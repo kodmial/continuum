@@ -29,15 +29,17 @@ jobs:
       github.event.comment.in_reply_to_id != null &&
       contains(github.event.comment.body, 'UNRESOLVED')
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 10
 
     permissions:
-      contents: write
-      pull-requests: write
+      actions: write
+      contents: read
+      issues: write
+      pull-requests: read
 
-    # All UNRESOLVED events for one PR are serialized. The first run collects
-    # every currently unresolved finding, so queued duplicate events become
-    # no-ops once that batch has been repaired and sent back for verification.
+    # Serialize the entire batch/dispatch transaction per PR. Never run a
+    # second CodeRabbit repair engine; the canonical OpenCode workflow owns
+    # model selection, runtime, publication, verification and recovery.
     concurrency:
       group: coderabbit-unresolved-${{ github.event.pull_request.number }}
       cancel-in-progress: false
@@ -238,306 +240,88 @@ jobs:
             core.setOutput('head_sha', headSha);
             core.setOutput('items_json', JSON.stringify(active));
 
-      - name: Checkout current PR branch
+      - name: Dispatch one batched repair to canonical OpenCode
         if: steps.context.outputs.should_run == 'true'
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
-        with:
-          fetch-depth: 0
-          token: ${{ secrets.TAP_PAT }}
-          persist-credentials: true
-          ref: ${{ steps.context.outputs.head_ref }}
-
-      - name: Configure Git identity
-        if: steps.context.outputs.should_run == 'true'
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-
-      - name: Install OpenCode CLI
-        if: steps.context.outputs.should_run == 'true'
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
         env:
-          CONTINUUM_IMAGE_DIGEST: ${{ vars.CONTINUUM_IMAGE_DIGEST }}
-        run: |
-          set -euo pipefail
-          # Continuum #179 prepared agent runtime: the immutable golden image
-          # (or its provider-native cache equivalent) already carries pinned
-          # OpenCode 1.18.34. The warm hit below is keyed by the image digest
-          # in CONTINUUM_IMAGE_DIGEST (wired from the repository variable):
-          # only a set, well-formed digest plus `command -v opencode` and the
-          # exact version takes the hit path with zero downloads. A cache
-          # failure (empty or malformed digest) falls back to deterministic
-          # reconstruction below, never failing closed. The digest is bound
-          # to the runtime by the image-digest stamp
-          # ($HOME/.opencode/image-digest) recorded by the validated image
-          # build: a stale or unrelated
-          # opencode 1.18.34 binary whose stamp does not match the digest
-          # cannot take the hit path. Deterministic reconstruction below
-          # never records the stamp, so a later job cannot take the warm
-          # path from a reconstruction self-stamp.
-          export PATH="$HOME/.opencode/bin:$PATH"
-          STAMP_FILE="$HOME/.opencode/image-digest"
-          if [[ -n "${CONTINUUM_IMAGE_DIGEST:-}" ]] && ! [[ "$CONTINUUM_IMAGE_DIGEST" =~ ^[0-9a-f]{64}$ ]]; then
-            echo "::warning::CONTINUUM_IMAGE_DIGEST is malformed; falling back to deterministic reconstruction."
-            CONTINUUM_IMAGE_DIGEST=""
-          fi
-          if [[ "${CONTINUUM_IMAGE_DIGEST:-}" =~ ^[0-9a-f]{64}$ ]] && [[ -f "$STAMP_FILE" ]] && [[ "$(cat "$STAMP_FILE")" == "$CONTINUUM_IMAGE_DIGEST" ]] && command -v opencode >/dev/null 2>&1 && opencode --version 2>&1 | grep -E -q "(^|[^0-9.])1\.18\.34([^0-9.]|$)"; then
-            echo "prepared-runtime hit: opencode 1.18.34 already present (image digest ${CONTINUUM_IMAGE_DIGEST} validated against ${STAMP_FILE})."
-            echo "$HOME/.opencode/bin" >> "$GITHUB_PATH"
-            exit 0
-          fi
-          for attempt in 1 2 3; do
-            if curl -fsSL --retry 3 --retry-delay 2 https://opencode.ai/install | bash -s -- --version 1.18.34; then
-              export PATH="$HOME/.opencode/bin:$PATH"
-              opencode --version 2>&1 | grep -E -q "(^|[^0-9.])1\.18\.34([^0-9.]|$)" || exit 1
-              # Deterministic reconstruction never records the stamp: only
-              # the validated image build (or a provider cache restore of
-              # it) proves golden-image provenance.
-              echo "$HOME/.opencode/bin" >> "$GITHUB_PATH"
-              exit 0
-            fi
-            if [[ "$attempt" -eq 3 ]]; then
-              echo "::error::OpenCode installer failed after 3 attempts."
-              exit 1
-            fi
-            sleep $((attempt * 15))
-          done
-
-      - name: Fix all unresolved findings in one OpenCode run
-        id: fix
-        if: steps.context.outputs.should_run == 'true'
-        env:
-          OPENCODE_MODEL: ${{ vars.OPENCODE_MODEL || 'opencode/muse-spark-1.3-contributor-free' }}
-          GITHUB_TOKEN: ${{ secrets.TAP_PAT }}
-          GH_TOKEN: ${{ secrets.TAP_PAT }}
           PR_NUMBER: ${{ steps.context.outputs.pr_number }}
           HEAD_REF: ${{ steps.context.outputs.head_ref }}
           COLLECTED_HEAD: ${{ steps.context.outputs.head_sha }}
           UNRESOLVED_ITEMS_JSON: ${{ steps.context.outputs.items_json }}
-          OPENCODE_CONFIG_CONTENT: >-
-            {"permission":{"bash":{"*":"allow","git *":"deny","git status":"allow","git status *":"allow","git diff":"allow","git diff *":"allow","git log":"allow","git log *":"allow","git show":"allow","git show *":"allow","git rev-parse *":"allow","git ls-files":"allow","git ls-files *":"allow","git grep *":"allow","git blame *":"allow","git branch --show-current":"allow","git remote -v":"allow","git tag":"allow","git tag --list *":"allow","git tag -l *":"allow","git describe *":"allow"}}}
-        run: |
-          set -euo pipefail
-
-          # kodmial/continuum#302: canonical fail-closed branch safety. The
-          # batch repair pushes only to the live-read PR head, which must be
-          # a proven non-default ref; only the PR merge operation may update
-          # the default branch. Missing/moved/ambiguous identity fails
-          # closed before mutation.
-          continuum_assert_safe_push() {
-            local dest="${1:-}"
-            local repo="${2:-$GITHUB_REPOSITORY}"
-            dest="${dest#refs/heads/}"
-            dest="$(printf '%s' "$dest" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
-            if [[ -z "$dest" ]]; then echo "::error::Continuum branch safety: refusing code push with an empty destination." >&2; return 1; fi
-            case "$dest" in HEAD|@|FETCH_HEAD|ORIG_HEAD|MERGE_HEAD) echo "::error::Continuum branch safety: refusing ambiguous push destination '$dest'." >&2; return 1;; esac
-            case "$dest" in *".."*|*"~"*|*"^"*|*"?"*|*"*"*|*"["*|*" "*|*"@{"*) echo "::error::Continuum branch safety: refusing ambiguous push destination '$dest'." >&2; return 1;; esac
-            case "$dest" in -*|/*|*/|*.lock) echo "::error::Continuum branch safety: refusing ambiguous push destination '$dest'." >&2; return 1;; esac
-            if [[ "$dest" == *"//"* ]]; then echo "::error::Continuum branch safety: refusing ambiguous push destination '$dest'." >&2; return 1; fi
-            local default_branch=""
-            default_branch="$(gh api "repos/$repo" --jq .default_branch 2>/dev/null || true)"
-            default_branch="${default_branch#refs/heads/}"
-            default_branch="$(printf '%s' "$default_branch" | tr -d '[:space:]')"
-            if [[ -z "$default_branch" ]]; then echo "::error::Continuum branch safety: repository default branch is undiscoverable for '$repo'; refusing code push to '$dest'." >&2; return 1; fi
-            if [[ "$dest" == "$default_branch" ]]; then echo "::error::Continuum branch safety: refusing code push to the default branch '$dest'. Recovery resumes the same PR branch; only the PR merge operation may update the default branch." >&2; return 1; fi
-          }
-          continuum_assert_safe_push "$HEAD_REF" || exit 1
-
-          CURRENT_HEAD="$(git rev-parse HEAD)"
-          echo "started_head=$CURRENT_HEAD" >> "$GITHUB_OUTPUT"
-
-          PROMPT=$(cat <<EOF
-          Fix ALL CodeRabbit findings that are currently UNRESOLVED on pull request #${PR_NUMBER} in one repair pass.
-
-          Current checked-out PR branch: ${HEAD_REF}
-          Current checked-out PR HEAD: ${CURRENT_HEAD}
-          PR HEAD when the batch was collected: ${COLLECTED_HEAD}
-
-          Complete unresolved batch (JSON):
-          ${UNRESOLVED_ITEMS_JSON}
-
-          Each object contains:
-          - review_id: the original CodeRabbit review id;
-          - finding_id: the original top-level CodeRabbit review-comment id;
-          - unresolved_id: the latest CodeRabbit UNRESOLVED reply id for that finding;
-          - verified_head: the PR HEAD CodeRabbit evaluated when producing that reply.
-
-          Before editing, inspect every listed original finding, its complete review thread,
-          its latest UNRESOLVED reply, the current code, and the current PR diff using GitHub
-          CLI/API. The current code is authoritative: another repair may already have changed
-          code since a listed verified_head.
-
-          Requirements:
-          - Process EVERY object in the batch; do not stop after fixing the first finding.
-          - Fix all actionable unresolved findings together in this one working tree.
-          - If the current code already fixes a listed finding, do not reintroduce or duplicate a fix.
-          - Keep changes scoped to the listed CodeRabbit feedback; do not make unrelated refactors.
-          - Run the relevant tests, linters, or validation for the files you change.
-          - Do not create or switch branches and do not create a new pull request.
-          - Do not resolve or dismiss CodeRabbit review threads yourself.
-          - Do not commit or push; the workflow will create one commit and one push for the batch.
-          - If CodeRabbit is incorrect about a finding, leave that part of the code unchanged.
-          - Keep all comments and commit messages in English.
-          EOF
-          )
-
-          opencode run --auto --model "$OPENCODE_MODEL" "$PROMPT"
-
-          if [[ -z "$(git status --porcelain)" ]]; then
-            echo "changed=false" >> "$GITHUB_OUTPUT"
-
-            VERIFY_ITEMS="$(
-              jq -c --arg head "$CURRENT_HEAD" \
-                '[.[] | select(.verified_head != $head)]' \
-                <<<"$UNRESOLVED_ITEMS_JSON"
-            )"
-            echo "verify_items_json=$VERIFY_ITEMS" >> "$GITHUB_OUTPUT"
-
-            if [[ "$VERIFY_ITEMS" == "[]" ]]; then
-              echo "verify=false" >> "$GITHUB_OUTPUT"
-              echo "OpenCode made no changes and all findings were already UNRESOLVED on this same HEAD; avoiding a same-state loop."
-            else
-              echo "verify=true" >> "$GITHUB_OUTPUT"
-              echo "OpenCode made no changes, but some findings were evaluated on an older HEAD; they will be re-verified against current code."
-            fi
-            exit 0
-          fi
-
-          git add -A
-          # kodmial/continuum#260: workflow-owned repair commit uses the bot
-          # identity (see Configure Git identity) plus the component trailer.
-          git commit -m "fix: address unresolved CodeRabbit findings" -m "Continuum-Component: coderabbit-unresolved"
-          # kodmial/continuum#302: the live-read PR head was asserted on
-          # entry; re-assert it immediately before mutation.
-          continuum_assert_safe_push "${HEAD_REF}" || exit 1
-          git push origin "HEAD:${HEAD_REF}"
-          echo "changed=true" >> "$GITHUB_OUTPUT"
-          echo "verify=true" >> "$GITHUB_OUTPUT"
-          echo "verify_items_json=$UNRESOLVED_ITEMS_JSON" >> "$GITHUB_OUTPUT"
-
-      - name: Ask CodeRabbit to verify every finding in the batch
-        if: >-
-          steps.context.outputs.should_run == 'true' &&
-          steps.fix.outputs.verify == 'true'
-        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
-        env:
-          PR_NUMBER: ${{ steps.context.outputs.pr_number }}
-          VERIFY_ITEMS_JSON: ${{ steps.fix.outputs.verify_items_json }}
         with:
-          # kodmial/continuum#259: verification replies address CodeRabbit
-          # (external app) and never need to trigger a GitHub workflow, so
-          # they use GITHUB_TOKEN (github-actions[bot] actor). The fix push
-          # above intentionally stays PAT-backed so CI still fans out.
-          github-token: ${{ github.token }}
+          # A PAT-authored dispatch reliably triggers the OpenCode workflow,
+          # while regular collection uses the cheaper read-only GITHUB_TOKEN.
+          github-token: ${{ secrets.TAP_PAT }}
           script: |
+            const crypto = require('crypto');
             const owner = context.repo.owner;
             const repo = context.repo.repo;
             const pullNumber = Number(process.env.PR_NUMBER);
-            const items = JSON.parse(process.env.VERIFY_ITEMS_JSON || '[]');
-
-            if (items.length === 0) {
-              core.notice('No findings need CodeRabbit verification.');
-              return;
+            const head = String(process.env.COLLECTED_HEAD || '');
+            const headRef = String(process.env.HEAD_REF || '');
+            const items = JSON.parse(process.env.UNRESOLVED_ITEMS_JSON || '[]');
+            if (!Number.isInteger(pullNumber) || pullNumber <= 0 ||
+                !/^[0-9a-f]{40}$/.test(head) ||
+                !/^[A-Za-z0-9_./-]+$/.test(headRef) ||
+                !Array.isArray(items) || items.length === 0 || items.length > 80) {
+              throw new Error('Invalid CodeRabbit batch/PR identity; refusing dispatch.');
             }
-
-            const pr = await github.rest.pulls.get({
-              owner,
-              repo,
-              pull_number: pullNumber,
-            });
-            if (pr.data.head.repo?.full_name !== `${owner}/${repo}`) {
-              core.setFailed(
-                `PR #${pullNumber}: batched CodeRabbit verification requires a same-repository head branch.`
-              );
-              return;
-            }
-            const { data: publishedRef } = await github.rest.git.getRef({
-              owner,
-              repo,
-              ref: `heads/${pr.data.head.ref}`,
-            });
-            const headSha = publishedRef.object.sha;
-            if (pr.data.head.sha !== headSha) {
-              core.notice(
-                `PR #${pullNumber}: pull metadata still reports stale HEAD ${pr.data.head.sha}; verifying published batch-repair HEAD ${headSha}.`
-              );
-            }
-
-            // Bounded newest-first duplicate check (#254): the marker being
-            // checked carries the just-pushed HEAD, so the three newest
-            // pages bound the cost; a missed marker only duplicates a
-            // visible reply. The review-comment endpoint lists oldest-first
-            // and ignores sort/direction, so anchor at the newest end via
-            // the review-comment total instead of scanning pages 1..3.
-            const totalForVerify = Number(pr?.data?.review_comments || 0);
-            const lastVerifyPage = Math.max(
-              1,
-              Math.ceil((Number.isFinite(totalForVerify) ? totalForVerify : 0) / 100) || 1
-            );
-            const firstVerifyPage = Math.max(1, lastVerifyPage - 2);
-            const comments = [];
-            for (let page = lastVerifyPage; page >= firstVerifyPage; page -= 1) {
-              const { data } = await github.rest.pulls.listReviewComments({
-                owner,
-                repo,
-                pull_number: pullNumber,
-                per_page: 100,
-                page,
-              });
-              if (!Array.isArray(data) || data.length === 0) continue;
-              comments.push(...data);
-            }
-
-            let requested = 0;
+            const seen = new Set();
             for (const item of items) {
-              const reviewId = Number(item.review_id);
-              const findingId = Number(item.finding_id);
-              const unresolvedId = Number(item.unresolved_id);
-              const previousHead = String(item.verified_head);
-              const marker =
-                `<!-- opencode-coderabbit-verification review=${reviewId} finding=${findingId} head=${headSha} -->`;
-
-              const duplicate = comments.some(
-                (comment) =>
-                  comment.in_reply_to_id === findingId &&
-                  comment.body?.includes(marker)
-              );
-
-              if (duplicate) {
-                core.info(
-                  `Verification already requested for finding ${findingId} at ${headSha}.`
-                );
-                continue;
+              if (!Number.isInteger(item.review_id) || item.review_id <= 0 ||
+                  !Number.isInteger(item.finding_id) || item.finding_id <= 0 ||
+                  !Number.isInteger(item.unresolved_id) || item.unresolved_id <= 0 ||
+                  !/^[0-9a-f]{40}$/.test(String(item.verified_head || '')) ||
+                  seen.has(item.finding_id)) {
+                throw new Error('Malformed or duplicate CodeRabbit unresolved finding.');
               }
+              seen.add(item.finding_id);
+            }
+            const batch = JSON.stringify(items);
+            if (Buffer.byteLength(batch, 'utf8') > 30000) {
+              throw new Error('CodeRabbit batch exceeds workflow-dispatch safe payload.');
+            }
+            const live = (await github.rest.pulls.get({
+              owner, repo, pull_number: pullNumber,
+            })).data;
+            if (live.state !== 'open' || live.head?.repo?.full_name !== `${owner}/${repo}` ||
+                live.head.sha !== head || live.head.ref !== headRef) {
+              core.notice('PR HEAD or state advanced during CodeRabbit batching; deferring to next reconciliation.');
+              return;
+            }
+            const batchKey = crypto.createHash('sha256')
+              .update(head + '\n' + batch).digest('hex');
+            const marker =
+              `<!-- continuum-coderabbit-batch head=${head} digest=${batchKey} -->`;
+            const priorComments = await github.paginate(github.rest.issues.listComments, {
+              owner, repo, issue_number: pullNumber, per_page: 100,
+            });
+            if (priorComments.some(comment => (comment.body || '').includes(marker))) {
+              core.notice('CodeRabbit batch already dispatched for this PR/HEAD/findings; duplicate event ignored.');
+              return;
+            }
 
-              const body = [
+            // No CodeRabbit-specific model, OpenCode version, or git writer here.
+            // The existing coderabbit-fix engine handles this exact batch.
+            await github.rest.actions.createWorkflowDispatch({
+              owner, repo,
+              workflow_id: 'continuum-opencode.yml',
+              ref: context.payload.repository.default_branch,
+              inputs: {
+                mode: 'coderabbit-fix',
+                pr_number: String(pullNumber),
+                head_ref: headRef,
+                review_id: String(items[0].review_id),
+                unresolved_items_json: batch,
+              },
+            });
+            await github.rest.issues.createComment({
+              owner, repo, issue_number: pullNumber,
+              body: [
                 marker,
                 '⚡ **Continuum · coderabbit-unresolved**',
                 '<!-- continuum-origin role=continuum component=coderabbit-unresolved -->',
-                '@coderabbitai Re-check this exact original finding after the batched OpenCode retry.',
-                '',
-                `Latest UNRESOLVED reply processed: ${unresolvedId}`,
-                `Current PR HEAD: \`${headSha}\``,
-                `Previous HEAD associated with that UNRESOLVED reply: \`${previousHead}\``,
-                '',
-                'Compare the original finding and the latest UNRESOLVED explanation with the current code itself.',
-                '',
-                'Reply with **RESOLVED** only if the underlying issue is fully fixed.',
-                'Otherwise reply with **UNRESOLVED** and state exactly what remains.',
-              ].join('\n');
-
-              await github.request(
-                'POST /repos/{owner}/{repo}/pulls/{pull_number}/comments/{comment_id}/replies',
-                {
-                  owner,
-                  repo,
-                  pull_number: pullNumber,
-                  comment_id: findingId,
-                  body,
-                }
-              );
-              requested += 1;
-            }
-
-            core.notice(
-              `Requested CodeRabbit verification for ${requested}/${items.length} batched finding(s) at HEAD ${headSha}.`
-            );
+                `Queued one canonical OpenCode repair for ${items.length} current UNRESOLVED finding(s) on HEAD \`${head}\`.`,
+              ].join('\n'),
+            });
+            core.notice(`Dispatched canonical OpenCode for ${items.length} unresolved finding(s) of PR #${pullNumber}.`);
