@@ -45,6 +45,10 @@ class Conflict(RouteError):
     pass
 
 
+class SelectionNotVisible(RouteError):
+    """The same-run selection receipt may lag a recent Git state ref write."""
+
+
 def bounded(name: str, value: str, default: int, minimum: int, maximum: int) -> int:
     if value is None or value == "":
         return default
@@ -235,7 +239,9 @@ class GitRefStore:
             headers={"Authorization": "Bearer " + self.token,
                      "Accept": "application/vnd.github+json",
                      "X-GitHub-Api-Version": "2022-11-28",
-                     "Content-Type": "application/json"})
+                     "Content-Type": "application/json",
+                      "Cache-Control": "no-cache, no-store",
+                      "Pragma": "no-cache"})
         try:
             with urllib.request.urlopen(request, timeout=15) as reply:
                 return json.load(reply)
@@ -333,8 +339,10 @@ def attest_completion(current: dict, ticket: str, model: str, now: int,
     pending = current.get("qualified_selections") or {}
     if not isinstance(pending, dict):
         raise RouteError("Corrupt model selection state")
-    selected = pending.get(ticket) or {}
-    if selected.get("model") != model:
+    if ticket not in pending:
+        raise SelectionNotVisible("No qualified selection for this run and model")
+    selected = pending[ticket]
+    if not isinstance(selected, dict) or selected.get("model") != model:
         raise RouteError("No qualified selection for this run and model")
     selected_at = selected.get("at")
     probe_at = selected.get("probe_at")
@@ -367,8 +375,10 @@ def attest_retryable_failure(current: dict, ticket: str, model: str, now: int,
     pending = current.get("qualified_selections") or {}
     if not isinstance(pending, dict):
         raise RouteError("Corrupt model selection state")
-    selected = pending.get(ticket) or {}
-    if selected.get("model") != model:
+    if ticket not in pending:
+        raise SelectionNotVisible("No qualified selection for this run and model")
+    selected = pending[ticket]
+    if not isinstance(selected, dict) or selected.get("model") != model:
         raise RouteError("No qualified selection for this run and model")
     selected_at = selected.get("at")
     if not isinstance(selected_at, int) or not 0 <= now - selected_at <= MAX_EXECUTION_SECONDS:
@@ -415,6 +425,25 @@ def binary_provenance() -> tuple[str, str]:
     return version, digest
 
 
+def persist_bound_receipt(store: GitRefStore, key: str, mutator,
+                          *, sleep=time.sleep) -> dict:
+    """Resolve Git ref read-after-write lag without inventing missing receipts.
+
+    Git ref/blob GETs may briefly observe a pre-selection branch head,
+    even though select's non-force fast-forward commit already succeeded.
+    Bounded retries refresh the ref and require the genuine same-run ticket.
+    All other state errors remain fatal and no provider call is repeated.
+    """
+    for attempt in range(4):
+        try:
+            return store.update(key, mutator)
+        except SelectionNotVisible:
+            if attempt == 3:
+                raise
+            sleep(2 ** attempt)
+    raise RouteError("Receipt state visibility retry budget exhausted")
+
+
 def run() -> int:
     cli = argparse.ArgumentParser()
     cli.add_argument("operation", choices=("select", "record", "fail"))
@@ -454,7 +483,7 @@ def run() -> int:
             def record(current):
                 return attest_retryable_failure(
                     current, ticket, selected, now, fingerprint, reason, config.cooldown)
-        store.update(key, record)
+        persist_bound_receipt(store, key, record)
         return 0
 
     state, _, _ = store.read(key)
