@@ -71,6 +71,20 @@ class BridgeTimingTests(unittest.TestCase):
         self.assertEqual(handler.observed_status, 504)
         self.assertEqual(handler.observed_payload["error"]["type"], "upstream_error")
 
+    def test_session_status_monitor_does_not_expose_session_or_prompt(self):
+        class StatusReply(FakeReply):
+            def read(self):
+                return b'{"secret-session-id": {"type": "busy"}}'
+
+        stderr = io.StringIO()
+        with patch.object(bridge.urllib.request, "urlopen", return_value=StatusReply()):
+            with contextlib.redirect_stderr(stderr):
+                state = bridge._session_state_sample("secret-session-id")
+                bridge._bridge_timing("send-message", 0.0, "status_" + state)
+        self.assertEqual(state, "busy")
+        self.assertIn("outcome=status_busy", stderr.getvalue())
+        self.assertNotIn("secret-session-id", stderr.getvalue())
+
     def test_network_timeout_at_open_code_is_logged_as_distinct_error(self):
         stderr = io.StringIO()
         with patch.object(bridge.urllib.request, "urlopen", side_effect=TimeoutError("private-data")):
