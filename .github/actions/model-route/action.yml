@@ -1,8 +1,8 @@
 name: Continuum OpenCode route selector
-description: Resolve only trusted caller-approved models using verified OpenCode; record separately after real success
+description: Resolve only trusted caller-approved models using verified OpenCode; record completion or failure after real execution
 inputs:
   operation:
-    description: select before work or record after successful real work
+    description: select before work, record after success, fail after unsuccessful real review
     required: false
     default: select
   models:
@@ -18,7 +18,7 @@ inputs:
     required: false
     default: ''
   selected-model:
-    description: Exact model produced by select; required for record
+    description: Exact model produced by select; required for record/fail
     required: false
     default: ''
   task-class:
@@ -88,5 +88,5 @@ runs:
         OPERATION: ${{ inputs.operation }}
       run: |
         set -euo pipefail
-        case "$OPERATION" in select|record) ;; *) echo '::error::Invalid model route operation'; exit 2;; esac
+        case "$OPERATION" in select|record|fail) ;; *) echo '::error::Invalid model route operation'; exit 2;; esac
         python3 "$GITHUB_ACTION_PATH/../../../src/continuum/model_routing.py" "$OPERATION"
