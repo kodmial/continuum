@@ -798,6 +798,7 @@ PR_AGENT_FAMILY = {
         "Revalidate the PR head after improve",
         "Normalize persistent improve presentation",
         "Qualify trusted review-model route",
+        "Cool down failed real provider route before the bounded retry",
         "Attest successful independent OpenCode review",
         "Publish private exact-head repair handoff",
         "Clear settled PR-Agent controller state",
