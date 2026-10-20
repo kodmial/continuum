@@ -100,6 +100,7 @@ def opencode_call(method: str, path: str, payload: Dict[str, Any] | None, timeou
     else:
         stage = "other"
     started = time.monotonic()
+    _bridge_timing(stage, started, "started")
     data = json.dumps(payload).encode() if payload is not None else None
     request = urllib.request.Request(
         server_url() + path,
