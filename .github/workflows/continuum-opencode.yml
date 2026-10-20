@@ -2723,6 +2723,53 @@ jobs:
               });
               recent.push(...data);
             }
+            // The executor independently verifies the same live GitHub
+            // review-thread state as the canonical CodeRabbit batcher.
+            // A natural-language answer is not required to contain UNRESOLVED.
+            const openThreadRoots = new Set();
+            let threadCursor = null;
+            let threadPageCount = 0;
+            do {
+              const response = await github.graphql(
+                `query($owner: String!, $repo: String!, $number: Int!, $cursor: String) {
+                  repository(owner: $owner, name: $repo) {
+                    pullRequest(number: $number) {
+                      reviewThreads(first: 100, after: $cursor) {
+                        nodes {
+                          isResolved
+                          comments(first: 1) { nodes { databaseId author { login } } }
+                        }
+                        pageInfo { hasNextPage endCursor }
+                      }
+                    }
+                  }
+                }`,
+                { owner, repo, number, cursor: threadCursor }
+              );
+              const threads = response.repository?.pullRequest?.reviewThreads;
+              if (!threads?.pageInfo || !Array.isArray(threads.nodes)) {
+                throw new Error('Cannot validate live CodeRabbit review-thread state.');
+              }
+              for (const thread of threads.nodes) {
+                const root = thread.comments?.nodes?.[0];
+                if (!thread.isResolved && root?.author?.login?.startsWith('coderabbitai') &&
+                    Number.isInteger(root.databaseId)) {
+                  openThreadRoots.add(root.databaseId);
+                }
+              }
+              threadCursor = threads.pageInfo.hasNextPage
+                ? threads.pageInfo.endCursor : null;
+              threadPageCount += 1;
+              if (threadCursor && threadPageCount >= 10) {
+                throw new Error('Review-thread validation exceeds bounded page window.');
+              }
+            } while (threadCursor);
+
+            const explicitlyResolved = body =>
+              !/\bUNRESOLVED\b/i.test(body || '') &&
+              (/\*\*RESOLVED(?:\.|\*\*)/i.test(body || '') ||
+               /✅\s*Review thread resolved\.?/i.test(body || ''));
+
             const valid = [];
             const unique = new Set();
             const comparisons = new Map();
@@ -2747,11 +2794,19 @@ jobs:
               const latest = recent.filter(comment =>
                 comment.in_reply_to_id === findingId &&
                 comment.user?.login === 'coderabbitai[bot]' &&
-                /\b(?:RESOLVED|UNRESOLVED)\b/i.test(comment.body || '')
+                !/Review rate limited|Review limit reached/i.test(comment.body || '')
+              ).sort((a, b) => b.id - a.id)[0];
+              // An in-flight newer verification supersedes an earlier bot
+              // answer, even if the existing thread is still open.
+              const latestVerification = recent.filter(comment =>
+                comment.in_reply_to_id === findingId &&
+                /<!-- (?:opencode-coderabbit-verification|auto-merge-coderabbit-verification) /.test(comment.body || '')
               ).sort((a, b) => b.id - a.id)[0];
               if (!latest || latest.id !== unresolvedId ||
-                  !/\bUNRESOLVED\b/i.test(latest.body || '')) {
-                core.notice(`Finding #${findingId} has a newer verdict or is outside the verified recent window; skipping.`);
+                  !openThreadRoots.has(findingId) ||
+                  explicitlyResolved(latest.body) ||
+                  (latestVerification && latestVerification.id >= latest.id)) {
+                core.notice(`Finding #${findingId} is resolved, superseded, or outside the live window; skipping.`);
                 continue;
               }
               if (verifiedHead !== liveHead) {
