@@ -2717,7 +2717,7 @@ jobs:
             // canonical controller envelope; do not require POLICY_SCRIPT.
             const controllerMarker = '<!-- continuum-pr-agent-controller-state:v1 -->';
             const controllerStateBody = (marker, summary) => {
-              const kindMatch = /\\bkind=(review|repair)\\b/.exec(marker);
+              const kindMatch = /\bkind=(review|repair)\b/.exec(marker);
               const component = kindMatch ? 'pr-agent-' + kindMatch[1] : 'pr-agent';
               return [
                 controllerMarker, marker,
@@ -2725,7 +2725,7 @@ jobs:
                 '<!-- continuum-origin role=continuum component=' + component + ' -->',
                 '<details>', '<summary>Continuum PR-Agent controller state</summary>',
                 '', summary, '', '</details>',
-              ].join('\\n');
+              ].join('\n');
             };
             const prNumber = Number(process.env.PR_NUMBER);
             const head = String(process.env.HEAD_SHA || '').toLowerCase();
