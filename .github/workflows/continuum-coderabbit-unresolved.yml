@@ -448,7 +448,7 @@ jobs:
                 marker,
                 '⚡ **Continuum · coderabbit-unresolved**',
                 '<!-- continuum-origin role=continuum component=coderabbit-unresolved -->',
-                `Queued canonical OpenCode repair attempt ${attempts.length + 1} for ${items.length} current unresolved CodeRabbit finding(s) on HEAD \`${head}\`.`,
+                `Queued one canonical OpenCode repair for ${items.length} current unresolved CodeRabbit finding(s) (attempt ${attempts.length + 1}) on HEAD \`${head}\`.`,
               ].join('\n'),
             });
             core.notice(`Dispatched canonical OpenCode for ${items.length} unresolved finding(s) of PR #${pullNumber}.`);
