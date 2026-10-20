@@ -395,7 +395,7 @@ class CooldownRecoveryContractTests(unittest.TestCase):
                 config, retired, now, env={"GITHUB_ENV": str(output)})
             self.assertEqual(deadline, 1300)
             self.assertEqual(
-                output.read_text(), "CONTINUUM_MODEL_NOT_BEFORE_EPOCH=1300\\n")
+                output.read_text(), "CONTINUUM_MODEL_NOT_BEFORE_EPOCH=1300\n")
 
     def test_live_provider_timeout_never_launches_blind_inline_review_or_repair_retry(self):
         repo = PATH.parents[2]
