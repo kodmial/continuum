@@ -2423,7 +2423,7 @@ class ProtectedBaselineTests(unittest.TestCase):
         # The new immutable pin includes the previously reviewed model-routing
         # migration plus only the intended batch qualifiers and verification.
         # Every other protected file still uses its historical baseline.
-        migration = "3bd52bfa8e4f1aec1a1c5b193ca5ba5330a35548"
+        migration = "a4500e9b8a0221616bd65085abaa15d19f45e999"
         def show_at(revision, path):
             result = subprocess.run(["git", "show", f"{revision}:{path}"],
                                     cwd=ROOT, capture_output=True, text=True, timeout=60)
