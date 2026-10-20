@@ -3049,15 +3049,29 @@ jobs:
               );
             }
 
-            const comments = await github.paginate(
-              github.rest.pulls.listReviewComments,
-              {
-                owner,
-                repo,
-                pull_number: pullNumber,
-                per_page: 100,
+            // Ordinary full reviews use the existing complete listing.
+            // Provider-owned UNRESOLVED batches only need the most recent
+            // verdicts and duplicate markers. Bound this scan to the newest
+            // three pages (the API ignores oldest-first sort/direction).
+            const comments = [];
+            if (process.env.UNRESOLVED_ITEMS_JSON) {
+              const totalForVerify = Number(pr.data.review_comments || 0);
+              const lastVerifyPage = Math.max(
+                1, Math.ceil((Number.isFinite(totalForVerify) ? totalForVerify : 0) / 100) || 1
+              );
+              const firstVerifyPage = Math.max(1, lastVerifyPage - 2);
+              for (let page = lastVerifyPage; page >= firstVerifyPage; page--) {
+                const { data } = await github.rest.pulls.listReviewComments({
+                  owner, repo, pull_number: pullNumber, per_page: 100, page,
+                });
+                if (Array.isArray(data)) comments.push(...data);
               }
-            );
+            } else {
+              comments.push(...await github.paginate(
+                github.rest.pulls.listReviewComments,
+                { owner, repo, pull_number: pullNumber, per_page: 100 }
+              ));
+            }
 
             // A provider-owned UNRESOLVED batch is one repair transaction.
             // Verify exactly its still-current finding IDs, never all remarks
