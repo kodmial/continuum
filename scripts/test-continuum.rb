@@ -8,7 +8,11 @@ require 'open3'
 
 class ContinuumTest < Minitest::Test
   ROOT = File.expand_path('..', __dir__)
-  CORE_STUBS = Dir[File.join(ROOT, '.github/caller-stubs/*.yml')].sort
+  # Legacy CodeRabbit batch repair remains as a compatibility fixture for
+  # already-installed consumers, but is no longer provisioned in core.
+  CORE_STUBS = Dir[File.join(ROOT, '.github/caller-stubs/*.yml')].sort.reject do |path|
+    File.basename(path) == 'continuum-coderabbit-unresolved.yml'
+  end
   TECH_STUBS = Dir[File.join(ROOT, '.github/caller-stubs/tech/*.yml')].sort
   PARENT_STUBS = Dir[File.join(ROOT, '.github/caller-stubs/parent/*.yml')].sort
   WORKFLOWS = Dir[File.join(ROOT, '.github/workflows/*.yml')].sort
@@ -1023,7 +1027,7 @@ class ContinuumTest < Minitest::Test
   # three sets are independent files in one directory, so a one-line edit to the
   # prune candidate list — or a future edit to `"${STUBS[@]}"` — could delete a
   # consumer's whole tech or parent layer with no warning. The growth
-  # 19 -> 20 -> 24 is the observable form of that guarantee.
+  # 18 -> 19 -> 23 is the observable form of that guarantee.
   def test_installing_one_set_does_not_delete_another_sets_callers
     fixture do |dir|
       target = File.join(dir, 'consumer')
@@ -1048,11 +1052,11 @@ class ContinuumTest < Minitest::Test
           PARENT_STUBS.each { |stub| assert_includes installed, File.basename(stub) }
         end
       end
-      # Each set adds exactly its own files: 19 core, +1 tech, +4 parent.
+      # Each set adds exactly its own files: 18 core, +1 tech, +4 parent.
       assert_equal CORE_STUBS.size, counts['core']
       assert_equal CORE_STUBS.size + TECH_STUBS.size, counts['tech']
       assert_equal ALL_STUBS.size, counts['parent']
-      assert_equal 24, ALL_STUBS.size,
+      assert_equal 23, ALL_STUBS.size,
                    'every install-managed caller Continuum ships, across all three layers'
     end
   end
@@ -1488,7 +1492,7 @@ class ContinuumTest < Minitest::Test
   # feature does — moved both sides and passed. A literal is the third,
   # independent source: to change the twenty core callers someone has to say so
   # here, which is where a reviewer sees it.
-  CORE_COUNT = 19
+  CORE_COUNT = 18
 
   # Every core workflow is either called by a stub in one of the three layers
   # or is a repository-owned/shared engine intentionally invoked from a
@@ -3883,8 +3887,7 @@ class ContinuumTest < Minitest::Test
     'continuum-auto-merge.yml' => %w[continuum_ref post_merge_wakeups post_merge_wakeup_ref],
     'continuum-bootstrap-runtime-secret.yml' => %w[continuum_ref repository],
     'continuum-coderabbit-retry.yml' => %w[continuum_ref],
-    'continuum-coderabbit-unresolved.yml' => %w[continuum_ref],
-    'continuum-docker-qualification.yml' => %w[
+     'continuum-docker-qualification.yml' => %w[
       continuum_ref issue_number artifact_repository binary_name model
       docker_image memory_mib min_headroom_mib trials result_schema
       result_kind result_marker result_file evidence_dir artifact_prefix
