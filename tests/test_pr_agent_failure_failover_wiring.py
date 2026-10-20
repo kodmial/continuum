@@ -31,6 +31,20 @@ class FailureFailoverWiring(unittest.TestCase):
                 self.assertIn(term, snippet)
         self.assertNotIn("continue-on-error: true", snippet)
 
+    def test_upstream_agent_does_not_multiply_same_model_timeouts_or_escape_pool(self):
+        workflow = (ROOT / ".github/workflows/continuum-pr-agent.yml").read_text()
+        # PR-Agent 0.46.0 defaults to same-model timeout retries and a
+        # built-in non-allowlisted fallback. Neither is legitimate when the
+        # shared run-scoped model router owns retry/failover.
+        for setting in (
+            "CONFIG__RETRY_SAME_MODEL_ON_TIMEOUT: 'false'",
+            "CONFIG__NUM_RETRIES: '0'",
+            "CONFIG__FALLBACK_MODELS: '[]'",
+        ):
+            with self.subTest(setting=setting):
+                self.assertEqual(workflow.count(setting), 2)
+        self.assertIn("steps.model_route.outputs.model", workflow)
+
     def test_shared_action_exposes_review_failure_without_new_model_defaults(self):
         action = (ROOT / ".github/actions/model-route/action.yml").read_text()
         self.assertIn("select|record|fail)", action)
