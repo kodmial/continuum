@@ -170,28 +170,10 @@ jobs:
           fi
 
           # Use live PR state, not only the historical webhook payload.
-          LIVE_PR="$(gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}" \
-            --jq '[.head.sha, .head.repo.full_name, .state] | @tsv')"
-          IFS=
-          echo "continuum-api-budget: comment_pages=$(( LAST_PAGE - FIRST_PAGE + 1 + PROBE_EXTRA )) max_pages=${MAX_PAGES} raw_CONTINUUM_MAX_COMMENT_PAGES=${CONTINUUM_MAX_COMMENT_PAGES:-5}"
-
-      - name: Dispatch OpenCode retry
-        if: steps.context.outputs.dispatch == 'true'
-        env:
-          GH_TOKEN: ${{ github.token }}
-          PR_NUMBER: ${{ github.event.pull_request.number }}
-          HEAD_REF: ${{ github.event.pull_request.head.ref }}
-          REVIEW_ID: ${{ steps.context.outputs.review_id }}
-        run: |
-          set -euo pipefail
-          gh api --method POST \
-            "repos/${GITHUB_REPOSITORY}/actions/workflows/continuum-opencode.yml/dispatches" \
-            -f ref=main \
-            -f "inputs[mode]=coderabbit-fix" \
-            -f "inputs[pr_number]=${PR_NUMBER}" \
-            -f "inputs[head_ref]=${HEAD_REF}" \
-            -f "inputs[review_id]=${REVIEW_ID}"
-\t' read -r LIVE_HEAD LIVE_REPO LIVE_STATE <<<"$LIVE_PR"
+          LIVE_PR="$(gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}")"
+          LIVE_HEAD="$(jq -r '.head.sha' <<<"$LIVE_PR")"
+          LIVE_REPO="$(jq -r '.head.repo.full_name' <<<"$LIVE_PR")"
+          LIVE_STATE="$(jq -r '.state' <<<"$LIVE_PR")"
           if [[ "$LIVE_REPO" != "$GITHUB_REPOSITORY" ]] ||
              [[ "$LIVE_STATE" != "open" ]] ||
              [[ ! "$LIVE_HEAD" =~ ^[0-9a-f]{40}$ ]]; then
