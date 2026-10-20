@@ -2707,11 +2707,26 @@ jobs:
           HEAD_SHA: ${{ steps.admit.outputs.head_sha }}
           RETRY_ATTEMPT: ${{ steps.stack.outputs.retry_attempt }}
           RECOVERY_KIND: ${{ steps.stack.outputs.recovery_kind }}
-          POLICY_SCRIPT: ${{ steps.runtime.outputs.policy_script }}
+          ROUTE_NOT_BEFORE: ${{ env.CONTINUUM_MODEL_NOT_BEFORE_EPOCH }}
+          MODEL_ROUTE_FAILED: ${{ steps.model_route.outcome == 'failure' && 'true' || 'false' }}
         with:
           github-token: ${{ env.CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED == 'true' && secrets.TAP_PAT || (env.CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED != 'true' && github.token || '') }}
           script: |
-            const policy = require(process.env.POLICY_SCRIPT);
+            // This step must work when route qualification fails BEFORE the
+            // runtime bundle/policy script can be downloaded. Use the same
+            // canonical controller envelope; do not require POLICY_SCRIPT.
+            const controllerMarker = '<!-- continuum-pr-agent-controller-state:v1 -->';
+            const controllerStateBody = (marker, summary) => {
+              const kindMatch = /\\bkind=(review|repair)\\b/.exec(marker);
+              const component = kindMatch ? 'pr-agent-' + kindMatch[1] : 'pr-agent';
+              return [
+                controllerMarker, marker,
+                '⚡ **Continuum · ' + component + '**',
+                '<!-- continuum-origin role=continuum component=' + component + ' -->',
+                '<details>', '<summary>Continuum PR-Agent controller state</summary>',
+                '', summary, '', '</details>',
+              ].join('\\n');
+            };
             const prNumber = Number(process.env.PR_NUMBER);
             const head = String(process.env.HEAD_SHA || '').toLowerCase();
             // Defense in depth: every stale-head discard above carries its
@@ -2737,17 +2752,34 @@ jobs:
             }
             const kind = String(process.env.RECOVERY_KIND || 'review').toLowerCase();
             const attempt = Number(process.env.RETRY_ATTEMPT || '0');
-            const exhausted = Number.isInteger(attempt) && attempt >= 2;
+            const notBefore = Number(process.env.ROUTE_NOT_BEFORE || '0');
+            // The model selector publishes this only after confirming every
+            // trusted route has a future durable cooldown. A preflight that
+            // cannot possibly pick a model must NOT exhaust the old 3-try
+            // inline budget. The shared recovery controller understands this
+            // canonical not-before marker and wakes after the earliest expiry.
+            const cooling = process.env.MODEL_ROUTE_FAILED === 'true' &&
+              Number.isSafeInteger(notBefore) &&
+              notBefore > Math.floor(Date.now() / 1000);
+            const exhausted = !cooling && Number.isInteger(attempt) && attempt >= 2;
             const next = Number.isInteger(attempt) ? attempt + 1 : 1;
-            const stateMarker = exhausted
-              ? '<!-- continuum-pr-agent-retry-exhausted head=' + head +
-                ' kind=' + kind + ' attempts=' + next + ' -->'
-              : '<!-- continuum-pr-agent-retry head=' + head +
-                ' kind=' + kind + ' attempt=' + next + ' -->';
-            const summary = exhausted
-              ? 'Retry budget exhausted for ' + kind + ' on exact HEAD ' + head + '.'
-              : 'Transient ' + kind + ' failure; bounded retry ' + next + '/3 is scheduled for exact HEAD ' + head + '.';
-            const body = policy.controllerStateBody(stateMarker, summary);
+            const stateMarker = cooling
+              ? '<!-- continuum-lifecycle-retry head=' + head +
+                ' kind=' + kind + ' attempt=' + attempt +
+                ' not-before=' + notBefore + ' -->'
+              : exhausted
+                ? '<!-- continuum-pr-agent-retry-exhausted head=' + head +
+                  ' kind=' + kind + ' attempts=' + next + ' -->'
+                : '<!-- continuum-pr-agent-retry head=' + head +
+                  ' kind=' + kind + ' attempt=' + next + ' -->';
+            const summary = cooling
+              ? 'All approved OpenCode routes are cooling down. Recovery for exact HEAD ' +
+                head + ' is deferred until ' + new Date(notBefore * 1000).toISOString() +
+                ' without sleeping on a runner or exhausting the retry budget.'
+              : exhausted
+                ? 'Retry budget exhausted for ' + kind + ' on exact HEAD ' + head + '.'
+                : 'Transient ' + kind + ' failure; bounded retry ' + next + '/3 is scheduled for exact HEAD ' + head + '.';
+            const body = controllerStateBody(stateMarker, summary);
             // Bounded scan (#254): ten pages cover any realistic controller
             // history; a truncated window only drops old history, which the
             // prune loop below removes once visible. `listComments` is
@@ -2767,7 +2799,7 @@ jobs:
               comments.push(...data);
             }
             const controller = comments
-              .filter(comment => String(comment.body || '').includes(policy.CONTROLLER_STATE_MARKER))
+              .filter(comment => String(comment.body || '').includes(controllerMarker))
               .sort((a, b) => Number(a.id) - Number(b.id));
             const latest = controller.at(-1);
             if (latest) {
