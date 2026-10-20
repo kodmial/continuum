@@ -1163,6 +1163,36 @@ jobs:
           echo "improve_file=$CONTINUUM_PR_AGENT_WORKTREE/pr-agent-outputs/continuum.jsonl" >> "$GITHUB_OUTPUT"
           echo "Upstream review completed for $REVIEWED_SHA; raw review evidence remains runner-local."
 
+      # The short semantic probe is NOT evidence that an actual PR-Agent
+      # review can complete. Quarantine the selected route when upstream
+      # review execution fails, before the bounded retry selects its model.
+      # The shared action consumes a same-run qualified selection receipt:
+      # no invented model, no cross-run poisoning, no unreviewed merge.
+      - name: Record failed real PR-Agent execution for route failover
+        if: >-
+          always() &&
+          steps.stack.outputs.enabled == 'true' &&
+          steps.admit.outputs.admitted == 'true' &&
+          steps.model_route.outcome == 'success' &&
+          steps.pragent.outcome == 'failure' &&
+          steps.model_route.outputs.model
+        uses: kodmial/continuum/.github/actions/model-route@main
+        with:
+          operation: fail
+          models: ${{ vars.OPENCODE_MODELS }}
+          legacy-model: ${{ vars.OPENCODE_MODEL }}
+          explicit-pin: ${{ inputs.opencode_model }}
+          selected-model: ${{ steps.model_route.outputs.model }}
+          task-class: review
+          profile: pr-review
+          state-repository: ${{ env.CONTINUUM_PR_AGENT_TARGET_REPOSITORY }}
+          state-token: ${{ env.CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED == 'true' && secrets.TAP_PAT || (env.CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED != 'true' && github.token || '') }}
+          runtime-version: ${{ steps.install_pragent.outputs.runtime-version }}
+          strategy: ${{ vars.OPENCODE_MODEL_STRATEGY || 'sticky-failover' }}
+          probe-ttl: ${{ vars.OPENCODE_PROBE_TTL || '3600' }}
+          cooldown: ${{ vars.OPENCODE_MODEL_COOLDOWN || '900' }}
+          timeout: ${{ vars.OPENCODE_PROBE_TIMEOUT || '90' }}
+
       - name: Revalidate the PR head and native review output after review
         if: steps.stack.outputs.enabled == 'true' && steps.admit.outputs.admitted == 'true'
         id: result
