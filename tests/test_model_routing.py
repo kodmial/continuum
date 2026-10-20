@@ -210,6 +210,82 @@ class CompletionTicketTests(unittest.TestCase):
             route.execution_ticket({"GITHUB_RUN_ID": "not-numeric", "GITHUB_RUN_ATTEMPT": "1"})
 
 
+class LiveFailureReceiptTests(unittest.TestCase):
+    def setUp(self):
+        self.ticket = route.execution_ticket(
+            {"GITHUB_RUN_ID": "901", "GITHUB_RUN_ATTEMPT": "2"})
+        self.other = route.execution_ticket(
+            {"GITHUB_RUN_ID": "902", "GITHUB_RUN_ATTEMPT": "1"})
+        self.pool = route.Configuration.parse(f"{A},{B}", ttl="60",
+                                               cooldown="900")
+
+    def qualified(self):
+        state = {"fingerprint": "f", "cooldowns": {},
+                 "last_successful_real_execution": {"model": A, "at": 990}}
+        return route.reserve_completion(state, self.ticket, A, 1000, 990)
+
+    def test_real_failure_quarantines_and_next_retry_selects_alternative(self):
+        state = route.attest_execution_failure(
+            self.qualified(), self.ticket, A, 1100, "f", 60, 900)
+        self.assertEqual(state["cooldowns"][A], 2000)
+        self.assertEqual(state["last_failed_real_execution"]["reason"],
+                         "review_execution_failed")
+        self.assertNotIn(self.ticket, state["qualified_selections"])
+        self.assertEqual(route.route_order(self.pool, state, 1101), (B,))
+        self.assertEqual(route.route_order(self.pool, state, 2000), (A, B))
+        self.assertEqual(state["last_successful_real_execution"]["model"], A)
+
+    def test_failed_receipt_is_run_bound_and_one_time_only(self):
+        initial = self.qualified()
+        for ticket, model in ((self.other, A), (self.ticket, B)):
+            with self.assertRaisesRegex(route.RouteError, "No qualified selection"):
+                route.attest_execution_failure(
+                    initial, ticket, model, 1050, "f", 60, 900)
+        recorded = route.attest_execution_failure(
+            initial, self.ticket, A, 1050, "f", 60, 900)
+        with self.assertRaisesRegex(route.RouteError, "No qualified selection"):
+            route.attest_execution_failure(
+                recorded, self.ticket, A, 1051, "f", 60, 900)
+        with self.assertRaisesRegex(route.RouteError, "No qualified selection"):
+            route.attest_completion(recorded, self.ticket, A, 1051, "f", 60, "901/2")
+
+    def test_failure_rejects_expired_and_unqualified_receipts(self):
+        initial = self.qualified()
+        with self.assertRaisesRegex(route.RouteError, "Stale model state"):
+            route.attest_execution_failure(initial, self.ticket, A, 1050,
+                                           "different", 60, 900)
+        with self.assertRaisesRegex(route.RouteError, "proof expired"):
+            route.attest_execution_failure(initial, self.ticket, A,
+                                           1000 + route.MAX_EXECUTION_SECONDS + 1,
+                                           "f", 60, 900)
+        expired = route.reserve_completion(
+            {"fingerprint": "f"}, self.ticket, A, 1100, 1000)
+        with self.assertRaisesRegex(route.RouteError, "proof expired"):
+            route.attest_execution_failure(expired, self.ticket, A, 1101,
+                                           "f", 60, 900)
+
+    def test_no_cooldown_shrink_when_concurrent_report_arrives(self):
+        initial = self.qualified()
+        initial["cooldowns"] = {A: 5000}
+        state = route.attest_execution_failure(
+            initial, self.ticket, A, 1050, "f", 60, 900)
+        self.assertEqual(state["cooldowns"][A], 5000)
+
+    def test_pinned_route_stays_blocked_instead_of_bypassing_cooldown(self):
+        state = route.attest_execution_failure(
+            self.qualified(), self.ticket, A, 1050, "f", 60, 900)
+        pinned = route.Configuration.parse(f"{A},{B}", explicit=A)
+        self.assertEqual(route.route_order(pinned, state, 1051), ())
+
+    def test_failed_attempt_does_not_erase_other_parallel_receipts(self):
+        state = self.qualified()
+        state = route.reserve_completion(state, self.other, B, 1001, 991)
+        state = route.attest_execution_failure(
+            state, self.ticket, A, 1050, "f", 60, 900)
+        self.assertIn(self.other, state["qualified_selections"])
+
+
+
 class GitRefStoreTests(unittest.TestCase):
     def test_first_write_creates_orphan_ref_not_main(self):
         store = route.GitRefStore("example/private", "fake-token")
