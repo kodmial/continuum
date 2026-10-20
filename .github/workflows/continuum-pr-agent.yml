@@ -1123,7 +1123,7 @@ jobs:
               echo "::endgroup::"
             fi
             # Only recognized client/provider errors may retire a model.
-            if grep -Eiq 'litellm[.]Timeout|APITimeoutError|Request timed out|timeout value=' "$review_log"; then
+            if grep -Eiq 'litellm[.]Timeout|APITimeoutError|Request timed out|timeout value=|Error code: 504|504 Gateway Timeout' "$review_log"; then
               echo "provider_failure=timeout" >> "$GITHUB_OUTPUT"
             elif grep -Eiq 'FreeUsageLimitError|litellm[.]RateLimitError|429 Too Many Requests' "$review_log"; then
               echo "provider_failure=quota_429" >> "$GITHUB_OUTPUT"
