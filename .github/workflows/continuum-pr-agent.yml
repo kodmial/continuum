@@ -2681,7 +2681,8 @@ jobs:
           steps.stack.outputs.enabled == 'true' &&
           steps.admit.outputs.admitted == 'true' &&
           failure() &&
-          (steps.install_pragent.outcome == 'failure' ||
+          (steps.model_route.outcome == 'failure' ||
+           steps.install_pragent.outcome == 'failure' ||
            steps.install_opencode.outcome == 'failure' ||
            steps.start_opencode.outcome == 'failure' ||
            steps.runtime.outcome == 'failure' ||
