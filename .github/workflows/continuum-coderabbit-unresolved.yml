@@ -301,20 +301,40 @@ jobs:
               return;
             }
 
-            // No CodeRabbit-specific model, OpenCode version, or git writer here.
-            // The existing coderabbit-fix engine handles this exact batch.
-            await github.rest.actions.createWorkflowDispatch({
-              owner, repo,
-              workflow_id: 'continuum-opencode.yml',
+            // The optional batch input is an additive consumer API. An
+            // already-installed caller may predate it: route each distinct
+            // source review to the SAME canonical OpenCode executor until
+            // the next installer upgrade. Never invoke an independent model.
+            const caller = (await github.rest.repos.getContent({
+              owner, repo, path: '.github/workflows/continuum-opencode.yml',
               ref: context.payload.repository.default_branch,
-              inputs: {
+            })).data;
+            if (!caller || typeof caller.content !== 'string') {
+              throw new Error('Cannot inspect consumer OpenCode caller for batch compatibility.');
+            }
+            const callerSource = Buffer.from(caller.content.replace(/\\n/g, ''), 'base64').toString('utf8');
+            const supportsBatch = /^\\s+unresolved_items_json:\\s*$/m.test(callerSource);
+            const distinctReviews = [...new Set(items.map(item => item.review_id))];
+            for (const reviewId of (supportsBatch ? [items[0].review_id] : distinctReviews)) {
+              const inputs = {
                 mode: 'coderabbit-fix',
                 pr_number: String(pullNumber),
                 head_ref: headRef,
-                review_id: String(items[0].review_id),
-                unresolved_items_json: batch,
-              },
-            });
+                review_id: String(reviewId),
+              };
+              if (supportsBatch) inputs.unresolved_items_json = batch;
+              await github.rest.actions.createWorkflowDispatch({
+                owner, repo,
+                workflow_id: 'continuum-opencode.yml',
+                ref: context.payload.repository.default_branch,
+                inputs,
+              });
+            }
+            if (!supportsBatch) {
+              core.warning(
+                'Consumer OpenCode caller lacks batch input: used one canonical repair per distinct review. Run the Continuum installer to enable efficient batching.'
+              );
+            }
             await github.rest.issues.createComment({
               owner, repo, issue_number: pullNumber,
               body: [
