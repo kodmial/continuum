@@ -106,7 +106,15 @@ const core = {
 };
 const context = {repo:{owner:'kodmial', repo:'nanodictate'},
  payload:{pull_request:{number:226}}};
-const github = {rest:{
+const github = {
+ graphql: async () => ({repository:{pullRequest:{reviewThreads:{
+  nodes:[
+   {isResolved:false,comments:{nodes:[{databaseId:100,author:{login:'coderabbitai[bot]'}}]}},
+   {isResolved:false,comments:{nodes:[{databaseId:200,author:{login:'coderabbitai[bot]'}}]}}
+  ],
+  pageInfo:{hasNextPage:false,endCursor:null}
+ }}}}),
+ rest:{
  pulls:{
    get: async () => ({data:{review_comments:comments.length,
      head:{sha:head, ref:'opencode/task', repo:{full_name:'kodmial/nanodictate'}}}}),
