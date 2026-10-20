@@ -604,6 +604,14 @@ ENTRIES = (
     },
     {
         "workflow": "continuum-pr-agent-repair.yml",
+        "step": "Retire verified failed OpenCode repair route",
+        "capability": DELEGATED_CONDITIONAL,
+        "same_repo": False,
+        "reason": "Verified external OpenCode repair provider failure must retire its durable qualified model route; delegated cross-repository model-state writes require PAT while local runs use github.token.",
+        "evidence": ("state-token: ${{ env.CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED == 'true' && secrets.TAP_PAT || (env.CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED != 'true' && github.token || '') }}",),
+    },
+    {
+        "workflow": "continuum-pr-agent-repair.yml",
         "step": "Persist PR-Agent no-progress controller state",
         "capability": CONTROLLER_STATE,
         "same_repo": True,
