@@ -1299,6 +1299,8 @@ jobs:
           HEAD_SHA: ${{ inputs.head_sha }}
           RETRY_ATTEMPT: ${{ inputs.retry_attempt || '0' }}
           POLICY_SCRIPT: ${{ steps.policy.outputs.policy_script }}
+          ROUTE_NOT_BEFORE: ${{ env.CONTINUUM_MODEL_NOT_BEFORE_EPOCH }}
+          MODEL_ROUTE_FAILED: ${{ steps.model_route.outcome == 'failure' && 'true' || 'false' }}
         with:
           github-token: ${{ secrets.TAP_PAT }}
           script: |
@@ -1306,16 +1308,29 @@ jobs:
             const prNumber = Number(process.env.PR_NUMBER);
             const head = String(process.env.HEAD_SHA || '').toLowerCase();
             const attempt = Number(process.env.RETRY_ATTEMPT || '0');
-            const exhausted = Number.isInteger(attempt) && attempt >= 2;
+            const notBefore = Number(process.env.ROUTE_NOT_BEFORE || '0');
+            // A model route that is still in durable cooldown must be retried
+            // by the scheduler only after eligibility, not immediately.
+            const cooling = process.env.MODEL_ROUTE_FAILED === 'true' &&
+              Number.isSafeInteger(notBefore) &&
+              notBefore > Math.floor(Date.now() / 1000);
+            const exhausted = !cooling && Number.isInteger(attempt) && attempt >= 2;
             const next = Number.isInteger(attempt) ? attempt + 1 : 1;
-            const stateMarker = exhausted
-              ? '<!-- continuum-pr-agent-retry-exhausted head=' + head +
-                ' kind=repair attempts=' + next + ' -->'
-              : '<!-- continuum-pr-agent-retry head=' + head +
-                ' kind=repair attempt=' + next + ' -->';
-            const summary = exhausted
-              ? 'Retry budget exhausted for repair on exact HEAD ' + head + '.'
-              : 'Transient repair failure; bounded retry ' + next + '/3 is scheduled for exact HEAD ' + head + '.';
+            const stateMarker = cooling
+              ? '<!-- continuum-lifecycle-retry head=' + head +
+                ' kind=repair attempt=' + attempt + ' not-before=' + notBefore + ' -->'
+              : exhausted
+                ? '<!-- continuum-pr-agent-retry-exhausted head=' + head +
+                  ' kind=repair attempts=' + next + ' -->'
+                : '<!-- continuum-pr-agent-retry head=' + head +
+                  ' kind=repair attempt=' + next + ' -->';
+            const summary = cooling
+              ? 'Approved OpenCode repair models are cooling down. Recovery for exact HEAD ' +
+                head + ' is deferred until ' + new Date(notBefore * 1000).toISOString() +
+                ' without exhausting retries or holding a runner.'
+              : exhausted
+                ? 'Retry budget exhausted for repair on exact HEAD ' + head + '.'
+                : 'Transient repair failure; bounded retry ' + next + '/3 is scheduled for exact HEAD ' + head + '.';
             const body = policy.controllerStateBody(stateMarker, summary);
             // Bounded scan (#254): controller markers are written by recent
             // activity, so the newest window preserves live state.
