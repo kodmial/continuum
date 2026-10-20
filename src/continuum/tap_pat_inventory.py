@@ -449,28 +449,20 @@ ENTRIES = (
         "evidence": ("TAP_PAT: ${{ secrets.TAP_PAT }}", "patClient().rest.actions.createWorkflowDispatch", "READ_GITHUB_TOKEN"),
     },
     {
+        "workflow": "continuum-coderabbit-unresolved.yml",
+        "step": "Dispatch one batched repair to canonical OpenCode",
+        "capability": DISPATCH,
+        "same_repo": True,
+        "reason": "The batched dispatcher must start the canonical OpenCode executor through an event that fans out; a GITHUB_TOKEN-authored dispatch does not reliably start the downstream workflow, so the dispatch keeps PAT even though the caller already grants actions:write.",
+        "evidence": ("github-token: ${{ secrets.TAP_PAT }}", "workflow_id: 'continuum-opencode.yml'"),
+    },
+    {
         "workflow": "continuum-coderabbit-retry.yml",
         "step": "Reconcile global CodeRabbit review queue",
         "capability": SPLIT_ACTOR,
         "same_repo": True,
         "reason": "Split actor: queue labels use github-actions[bot] while only the @coderabbitai command comment keeps COMMENT_PAT because the integration rejects the triggering comment from GITHUB_TOKEN.",
         "evidence": ("COMMENT_PAT: ${{ secrets.TAP_PAT }}",),
-    },
-    {
-        "workflow": "continuum-coderabbit-unresolved.yml",
-        "step": "Checkout current PR branch",
-        "capability": PUSH_FANOUT,
-        "same_repo": True,
-        "reason": "Fix push must trigger CI and review-status recomputation; a token push would suppress those workflows.",
-        "evidence": ("token: ${{ secrets.TAP_PAT }}",),
-    },
-    {
-        "workflow": "continuum-coderabbit-unresolved.yml",
-        "step": "Fix all unresolved findings in one OpenCode run",
-        "capability": PUSH_FANOUT,
-        "same_repo": True,
-        "reason": "Unresolved-finding repairs push to the PR branch and publish review-thread follow-ups that must retrigger CI and CodeRabbit verification.",
-        "evidence": ("GH_TOKEN: ${{ secrets.TAP_PAT }}",),
     },
     # -- automation / router / bootstrap / render / docker ---------------
     {

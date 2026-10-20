@@ -158,14 +158,6 @@ COMMIT_SITES = (
         "scope": "CI/repair commits (blocking workflow repair)",
     },
     {
-        "workflow": "continuum-coderabbit-unresolved.yml",
-        "step": "Fix all unresolved findings in one OpenCode run",
-        "component": "coderabbit-unresolved",
-        "subject": "address unresolved CodeRabbit findings",
-        "identity": "git-config",
-        "scope": "CI/repair commits (CodeRabbit findings)",
-    },
-    {
         "workflow": "continuum-pr-agent-repair.yml",
         "step": "Run one bounded OpenCode repair pass over every current item",
         "component": "pr-agent-repair",
@@ -230,7 +222,7 @@ RESIDUAL_PAT_OPS = (
         "app_candidate": "Attribute task-branch publication to a Continuum GitHub App instead of the owner PAT.",
     },
     {
-        "operation": "continuum-coderabbit-unresolved fix push",
+        "operation": "continuum-opencode CodeRabbit fix push",
         "why_pat": "Fix pushes must trigger CI and review-status recomputation; token pushes would suppress those workflows.",
         "app_candidate": "Attribute CodeRabbit fix pushes to a Continuum GitHub App.",
     },

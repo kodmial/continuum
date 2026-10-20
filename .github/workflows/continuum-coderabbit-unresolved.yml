@@ -293,9 +293,29 @@ jobs:
               .update(head + '\n' + batch).digest('hex');
             const marker =
               `<!-- continuum-coderabbit-batch head=${head} digest=${batchKey} -->`;
-            const priorComments = await github.paginate(github.rest.issues.listComments, {
-              owner, repo, issue_number: pullNumber, per_page: 100,
-            });
+            // Bounded newest-first dedupe scan (#254): the marker is written
+            // immediately after a dispatch, so a bounded newest window holds
+            // any duplicate event's marker without paginating full history.
+            // listComments lists oldest-first and ignores sort/direction, so
+            // anchor at the newest page via the issue-comment total.
+            const totalIssueComments = Number(live.comments || 0);
+            const lastIssuePage = Math.max(
+              1,
+              Math.ceil((Number.isFinite(totalIssueComments) ? totalIssueComments : 0) / 100) || 1
+            );
+            const firstIssuePage = Math.max(1, lastIssuePage - 9);
+            const priorComments = [];
+            for (let page = lastIssuePage; page >= firstIssuePage; page -= 1) {
+              const { data } = await github.rest.issues.listComments({
+                owner,
+                repo,
+                issue_number: pullNumber,
+                per_page: 100,
+                page,
+              });
+              if (!Array.isArray(data) || data.length === 0) continue;
+              priorComments.push(...data);
+            }
             if (priorComments.some(comment => (comment.body || '').includes(marker))) {
               core.notice('CodeRabbit batch already dispatched for this PR/HEAD/findings; duplicate event ignored.');
               return;
