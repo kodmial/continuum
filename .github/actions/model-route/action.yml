@@ -2,7 +2,7 @@ name: Continuum OpenCode route selector
 description: Resolve only trusted caller-approved models using verified OpenCode; record separately after real success
 inputs:
   operation:
-    description: select before work, record after successful real work, or verify a durable receipt
+    description: select before work, record after real success, fail after a verified provider error, or verify a durable receipt
     required: false
     default: select
   models:
@@ -18,7 +18,11 @@ inputs:
     required: false
     default: ''
   selected-model:
-    description: Exact model produced by select; required for record
+    description: Exact model produced by select; required for record or fail
+    required: false
+    default: ''
+  failure-reason:
+    description: Strict provider error class for fail (timeout, quota_429, upstream, unavailable)
     required: false
     default: ''
   expected-model:
@@ -99,6 +103,7 @@ runs:
         CONTINUUM_EXPECTED_MODEL: ${{ inputs.expected-model }}
         CONTINUUM_EXPECTED_RUN: ${{ inputs.expected-run }}
         CONTINUUM_EXPECTED_HEAD: ${{ inputs.expected-head }}
+        CONTINUUM_FAILURE_REASON: ${{ inputs.failure-reason }}
         CONTINUUM_MODEL_TASK_CLASS: ${{ inputs.task-class }}
         CONTINUUM_MODEL_PROFILE: ${{ inputs.profile }}
         CONTINUUM_MODEL_STATE_REPOSITORY: ${{ inputs.state-repository }}
@@ -112,5 +117,5 @@ runs:
         OPERATION: ${{ inputs.operation }}
       run: |
         set -euo pipefail
-        case "$OPERATION" in select|record|verify) ;; *) echo '::error::Invalid model route operation'; exit 2;; esac
+        case "$OPERATION" in select|record|fail|verify) ;; *) echo '::error::Invalid model route operation'; exit 2;; esac
         python3 "$GITHUB_ACTION_PATH/../../../src/continuum/model_routing.py" "$OPERATION"

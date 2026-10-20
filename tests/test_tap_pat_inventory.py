@@ -82,8 +82,9 @@ class CoverageTests(unittest.TestCase):
         # Pinned count guards against silent scope drift in either direction:
         # new PAT sites must extend the inventory, removals must shrink it.
         # Work Lock #66 adds seven scoped state-ref bindings (documented
-        # individually in tap_pat_inventory; no unchecked credential drift).
-        self.assertEqual(len(bindings), 120)
+        # individually in tap_pat_inventory; the real-provider failure receipt
+        # adds one delegated-aware PAT binding, also inventoried).
+        self.assertEqual(len(bindings), 121)
         gaps = inventory.coverage_gaps(WORKFLOWS_DIR)
         self.assertEqual(gaps, [], f"uninventoried TAP_PAT bindings: {gaps}")
 

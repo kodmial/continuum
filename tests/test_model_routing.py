@@ -210,6 +210,58 @@ class CompletionTicketTests(unittest.TestCase):
             route.execution_ticket({"GITHUB_RUN_ID": "not-numeric", "GITHUB_RUN_ATTEMPT": "1"})
 
 
+class RealExecutionFailureTests(unittest.TestCase):
+    def _selection(self, *, ticket="run", model=A, at=1000):
+        return route.reserve_completion({"fingerprint": "f"}, ticket, model, at, at)
+
+    def test_provider_timeout_consumes_receipt_and_routes_to_next_model(self):
+        state = self._selection()
+        state["last_successful_real_execution"] = {"model": A, "at": 900}
+        updated = route.attest_retryable_failure(
+            state, "run", A, 1200, "f", "timeout", 900)
+        self.assertEqual(updated["qualified_selections"], {})
+        self.assertEqual(updated["cooldowns"][A], 4800)
+        self.assertEqual(route.route_order(
+            route.Configuration.parse(f"{A},{B}"), updated, 1201), (B,))
+        self.assertEqual(updated["last_successful_real_execution"]["model"], A)
+
+    def test_invalid_reason_and_wrong_run_cannot_retire_model(self):
+        state = self._selection()
+        for ticket, model, reason in (
+            ("other", A, "timeout"), ("run", B, "timeout"),
+            ("run", A, "code_failure"), ("run", A, "review_quality")):
+            with self.subTest(ticket=ticket, model=model, reason=reason):
+                with self.assertRaises(route.RouteError):
+                    route.attest_retryable_failure(
+                        state.copy(), ticket, model, 1200, "f", reason, 900)
+        self.assertNotIn("cooldowns", state)
+
+    def test_expired_selection_replay_and_stale_pool_are_rejected(self):
+        state = self._selection()
+        for now, fingerprint in (
+            (1000 + route.MAX_EXECUTION_SECONDS + 1, "f"),
+            (1100, "changed")):
+            with self.assertRaises(route.RouteError):
+                route.attest_retryable_failure(
+                    state.copy(), "run", A, now, fingerprint, "timeout", 900)
+        updated = route.attest_retryable_failure(
+            state, "run", A, 1100, "f", "timeout", 900)
+        with self.assertRaises(route.RouteError):
+            route.attest_retryable_failure(
+                updated, "run", A, 1101, "f", "timeout", 900)
+
+    def test_live_failure_does_not_cancel_other_inflight_execution(self):
+        state = self._selection()
+        state = route.reserve_completion(state, "other", B, 1001, 1001)
+        updated = route.attest_retryable_failure(
+            state, "run", A, 1030, "f", "upstream", 900)
+        self.assertEqual(updated["cooldowns"][A], 1930)
+        self.assertIn("other", updated["qualified_selections"])
+        self.assertNotIn("run", updated["qualified_selections"])
+        self.assertEqual(route.route_order(
+            route.Configuration.parse(f"{A},{B}"), updated, 1031), (B,))
+
+
 class GitRefStoreTests(unittest.TestCase):
     def test_first_write_creates_orphan_ref_not_main(self):
         store = route.GitRefStore("example/private", "fake-token")
