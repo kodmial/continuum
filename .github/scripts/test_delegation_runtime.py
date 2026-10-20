@@ -196,6 +196,56 @@ class DelegationRuntimeTests(unittest.TestCase):
                 child_id="beta",
             )
 
+    def test_classify_response_reads_status_and_retry_headers(self):
+        raw = (
+            "HTTP/2.0 403 Forbidden\n"
+            "X-RateLimit-Remaining: 0\r\n"
+            "Retry-After: 5\r\n\r\n"
+            '{"message":"rate limit"}\n'
+        )
+        self.assertEqual(runtime.classify_response(raw), ("rate_limited", 5.0))
+        self.assertEqual(
+            runtime.classify_response("gh: Bad credentials (HTTP 401)")[0], "auth"
+        )
+
+    def test_classify_response_cli_emits_verdict_and_delay(self):
+        path = write(self.tmp, "raw.txt", "gh: HTTP 503 service unavailable\n")
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            rc = runtime.main(["classify-response", "--raw-file", path])
+        self.assertEqual(rc, 0)
+        self.assertIn("verdict=transient", output.getvalue())
+        self.assertIn("retry-delay=0", output.getvalue())
+
+    def test_inventory_cache_cli_round_trip(self):
+        cache = os.path.join(self.tmp, "inventory.json")
+        plan = write(self.tmp, "plan.json",
+                     json.dumps([{"id": "alpha", "repository": "owner/child"}]))
+        rc = runtime.main([
+            "inventory-write", "--cache", cache, "--parent", "owner/parent",
+            "--allowlist-json", '["alpha"]', "--plan-file", plan, "--now", "1000",
+        ])
+        self.assertEqual(rc, 0)
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            rc = runtime.main([
+                "inventory-read", "--cache", cache, "--parent", "owner/parent",
+                "--allowlist-json", '["alpha"]', "--now", "1000",
+            ])
+        self.assertEqual(rc, 0)
+        self.assertEqual(
+            json.loads(output.getvalue()),
+            [{"id": "alpha", "repository": "owner/child"}],
+        )
+        # Scope mismatch refuses to guess.
+        self.assertEqual(
+            runtime.main([
+                "inventory-read", "--cache", cache, "--parent", "owner/other",
+                "--allowlist-json", '["alpha"]', "--now", "1000",
+            ]),
+            1,
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -59,7 +59,8 @@ else:
                    FIXTURE=str(fixture), CONTINUUM_ENGINE_ROOT=str(ROOT),
                    GITHUB_REPOSITORY='owner/parent', RUNNER_TEMP=str(self.root),
                    PARENT_CONFIG=str(self.root / '.continuum.yml'),
-                   PARENT_ROLE='', PARENT_CHILDREN='', CHILD_REPOSITORIES='')
+                   PARENT_ROLE='', PARENT_CHILDREN='', CHILD_REPOSITORIES='',
+                   CONTINUUM_DISCOVERY_BASE_DELAY='0')
         env.update(extra_env or {})
         return subprocess.run(['bash', str(ROOT / '.github/scripts/delegation_repository.sh'), *args],
                               env=env, cwd=self.root, text=True, capture_output=True)
@@ -252,3 +253,82 @@ else:
         )
         self.assertEqual(outage.returncode, 4, outage.stderr)
         self.assertNotIn('owner/child', outage.stdout + outage.stderr)
+
+    def test_unavailable_discovery_never_emits_an_empty_success(self):
+        # kodmial/continuum#326: an API outage must never look like a
+        # successful empty child inventory. The plan fails closed (exit 4)
+        # with no payload so the scheduler reports a distinct degraded state
+        # instead of fabricating `[]`.
+        result = self.run_resolver('plan', extra_env={'GH_FAIL': '/user/repos'})
+        self.assertEqual(result.returncode, 4, result.stderr)
+        self.assertEqual(result.stdout.strip(), '')
+        self.assertNotIn('[]', result.stdout)
+
+    def test_rate_limited_discovery_retries_are_bounded(self):
+        # A persistent rate limit retries a bounded number of times (never a
+        # busy loop) and then fails closed. Default budget is 2 attempts.
+        calls_file = self.root / 'calls.log'
+        calls_file.write_text('')
+        result = self.run_resolver(
+            'plan',
+            extra_env={'GH_FAIL': '/user/repos', 'FIXTURE_CALLS': str(calls_file)},
+        )
+        self.assertEqual(result.returncode, 4, result.stderr)
+        endpoints = calls_file.read_text().split()
+        user_repo_calls = [e for e in endpoints if e.startswith('/user/repos')]
+        self.assertEqual(len(user_repo_calls), 2, endpoints)
+
+    def test_discovery_fallback_backoff_is_exponential(self):
+        sleep_log = self.root / 'sleep.log'
+        sleep_log.write_text('')
+        sleep = self.root / 'sleep'
+        sleep.write_text(
+            '#!/usr/bin/env bash\n'
+            'printf "%s\\n" "$1" >> "$SLEEP_LOG"\n'
+        )
+        sleep.chmod(0o755)
+        result = self.run_resolver(
+            'plan',
+            extra_env={
+                'GH_FAIL': '/user/repos',
+                'CONTINUUM_DISCOVERY_MAX_ATTEMPTS': '3',
+                'CONTINUUM_DISCOVERY_BASE_DELAY': '2',
+                'SLEEP_LOG': str(sleep_log),
+            },
+        )
+        self.assertEqual(result.returncode, 4, result.stderr)
+        self.assertEqual(sleep_log.read_text().split(), ['2', '4'])
+
+    def test_trusted_inventory_is_reused_within_ttl_without_rescan(self):
+        cache = self.root / 'inventory.json'
+        calls_file = self.root / 'cache-calls.log'
+        calls_file.write_text('')
+        first = self.run_resolver(
+            'plan',
+            extra_env={
+                'CONTINUUM_DELEGATION_CACHE': str(cache),
+                'FIXTURE_CALLS': str(calls_file),
+            },
+        )
+        self.assertEqual(first.returncode, 0, first.stderr)
+        self.assertEqual(
+            json.loads(first.stdout),
+            [{'id': 'alpha', 'repository': 'owner/child'}],
+        )
+        self.assertTrue(cache.exists())
+        first_calls = calls_file.read_text().split()
+        # Even with discovery now failing, a trusted unexpired inventory is
+        # reused (authenticated + scoped + TTL-limited) with no second rescan.
+        second = self.run_resolver(
+            'plan',
+            extra_env={
+                'CONTINUUM_DELEGATION_CACHE': str(cache),
+                'GH_FAIL': '/user/repos',
+                'FIXTURE_CALLS': str(calls_file),
+            },
+        )
+        self.assertEqual(second.returncode, 0, second.stderr)
+        self.assertEqual(json.loads(second.stdout), json.loads(first.stdout))
+        second_calls = calls_file.read_text().split()
+        self.assertNotIn('/user/repos', second_calls[len(first_calls):])
+

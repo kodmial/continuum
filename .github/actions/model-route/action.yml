@@ -2,7 +2,7 @@ name: Continuum OpenCode route selector
 description: Resolve only trusted caller-approved models using verified OpenCode; record separately after real success
 inputs:
   operation:
-    description: select before work, record after real success, fail after a verified provider error
+    description: select before work, record after real success, fail after a verified provider error, or verify a durable receipt
     required: false
     default: select
   models:
@@ -23,6 +23,18 @@ inputs:
     default: ''
   failure-reason:
     description: Strict provider error class for fail (timeout, quota_429, upstream, unavailable)
+    required: false
+    default: ''
+  expected-model:
+    description: Trusted handoff model a verify must match; empty skips this binding
+    required: false
+    default: ''
+  expected-run:
+    description: Trusted originating run a verify must match; empty skips this binding
+    required: false
+    default: ''
+  expected-head:
+    description: Trusted exact HEAD a verify must match; empty skips this binding
     required: false
     default: ''
   task-class:
@@ -68,6 +80,15 @@ outputs:
   model:
     description: Frozen effective model route
     value: ${{ steps.route.outputs.model }}
+  verified:
+    description: 'true only for a verified immutable attestation receipt'
+    value: ${{ steps.route.outputs.verified }}
+  attested-run:
+    description: Opaque originating run identity of a verified receipt
+    value: ${{ steps.route.outputs.attested_run }}
+  attested-head:
+    description: Exact HEAD recorded on a verified receipt (may be empty)
+    value: ${{ steps.route.outputs.attested_head }}
 runs:
   using: composite
   steps:
@@ -79,6 +100,9 @@ runs:
         OPENCODE_MODEL: ${{ inputs.legacy-model }}
         CONTINUUM_EXPLICIT_MODEL: ${{ inputs.explicit-pin }}
         CONTINUUM_SELECTED_MODEL: ${{ inputs.selected-model }}
+        CONTINUUM_EXPECTED_MODEL: ${{ inputs.expected-model }}
+        CONTINUUM_EXPECTED_RUN: ${{ inputs.expected-run }}
+        CONTINUUM_EXPECTED_HEAD: ${{ inputs.expected-head }}
         CONTINUUM_FAILURE_REASON: ${{ inputs.failure-reason }}
         CONTINUUM_MODEL_TASK_CLASS: ${{ inputs.task-class }}
         CONTINUUM_MODEL_PROFILE: ${{ inputs.profile }}
@@ -93,5 +117,5 @@ runs:
         OPERATION: ${{ inputs.operation }}
       run: |
         set -euo pipefail
-        case "$OPERATION" in select|record|fail) ;; *) echo '::error::Invalid model route operation'; exit 2;; esac
+        case "$OPERATION" in select|record|fail|verify) ;; *) echo '::error::Invalid model route operation'; exit 2;; esac
         python3 "$GITHUB_ACTION_PATH/../../../src/continuum/model_routing.py" "$OPERATION"
