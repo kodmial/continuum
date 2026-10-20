@@ -101,7 +101,7 @@ class OpenCodeUpstreamRecoveryTests(unittest.TestCase):
         for mode in ("issue", "qualification", "coderabbit-fix", "resolve-conflict", "ci-fix"):
             self.assertRegex(
                 source,
-                r'continuum_infra_evacuate "[^"\\n]+" "[^"\\n]+" "' +
+                r'continuum_infra_evacuate "[^"]+" "[^"]+" "' +
                 re.escape(mode) + r'"',
             )
         self.assertEqual(source.count('[[ "$OPENCODE_RUN_RC" -eq 76 ]] || grep'), 5)
