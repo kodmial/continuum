@@ -19,6 +19,11 @@ on:
         description: Source CodeRabbit review id
         required: false
         type: string
+      unresolved_items_json:
+        description: Optional provider-owned batch of current unresolved CodeRabbit findings
+        required: false
+        type: string
+        default: ''
       run_id:
         description: Source failed workflow run id
         required: false
