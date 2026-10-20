@@ -624,45 +624,6 @@ jobs:
           opencode --version
           pr-agent --version
 
-      - name: Qualify trusted review-model route
-        id: model_route
-        if: steps.stack.outputs.enabled == 'true' && steps.admit.outputs.admitted == 'true'
-        uses: kodmial/continuum/.github/actions/model-route@main
-        with:
-          models: ${{ vars.OPENCODE_MODELS }}
-          legacy-model: ${{ vars.OPENCODE_MODEL }}
-          explicit-pin: ${{ inputs.opencode_model }}
-          task-class: review
-          profile: pr-review
-          state-repository: ${{ env.CONTINUUM_PR_AGENT_TARGET_REPOSITORY }}
-          state-token: ${{ env.CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED == 'true' && secrets.TAP_PAT || (env.CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED != 'true' && github.token || '') }}
-          runtime-version: ${{ steps.install_pragent.outputs.runtime-version }}
-          strategy: ${{ vars.OPENCODE_MODEL_STRATEGY || 'sticky-failover' }}
-          probe-ttl: ${{ vars.OPENCODE_PROBE_TTL || '3600' }}
-          cooldown: ${{ vars.OPENCODE_MODEL_COOLDOWN || '900' }}
-          timeout: ${{ vars.OPENCODE_PROBE_TIMEOUT || '90' }}
-
-      - name: Start opencode serve on loopback
-        id: start_opencode
-        if: steps.stack.outputs.enabled == 'true' && steps.admit.outputs.admitted == 'true'
-        env:
-          OPENCODE_MODEL: ${{ steps.model_route.outputs.model }}
-          SERVER_PORT: ${{ steps.stack.outputs.server_port }}
-        run: |
-          set -euo pipefail
-          (setsid nohup opencode serve --hostname 127.0.0.1 --port "$SERVER_PORT" \
-            > "$RUNNER_TEMP/opencode-serve.log" 2>&1 &)
-          for attempt in $(seq 1 30); do
-            if curl -fsS "http://127.0.0.1:${SERVER_PORT}/global/health" >/dev/null 2>&1; then
-              echo "opencode serve is up on 127.0.0.1:${SERVER_PORT}."
-              exit 0
-            fi
-            sleep 2
-          done
-          echo "::error::opencode serve did not become ready."
-          cat "$RUNNER_TEMP/opencode-serve.log" || true
-          exit 1
-
       - name: Resolve the Continuum-owned PR-Agent runtime bundle
         if: steps.stack.outputs.enabled == 'true' && steps.admit.outputs.admitted == 'true'
         id: runtime
@@ -746,6 +707,45 @@ jobs:
           echo "bridge_script=$BRIDGE_SCRIPT" >> "$GITHUB_OUTPUT"
           echo "policy_script=$POLICY_SCRIPT" >> "$GITHUB_OUTPUT"
           echo "fallback_pythonpath=$RUNTIME_ROOT/src" >> "$GITHUB_OUTPUT"
+
+      - name: Qualify trusted review-model route
+        id: model_route
+        if: steps.stack.outputs.enabled == 'true' && steps.admit.outputs.admitted == 'true'
+        uses: kodmial/continuum/.github/actions/model-route@main
+        with:
+          models: ${{ vars.OPENCODE_MODELS }}
+          legacy-model: ${{ vars.OPENCODE_MODEL }}
+          explicit-pin: ${{ inputs.opencode_model }}
+          task-class: review
+          profile: pr-review
+          state-repository: ${{ env.CONTINUUM_PR_AGENT_TARGET_REPOSITORY }}
+          state-token: ${{ env.CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED == 'true' && secrets.TAP_PAT || (env.CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED != 'true' && github.token || '') }}
+          runtime-version: ${{ steps.install_pragent.outputs.runtime-version }}
+          strategy: ${{ vars.OPENCODE_MODEL_STRATEGY || 'sticky-failover' }}
+          probe-ttl: ${{ vars.OPENCODE_PROBE_TTL || '3600' }}
+          cooldown: ${{ vars.OPENCODE_MODEL_COOLDOWN || '900' }}
+          timeout: ${{ vars.OPENCODE_PROBE_TIMEOUT || '90' }}
+
+      - name: Start opencode serve on loopback
+        id: start_opencode
+        if: steps.stack.outputs.enabled == 'true' && steps.admit.outputs.admitted == 'true'
+        env:
+          OPENCODE_MODEL: ${{ steps.model_route.outputs.model }}
+          SERVER_PORT: ${{ steps.stack.outputs.server_port }}
+        run: |
+          set -euo pipefail
+          (setsid nohup opencode serve --hostname 127.0.0.1 --port "$SERVER_PORT" \
+            > "$RUNNER_TEMP/opencode-serve.log" 2>&1 &)
+          for attempt in $(seq 1 30); do
+            if curl -fsS "http://127.0.0.1:${SERVER_PORT}/global/health" >/dev/null 2>&1; then
+              echo "opencode serve is up on 127.0.0.1:${SERVER_PORT}."
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "::error::opencode serve did not become ready."
+          cat "$RUNNER_TEMP/opencode-serve.log" || true
+          exit 1
 
       - name: Start the OpenAI-compatibility bridge on loopback
         id: start_bridge
@@ -2708,6 +2708,8 @@ jobs:
           RETRY_ATTEMPT: ${{ steps.stack.outputs.retry_attempt }}
           RECOVERY_KIND: ${{ steps.stack.outputs.recovery_kind }}
           POLICY_SCRIPT: ${{ steps.runtime.outputs.policy_script }}
+          ROUTE_NOT_BEFORE: ${{ env.CONTINUUM_MODEL_NOT_BEFORE_EPOCH }}
+          MODEL_ROUTE_FAILED: ${{ steps.model_route.outcome == 'failure' && 'true' || 'false' }}
         with:
           github-token: ${{ env.CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED == 'true' && secrets.TAP_PAT || (env.CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED != 'true' && github.token || '') }}
           script: |
@@ -2737,16 +2739,33 @@ jobs:
             }
             const kind = String(process.env.RECOVERY_KIND || 'review').toLowerCase();
             const attempt = Number(process.env.RETRY_ATTEMPT || '0');
-            const exhausted = Number.isInteger(attempt) && attempt >= 2;
+            const notBefore = Number(process.env.ROUTE_NOT_BEFORE || '0');
+            // The model selector publishes this only after confirming every
+            // trusted route has a future durable cooldown. A preflight that
+            // cannot possibly pick a model must NOT exhaust the old 3-try
+            // inline budget. The shared recovery controller understands this
+            // canonical not-before marker and wakes after the earliest expiry.
+            const cooling = process.env.MODEL_ROUTE_FAILED === 'true' &&
+              Number.isSafeInteger(notBefore) &&
+              notBefore > Math.floor(Date.now() / 1000);
+            const exhausted = !cooling && Number.isInteger(attempt) && attempt >= 2;
             const next = Number.isInteger(attempt) ? attempt + 1 : 1;
-            const stateMarker = exhausted
-              ? '<!-- continuum-pr-agent-retry-exhausted head=' + head +
-                ' kind=' + kind + ' attempts=' + next + ' -->'
-              : '<!-- continuum-pr-agent-retry head=' + head +
-                ' kind=' + kind + ' attempt=' + next + ' -->';
-            const summary = exhausted
-              ? 'Retry budget exhausted for ' + kind + ' on exact HEAD ' + head + '.'
-              : 'Transient ' + kind + ' failure; bounded retry ' + next + '/3 is scheduled for exact HEAD ' + head + '.';
+            const stateMarker = cooling
+              ? '<!-- continuum-lifecycle-retry head=' + head +
+                ' kind=' + kind + ' attempt=' + attempt +
+                ' not-before=' + notBefore + ' -->'
+              : exhausted
+                ? '<!-- continuum-pr-agent-retry-exhausted head=' + head +
+                  ' kind=' + kind + ' attempts=' + next + ' -->'
+                : '<!-- continuum-pr-agent-retry head=' + head +
+                  ' kind=' + kind + ' attempt=' + next + ' -->';
+            const summary = cooling
+              ? 'All approved OpenCode routes are cooling down. Recovery for exact HEAD ' +
+                head + ' is deferred until ' + new Date(notBefore * 1000).toISOString() +
+                ' without sleeping on a runner or exhausting the retry budget.'
+              : exhausted
+                ? 'Retry budget exhausted for ' + kind + ' on exact HEAD ' + head + '.'
+                : 'Transient ' + kind + ' failure; bounded retry ' + next + '/3 is scheduled for exact HEAD ' + head + '.';
             const body = policy.controllerStateBody(stateMarker, summary);
             // Bounded scan (#254): ten pages cover any realistic controller
             // history; a truncated window only drops old history, which the

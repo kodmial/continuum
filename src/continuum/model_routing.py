@@ -101,6 +101,31 @@ class Configuration:
         return hashlib.sha256(json.dumps(data, separators=(",", ":")).encode()).hexdigest()
 
 
+def publish_cooldown_not_before(config: Configuration, state: dict, now: int,
+                                env: dict | None = None) -> int | None:
+    """Publish the earliest viable route epoch for scheduled recovery.
+
+    Only a verified all-cooling route pool authorizes a hold; never infer one
+    from credentials, malformed state, or an arbitrary probe/runtime error.
+    GITHUB_ENV survives a failed composite action into subsequent job steps.
+    """
+    active = state.get("cooldowns")
+    if not isinstance(active, dict):
+        return None
+    try:
+        deadlines = [int(active.get(model, 0)) for model in config.models]
+    except (TypeError, ValueError):
+        return None
+    if not deadlines or any(value <= now for value in deadlines):
+        return None
+    not_before = min(deadlines)
+    target = (env if env is not None else os.environ).get("GITHUB_ENV", "")
+    if target:
+        with open(target, "a", encoding="utf-8") as output:
+            output.write(f"CONTINUUM_MODEL_NOT_BEFORE_EPOCH={not_before}\n")
+    return not_before
+
+
 def route_order(config: Configuration, state: dict, now: int) -> tuple[str, ...]:
     cooldowns = state.get("cooldowns") or {}
     allowed = [m for m in config.models if now >= int(cooldowns.get(m, 0))]
@@ -517,6 +542,7 @@ def run() -> int:
         state = {}
     order = route_order(config, state, now)
     if not order:
+        publish_cooldown_not_before(config, state, now)
         raise RouteError("All trusted routes are cooling down")
     errors = {}
     for model in order:
@@ -567,6 +593,10 @@ def run() -> int:
             store.update(key, pause)
             if config.pinned:
                 break
+    # Probes can cool every route within this selection attempt. Persist the
+    # actual next eligible epoch instead of immediately spending review retries.
+    latest_state, _, _ = store.read(key)
+    publish_cooldown_not_before(config, latest_state, int(time.time()))
     raise RouteError("No route qualified: " + "; ".join(errors.values()))
 
 
