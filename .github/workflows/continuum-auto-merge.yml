@@ -1622,6 +1622,7 @@ jobs:
               );
 
               let requested = 0;
+              let repairReconciliationDispatched = false;
               for (const thread of threads) {
                 if (!thread.commentId) continue;
 
@@ -1642,18 +1643,78 @@ jobs:
                 if (latestVerification) {
                   const verificationAt =
                     new Date(latestVerification.created_at || 0).getTime();
-                  const verdictAfter = comments.some(comment =>
-                    comment.in_reply_to_id === thread.commentId &&
-                    comment.user?.login?.startsWith('coderabbitai') &&
-                    new Date(comment.created_at || 0).getTime() > verificationAt &&
-                    /\b(?:RESOLVED|UNRESOLVED)\b/i.test(comment.body || '')
-                  );
-
-                  // A real verdict owns the next transition. Otherwise the
-                  // request is an in-flight lease only for a bounded interval;
-                  // after that interval recovery is allowed to re-ask the same
-                  // exact-HEAD question.
-                  if (verdictAfter) continue;
+                  // CodeRabbit often answers with "the finding remains
+                  // valid" rather than the literal word UNRESOLVED. Such a
+                  // reply completes verification, and the still-unresolved
+                  // GitHub thread must be forwarded to the canonical batcher.
+                  // Never keep asking the provider the same question.
+                  const latestAnswer = comments
+                    .filter(comment =>
+                      comment.in_reply_to_id === thread.commentId &&
+                      comment.user?.login?.startsWith('coderabbitai') &&
+                      new Date(comment.created_at || 0).getTime() > verificationAt &&
+                      !/Review rate limited|Review limit reached/i.test(comment.body || '')
+                    )
+                    .sort((a, b) => Number(b.id) - Number(a.id))[0] || null;
+                  if (latestAnswer) {
+                    if (!repairReconciliationDispatched &&
+                        !codeRabbitExplicitlyResolved(latestAnswer.body || '')) {
+                      // The event-driven CodeRabbit batcher normally handles
+                      // this reply. A scheduled reconciliation also wakes the
+                      // batcher when that event was lost or the old keyword
+                      // filter discarded the actual bot response.
+                      const answeredAt = String(latestAnswer.created_at || '');
+                      const laterBatches = await withReadFallback(client =>
+                        client.paginate(client.rest.issues.listComments, {
+                          owner, repo, issue_number: pr.number,
+                          per_page: 100, since: answeredAt,
+                        })
+                      );
+                      const batchAlreadyQueued = laterBatches.some(comment =>
+                        (comment.body || '').includes(
+                          `<!-- continuum-coderabbit-batch head=${pr.head.sha} `
+                        )
+                      );
+                      if (!batchAlreadyQueued) {
+                        // Older installed consumers may not yet support a
+                        // workflow_dispatch PR identity. Do not turn that
+                        // compatibility gap into an auto-merge failure.
+                        const source = await withReadFallback(client =>
+                          client.rest.repos.getContent({
+                            owner, repo,
+                            path: '.github/workflows/continuum-coderabbit-unresolved.yml',
+                            ref: context.payload.repository?.default_branch || 'main',
+                          })
+                        );
+                        const callerText = source?.data?.type === 'file' &&
+                          typeof source.data.content === 'string'
+                          ? Buffer.from(source.data.content, 'base64').toString('utf8')
+                          : '';
+                        if (/^  workflow_dispatch:/m.test(callerText) &&
+                            /^      pr_number:/m.test(callerText)) {
+                          const currentPr = await withReadFallback(client =>
+                            client.rest.pulls.get({
+                              owner, repo, pull_number: pr.number,
+                            })
+                          );
+                          if (currentPr.data.state === 'open' &&
+                              currentPr.data.head.sha === pr.head.sha) {
+                            await github.rest.actions.createWorkflowDispatch({
+                              owner, repo,
+                              workflow_id: 'continuum-coderabbit-unresolved.yml',
+                              ref: context.payload.repository?.default_branch || 'main',
+                              inputs: { pr_number: String(pr.number) },
+                            });
+                            repairReconciliationDispatched = true;
+                            core.notice(
+                              `PR #${pr.number}: recovered CodeRabbit reply for unresolved thread #${thread.commentId} via canonical batch reconciler.`
+                            );
+                          }
+                        }
+                      }
+                    }
+                    continue;
+                  }
                   if (
                     Date.now() - verificationAt <
                     CODERABBIT_THREAD_VERIFICATION_TIMEOUT_MS
