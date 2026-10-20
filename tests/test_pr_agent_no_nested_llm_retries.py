@@ -23,6 +23,33 @@ class ReviewerRetryPolicy(unittest.TestCase):
             "steps.repair_pass.outputs.provider_failure != ''", workflow
         )
 
+    def test_native_improve_retirement_and_review_receipt_are_mutually_exclusive(self):
+        workflow = (ROOT / ".github/workflows/continuum-pr-agent.yml").read_text()
+        improve = workflow.split(
+            "      - name: Run upstream improve on the exact HEAD when repair value remains", 1
+        )[1].split("      - name: Record skipped automatic improve for the clean HEAD", 1)[0]
+        for expected in (
+            'improve_log="$RUNNER_TEMP/pr-agent-improve-execution.log"',
+            "provider_failure=timeout",
+            "provider_failure=quota_429",
+            "provider_failure=upstream",
+            'echo "provider_failure=timeout" >> "$GITHUB_OUTPUT"',
+            "if [[ \"$improve_ok\" != true ]]; then",
+        ):
+            self.assertIn(expected, improve)
+        cooldown = workflow.split(
+            "      - name: Cool down failed real provider route before the bounded retry", 1
+        )[1].split("      - name: Attest successful independent OpenCode review", 1)[0]
+        self.assertIn("steps.improve.outputs.provider_failure != ''", cooldown)
+        self.assertIn(
+            "steps.pragent.outputs.provider_failure || steps.improve.outputs.provider_failure",
+            cooldown)
+        receipt = workflow.split(
+            "      - name: Attest successful independent OpenCode review", 1
+        )[1].split("      - name: Publish private exact-head repair handoff", 1)[0]
+        self.assertIn("steps.improve.outcome != 'failure'", receipt)
+
+
     def test_both_native_review_and_improve_disable_hidden_llm_retries(self):
         workflow = (ROOT / ".github/workflows/continuum-pr-agent.yml").read_text()
         for setting in (
