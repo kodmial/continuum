@@ -7432,8 +7432,8 @@ class ContinuumTest < Minitest::Test
                     'canonical executor must bound the newest verification comment window'
     refute_includes body, "sort: 'created'",
                     'unresolved scans must not rely on server-side sort/direction, which the endpoint ignores'
-    refute_includes body, 'github.paginate(',
-                    'unresolved scans must not paginate unbounded history'
+    refute_includes body, 'github.paginate(github.rest.pulls.listReviewComments',
+                    'UNRESOLVED review-comment scans must remain bounded; idempotency claims are PR issue comments'
   end
 
   # PR-Agent delegated-execution contract: the opaque `target_child_id`
