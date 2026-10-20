@@ -158,14 +158,6 @@ COMMIT_SITES = (
         "scope": "CI/repair commits (blocking workflow repair)",
     },
     {
-        "workflow": "continuum-coderabbit-unresolved.yml",
-        "step": "Fix all unresolved findings in one OpenCode run",
-        "component": "coderabbit-unresolved",
-        "subject": "address unresolved CodeRabbit findings",
-        "identity": "git-config",
-        "scope": "CI/repair commits (CodeRabbit findings)",
-    },
-    {
         "workflow": "continuum-pr-agent-repair.yml",
         "step": "Run one bounded OpenCode repair pass over every current item",
         "component": "pr-agent-repair",
