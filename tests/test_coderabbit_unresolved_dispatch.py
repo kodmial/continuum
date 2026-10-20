@@ -96,7 +96,7 @@ const comments = [
  {id: 201, in_reply_to_id:200, user:{login:'kodmial'},
   body:'<!-- auto-merge-coderabbit-verification finding=200 head='+head+' -->'},
  {id: 102, in_reply_to_id:100, user:{login:'coderabbitai[bot]'}, body:'**UNRESOLVED**'},
- {id: 202, in_reply_to_id:200, user:{login:'coderabbitai[bot]'}, body:'**UNRESOLVED**'},
+ {id: 202, in_reply_to_id:200, user:{login:'coderabbitai[bot]'}, body:'The finding remains valid and requires a code fix.'},
  {id: 103, in_reply_to_id:100, user:{login:'coderabbitai[bot]'}, body:'**RESOLVED**'},
  {id: 104, in_reply_to_id:100, user:{login:'random'}, body:'**UNRESOLVED**'}
 ];
