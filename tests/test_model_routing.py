@@ -262,6 +262,74 @@ class RealExecutionFailureTests(unittest.TestCase):
             route.Configuration.parse(f"{A},{B}"), updated, 1031), (B,))
 
 
+class ReadAfterWriteReceiptTests(unittest.TestCase):
+    def test_real_provider_failure_retries_stale_ref_without_requalification(self):
+        model = A
+        ticket = route.execution_ticket({"GITHUB_RUN_ID": "789", "GITHUB_RUN_ATTEMPT": "2"})
+        fresh = route.reserve_completion({"fingerprint": "f"}, ticket, model, 1000, 999)
+        seen = []
+        waits = []
+
+        class EventuallyConsistentStore:
+            def update(self, key, mutator):
+                seen.append(key)
+                current = {} if len(seen) < 3 else fresh.copy()
+                return mutator(current)
+
+        def failure(state):
+            return route.attest_retryable_failure(
+                state, ticket, model, 1100, "f", "timeout", 900)
+
+        output = route.persist_bound_receipt(
+            EventuallyConsistentStore(), "scope", failure, sleep=waits.append)
+        self.assertEqual(waits, [1, 2])
+        self.assertEqual(seen, ["scope"] * 3)
+        self.assertEqual(output["cooldowns"][model], 4700)
+        self.assertNotIn(ticket, output["qualified_selections"])
+
+    def test_stale_ref_does_not_forge_success_or_weaken_authorization(self):
+        waits = []
+
+        class PermanentlyStale:
+            def update(self, key, mutator):
+                return mutator({"fingerprint": "f", "qualified_selections": {}})
+
+        def missing(state):
+            return route.attest_completion(
+                state, "expected-run-receipt", A, 1100, "f", 3600, "789/1")
+
+        with self.assertRaisesRegex(route.SelectionNotVisible, "No qualified selection"):
+            route.persist_bound_receipt(PermanentlyStale(), "scope", missing, sleep=waits.append)
+        self.assertEqual(waits, [1, 2, 4])
+
+        wrong = route.reserve_completion({"fingerprint": "f"}, "expected-run-receipt",
+                                        B, 1000, 1000)
+        called = []
+        class WrongModel:
+            def update(self, key, mutator):
+                return mutator(wrong)
+        with self.assertRaises(route.RouteError):
+            route.persist_bound_receipt(WrongModel(), "scope", missing, sleep=called.append)
+        self.assertEqual(called, [])
+
+    def test_route_state_http_get_requires_uncached_representation(self):
+        import json as _json
+        from unittest.mock import patch as _patch
+        class FakeReply:
+            def __enter__(self): return self
+            def __exit__(self, *args): return False
+            def read(self, *args): return b'{}'
+        seen = []
+        def urlopen(request, timeout):
+            seen.append(request)
+            return FakeReply()
+        with _patch.object(route.urllib.request, "urlopen", urlopen):
+            store = route.GitRefStore("owner/repository", "mock-token")
+            self.assertEqual(store.api("GET", "git/ref/heads/continuum-model-state"), {})
+        self.assertEqual(seen[0].get_header("Cache-control"), "no-cache, no-store")
+        self.assertEqual(seen[0].get_header("Pragma"), "no-cache")
+
+
 class GitRefStoreTests(unittest.TestCase):
     def test_first_write_creates_orphan_ref_not_main(self):
         store = route.GitRefStore("example/private", "fake-token")
