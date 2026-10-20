@@ -52,7 +52,9 @@ CORE_STUBS=(
   continuum-auto-merge.yml
   continuum-bootstrap-runtime-secret.yml
   continuum-coderabbit-retry.yml
-  continuum-coderabbit-unresolved.yml
+  # Only the canonical continuum-opencode-unresolved.yml caller is installed.
+  # The old CodeRabbit-specific repair caller remains in legacy repositories
+  # but must never be reintroduced by a normal Continuum upgrade.
   continuum-docker-qualification.yml
   continuum-issue-scheduler.yml
   continuum-opencode-repair.yml
