@@ -1143,6 +1143,7 @@ jobs:
           timeout: ${{ vars.OPENCODE_PROBE_TIMEOUT || '90' }}
 
       - name: Retire verified failed OpenCode repair route
+        id: model_cooldown
         if: >-
           always() &&
           steps.model_route.outcome == 'success' &&
@@ -1300,7 +1301,7 @@ jobs:
           RETRY_ATTEMPT: ${{ inputs.retry_attempt || '0' }}
           POLICY_SCRIPT: ${{ steps.policy.outputs.policy_script }}
           ROUTE_NOT_BEFORE: ${{ env.CONTINUUM_MODEL_NOT_BEFORE_EPOCH }}
-          MODEL_ROUTE_FAILED: ${{ steps.model_route.outcome == 'failure' && 'true' || 'false' }}
+          ROUTE_UNAVAILABLE: ${{ (steps.model_route.outcome == 'failure' || steps.model_cooldown.outcome == 'success') && 'true' || 'false' }}
         with:
           github-token: ${{ secrets.TAP_PAT }}
           script: |
@@ -1311,7 +1312,7 @@ jobs:
             const notBefore = Number(process.env.ROUTE_NOT_BEFORE || '0');
             // A model route that is still in durable cooldown must be retried
             // by the scheduler only after eligibility, not immediately.
-            const cooling = process.env.MODEL_ROUTE_FAILED === 'true' &&
+            const cooling = process.env.ROUTE_UNAVAILABLE === 'true' &&
               Number.isSafeInteger(notBefore) &&
               notBefore > Math.floor(Date.now() / 1000);
             const exhausted = !cooling && Number.isInteger(attempt) && attempt >= 2;
@@ -1384,6 +1385,7 @@ jobs:
           steps.batch.outputs.empty != 'true' &&
           steps.convergence.outcome == 'success' && steps.convergence.outputs.held != 'true' &&
           failure() &&
+          env.CONTINUUM_MODEL_NOT_BEFORE_EPOCH == '' &&
           (steps.install_opencode.outcome == 'failure' ||
            (steps.repair_pass.outcome == 'failure' &&
             steps.repair_pass.outputs.classification == 'transient'))
@@ -1406,6 +1408,10 @@ jobs:
           if [[ "${CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED:-false}" == "true" && -z "${TAP_PAT:-}" ]]; then
             echo "::error::Delegated repair retry requires TAP_PAT; refusing to silently cancel."
             exit 1
+          fi
+          if [[ -n "${CONTINUUM_MODEL_NOT_BEFORE_EPOCH:-}" ]]; then
+            echo "All trusted repair models are in durable cooldown; recovery controller owns the deferred retry."
+            exit 0
           fi
           attempt="${RETRY_ATTEMPT:-0}"
           [[ "$attempt" =~ ^[0-9]+$ ]] || attempt=0
