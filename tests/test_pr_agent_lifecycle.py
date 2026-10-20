@@ -2419,10 +2419,11 @@ class ProtectedBaselineTests(unittest.TestCase):
                 self.assertEqual(actual, spec_digest(record["title"], record["body"]))
 
     def test_every_protected_coderabbit_file_has_zero_diff_from_baseline(self):
-        # The exact reviewed Work Lock #67 migration snapshot is the new
-        # deliberately narrow protected baseline for OpenCode's install sites.
-        # All other historically protected files retain their original pins.
-        migration = "db2fe95f5b6cbd453b633df3397c2e6629291d16"
+        # Exact reviewed CodeRabbit-batch / canonical OpenCode contract.
+        # The new immutable pin includes the previously reviewed model-routing
+        # migration plus only the intended batch qualifiers and verification.
+        # Every other protected file still uses its historical baseline.
+        migration = "3bd52bfa8e4f1aec1a1c5b193ca5ba5330a35548"
         def show_at(revision, path):
             result = subprocess.run(["git", "show", f"{revision}:{path}"],
                                     cwd=ROOT, capture_output=True, text=True, timeout=60)
@@ -2445,19 +2446,12 @@ class ProtectedBaselineTests(unittest.TestCase):
                 approved = migration if path == ".github/workflows/continuum-opencode.yml" else BASELINE_SHA
                 original = show_at(approved, path)
                 if path == ".github/workflows/continuum-opencode.yml":
-                    # Exact reviewed routing delta; no other baseline drift allowed.
-                    original = original.replace(
-                        "${{ vars.OPENCODE_MODEL || 'opencode/muse-spark-1.3-contributor-free' }}",
-                        "${{ steps.model_route.outputs.model }}"
-                    )
-                    original = original.replace(
-                        "      - name: Run OpenCode\n",
-                        "      # #66: resolve a trusted model before any OpenCode agent side effects.\n      - name: Qualify trusted OpenCode route\n        id: model_route\n        if: steps.issue_readiness.outputs.ready != 'false' && steps.recovery_restore.outputs.skip_opencode != 'true'\n        uses: kodmial/continuum/.github/actions/model-route@main\n        with:\n          models: ${{ vars.OPENCODE_MODELS }}\n          legacy-model: ${{ vars.OPENCODE_MODEL }}\n          task-class: coder\n          profile: ${{ inputs.mode || 'interactive' }}\n          state-token: ${{ secrets.TAP_PAT }}\n          runtime-version: ${{ steps.cached_opencode.outputs.runtime-version }}\n          strategy: ${{ vars.OPENCODE_MODEL_STRATEGY || 'sticky-failover' }}\n          probe-ttl: ${{ vars.OPENCODE_PROBE_TTL || '3600' }}\n          cooldown: ${{ vars.OPENCODE_MODEL_COOLDOWN || '900' }}\n          timeout: ${{ vars.OPENCODE_PROBE_TIMEOUT || '90' }}\n\n" + "      - name: Run OpenCode\n"
-                    )
-                    original = original.replace(
-                        "      - name: Resolve qualification run identity\n",
-                        "      - name: Attest successful OpenCode issue execution\n        if: >-\n          success() &&\n          steps.model_route.outcome == 'success' &&\n          steps.duplicate_guard.outputs.skip != 'true' &&\n          ((github.event_name == 'workflow_dispatch' && inputs.mode == 'issue') ||\n           (github.event_name == 'issue_comment' && !github.event.issue.pull_request))\n        uses: kodmial/continuum/.github/actions/model-route@main\n        with:\n          operation: record\n          models: ${{ vars.OPENCODE_MODELS }}\n          legacy-model: ${{ vars.OPENCODE_MODEL }}\n          selected-model: ${{ steps.model_route.outputs.model }}\n          task-class: coder\n          profile: ${{ inputs.mode || 'interactive' }}\n          state-token: ${{ secrets.TAP_PAT }}\n          runtime-version: ${{ steps.cached_opencode.outputs.runtime-version }}\n          strategy: ${{ vars.OPENCODE_MODEL_STRATEGY || 'sticky-failover' }}\n          probe-ttl: ${{ vars.OPENCODE_PROBE_TTL || '3600' }}\n          cooldown: ${{ vars.OPENCODE_MODEL_COOLDOWN || '900' }}\n          timeout: ${{ vars.OPENCODE_PROBE_TIMEOUT || '90' }}\n\n" + "      - name: Resolve qualification run identity\n"
-                    )
+                    # Immutable reviewed artifact, not an accumulating wildcard
+                    # or a broad regex allowlist. Baseline advances only after
+                    # a deliberate architectural change and its own tests.
+                    self.assertIn("Qualify current CodeRabbit unresolved batch", original)
+                    self.assertIn("CONTINUUM_OPENCODE_PUBLISH_RACE_RETRY_REQUIRED", original)
+                    self.assertIn("steps.model_route.outputs.model", original)
                 self.assertEqual(read_repo(path), original,
                                  f"{path}: unexpected drift outside reviewed protected baseline")
                 if path == ".github/workflows/continuum-opencode.yml":

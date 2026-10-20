@@ -24,11 +24,9 @@ WORKFLOWS_DIR = os.path.join(ROOT, ".github", "workflows")
 # Every agent-runtime install site: file -> one (tool, version) entry per
 # installer line, in file order. This map locks the duplication surface: a
 # new install site without probe coverage fails here until it is added.
-# Legacy, still-supported CodeRabbit diagnostic is the only direct installer.
-# All production OpenCode/PR-Agent paths now use the verified composite cache.
-EXPECTED_SITES = {
-    "continuum-coderabbit-unresolved.yml": [("opencode", "1.18.34")],
-}
+# Every production CodeRabbit/OpenCode execution now uses the verified
+# composite toolchain. No workflow may install an independent runtime.
+EXPECTED_SITES = {}
 CACHED_WORKFLOWS = {
     "continuum-opencode.yml": "opencode",
     "continuum-pr-agent.yml": "both",
