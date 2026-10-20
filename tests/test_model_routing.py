@@ -379,5 +379,43 @@ class CooldownRecoveryContractTests(unittest.TestCase):
         self.assertIn("const exhausted = !cooling", block)
 
 
+
+    def test_real_provider_failure_exposes_next_available_model(self):
+        config = route.Configuration.parse(f"{A},{B}")
+        now = 1000
+        reserved = route.reserve_completion(
+            {"fingerprint": "f", "cooldowns": {B: 1300}},
+            "ticket", A, now - 5, now - 5)
+        retired = route.attest_retryable_failure(
+            reserved, "ticket", A, now, "f", "timeout", 900)
+        self.assertEqual(retired["cooldowns"][A], 4600)
+        with tempfile.TemporaryDirectory() as tmp:
+            output = pathlib.Path(tmp) / "env"
+            deadline = route.publish_cooldown_not_before(
+                config, retired, now, env={"GITHUB_ENV": str(output)})
+            self.assertEqual(deadline, 1300)
+            self.assertEqual(
+                output.read_text(), "CONTINUUM_MODEL_NOT_BEFORE_EPOCH=1300\\n")
+
+    def test_live_provider_timeout_never_launches_blind_inline_review_or_repair_retry(self):
+        repo = PATH.parents[2]
+        for filename, cooldown_step, schedule_step in (
+            ("continuum-pr-agent.yml",
+             "Cool down failed real provider route before the bounded retry",
+             "Schedule bounded retry for retryable PR-Agent review failure"),
+            ("continuum-pr-agent-repair.yml",
+             "Retire verified failed OpenCode repair route",
+             "Schedule bounded retry for retryable PR-Agent repair failure"),
+        ):
+            with self.subTest(workflow=filename):
+                text = (repo / ".github/workflows" / filename).read_text()
+                self.assertIn(
+                    "      - name: " + cooldown_step + "\n        id: model_cooldown",
+                    text)
+                body = text.split("      - name: " + schedule_step, 1)[1]
+                self.assertIn("env.CONTINUUM_MODEL_NOT_BEFORE_EPOCH == ''", body)
+                self.assertIn('CONTINUUM_MODEL_NOT_BEFORE_EPOCH:-', body)
+                self.assertIn("steps.model_cooldown.outcome == 'success'", text)
+
 if __name__ == "__main__":
     unittest.main()
