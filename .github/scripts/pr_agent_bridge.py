@@ -100,6 +100,7 @@ def opencode_call(method: str, path: str, payload: Dict[str, Any] | None, timeou
     else:
         stage = "other"
     started = time.monotonic()
+    _bridge_timing(stage, started, "started")
     data = json.dumps(payload).encode() if payload is not None else None
     request = urllib.request.Request(
         server_url() + path,
@@ -224,7 +225,12 @@ class Handler(BaseHTTPRequestHandler):
             self._send(400, openai_error("invalid_request", str(exc)))
             outcome = "http_400"
         except BridgeUpstreamError as exc:
-            status = 504 if "timeout" in str(exc).lower() else 502
+            # Python socket read timeout says "timed out", not "timeout".
+            # Expose a 504 to reviewer routing, not a generic 502.
+            timeout_detected = any(
+                token in str(exc).lower() for token in ("timeout", "timed out")
+            )
+            status = 504 if timeout_detected else 502
             self._send(status, openai_error("upstream_error", str(exc)))
             outcome = f"http_{status}"
         except (BrokenPipeError, ConnectionResetError):
