@@ -992,6 +992,12 @@ jobs:
           CONFIG__GIT_PROVIDER: github
           CONFIG__MODEL: ${{ steps.stack.outputs.model }}
           CONFIG__CUSTOM_MODEL_MAX_TOKENS: ${{ steps.stack.outputs.max_tokens }}
+          # The shared outer router owns failover between approved models.
+          # PR-Agent 0.46.0 otherwise retries one timed-out model internally
+          # and falls back to its default, which is not in OPENCODE_MODELS.
+          CONFIG__RETRY_SAME_MODEL_ON_TIMEOUT: 'false'
+          CONFIG__NUM_RETRIES: '0'
+          CONFIG__FALLBACK_MODELS: '[]'
           CONFIG__PROPAGATE_TOOL_ERRORS: 'true'
           CONFIG__PERSISTENT_INLINE_COMMENTS: 'true'
           OPENAI__API_BASE: ${{ steps.stack.outputs.api_base }}
@@ -1688,6 +1694,12 @@ jobs:
           CONFIG__GIT_PROVIDER: github
           CONFIG__MODEL: ${{ steps.stack.outputs.model }}
           CONFIG__CUSTOM_MODEL_MAX_TOKENS: ${{ steps.stack.outputs.max_tokens }}
+          # The shared outer router owns failover between approved models.
+          # PR-Agent 0.46.0 otherwise retries one timed-out model internally
+          # and falls back to its default, which is not in OPENCODE_MODELS.
+          CONFIG__RETRY_SAME_MODEL_ON_TIMEOUT: 'false'
+          CONFIG__NUM_RETRIES: '0'
+          CONFIG__FALLBACK_MODELS: '[]'
           CONFIG__PROPAGATE_TOOL_ERRORS: 'true'
           OPENAI__API_BASE: ${{ steps.stack.outputs.api_base }}
           OPENAI__KEY: continuum-loopback
