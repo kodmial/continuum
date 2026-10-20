@@ -845,7 +845,19 @@ jobs:
           PY
           )"
           START_HEAD="$(git rev-parse HEAD)"
-          if ! opencode run --auto --model "$OPENCODE_MODEL" "$PROMPT"; then
+          # Attribute only explicit external provider failures to the
+          # selected OpenCode route. Code/tool failures must not burn models.
+          repair_log="$RUNNER_TEMP/pr-agent-opencode-repair.log"
+          if ! opencode run --auto --model "$OPENCODE_MODEL" "$PROMPT" 2>&1 | tee "$repair_log"; then
+            if grep -Eiq 'Upstream request failed: Endpoint is unavailable|Endpoint is unavailable|model unavailable|ModelUnavailableError' "$repair_log"; then
+              echo "provider_failure=unavailable" >> "$GITHUB_OUTPUT"
+            elif grep -Eiq 'APITimeoutError|TimeoutError|Request timed out|timed out' "$repair_log"; then
+              echo "provider_failure=timeout" >> "$GITHUB_OUTPUT"
+            elif grep -Eiq 'HTTP 503|503 Service Unavailable|502 Bad Gateway|upstream request failed' "$repair_log"; then
+              echo "provider_failure=upstream" >> "$GITHUB_OUTPUT"
+            elif grep -Eiq 'FreeUsageLimitError|RateLimitError|429 Too Many Requests' "$repair_log"; then
+              echo "provider_failure=quota_429" >> "$GITHUB_OUTPUT"
+            fi
             echo "classification=transient" >> "$GITHUB_OUTPUT"
             echo "::error::OpenCode repair runtime failed; recovery may retry this exact operation."
             exit 1
@@ -1130,6 +1142,29 @@ jobs:
           cooldown: ${{ vars.OPENCODE_MODEL_COOLDOWN || '900' }}
           timeout: ${{ vars.OPENCODE_PROBE_TIMEOUT || '90' }}
 
+      - name: Retire verified failed OpenCode repair route
+        if: >-
+          always() &&
+          steps.model_route.outcome == 'success' &&
+          steps.repair_pass.outcome == 'failure' &&
+          steps.repair_pass.outputs.provider_failure != ''
+        uses: kodmial/continuum/.github/actions/model-route@main
+        with:
+          operation: fail
+          models: ${{ vars.OPENCODE_MODELS }}
+          legacy-model: ${{ vars.OPENCODE_MODEL }}
+          selected-model: ${{ steps.model_route.outputs.model }}
+          failure-reason: ${{ steps.repair_pass.outputs.provider_failure }}
+          task-class: repair
+          profile: pr-repair
+          state-repository: ${{ env.CONTINUUM_PR_AGENT_TARGET_REPOSITORY }}
+          state-token: ${{ env.CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED == 'true' && secrets.TAP_PAT || (env.CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED != 'true' && github.token || '') }}
+          runtime-version: ${{ steps.install_opencode.outputs.runtime-version }}
+          strategy: ${{ vars.OPENCODE_MODEL_STRATEGY || 'sticky-failover' }}
+          probe-ttl: ${{ vars.OPENCODE_PROBE_TTL || '3600' }}
+          cooldown: ${{ vars.OPENCODE_MODEL_COOLDOWN || '900' }}
+          timeout: ${{ vars.OPENCODE_PROBE_TIMEOUT || '90' }}
+
       - name: Persist PR-Agent no-progress controller state
         if: always() && steps.repair_pass.outputs.no_progress == 'true'
         uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
@@ -1229,7 +1264,7 @@ jobs:
         uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
         env:
           HEAD_SHA: ${{ inputs.head_sha }}
-          RETRYABLE_FAILURE: ${{ (steps.install_opencode.outcome == 'failure' || (steps.repair_pass.outcome == 'failure' && steps.repair_pass.outputs.classification == 'transient')) && 'true' || 'false' }}
+          RETRYABLE_FAILURE: ${{ (steps.model_route.outcome == 'failure' || steps.install_opencode.outcome == 'failure' || (steps.repair_pass.outcome == 'failure' && steps.repair_pass.outputs.classification == 'transient')) && 'true' || 'false' }}
         with:
           github-token: ${{ secrets.TAP_PAT }}
           script: |
@@ -1254,7 +1289,8 @@ jobs:
           steps.batch.outputs.empty != 'true' &&
           steps.convergence.outcome == 'success' && steps.convergence.outputs.held != 'true' &&
           failure() &&
-          (steps.install_opencode.outcome == 'failure' ||
+          (steps.model_route.outcome == 'failure' ||
+           steps.install_opencode.outcome == 'failure' ||
            (steps.repair_pass.outcome == 'failure' &&
             steps.repair_pass.outputs.classification == 'transient'))
         uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
