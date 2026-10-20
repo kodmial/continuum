@@ -7378,7 +7378,9 @@ class ContinuumTest < Minitest::Test
     assert_includes batch, 'Collect all unresolved findings'
     assert_includes batch, 'Dispatch one batched repair to canonical OpenCode'
     assert_includes batch, "workflow_id: 'continuum-opencode.yml'"
-    assert_includes batch, 'unresolved_items_json: batch'
+    assert_includes batch, 'if (supportsBatch) inputs.unresolved_items_json = batch'
+    assert_includes batch, 'distinctReviews',
+                    'unmigrated callers must retain bounded canonical per-review compatibility'
     refute_includes batch, 'opencode run --auto'
     refute_includes batch, 'git commit '
     refute_includes batch, 'git push '
