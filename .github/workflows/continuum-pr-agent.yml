@@ -1116,13 +1116,13 @@ jobs:
             fi
           fi
           if [[ "$review_ok" != true ]]; then
-            # Print only structured phase timings from the loopback bridge.
-            # Never print raw bridge requests/responses or caller PR content.
+            # Print content-free bridge stage timings only. Never dump payloads.
             if [[ -f "$RUNNER_TEMP/pr-agent-bridge.log" ]]; then
-              echo "::group::OpenCode bridge phase timings (content-free)"
-              grep -E '^bridge-phase stage=(create-session|send-message|delete-session|other) elapsed_ms=[0-9]+ outcome=[a-zA-Z0-9_]+, source failures,
-            # network/git errors or missing permissions. Only LLM provider
-            # diagnostics authorize a model failure receipt.
+              echo "::group::OpenCode bridge timing diagnostics"
+              awk '/^bridge-phase stage=/ { print }' "$RUNNER_TEMP/pr-agent-bridge.log" | tail -n 50 || true
+              echo "::endgroup::"
+            fi
+            # Only recognized client/provider errors may retire a model.
             if grep -Eiq 'litellm[.]Timeout|APITimeoutError|Request timed out|timeout value=' "$review_log"; then
               echo "provider_failure=timeout" >> "$GITHUB_OUTPUT"
             elif grep -Eiq 'FreeUsageLimitError|litellm[.]RateLimitError|429 Too Many Requests' "$review_log"; then
