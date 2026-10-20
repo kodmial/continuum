@@ -238,9 +238,9 @@ jobs:
             } while (threadCursor);
 
             const explicitlyResolved = body =>
-              !/\\bUNRESOLVED\\b/i.test(body || '') &&
-              (/\\*\\*RESOLVED(?:\\.|\\*\\*)/i.test(body || '') ||
-               /✅\\s*Review thread resolved\\.?/i.test(body || ''));
+              !/\bUNRESOLVED\b/i.test(body || '') &&
+              (/\*\*RESOLVED(?:\.|\*\*)/i.test(body || '') ||
+               /✅\s*Review thread resolved\.?/i.test(body || ''));
 
             const active = [];
             for (const verification of latestVerification.values()) {
