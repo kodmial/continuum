@@ -32,6 +32,7 @@ import argparse
 import json
 import os
 import sys
+import threading
 import time
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -122,6 +123,28 @@ def opencode_call(method: str, path: str, payload: Dict[str, Any] | None, timeou
         raise BridgeUpstreamError(f"cannot reach opencode server: {exc}", retryable=True) from None
 
 
+def _session_state_sample(session_id: str) -> str:
+    """Best-effort OpenCode session status; return a fixed non-sensitive label."""
+    request = urllib.request.Request(server_url() + "/session/status", method="GET")
+    try:
+        with urllib.request.urlopen(request, timeout=3) as response:
+            statuses = json.loads(response.read().decode())
+        value = statuses.get(session_id, {}) if isinstance(statuses, dict) else {}
+        state = str(value.get("type", "unknown")) if isinstance(value, dict) else "unknown"
+        return state if state in ("busy", "idle", "retry") else "unknown"
+    except (OSError, ValueError, TimeoutError):
+        return "unreachable"
+
+
+def _monitor_opencode_session(session_id: str, finished: threading.Event) -> None:
+    """Probe server liveness every 30s while the synchronous message waits."""
+    started = time.monotonic()
+    while not finished.wait(30):
+        state = _session_state_sample(session_id)
+        # Reuse existing safe phase reporter so workflows print these metrics.
+        _bridge_timing("send-message", started, "status_" + state)
+
+
 def run_completion(body: Dict[str, Any], timeout: int) -> Dict[str, Any]:
     messages = body.get("messages", [])
     request_model = str(body.get("model", "") or "")
@@ -140,9 +163,20 @@ def run_completion(body: Dict[str, Any], timeout: int) -> Dict[str, Any]:
     if not session_id:
         raise BridgeUpstreamError("opencode server returned no session id", retryable=True)
     try:
-        status, raw = opencode_call(
-            "POST", f"/session/{session_id}/message", opencode_body, timeout
+        finished = threading.Event()
+        monitor = threading.Thread(
+            target=_monitor_opencode_session,
+            args=(session_id, finished),
+            daemon=True,
         )
+        monitor.start()
+        try:
+            status, raw = opencode_call(
+                "POST", f"/session/{session_id}/message", opencode_body, timeout
+            )
+        finally:
+            finished.set()
+            monitor.join(timeout=4)
         if status != 200:
             raise map_opencode_error(status, raw)
         result = json.loads(raw)
