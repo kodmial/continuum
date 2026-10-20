@@ -3921,7 +3921,7 @@ class ContinuumTest < Minitest::Test
       caller_event_name caller_issue_number
     ],
     'continuum-opencode.yml' => %w[
-      continuum_ref mode issue_number pr_number head_ref review_id run_id
+      continuum_ref mode issue_number pr_number head_ref review_id unresolved_items_json run_id
       ci_workflow_id conflict_strategy dispatch_marker in_progress_label
       pause_marker max_dispatch_attempts base_ref knowledge_protocol_path
       knowledge_records_dir issue_commit_prefix
@@ -7372,16 +7372,35 @@ class ContinuumTest < Minitest::Test
     assert_includes body, 'await originalReviewIdForFinding(findingId)'
   end
 
+  def test_coderabbit_batch_delegates_all_runtime_and_git_ownership_to_opencode
+    batch = workflow_body('continuum-coderabbit-unresolved.yml')
+    executor = workflow_body('continuum-opencode.yml')
+    assert_includes batch, 'Collect all unresolved findings'
+    assert_includes batch, 'Dispatch one batched repair to canonical OpenCode'
+    assert_includes batch, "workflow_id: 'continuum-opencode.yml'"
+    assert_includes batch, 'unresolved_items_json: batch'
+    refute_includes batch, 'opencode run --auto'
+    refute_includes batch, 'git commit '
+    refute_includes batch, 'git push '
+    refute_includes batch, '1.18.34'
+    assert_includes executor, 'Fix CodeRabbit review findings'
+    assert_includes executor, 'Ask CodeRabbit to verify every original finding'
+    assert_includes executor, 'Continuum-Component: opencode'
+    assert_includes executor, 'CONTINUUM_OPENCODE_PUBLISH_RACE_RETRY_REQUIRED'
+    assert_includes executor, 'Qualify current CodeRabbit unresolved batch'
+  end
+
   def test_coderabbit_unresolved_reverification_uses_unwrapped_git_ref_data
     body = workflow_body('continuum-coderabbit-unresolved.yml')
 
     # github.rest.git.getRef returns {data: {object: {sha: ...}}}.
     # The destructuring below has already removed the outer .data layer;
     # dereferencing .data a second time crashes after a successful repair.
-    assert_includes body, 'const { data: publishedRef } = await github.rest.git.getRef({'
-    assert_includes body, 'const headSha = publishedRef.object.sha;'
-    refute_includes body, 'publishedRef.data.object.sha;',
-                    'batched CodeRabbit verification must not dereference an unwrapped response twice'
+    assert_includes body, 'const { data: headRef } = await github.rest.git.getRef({'
+    assert_includes body, 'headRef?.object?.sha',
+                    'CodeRabbit batch admission must use the unwrapped authoritative branch ref'
+    refute_includes body, 'headRef.data.object.sha',
+                    'CodeRabbit batch admission must not double-unwrap the ref'
   end
 
   def test_opencode_unresolved_reply_without_link_header_is_not_a_shell_failure
@@ -7406,10 +7425,11 @@ class ContinuumTest < Minitest::Test
                     'batch collection must anchor at the newest page instead of pages 1..N oldest-first'
     assert_includes body, 'firstReviewPage',
                     'batch collection must walk a bounded newest window'
-    assert_includes body, 'lastVerifyPage',
-                    'verification duplicate checks must anchor at the newest page'
-    assert_includes body, 'firstVerifyPage',
-                    'verification duplicate checks must walk a bounded newest window'
+    executor = workflow_body('continuum-opencode.yml')
+    assert_includes executor, 'lastVerifyPage',
+                    'batched verification belongs to canonical OpenCode and must anchor at newest page'
+    assert_includes executor, 'firstVerifyPage',
+                    'canonical executor must bound the newest verification comment window'
     refute_includes body, "sort: 'created'",
                     'unresolved scans must not rely on server-side sort/direction, which the endpoint ignores'
     refute_includes body, 'github.paginate(',
@@ -7967,7 +7987,6 @@ class ContinuumTest < Minitest::Test
     ['continuum-opencode.yml', 'Fix CodeRabbit review findings', 'opencode', 'address CodeRabbit review findings for PR #'],
     ['continuum-opencode.yml', 'Resolve merge conflict with main', 'opencode', 'resolve merge conflict with main for PR #'],
     ['continuum-opencode.yml', 'Fix failed blocking workflow', 'opencode', 'repair blocking workflow for PR #'],
-    ['continuum-coderabbit-unresolved.yml', 'Fix all unresolved findings in one OpenCode run', 'coderabbit-unresolved', 'address unresolved CodeRabbit findings'],
     ['continuum-pr-agent-repair.yml', 'Run one bounded OpenCode repair pass over every current item', 'pr-agent-repair', 'apply PR-Agent review findings'],
     ['continuum-pr-agent-canary.yml', 'Run the disposable-PR end to end', 'pr-agent-canary', 'seed disposable PR-Agent canary defect'],
     ['continuum-pr-agent-canary.yml', 'Run the disposable-PR end to end', 'pr-agent-canary', 'correct disposable PR-Agent canary defect'],
