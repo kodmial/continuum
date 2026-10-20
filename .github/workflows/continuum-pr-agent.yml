@@ -1761,13 +1761,33 @@ jobs:
               --pr_code_suggestions.suggestions_score_threshold="$IMPROVE_REPAIR_THRESHOLD" \
               --github.publish_as_check_run=false
           }
+          # Native improve is a second independent LLM call. Apply the
+          # same *verified* provider failure classification as native review,
+          # without ever leaking delegated improve content to public logs.
+          improve_log="$RUNNER_TEMP/pr-agent-improve-execution.log"
           if [[ "${CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED:-false}" == "true" ]]; then
-            if ! run_improve >"$RUNNER_TEMP/pr-agent-delegated-improve.log" 2>&1; then
+            if run_improve >"$improve_log" 2>&1; then
+              improve_ok=true
+            else
+              improve_ok=false
               echo "::error::Delegated PR-Agent improve failed; detailed output remains runner-local."
-              exit 1
             fi
           else
-            run_improve
+            if run_improve 2>&1 | tee "$improve_log"; then
+              improve_ok=true
+            else
+              improve_ok=false
+            fi
+          fi
+          if [[ "$improve_ok" != true ]]; then
+            if grep -Eiq 'litellm[.]Timeout|APITimeoutError|Request timed out|timeout value=|Error code: 504|504 Gateway Timeout' "$improve_log"; then
+              echo "provider_failure=timeout" >> "$GITHUB_OUTPUT"
+            elif grep -Eiq 'FreeUsageLimitError|litellm[.]RateLimitError|429 Too Many Requests' "$improve_log"; then
+              echo "provider_failure=quota_429" >> "$GITHUB_OUTPUT"
+            elif grep -Eiq 'litellm[.](InternalServerError|APIConnectionError)|503 Service Unavailable|502 Bad Gateway' "$improve_log"; then
+              echo "provider_failure=upstream" >> "$GITHUB_OUTPUT"
+            fi
+            exit 1
           fi
           if [[ ! -s pr-agent-outputs/continuum.jsonl ]]; then
             echo "No improve suggestions were published; recording an empty payload."
@@ -2051,13 +2071,16 @@ jobs:
         if: >-
           always() &&
           steps.model_route.outcome == 'success' &&
-          steps.pragent.outcome == 'failure' &&
-          steps.pragent.outputs.provider_failure != '' &&
+          ((steps.pragent.outcome == 'failure' &&
+            steps.pragent.outputs.provider_failure != '') ||
+           (steps.pragent.outcome == 'success' &&
+            steps.improve.outcome == 'failure' &&
+            steps.improve.outputs.provider_failure != '')) &&
           steps.admit.outputs.admitted == 'true'
         uses: kodmial/continuum/.github/actions/model-route@main
         with:
           operation: fail
-          failure-reason: ${{ steps.pragent.outputs.provider_failure }}
+          failure-reason: ${{ steps.pragent.outputs.provider_failure || steps.improve.outputs.provider_failure }}
           models: ${{ vars.OPENCODE_MODELS }}
           legacy-model: ${{ vars.OPENCODE_MODEL }}
           explicit-pin: ${{ inputs.opencode_model }}
@@ -2076,6 +2099,7 @@ jobs:
         if: >-
           steps.model_route.outcome == 'success' &&
           steps.pragent.outcome == 'success' &&
+          steps.improve.outcome != 'failure' &&
           steps.result.outcome == 'success' &&
           steps.admit.outputs.admitted == 'true'
         uses: kodmial/continuum/.github/actions/model-route@main
