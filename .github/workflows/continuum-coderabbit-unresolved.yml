@@ -15,6 +15,11 @@ on:
         type: string
         default: ''
         required: false
+      pr_number:
+        description: PR to reconcile when a latest-state caller wakes the batcher.
+        type: string
+        default: ''
+        required: false
 
 permissions: {}
 
@@ -22,12 +27,13 @@ jobs:
   retry-unresolved:
     if: >-
       (inputs.review_provider || vars.CONTINUUM_REVIEW_PROVIDER || 'none') == 'coderabbit' &&
-      github.event.action == 'created' &&
-      github.event.comment.user.login == 'coderabbitai[bot]' &&
-      github.event.pull_request.state == 'open' &&
-      github.event.pull_request.head.repo.full_name == github.repository &&
-      github.event.comment.in_reply_to_id != null &&
-      contains(github.event.comment.body, 'UNRESOLVED')
+      ((github.event_name == 'workflow_dispatch' && inputs.pr_number != '') ||
+       (github.event_name == 'pull_request_review_comment' &&
+        github.event.action == 'created' &&
+        github.event.comment.user.login == 'coderabbitai[bot]' &&
+        github.event.pull_request.state == 'open' &&
+        github.event.pull_request.head.repo.full_name == github.repository &&
+        github.event.comment.in_reply_to_id != null))
     runs-on: ubuntu-latest
     timeout-minutes: 10
 
@@ -41,7 +47,7 @@ jobs:
     # second CodeRabbit repair engine; the canonical OpenCode workflow owns
     # model selection, runtime, publication, verification and recovery.
     concurrency:
-      group: coderabbit-unresolved-${{ github.event.pull_request.number }}
+      group: coderabbit-unresolved-${{ github.event.pull_request.number || inputs.pr_number }}
       cancel-in-progress: false
 
     steps:
@@ -51,6 +57,8 @@ jobs:
       - name: Collect all unresolved findings
         id: context
         uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
+        env:
+          INPUT_PR_NUMBER: ${{ inputs.pr_number }}
         with:
           # kodmial/continuum#259: read-only collection uses GITHUB_TOKEN so
           # the run is attributed to github-actions[bot] and never spends
@@ -59,7 +67,12 @@ jobs:
           script: |
             const owner = context.repo.owner;
             const repo = context.repo.repo;
-            const pullNumber = context.payload.pull_request.number;
+            const pullNumber = Number(
+              context.payload.pull_request?.number || process.env.INPUT_PR_NUMBER || 0
+            );
+            if (!Number.isInteger(pullNumber) || pullNumber <= 0) {
+              throw new Error('No valid PR number for CodeRabbit reconciliation.');
+            }
             const opencodeVerificationPattern =
               /<!-- opencode-coderabbit-verification review=(\d+) finding=(\d+) head=([0-9a-f]{40}) -->/;
             const autoMergeVerificationPattern =
@@ -181,6 +194,54 @@ jobs:
               }
             }
 
+            // GitHub review-thread resolution, not a word in the AI response,
+            // determines whether a verified finding is still actionable.
+            // A CodeRabbit reply such as "the finding remains valid" is a
+            // completed reply and must not be silently discarded.
+            const unresolvedRoots = new Set();
+            let threadCursor = null;
+            let threadPages = 0;
+            do {
+              const page = await github.graphql(
+                `query($owner: String!, $repo: String!, $number: Int!, $cursor: String) {
+                  repository(owner: $owner, name: $repo) {
+                    pullRequest(number: $number) {
+                      reviewThreads(first: 100, after: $cursor) {
+                        nodes {
+                          isResolved
+                          comments(first: 1) { nodes { databaseId author { login } } }
+                        }
+                        pageInfo { hasNextPage endCursor }
+                      }
+                    }
+                  }
+                }`,
+                { owner, repo, number: pullNumber, cursor: threadCursor }
+              );
+              const threads = page.repository?.pullRequest?.reviewThreads;
+              if (!threads?.pageInfo || !Array.isArray(threads.nodes)) {
+                throw new Error('Cannot establish current CodeRabbit thread state.');
+              }
+              for (const thread of threads.nodes) {
+                const root = thread.comments?.nodes?.[0];
+                if (!thread.isResolved && root?.author?.login?.startsWith('coderabbitai') &&
+                    Number.isInteger(root.databaseId)) {
+                  unresolvedRoots.add(root.databaseId);
+                }
+              }
+              threadCursor = threads.pageInfo.hasNextPage
+                ? threads.pageInfo.endCursor : null;
+              threadPages += 1;
+              if (threadCursor && threadPages >= 10) {
+                throw new Error('CodeRabbit threads exceed bounded reconciliation window.');
+              }
+            } while (threadCursor);
+
+            const explicitlyResolved = body =>
+              !/\\bUNRESOLVED\\b/i.test(body || '') &&
+              (/\\*\\*RESOLVED(?:\\.|\\*\\*)/i.test(body || '') ||
+               /✅\\s*Review thread resolved\\.?/i.test(body || ''));
+
             const active = [];
             for (const verification of latestVerification.values()) {
               const replies = comments
@@ -189,12 +250,16 @@ jobs:
                     comment.user?.login === 'coderabbitai[bot]' &&
                     getRootId(comment) === verification.findingId &&
                     comment.id > verification.comment.id &&
-                    /\b(?:RESOLVED|UNRESOLVED)\b/i.test(comment.body ?? '')
+                    !/Review rate limited|Review limit reached/i.test(comment.body ?? '')
                 )
                 .sort((a, b) => b.id - a.id);
 
               const latestReply = replies[0];
-              if (!latestReply || !/\bUNRESOLVED\b/i.test(latestReply.body ?? '')) {
+              // Verify the latest CodeRabbit answer against the live thread.
+              // An explicit RESOLVED reply is normalized by auto-merge.
+              if (!latestReply ||
+                  !unresolvedRoots.has(verification.findingId) ||
+                  explicitlyResolved(latestReply.body)) {
                 continue;
               }
 
