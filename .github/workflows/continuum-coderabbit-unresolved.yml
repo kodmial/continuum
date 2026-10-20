@@ -361,9 +361,51 @@ jobs:
             const priorComments = await github.paginate(github.rest.issues.listComments, {
               owner, repo, issue_number: pullNumber, per_page: 100,
             });
-            if (priorComments.some(comment => (comment.body || '').includes(marker))) {
-              core.notice('CodeRabbit batch already dispatched for this PR/HEAD/findings; duplicate event ignored.');
-              return;
+            // Dispatch is NOT completion. The executor can finish a green
+            // workflow without invoking the model when it rejects the batch,
+            // or a provider can fail before publishing anything. Never make
+            // the enqueue marker a permanent terminal state.
+            const attempts = priorComments
+              .filter(comment => (comment.body || '').includes(marker))
+              .sort((a, b) => Number(b.id) - Number(a.id));
+            if (attempts.length) {
+              const latest = attempts[0];
+              const latestAt = Date.parse(latest.created_at || '');
+              if (!Number.isFinite(latestAt)) {
+                throw new Error('Cannot establish the prior batch dispatch time.');
+              }
+              // Bounded infrastructure backoff, shared by event and scheduled
+              // reconciliation. The source finding and exact HEAD are
+              // revalidated on every pass above.
+              const retryDelayMinutes = Math.min(80, 10 * 2 ** Math.min(3, attempts.length - 1));
+              if (Date.now() - latestAt < retryDelayMinutes * 60_000) {
+                core.notice(
+                  `CodeRabbit batch already queued: retry backoff ${retryDelayMinutes}m for this exact head/findings.`
+                );
+                return;
+              }
+              const { data: runsData } = await github.rest.actions.listWorkflowRuns({
+                owner, repo, workflow_id: 'continuum-opencode.yml',
+                event: 'workflow_dispatch', per_page: 100,
+              });
+              const matching = (runsData.workflow_runs || []).filter(run =>
+                String(run.display_title || '') === `OpenCode repair PR #${pullNumber}` &&
+                Date.parse(run.created_at || '') >= latestAt - 15_000
+              );
+              if (matching.some(run => run.status !== 'completed')) {
+                core.notice('Canonical OpenCode repair for this PR is still active; duplicate batch suppressed.');
+                return;
+              }
+              if (!matching.length && Date.now() - latestAt < 4 * 60 * 60_000) {
+                // A bounded workflow-run listing may lose a busy run outside
+                // the window. Do not race an unobservable in-flight agent;
+                // the periodic reconciliation can retry after that deadline.
+                core.warning('Previous dispatch run not visible in bounded Actions history; deferring.');
+                return;
+              }
+              core.warning(
+                `CodeRabbit batch remains unresolved on identical HEAD after ${attempts.length} completed dispatch(es). Re-dispatching through canonical OpenCode with bounded backoff.`
+              );
             }
 
             // The optional batch input is an additive consumer API. An
@@ -406,7 +448,7 @@ jobs:
                 marker,
                 '⚡ **Continuum · coderabbit-unresolved**',
                 '<!-- continuum-origin role=continuum component=coderabbit-unresolved -->',
-                `Queued one canonical OpenCode repair for ${items.length} current UNRESOLVED finding(s) on HEAD \`${head}\`.`,
+                `Queued canonical OpenCode repair attempt ${attempts.length + 1} for ${items.length} current unresolved CodeRabbit finding(s) on HEAD \`${head}\`.`,
               ].join('\n'),
             });
             core.notice(`Dispatched canonical OpenCode for ${items.length} unresolved finding(s) of PR #${pullNumber}.`);
