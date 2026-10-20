@@ -112,7 +112,7 @@ class OpenCode429RunnerRecoveryContractTest(unittest.TestCase):
             self.assertIn(marker, self.body)
         # Every workflow_dispatch agent mode evacuates on 429.
         self.assertGreaterEqual(
-            self.body.count("continuum_429_evacuate \""), 5
+            self.body.count("continuum_infra_evacuate \""), 5
         )
 
     def test_fresh_run_restores_exact_checkpoint_and_skips_completed_stages(self):
