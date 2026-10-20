@@ -334,7 +334,7 @@ class CooldownRecoveryContractTests(unittest.TestCase):
                 now=1000, env={"GITHUB_ENV": str(file)})
             self.assertEqual(actual, 3900)
             self.assertEqual(
-                file.read_text(), "CONTINUUM_MODEL_NOT_BEFORE_EPOCH=3900\\n")
+                file.read_text(), "CONTINUUM_MODEL_NOT_BEFORE_EPOCH=3900\n")
 
     def test_never_defer_if_any_model_ready_or_state_invalid(self):
         config = route.Configuration.parse(f"{A},{B}")
