@@ -49,6 +49,28 @@ class BridgeTimingTests(unittest.TestCase):
         self.assertNotIn("private-data", log)
         self.assertNotIn("session-secret", log)
 
+    def test_bridge_socket_read_timeout_is_http_504(self):
+        class RecordingHandler(bridge.Handler):
+            def _send(self, status, payload):
+                self.observed_status = status
+                self.observed_payload = payload
+
+        handler = object.__new__(RecordingHandler)
+        handler.path = "/v1/chat/completions"
+        handler.headers = {"Content-Length": "2"}
+        handler.rfile = io.BytesIO(b"{}")
+        with patch.object(handler, "_authorized", return_value=True):
+            with patch.object(
+                bridge,
+                "run_completion",
+                side_effect=bridge.BridgeUpstreamError(
+                    "cannot reach opencode server: timed out", retryable=True
+                ),
+            ):
+                handler.do_POST()
+        self.assertEqual(handler.observed_status, 504)
+        self.assertEqual(handler.observed_payload["error"]["type"], "upstream_error")
+
     def test_network_timeout_at_open_code_is_logged_as_distinct_error(self):
         stderr = io.StringIO()
         with patch.object(bridge.urllib.request, "urlopen", side_effect=TimeoutError("private-data")):
