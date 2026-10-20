@@ -312,8 +312,8 @@ jobs:
             if (!caller || typeof caller.content !== 'string') {
               throw new Error('Cannot inspect consumer OpenCode caller for batch compatibility.');
             }
-            const callerSource = Buffer.from(caller.content.replace(/\\n/g, ''), 'base64').toString('utf8');
-            const supportsBatch = /^\\s+unresolved_items_json:\\s*$/m.test(callerSource);
+            const callerSource = Buffer.from(caller.content.replace(/\n/g, ''), 'base64').toString('utf8');
+            const supportsBatch = /^\s+unresolved_items_json:\s*$/m.test(callerSource);
             const distinctReviews = [...new Set(items.map(item => item.review_id))];
             for (const reviewId of (supportsBatch ? [items[0].review_id] : distinctReviews)) {
               const inputs = {
