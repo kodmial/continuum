@@ -538,7 +538,7 @@ class WorkflowBindingTests(unittest.TestCase):
             self.auto_merge,
         )
         self.assertIn(
-            "/\\b(?:RESOLVED|UNRESOLVED)\\b/i.test(comment.body || '')",
+            "const latestAnswer = comments",
             self.auto_merge,
         )
         self.assertIn(
