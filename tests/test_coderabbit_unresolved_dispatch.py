@@ -55,6 +55,15 @@ class CodeRabbitBatchContractTests(unittest.TestCase):
         self.assertIn('echo "dispatch=false"', legacy)
         self.assertIn("(vars.CONTINUUM_REVIEW_PROVIDER || 'none') == 'coderabbit'", legacy)
 
+    def test_429_checkpoint_preserves_the_batched_finding_identity(self):
+        executor = OPENCODE.read_text(encoding="utf-8")
+        watchdog = (ROOT / ".github/workflows/continuum-opencode-watchdog.yml").read_text(encoding="utf-8")
+        self.assertIn('"unresolved_items_json": os.environ.get("UNRESOLVED_ITEMS_JSON", "")', executor)
+        self.assertIn("unresolved_items_json: String(identity.unresolved_items_json || '')", watchdog)
+        self.assertIn('unresolved_items_json: "${{ inputs.unresolved_items_json }}"',
+                      STUB.read_text(encoding="utf-8"))
+        self.assertIn("steps.unresolved_batch.outputs.items_json", executor)
+
     @unittest.skipUnless(shutil.which("node"), "Node.js unavailable")
     def test_all_github_script_steps_parse_as_javascript(self):
         sources = [
@@ -120,6 +129,22 @@ const github = {rest:{
         self.assertEqual([item["finding_id"] for item in active], [200])
         self.assertEqual(active[0]["review_id"], 22)
         self.assertEqual(active[0]["unresolved_id"], 202)
+
+        # The same original CodeRabbit collector must still batch two
+        # simultaneously actionable findings across distinct review IDs.
+        both = node_fixture.replace(
+            "{id: 103, in_reply_to_id:100, user:{login:'coderabbitai[bot]'}, body:'**RESOLVED**'}",
+            "{id: 103, in_reply_to_id:100, user:{login:'random'}, body:'not a verdict'}",
+        )
+        result = subprocess.run(
+            ["node", "-"],
+            input=both + "\nasync function run(){\n" + production +
+                  "\n}\nrun().then(() => console.log(JSON.stringify(out))).catch(e=>{console.error(e);process.exit(1)})",
+            text=True, capture_output=True, check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        active = json.loads(json.loads(result.stdout)["items_json"])
+        self.assertEqual([item["finding_id"] for item in active], [100, 200])
 
 
 if __name__ == "__main__":
