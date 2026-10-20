@@ -726,6 +726,14 @@ ENTRIES = (
     },
     {
         "workflow": "continuum-opencode.yml",
+        "step": "Quarantine unavailable upstream route",
+        "capability": CONTROLLER_STATE,
+        "same_repo": True,
+        "reason": "Verified upstream unavailability updates repository-scoped durable model-route state for bounded cooldown and automatic healthy-route failover; this existing contents-write PAT is scoped to the caller repository.",
+        "evidence": ("state-token: ${{ secrets.TAP_PAT }}", "failure-reason: unavailable"),
+    },
+    {
+        "workflow": "continuum-opencode.yml",
         "step": "Attest successful OpenCode issue execution",
         "capability": CONTROLLER_STATE,
         "same_repo": True,
