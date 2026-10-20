@@ -464,10 +464,12 @@ jobs:
         run: |
           set -euo pipefail
           [[ -n "$RECOVERY_OPERATION_ID" ]] || { echo "::error::429 recovery without operation identity."; exit 1; }
-          [[ "$RECOVERY_CHECKPOINT_REF" == opencode/429-checkpoint-* ]] || {
-            echo "::error::Malformed 429 checkpoint ref '$RECOVERY_CHECKPOINT_REF'."
-            exit 1
-          }
+          # Accept the historical quota checkpoints and the infrastructure
+          # checkpoint namespace, with the same exact-SHA safety contract.
+          case "$RECOVERY_CHECKPOINT_REF" in
+            opencode/429-checkpoint-*|opencode/infra-checkpoint-*) ;;
+            *) echo "::error::Malformed infrastructure checkpoint ref '$RECOVERY_CHECKPOINT_REF'."; exit 1 ;;
+          esac
           case "${RECOVERY_STAGE:-implementation-incomplete}" in
             implementation-incomplete|implementation-complete|tests-running|tests-passed|publish-pr|review-repair|qualification) ;;
             *) echo "::error::Unknown 429 recovery stage '$RECOVERY_STAGE'."; exit 1 ;;
