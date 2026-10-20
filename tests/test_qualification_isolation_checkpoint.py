@@ -88,7 +88,7 @@ class InterruptedIssueCheckpointTests(unittest.TestCase):
             # 429 path evacuates through the workflow-owned durable
             # recovery ref (never a second model call on the same VM)
             # instead of the bare interruption exit.
-            'continuum_429_evacuate "opencode-429-issue-issue${ISSUE_NUMBER}"',
+            'continuum_infra_evacuate "opencode-429-issue-issue${ISSUE_NUMBER}"',
             'git push --force origin "HEAD:refs/heads/$CHECKPOINT_BRANCH"',
             'COMMITS_FROM_START="$(git rev-list --count "$BASE_START_SHA..HEAD"',
         ):
