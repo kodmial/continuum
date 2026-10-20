@@ -16,7 +16,7 @@ def script_for_step():
     marker = "      - name: Qualify current CodeRabbit unresolved batch\n"
     assert source.count(marker) == 1
     section = source.split(marker, 1)[1].split("\n      - name: ", 1)[0]
-    match = re.search(r"(?ms)^          script: \\|\\n(.*)", section)
+    match = re.search(r"(?ms)^          script: \|\n(.*)", section)
     assert match, "missing executable batch-validation script"
     return textwrap.dedent(match.group(1))
 
