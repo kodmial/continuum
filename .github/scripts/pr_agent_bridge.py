@@ -77,9 +77,29 @@ def split_model(model: str) -> Tuple[str, str]:
     return (provider.strip() or "opencode", (rest.strip() or model.strip()))
 
 
+def _bridge_timing(stage: str, started: float, outcome: str) -> None:
+    """Structured, content-free evidence; never print prompts, paths or IDs."""
+    elapsed_ms = int((time.monotonic() - started) * 1000)
+    print(
+        f"bridge-phase stage={stage} elapsed_ms={elapsed_ms} outcome={outcome}",
+        file=sys.stderr,
+        flush=True,
+    )
+
+
 def opencode_call(method: str, path: str, payload: Dict[str, Any] | None, timeout: int) -> Tuple[int, str]:
     import urllib.error
 
+    # Fixed labels avoid logging OpenCode session ids or request bodies.
+    if method == "POST" and path == "/session":
+        stage = "create-session"
+    elif method == "POST" and path.endswith("/message"):
+        stage = "send-message"
+    elif method == "DELETE" and path.startswith("/session/"):
+        stage = "delete-session"
+    else:
+        stage = "other"
+    started = time.monotonic()
     data = json.dumps(payload).encode() if payload is not None else None
     request = urllib.request.Request(
         server_url() + path,
@@ -89,10 +109,15 @@ def opencode_call(method: str, path: str, payload: Dict[str, Any] | None, timeou
     )
     try:
         with urllib.request.urlopen(request, timeout=timeout) as response:
-            return response.status, response.read().decode()
+            content = response.read().decode()
+            _bridge_timing(stage, started, f"http_{response.status}")
+            return response.status, content
     except urllib.error.HTTPError as exc:
-        return exc.code, exc.read().decode(errors="replace")
+        content = exc.read().decode(errors="replace")
+        _bridge_timing(stage, started, f"http_{exc.code}")
+        return exc.code, content
     except (urllib.error.URLError, TimeoutError, OSError) as exc:
+        _bridge_timing(stage, started, type(exc).__name__)
         raise BridgeUpstreamError(f"cannot reach opencode server: {exc}", retryable=True) from None
 
 
@@ -191,13 +216,23 @@ class Handler(BaseHTTPRequestHandler):
             self._send(400, openai_error("invalid_request", f"invalid JSON: {exc}"))
             return
         timeout = int(_env("PR_AGENT_TIMEOUT_SECONDS", "180") or "180")
+        started = time.monotonic()
         try:
             self._send(200, run_completion(body, timeout))
+            outcome = "http_200"
         except PrAgentError as exc:
             self._send(400, openai_error("invalid_request", str(exc)))
+            outcome = "http_400"
         except BridgeUpstreamError as exc:
             status = 504 if "timeout" in str(exc).lower() else 502
             self._send(status, openai_error("upstream_error", str(exc)))
+            outcome = f"http_{status}"
+        except (BrokenPipeError, ConnectionResetError):
+            # The reviewer has already ended the HTTP request. Record the
+            # disconnection rather than misattribute it to OpenCode.
+            outcome = "client_disconnected"
+        finally:
+            _bridge_timing("client-request", started, outcome if "outcome" in locals() else "exception")
 
 
 def main() -> int:

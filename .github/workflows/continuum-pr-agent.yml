@@ -991,6 +991,10 @@ jobs:
           GITHUB__USER_TOKEN: ${{ env.CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED == 'true' && secrets.TAP_PAT || (env.CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED != 'true' && github.token || '') }}
           CONFIG__GIT_PROVIDER: github
           CONFIG__MODEL: ${{ steps.stack.outputs.model }}
+          # PR-Agent defaults to 120s, while the synchronous OpenCode bridge
+          # can legitimately wait up to 170s for a whole session response.
+          # Bound the outer reviewer at 200s (>170s bridge + cleanup margin).
+          CONFIG__AI_TIMEOUT: '200'
           CONFIG__CUSTOM_MODEL_MAX_TOKENS: ${{ steps.stack.outputs.max_tokens }}
           # Keep every request on the trusted, route-qualified OpenCode model.
           CONFIG__FALLBACK_MODELS: '[]'
@@ -1685,6 +1689,10 @@ jobs:
           GITHUB__USER_TOKEN: ${{ env.CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED == 'true' && secrets.TAP_PAT || (env.CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED != 'true' && github.token || '') }}
           CONFIG__GIT_PROVIDER: github
           CONFIG__MODEL: ${{ steps.stack.outputs.model }}
+          # PR-Agent defaults to 120s, while the synchronous OpenCode bridge
+          # can legitimately wait up to 170s for a whole session response.
+          # Bound the outer reviewer at 200s (>170s bridge + cleanup margin).
+          CONFIG__AI_TIMEOUT: '200'
           CONFIG__CUSTOM_MODEL_MAX_TOKENS: ${{ steps.stack.outputs.max_tokens }}
           # Keep every request on the trusted, route-qualified OpenCode model.
           CONFIG__FALLBACK_MODELS: '[]'
@@ -2647,6 +2655,335 @@ jobs:
             exit 1
           fi
           echo "Checkout is unmodified: reviewer-only holds."
+
+      - name: Report safe OpenCode bridge phase timings
+        if: always() && steps.start_bridge.outcome == 'success'
+        shell: bash
+        run: |
+          # The bridge emits only fixed operation labels, HTTP status classes
+          # and monotonic durations. Never emit raw OpenCode or PR diff logs.
+          if [[ -s "$RUNNER_TEMP/pr-agent-bridge.log" ]]; then
+            grep -E '^bridge-phase stage=(create-session|send-message|delete-session|client-request) elapsed_ms=[0-9]+ outcome=[a-zA-Z0-9_-]+        if: always()
+        run: |
+          pkill -f "opencode serv[e] --hostname 127.0.0.1" || true
+          pkill -f "continuum-pr-agent-bridge.p[y]" || true
+          pkill -f "pr_agent_bridge.p[y]" || true
+
+      - name: Update persistent PR-Agent retry controller state
+        if: >-
+          always() &&
+          steps.stack.outputs.enabled == 'true' &&
+          steps.admit.outputs.admitted == 'true' &&
+          failure() &&
+          (steps.install_pragent.outcome == 'failure' ||
+           steps.install_opencode.outcome == 'failure' ||
+           steps.start_opencode.outcome == 'failure' ||
+           steps.runtime.outcome == 'failure' ||
+           steps.start_bridge.outcome == 'failure' ||
+           steps.pragent.outcome == 'failure' ||
+           steps.result.outcome == 'failure' ||
+           steps.persistent.outcome == 'failure' ||
+           steps.improve_gate.outcome == 'failure' ||
+           steps.improve.outcome == 'failure' ||
+           steps.improve_skipped.outcome == 'failure' ||
+           steps.post_improve.outcome == 'failure' ||
+           steps.improve_output.outcome == 'failure') &&
+           steps.result.outputs.stale_head != 'true' &&
+           steps.persistent.outputs.stale_head != 'true' &&
+           steps.improve_gate.outputs.stale_head != 'true' &&
+           steps.improve.outputs.stale_head != 'true' &&
+           steps.improve_skipped.outputs.stale_head != 'true' &&
+           steps.post_improve.outputs.stale_head != 'true'
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
+        env:
+          PR_NUMBER: ${{ steps.stack.outputs.pr_number }}
+          HEAD_SHA: ${{ steps.admit.outputs.head_sha }}
+          RETRY_ATTEMPT: ${{ steps.stack.outputs.retry_attempt }}
+          RECOVERY_KIND: ${{ steps.stack.outputs.recovery_kind }}
+          POLICY_SCRIPT: ${{ steps.runtime.outputs.policy_script }}
+        with:
+          github-token: ${{ env.CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED == 'true' && secrets.TAP_PAT || (env.CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED != 'true' && github.token || '') }}
+          script: |
+            const policy = require(process.env.POLICY_SCRIPT);
+            const prNumber = Number(process.env.PR_NUMBER);
+            const head = String(process.env.HEAD_SHA || '').toLowerCase();
+            // Defense in depth: every stale-head discard above carries its
+            // own flag, but revalidate the live PR head first so a
+            // bounded retry is never scheduled for an already-superseded
+            // admitted SHA. Fresh CI on the new HEAD recovers on its own.
+            try {
+              const { data: pr } = await github.rest.pulls.get({
+                owner: process.env.CONTINUUM_PR_AGENT_TARGET_OWNER,
+                repo: process.env.CONTINUUM_PR_AGENT_TARGET_REPO,
+                pull_number: prNumber,
+              });
+              const liveSha = String((pr && pr.head && pr.head.sha) || '').trim().toLowerCase();
+              if (liveSha && liveSha !== head) {
+                core.notice(
+                  'PR head moved during review (' + head + ' -> ' + liveSha + '); ' +
+                  'stale retry cancelled, waiting for fresh CI on the new HEAD.'
+                );
+                return;
+              }
+            } catch (err) {
+              core.warning(`Could not revalidate the live PR head: ${err.message}`);
+            }
+            const kind = String(process.env.RECOVERY_KIND || 'review').toLowerCase();
+            const attempt = Number(process.env.RETRY_ATTEMPT || '0');
+            const exhausted = Number.isInteger(attempt) && attempt >= 2;
+            const next = Number.isInteger(attempt) ? attempt + 1 : 1;
+            const stateMarker = exhausted
+              ? '<!-- continuum-pr-agent-retry-exhausted head=' + head +
+                ' kind=' + kind + ' attempts=' + next + ' -->'
+              : '<!-- continuum-pr-agent-retry head=' + head +
+                ' kind=' + kind + ' attempt=' + next + ' -->';
+            const summary = exhausted
+              ? 'Retry budget exhausted for ' + kind + ' on exact HEAD ' + head + '.'
+              : 'Transient ' + kind + ' failure; bounded retry ' + next + '/3 is scheduled for exact HEAD ' + head + '.';
+            const body = policy.controllerStateBody(stateMarker, summary);
+            // Bounded scan (#254): ten pages cover any realistic controller
+            // history; a truncated window only drops old history, which the
+            // prune loop below removes once visible. `listComments` is
+            // oldest-first and ignores sort/direction, so count down from
+            // the issue total to scan newest-first.
+            // Target-aware: delegated reads use the resolved child.
+            const comments = [];
+            const total = (await github.rest.issues.get({ owner: process.env.CONTINUUM_PR_AGENT_TARGET_OWNER, repo: process.env.CONTINUUM_PR_AGENT_TARGET_REPO, issue_number: prNumber })).data.comments || 0;
+            const lastPage = Math.max(1, Math.ceil(total / 100));
+            for (let page = 1; page <= 10; page += 1) {
+              const targetPage = lastPage - (page - 1);
+              if (targetPage < 1) break;
+              const { data } = await github.rest.issues.listComments(
+                { owner: process.env.CONTINUUM_PR_AGENT_TARGET_OWNER, repo: process.env.CONTINUUM_PR_AGENT_TARGET_REPO, issue_number: prNumber, per_page: 100, page: targetPage }
+              );
+              if (!Array.isArray(data) || data.length === 0) continue;
+              comments.push(...data);
+            }
+            const controller = comments
+              .filter(comment => String(comment.body || '').includes(policy.CONTROLLER_STATE_MARKER))
+              .sort((a, b) => Number(a.id) - Number(b.id));
+            const latest = controller.at(-1);
+            if (latest) {
+              await github.rest.issues.updateComment({
+                owner: process.env.CONTINUUM_PR_AGENT_TARGET_OWNER,
+                repo: process.env.CONTINUUM_PR_AGENT_TARGET_REPO,
+                comment_id: latest.id,
+                body,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: process.env.CONTINUUM_PR_AGENT_TARGET_OWNER,
+                repo: process.env.CONTINUUM_PR_AGENT_TARGET_REPO,
+                issue_number: prNumber,
+                body,
+              });
+            }
+            for (const stale of controller.slice(0, -1)) {
+              await github.rest.issues.deleteComment({
+                owner: process.env.CONTINUUM_PR_AGENT_TARGET_OWNER,
+                repo: process.env.CONTINUUM_PR_AGENT_TARGET_REPO,
+                comment_id: stale.id,
+              });
+            }
+
+      - name: Schedule bounded retry for retryable PR-Agent review failure
+        if: >-
+          always() &&
+          steps.stack.outputs.enabled == 'true' &&
+          steps.admit.outputs.admitted == 'true' &&
+          failure() &&
+          (steps.install_pragent.outcome == 'failure' ||
+           steps.install_opencode.outcome == 'failure' ||
+           steps.start_opencode.outcome == 'failure' ||
+           steps.runtime.outcome == 'failure' ||
+           steps.start_bridge.outcome == 'failure' ||
+           steps.pragent.outcome == 'failure' ||
+           steps.result.outcome == 'failure' ||
+           steps.persistent.outcome == 'failure' ||
+           steps.improve_gate.outcome == 'failure' ||
+           steps.improve.outcome == 'failure' ||
+           steps.improve_skipped.outcome == 'failure' ||
+           steps.post_improve.outcome == 'failure' ||
+           steps.improve_output.outcome == 'failure') &&
+           steps.result.outputs.stale_head != 'true' &&
+           steps.persistent.outputs.stale_head != 'true' &&
+           steps.improve_gate.outputs.stale_head != 'true' &&
+           steps.improve.outputs.stale_head != 'true' &&
+           steps.improve_skipped.outputs.stale_head != 'true' &&
+           steps.post_improve.outputs.stale_head != 'true'
+        env:
+          # Target-aware revalidation (gh pr view plus exact-HEAD workflow-run
+          # evidence against the resolved target). Local same-repository reads
+          # use github.token; delegated cross-repository reads require TAP_PAT.
+          # The fallback is gated on non-delegated runs so a delegated run
+          # without PAT yields an empty token (auth itself fails closed).
+          GH_TOKEN: ${{ env.CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED == 'true' && secrets.TAP_PAT || (env.CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED != 'true' && github.token || '') }}
+          TAP_PAT: ${{ secrets.TAP_PAT }}
+          PR_NUMBER: ${{ steps.stack.outputs.pr_number }}
+          HEAD_SHA: ${{ steps.admit.outputs.head_sha }}
+          RETRY_ATTEMPT: ${{ steps.stack.outputs.retry_attempt }}
+          RETRY_WORKFLOW: ${{ steps.stack.outputs.retry_workflow }}
+          CURRENT_RECOVERY_KIND: ${{ steps.stack.outputs.recovery_kind }}
+          TARGET_CHILD_ID: ${{ inputs.target_child_id }}
+          CONTINUUM_REF_INPUT: ${{ inputs.continuum_ref }}
+          CI_WORKFLOW_NAME: ${{ inputs.ci_workflow_name || vars.CONTINUUM_CI_WORKFLOW_NAME || 'CI' }}
+        run: |
+          set -euo pipefail
+          # Target-aware revalidation against the resolved target: local
+          # same-repository reads use github.token while delegated
+          # cross-repository reads require TAP_PAT. Fail closed when
+          # delegated without PAT instead of masking an auth failure as
+          # stale-cancelled via the revalidation branches below.
+          if [[ "${CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED:-false}" == "true" && -z "${TAP_PAT:-}" ]]; then
+            echo "::error::Delegated PR-Agent retry requires TAP_PAT; refusing to silently cancel."
+            exit 1
+          fi
+          attempt="${RETRY_ATTEMPT:-0}"
+          [[ "$attempt" =~ ^[0-9]+$ ]] || attempt=0
+          case "$RETRY_WORKFLOW" in
+            continuum-pr-agent.yml|pr-agent.yml) ;;
+            *)
+              echo "::error::Invalid isolated PR-Agent retry workflow: $RETRY_WORKFLOW"
+              exit 1
+              ;;
+          esac
+          if (( attempt >= 2 )); then
+            echo "Retry budget exhausted for PR #$PR_NUMBER HEAD $HEAD_SHA."
+            exit 0
+          fi
+
+          # Defense in depth: every stale-head discard above carries its own
+          # flag, but cancel before the backoff anyway so a superseded SHA
+          # never sleeps toward a dispatch. The post-backoff revalidation
+          # below remains as further defense in depth.
+          if live_head="$(gh pr view "$PR_NUMBER" --repo "$CONTINUUM_PR_AGENT_TARGET_REPOSITORY" --json headRefOid --jq .headRefOid 2>/dev/null)"; then
+            if [[ -n "$live_head" && "$live_head" != "$HEAD_SHA" ]]; then
+              echo "PR head moved ($HEAD_SHA -> $live_head); stale retry cancelled."
+              exit 0
+            fi
+          fi
+
+          next=$((attempt + 1))
+          delay=$((15 * (1 << attempt)))
+          sleep "$delay"
+
+          if ! current="$(gh pr view "$PR_NUMBER" --repo "$CONTINUUM_PR_AGENT_TARGET_REPOSITORY" --json headRefOid,state,isDraft --jq '[.headRefOid,.state,(.isDraft|tostring)]|@tsv')"; then
+            echo "Could not revalidate PR state after backoff; stale retry cancelled."
+            exit 0
+          fi
+          current_sha="$(cut -f1 <<<"$current")"
+          current_state="$(cut -f2 <<<"$current")"
+          current_draft="$(cut -f3 <<<"$current")"
+          if [[ "$current_sha" != "$HEAD_SHA" || "$current_state" != "OPEN" || "$current_draft" == "true" ]]; then
+            echo "PR state changed during retry backoff; stale retry cancelled."
+            exit 0
+          fi
+          CI_JSON="$RUNNER_TEMP/pr-agent-ci-runs.json"
+          if ! gh api "repos/$CONTINUUM_PR_AGENT_TARGET_REPOSITORY/actions/runs?event=pull_request&head_sha=$HEAD_SHA&per_page=100" > "$CI_JSON"; then
+            echo "Could not revalidate exact-HEAD CI after backoff; stale retry cancelled."
+            exit 0
+          fi
+          if ! python3 - "$CI_JSON" "$CI_WORKFLOW_NAME" "$HEAD_SHA" "${CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED:-false}" <<'PY'
+          import json, sys
+          path, workflow, head, delegated = sys.argv[1:5]
+          with open(path, "r", encoding="utf-8") as handle:
+              runs = json.load(handle).get("workflow_runs", [])
+          current = sorted(
+              (run for run in runs if run.get("name") == workflow and run.get("head_sha") == head),
+              key=lambda run: run.get("created_at") or "",
+              reverse=True,
+          )
+          conclusion = current[0].get("conclusion") if current else None
+          accepted = (
+              current
+              and current[0].get("status") == "completed"
+              and (
+                  conclusion == "success"
+                  or (delegated == "true" and conclusion == "skipped")
+              )
+          )
+          raise SystemExit(0 if accepted else 1)
+          PY
+          then
+            echo "Exact HEAD no longer has green CI; retry cancelled until a fresh CI event."
+            exit 0
+          fi
+
+          DEFAULT_BRANCH="$(gh repo view "$GITHUB_REPOSITORY" --json defaultBranchRef --jq .defaultBranchRef.name 2>/dev/null || echo main)"
+          DEFAULT_BRANCH="$(printf '%s' "${DEFAULT_BRANCH:-main}" | tr -d ' \t\r\n')"
+          case "$DEFAULT_BRANCH" in
+            ""|*".."*|*"//"*|*"@{"*|*/|*.|*.lock|HEAD|"@"|refs/*|-*|.*) DEFAULT_BRANCH="main" ;;
+          esac
+          if ! [[ "$DEFAULT_BRANCH" =~ ^[A-Za-z0-9][A-Za-z0-9._/-]*$ ]]; then DEFAULT_BRANCH="main"; fi
+          if [[ "$DEFAULT_BRANCH" == */.*/* || "$DEFAULT_BRANCH" == .*/ || "$DEFAULT_BRANCH" == */. ]] || [[ "$DEFAULT_BRANCH" =~ (^|/)\. ]] || [[ "$DEFAULT_BRANCH" =~ \.lock($|/) ]]; then DEFAULT_BRANCH="main"; fi
+          # Local runs dispatch bare: a custom retry_workflow without the
+          # target_child_id workflow_dispatch input rejects unknown inputs,
+          # so an empty value must be omitted (mirrors recovery JS). A
+          # delegated dispatch rejected as an unknown input fails closed
+          # here with an explicit message instead of a generic shell error
+          # (mirrors the merge-wakeup 422 detection).
+          dispatch_isolated_retry() {
+            local dispatch_output dispatch_status
+            set +e
+            dispatch_output="$(gh workflow run "$RETRY_WORKFLOW" --repo "$GITHUB_REPOSITORY" --ref "$DEFAULT_BRANCH" "$@" 2>&1)"
+            dispatch_status=$?
+            set -e
+            if (( dispatch_status == 0 )); then
+              printf '%s\n' "$dispatch_output"
+              return 0
+            fi
+            printf '%s\n' "$dispatch_output" >&2
+            if [[ -n "${TARGET_CHILD_ID:-}" ]] && [[ "$dispatch_output" == *"422"* ]] && [[ "${dispatch_output,,}" == *"target_child_id"* ]]; then
+              echo "::error::Delegated retry requires retry workflow $RETRY_WORKFLOW to declare a target_child_id workflow_dispatch input; refusing bare retry to preserve the delegated target."
+              return 1
+            fi
+            return "$dispatch_status"
+          }
+          CONTINUUM_REF_INPUT="${CONTINUUM_REF_INPUT:-}"
+          if [[ -n "${TARGET_CHILD_ID:-}" ]]; then
+            : "${CONTINUUM_REF_INPUT:?CONTINUUM_REF is required for delegated retry}"
+            dispatch_isolated_retry -f pr_number="$PR_NUMBER" -f expected_head_sha="$HEAD_SHA" -f retry_attempt="$next" -f retry_workflow="$RETRY_WORKFLOW" -f recovery_kind="${CURRENT_RECOVERY_KIND:-review}" -f target_child_id="$TARGET_CHILD_ID" -f continuum_ref="$CONTINUUM_REF_INPUT"
+          else
+            dispatch_isolated_retry -f pr_number="$PR_NUMBER" -f expected_head_sha="$HEAD_SHA" -f retry_attempt="$next" -f retry_workflow="$RETRY_WORKFLOW" -f recovery_kind="${CURRENT_RECOVERY_KIND:-review}"
+          fi
+          echo "Dispatched isolated PR-Agent retry attempt $next/3 for PR #$PR_NUMBER HEAD $HEAD_SHA."
+
+  repair:
+    needs: pr_agent
+    if: >-
+      needs.pr_agent.outputs.admitted == 'true' &&
+      needs.pr_agent.outputs.needs_repair == 'true'
+    uses: ./.github/workflows/continuum-pr-agent-repair.yml
+    secrets: inherit
+    with:
+      continuum_ref: ${{ inputs.continuum_ref }}
+      review_provider: ${{ needs.pr_agent.outputs.review_provider }}
+      pr_number: ${{ needs.pr_agent.outputs.pr_number }}
+      head_sha: ${{ needs.pr_agent.outputs.head_sha }}
+      repair_batch_comment_id: ${{ needs.pr_agent.outputs.repair_batch_comment_id }}
+      retry_attempt: ${{ needs.pr_agent.outputs.recovery_kind == 'repair' && needs.pr_agent.outputs.retry_attempt || '0' }}
+      retry_workflow: ${{ needs.pr_agent.outputs.retry_workflow }}
+      target_child_id: ${{ inputs.target_child_id }}
+
+  merge:
+    needs: pr_agent
+    if: >-
+      needs.pr_agent.outputs.admitted == 'true' &&
+      needs.pr_agent.outputs.ready_to_merge == 'true' &&
+      needs.pr_agent.outputs.merge_gate_verified == 'true'
+    uses: ./.github/workflows/continuum-pr-agent-auto-merge.yml
+    secrets: inherit
+    with:
+      continuum_ref: ${{ inputs.continuum_ref }}
+      review_provider: ${{ needs.pr_agent.outputs.review_provider }}
+      pr_number: ${{ needs.pr_agent.outputs.pr_number }}
+      head_sha: ${{ needs.pr_agent.outputs.head_sha }}
+      gate_verified: ${{ needs.pr_agent.outputs.merge_gate_verified }}
+      target_child_id: ${{ inputs.target_child_id }}
+      post_merge_wakeups: ${{ vars.CONTINUUM_POST_MERGE_WAKEUPS || 'continuum-issue-scheduler.yml' }}
+      post_merge_wakeup_ref: ${{ vars.CONTINUUM_POST_MERGE_WAKEUP_REF || github.event.repository.default_branch || 'main' }}
+ "$RUNNER_TEMP/pr-agent-bridge.log" | tail -n 100 || true
+          fi
 
       - name: Stop the review backend
         if: always()
