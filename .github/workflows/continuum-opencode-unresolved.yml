@@ -14,6 +14,8 @@ permissions: {}
 jobs:
   dispatch-unresolved-fix:
     if: >-
+      (vars.CONTINUUM_REVIEW_PROVIDER || 'none') == 'coderabbit' &&
+      vars.CONTINUUM_ROLE != 'child' &&
       github.event.comment.user.login == 'coderabbitai[bot]' &&
       github.event.comment.in_reply_to_id != null &&
       contains(github.event.comment.body, '**UNRESOLVED**') &&
@@ -40,6 +42,18 @@ jobs:
           REPO_OWNER: ${{ github.repository_owner }}
         run: |
           set -euo pipefail
+          # During compatible migration, old consumers may still have this
+          # historical caller installed. A canonical CodeRabbit caller owns
+          # all UNRESOLVED events when present; never dispatch twice.
+          DEFAULT_BRANCH="$(gh api "repos/${GITHUB_REPOSITORY}" --jq '.default_branch')"
+          CANONICAL_CALLER="$(gh api \
+            "repos/${GITHUB_REPOSITORY}/contents/.github/workflows/continuum-coderabbit-unresolved.yml?ref=${DEFAULT_BRANCH}" \
+            --jq '.content' 2>/dev/null | base64 -d 2>/dev/null || true)"
+          if grep -qE '^[[:space:]]*uses:[[:space:]]*kodmial/continuum/.github/workflows/continuum-coderabbit-unresolved.yml@' <<<"$CANONICAL_CALLER"; then
+            echo "Canonical CodeRabbit batching owns this event; legacy dispatcher disabled."
+            echo "dispatch=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
 
           # CodeRabbit replies to the original finding. Accept verification
           # requests from the canonical OpenCode repair and the Continuum
