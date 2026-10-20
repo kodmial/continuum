@@ -995,6 +995,9 @@ jobs:
           # Keep every request on the trusted, route-qualified OpenCode model.
           CONFIG__FALLBACK_MODELS: '[]'
           CONFIG__RETRY_SAME_MODEL_ON_TIMEOUT: 'false'
+          # LiteLLM's own default per-request retries multiply the outer
+          # reviewer retry budget; the verified Continuum route owns failover.
+          CONFIG__NUM_RETRIES: '0'
           CONFIG__PROPAGATE_TOOL_ERRORS: 'true'
           CONFIG__PERSISTENT_INLINE_COMMENTS: 'true'
           OPENAI__API_BASE: ${{ steps.stack.outputs.api_base }}
@@ -1686,6 +1689,9 @@ jobs:
           # Keep every request on the trusted, route-qualified OpenCode model.
           CONFIG__FALLBACK_MODELS: '[]'
           CONFIG__RETRY_SAME_MODEL_ON_TIMEOUT: 'false'
+          # LiteLLM's own default per-request retries multiply the outer
+          # reviewer retry budget; the verified Continuum route owns failover.
+          CONFIG__NUM_RETRIES: '0'
           CONFIG__PROPAGATE_TOOL_ERRORS: 'true'
           OPENAI__API_BASE: ${{ steps.stack.outputs.api_base }}
           OPENAI__KEY: continuum-loopback
