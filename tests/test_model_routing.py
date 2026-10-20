@@ -362,6 +362,52 @@ class VerifiedReceiptTests(unittest.TestCase):
         receipt = route.verified_receipt(state, "f", expected_model=A)
         self.assertEqual(receipt["head"], "")
 
+    def test_run_scoped_receipt_survives_concurrent_attestation(self):
+        first = route.execution_ticket({"GITHUB_RUN_ID": "703", "GITHUB_RUN_ATTEMPT": "1"})
+        second = route.execution_ticket({"GITHUB_RUN_ID": "704", "GITHUB_RUN_ATTEMPT": "1"})
+        state = {"fingerprint": "f"}
+        state = route.reserve_completion(state, first, A, 1000, 1000)
+        state = route.attest_completion(
+            state, first, A, 1010, "f", 60, "703/1", "head-one")
+        state = route.reserve_completion(state, second, B, 1011, 1011)
+        state = route.attest_completion(
+            state, second, B, 1020, "f", 60, "704/1", "head-two")
+        self.assertEqual(state["last_successful_real_execution"]["run"], "704/1")
+        one = route.verified_receipt(
+            state, "f", expected_model=A, expected_run="703/1",
+            expected_head="head-one")
+        two = route.verified_receipt(
+            state, "f", expected_model=B, expected_run="704/1",
+            expected_head="head-two")
+        self.assertEqual((one["model"], one["run"]), (A, "703/1"))
+        self.assertEqual((two["model"], two["run"]), (B, "704/1"))
+        with self.assertRaisesRegex(route.RouteError, "run differs"):
+            route.verified_receipt(state, "f", expected_run="705/1")
+
+    def test_run_scoped_receipts_are_bounded(self):
+        state = {"fingerprint": "f"}
+        for index in range(route.MAX_EXECUTION_RECEIPTS + 4):
+            run = f"{800 + index}/1"
+            ticket = route.execution_ticket(
+                {"GITHUB_RUN_ID": str(800 + index), "GITHUB_RUN_ATTEMPT": "1"})
+            state = route.reserve_completion(state, ticket, A, 1000 + index, 1000 + index)
+            state = route.attest_completion(
+                state, ticket, A, 1000 + index, "f", 60, run)
+        receipts = state["real_execution_receipts"]
+        self.assertEqual(len(receipts), route.MAX_EXECUTION_RECEIPTS)
+        self.assertIn(f"{800 + route.MAX_EXECUTION_RECEIPTS + 3}/1", receipts)
+        self.assertNotIn("800/1", receipts)
+
+    def test_e2e_fresh_runner_uses_originating_run_handoff(self):
+        workflow = (pathlib.Path(__file__).resolve().parents[1] /
+                    ".github/workflows/continuum-model-routing-e2e.yml").read_text()
+        self.assertIn(
+            "execution_run: ${{ github.run_id }}/${{ github.run_attempt }}", workflow)
+        self.assertIn(
+            "expected-run: ${{ needs.first-runner.outputs.execution_run }}", workflow)
+        self.assertNotIn(
+            "expected-run: ${{ github.run_id }}/${{ github.run_attempt }}", workflow)
+
     def test_verify_operation_reads_receipt_without_probing_or_writing(self):
         import os
         import sys

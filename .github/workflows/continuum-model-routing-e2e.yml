@@ -21,6 +21,7 @@ jobs:
     timeout-minutes: 20
     outputs:
       selected_model: ${{ steps.select.outputs.model }}
+      execution_run: ${{ github.run_id }}/${{ github.run_attempt }}
     steps:
       - name: Checkout exact test code
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
@@ -106,13 +107,14 @@ jobs:
           state-token: ${{ github.token }}
           runtime-version: ${{ steps.toolchain.outputs.runtime-version }}
           expected-model: ${{ needs.first-runner.outputs.selected_model }}
-          expected-run: ${{ github.run_id }}/${{ github.run_attempt }}
+          expected-run: ${{ needs.first-runner.outputs.execution_run }}
       - name: Prove the immutable attestation survived ephemeral runner destruction
         env:
           ACTUAL: ${{ steps.selected.outputs.model }}
           VERIFIED: ${{ steps.selected.outputs.verified }}
           ATTESTED_RUN: ${{ steps.selected.outputs.attested-run }}
           EXPECTED: ${{ needs.first-runner.outputs.selected_model }}
+          EXPECTED_RUN: ${{ needs.first-runner.outputs.execution_run }}
         run: |
           set -euo pipefail
           test "$VERIFIED" = "true"
@@ -121,7 +123,7 @@ jobs:
             echo "::error::Verified model differs from the recorded receipt."
             exit 1
           }
-          test "$ATTESTED_RUN" = "${{ github.run_id }}/${{ github.run_attempt }}" || {
+          test "$ATTESTED_RUN" = "$EXPECTED_RUN" || {
             echo "::error::Verified receipt run identity does not match the trusted handoff."
             exit 1
           }

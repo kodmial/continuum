@@ -31,6 +31,7 @@ STATE_VERSION = 1
 # Long-running consumers may finish after the semantic probe TTL expires.
 MAX_EXECUTION_SECONDS = 6 * 60 * 60
 MAX_PENDING_EXECUTIONS = 128
+MAX_EXECUTION_RECEIPTS = 16
 
 
 class RouteError(RuntimeError):
@@ -347,9 +348,28 @@ def attest_completion(current: dict, ticket: str, model: str, now: int,
     remaining = dict(pending)
     del remaining[ticket]
     current["qualified_selections"] = remaining
-    current["last_successful_real_execution"] = {
+    receipt = {
         "model": model, "at": now, "run": execution_id, "head": head,
     }
+    current["last_successful_real_execution"] = dict(receipt)
+    # Keep a bounded, run-scoped receipt index so a concurrently attested
+    # execution cannot overwrite the exact receipt a later verifier was handed.
+    receipts = current.get("real_execution_receipts")
+    if not isinstance(receipts, dict):
+        receipts = {}
+    receipts = {
+        run: value for run, value in receipts.items()
+        if isinstance(run, str) and run and isinstance(value, dict)
+    }
+    if isinstance(execution_id, str) and 0 < len(execution_id) <= 128:
+        receipts[execution_id] = dict(receipt)
+    ordered = sorted(
+        receipts.items(),
+        key=lambda item: (item[1].get("at"), item[0])
+        if isinstance(item[1].get("at"), int) else (0, item[0]),
+        reverse=True,
+    )
+    current["real_execution_receipts"] = dict(ordered[:MAX_EXECUTION_RECEIPTS])
     return current
 
 
@@ -365,11 +385,24 @@ def verified_receipt(state: dict, fingerprint: str, *,
     handoff (expected model / exact HEAD / originating run).  It never probes
     and never writes.
     """
-    receipt = state.get("last_successful_real_execution")
-    if not isinstance(receipt, dict) or not receipt:
-        raise RouteError("No attested real model execution receipt")
     if state.get("fingerprint") != fingerprint:
         raise RouteError("Attested receipt does not match the trusted runtime route")
+    latest = state.get("last_successful_real_execution")
+    if not isinstance(latest, dict) or not latest:
+        raise RouteError("No attested real model execution receipt")
+    receipt = latest
+    if expected_run:
+        # Prefer the immutable run-scoped receipt. Concurrent executions share
+        # the sticky "latest" pointer, but must never invalidate each other's
+        # already-attested handoff.
+        receipts = state.get("real_execution_receipts")
+        scoped = receipts.get(expected_run) if isinstance(receipts, dict) else None
+        if isinstance(scoped, dict) and scoped:
+            if str(scoped.get("run") or "") != expected_run:
+                raise RouteError("Attested receipt run differs from the trusted handoff")
+            receipt = scoped
+        elif str(latest.get("run") or "") != expected_run:
+            raise RouteError("Attested receipt run differs from the trusted handoff")
     model = receipt.get("model")
     if not isinstance(model, str) or not model:
         raise RouteError("Attested receipt has no model")
