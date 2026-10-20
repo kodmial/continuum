@@ -458,19 +458,11 @@ ENTRIES = (
     },
     {
         "workflow": "continuum-coderabbit-unresolved.yml",
-        "step": "Checkout current PR branch",
-        "capability": PUSH_FANOUT,
+        "step": "Dispatch one batched repair to canonical OpenCode",
+        "capability": DISPATCH,
         "same_repo": True,
-        "reason": "Fix push must trigger CI and review-status recomputation; a token push would suppress those workflows.",
-        "evidence": ("token: ${{ secrets.TAP_PAT }}",),
-    },
-    {
-        "workflow": "continuum-coderabbit-unresolved.yml",
-        "step": "Fix all unresolved findings in one OpenCode run",
-        "capability": PUSH_FANOUT,
-        "same_repo": True,
-        "reason": "Unresolved-finding repairs push to the PR branch and publish review-thread follow-ups that must retrigger CI and CodeRabbit verification.",
-        "evidence": ("GH_TOKEN: ${{ secrets.TAP_PAT }}",),
+        "reason": "PAT-authored workflow_dispatch is needed to wake the existing canonical OpenCode run; the provider batcher never writes code or publishes to PR heads.",
+        "evidence": ("github-token: ${{ secrets.TAP_PAT }}",),
     },
     # -- automation / router / bootstrap / render / docker ---------------
     {
