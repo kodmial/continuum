@@ -96,7 +96,7 @@ const comments = [
  {id: 201, in_reply_to_id:200, user:{login:'kodmial'},
   body:'<!-- auto-merge-coderabbit-verification finding=200 head='+head+' -->'},
  {id: 102, in_reply_to_id:100, user:{login:'coderabbitai[bot]'}, body:'**UNRESOLVED**'},
- {id: 202, in_reply_to_id:200, user:{login:'coderabbitai[bot]'}, body:'**UNRESOLVED**'},
+ {id: 202, in_reply_to_id:200, user:{login:'coderabbitai[bot]'}, body:'The finding remains valid and requires a code fix.'},
  {id: 103, in_reply_to_id:100, user:{login:'coderabbitai[bot]'}, body:'**RESOLVED**'},
  {id: 104, in_reply_to_id:100, user:{login:'random'}, body:'**UNRESOLVED**'}
 ];
@@ -106,7 +106,15 @@ const core = {
 };
 const context = {repo:{owner:'kodmial', repo:'nanodictate'},
  payload:{pull_request:{number:226}}};
-const github = {rest:{
+const github = {
+ graphql: async () => ({repository:{pullRequest:{reviewThreads:{
+  nodes:[
+   {isResolved:false,comments:{nodes:[{databaseId:100,author:{login:'coderabbitai[bot]'}}]}},
+   {isResolved:false,comments:{nodes:[{databaseId:200,author:{login:'coderabbitai[bot]'}}]}}
+  ],
+  pageInfo:{hasNextPage:false,endCursor:null}
+ }}}}),
+ rest:{
  pulls:{
    get: async () => ({data:{review_comments:comments.length,
      head:{sha:head, ref:'opencode/task', repo:{full_name:'kodmial/nanodictate'}}}}),

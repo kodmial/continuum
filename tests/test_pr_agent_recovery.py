@@ -1342,7 +1342,7 @@ class CodeRabbitDeadlockWiringTests(unittest.TestCase):
         self.assertIn("auto-merge-coderabbit-verification", gate)
         self.assertIn("CODERABBIT_THREAD_VERIFICATION_TIMEOUT_MS = 30 * 60_000", gate)
         self.assertIn("const latestVerification = verificationRequests[0] || null", gate)
-        self.assertIn("const verdictAfter = comments.some", gate)
+        self.assertIn("const latestAnswer = comments", gate)
         self.assertIn("Date.now() - verificationAt <", gate)
         self.assertIn("CodeRabbit did not answer thread verification", gate)
         self.assertNotIn("if (duplicate) continue", gate)
