@@ -36,7 +36,7 @@ class CodeRabbitBatchContractTests(unittest.TestCase):
         canonical = OPENCODE.read_text(encoding="utf-8")
         self.assertIn("Collect all unresolved findings", batcher)
         self.assertIn("Dispatch one batched repair to canonical OpenCode", batcher)
-        self.assertIn("unresolved_items_json: batch", batcher)
+        self.assertIn("if (supportsBatch) inputs.unresolved_items_json = batch", batcher)
         self.assertNotIn("opencode run --auto", batcher)
         self.assertNotIn("1.18.34", batcher)
         self.assertNotIn("git push ", batcher)
