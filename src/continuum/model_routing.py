@@ -479,7 +479,12 @@ def run() -> int:
             def record(current):
                 return attest_retryable_failure(
                     current, ticket, selected, now, fingerprint, reason, config.cooldown)
-        store.update(key, record)
+        updated = store.update(key, record)
+        if args.operation == "fail":
+            # A real provider timeout may retire the LAST viable route.
+            # Propagate its durable cooldown to the workflow so no nested
+            # 15/30-second retry runs before any model can recover.
+            publish_cooldown_not_before(config, updated, now)
         return 0
 
     state, _, _ = store.read(key)
