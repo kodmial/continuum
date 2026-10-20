@@ -1670,12 +1670,25 @@ jobs:
                           per_page: 100, since: answeredAt,
                         })
                       );
-                      const batchAlreadyQueued = laterBatches.some(comment =>
-                        (comment.body || '').includes(
-                          `<!-- continuum-coderabbit-batch head=${pr.head.sha} `
+                      // Queuing is not completion: an OpenCode run may
+                      // succeed after skipping the actual repair. A recent
+                      // enqueue is an in-flight lease only, not a permanent
+                      // proof that the review finding was fixed. The canonical
+                      // batcher below owns dedupe, runner activity checks and
+                      // exponential infrastructure backoff.
+                      const latestBatch = laterBatches
+                        .filter(comment =>
+                          (comment.body || '').includes(
+                            `<!-- continuum-coderabbit-batch head=${pr.head.sha} `
+                          )
                         )
-                      );
-                      if (requireCodeRabbit && !batchAlreadyQueued) {
+                        .sort((a, b) => Number(b.id) - Number(a.id))[0];
+                      const batchAt = latestBatch
+                        ? Date.parse(latestBatch.created_at || '') : 0;
+                      const recentBatchLease = !!latestBatch &&
+                        (!Number.isFinite(batchAt) ||
+                         Date.now() - batchAt < 10 * 60_000);
+                      if (requireCodeRabbit && !recentBatchLease) {
                         // Older installed consumers may not yet support a
                         // workflow_dispatch PR identity. Do not turn that
                         // compatibility gap into an auto-merge failure.
