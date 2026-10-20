@@ -78,7 +78,7 @@ MUTATION_COUNTS = {
     "continuum-issue-scheduler.yml": 11,
     "continuum-opencode-repair.yml": 2,
     "continuum-opencode-watchdog.yml": 5,
-    "continuum-opencode.yml": 11,
+    "continuum-opencode.yml": 12,  # additional functional batch-verification reply
     "continuum-pr-agent-auto-merge.yml": 1,
     "continuum-pr-agent-canary.yml": 4,
     "continuum-pr-agent-recovery.yml": 4,
@@ -137,7 +137,7 @@ FUNCTIONAL_ANCHORS = {
     ),
     "continuum-coderabbit-retry.yml": ("@coderabbitai full review",),
     "continuum-coderabbit-unresolved.yml": (
-        "Re-check this exact original finding after the batched OpenCode retry.",
+        "Queued one canonical OpenCode repair for",
     ),
     "continuum-consumer-child-dispatcher.yml": (
         "Closed automatically: delegated task #",
@@ -193,6 +193,7 @@ FUNCTIONAL_ANCHORS = {
         "Continuum classified this CodeRabbit",
         "@coderabbitai full review",
         "Re-check this exact original finding after the OpenCode fixes.",
+        "Re-check this exact original finding after the batched OpenCode repair.",
         "Automation produced no code changes",
         "Qualification attempted product changes",
         "produced no trusted pass/fail evidence",
