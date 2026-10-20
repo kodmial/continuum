@@ -2,7 +2,7 @@ name: Continuum OpenCode route selector
 description: Resolve only trusted caller-approved models using verified OpenCode; record completion or failure after real execution
 inputs:
   operation:
-    description: select before work, record after success, fail after unsuccessful real review
+    description: select before work, record after success, fail after a verified provider error
     required: false
     default: select
   models:
@@ -18,7 +18,11 @@ inputs:
     required: false
     default: ''
   selected-model:
-    description: Exact model produced by select; required for record/fail
+    description: Exact model produced by select; required for record or fail
+    required: false
+    default: ''
+  failure-reason:
+    description: Strict provider error class for fail (timeout, quota_429, upstream, unavailable)
     required: false
     default: ''
   task-class:
@@ -75,6 +79,7 @@ runs:
         OPENCODE_MODEL: ${{ inputs.legacy-model }}
         CONTINUUM_EXPLICIT_MODEL: ${{ inputs.explicit-pin }}
         CONTINUUM_SELECTED_MODEL: ${{ inputs.selected-model }}
+        CONTINUUM_FAILURE_REASON: ${{ inputs.failure-reason }}
         CONTINUUM_MODEL_TASK_CLASS: ${{ inputs.task-class }}
         CONTINUUM_MODEL_PROFILE: ${{ inputs.profile }}
         CONTINUUM_MODEL_STATE_REPOSITORY: ${{ inputs.state-repository }}

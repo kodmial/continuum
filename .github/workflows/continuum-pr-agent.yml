@@ -992,12 +992,13 @@ jobs:
           CONFIG__GIT_PROVIDER: github
           CONFIG__MODEL: ${{ steps.stack.outputs.model }}
           CONFIG__CUSTOM_MODEL_MAX_TOKENS: ${{ steps.stack.outputs.max_tokens }}
+          # Keep every request on the trusted, route-qualified OpenCode model.
           # The shared outer router owns failover between approved models.
           # PR-Agent 0.46.0 otherwise retries one timed-out model internally
           # and falls back to its default, which is not in OPENCODE_MODELS.
+          CONFIG__FALLBACK_MODELS: '[]'
           CONFIG__RETRY_SAME_MODEL_ON_TIMEOUT: 'false'
           CONFIG__NUM_RETRIES: '0'
-          CONFIG__FALLBACK_MODELS: '[]'
           CONFIG__PROPAGATE_TOOL_ERRORS: 'true'
           CONFIG__PERSISTENT_INLINE_COMMENTS: 'true'
           OPENAI__API_BASE: ${{ steps.stack.outputs.api_base }}
@@ -1094,13 +1095,35 @@ jobs:
               --github_action_config.enable_output=true \
               --github_action_config.fail_on_tool_errors=true
           }
+          # Preserve native review evidence on failure so a trusted, bounded
+          # provider-error classifier can retire only the selected route.
+          review_log="$RUNNER_TEMP/pr-agent-review-execution.log"
           if [[ "${CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED:-false}" == "true" ]]; then
-            if ! run_review >"$RUNNER_TEMP/pr-agent-delegated-review.log" 2>&1; then
+            if run_review >"$review_log" 2>&1; then
+              review_ok=true
+            else
+              review_ok=false
               echo "::error::Delegated PR-Agent review failed; detailed output remains runner-local."
-              exit 1
             fi
           else
-            run_review
+            if run_review 2>&1 | tee "$review_log"; then
+              review_ok=true
+            else
+              review_ok=false
+            fi
+          fi
+          if [[ "$review_ok" != true ]]; then
+            # Never cooldown for malformed review output, source failures,
+            # network/git errors or missing permissions. Only LLM provider
+            # diagnostics authorize a model failure receipt.
+            if grep -Eiq 'litellm[.]Timeout|APITimeoutError|Request timed out|timeout value=' "$review_log"; then
+              echo "provider_failure=timeout" >> "$GITHUB_OUTPUT"
+            elif grep -Eiq 'FreeUsageLimitError|litellm[.]RateLimitError|429 Too Many Requests' "$review_log"; then
+              echo "provider_failure=quota_429" >> "$GITHUB_OUTPUT"
+            elif grep -Eiq 'litellm[.](InternalServerError|APIConnectionError)|503 Service Unavailable|502 Bad Gateway' "$review_log"; then
+              echo "provider_failure=upstream" >> "$GITHUB_OUTPUT"
+            fi
+            exit 1
           fi
           # Raw native review evidence must never cross a public parent
           # step/job boundary as a GitHub output: delegated target identifiers
@@ -1171,9 +1194,10 @@ jobs:
 
       # The short semantic probe is NOT evidence that an actual PR-Agent
       # review can complete. Quarantine the selected route when upstream
-      # review execution fails, before the bounded retry selects its model.
-      # The shared action consumes a same-run qualified selection receipt:
-      # no invented model, no cross-run poisoning, no unreviewed merge.
+      # review reports a verified provider failure, before the bounded retry
+      # selects its model. The shared action consumes a same-run qualified
+      # selection receipt: no invented model, no cross-run poisoning, no
+      # unreviewed merge.
       - name: Record failed real PR-Agent execution for route failover
         if: >-
           always() &&
@@ -1181,10 +1205,12 @@ jobs:
           steps.admit.outputs.admitted == 'true' &&
           steps.model_route.outcome == 'success' &&
           steps.pragent.outcome == 'failure' &&
+          steps.pragent.outputs.provider_failure != '' &&
           steps.model_route.outputs.model
         uses: kodmial/continuum/.github/actions/model-route@main
         with:
           operation: fail
+          failure-reason: ${{ steps.pragent.outputs.provider_failure }}
           models: ${{ vars.OPENCODE_MODELS }}
           legacy-model: ${{ vars.OPENCODE_MODEL }}
           explicit-pin: ${{ inputs.opencode_model }}
@@ -1694,12 +1720,13 @@ jobs:
           CONFIG__GIT_PROVIDER: github
           CONFIG__MODEL: ${{ steps.stack.outputs.model }}
           CONFIG__CUSTOM_MODEL_MAX_TOKENS: ${{ steps.stack.outputs.max_tokens }}
+          # Keep every request on the trusted, route-qualified OpenCode model.
           # The shared outer router owns failover between approved models.
           # PR-Agent 0.46.0 otherwise retries one timed-out model internally
           # and falls back to its default, which is not in OPENCODE_MODELS.
+          CONFIG__FALLBACK_MODELS: '[]'
           CONFIG__RETRY_SAME_MODEL_ON_TIMEOUT: 'false'
           CONFIG__NUM_RETRIES: '0'
-          CONFIG__FALLBACK_MODELS: '[]'
           CONFIG__PROPAGATE_TOOL_ERRORS: 'true'
           OPENAI__API_BASE: ${{ steps.stack.outputs.api_base }}
           OPENAI__KEY: continuum-loopback

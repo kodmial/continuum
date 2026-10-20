@@ -389,6 +389,43 @@ def attest_execution_failure(current: dict, ticket: str, model: str, now: int,
     return current
 
 
+def attest_retryable_failure(current: dict, ticket: str, model: str, now: int,
+                             fingerprint: str, reason: str, cooldown: int) -> dict:
+    """Consume only the same run's qualified selection after a real provider error.
+
+    Never convert source-code/review-tool failures into model cooldowns.
+    No other Actions run may report a failure for this selection.
+    """
+    if reason not in ("timeout", "quota_429", "upstream", "unavailable"):
+        raise RouteError("Unsupported real-execution failure reason")
+    if current.get("fingerprint") != fingerprint:
+        raise RouteError("Stale model state fingerprint")
+    pending = current.get("qualified_selections") or {}
+    if not isinstance(pending, dict):
+        raise RouteError("Corrupt model selection state")
+    selected = pending.get(ticket) or {}
+    if selected.get("model") != model:
+        raise RouteError("No qualified selection for this run and model")
+    selected_at = selected.get("at")
+    if not isinstance(selected_at, int) or not 0 <= now - selected_at <= MAX_EXECUTION_SECONDS:
+        raise RouteError("Model selection proof expired or was not qualified")
+    remaining = dict(pending)
+    del remaining[ticket]
+    current["qualified_selections"] = remaining
+    # A large review can run longer than the probe cooldown. Do not reselect
+    # the timed-out model on the very next bounded retry.
+    delay = max(cooldown, 3600) if reason == "timeout" else cooldown
+    active = current.get("cooldowns") or {}
+    if not isinstance(active, dict):
+        raise RouteError("Corrupt model cooldown state")
+    current["cooldowns"] = dict(active)
+    current["cooldowns"][model] = max(int(active.get(model, 0)), now + delay)
+    current["last_failed_real_execution"] = {
+        "model": model, "at": now, "reason": reason,
+    }
+    return current
+
+
 def route_key(repo: str, profile: str, credentials: str, config: Configuration,
               binary_sha: str) -> str:
     if not profile or not re.fullmatch(r"[A-Za-z0-9._-]{1,80}", profile):
@@ -437,31 +474,32 @@ def run() -> int:
     store = GitRefStore(owner, env.get("CONTINUUM_MODEL_STATE_TOKEN", ""))
     now = int(time.time())
     ticket = execution_ticket(env)
-    if args.operation == "record":
+    if args.operation in ("record", "fail"):
         selected = env.get("CONTINUUM_SELECTED_MODEL", "")
         execution_id = env.get("GITHUB_RUN_ID", "") + "/" + env.get("GITHUB_RUN_ATTEMPT", "")
         if selected not in config.models or not execution_id.strip("/"):
             raise RouteError("Cannot attest unspecified execution")
-        def record(current):
-            return attest_completion(
-                current, ticket, selected, now,
-                config.fingerprint(digest, credential_scope), config.ttl,
-                execution_id, env.get("CONTINUUM_TASK_HEAD", ""))
+        fingerprint = config.fingerprint(digest, credential_scope)
+        if args.operation == "record":
+            def record(current):
+                return attest_completion(
+                    current, ticket, selected, now, fingerprint, config.ttl,
+                    execution_id, env.get("CONTINUUM_TASK_HEAD", ""))
+        else:
+            reason = env.get("CONTINUUM_FAILURE_REASON", "")
+            if reason:
+                def record(current):
+                    return attest_retryable_failure(
+                        current, ticket, selected, now, fingerprint, reason,
+                        config.cooldown)
+            else:
+                if config.task_class != "review":
+                    raise RouteError("Real execution failover receipt is review-only")
+                def record(current):
+                    return attest_execution_failure(
+                        current, ticket, selected, now, fingerprint,
+                        config.ttl, config.cooldown)
         store.update(key, record)
-        return 0
-
-    if args.operation == "fail":
-        if config.task_class != "review":
-            raise RouteError("Real execution failover receipt is review-only")
-        selected = env.get("CONTINUUM_SELECTED_MODEL", "")
-        if selected not in config.models:
-            raise RouteError("Cannot record a failure for an unapproved model")
-        def fail(current):
-            return attest_execution_failure(
-                current, ticket, selected, now,
-                config.fingerprint(digest, credential_scope),
-                config.ttl, config.cooldown)
-        store.update(key, fail)
         return 0
 
     state, _, _ = store.read(key)
