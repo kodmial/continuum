@@ -1,4 +1,4 @@
-"""Regression contract for the single CodeRabbit -> Continuum OpenCode repair path."""
+"""Executable contract for CodeRabbit-owned UNRESOLVED batching and canonical OpenCode."""
 
 import json
 from pathlib import Path
@@ -8,100 +8,118 @@ import subprocess
 import textwrap
 import unittest
 
-
 ROOT = Path(__file__).resolve().parents[1]
-CANONICAL = ROOT / ".github/workflows/continuum-opencode-unresolved.yml"
+BATCHER = ROOT / ".github/workflows/continuum-coderabbit-unresolved.yml"
+OPENCODE = ROOT / ".github/workflows/continuum-opencode.yml"
+LEGACY = ROOT / ".github/workflows/continuum-opencode-unresolved.yml"
 INSTALLER = ROOT / "install.sh"
+STUB = ROOT / ".github/caller-stubs/continuum-opencode.yml"
 
 
-def dispatch_shell() -> str:
-    workflow = CANONICAL.read_text(encoding="utf-8")
-    match = re.search(
-        r"(?ms)^        run: \|\n(.*?)^      - name: Dispatch OpenCode retry",
-        workflow,
-    )
-    if not match:
-        raise AssertionError("Missing canonical CodeRabbit UNRESOLVED dispatch script")
+def js_for_step(workflow, step_name):
+    text = workflow.read_text(encoding="utf-8")
+    marker = "      - name: " + step_name + "\n"
+    assert text.count(marker) == 1, "expected one " + step_name
+    section = text.split(marker, 1)[1].split("\n      - name: ", 1)[0]
+    match = re.search(r"(?ms)^          script: \|\n(.*)", section)
+    assert match, "missing JS for " + step_name
     return textwrap.dedent(match.group(1))
 
 
-def verification_filter() -> str:
-    shell = dispatch_shell()
-    match = re.search(
-        r'(?s)--arg owner "\$REPO_OWNER" \'(.*?)\' <<<"\$COMMENTS"\)',
-        shell,
-    )
-    if not match:
-        raise AssertionError("Missing production jq verification selector")
-    return match.group(1)
+class CodeRabbitBatchContractTests(unittest.TestCase):
+    def test_one_provider_owner_and_one_model_executor(self):
+        installer = INSTALLER.read_text(encoding="utf-8")
+        core = installer.split("CORE_STUBS=(", 1)[1].split(")", 1)[0]
+        self.assertIn("\n  continuum-coderabbit-unresolved.yml\n", core)
+        self.assertNotIn("\n  continuum-opencode-unresolved.yml\n", core)
+        batcher = BATCHER.read_text(encoding="utf-8")
+        canonical = OPENCODE.read_text(encoding="utf-8")
+        self.assertIn("Collect all unresolved findings", batcher)
+        self.assertIn("Dispatch one batched repair to canonical OpenCode", batcher)
+        self.assertIn("unresolved_items_json: batch", batcher)
+        self.assertNotIn("opencode run --auto", batcher)
+        self.assertNotIn("1.18.34", batcher)
+        self.assertNotIn("git push ", batcher)
+        self.assertNotIn("git commit ", batcher)
+        self.assertIn("steps.model_route.outputs.model", canonical)
+        self.assertIn("steps.cached_opencode.outputs.runtime-version", canonical)
+        self.assertIn("Qualify current CodeRabbit unresolved batch", canonical)
+        self.assertIn("Fix CodeRabbit review findings", canonical)
+        self.assertIn("Ask CodeRabbit to verify every original finding", canonical)
+        self.assertIn("UNRESOLVED_ITEMS_JSON", canonical)
+        self.assertIn("unresolved_items_json:", STUB.read_text(encoding="utf-8"))
 
+    def test_old_handler_is_a_migration_shim_not_a_competing_owner(self):
+        legacy = LEGACY.read_text(encoding="utf-8")
+        self.assertIn("CANONICAL_CALLER", legacy)
+        self.assertIn('echo "dispatch=false"', legacy)
+        self.assertIn("(vars.CONTINUUM_REVIEW_PROVIDER || 'none') == 'coderabbit'", legacy)
 
-class CodeRabbitUnresolvedDispatchContract(unittest.TestCase):
-    def test_real_dispatch_shell_is_syntactically_valid(self):
-        if not shutil.which("bash"):
-            self.skipTest("bash unavailable")
+    @unittest.skipUnless(shutil.which("node"), "Node.js unavailable")
+    def test_all_github_script_steps_parse_as_javascript(self):
+        sources = [
+            (BATCHER, "Collect all unresolved findings"),
+            (BATCHER, "Dispatch one batched repair to canonical OpenCode"),
+            (OPENCODE, "Qualify current CodeRabbit unresolved batch"),
+            (OPENCODE, "Ask CodeRabbit to verify every original finding"),
+        ]
+        for workflow, step in sources:
+            with self.subTest(workflow=workflow.name, step=step):
+                code = "async function testWorkflow() {\n" + js_for_step(workflow, step) + "\n}\n"
+                check = subprocess.run(
+                    ["node", "--check", "-"], input=code, text=True,
+                    capture_output=True, check=False,
+                )
+                self.assertEqual(check.returncode, 0, check.stderr)
+
+    @unittest.skipUnless(shutil.which("node"), "Node.js unavailable")
+    def test_original_batch_collector_keeps_multiple_latest_unresolved(self):
+        # Exercise the actual production JS collector with GitHub API fixtures:
+        # two CodeRabbit findings from different reviews; a newer RESOLVED
+        # supersedes one UNRESOLVED; an unrelated author never participates.
+        node_fixture = """
+const head = 'a'.repeat(40);
+const comments = [
+ {id: 100, user:{login:'coderabbitai[bot]'}, pull_request_review_id:11, body:'issue one'},
+ {id: 200, user:{login:'coderabbitai[bot]'}, pull_request_review_id:22, body:'issue two'},
+ {id: 101, in_reply_to_id:100, user:{login:'kodmial'},
+  body:'<!-- opencode-coderabbit-verification review=11 finding=100 head='+head+' -->'},
+ {id: 201, in_reply_to_id:200, user:{login:'kodmial'},
+  body:'<!-- auto-merge-coderabbit-verification finding=200 head='+head+' -->'},
+ {id: 102, in_reply_to_id:100, user:{login:'coderabbitai[bot]'}, body:'**UNRESOLVED**'},
+ {id: 202, in_reply_to_id:200, user:{login:'coderabbitai[bot]'}, body:'**UNRESOLVED**'},
+ {id: 103, in_reply_to_id:100, user:{login:'coderabbitai[bot]'}, body:'**RESOLVED**'},
+ {id: 104, in_reply_to_id:100, user:{login:'random'}, body:'**UNRESOLVED**'}
+];
+const out = {};
+const core = {
+ setOutput: (k,v) => {out[k]=String(v);}, notice: () => {}, warning: () => {}
+};
+const context = {repo:{owner:'kodmial', repo:'nanodictate'},
+ payload:{pull_request:{number:226}}};
+const github = {rest:{
+ pulls:{
+   get: async () => ({data:{review_comments:comments.length,
+     head:{sha:head, ref:'opencode/task', repo:{full_name:'kodmial/nanodictate'}}}}),
+   listReviewComments: async () => ({data:comments}),
+   getReviewComment: async ({comment_id}) => ({data:comments.find(c=>c.id===comment_id)})
+ },
+ git:{getRef:async()=>({data:{object:{sha:head}}})}
+}};
+"""
+        production = js_for_step(BATCHER, "Collect all unresolved findings")
+        script = node_fixture + "\nasync function run(){\n" + production + "\n}\nrun().then(() => console.log(JSON.stringify(out))).catch(e=>{console.error(e);process.exit(1)})"
         result = subprocess.run(
-            ["bash", "-n"], input=dispatch_shell(), text=True,
+            ["node", "-"], input=script, text=True,
             capture_output=True, check=False,
         )
         self.assertEqual(result.returncode, 0, result.stderr)
-
-    @unittest.skipUnless(shutil.which("jq"), "jq unavailable")
-    def test_both_verified_sources_use_one_newest_authorized_request(self):
-        sha = "a" * 40
-        finding = 4325066310
-        for source in (
-            f"<!-- opencode-coderabbit-verification review=5585156309 finding={finding} head={sha} -->",
-            f"<!-- auto-merge-coderabbit-verification finding={finding} head={sha} -->",
-        ):
-            with self.subTest(source=source):
-                comments = [
-                    {"id": 10, "in_reply_to_id": finding,
-                     "user": {"login": "someone-else"}, "body": source},
-                    {"id": 11, "in_reply_to_id": finding,
-                     "user": {"login": "kodmial"},
-                     "body": f"<!-- auto-merge-coderabbit-verification finding={finding}0 head={sha} -->"},
-                    {"id": 12, "in_reply_to_id": finding,
-                     "user": {"login": "kodmial"}, "body": source},
-                    {"id": 14, "in_reply_to_id": finding,
-                     "user": {"login": "kodmial"}, "body": source},
-                ]
-                result = subprocess.run(
-                    ["jq", "-c", "--argjson", "finding", str(finding),
-                     "--argjson", "unresolved", "13",
-                     "--arg", "owner", "kodmial", verification_filter()],
-                    input=json.dumps(comments), text=True,
-                    capture_output=True, check=False,
-                )
-                self.assertEqual(result.returncode, 0, result.stderr)
-                self.assertEqual(json.loads(result.stdout)["id"], 12)
-
-    def test_legacy_handler_not_installed_or_invoked_by_canonical_path(self):
-        installer = INSTALLER.read_text(encoding="utf-8")
-        core = installer.split("CORE_STUBS=(", 1)[1].split(")", 1)[0]
-        self.assertIn("continuum-opencode-unresolved.yml", core)
-        self.assertNotIn("\n  continuum-coderabbit-unresolved.yml", core)
-        workflow = CANONICAL.read_text(encoding="utf-8")
-        self.assertEqual(workflow.count("      - name: Dispatch OpenCode retry"), 1)
-        self.assertIn("continuum-opencode.yml/dispatches", workflow)
-        self.assertNotIn("opencode run --auto", workflow)
-        self.assertNotIn("1.18.34", workflow)
-
-    def test_repair_stays_bound_to_original_finding_and_live_pr(self):
-        shell = dispatch_shell()
-        for token in (
-            "pulls/comments/${FINDING_ID}",
-            "ROOT_AUTHOR",
-            "coderabbitai[bot]",
-            "ROOT_PR",
-            "ROOT_PARENT",
-            ".pull_request_review_id",
-            '[[ "$LATEST_RABBIT_REPLY_ID" != "$UNRESOLVED_COMMENT_ID" ]]',
-            '[[ "$LIVE_REPO" != "$GITHUB_REPOSITORY" ]]',
-            '[[ "$LIVE_STATE" != "open" ]]',
-            '[[ "$COMPARE_STATUS" != "ahead" ]]',
-        ):
-            self.assertIn(token, shell)
+        values = json.loads(result.stdout)
+        self.assertEqual(values["should_run"], "true")
+        active = json.loads(values["items_json"])
+        self.assertEqual([item["finding_id"] for item in active], [200])
+        self.assertEqual(active[0]["review_id"], 22)
+        self.assertEqual(active[0]["unresolved_id"], 202)
 
 
 if __name__ == "__main__":
