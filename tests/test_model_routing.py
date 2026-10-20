@@ -366,5 +366,18 @@ class CooldownRecoveryContractTests(unittest.TestCase):
             "Controller-state policy must exist before model selection can fail")
 
 
+    def test_repair_recovery_uses_same_cooldown_deadline(self):
+        workflow = (PATH.parents[2] / ".github/workflows/continuum-pr-agent-repair.yml").read_text()
+        block = workflow.split(
+            "      - name: Update persistent PR-Agent repair retry controller state", 1
+        )[1].split(
+            "      - name: Schedule bounded retry for retryable PR-Agent repair failure", 1
+        )[0]
+        self.assertIn("CONTINUUM_MODEL_NOT_BEFORE_EPOCH", block)
+        self.assertIn("kind=repair attempt=", block)
+        self.assertIn("not-before=", block)
+        self.assertIn("const exhausted = !cooling", block)
+
+
 if __name__ == "__main__":
     unittest.main()
