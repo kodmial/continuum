@@ -2047,6 +2047,7 @@ jobs:
             );
 
       - name: Cool down failed real provider route before the bounded retry
+        id: model_cooldown
         if: >-
           always() &&
           steps.model_route.outcome == 'success' &&
@@ -2709,7 +2710,7 @@ jobs:
           RECOVERY_KIND: ${{ steps.stack.outputs.recovery_kind }}
           POLICY_SCRIPT: ${{ steps.runtime.outputs.policy_script }}
           ROUTE_NOT_BEFORE: ${{ env.CONTINUUM_MODEL_NOT_BEFORE_EPOCH }}
-          MODEL_ROUTE_FAILED: ${{ steps.model_route.outcome == 'failure' && 'true' || 'false' }}
+          ROUTE_UNAVAILABLE: ${{ (steps.model_route.outcome == 'failure' || steps.model_cooldown.outcome == 'success') && 'true' || 'false' }}
         with:
           github-token: ${{ env.CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED == 'true' && secrets.TAP_PAT || (env.CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED != 'true' && github.token || '') }}
           script: |
@@ -2745,7 +2746,7 @@ jobs:
             // cannot possibly pick a model must NOT exhaust the old 3-try
             // inline budget. The shared recovery controller understands this
             // canonical not-before marker and wakes after the earliest expiry.
-            const cooling = process.env.MODEL_ROUTE_FAILED === 'true' &&
+            const cooling = process.env.ROUTE_UNAVAILABLE === 'true' &&
               Number.isSafeInteger(notBefore) &&
               notBefore > Math.floor(Date.now() / 1000);
             const exhausted = !cooling && Number.isInteger(attempt) && attempt >= 2;
@@ -2818,6 +2819,7 @@ jobs:
           steps.stack.outputs.enabled == 'true' &&
           steps.admit.outputs.admitted == 'true' &&
           failure() &&
+          env.CONTINUUM_MODEL_NOT_BEFORE_EPOCH == '' &&
           (steps.install_pragent.outcome == 'failure' ||
            steps.install_opencode.outcome == 'failure' ||
            steps.start_opencode.outcome == 'failure' ||
@@ -2863,6 +2865,10 @@ jobs:
           if [[ "${CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED:-false}" == "true" && -z "${TAP_PAT:-}" ]]; then
             echo "::error::Delegated PR-Agent retry requires TAP_PAT; refusing to silently cancel."
             exit 1
+          fi
+          if [[ -n "${CONTINUUM_MODEL_NOT_BEFORE_EPOCH:-}" ]]; then
+            echo "All trusted models are in durable cooldown; recovery controller owns the deferred retry."
+            exit 0
           fi
           attempt="${RETRY_ATTEMPT:-0}"
           [[ "$attempt" =~ ^[0-9]+$ ]] || attempt=0

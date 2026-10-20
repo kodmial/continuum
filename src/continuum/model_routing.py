@@ -360,6 +360,8 @@ def attest_completion(current: dict, ticket: str, model: str, now: int,
                       head: str = "") -> dict:
     """A live success may outlast probe TTL, but never its run-scoped receipt."""
     if current.get("fingerprint") != fingerprint:
+        if not current:
+            raise SelectionNotVisible("Model state ref is not visible yet")
         raise RouteError("Stale model state fingerprint")
     pending = current.get("qualified_selections") or {}
     if not isinstance(pending, dict):
@@ -396,6 +398,8 @@ def attest_retryable_failure(current: dict, ticket: str, model: str, now: int,
     if reason not in ("timeout", "quota_429", "upstream", "unavailable"):
         raise RouteError("Unsupported real-execution failure reason")
     if current.get("fingerprint") != fingerprint:
+        if not current:
+            raise SelectionNotVisible("Model state ref is not visible yet")
         raise RouteError("Stale model state fingerprint")
     pending = current.get("qualified_selections") or {}
     if not isinstance(pending, dict):
@@ -508,7 +512,12 @@ def run() -> int:
             def record(current):
                 return attest_retryable_failure(
                     current, ticket, selected, now, fingerprint, reason, config.cooldown)
-        persist_bound_receipt(store, key, record)
+        updated = persist_bound_receipt(store, key, record)
+        if args.operation == "fail":
+            # A real provider timeout may retire the LAST viable route.
+            # Propagate its durable cooldown to the workflow so no nested
+            # 15/30-second retry runs before any model can recover.
+            publish_cooldown_not_before(config, updated, now)
         return 0
 
     state, _, _ = store.read(key)
