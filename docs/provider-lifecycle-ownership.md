@@ -43,7 +43,8 @@ authority: the two auto-merge workflows remain the sole executors.
 Canonical: `src/continuum/coderabbit_adapter.py` plus the
 CodeRabbit-owned blocks inside `continuum-auto-merge.yml`,
 `continuum-coderabbit-retry.yml`, and
-`continuum-coderabbit-unresolved.yml`.
+`continuum-coderabbit-unresolved.yml` (provider-owned batch admission;
+model execution delegates to the canonical `continuum-opencode.yml`).
 
 Owns:
 
