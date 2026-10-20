@@ -41,10 +41,10 @@ jobs:
         run: |
           set -euo pipefail
 
-          # CodeRabbit replies to the original top-level finding, not to our
-          # verification comment. Locate the verification marker for the same
-          # finding and the *current* PR HEAD. This makes stale UNRESOLVED replies
-          # harmless if the branch has already advanced.
+          # CodeRabbit replies to the original finding. Accept verification
+          # requests from the canonical OpenCode repair and the Continuum
+          # auto-merge reconciler; only a verified ancestor of the live PR
+          # HEAD can trigger a follow-up repair after a clean main-sync.
           #
           # Bounded newest-first page walk (#254): review comments list
           # oldest-first and may ignore sort/direction, so pages 1..N would
@@ -129,8 +129,11 @@ jobs:
                 | select(.in_reply_to_id == $finding)
                 | select(.id < $unresolved)
                 | select(.user.login == $owner)
-                | select(.body | contains("<!-- opencode-coderabbit-verification "))
-                | select(.body | contains("finding=" + ($finding | tostring)))
+                | select(
+                    (.body | contains("<!-- opencode-coderabbit-verification ")) or
+                    (.body | contains("<!-- auto-merge-coderabbit-verification "))
+                  )
+                | select(.body | contains("finding=" + ($finding | tostring) + " "))
               ]
               | sort_by(.id)
               | last // empty
@@ -143,15 +146,37 @@ jobs:
           fi
 
           BODY=$(jq -r '.body' <<<"$VERIFICATION")
-          REVIEW_ID=$(sed -nE \
-            's/.*opencode-coderabbit-verification review=([0-9]+) finding=.*/\1/p' \
-            <<<"$BODY" | head -n 1)
-          VERIFIED_HEAD=$(sed -nE \
-            's/.*opencode-coderabbit-verification review=[0-9]+ finding=[0-9]+ head=([0-9a-f]{40}).*/\1/p' \
-            <<<"$BODY" | head -n 1)
+          VERIFIED_HEAD=""
+          REVIEW_ID=""
+          if [[ "$BODY" == *"<!-- opencode-coderabbit-verification "* ]]; then
+            REVIEW_ID=$(sed -nE \
+              's/.*opencode-coderabbit-verification review=([0-9]+) finding=.*/\1/p' \
+              <<<"$BODY" | head -n 1)
+            VERIFIED_HEAD=$(sed -nE \
+              's/.*opencode-coderabbit-verification review=[0-9]+ finding=[0-9]+ head=([0-9a-f]{40}).*/\1/p' \
+              <<<"$BODY" | head -n 1)
+          elif [[ "$BODY" == *"<!-- auto-merge-coderabbit-verification "* ]]; then
+            VERIFIED_HEAD=$(sed -nE \
+              's/.*auto-merge-coderabbit-verification finding=[0-9]+ head=([0-9a-f]{40}).*/\1/p' \
+              <<<"$BODY" | head -n 1)
+            # Auto-merge's marker has no review id. Fetch the original inline
+            # finding, not a guessed review, and bind it to this PR and bot.
+            ROOT_COMMENT="$(gh api "repos/${GITHUB_REPOSITORY}/pulls/comments/${FINDING_ID}")"
+            ROOT_AUTHOR="$(jq -r '.user.login // ""' <<<"$ROOT_COMMENT")"
+            ROOT_PR="$(jq -r '.pull_request_url // ""' <<<"$ROOT_COMMENT")"
+            ROOT_PARENT="$(jq -r '.in_reply_to_id // ""' <<<"$ROOT_COMMENT")"
+            REVIEW_ID="$(jq -r '.pull_request_review_id // ""' <<<"$ROOT_COMMENT")"
+            if [[ "$ROOT_AUTHOR" != "coderabbitai[bot]" ]] ||
+               [[ "$ROOT_PR" != "https://api.github.com/repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}" ]] ||
+               [[ -n "$ROOT_PARENT" ]]; then
+              echo "::error::Auto-merge verification does not belong to an original CodeRabbit finding on this PR."
+              exit 1
+            fi
+          fi
 
-          if [[ ! "$REVIEW_ID" =~ ^[0-9]+$ ]] || [[ ! "$VERIFIED_HEAD" =~ ^[0-9a-f]{40}$ ]]; then
-            echo "::error::Malformed review id or verified HEAD in CodeRabbit verification marker."
+          if [[ ! "$REVIEW_ID" =~ ^[0-9]+$ ]] || [[ "$REVIEW_ID" == "0" ]] ||
+             [[ ! "$VERIFIED_HEAD" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::Malformed source review id or verified HEAD in CodeRabbit verification marker."
             exit 1
           fi
 
