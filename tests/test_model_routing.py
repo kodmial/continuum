@@ -359,7 +359,11 @@ class CooldownRecoveryContractTests(unittest.TestCase):
         self.assertIn("continuum-lifecycle-retry head=", block)
         self.assertIn("not-before=", block)
         self.assertIn("const exhausted = !cooling", block)
-        self.assertNotIn("require(process.env.POLICY_SCRIPT)", block)
+        self.assertIn("policy.controllerStateBody(stateMarker, summary)", block)
+        self.assertLess(
+            workflow.index("      - name: Resolve the Continuum-owned PR-Agent runtime bundle"),
+            workflow.index("      - name: Qualify trusted review-model route"),
+            "Controller-state policy must exist before model selection can fail")
 
 
 if __name__ == "__main__":
