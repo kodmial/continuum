@@ -1458,6 +1458,9 @@ class ContinuumTest < Minitest::Test
     continuum-validation.yml
     continuum-model-routing-e2e.yml # Repository-owned live test, not a reusable consumer callee
   ].freeze
+  # Retired from fresh installs, but reusable for existing consumer callers.
+  # This exception MUST NOT restore the old stub to CORE_STUBS.
+  LEGACY_REUSABLE_WORKFLOWS = %w[continuum-coderabbit-unresolved.yml].freeze
 
   # The number of callers Continuum ships in the `tech` and `parent` layers,
   # stated as literals for the same reason as `CORE_COUNT` below.
@@ -1490,7 +1493,7 @@ class ContinuumTest < Minitest::Test
   # count was taken from the workflow tree and then compared against the stub
   # tree, so adding a workflow and its stub together — exactly what a new
   # feature does — moved both sides and passed. A literal is the third,
-  # independent source: to change the twenty core callers someone has to say so
+  # independent source: to change the core caller count someone has to say so
   # here, which is where a reviewer sees it.
   CORE_COUNT = 18
 
@@ -1538,7 +1541,10 @@ class ContinuumTest < Minitest::Test
     stubs = CORE_STUBS + TECH_STUBS + PARENT_STUBS
     called = stubs.map { |path| stub_callee_name(path) }.compact
     workflows = WORKFLOWS.map { |path| File.basename(path) }
-    uncalled = workflows.reject { |base| called.include?(base) || REPO_OWNED_WORKFLOWS.include?(base) }
+    uncalled = workflows.reject do |base|
+      called.include?(base) || REPO_OWNED_WORKFLOWS.include?(base) ||
+        LEGACY_REUSABLE_WORKFLOWS.include?(base)
+    end
     assert_empty uncalled, "core workflows with no caller stub: #{uncalled.join(', ')}"
     # And the reverse: a stub whose callee is gone is a caller that 404s at
     # run time, which only the workflow_run path would ever discover.
