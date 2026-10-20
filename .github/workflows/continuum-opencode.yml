@@ -2716,10 +2716,10 @@ jobs:
               const latest = recent.filter(comment =>
                 comment.in_reply_to_id === findingId &&
                 comment.user?.login === 'coderabbitai[bot]' &&
-                /\\b(?:RESOLVED|UNRESOLVED)\\b/i.test(comment.body || '')
+                /\b(?:RESOLVED|UNRESOLVED)\b/i.test(comment.body || '')
               ).sort((a, b) => b.id - a.id)[0];
               if (!latest || latest.id !== unresolvedId ||
-                  !/\\bUNRESOLVED\\b/i.test(latest.body || '')) {
+                  !/\bUNRESOLVED\b/i.test(latest.body || '')) {
                 core.notice(`Finding #${findingId} has a newer verdict or is outside the verified recent window; skipping.`);
                 continue;
               }
@@ -2985,6 +2985,13 @@ jobs:
               exit 76
             fi
           fi
+          if [[ -n "${UNRESOLVED_ITEMS_JSON:-}" ]]; then
+            if [[ "$(git rev-list --count "${REPAIR_BASE_SHA}"..HEAD)" -gt 0 ]]; then
+              echo "changed=true" >> "$GITHUB_OUTPUT"
+            else
+              echo "changed=false" >> "$GITHUB_OUTPUT"
+            fi
+          fi
 
       - name: Ask CodeRabbit to verify every original finding
         if: github.event_name == 'workflow_dispatch' && inputs.mode == 'coderabbit-fix' && steps.unresolved_batch.outputs.skip != 'true'
@@ -3051,6 +3058,74 @@ jobs:
                 per_page: 100,
               }
             );
+
+            // A provider-owned UNRESOLVED batch is one repair transaction.
+            // Verify exactly its still-current finding IDs, never all remarks
+            // from the original review (which may already be resolved).
+            const batchItems = JSON.parse(process.env.UNRESOLVED_ITEMS_JSON || '[]');
+            if (batchItems.length) {
+              let requested = 0;
+              const changed = process.env.REPAIR_CHANGED === 'true';
+              for (const item of batchItems) {
+                const findingId = Number(item.finding_id);
+                const itemReviewId = Number(item.review_id);
+                if (!Number.isInteger(findingId) || !Number.isInteger(itemReviewId) ||
+                    !/^[0-9a-f]{40}$/.test(String(item.verified_head || ''))) {
+                  throw new Error('Invalid CodeRabbit batch verification identity.');
+                }
+                // A no-diff repair on the exact already-rejected HEAD must not
+                // ask CodeRabbit for the same verdict again (no-progress loop).
+                if (!changed && item.verified_head === headSha) {
+                  core.notice(`No change for finding #${findingId} on its already-rejected HEAD; no same-state retry.`);
+                  continue;
+                }
+                const root = comments.find(comment => comment.id === findingId) ||
+                  (await github.rest.pulls.getReviewComment({
+                    owner, repo, comment_id: findingId,
+                  })).data;
+                if (root.user?.login !== 'coderabbitai[bot]' ||
+                    root.pull_request_review_id !== itemReviewId ||
+                    root.pull_request_url !== `https://api.github.com/repos/${owner}/${repo}/pulls/${pullNumber}`) {
+                  throw new Error('Invalid source finding/review association for CodeRabbit batch.');
+                }
+                const verdicts = comments.filter(comment =>
+                  comment.in_reply_to_id === findingId &&
+                  comment.user?.login === 'coderabbitai[bot]' &&
+                  /\b(?:RESOLVED|UNRESOLVED)\b/i.test(comment.body || '')
+                ).sort((a, b) => b.id - a.id);
+                if (!verdicts.length || verdicts[0].id !== Number(item.unresolved_id) ||
+                    !/\bUNRESOLVED\b/i.test(verdicts[0].body || '')) {
+                  core.info(`Finding #${findingId} already has a newer CodeRabbit decision; skipping.`);
+                  continue;
+                }
+                const marker =
+                  `<!-- opencode-coderabbit-verification review=${itemReviewId} finding=${findingId} head=${headSha} -->`;
+                if (comments.some(comment =>
+                    comment.in_reply_to_id === findingId &&
+                    (comment.body || '').includes(marker))) {
+                  core.info(`Finding #${findingId} already requested on ${headSha}.`);
+                  continue;
+                }
+                const body = [
+                  marker,
+                  '⚡ **Continuum · coderabbit-unresolved**',
+                  '<!-- continuum-origin role=continuum component=coderabbit-unresolved -->',
+                  '@coderabbitai Re-check this exact original finding after the batched OpenCode repair.',
+                  '',
+                  `Current PR HEAD: \`${headSha}\``,
+                  `Latest UNRESOLVED reply: ${item.unresolved_id}`,
+                  'Read the current code and the original finding, not only the incremental diff.',
+                  'Reply **RESOLVED** only if fully fixed; otherwise **UNRESOLVED** with remaining details.',
+                ].join('\n');
+                await github.request(
+                  'POST /repos/{owner}/{repo}/pulls/{pull_number}/comments/{comment_id}/replies',
+                  { owner, repo, pull_number: pullNumber, comment_id: findingId, body }
+                );
+                requested += 1;
+              }
+              core.notice(`Requested verification for ${requested}/${batchItems.length} batched CodeRabbit finding(s) at ${headSha}.`);
+              return;
+            }
 
             const findings = comments.filter(
               (comment) =>
