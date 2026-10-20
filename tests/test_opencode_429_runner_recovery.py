@@ -101,7 +101,7 @@ class OpenCode429RunnerRecoveryContractTest(unittest.TestCase):
         # Shell/workflow code — not the model — persists recoverable state.
         for marker in (
             "Install 429 checkpoint evacuator",
-            "continuum_429_evacuate",
+            "continuum_infra_evacuate",
             "opencode/429-checkpoint-",
             ".continuum-429-recovery.json",
             "operation_id",
