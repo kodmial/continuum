@@ -191,6 +191,8 @@ jobs:
             // never requires manual /oc. Repeated fresh-VM 429s enter
             // bounded infrastructure backoff and resume automatically.
             const rateLimitMarker = 'CONTINUUM_OPENCODE_429_RESTART_REQUIRED';
+            const upstreamUnavailableMarker =
+              'CONTINUUM_OPENCODE_UPSTREAM_UNAVAILABLE_RESTART_REQUIRED';
             const publishRaceMarker =
               'CONTINUUM_OPENCODE_PUBLISH_RACE_RETRY_REQUIRED';
             // Evacuation line written by the workflow-owned 429 evacuator:
@@ -198,7 +200,7 @@ jobs:
             // <op>, stage <stage>, generation <gen>, mode <mode>, issue <i>,
             // pr <p>, branch <b>)."
             const evacuatedRe =
-              /Evacuated 429 checkpoint (\S+) at exact SHA ([0-9a-f]{40}) \(operation (\S+), stage (\S+), generation (\d+), mode (\S+), issue ([^,]*), pr ([^,]*), branch ([^)]*)\)/;
+              /Evacuated (?:429|infrastructure) checkpoint (\S+) at exact SHA ([0-9a-f]{40}) \(operation (\S+), stage (\S+), generation (\d+), mode (\S+), issue ([^,]*), pr ([^,]*), branch ([^)]*)\)/;
             const max429Restarts = Number.parseInt(
               process.env.MAX_429_RUNNER_RESTARTS || '3',
               10
@@ -224,7 +226,7 @@ jobs:
             }) {
               if (!evacuated429) {
                 core.notice(
-                  'OpenCode 429 marker without a workflow-owned evacuation ' +
+                  'OpenCode infrastructure marker without a workflow-owned evacuation ' +
                   'pointer in run ' + run.id + '; keeping the automation ' +
                   'reservation so the scheduler lease retries it. No task ' +
                   'budget was consumed and no pause was applied.'
@@ -235,9 +237,9 @@ jobs:
               const checkpointRef = String(evacuated429.checkpointRef || '').trim();
               let generation = Number(evacuated429.generation || 0);
               if (!Number.isInteger(generation) || generation < 0) generation = 0;
-              if (!operation || !checkpointRef.startsWith('opencode/429-checkpoint-')) {
+              if (!operation || !/^opencode\/(?:429|infra)-checkpoint-/.test(checkpointRef)) {
                 core.warning(
-                  'OpenCode 429 evacuation identity is malformed in run ' +
+                  'OpenCode infrastructure evacuation identity is malformed in run ' +
                   run.id + '; keeping the reservation for scheduler retry.'
                 );
                 return;
@@ -261,7 +263,7 @@ jobs:
                 );
               } catch (err) {
                 core.warning(
-                  'OpenCode 429 checkpoint ' + checkpointRef +
+                  'OpenCode infrastructure checkpoint ' + checkpointRef +
                   ' metadata is not readable yet (' + (err.message || err) +
                   '); keeping the reservation for a later watchdog pass. ' +
                   'No pause was applied.'
@@ -282,7 +284,7 @@ jobs:
                 Number(identity.generation || 0) !== generation
               ) {
                 core.warning(
-                  'OpenCode 429 checkpoint metadata does not match the ' +
+                  'OpenCode infrastructure checkpoint metadata does not match the ' +
                   'evacuation pointer for operation ' + operation + '; ' +
                   'keeping the reservation for a later watchdog pass.'
                 );
@@ -296,7 +298,7 @@ jobs:
               const mode = String(identity.mode || '');
               if (!['issue', 'qualification', 'coderabbit-fix', 'resolve-conflict', 'ci-fix'].includes(mode)) {
                 core.warning(
-                  'OpenCode 429 checkpoint has unknown mode for operation ' + operation +
+                  'OpenCode infrastructure checkpoint has unknown mode for operation ' + operation +
                   '; keeping reservation for later pass.'
                 );
                 return;
@@ -311,7 +313,7 @@ jobs:
                 // marker thread, but still never pause and never consume
                 // task budgets.
                 core.notice(
-                  'OpenCode 429 operation ' + operation + ' has no numeric ' +
+                  'OpenCode infrastructure operation ' + operation + ' has no numeric ' +
                   'thread; resuming without a dedupe comment.'
                 );
               }
@@ -326,7 +328,7 @@ jobs:
                 );
                 if (comments.some(comment => (comment.body || '').includes(resumptionMarker))) {
                   core.notice(
-                    'OpenCode 429 operation ' + operation + ' generation ' +
+                    'OpenCode infrastructure operation ' + operation + ' generation ' +
                     generation + ' was already resumed; watchdog will not ' +
                     'create a competing resumption.'
                   );
@@ -356,7 +358,7 @@ jobs:
                         backoffMarker,
                         '⚡ **Continuum · opencode-watchdog**',
                         '<!-- continuum-origin role=continuum component=opencode-watchdog -->',
-                        'Model 429 burned fresh runners repeatedly (generation ' + generation +
+                        'Model infrastructure unavailable across fresh runners (generation ' + generation +
                           ', operation `' + operation + '`, stage `' + stage + '`): ' +
                           'entering bounded infrastructure backoff.',
                         '',
@@ -371,7 +373,7 @@ jobs:
                   }
                 }
                 core.warning(
-                  'OpenCode 429 operation ' + operation + ' entered bounded ' +
+                  'OpenCode infrastructure operation ' + operation + ' entered bounded ' +
                   'infrastructure backoff after ' + generation +
                   ' fresh-runner generation(s); checkpoint ' + checkpointRef +
                   ' preserved for automatic resume.'
@@ -419,7 +421,7 @@ jobs:
                   resumptionMarker,
                   '⚡ **Continuum · opencode-watchdog**',
                   '<!-- continuum-origin role=continuum component=opencode-watchdog -->',
-                  'Model 429 burned the previous runner (infrastructure failure, not a task failure).',
+                  'Model provider/transport failed; restarting from an exact-SHA checkpoint (not a task failure).',
                   '',
                   'Resumption claim for operation `' + operation + '` ' +
                     'from checkpoint `' + checkpointRef + '` at exact SHA `' + checkpointSha + '` ' +
@@ -436,7 +438,7 @@ jobs:
                   resumptionClaim = created.data;
                 } catch (claimErr) {
                   core.warning(
-                    'OpenCode 429 operation ' + operation + ' generation ' +
+                    'OpenCode infrastructure operation ' + operation + ' generation ' +
                     generation + ' could not record the resumption claim (' +
                     (claimErr.message || claimErr) +
                     '); keeping the reservation for a later watchdog pass.'
@@ -460,13 +462,13 @@ jobs:
                       });
                     } catch (pruneErr) {
                       core.warning(
-                        'OpenCode 429 operation ' + operation +
+                        'OpenCode infrastructure operation ' + operation +
                         ': duplicate resumption claim prune failed: ' +
                         (pruneErr.message || pruneErr)
                       );
                     }
                     core.notice(
-                      'OpenCode 429 operation ' + operation + ' generation ' +
+                      'OpenCode infrastructure operation ' + operation + ' generation ' +
                       generation + ' was already claimed; watchdog will not ' +
                       'create a competing resumption.'
                     );
@@ -481,14 +483,14 @@ jobs:
                     });
                   } catch (cleanupErr) {
                     core.warning(
-                      'OpenCode 429 operation ' + operation +
+                      'OpenCode infrastructure operation ' + operation +
                       ': pre-dispatch claim cleanup failed: ' +
                       (cleanupErr.message || cleanupErr)
                     );
                   }
                   resumptionClaim = null;
                   core.warning(
-                    'OpenCode 429 operation ' + operation + ' generation ' +
+                    'OpenCode infrastructure operation ' + operation + ' generation ' +
                     generation + ' could not verify the resumption claim (' +
                     (recheckErr.message || recheckErr) +
                     '); keeping the reservation for a later watchdog pass.'
@@ -514,14 +516,14 @@ jobs:
                     });
                   } catch (cleanupErr) {
                     core.warning(
-                      'OpenCode 429 operation ' + operation +
+                      'OpenCode infrastructure operation ' + operation +
                       ': pre-dispatch claim cleanup failed: ' +
                       (cleanupErr.message || cleanupErr)
                     );
                   }
                 }
                 core.warning(
-                  'OpenCode 429 operation ' + operation + ' generation ' +
+                  'OpenCode infrastructure operation ' + operation + ' generation ' +
                   generation + ' dispatch failed (' +
                   (dispatchErr.message || dispatchErr) +
                   '); keeping the reservation for a later watchdog pass. ' +
@@ -540,7 +542,7 @@ jobs:
                   resumptionMarker,
                   '⚡ **Continuum · opencode-watchdog**',
                   '<!-- continuum-origin role=continuum component=opencode-watchdog -->',
-                  'Model 429 burned the previous runner (infrastructure failure, not a task failure).',
+                  'Model provider/transport failed; restarting from an exact-SHA checkpoint (not a task failure).',
                   '',
                   'Dispatched a fresh-VM resumption for operation `' + operation + '` ' +
                     'from checkpoint `' + checkpointRef + '` at exact SHA `' + checkpointSha + '` ' +
@@ -558,7 +560,7 @@ jobs:
                     });
                   } catch (updateErr) {
                     core.warning(
-                      'OpenCode 429 operation ' + operation +
+                      'OpenCode infrastructure operation ' + operation +
                       ': resumption marker update failed: ' +
                       (updateErr.message || updateErr)
                     );
@@ -602,7 +604,8 @@ jobs:
                 continue;
               }
               const logText = await response.text();
-              if (logText.includes(rateLimitMarker)) {
+              if (logText.includes(rateLimitMarker) ||
+                  logText.includes(upstreamUnavailableMarker)) {
                 runnerRestartRequired = true;
                 const evacuated = logText.match(evacuatedRe);
                 if (evacuated) {
