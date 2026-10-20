@@ -3122,8 +3122,8 @@ jobs:
                 }
                 const body = [
                   marker,
-                  '⚡ **Continuum · coderabbit-unresolved**',
-                  '<!-- continuum-origin role=continuum component=coderabbit-unresolved -->',
+                  '⚡ **Continuum · opencode**',
+                  '<!-- continuum-origin role=continuum component=opencode -->',
                   '@coderabbitai Re-check this exact original finding after the batched OpenCode repair.',
                   '',
                   `Current PR HEAD: \`${headSha}\``,
