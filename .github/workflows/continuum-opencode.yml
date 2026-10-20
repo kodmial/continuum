@@ -2723,6 +2723,53 @@ jobs:
               });
               recent.push(...data);
             }
+            // The executor independently verifies the same live GitHub
+            // review-thread state as the canonical CodeRabbit batcher.
+            // A natural-language answer is not required to contain UNRESOLVED.
+            const openThreadRoots = new Set();
+            let threadCursor = null;
+            let threadPageCount = 0;
+            do {
+              const response = await github.graphql(
+                `query($owner: String!, $repo: String!, $number: Int!, $cursor: String) {
+                  repository(owner: $owner, name: $repo) {
+                    pullRequest(number: $number) {
+                      reviewThreads(first: 100, after: $cursor) {
+                        nodes {
+                          isResolved
+                          comments(first: 1) { nodes { databaseId author { login } } }
+                        }
+                        pageInfo { hasNextPage endCursor }
+                      }
+                    }
+                  }
+                }`,
+                { owner, repo, number, cursor: threadCursor }
+              );
+              const threads = response.repository?.pullRequest?.reviewThreads;
+              if (!threads?.pageInfo || !Array.isArray(threads.nodes)) {
+                throw new Error('Cannot validate live CodeRabbit review-thread state.');
+              }
+              for (const thread of threads.nodes) {
+                const root = thread.comments?.nodes?.[0];
+                if (!thread.isResolved && root?.author?.login?.startsWith('coderabbitai') &&
+                    Number.isInteger(root.databaseId)) {
+                  openThreadRoots.add(root.databaseId);
+                }
+              }
+              threadCursor = threads.pageInfo.hasNextPage
+                ? threads.pageInfo.endCursor : null;
+              threadPageCount += 1;
+              if (threadCursor && threadPageCount >= 10) {
+                throw new Error('Review-thread validation exceeds bounded page window.');
+              }
+            } while (threadCursor);
+
+            const explicitlyResolved = body =>
+              !/\\bUNRESOLVED\\b/i.test(body || '') &&
+              (/\\*\\*RESOLVED(?:\\.|\\*\\*)/i.test(body || '') ||
+               /✅\\s*Review thread resolved\\.?/i.test(body || ''));
+
             const valid = [];
             const unique = new Set();
             const comparisons = new Map();
