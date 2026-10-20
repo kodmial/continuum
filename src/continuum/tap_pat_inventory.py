@@ -790,6 +790,7 @@ PR_AGENT_FAMILY = {
         "Revalidate the admitted exact HEAD immediately before review",
         "Resolve exact-HEAD original findings for targeted verification",
         "Run upstream full review on the exact HEAD",
+        "Record failed real PR-Agent execution for route failover",
         "Revalidate the PR head and native review output after review",
         "Export native persistent finding state for the reviewed HEAD",
         "Decide whether automatic improve can be skipped",
