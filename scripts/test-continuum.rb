@@ -8,10 +8,10 @@ require 'open3'
 
 class ContinuumTest < Minitest::Test
   ROOT = File.expand_path('..', __dir__)
-  # Legacy CodeRabbit batch repair remains as a compatibility fixture for
-  # already-installed consumers, but is no longer provisioned in core.
+  # The historical direct OpenCode event dispatcher is a compatibility
+  # fixture for consumers not yet migrated to CodeRabbit-owned batching.
   CORE_STUBS = Dir[File.join(ROOT, '.github/caller-stubs/*.yml')].sort.reject do |path|
-    File.basename(path) == 'continuum-coderabbit-unresolved.yml'
+    File.basename(path) == 'continuum-opencode-unresolved.yml'
   end
   TECH_STUBS = Dir[File.join(ROOT, '.github/caller-stubs/tech/*.yml')].sort
   PARENT_STUBS = Dir[File.join(ROOT, '.github/caller-stubs/parent/*.yml')].sort
@@ -1460,7 +1460,7 @@ class ContinuumTest < Minitest::Test
   ].freeze
   # Retired from fresh installs, but reusable for existing consumer callers.
   # This exception MUST NOT restore the old stub to CORE_STUBS.
-  LEGACY_REUSABLE_WORKFLOWS = %w[continuum-coderabbit-unresolved.yml].freeze
+  LEGACY_REUSABLE_WORKFLOWS = %w[continuum-opencode-unresolved.yml].freeze
 
   # The number of callers Continuum ships in the `tech` and `parent` layers,
   # stated as literals for the same reason as `CORE_COUNT` below.
@@ -3934,7 +3934,7 @@ class ContinuumTest < Minitest::Test
       continuum_ref pr_number head_sha conclusion run_id ci_repair_label
       head_ref_pattern auto_merge_workflow opencode_workflow
     ],
-    'continuum-opencode-unresolved.yml' => %w[continuum_ref],
+    'continuum-coderabbit-unresolved.yml' => %w[continuum_ref review_provider],
     'continuum-pr-agent-recovery.yml' => %w[continuum_ref target_child_id max_executions],
     'continuum-pr-agent-canary.yml' => %w[
       continuum_ref canary_enabled base_ref opencode_model model max_tokens

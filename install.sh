@@ -52,13 +52,12 @@ CORE_STUBS=(
   continuum-auto-merge.yml
   continuum-bootstrap-runtime-secret.yml
   continuum-coderabbit-retry.yml
-  # Only the canonical continuum-opencode-unresolved.yml caller is installed.
-  # The old CodeRabbit-specific repair caller remains in legacy repositories
-  # but must never be reintroduced by a normal Continuum upgrade.
+  # CodeRabbit owns UNRESOLVED batching; only the canonical OpenCode
+  # executor owns model routing, runtime, commit/push and verification.
+  continuum-coderabbit-unresolved.yml
   continuum-docker-qualification.yml
   continuum-issue-scheduler.yml
   continuum-opencode-repair.yml
-  continuum-opencode-unresolved.yml
   continuum-opencode-watchdog.yml
   continuum-opencode.yml
   continuum-pr-agent-canary.yml
