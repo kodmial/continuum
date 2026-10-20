@@ -391,5 +391,61 @@ class GitRefStoreTests(unittest.TestCase):
         with self.assertRaises(route.RouteError):
             route.GitRefStore("example/private", "")
 
+
+class CooldownRecoveryContractTests(unittest.TestCase):
+    def test_all_cooling_exposes_earliest_future_epoch_to_followup_step(self):
+        config = route.Configuration.parse(f"{A},{B},{C}")
+        with tempfile.TemporaryDirectory() as tmp:
+            file = pathlib.Path(tmp) / "github-env"
+            actual = route.publish_cooldown_not_before(
+                config, {"cooldowns": {A: 4600, B: 3900, C: 4300}},
+                now=1000, env={"GITHUB_ENV": str(file)})
+            self.assertEqual(actual, 3900)
+            self.assertEqual(
+                file.read_text(), "CONTINUUM_MODEL_NOT_BEFORE_EPOCH=3900\n")
+
+    def test_never_defer_if_any_model_ready_or_state_invalid(self):
+        config = route.Configuration.parse(f"{A},{B}")
+        for state in (
+            {}, {"cooldowns": {A: 2000}},
+            {"cooldowns": {A: 2000, B: 1000}},
+            {"cooldowns": {A: 2000, B: "not-a-number"}},
+        ):
+            with self.subTest(state=state):
+                with tempfile.TemporaryDirectory() as tmp:
+                    file = pathlib.Path(tmp) / "github-env"
+                    self.assertIsNone(route.publish_cooldown_not_before(
+                        config, state, now=1000, env={"GITHUB_ENV": str(file)}))
+                    self.assertFalse(file.exists())
+
+    def test_recovery_can_persist_wait_even_when_runtime_bundle_missing(self):
+        workflow = (PATH.parents[2] / ".github/workflows/continuum-pr-agent.yml").read_text()
+        marker = "      - name: Update persistent PR-Agent retry controller state"
+        stop = "      - name: Schedule bounded retry for retryable PR-Agent review failure"
+        block = workflow.split(marker, 1)[1].split(stop, 1)[0]
+        self.assertIn("CONTINUUM_MODEL_NOT_BEFORE_EPOCH", block)
+        self.assertIn("continuum-lifecycle-retry head=", block)
+        self.assertIn("not-before=", block)
+        self.assertIn("const exhausted = !cooling", block)
+        self.assertIn("policy.controllerStateBody(stateMarker, summary)", block)
+        self.assertLess(
+            workflow.index("      - name: Resolve the Continuum-owned PR-Agent runtime bundle"),
+            workflow.index("      - name: Qualify trusted review-model route"),
+            "Controller-state policy must exist before model selection can fail")
+
+
+    def test_repair_recovery_uses_same_cooldown_deadline(self):
+        workflow = (PATH.parents[2] / ".github/workflows/continuum-pr-agent-repair.yml").read_text()
+        block = workflow.split(
+            "      - name: Update persistent PR-Agent repair retry controller state", 1
+        )[1].split(
+            "      - name: Schedule bounded retry for retryable PR-Agent repair failure", 1
+        )[0]
+        self.assertIn("CONTINUUM_MODEL_NOT_BEFORE_EPOCH", block)
+        self.assertIn("kind=repair attempt=", block)
+        self.assertIn("not-before=", block)
+        self.assertIn("const exhausted = !cooling", block)
+
+
 if __name__ == "__main__":
     unittest.main()
