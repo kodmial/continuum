@@ -1002,9 +1002,6 @@ jobs:
           # LiteLLM's own default per-request retries multiply the outer
           # reviewer retry budget; the verified Continuum route owns failover.
           CONFIG__NUM_RETRIES: '0'
-          # PR-Agent must wait beyond the OpenCode bridge's bounded 170s call.
-          # Keep the downstream timeout authoritative and leave 10s for translation.
-          CONFIG__AI_TIMEOUT: '180'
           CONFIG__PROPAGATE_TOOL_ERRORS: 'true'
           CONFIG__PERSISTENT_INLINE_COMMENTS: 'true'
           OPENAI__API_BASE: ${{ steps.stack.outputs.api_base }}
