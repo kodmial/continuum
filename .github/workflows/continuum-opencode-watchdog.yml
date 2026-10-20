@@ -604,8 +604,15 @@ jobs:
                 continue;
               }
               const logText = await response.text();
-              if (logText.includes(rateLimitMarker) ||
-                  logText.includes(upstreamUnavailableMarker)) {
+              // GitHub echoes shell source into job logs. Match only the
+              // executed workflow-command error line, not a marker embedded
+              // in the printed run script or an agent prompt.
+              const emittedRestartMarker = logText.split('\n').some(line =>
+                line.includes('##[error]') &&
+                (line.includes(rateLimitMarker) ||
+                 line.includes(upstreamUnavailableMarker))
+              );
+              if (emittedRestartMarker) {
                 runnerRestartRequired = true;
                 const evacuated = logText.match(evacuatedRe);
                 if (evacuated) {
