@@ -123,6 +123,40 @@ class InventoryCacheTest(unittest.TestCase):
     def test_ttl_is_bounded(self):
         cache = InventoryCache(self.path, ttl=10 ** 9)
         self.assertEqual(cache.ttl, MAX_TTL_SECONDS)
+        self.assertLessEqual(MAX_TTL_SECONDS, DEFAULT_TTL_SECONDS)
+        self.assertEqual(InventoryCache(self.path, ttl=3600).ttl, MAX_TTL_SECONDS)
+
+    def test_cached_plan_is_filtered_to_the_current_allowlist(self):
+        self.write(now=1000, plan=[
+            {"id": "alpha", "repository": "owner/private-child"},
+            {"id": "beta", "repository": "owner/removed-child"},
+        ])
+        with open(self.path, "r", encoding="utf-8") as handle:
+            document = json.load(handle)
+        document["scope"] = allowlist_fingerprint("owner/parent", self.allowlist)
+        with open(self.path, "w", encoding="utf-8") as handle:
+            json.dump(document, handle)
+        self.assertEqual(
+            InventoryCache(self.path).read(
+                parent_repository="owner/parent",
+                allowlist_json=self.allowlist,
+                now=1000,
+            ),
+            [{"id": "alpha", "repository": "owner/private-child"}],
+        )
+
+    def test_unparseable_allowlist_refuses_the_cache(self):
+        self.write(now=1000)
+        with open(self.path, "r", encoding="utf-8") as handle:
+            document = json.load(handle)
+        document["scope"] = allowlist_fingerprint("owner/parent", "not-json")
+        with open(self.path, "w", encoding="utf-8") as handle:
+            json.dump(document, handle)
+        self.assertIsNone(InventoryCache(self.path).read(
+            parent_repository="owner/parent",
+            allowlist_json="not-json",
+            now=1000,
+        ))
 
     def test_fingerprint_binds_parent_and_allowlist(self):
         self.assertEqual(

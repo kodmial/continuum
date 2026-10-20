@@ -232,6 +232,14 @@ class RestFailureClassificationTest(unittest.TestCase):
         self.assertIsNotNone(delay)
         self.assertLessEqual(delay, 15.0)
 
+    def test_implausible_retry_after_date_is_ignored(self):
+        for value in (
+            "Fri, 31 Dec 1999 23:59:59 GMT",
+            "Sat, 01 Jan 2200 00:00:00 GMT",
+        ):
+            with self.subTest(value=value):
+                self.assertIsNone(retry_after_seconds({"Retry-After": value}, now=100))
+
 
 class ParseHttpResponseTest(unittest.TestCase):
     def test_headers_stripped_and_status_read(self):

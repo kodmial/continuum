@@ -44,7 +44,9 @@ DELEGATION_STATES = frozenset({DELEGATION_OK, DELEGATION_DEGRADED, DELEGATION_NO
 DEFAULT_TTL_SECONDS = 900
 
 #: Hard ceiling so a trusted inventory can never outlive the epoch by much.
-MAX_TTL_SECONDS = 3600
+#: Never longer than the default trust window: a cached Child binding must not
+#: stay reusable for an hour when the allowlist or bindings may have changed.
+MAX_TTL_SECONDS = DEFAULT_TTL_SECONDS
 
 SCHEMA_VERSION = 1
 
@@ -123,6 +125,21 @@ def _valid_plan(plan: Any) -> bool:
     return True
 
 
+def _allowed_child_ids(allowlist_json: Any) -> Optional[set]:
+    try:
+        value = json.loads(allowlist_json)
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(value, list):
+        return None
+    allowed = set()
+    for item in value:
+        if not isinstance(item, str) or not item:
+            return None
+        allowed.add(item)
+    return allowed
+
+
 def _bounded_ttl(ttl: Any) -> int:
     try:
         value = int(ttl)
@@ -188,7 +205,16 @@ class InventoryCache:
         plan = document.get("plan")
         if not _valid_plan(plan):
             return None
-        return [{"id": entry["id"], "repository": entry["repository"]} for entry in plan]
+        # A cached plan may only contain children still allowed by the current
+        # allowlist; a narrowed allowlist must never resurrect a removed child.
+        allowed = _allowed_child_ids(allowlist_json)
+        if allowed is None:
+            return None
+        return [
+            {"id": entry["id"], "repository": entry["repository"]}
+            for entry in plan
+            if entry["id"] in allowed
+        ]
 
 
 def deletion_evidence(delegation_state: str, dispatch_enabled: bool) -> str:

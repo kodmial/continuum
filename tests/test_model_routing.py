@@ -430,6 +430,13 @@ class VerifiedReceiptTests(unittest.TestCase):
         receipt = route.verified_receipt(state, "f", expected_model=A)
         self.assertEqual(receipt["head"], "")
 
+    def test_explicit_empty_head_is_verified_exactly(self):
+        receipt = route.verified_receipt(
+            self.state(head=""), "f", expected_head="")
+        self.assertEqual(receipt["head"], "")
+        with self.assertRaisesRegex(route.RouteError, "exact expected HEAD"):
+            route.verified_receipt(self.state(head="sha"), "f", expected_head="")
+
     def test_verify_operation_reads_receipt_without_probing_or_writing(self):
         import os
         import sys

@@ -31,7 +31,7 @@ UNAVAILABLE=4
 api_read() {
   local max_attempts="${CONTINUUM_DISCOVERY_MAX_ATTEMPTS:-2}"
   local base_delay="${CONTINUUM_DISCOVERY_BASE_DELAY:-1}"
-  local attempt=1 rc classification verdict delay
+  local attempt=1 rc classification verdict delay backoff
   local raw err
   raw="$(mktemp "${RUNNER_TEMP:-.}/continuum-api-raw.XXXXXX")"
   err="$(mktemp "${RUNNER_TEMP:-.}/continuum-api-err.XXXXXX")"
@@ -51,12 +51,18 @@ api_read() {
     delay="$(sed -n 's/^retry-delay=//p' <<<"$classification")"
     if { [[ "$verdict" == "rate_limited" ]] || [[ "$verdict" == "transient" ]]; } &&
        [[ "$attempt" -lt "$max_attempts" ]]; then
-      attempt=$((attempt + 1))
       if [[ -n "$delay" && "$delay" != "0" ]]; then
         sleep "$delay" 2>/dev/null || true
       else
-        sleep "$base_delay" 2>/dev/null || true
+        # Match read_discovery: without a usable Retry-After, fall back to
+        # exponential backoff (base * 2^(attempt-1)) rather than a fixed wait.
+        backoff="$(
+          python3 -c 'import sys; print("%g" % (float(sys.argv[1]) * (2 ** (int(sys.argv[2]) - 1))))' \
+            "$base_delay" "$attempt" 2>/dev/null || printf '%s' "$base_delay"
+        )"
+        sleep "$backoff" 2>/dev/null || true
       fi
+      attempt=$((attempt + 1))
       continue
     fi
     break

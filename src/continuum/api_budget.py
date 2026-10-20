@@ -435,7 +435,10 @@ def retry_after_seconds(headers: Any = None, *, now: Optional[float] = None,
             if parsed is not None:
                 if parsed.tzinfo is None:
                     parsed = parsed.replace(tzinfo=timezone.utc)
-                candidates.append(max(0.0, parsed.timestamp() - current))
+                # HTTP-date is always UTC and recent; reject implausible years
+                # so a misparsed or non-compliant date never skews the delta.
+                if 2000 <= parsed.year <= 2100:
+                    candidates.append(max(0.0, parsed.timestamp() - current))
     reset = (header_map.get("x-ratelimit-reset") or "").strip()
     if reset and _DIGITS_RE.match(reset):
         candidates.append(max(0.0, float(reset) - current))

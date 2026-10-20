@@ -21,6 +21,7 @@ import tempfile
 import time
 import urllib.error
 import urllib.request
+from typing import Optional
 
 MODEL_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._/-]{0,120}$")
 REPOSITORY = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
@@ -389,15 +390,17 @@ def attest_completion(current: dict, ticket: str, model: str, now: int,
 
 
 def verified_receipt(state: dict, fingerprint: str, *,
-                     expected_model: str = "", expected_head: str = "",
-                     expected_run: str = "") -> dict:
+                     expected_model: Optional[str] = None,
+                     expected_head: Optional[str] = None,
+                     expected_run: Optional[str] = None) -> dict:
     """Read-only verification of an immutable attested real-execution receipt.
 
     A fresh public runner must be able to prove the durable Child model state
     without issuing another LLM request, failing over, or rescanning the whole
     Child universe.  This validates exactly the stored attestation written by
     :func:`attest_completion` and optionally binds it to a trusted ephemeral
-    handoff (expected model / exact HEAD / originating run).  It never probes
+    handoff (expected model / exact HEAD / originating run).  ``None`` skips a
+    binding; an explicit empty string is verified exactly.  It never probes
     and never writes.
     """
     receipt = state.get("last_successful_real_execution")
@@ -408,14 +411,14 @@ def verified_receipt(state: dict, fingerprint: str, *,
     model = receipt.get("model")
     if not isinstance(model, str) or not model:
         raise RouteError("Attested receipt has no model")
-    if expected_model and model != expected_model:
+    if expected_model is not None and model != expected_model:
         raise RouteError("Attested model differs from the trusted handoff")
     head = receipt.get("head")
     head_value = head if isinstance(head, str) else ""
-    if expected_head and head_value != expected_head:
+    if expected_head is not None and head_value != expected_head:
         raise RouteError("Attested receipt head differs from the exact expected HEAD")
     run = str(receipt.get("run") or "")
-    if expected_run and run != expected_run:
+    if expected_run is not None and run != expected_run:
         raise RouteError("Attested receipt run differs from the trusted handoff")
     return {"model": model, "head": head_value, "run": run,
             "at": receipt.get("at")}
@@ -542,9 +545,9 @@ def run() -> int:
         state, _, _ = store.read(key)
         receipt = verified_receipt(
             state, fingerprint,
-            expected_model=env.get("CONTINUUM_EXPECTED_MODEL", ""),
-            expected_head=env.get("CONTINUUM_EXPECTED_HEAD", ""),
-            expected_run=env.get("CONTINUUM_EXPECTED_RUN", ""))
+            expected_model=env.get("CONTINUUM_EXPECTED_MODEL") or None,
+            expected_head=env.get("CONTINUUM_EXPECTED_HEAD") or None,
+            expected_run=env.get("CONTINUUM_EXPECTED_RUN") or None)
         write_outputs(env, {"model": receipt["model"], "verified": "true",
                             "attested_run": receipt["run"],
                             "attested_head": receipt["head"]})

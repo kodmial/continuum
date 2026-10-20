@@ -278,6 +278,27 @@ else:
         user_repo_calls = [e for e in endpoints if e.startswith('/user/repos')]
         self.assertEqual(len(user_repo_calls), 2, endpoints)
 
+    def test_discovery_fallback_backoff_is_exponential(self):
+        sleep_log = self.root / 'sleep.log'
+        sleep_log.write_text('')
+        sleep = self.root / 'sleep'
+        sleep.write_text(
+            '#!/usr/bin/env bash\n'
+            'printf "%s\\n" "$1" >> "$SLEEP_LOG"\n'
+        )
+        sleep.chmod(0o755)
+        result = self.run_resolver(
+            'plan',
+            extra_env={
+                'GH_FAIL': '/user/repos',
+                'CONTINUUM_DISCOVERY_MAX_ATTEMPTS': '3',
+                'CONTINUUM_DISCOVERY_BASE_DELAY': '2',
+                'SLEEP_LOG': str(sleep_log),
+            },
+        )
+        self.assertEqual(result.returncode, 4, result.stderr)
+        self.assertEqual(sleep_log.read_text().split(), ['2', '4'])
+
     def test_trusted_inventory_is_reused_within_ttl_without_rescan(self):
         cache = self.root / 'inventory.json'
         calls_file = self.root / 'cache-calls.log'
