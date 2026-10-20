@@ -353,6 +353,42 @@ def attest_completion(current: dict, ticket: str, model: str, now: int,
     return current
 
 
+def attest_execution_failure(current: dict, ticket: str, model: str, now: int,
+                             fingerprint: str, ttl: int, cooldown: int) -> dict:
+    """Quarantine a route after failed *real* execution, not a successful probe.
+
+    Only the qualified selection of this Actions run may report a failure.
+    The one-time receipt is consumed. Failing a review never retries work in
+    the same execution or turns missing review evidence into success.
+    """
+    if current.get("fingerprint") != fingerprint:
+        raise RouteError("Stale model state fingerprint")
+    pending = current.get("qualified_selections") or {}
+    if not isinstance(pending, dict):
+        raise RouteError("Corrupt model selection state")
+    selected = pending.get(ticket) or {}
+    if selected.get("model") != model:
+        raise RouteError("No qualified selection for this run and model")
+    selected_at = selected.get("at")
+    probe_at = selected.get("probe_at")
+    if not (isinstance(selected_at, int) and isinstance(probe_at, int)
+            and 0 <= selected_at - probe_at <= ttl
+            and 0 <= now - selected_at <= MAX_EXECUTION_SECONDS):
+        raise RouteError("Model selection proof expired or was not qualified")
+    remaining = dict(pending)
+    del remaining[ticket]
+    current["qualified_selections"] = remaining
+    cooldowns = dict(current.get("cooldowns") or {})
+    cooldowns[model] = max(int(cooldowns.get(model, 0)), now + cooldown)
+    current["cooldowns"] = cooldowns
+    # A previously successful execution is historical evidence, not proof
+    # that this specific failed review completed successfully.
+    current["last_failed_real_execution"] = {
+        "model": model, "at": now, "reason": "review_execution_failed",
+    }
+    return current
+
+
 def route_key(repo: str, profile: str, credentials: str, config: Configuration,
               binary_sha: str) -> str:
     if not profile or not re.fullmatch(r"[A-Za-z0-9._-]{1,80}", profile):
@@ -380,7 +416,7 @@ def binary_provenance() -> tuple[str, str]:
 
 def run() -> int:
     cli = argparse.ArgumentParser()
-    cli.add_argument("operation", choices=("select", "record"))
+    cli.add_argument("operation", choices=("select", "record", "fail"))
     args = cli.parse_args()
     env = os.environ
     config = Configuration.parse(
@@ -412,6 +448,20 @@ def run() -> int:
                 config.fingerprint(digest, credential_scope), config.ttl,
                 execution_id, env.get("CONTINUUM_TASK_HEAD", ""))
         store.update(key, record)
+        return 0
+
+    if args.operation == "fail":
+        if config.task_class != "review":
+            raise RouteError("Real execution failover receipt is review-only")
+        selected = env.get("CONTINUUM_SELECTED_MODEL", "")
+        if selected not in config.models:
+            raise RouteError("Cannot record a failure for an unapproved model")
+        def fail(current):
+            return attest_execution_failure(
+                current, ticket, selected, now,
+                config.fingerprint(digest, credential_scope),
+                config.ttl, config.cooldown)
+        store.update(key, fail)
         return 0
 
     state, _, _ = store.read(key)
