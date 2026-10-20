@@ -1652,7 +1652,7 @@ jobs:
                     .filter(comment =>
                       comment.in_reply_to_id === thread.commentId &&
                       comment.user?.login?.startsWith('coderabbitai') &&
-                      new Date(comment.created_at || 0).getTime() > verificationAt &&
+                      Number(comment.id) > Number(latestVerification.id) &&
                       !/Review rate limited|Review limit reached/i.test(comment.body || '')
                     )
                     .sort((a, b) => Number(b.id) - Number(a.id))[0] || null;
