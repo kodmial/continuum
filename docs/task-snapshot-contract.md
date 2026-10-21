@@ -134,6 +134,29 @@ automation never rewrites or reverts the user's issue body. Post-admission
 changes belong in a **new follow-up issue** with an explicit dependency;
 the working issue and its active PR are left untouched.
 
+## Comment command admission (AA #408 regression)
+
+The snapshot marker is machine state; it is never a command. A comment
+launches coding only when the shared parser in
+`src/continuum/opencode_commands.py` sees the exact token `/oc` or
+`/opencode` as its first significant line, and the author is the repository
+owner. The reusable OpenCode workflow now performs that check in a small
+`preflight` job before the coder job can acquire its runner or probe a
+model, and every plain-issue, PR-comment, review-comment, readiness,
+snapshot, recovery and implementation guard depends on that preflight result
+instead of `contains(body, '/oc')`. The scheduler's manual-command grace,
+reservation and dispatch accounting use the same rule.
+
+Issue #170 introduced the exact parser but its regression tests only
+exercised the parser and CLI in isolation, while the production plain-issue
+gate still asserted the substring rule. The pinned snapshot comment
+reproduces the issue specification as fenced JSON, so it naturally contains
+`/oc` strings and matched that gate, queueing a second coder behind
+`cancel-in-progress: false` (AA #408, run 39627686076). Tests now replay the
+owner command plus the machine snapshot through the production preflight and
+assert one admission, and the duplicate guard checks in-flight Actions runs
+for the same issue as well as open PRs.
+
 ## Scope notes
 
 * Scheduler-dispatched and owner-triggered `/oc` flows share one

@@ -377,6 +377,68 @@ jobs:
               `Dispatched OpenCode for CodeRabbit review ${reviewId} on PR #${pullNumber} with ${findings.length} inline finding(s).`
             );
 
+  preflight:
+    # GitHub expression `if:` cannot express the exact manual-command rule
+    # (first significant line is exactly /oc or /opencode). Substring gates
+    # let an internally authored task-snapshot comment whose JSON merely
+    # mentions /oc launch a second coder (kodmial/aa#408). This small job
+    # runs before the heavy OpenCode job and calls the canonical parser from
+    # src/continuum/opencode_commands.py. It never checks out the task
+    # workspace, probes a model, or starts an agent.
+    name: Admit OpenCode comment command
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      github.event_name == 'issue_comment' ||
+      github.event_name == 'pull_request_review_comment'
+    runs-on: ubuntu-latest
+    timeout-minutes: ${{ fromJSON(vars.AUTOMATION_PREFLIGHT_TIMEOUT_MINUTES || '5') }}
+
+    permissions:
+      contents: read
+
+    outputs:
+      admit: ${{ steps.command.outputs.admit }}
+
+    steps:
+      - name: Checkout Continuum command parser
+        if: >-
+          github.event_name == 'issue_comment' ||
+          github.event_name == 'pull_request_review_comment'
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: kodmial/continuum
+          ref: ${{ inputs.continuum_ref }}
+          path: .continuum-command
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Classify comment command
+        id: command
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          COMMENT_BODY: ${{ github.event.comment.body }}
+          COMMENT_AUTHOR: ${{ github.actor }}
+          REPOSITORY_OWNER: ${{ github.repository_owner }}
+        run: |
+          set -euo pipefail
+          if [[ "$EVENT_NAME" == "workflow_dispatch" ]]; then
+            echo "admit=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          body_file="${RUNNER_TEMP}/continuum-comment-body"
+          printf '%s' "$COMMENT_BODY" > "$body_file"
+          decision="$(PYTHONDONTWRITEBYTECODE=1 python3 \
+            "$GITHUB_WORKSPACE/.continuum-command/.github/scripts/opencode_command.py" \
+            is-owner-command --body-file "$body_file" \
+            --author "$COMMENT_AUTHOR" --owner "$REPOSITORY_OWNER")"
+          if [[ "$decision" == "true" ]]; then
+            echo "admit=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "admit=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::Comment is not an authorized exact OpenCode command; no coder admitted."
+          fi
+
   opencode:
     # Manual invocations remain owner-only. Automated repair modes arrive via
     # internal workflow_dispatch events from trusted workflows on main.
@@ -385,30 +447,24 @@ jobs:
     # issue_comment carrying a trusted qualification-dispatch marker is also
     # recognized as qualification mode and bound to that marker's triple, so
     # a later main advance can never retarget an already-started run.
-    # Interactive PR comments are gated narrowly: an issue_comment on a PR
-    # runs only for an explicit owner command at the start of the comment on
-    # a still-open PR. Substring matching is forbidden on that route because
-    # OpenCode-generated prose itself can mention /oc while documenting the
-    # contract, which chained one run per minute on a closed PR.
+    # Every issue/review comment route is admitted only by the preflight
+    # job's canonical exact-command parser. That rejects internally authored
+    # task-snapshot JSON, prose, quotes, code fences, /ocfoo, and /oc-cancel
+    # before this job can acquire a runner or call a model. A still-open PR
+    # remains required for the interactive PR route.
+    needs: preflight
     if: >-
       (github.event_name == 'workflow_dispatch' &&
        contains(fromJSON('["coderabbit-fix","resolve-conflict","ci-fix","issue","qualification"]'), inputs.mode)) ||
-      ((github.event_name == 'issue_comment' &&
-        !github.event.issue.pull_request) &&
-       github.actor == github.repository_owner &&
-       (contains(github.event.comment.body, '/oc') ||
-        contains(github.event.comment.body, '/opencode'))) ||
-      ((github.event_name == 'issue_comment' &&
-        github.event.issue.pull_request) &&
-       github.actor == github.repository_owner &&
+      (github.event_name == 'issue_comment' &&
+       !github.event.issue.pull_request &&
+       needs.preflight.outputs.admit == 'true') ||
+      (github.event_name == 'issue_comment' &&
+       github.event.issue.pull_request &&
        github.event.issue.state == 'open' &&
-       (startsWith(github.event.comment.body, '/oc') ||
-        startsWith(github.event.comment.body, '/opencode')) &&
-       !contains(github.event.comment.body, '/oc-cancel')) ||
-      ((github.event_name == 'pull_request_review_comment') &&
-       github.actor == github.repository_owner &&
-       (contains(github.event.comment.body, '/oc') ||
-        contains(github.event.comment.body, '/opencode')))
+       needs.preflight.outputs.admit == 'true') ||
+      (github.event_name == 'pull_request_review_comment' &&
+       needs.preflight.outputs.admit == 'true')
     runs-on: ${{ inputs.runner_os || vars.AUTOMATION_OPENCODE_RUNNER || 'ubuntu-latest' }}
     # Execution environment is a consumer decision. Core defaults to Linux;
     # consumers select another runner and prepare its toolchain explicitly.
@@ -512,10 +568,7 @@ jobs:
            (inputs.mode == 'issue' || inputs.mode == 'ci-fix')) ||
           (github.event_name == 'issue_comment' &&
            !github.event.issue.pull_request &&
-           github.actor == github.repository_owner &&
-           (contains(github.event.comment.body, '/oc') ||
-            contains(github.event.comment.body, '/opencode')) &&
-           !contains(github.event.comment.body, '/oc-cancel') &&
+           needs.preflight.outputs.admit == 'true' &&
            !contains(github.event.comment.body, 'continuum-qualification-dispatch'))
         uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
         env:
@@ -715,10 +768,7 @@ jobs:
           ((github.event_name == 'workflow_dispatch' && inputs.mode == 'issue') ||
            (github.event_name == 'issue_comment' &&
             !github.event.issue.pull_request &&
-            github.actor == github.repository_owner &&
-            (contains(github.event.comment.body, '/oc') ||
-             contains(github.event.comment.body, '/opencode')) &&
-            !contains(github.event.comment.body, '/oc-cancel') &&
+            needs.preflight.outputs.admit == 'true' &&
             !contains(github.event.comment.body, 'continuum-qualification-dispatch')))
         uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
         env:
@@ -1288,10 +1338,7 @@ jobs:
           (github.event_name == 'workflow_dispatch' && inputs.mode == 'issue') ||
           (github.event_name == 'issue_comment' &&
            !github.event.issue.pull_request &&
-           github.actor == github.repository_owner &&
-           (contains(github.event.comment.body, '/oc') ||
-            contains(github.event.comment.body, '/opencode')) &&
-           !contains(github.event.comment.body, '/oc-cancel') &&
+           needs.preflight.outputs.admit == 'true' &&
            !contains(github.event.comment.body, 'continuum-qualification-dispatch'))
         uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
         env:
@@ -1534,21 +1581,28 @@ jobs:
           set -euo pipefail
           eval "$PREPARE_COMMAND"
 
-      # Pre-emptive duplicate guard. The only other open-PR check in this
-      # workflow lives in `recover-scheduled-issue`, which runs AFTER a burnt
-      # run, so without this step a second dispatch for the same issue would
-      # launch a second agent against work that already has a PR. The branch
-      # prefix is the one the scheduler, the watchdog, and the repair
-      # controller all use.
+      # Pre-emptive duplicate guard. An open PR alone cannot stop a second
+      # trigger that arrives while the first coder is still running: the
+      # second run would queue behind the per-issue concurrency group and
+      # then execute after the first ends. This guard therefore checks both
+      # in-flight Actions runs for the exact issue identity and open PRs.
+      # The branch prefix is the one the scheduler, the watchdog, and the
+      # repair controller all use. Runs created before this run are the only
+      # competitors, so a run that legitimately starts after a terminal
+      # failure is never skipped merely because an older queued run exists.
       - name: Skip duplicate issue implementation
         id: duplicate_guard
         if: >-
           steps.issue_readiness.outputs.ready != 'false' &&
           ((github.event_name == 'workflow_dispatch' && inputs.mode == 'issue') ||
-           (github.event_name == 'issue_comment' && !github.event.issue.pull_request))
+           (github.event_name == 'issue_comment' &&
+            !github.event.issue.pull_request &&
+            needs.preflight.outputs.admit == 'true'))
         uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
         env:
           ISSUE_NUMBER: ${{ inputs.issue_number || github.event.issue.number }}
+          SNAPSHOT_GENERATION: '1'
+          SNAPSHOT_SPEC: ${{ steps.task_snapshot.outputs.spec_sha256 }}
           TAP_PAT: ${{ secrets.TAP_PAT }}
           GITHUB_API_URL: ${{ github.api_url }}
         with:
@@ -1557,6 +1611,8 @@ jobs:
             const owner = context.repo.owner;
             const repo = context.repo.repo;
             const issueNumber = Number(process.env.ISSUE_NUMBER || 0);
+            const generation = String(process.env.SNAPSHOT_GENERATION || '1');
+            const snapshotSpec = String(process.env.SNAPSHOT_SPEC || '').toLowerCase();
             const tapPat = String(process.env.TAP_PAT || '').trim();
             const apiBase = String(process.env.GITHUB_API_URL || 'https://api.github.com')
               .replace(/\/+$/, '');
@@ -1564,6 +1620,32 @@ jobs:
             if (!Number.isInteger(issueNumber) || issueNumber <= 0) {
               core.setOutput('skip', 'false');
               return;
+            }
+
+            const activeStatuses = new Set([
+              'queued', 'in_progress', 'waiting', 'requested', 'pending', 'action_required',
+            ]);
+            const runTitle = `OpenCode issue #${issueNumber}`;
+            const currentRunId = String(context.runId || '');
+
+            async function listActiveIssueRuns() {
+              const runs = [];
+              for (let page = 1; page <= 3; page += 1) {
+                const { data } = await github.rest.actions.listWorkflowRunsForRepo({
+                  owner,
+                  repo,
+                  per_page: 100,
+                  page,
+                });
+                const items = Array.isArray(data.workflow_runs) ? data.workflow_runs : [];
+                runs.push(...items);
+                if (items.length < 100) break;
+              }
+              return runs.filter(run =>
+                String(run.id) !== currentRunId &&
+                activeStatuses.has(String(run.status || '')) &&
+                String(run.display_title || '') === runTitle
+              );
             }
 
             async function listOpenPrsWithPat() {
@@ -1593,6 +1675,47 @@ jobs:
                 if (pageItems.length < 100) break;
               }
               return all;
+            }
+
+            let currentRun = null;
+            try {
+              const { data } = await github.rest.actions.getWorkflowRun({
+                owner,
+                repo,
+                run_id: Number(currentRunId),
+              });
+              currentRun = data;
+            } catch (err) {
+              core.warning(
+                `Duplicate guard could not read its own run ${currentRunId}: ${err.message || err}`
+              );
+            }
+
+            const currentCreatedAt = currentRun && currentRun.created_at
+              ? new Date(currentRun.created_at).getTime()
+              : null;
+            let competingRuns = [];
+            try {
+              competingRuns = await listActiveIssueRuns();
+            } catch (err) {
+              core.warning(
+                `Duplicate guard could not list active OpenCode runs: ${err.message || err}`
+              );
+            }
+            if (currentCreatedAt !== null) {
+              competingRuns = competingRuns.filter(
+                run => new Date(run.created_at || 0).getTime() < currentCreatedAt
+              );
+            }
+            if (competingRuns.length > 0) {
+              const run = competingRuns[0];
+              core.info(
+                `Run ${run.id} (${run.status}) is already active for issue #${issueNumber} ` +
+                `generation ${generation}${snapshotSpec ? ` spec ${snapshotSpec}` : ''}; ` +
+                'skipping duplicate OpenCode run.'
+              );
+              core.setOutput('skip', 'true');
+              return;
             }
 
             let openPrs;
@@ -1900,15 +2023,13 @@ jobs:
       - name: Run OpenCode
         if: >-
           github.event_name != 'workflow_dispatch' &&
-          ((github.event_name == 'pull_request_review_comment') ||
+          ((github.event_name == 'pull_request_review_comment' &&
+            needs.preflight.outputs.admit == 'true') ||
            (github.event_name == 'issue_comment' &&
             github.event.issue.pull_request &&
-            github.actor == github.repository_owner &&
             github.event.issue.state == 'open' &&
-            (startsWith(github.event.comment.body, '/oc') ||
-             startsWith(github.event.comment.body, '/opencode')))) &&
+            needs.preflight.outputs.admit == 'true')) &&
           steps.duplicate_guard.outputs.skip != 'true' &&
-          !contains(github.event.comment.body, '/oc-cancel') &&
           !contains(github.event.comment.body, 'continuum-qualification-dispatch')
         env:
           GITHUB_TOKEN: ${{ secrets.TAP_PAT }}
@@ -1931,10 +2052,7 @@ jobs:
           steps.issue_readiness.outputs.ready != 'false' &&
           github.event_name == 'issue_comment' &&
           !github.event.issue.pull_request &&
-          github.actor == github.repository_owner &&
-          (contains(github.event.comment.body, '/oc') ||
-           contains(github.event.comment.body, '/opencode')) &&
-          !contains(github.event.comment.body, '/oc-cancel') &&
+          needs.preflight.outputs.admit == 'true' &&
           !contains(github.event.comment.body, 'continuum-qualification-dispatch')
         env:
           GH_TOKEN: ${{ secrets.TAP_PAT }}
@@ -2030,11 +2148,8 @@ jobs:
           ((github.event_name == 'workflow_dispatch' && inputs.mode == 'issue') ||
            (github.event_name == 'issue_comment' &&
             !github.event.issue.pull_request &&
-            github.actor == github.repository_owner &&
-            (contains(github.event.comment.body, '/oc') ||
-             contains(github.event.comment.body, '/opencode')) &&
-            !contains(github.event.comment.body, '/oc-cancel') &&
-           !contains(github.event.comment.body, 'continuum-qualification-dispatch'))) &&
+            needs.preflight.outputs.admit == 'true' &&
+            !contains(github.event.comment.body, 'continuum-qualification-dispatch'))) &&
           steps.duplicate_guard.outputs.skip != 'true'
         env:
           GH_TOKEN: ${{ secrets.TAP_PAT }}
@@ -3877,15 +3992,15 @@ jobs:
 
   recover-scheduled-issue:
     name: Recover failed scheduled issue dispatch
-    needs: opencode
+    needs: [opencode, preflight]
     if: >-
       always() &&
       needs.opencode.outputs.restart_required != 'true' &&
       needs.opencode.result != 'success' &&
       needs.opencode.result != 'skipped' &&
       ((github.event_name == 'issue_comment' &&
-        github.actor == github.repository_owner &&
         !github.event.issue.pull_request &&
+        needs.preflight.outputs.admit == 'true' &&
         contains(github.event.comment.body, inputs.dispatch_marker || vars.AUTOMATION_DISPATCH_MARKER || '<!-- issue-scheduler-dispatch -->')) ||
        (github.event_name == 'workflow_dispatch' &&
         inputs.issue_number != ''))

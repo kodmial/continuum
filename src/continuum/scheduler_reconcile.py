@@ -35,10 +35,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
-import re
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 from .delegation_priority import effective_priority
+from .opencode_commands import is_manual_command
 
 
 @dataclass
@@ -94,26 +94,38 @@ class ReconcileResult:
     failed_message: str = ""
 
 
-# An owner command is a command token at the start of a line (up to three
-# leading spaces, mirroring the canonical manual-command rule), followed by
-# whitespace or end of input. Trailing prose on the same line (``/oc please``)
-# still counts as owner intent for the scheduler race guard, but substrings
-# such as ``/ocean`` or ``/ock``, mid-line prose mentions, quoted/inline-code
-# examples, and ``/oc-cancel`` (a launch guard, not a run) must not stall an
-# otherwise eligible issue.
-_OWNER_COMMAND_RE = re.compile(r"^[ ]{0,3}/(?:opencode|oc)(?=\s|$)", re.MULTILINE)
-
-
+# An owner command is exactly the shared manual-command rule from
+# :mod:`continuum.opencode_commands`: the first significant line must be one
+# of the documented launch tokens. Prose, snapshot JSON, quoted/indented
+# examples, lookalikes, and ``/oc-cancel`` never stall an otherwise eligible
+# issue. This module used to search every line for a token prefix, which let
+# an automation-authored snapshot comment (whose JSON contains escaped ``/oc``
+# strings) hold the scheduler race guard even though it launched nothing.
 def _is_owner_command(body: str) -> bool:
     if not isinstance(body, str) or not body:
         return False
-    return _OWNER_COMMAND_RE.search(body) is not None
+    return is_manual_command(body)
+
+
+def _has_marker_line(body: str, marker: str) -> bool:
+    """True when ``marker`` occupies a line of its own.
+
+    The scheduler writes the dispatch marker on a dedicated line. A task
+    snapshot reproduces the issue body inside fenced JSON, so it can contain
+    the same marker as substring data without being a dispatch record. Only a
+    standalone marker line is trusted as scheduler provenance.
+    """
+
+    if not isinstance(body, str) or not isinstance(marker, str) or not marker:
+        return False
+    normalized = body.replace("\r\n", "\n").replace("\r", "\n")
+    return any(line.strip() == marker for line in normalized.split("\n"))
 
 
 def _scheduler_dispatch_comments(
     comments: List[CommentRecord], marker: str
 ) -> List[CommentRecord]:
-    return [c for c in comments if marker in (c.body or "")]
+    return [c for c in comments if _has_marker_line(c.body or "", marker)]
 
 
 def _latest_relevant_dispatch(
@@ -122,7 +134,7 @@ def _latest_relevant_dispatch(
     relevant = [
         c
         for c in comments
-        if marker in (c.body or "")
+        if _has_marker_line(c.body or "", marker)
         or (c.author_is_owner and _is_owner_command(c.body or ""))
     ]
     if not relevant:

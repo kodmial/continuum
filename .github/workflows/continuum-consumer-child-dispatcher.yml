@@ -279,7 +279,11 @@ jobs:
                   break
                 fi
                 [[ "$override_count" =~ ^[0-9]+$ ]] || { override_failed=1; break; }
-                if ! override_cmds="$(jq -r --arg owner "$child_owner" '.[] | select(.user.login == $owner) | select((.body // "") | test("(^|[[:space:]])/(oc|opencode)([[:space:]]|$)")) | .created_at' <<<"$override_json" 2>/dev/null)"; then
+                # Exact manual-command parity with
+                # src/continuum/opencode_commands.py: the first significant
+                # line must be the bare token. Snapshot JSON, prose, quotes,
+                # code fences, lookalikes and /oc-cancel never hold a lease.
+                if ! override_cmds="$(jq -r --arg owner "$child_owner" '.[] | select(.user.login == $owner) | select((.body // "") as $b | ($b | split("\n") | map(select(test("^[ \\t]*$") | not)) | .[0] // "") as $line | (($line | test("^\\t|^ {4,}")) | not) and ((($line | gsub("^[ \\t]+|[ \\t]+$"; "")) == "/oc") or (($line | gsub("^[ \\t]+|[ \\t]+$"; "")) == "/opencode"))) | .created_at' <<<"$override_json" 2>/dev/null)"; then
                   override_failed=1
                   break
                 fi

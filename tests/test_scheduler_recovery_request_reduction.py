@@ -15,6 +15,8 @@ import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+from continuum.opencode_commands import is_manual_command  # noqa: E402
+
 
 ROOT = Path(__file__).resolve().parents[1]
 SCHEDULER = ROOT / ".github" / "workflows" / "continuum-issue-scheduler.yml"
@@ -213,7 +215,7 @@ class OwnerCommandWindowTests(unittest.TestCase):
     def test_bounded_lookup_still_catches_just_posted_command(self):
         owner = "octocat"
         history = [make_comment("hello", owner, 3600)] * 50 + [
-            make_comment("/oc please", owner, 20)
+            make_comment("/oc", owner, 20)
         ]
         store = CommentStore(history)
         grace_seconds = 5 * 60
@@ -223,16 +225,17 @@ class OwnerCommandWindowTests(unittest.TestCase):
         owner_hits = [
             c for c in window
             if c["user"]["login"] == owner
-            and ("/oc" in c["body"] or "/opencode" in c["body"])
+            and is_manual_command(c["body"])
         ]
         self.assertEqual(len(owner_hits), 1)
         age = (now - owner_hits[0]["created_at"]).total_seconds()
         self.assertLess(age, grace_seconds)
         # Both spellings are honored.
-        oc = make_comment("/oc run", owner, 10)
-        ope = make_comment("please /opencode this", owner, 10)
+        oc = make_comment("/oc", owner, 10)
+        ope = make_comment("/opencode", owner, 10)
         for comment in (oc, ope):
-            self.assertTrue("/oc" in comment["body"] or "/opencode" in comment["body"])
+            self.assertTrue(is_manual_command(comment["body"]))
+        self.assertFalse(is_manual_command("please /opencode this"))
 
     def test_scheduler_dispatch_guard_is_bounded_but_exact(self):
         body = scheduler_body()
@@ -240,7 +243,8 @@ class OwnerCommandWindowTests(unittest.TestCase):
         self.assertIn("commandGraceSinceIso", body)
         self.assertIn("since: commandGraceSinceIso()", body)
         self.assertIn("comment.user?.login === owner", body)
-        self.assertIn("(body.includes('/oc') || body.includes('/opencode'))", body)
+        self.assertIn("isExactManualCommand(body)", body)
+        self.assertNotIn("body.includes('/oc')", body)
         self.assertIn("if (commandAgeMs < commandGraceMs) {", body)
 
 
@@ -248,9 +252,10 @@ class DelegatedChildCommandTests(unittest.TestCase):
     def test_child_lookup_bounded_while_keeping_pat_and_identity(self):
         body = scheduler_body()
         start = body.index("local_override_active() {")
-        # Window covers the whole function body (bounded since-scan loop
-        # grew the function past the previous 2200-char slice).
-        window = body[start:start + 3000]
+        # Cover the whole function body, not a fixed-width slice that
+        # silently moves past the grace comparison when comments grow.
+        end = body.index("\n            }", start)
+        window = body[start:end]
         self.assertIn("since=$grace_since", window)
         self.assertIn("grace_since=", window)
         # Owner identity, both spellings and the grace comparison survive.
@@ -259,7 +264,9 @@ class DelegatedChildCommandTests(unittest.TestCase):
         self.assertIn("select(.user.login == $owner)", window)
         self.assertIn("--arg owner", window)
         self.assertIn('"$child_owner"', window)
-        self.assertIn("/(oc|opencode)", window)
+        self.assertIn('gsub("^[ \\\\t]+|[ \\\\t]+$"; "")', window)
+        self.assertIn('== "/oc")', window)
+        self.assertIn('== "/opencode")', window)
         self.assertIn("now_epoch - command_epoch < command_grace_seconds", window)
         # PAT credential for the cross-repository read is unchanged.
         self.assertIn("GH_TOKEN: ${{ secrets.TAP_PAT }}", body)
@@ -267,7 +274,7 @@ class DelegatedChildCommandTests(unittest.TestCase):
     def test_bounded_child_window_finds_recent_command(self):
         owner = "octocat"
         old = [make_comment("history", owner, 86400 + i) for i in range(100)]
-        fresh = make_comment("/opencode go", owner, 30)
+        fresh = make_comment("/opencode", owner, 30)
         store = CommentStore(old + [fresh])
         now = datetime.now(timezone.utc)
         window = store.list_since(now - timedelta(seconds=300 + 120))

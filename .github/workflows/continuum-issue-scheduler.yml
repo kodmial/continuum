@@ -873,7 +873,11 @@ jobs:
                   break
                 fi
                 [[ "$override_count" =~ ^[0-9]+$ ]] || { override_failed=1; break; }
-                if ! override_cmds="$(jq -r --arg owner "$child_owner" '.[] | select(.user.login == $owner) | select((.body // "") | test("(^|[[:space:]])/(oc|opencode)([[:space:]]|$)")) | .created_at' <<<"$override_json" 2>/dev/null)"; then
+                # Exact manual-command parity with
+                # src/continuum/opencode_commands.py: the first significant
+                # line must be the bare token. Snapshot JSON, prose, quotes,
+                # code fences, lookalikes and /oc-cancel never hold a lease.
+                if ! override_cmds="$(jq -r --arg owner "$child_owner" '.[] | select(.user.login == $owner) | select((.body // "") as $b | ($b | split("\n") | map(select(test("^[ \\t]*$") | not)) | .[0] // "") as $line | (($line | test("^\\t|^ {4,}")) | not) and ((($line | gsub("^[ \\t]+|[ \\t]+$"; "")) == "/oc") or (($line | gsub("^[ \\t]+|[ \\t]+$"; "")) == "/opencode"))) | .created_at' <<<"$override_json" 2>/dev/null)"; then
                   override_failed=1
                   break
                 fi
@@ -1491,6 +1495,37 @@ jobs:
               }
             }
 
+            // Canonical manual-command rule mirrored from
+            // src/continuum/opencode_commands.py (the Python scheduler model
+            // imports that module directly). A comment qualifies only when
+            // its first significant line is exactly /oc or /opencode;
+            // automation-authored snapshot JSON, prose, quotes, code fences,
+            // /ocfoo and /oc-cancel never consume the scheduler race guard.
+            function hasMarkerLine(body, marker) {
+              if (typeof body !== 'string' || typeof marker !== 'string' || !marker) {
+                return false;
+              }
+              return body
+                .replace(/\r\n?/g, '\n')
+                .split('\n')
+                .some(line => line.trim() === marker);
+            }
+
+            function isExactManualCommand(body) {
+              if (typeof body !== 'string' || body.length === 0) return false;
+              const lines = body.replace(/\r\n?/g, '\n').split('\n');
+              for (const raw of lines) {
+                if (raw.trim() === '') continue;
+                const line = raw.replace(/^\uFEFF+/, '');
+                if (line.startsWith('\t')) return false;
+                const leading = (line.match(/^ */) || [''])[0].length;
+                if (leading > 3) return false;
+                const token = line.replace(/^[ \t]+|[ \t]+$/g, '');
+                return token === '/oc' || token === '/opencode';
+              }
+              return false;
+            }
+
             // Bounded recent owner-command guard (Work-Lock #58 item 6 A3).
             // The final dispatch guard only cares about an owner /oc or
             // /opencode inside COMMAND_GRACE_MINUTES, so it queries the
@@ -1518,7 +1553,7 @@ jobs:
                 .filter(comment => {
                   const body = comment.body || '';
                   return comment.user?.login === owner &&
-                    (body.includes('/oc') || body.includes('/opencode'));
+                    isExactManualCommand(body);
                 })
                 .sort(
                   (a, b) =>
@@ -3051,7 +3086,7 @@ jobs:
               const body = comment?.body || '';
               const isOwnerCommand =
                 comment?.user?.login === owner &&
-                (body.includes('/oc') || body.includes('/opencode'));
+                isExactManualCommand(body);
 
               if (
                 eventIssue &&
@@ -3284,8 +3319,8 @@ jobs:
                   const body = comment.body || '';
                   const ownerOpenCodeCommand =
                     comment.user?.login === owner &&
-                    (body.includes('/oc') || body.includes('/opencode'));
-                  return body.includes(dispatchMarker) || ownerOpenCodeCommand;
+                    isExactManualCommand(body);
+                  return hasMarkerLine(body, dispatchMarker) || ownerOpenCodeCommand;
                 })
                 .sort(
                   (a, b) =>
@@ -3295,7 +3330,7 @@ jobs:
               // Only the scheduler's own dispatches consume the attempt budget;
               // a manual owner /oc must never burn one.
               const schedulerDispatches = comments.filter(comment =>
-                (comment.body || '').includes(dispatchMarker)
+                hasMarkerLine(comment.body || '', dispatchMarker)
               );
               const latestDispatch = dispatches.at(-1);
               const latestPr = latestPrByIssue.get(issueNumber);
@@ -3940,7 +3975,7 @@ jobs:
                     }
                   );
                   for (const comment of previous) {
-                    if ((comment.body || '').includes(dispatchMarker)) {
+                    if (hasMarkerLine(comment.body || '', dispatchMarker)) {
                       await github.rest.issues.deleteComment({
                         owner,
                         repo,

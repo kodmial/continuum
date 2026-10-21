@@ -184,5 +184,74 @@ class NoSelfTriggerTests(unittest.TestCase):
         self.assertEqual(commands.classify_issue_comment(body), "ignore")
 
 
+class TaskSnapshotNoSelfTriggerTests(unittest.TestCase):
+    """kodmial/continuum#339 / AA #408 regression fixture.
+
+    Issue #170 added the exact body parser, but the reusable workflow's
+    plain-issue job and step gates still used ``contains(body, '/oc')``,
+    and no test exercised that production condition. A machine-authored
+    task snapshot therefore still matched every ``contains`` gate because
+    its fenced JSON reproduces the issue body. These fixtures pin both the
+    parser and the admission decision the workflow must use.
+    """
+
+    SNAPSHOT = (
+        "<!-- continuum-task-snapshot repo=owner/repo issue=408 generation=1 "
+        "title-sha256=" + "a" * 64 + " body-sha256=" + "b" * 64 +
+        " spec-sha256=" + "c" * 64 + " -->\n"
+        "Continuum task snapshot (machine-owned, do not edit or delete).\n"
+        "This comment pins the exact issue title/body accepted for this "
+        "implementation generation.\n"
+        "\n"
+        "```json\n"
+        '{"body": "The owner posts /oc at 15:39:30 and /opencode later. '
+        'Never dispatch from this snapshot.", "title": "P0 snapshot"}\n'
+        "```"
+    )
+
+    def test_task_snapshot_json_is_never_a_command(self):
+        self.assertEqual(
+            commands.classify_issue_comment(self.SNAPSHOT), commands.IGNORE
+        )
+        self.assertFalse(
+            commands.is_owner_command(self.SNAPSHOT, "owner", "owner")
+        )
+
+    def test_aa_408_sequence_admits_the_owner_command_only(self):
+        conversation = [
+            ("owner", "/oc"),
+            ("owner", self.SNAPSHOT),
+            ("owner", "OpenCode run 39627655676 is running; the /oc token is context."),
+            ("owner", "> /oc"),
+            ("owner", "`/opencode`"),
+            ("owner", "/ocfoo"),
+            ("owner", "/oc-cancel"),
+            ("stranger", "/oc"),
+        ]
+        admitted = [
+            body for author, body in conversation
+            if commands.is_owner_command(body, author, "owner")
+        ]
+        self.assertEqual(admitted, ["/oc"])
+
+    def test_scheduler_and_watchdog_dispatch_forms_admit_once(self):
+        dispatch = (
+            "/oc\n\n" + commands.DEFAULT_DISPATCH_MARKER +
+            "\nAutomatically dispatched by the issue scheduler."
+        )
+        recovery = (
+            "/opencode\n\n" + commands.DEFAULT_RETRY_MARKER +
+            "\nAutomatic recovery retry 1/1."
+        )
+        self.assertTrue(commands.is_owner_command(dispatch, "owner", "owner"))
+        self.assertTrue(commands.is_owner_command(recovery, "owner", "owner"))
+        self.assertTrue(commands.is_scheduler_dispatch(dispatch))
+        self.assertTrue(commands.is_watchdog_recovery(recovery))
+        self.assertFalse(
+            commands.is_owner_command(dispatch, "stranger", "owner"),
+            "a forged scheduler marker from an untrusted actor must not run",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

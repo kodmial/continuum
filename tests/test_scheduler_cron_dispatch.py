@@ -32,6 +32,7 @@ from continuum.scheduler_reconcile import (
     CommentRecord,
     IssueState,
     SchedulerConfig,
+    _has_marker_line,
     reconcile,
 )
 
@@ -382,7 +383,7 @@ class OrderingAndBlockerTests(unittest.TestCase):
         comments = {
             156: [
                 CommentRecord(
-                    body="/oc please", author_is_owner=True,
+                    body="/oc", author_is_owner=True,
                     created_at=now - timedelta(minutes=1),
                 )
             ]
@@ -392,6 +393,65 @@ class OrderingAndBlockerTests(unittest.TestCase):
         )
         self.assertEqual(result.dispatched, [])
         self.assertIn("race window", result.skip_reasons[156])
+
+    def test_snapshot_and_prose_mentions_do_not_hold_the_command_grace(self):
+        config = SchedulerConfig(command_grace_minutes=5)
+        now = utcnow()
+        issues = {156: p0_issue()}
+        snapshot = (
+            "<!-- continuum-task-snapshot repo=owner/repo issue=408 generation=1 "
+            "title-sha256=" + "a" * 64 + " body-sha256=" + "b" * 64 +
+            " spec-sha256=" + "c" * 64 + " -->\n"
+            "Continuum task snapshot (machine-owned, do not edit or delete).\n"
+            "```json\n"
+            '{"body": "post /oc or /opencode to retry", "title": "Fix"}\n'
+            "```"
+        )
+        comments = {
+            156: [
+                CommentRecord(
+                    body=snapshot, author_is_owner=True,
+                    created_at=now - timedelta(minutes=1),
+                ),
+                CommentRecord(
+                    body="The owner should post /oc when ready.",
+                    author_is_owner=True,
+                    created_at=now - timedelta(minutes=1),
+                ),
+                CommentRecord(
+                    body="/ocfoo", author_is_owner=True,
+                    created_at=now - timedelta(minutes=1),
+                ),
+                CommentRecord(
+                    body="/oc-cancel", author_is_owner=True,
+                    created_at=now - timedelta(minutes=1),
+                ),
+            ]
+        }
+        result = reconcile(
+            now, issues, set(), set(), comments, {}, {}, set(), config
+        )
+        self.assertEqual(result.dispatched, [156])
+        self.assertNotIn(156, result.skip_reasons)
+
+
+class DispatchMarkerProvenanceTests(unittest.TestCase):
+    def test_snapshot_json_does_not_count_as_a_dispatch_marker(self):
+        marker = "<!-- issue-scheduler-dispatch -->"
+        snapshot = (
+            "<!-- continuum-task-snapshot repo=owner/repo issue=339 generation=1 "
+            "title-sha256=" + "a" * 64 + " body-sha256=" + "b" * 64 +
+            " spec-sha256=" + "c" * 64 + " -->\n"
+            "```json\n"
+            '{"body": "trusted syntax is /oc then ' + marker + '"}\n'
+            "```"
+        )
+        self.assertFalse(_has_marker_line(snapshot, marker))
+        self.assertTrue(
+            _has_marker_line(
+                "/oc\n\n" + marker + "\nAutomatically dispatched.", marker
+            )
+        )
 
 
 class WorkflowContractPinTests(unittest.TestCase):

@@ -7,6 +7,7 @@ qualification remains in #184.
 
 from __future__ import annotations
 
+import difflib
 import json
 import os
 import re
@@ -2354,6 +2355,241 @@ def issue_entry(relevant_file="src/app.py", header="Possible Bug", n: int = 0) -
     }
 
 
+# kodmial/continuum#339 (AA #408): exact comment admission and an
+# in-flight issue-run duplicate guard. This is the complete reviewed
+# added/removed line set for continuum-opencode.yml against the last
+# approved protected baseline (73955e2). Any further drift still fails.
+APPROVED_339_COMMENT_ADMISSION_ADDED_LINES = (
+    '  preflight:',
+    '    # GitHub expression `if:` cannot express the exact manual-command rule',
+    '    # (first significant line is exactly /oc or /opencode). Substring gates',
+    '    # let an internally authored task-snapshot comment whose JSON merely',
+    '    # mentions /oc launch a second coder (kodmial/aa#408). This small job',
+    '    # runs before the heavy OpenCode job and calls the canonical parser from',
+    '    # src/continuum/opencode_commands.py. It never checks out the task',
+    '    # workspace, probes a model, or starts an agent.',
+    '    name: Admit OpenCode comment command',
+    '    if: >-',
+    "      github.event_name == 'workflow_dispatch' ||",
+    "      github.event_name == 'issue_comment' ||",
+    "      github.event_name == 'pull_request_review_comment'",
+    '    runs-on: ubuntu-latest',
+    "    timeout-minutes: ${{ fromJSON(vars.AUTOMATION_PREFLIGHT_TIMEOUT_MINUTES || '5') }}",
+    '',
+    '    permissions:',
+    '      contents: read',
+    '',
+    '    outputs:',
+    '      admit: ${{ steps.command.outputs.admit }}',
+    '',
+    '    steps:',
+    '      - name: Checkout Continuum command parser',
+    '        if: >-',
+    "          github.event_name == 'issue_comment' ||",
+    "          github.event_name == 'pull_request_review_comment'",
+    '        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262',
+    '        with:',
+    '          repository: kodmial/continuum',
+    '          ref: ${{ inputs.continuum_ref }}',
+    '          path: .continuum-command',
+    '          fetch-depth: 1',
+    '          persist-credentials: false',
+    '',
+    '      - name: Classify comment command',
+    '        id: command',
+    '        shell: bash',
+    '        env:',
+    '          EVENT_NAME: ${{ github.event_name }}',
+    '          COMMENT_BODY: ${{ github.event.comment.body }}',
+    '          COMMENT_AUTHOR: ${{ github.actor }}',
+    '          REPOSITORY_OWNER: ${{ github.repository_owner }}',
+    '        run: |',
+    '          set -euo pipefail',
+    '          if [[ "$EVENT_NAME" == "workflow_dispatch" ]]; then',
+    '            echo "admit=true" >> "$GITHUB_OUTPUT"',
+    '            exit 0',
+    '          fi',
+    '          body_file="${RUNNER_TEMP}/continuum-comment-body"',
+    '          printf \'%s\' "$COMMENT_BODY" > "$body_file"',
+    '          decision="$(PYTHONDONTWRITEBYTECODE=1 python3 \\',
+    '            "$GITHUB_WORKSPACE/.continuum-command/.github/scripts/opencode_command.py" \\',
+    '            is-owner-command --body-file "$body_file" \\',
+    '            --author "$COMMENT_AUTHOR" --owner "$REPOSITORY_OWNER")"',
+    '          if [[ "$decision" == "true" ]]; then',
+    '            echo "admit=true" >> "$GITHUB_OUTPUT"',
+    '          else',
+    '            echo "admit=false" >> "$GITHUB_OUTPUT"',
+    '            echo "::notice::Comment is not an authorized exact OpenCode command; no coder admitted."',
+    '          fi',
+    '',
+    '    # Every issue/review comment route is admitted only by the preflight',
+    "    # job's canonical exact-command parser. That rejects internally authored",
+    '    # task-snapshot JSON, prose, quotes, code fences, /ocfoo, and /oc-cancel',
+    '    # before this job can acquire a runner or call a model. A still-open PR',
+    '    # remains required for the interactive PR route.',
+    '    needs: preflight',
+    "      (github.event_name == 'issue_comment' &&",
+    '       !github.event.issue.pull_request &&',
+    "       needs.preflight.outputs.admit == 'true') ||",
+    "      (github.event_name == 'issue_comment' &&",
+    '       github.event.issue.pull_request &&',
+    "       needs.preflight.outputs.admit == 'true') ||",
+    "      (github.event_name == 'pull_request_review_comment' &&",
+    "       needs.preflight.outputs.admit == 'true')",
+    "           needs.preflight.outputs.admit == 'true' &&",
+    "            needs.preflight.outputs.admit == 'true' &&",
+    "           needs.preflight.outputs.admit == 'true' &&",
+    '      # Pre-emptive duplicate guard. An open PR alone cannot stop a second',
+    '      # trigger that arrives while the first coder is still running: the',
+    '      # second run would queue behind the per-issue concurrency group and',
+    '      # then execute after the first ends. This guard therefore checks both',
+    '      # in-flight Actions runs for the exact issue identity and open PRs.',
+    '      # The branch prefix is the one the scheduler, the watchdog, and the',
+    '      # repair controller all use. Runs created before this run are the only',
+    '      # competitors, so a run that legitimately starts after a terminal',
+    '      # failure is never skipped merely because an older queued run exists.',
+    "           (github.event_name == 'issue_comment' &&",
+    '            !github.event.issue.pull_request &&',
+    "            needs.preflight.outputs.admit == 'true'))",
+    "          SNAPSHOT_GENERATION: '1'",
+    '          SNAPSHOT_SPEC: ${{ steps.task_snapshot.outputs.spec_sha256 }}',
+    "            const generation = String(process.env.SNAPSHOT_GENERATION || '1');",
+    "            const snapshotSpec = String(process.env.SNAPSHOT_SPEC || '').toLowerCase();",
+    '            const activeStatuses = new Set([',
+    "              'queued', 'in_progress', 'waiting', 'requested', 'pending', 'action_required',",
+    '            ]);',
+    '            const runTitle = `OpenCode issue #${issueNumber}`;',
+    "            const currentRunId = String(context.runId || '');",
+    '',
+    '            async function listActiveIssueRuns() {',
+    '              const runs = [];',
+    '              for (let page = 1; page <= 3; page += 1) {',
+    '                const { data } = await github.rest.actions.listWorkflowRunsForRepo({',
+    '                  owner,',
+    '                  repo,',
+    '                  per_page: 100,',
+    '                  page,',
+    '                });',
+    '                const items = Array.isArray(data.workflow_runs) ? data.workflow_runs : [];',
+    '                runs.push(...items);',
+    '                if (items.length < 100) break;',
+    '              }',
+    '              return runs.filter(run =>',
+    '                String(run.id) !== currentRunId &&',
+    "                activeStatuses.has(String(run.status || '')) &&",
+    "                String(run.display_title || '') === runTitle",
+    '              );',
+    '            }',
+    '',
+    '            let currentRun = null;',
+    '            try {',
+    '              const { data } = await github.rest.actions.getWorkflowRun({',
+    '                owner,',
+    '                repo,',
+    '                run_id: Number(currentRunId),',
+    '              });',
+    '              currentRun = data;',
+    '            } catch (err) {',
+    '              core.warning(',
+    '                `Duplicate guard could not read its own run ${currentRunId}: ${err.message || err}`',
+    '              );',
+    '            }',
+    '',
+    '            const currentCreatedAt = currentRun && currentRun.created_at',
+    '              ? new Date(currentRun.created_at).getTime()',
+    '              : null;',
+    '            let competingRuns = [];',
+    '            try {',
+    '              competingRuns = await listActiveIssueRuns();',
+    '            } catch (err) {',
+    '              core.warning(',
+    '                `Duplicate guard could not list active OpenCode runs: ${err.message || err}`',
+    '              );',
+    '            }',
+    '            if (currentCreatedAt !== null) {',
+    '              competingRuns = competingRuns.filter(',
+    '                run => new Date(run.created_at || 0).getTime() < currentCreatedAt',
+    '              );',
+    '            }',
+    '            if (competingRuns.length > 0) {',
+    '              const run = competingRuns[0];',
+    '              core.info(',
+    '                `Run ${run.id} (${run.status}) is already active for issue #${issueNumber} ` +',
+    "                `generation ${generation}${snapshotSpec ? ` spec ${snapshotSpec}` : ''}; ` +",
+    "                'skipping duplicate OpenCode run.'",
+    '              );',
+    "              core.setOutput('skip', 'true');",
+    '              return;',
+    '            }',
+    '',
+    "          ((github.event_name == 'pull_request_review_comment' &&",
+    "            needs.preflight.outputs.admit == 'true') ||",
+    "            needs.preflight.outputs.admit == 'true')) &&",
+    "          needs.preflight.outputs.admit == 'true' &&",
+    "            needs.preflight.outputs.admit == 'true' &&",
+    "            !contains(github.event.comment.body, 'continuum-qualification-dispatch'))) &&",
+    '    needs: [opencode, preflight]',
+    "        needs.preflight.outputs.admit == 'true' &&",
+)
+
+APPROVED_339_COMMENT_ADMISSION_REMOVED_LINES = (
+    '    # Interactive PR comments are gated narrowly: an issue_comment on a PR',
+    '    # runs only for an explicit owner command at the start of the comment on',
+    '    # a still-open PR. Substring matching is forbidden on that route because',
+    '    # OpenCode-generated prose itself can mention /oc while documenting the',
+    '    # contract, which chained one run per minute on a closed PR.',
+    "      ((github.event_name == 'issue_comment' &&",
+    '        !github.event.issue.pull_request) &&',
+    '       github.actor == github.repository_owner &&',
+    "       (contains(github.event.comment.body, '/oc') ||",
+    "        contains(github.event.comment.body, '/opencode'))) ||",
+    "      ((github.event_name == 'issue_comment' &&",
+    '        github.event.issue.pull_request) &&',
+    '       github.actor == github.repository_owner &&',
+    "       (startsWith(github.event.comment.body, '/oc') ||",
+    "        startsWith(github.event.comment.body, '/opencode')) &&",
+    "       !contains(github.event.comment.body, '/oc-cancel')) ||",
+    "      ((github.event_name == 'pull_request_review_comment') &&",
+    '       github.actor == github.repository_owner &&',
+    "       (contains(github.event.comment.body, '/oc') ||",
+    "        contains(github.event.comment.body, '/opencode')))",
+    '           github.actor == github.repository_owner &&',
+    "           (contains(github.event.comment.body, '/oc') ||",
+    "            contains(github.event.comment.body, '/opencode')) &&",
+    "           !contains(github.event.comment.body, '/oc-cancel') &&",
+    '            github.actor == github.repository_owner &&',
+    "            (contains(github.event.comment.body, '/oc') ||",
+    "             contains(github.event.comment.body, '/opencode')) &&",
+    "            !contains(github.event.comment.body, '/oc-cancel') &&",
+    '           github.actor == github.repository_owner &&',
+    "           (contains(github.event.comment.body, '/oc') ||",
+    "            contains(github.event.comment.body, '/opencode')) &&",
+    "           !contains(github.event.comment.body, '/oc-cancel') &&",
+    '      # Pre-emptive duplicate guard. The only other open-PR check in this',
+    '      # workflow lives in `recover-scheduled-issue`, which runs AFTER a burnt',
+    '      # run, so without this step a second dispatch for the same issue would',
+    '      # launch a second agent against work that already has a PR. The branch',
+    '      # prefix is the one the scheduler, the watchdog, and the repair',
+    '      # controller all use.',
+    "           (github.event_name == 'issue_comment' && !github.event.issue.pull_request))",
+    "          ((github.event_name == 'pull_request_review_comment') ||",
+    '            github.actor == github.repository_owner &&',
+    "            (startsWith(github.event.comment.body, '/oc') ||",
+    "             startsWith(github.event.comment.body, '/opencode')))) &&",
+    "          !contains(github.event.comment.body, '/oc-cancel') &&",
+    '          github.actor == github.repository_owner &&',
+    "          (contains(github.event.comment.body, '/oc') ||",
+    "           contains(github.event.comment.body, '/opencode')) &&",
+    "          !contains(github.event.comment.body, '/oc-cancel') &&",
+    '            github.actor == github.repository_owner &&',
+    "            (contains(github.event.comment.body, '/oc') ||",
+    "             contains(github.event.comment.body, '/opencode')) &&",
+    "            !contains(github.event.comment.body, '/oc-cancel') &&",
+    "           !contains(github.event.comment.body, 'continuum-qualification-dispatch'))) &&",
+    '    needs: opencode',
+    '        github.actor == github.repository_owner &&',
+)
+
 class StampDetectorTests(unittest.TestCase):
     def test_stamp_write_spellings_are_detected(self):
         for line in (
@@ -2445,6 +2681,7 @@ class ProtectedBaselineTests(unittest.TestCase):
             with self.subTest(path=path):
                 approved = migration if path == ".github/workflows/continuum-opencode.yml" else BASELINE_SHA
                 original = show_at(approved, path)
+                current = read_repo(path)
                 if path == ".github/workflows/continuum-opencode.yml":
                     # Immutable reviewed artifact, not an accumulating wildcard
                     # or a broad regex allowlist. Baseline advances only after
@@ -2452,8 +2689,30 @@ class ProtectedBaselineTests(unittest.TestCase):
                     self.assertIn("Qualify current CodeRabbit unresolved batch", original)
                     self.assertIn("CONTINUUM_OPENCODE_PUBLISH_RACE_RETRY_REQUIRED", original)
                     self.assertIn("steps.model_route.outputs.model", original)
-                self.assertEqual(read_repo(path), original,
-                                 f"{path}: unexpected drift outside reviewed protected baseline")
+                    diff = list(difflib.unified_diff(
+                        original.splitlines(), current.splitlines(), lineterm=""
+                    ))
+                    added = [
+                        line[1:] for line in diff
+                        if line.startswith("+") and not line.startswith("+++")
+                    ]
+                    removed = [
+                        line[1:] for line in diff
+                        if line.startswith("-") and not line.startswith("---")
+                    ]
+                    self.assertEqual(
+                        sorted(added),
+                        sorted(APPROVED_339_COMMENT_ADMISSION_ADDED_LINES),
+                        f"{path}: added lines outside the #339 comment-admission change",
+                    )
+                    self.assertEqual(
+                        sorted(removed),
+                        sorted(APPROVED_339_COMMENT_ADMISSION_REMOVED_LINES),
+                        f"{path}: removed lines outside the #339 comment-admission change",
+                    )
+                else:
+                    self.assertEqual(current, original,
+                                     f"{path}: unexpected drift outside reviewed protected baseline")
                 if path == ".github/workflows/continuum-opencode.yml":
                     self.assertIn("Restore verified cached OpenCode for coder and repair", read_repo(path))
                     self.assertNotIn("https://opencode.ai/install", read_repo(path))

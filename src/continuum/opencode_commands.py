@@ -2,10 +2,10 @@
 
 A single deterministic rule decides whether an issue comment is a manual
 OpenCode command. Every Continuum controller that admits owner commands --
-the OpenCode entry path, the scheduler grace logic, the scheduler caller
-stub, and the watchdog recovery path -- must apply exactly this rule, so an
-automation-authored explanatory comment that merely mentions ``/oc`` or
-``/opencode`` in prose can never be mistaken for a fresh command.
+the OpenCode preflight, the scheduler grace logic, and the watchdog recovery
+path -- must apply exactly this rule, so an automation-authored explanatory
+comment that merely mentions ``/oc`` or ``/opencode`` in prose can never be
+mistaken for a fresh command.
 
 The rule
 --------
@@ -41,10 +41,10 @@ What this module does not decide
   repository owner as the comment author (``github.actor ==
   github.repository_owner``); see :func:`is_owner_command`.
 * The pull-request interactive path. PR issue comments additionally require
-  the PR to still be open and the command token at the start of the comment
-  (``startsWith`` in the workflow expression, not ``contains``), so
-  agent-generated prose that mentions ``/oc`` later can never chain a
-  self-triggered run. Review comments keep their existing owner gate.
+  the PR to still be open, so an owner command on a closed PR never starts a
+  run. Every plain-issue, PR-comment and review-comment route shares the same
+  preflight parser, which rejects agent-generated prose that mentions ``/oc``
+  only later in the body.
 * Cancellation of running work. ``/oc-cancel`` is a launch guard only:
   Continuum has no mechanism that cancels an already-running run.
 
@@ -166,21 +166,27 @@ def is_owner_command(body, author_login, owner_login) -> bool:
     return is_manual_command(body) and _logins_equal(author_login, owner_login)
 
 
+def _has_marker_line(body, marker) -> bool:
+    """Whether ``marker`` occupies a line of its own in ``body``.
+
+    A task snapshot reproduces the issue body in fenced JSON, so it can
+    contain a marker string as data. Only a standalone line proves that the
+    publishing controller wrote the marker as provenance.
+    """
+
+    if not isinstance(body, str) or not isinstance(marker, str) or not marker:
+        return False
+    text = body.replace("\r\n", "\n").replace("\r", "\n")
+    return any(line.strip() == marker for line in text.split("\n"))
+
+
 def is_scheduler_dispatch(body, dispatch_marker=DEFAULT_DISPATCH_MARKER) -> bool:
     """Whether a comment carries the scheduler's dispatch marker."""
 
-    if not isinstance(body, str) or not isinstance(dispatch_marker, str):
-        return False
-    if not dispatch_marker:
-        return False
-    return dispatch_marker in body
+    return _has_marker_line(body, dispatch_marker)
 
 
 def is_watchdog_recovery(body, retry_marker=DEFAULT_RETRY_MARKER) -> bool:
     """Whether a comment carries the watchdog's recovery marker."""
 
-    if not isinstance(body, str) or not isinstance(retry_marker, str):
-        return False
-    if not retry_marker:
-        return False
-    return retry_marker in body
+    return _has_marker_line(body, retry_marker)
