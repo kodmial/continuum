@@ -207,14 +207,35 @@ class FakeOpenCodeHandler(BaseHTTPRequestHandler):
             type(self).sessions[sid] = True
             self._send(200, {"id": sid})
             return
-        if self.path.endswith("/message"):
+        if self.path.endswith("/prompt_async"):
             type(self).bodies.append(json.loads(raw))
+            self.send_response(204)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        if self.path.endswith("/message"):
+            # Deliberately refuse the legacy synchronous inference path.
+            self._send(400, {"error": "blocking message endpoint is forbidden"})
+            return
+        self._send(404, {"error": "nope"})
+
+    def do_GET(self) -> None:  # noqa: N802
+        if self.path == "/session/status":
             self._send(
                 200,
-                {
-                    "info": {"role": "assistant"},
+                {sid: {"type": "idle"} for sid in type(self).sessions},
+            )
+            return
+        if self.path.endswith("/message"):
+            self._send(
+                200,
+                [{
+                    "info": {
+                        "role": "assistant",
+                        "time": {"created": 1, "completed": 2},
+                    },
                     "parts": [{"type": "text", "text": "bridge-probe-ok"}],
-                },
+                }],
             )
             return
         self._send(404, {"error": "nope"})

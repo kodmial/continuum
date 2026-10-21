@@ -94,6 +94,10 @@ def opencode_call(method: str, path: str, payload: Dict[str, Any] | None, timeou
     # Fixed labels avoid logging OpenCode session ids or request bodies.
     if method == "POST" and path == "/session":
         stage = "create-session"
+    elif method == "POST" and path.endswith("/prompt_async"):
+        stage = "submit-async"
+    elif method == "GET" and path.endswith("/message"):
+        stage = "read-messages"
     elif method == "POST" and path.endswith("/message"):
         stage = "send-message"
     elif method == "DELETE" and path.startswith("/session/"):
@@ -145,6 +149,87 @@ def _monitor_opencode_session(session_id: str, finished: threading.Event) -> Non
         _bridge_timing("send-message", started, "status_" + state)
 
 
+def _await_async_assistant(session_id: str, timeout: int) -> Dict[str, Any]:
+    """Wait for a finished, server-recorded OpenCode reply, not a long socket read.
+
+    OpenCode /prompt_async acknowledges immediately (204). /session/status
+    reports busy or retry while the model works; /session/:id/message
+    contains a completed assistant message once the turn has actually ended.
+    The deadline here is a finite *infrastructure liveness watchdog*, never
+    a socket-read timeout or an invented successful review. Every HTTP poll
+    has a separate short transport timeout.
+    """
+    if timeout <= 0:
+        raise BridgeUpstreamError("invalid OpenCode completion watchdog", retryable=False)
+    started = time.monotonic()
+    deadline = started + timeout
+    last_status_log = started - 30.0
+    idle_without_reply_since: float | None = None
+    while True:
+        now = time.monotonic()
+        if now >= deadline:
+            raise BridgeUpstreamError(
+                "opencode session exceeded its configured completion watchdog",
+                retryable=True,
+            )
+        state = _session_state_sample(session_id)
+        if now - last_status_log >= 30:
+            _bridge_timing("send-message", started, "status_" + state)
+            last_status_log = now
+        if state not in ("busy", "retry"):
+            # OpenCode omits an idle session from /session/status in some
+            # releases. The durable assistant completion record, NOT missing
+            # status alone, is the authoritative successful response.
+            status, raw = opencode_call(
+                "GET", f"/session/{session_id}/message", None, 12
+            )
+            if status != 200:
+                raise map_opencode_error(status, raw)
+            try:
+                messages = json.loads(raw)
+            except (ValueError, TypeError):
+                raise BridgeUpstreamError(
+                    "opencode returned malformed session message list",
+                    retryable=True,
+                ) from None
+            if not isinstance(messages, list):
+                raise BridgeUpstreamError(
+                    "opencode returned non-list session messages",
+                    retryable=True,
+                )
+            assistants = [
+                entry for entry in messages
+                if isinstance(entry, dict)
+                and isinstance(entry.get("info"), dict)
+                and entry["info"].get("role") == "assistant"
+            ]
+            for entry in reversed(assistants):
+                info = entry["info"]
+                times = info.get("time")
+                if isinstance(times, dict) and times.get("completed") is not None:
+                    if info.get("error"):
+                        raise BridgeUpstreamError(
+                            "opencode completed with an assistant error",
+                            retryable=True,
+                        )
+                    # A completed assistant can still have no usable content:
+                    # extract_assistant_text fails closed on that condition.
+                    return entry
+            if state in ("idle", "unknown"):
+                if idle_without_reply_since is None:
+                    idle_without_reply_since = now
+                elif now - idle_without_reply_since >= 20:
+                    raise BridgeUpstreamError(
+                        "opencode became idle without a completed assistant reply",
+                        retryable=True,
+                    )
+            else:
+                idle_without_reply_since = None
+        else:
+            idle_without_reply_since = None
+        time.sleep(min(3.0, max(0.1, deadline - time.monotonic())))
+
+
 def run_completion(body: Dict[str, Any], timeout: int) -> Dict[str, Any]:
     messages = body.get("messages", [])
     request_model = str(body.get("model", "") or "")
@@ -156,30 +241,22 @@ def run_completion(body: Dict[str, Any], timeout: int) -> Dict[str, Any]:
     opencode_body = build_opencode_request(messages, inference_model(request_model), limit)
     require_inference_hardening(opencode_body)
 
-    status, raw = opencode_call("POST", "/session", {"title": "pr-agent-bridge"}, timeout)
+    status, raw = opencode_call("POST", "/session", {"title": "pr-agent-bridge"}, 15)
     if status != 200:
         raise map_opencode_error(status, raw)
     session_id = json.loads(raw).get("id", "")
     if not session_id:
         raise BridgeUpstreamError("opencode server returned no session id", retryable=True)
     try:
-        finished = threading.Event()
-        monitor = threading.Thread(
-            target=_monitor_opencode_session,
-            args=(session_id, finished),
-            daemon=True,
+        # Never hold one urllib socket for the entire model generation.
+        # The old synchronous POST was discarded after 170 seconds even
+        # when the actual session was still reporting status_busy.
+        status, raw = opencode_call(
+            "POST", f"/session/{session_id}/prompt_async", opencode_body, 15
         )
-        monitor.start()
-        try:
-            status, raw = opencode_call(
-                "POST", f"/session/{session_id}/message", opencode_body, timeout
-            )
-        finally:
-            finished.set()
-            monitor.join(timeout=4)
-        if status != 200:
+        if status != 204:
             raise map_opencode_error(status, raw)
-        result = json.loads(raw)
+        result = _await_async_assistant(session_id, timeout)
         text = extract_assistant_text(result)
         return opencode_response_to_openai(request_model or inference_model(request_model), text)
     finally:
@@ -250,7 +327,7 @@ class Handler(BaseHTTPRequestHandler):
         except (json.JSONDecodeError, UnicodeDecodeError) as exc:
             self._send(400, openai_error("invalid_request", f"invalid JSON: {exc}"))
             return
-        timeout = int(_env("PR_AGENT_TIMEOUT_SECONDS", "180") or "180")
+        timeout = int(_env("PR_AGENT_TIMEOUT_SECONDS", "600") or "600")
         started = time.monotonic()
         try:
             self._send(200, run_completion(body, timeout))
