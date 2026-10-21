@@ -998,6 +998,7 @@ jobs:
           # Neither number is an application-answer performance SLO.
           CONFIG__AI_TIMEOUT: '660'
           CONFIG__CUSTOM_MODEL_MAX_TOKENS: ${{ steps.stack.outputs.max_tokens }}
+          CONFIG__MAX_MODEL_TOKENS: ${{ steps.stack.outputs.max_tokens }}
           # Keep every request on the trusted, route-qualified OpenCode model.
           CONFIG__FALLBACK_MODELS: '[]'
           CONFIG__RETRY_SAME_MODEL_ON_TIMEOUT: 'false'
@@ -1714,6 +1715,7 @@ jobs:
           # Bound the outer reviewer at 200s (>170s bridge + cleanup margin).
           CONFIG__AI_TIMEOUT: '660'
           CONFIG__CUSTOM_MODEL_MAX_TOKENS: ${{ steps.stack.outputs.max_tokens }}
+          CONFIG__MAX_MODEL_TOKENS: ${{ steps.stack.outputs.max_tokens }}
           # Keep every request on the trusted, route-qualified OpenCode model.
           CONFIG__FALLBACK_MODELS: '[]'
           CONFIG__RETRY_SAME_MODEL_ON_TIMEOUT: 'false'
