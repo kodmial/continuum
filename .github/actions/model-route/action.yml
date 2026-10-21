@@ -22,7 +22,7 @@ inputs:
     required: false
     default: ''
   failure-reason:
-    description: Strict provider error class for fail (timeout, quota_429, upstream, unavailable)
+    description: Strict attested real-execution error class for fail (timeout, quota_429, upstream, unavailable, invalid_review_format); never code defects
     required: false
     default: ''
   expected-model:

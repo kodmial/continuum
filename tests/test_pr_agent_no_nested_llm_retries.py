@@ -1,5 +1,6 @@
 """Regression contract for nested reviewer timeouts and approved route ownership."""
 from pathlib import Path
+import re
 import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -49,6 +50,58 @@ class ReviewerRetryPolicy(unittest.TestCase):
         )[1].split("      - name: Publish private exact-head repair handoff", 1)[0]
         self.assertIn("steps.improve.outcome != 'failure'", receipt)
 
+
+    def test_malformed_live_yaml_fails_over_without_bypassing_review(self):
+        workflow = (ROOT / ".github/workflows/continuum-pr-agent.yml").read_text()
+        full_review = workflow.split(
+            "      - name: Run upstream full review on the exact HEAD", 1
+        )[1].split(
+            "      - name: Attest successful independent OpenCode review", 1
+        )[0]
+        # A parser-level failure after successful OpenCode HTTP calls is a
+        # model response-format error, not a code-quality finding, transport
+        # timeout, or an approval. It MUST retire just the selected route.
+        self.assertIn('provider_failure=invalid_review_format', full_review)
+        # Exercise the EXACT production grep expression with sanitized
+        # excerpts of the AA #410 review failure, not a hand-written regex.
+        matcher_line = next(
+            line for line in full_review.splitlines()
+            if "elif grep -Eiq" in line
+            and "Failed to parse AI prediction after fallbacks" in line
+        )
+        expression = matcher_line.split("'", 2)[1]
+        for log_line in (
+            "pr_agent.algo.utils:load_yaml:886 - Failed to parse AI prediction after fallbacks",
+            "ValueError: review chunk 2 did not contain a non-empty review mapping",
+        ):
+            with self.subTest(log_line=log_line):
+                self.assertRegex(log_line, re.compile(expression, re.I))
+        for non_model_error in (
+            "CI failed: invalid YAML in application workflow",
+            "Review failed because network permissions are missing",
+            "PR diff mentions: review chunk 2 did not contain a non-empty review mapping",
+            "PR-Agent returned clean review after a recoverable YAML warning",
+        ):
+            with self.subTest(non_model_error=non_model_error):
+                self.assertIsNone(re.search(expression, non_model_error, re.I))
+
+        self.assertIn(
+            'pr_agent[.]algo[.]utils.*Failed to parse AI prediction after fallbacks',
+            full_review)
+        self.assertIn(
+            'ValueError.*review chunk [0-9]+ did not contain a non-empty review mapping',
+            full_review)
+        self.assertIn("operation: fail", full_review)
+        self.assertIn("steps.pragent.outputs.provider_failure", full_review)
+        self.assertIn(
+            "steps.pragent.outcome == 'success'", full_review)
+        self.assertIn(
+            "Return strictly valid YAML in the requested review schema",
+            full_review)
+        # The upstream reviewer remains independent and must still succeed:
+        # format failure alone NEVER authorizes auto-merge.
+        self.assertIn("CONFIG__FALLBACK_MODELS: '[]'", full_review)
+        self.assertIn("CONFIG__NUM_RETRIES: '0'", full_review)
 
     def test_both_native_review_and_improve_disable_hidden_llm_retries(self):
         workflow = (ROOT / ".github/workflows/continuum-pr-agent.yml").read_text()
