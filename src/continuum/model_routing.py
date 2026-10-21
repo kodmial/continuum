@@ -426,12 +426,17 @@ def verified_receipt(state: dict, fingerprint: str, *,
 
 def attest_retryable_failure(current: dict, ticket: str, model: str, now: int,
                              fingerprint: str, reason: str, cooldown: int) -> dict:
-    """Consume only the same run's qualified selection after a real provider error.
+    """Consume only the same run's qualified selection after a model execution failure.
 
-    Never convert source-code/review-tool failures into model cooldowns.
+    An invalid_review_format receipt means the real inference finished but produced
+    a review YAML contract rejected by the *upstream PR-Agent parser*. Only the
+    trusted review runner may emit this class after confirming that diagnostic.
+    A syntax error in the PR code, a failed CI check, or a reviewer tool failure
+    is NOT a model-output failure and must never cool down the model.
     No other Actions run may report a failure for this selection.
     """
-    if reason not in ("timeout", "quota_429", "upstream", "unavailable"):
+    if reason not in ("timeout", "quota_429", "upstream", "unavailable",
+                      "invalid_review_format"):
         raise RouteError("Unsupported real-execution failure reason")
     if current.get("fingerprint") != fingerprint:
         if not current:
