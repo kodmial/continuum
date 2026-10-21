@@ -2,6 +2,7 @@
 set -euo pipefail
 
 ruby -E UTF-8 scripts/test-continuum.rb
+PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=src python3 -m continuum.trigger_manifest --check
 
 mkdir -p .opencode-tmp
 export TMPDIR="$PWD/.opencode-tmp"
