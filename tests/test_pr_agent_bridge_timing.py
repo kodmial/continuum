@@ -85,6 +85,79 @@ class BridgeTimingTests(unittest.TestCase):
         self.assertIn("outcome=status_busy", stderr.getvalue())
         self.assertNotIn("secret-session-id", stderr.getvalue())
 
+    def test_async_completion_survives_legacy_170_second_socket_cutoff(self):
+        """A busy model can finish at 180 seconds without waiting on one HTTP socket."""
+        finished = [{
+            "info": {"role": "assistant", "time": {"completed": 180001}},
+            "parts": [{"type": "text", "text": "grounded-review"}],
+        }]
+        clock = [0.0]
+
+        def monotonic():
+            # The server's model has been busy for >170s since dispatch.
+            clock[0] += 45.0
+            return clock[0]
+
+        with patch.object(bridge.time, "monotonic", side_effect=monotonic):
+            with patch.object(bridge.time, "sleep", return_value=None):
+                with patch.object(
+                    bridge, "_session_state_sample",
+                    side_effect=["busy", "busy", "busy", "idle"],
+                ) as status_sample:
+                    with patch.object(
+                        bridge, "opencode_call",
+                        return_value=(200, bridge.json.dumps(finished)),
+                    ) as read:
+                        answer = bridge._await_async_assistant("secret-session", 600)
+        self.assertEqual(bridge.extract_assistant_text(answer), "grounded-review")
+        self.assertEqual(status_sample.call_count, 4)
+        read.assert_called_once_with(
+            "GET", "/session/secret-session/message", None, 12
+        )
+
+    def test_async_status_does_not_accept_incomplete_or_error_reply(self):
+        for data in (
+            [{"info": {"role": "assistant", "time": {}},
+              "parts": [{"type": "text", "text": "partial"}]}],
+            [{"info": {"role": "assistant", "time": {"completed": 2},
+                       "error": {"message": "provider failure"}},
+              "parts": [{"type": "text", "text": "looks done"}]}],
+        ):
+            with self.subTest(data=data):
+                with patch.object(bridge, "_session_state_sample", return_value="idle"):
+                    with patch.object(
+                        bridge, "opencode_call",
+                        return_value=(200, bridge.json.dumps(data)),
+                    ):
+                        with patch.object(bridge.time, "sleep", return_value=None):
+                            with patch.object(
+                                bridge.time, "monotonic",
+                                side_effect=iter(range(0, 120, 3)),
+                            ):
+                                with self.assertRaises(bridge.BridgeUpstreamError):
+                                    bridge._await_async_assistant("secret-session", 60)
+
+    def test_async_endpoint_required_and_session_cleaned_after_failure(self):
+        with patch.dict(bridge.os.environ, {"OPENCODE_MODEL": "opencode/test-route"}):
+            with patch.object(
+                bridge, "opencode_call",
+                side_effect=[
+                    (200, '{"id":"private-session"}'),
+                    (500, '{"error":"unsupported async"}'),
+                    (200, "true"),
+                ],
+            ) as transport:
+                with self.assertRaises(bridge.BridgeUpstreamError):
+                    bridge.run_completion(
+                        {"messages": [{"role": "user", "content": "review"}]},
+                        timeout=600,
+                    )
+        self.assertEqual(
+            [call.args[1] for call in transport.call_args_list],
+            ["/session", "/session/private-session/prompt_async",
+             "/session/private-session"],
+        )
+
     def test_network_timeout_at_open_code_is_logged_as_distinct_error(self):
         stderr = io.StringIO()
         with patch.object(bridge.urllib.request, "urlopen", side_effect=TimeoutError("private-data")):
