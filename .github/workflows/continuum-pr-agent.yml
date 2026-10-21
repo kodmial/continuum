@@ -1137,7 +1137,7 @@ jobs:
             # Do not retry a malformed chunk blindly inside PR-Agent or merge
             # an incomplete review. Match only upstream parser diagnostics on
             # a failed review command, never arbitrary PR diff/code text.
-            elif grep -Eiq 'pr_agent[.]algo[.]utils.*Failed to parse AI prediction after fallbacks|review chunk [0-9]+ did not contain a non-empty review mapping' "$review_log"; then
+            elif grep -Eiq 'pr_agent[.]algo[.]utils.*Failed to parse AI prediction after fallbacks|ValueError.*review chunk [0-9]+ did not contain a non-empty review mapping' "$review_log"; then
               echo "provider_failure=invalid_review_format" >> "$GITHUB_OUTPUT"
             elif grep -Eiq 'FreeUsageLimitError|litellm[.]RateLimitError|429 Too Many Requests' "$review_log"; then
               echo "provider_failure=quota_429" >> "$GITHUB_OUTPUT"
