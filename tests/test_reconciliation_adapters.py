@@ -168,6 +168,15 @@ class ReviewAndRepairTests(unittest.TestCase):
         self.assertEqual(decision.kind, adapters.ACTION)
         self.assertEqual(decision.action, "repair_conflict")
 
+    def test_conflict_repair_budget_hold_reconsiders_on_new_head(self):
+        decision = adapters.decide_ci_repair(
+            pr(mergeable=False),
+            ci_run={"status": "completed", "conclusion": "failure"},
+            dispatches_for_head=3,
+            conflict_marker_age_seconds=601,
+        )
+        self.assertEqual(decision.kind, adapters.WAIT)
+
     def test_coderabbit_queue_retries_during_cooldown(self):
         limited_at = NOW - timedelta(minutes=5)
         decision = adapters.decide_coderabbit_queue(

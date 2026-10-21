@@ -489,10 +489,8 @@ def decide_ci_repair(
             conflict.reason,
             details={"attempt": conflict.attempt},
         )
-    if conflict.action in ("wait", "resume"):
+    if conflict.action in ("wait", "resume", "hold"):
         return _decision(WAIT, domain, owner, subject, "none", conflict.reason)
-    if conflict.action == "hold":
-        return _decision(TERMINAL, domain, owner, subject, "none", conflict.reason)
 
     status, conclusion = _run_state(ci_run)
     if status != "completed":
