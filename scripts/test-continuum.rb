@@ -2760,13 +2760,28 @@ class ContinuumTest < Minitest::Test
   # delegated worker run, and no publication or merge path may outrun a STOP.
   def test_operator_stop_reaches_parent_delegated_runs_and_publication
     scheduler = workflow_body('continuum-issue-scheduler.yml')
+    workflow = yaml(File.join(ROOT, '.github/workflows/continuum-issue-scheduler.yml'))
+    stub = yaml(File.join(ROOT, '.github/caller-stubs/continuum-issue-scheduler.yml'))
+    stop_job = workflow.fetch('jobs').fetch('stop')
+    stop_if = stop_job.fetch('if').to_s
+    assert_includes stop_if, "inputs.caller_event_name == 'issue_comment'"
+    assert_includes stop_if, 'inputs.caller_comment_body'
+    assert_includes stop_if, 'inputs.caller_comment_author == github.repository_owner'
+    assert_includes stop_if, "contains(inputs.caller_comment_body, '/oc-cancel')"
+    stop_with = stub.fetch('jobs').fetch('call').fetch('with')
+    %w[caller_comment_body caller_comment_author caller_comment_id caller_comment_created_at].each do |key|
+      assert stop_with.key?(key), "child STOP cannot reach the reusable control plane without #{key}"
+    end
     assert_includes scheduler,
                     "RUN_REPO_FULL: ${{ vars.CONTINUUM_ROLE == 'child' && vars.CONTINUUM_PARENT || github.repository }}"
     assert_includes scheduler,
                     "'.github/workflows/continuum-child-worker.yml' || format("
     control = File.read(File.join(ROOT, '.github/scripts/issue_stop_control.sh'))
     assert_includes control, 'run_repo="${RUN_REPO_FULL:-$REPO_FULL}"'
-    assert_includes control, 'gh api "repos/$run_repo/actions/runs?per_page=100"'
+    assert_includes control, 'for status in in_progress queued waiting pending requested; do'
+    assert_includes control, '"repos/$run_repo/actions/runs?status=$status&per_page=100&page=$page"'
+    assert_includes control, 'list_active_runs "$work/runs-observed-active.json"'
+    assert_includes control, 'repos/$run_repo/actions/runs/$run_id"'
     assert_includes control, 'gh api --method POST "repos/$run_repo/actions/runs/$run_id/cancel"'
     assert_includes scheduler, 'RUN_REPO_FULL="$GITHUB_REPOSITORY" \\'
     assert_includes scheduler, 'WORKFLOW_PATHS="$LOCAL_WORKFLOW_PATHS" \\'
@@ -4137,16 +4152,25 @@ class ContinuumTest < Minitest::Test
     workflow = yaml(File.join(ROOT, '.github/workflows/continuum-issue-scheduler.yml'))
     assert_equal "vars.CONTINUUM_ROLE != 'child'",
                  workflow.fetch('jobs').fetch('schedule').fetch('if')
-    assert_equal "vars.CONTINUUM_ROLE == 'child' && (inputs.caller_event_name == 'issues' || inputs.caller_event_name == 'issue_comment')",
-                 workflow.fetch('jobs').fetch('wake_parent').fetch('if'),
-                 'the reusable always sees github.event_name as workflow_call, so the legacy best-effort wake gate must read the caller-forwarded event name'
+    wake_if = workflow.fetch('jobs').fetch('wake_parent').fetch('if')
+    assert_includes wake_if, "vars.CONTINUUM_ROLE == 'child'"
+    assert_includes wake_if, "inputs.caller_event_name == 'issues'"
+    assert_includes wake_if, "inputs.caller_event_name == 'issue_comment'"
+    assert_includes wake_if, "!contains(inputs.caller_comment_body, '/oc-cancel')",
+                    'a child STOP must not wake the parent scheduler and race its own fence'
 
     stub = yaml(File.join(ROOT, '.github/caller-stubs/continuum-issue-scheduler.yml'))
     caller_gate = stub.fetch('jobs').fetch('call').fetch('if')
     assert_includes caller_gate, "vars.CONTINUUM_ROLE != 'child'",
-                    'a child must never invoke the reusable scheduler: every child event stays a cheap caller skip so delegated dispatch cannot depend on private child Actions capacity'
+                    'non-child events keep the original scheduler gate'
+    assert_includes caller_gate, "vars.CONTINUUM_ROLE == 'child' &&",
+                    'a child allocates a runner only for an exact owner STOP command'
+    assert_includes caller_gate, "github.actor == github.repository_owner &&",
+                    'the child STOP exception must be owner-authenticated'
+    assert_includes caller_gate, "contains(github.event.comment.body, '/oc-cancel')",
+                    'owner STOP prose is routed only for exact classification by the shared parser'
     refute_includes caller_gate, "vars.CONTINUUM_ROLE != 'child' ||",
-                     'no child event — issues or issue_comment — may admit a runner merely to wake the parent'
+                     'no automatic child event may admit a runner merely to wake the parent'
     refute_includes caller_gate, "github.event.action == 'opened'",
                      'the caller-level skip must not admit any child issue transition: parent cron is the recovery path'
 
@@ -4218,11 +4242,19 @@ class ContinuumTest < Minitest::Test
     # reconciler. A new eligible child issue is therefore picked up no later
     # than the next cron tick with no manual workflow_dispatch/comment/label
     # intervention.
-    assert_includes stub.fetch('jobs').fetch('call').fetch('if'),
-                    "vars.CONTINUUM_ROLE != 'child'"
-    refute_includes stub.fetch('jobs').fetch('call').fetch('if'),
-                    "vars.CONTINUUM_ROLE != 'child' ||",
-                    'no child event may invoke the reusable scheduler merely to wake the parent'
+    child_gate = stub.fetch('jobs').fetch('call').fetch('if')
+    assert_includes child_gate, "vars.CONTINUUM_ROLE != 'child'"
+    assert_includes child_gate, "contains(github.event.comment.body, '/oc-cancel')",
+                    'a child runs only the explicit owner STOP control plane, never automatic scheduling'
+    assert_includes child_gate, "github.actor == github.repository_owner",
+                    'child STOP must be owner-authenticated'
+    refute_includes child_gate, "vars.CONTINUUM_ROLE != 'child' ||",
+                    'no automatic child event may invoke the reusable scheduler merely to wake the parent'
+    %w[schedule push workflow_run].each do |automatic|
+      refute_match(/vars\.CONTINUUM_ROLE == 'child' &&[\s\S]{0,200}#{automatic}/,
+                   child_gate,
+                   "the child STOP exception must not admit #{automatic} events")
+    end
     on = events(stub)
     assert_equal ['7,17,27,37,47,57 * * * *'],
                  on.fetch('schedule').map { |entry| entry.fetch('cron') },
@@ -4511,6 +4543,10 @@ class ContinuumTest < Minitest::Test
     assert_includes scheduler, 'run.path === opencodeWorkflowPath ||'
     assert_includes scheduler, 'run.name === opencodeWorkflowName'
     assert_includes scheduler, "if (\n                openPrIssues.has(issueNumber) ||\n                activeRunIssues.has(issueNumber)\n              ) continue;"
+    assert_includes scheduler, 'An already-running coder always consumes WIP, even after'
+    refute_includes scheduler, 'if (!readyLabel || activeLabels.has(readyLabel))'
+    assert_includes scheduler, 'Released reservation on issue #'
+    assert_includes scheduler, ': missing required admission label `'
     assert_includes scheduler, "OPENCODE_WORKFLOW_NAME: ${{ inputs.opencode_workflow_name || vars.CONTINUUM_OPENCODE_WORKFLOW_NAME || 'OpenCode agent' }}"
     assert_includes scheduler, "OPENCODE_WORKFLOW_PATH: ${{ inputs.opencode_workflow_path || vars.CONTINUUM_OPENCODE_WORKFLOW_PATH || '.github/workflows/continuum-opencode.yml' }}"
   end

@@ -60,8 +60,10 @@ if ! gh api "repos/$REPO_FULL/issues/$ISSUE_NUMBER" >"$issue_json"; then
   fail "Could not read issue #$ISSUE_NUMBER for STOP."
 fi
 
+# Read the bounded full comment history (50 pages) so a STOP intent or a
+# later explicit recovery beyond the first page is never missed.
 : >"$work/comments-pages.jsonl"
-for page in 1 2 3; do
+for page in $(seq 1 50); do
   if ! page_json="$(gh api "repos/$REPO_FULL/issues/$ISSUE_NUMBER/comments?per_page=100&page=$page")"; then
     fail "Could not read comments for issue #$ISSUE_NUMBER; refusing to report STOPPED."
   fi
@@ -75,12 +77,21 @@ fi
 
 # 1) Revoke ready FIRST. Removing ready alone never cancels anything, but a
 #    STOP must prevent every new start even while cancellation is in flight.
-if ! gh api --method DELETE \
+#    404 means already absent, which is the desired state; any other failure
+#    that leaves the label present is actionable and fails closed.
+if gh api --method DELETE \
   "repos/$REPO_FULL/issues/$ISSUE_NUMBER/labels/${ready_label//:/%3A}" >/dev/null 2>&1; then
-  # 404 means already absent, which is the desired state.
-  :
+  echo "Revoked $ready_label on #$ISSUE_NUMBER before cancellation."
+else
+  if ! current_issue="$(gh api "repos/$REPO_FULL/issues/$ISSUE_NUMBER")"; then
+    fail "Could not verify $ready_label revocation on #$ISSUE_NUMBER."
+  fi
+  if jq -e '[.labels[]?.name] | index("automation:ready") != null' \
+      <<<"$current_issue" >/dev/null 2>&1; then
+    fail "Could not revoke $ready_label on #$ISSUE_NUMBER; refusing to report STOPPED."
+  fi
+  echo "$ready_label was already absent on #$ISSUE_NUMBER."
 fi
-echo "Revoked $ready_label on #$ISSUE_NUMBER before cancellation."
 
 # 2) Persist the durable intent/fence and the shared terminal stop BEFORE any
 #    cancellation attempt. Repeated STOP is idempotent: an existing intent is
@@ -108,26 +119,57 @@ stop_active="$(python3 "$stop_cli" is-active --comments-json "$comments_json" \
   --repo "$REPO_FULL" --issue "$ISSUE_NUMBER" --generation "$generation" \
   --owner "$REPO_OWNER" 2>/dev/null || echo active)"
 if [[ "$stop_active" != "stopped" ]]; then
-  spec="$(python3 - "$issue_json" <<'PY'
+  spec_json="$(python3 - "$issue_json" "$comments_json" "$REPO_FULL" \
+      "$ISSUE_NUMBER" "$generation" "$REPO_OWNER" <<'PY'
 import json, sys
 sys.path.insert(0, __import__('os').environ.get('ENGINE_ROOT', '') + '/src')
-from continuum.task_snapshot import spec_digest
+from continuum.task_snapshot import select_snapshot, spec_digest
 issue = json.load(open(sys.argv[1], encoding='utf-8'))
-print(spec_digest(issue.get('title') or '', issue.get('body') or ''))
+comments = json.load(open(sys.argv[2], encoding='utf-8'))
+live = spec_digest(issue.get('title') or '', issue.get('body') or '')
+selection = select_snapshot(
+    comments, repo=sys.argv[3], issue=int(sys.argv[4]),
+    generation=int(sys.argv[5]), owner_login=sys.argv[6],
+)
+pinned = (selection.snapshot.spec_sha256
+          if selection.status == 'found' and selection.snapshot else live)
+print(json.dumps({'pinned': pinned, 'live': live}))
 PY
 )" || fail "Could not compute the STOP fingerprint."
+  pinned_spec="$(jq -r '.pinned' <<<"$spec_json")"
+  live_spec="$(jq -r '.live' <<<"$spec_json")"
   stop_body="$(python3 "$stop_cli" render-stop --repo "$REPO_FULL" \
     --issue "$ISSUE_NUMBER" --generation "$generation" \
-    --pinned-spec "$spec" --live-spec "$spec" --reason operator)" || \
-    fail "Could not render STOP state."
+    --pinned-spec "$pinned_spec" --live-spec "$live_spec" \
+    --reason operator)" || fail "Could not render STOP state."
   gh api --method POST "repos/$REPO_FULL/issues/$ISSUE_NUMBER/comments" \
     -f body="$stop_body" >/dev/null || fail "Could not persist STOP state."
 fi
 echo "Persisted durable operator STOP for $REPO_FULL#$ISSUE_NUMBER generation $generation."
 
 # 3) Discover only runs with matching issue + workflow provenance. Never cancel
-#    all workflows, and never match a display title alone.
-gh api "repos/$run_repo/actions/runs?per_page=100" >"$runs_json" || \
+#    all workflows, and never match a display title alone. Query every active
+#    status so stale first-page history cannot hide a live run (a missing live
+#    run would otherwise be reported as a false STOPPED).
+list_active_runs() {
+  local destination="$1"
+  local pages="$2"
+  local status page page_json count
+  : >"$pages"
+  for status in in_progress queued waiting pending requested; do
+    for page in 1 2 3; do
+      if ! page_json="$(gh api \
+        "repos/$run_repo/actions/runs?status=$status&per_page=100&page=$page")"; then
+        return 1
+      fi
+      printf '%s\n' "$page_json" >>"$pages"
+      count="$(jq '.workflow_runs | length' <<<"$page_json" 2>/dev/null || echo 0)"
+      [[ "$count" == "100" ]] || break
+    done
+  done
+  jq -s '[.[] | .workflow_runs[]?] | unique_by(.id)' "$pages" >"$destination"
+}
+list_active_runs "$runs_json" "$work/runs-pages.jsonl" || \
   fail "Could not list Actions runs for STOP; no cancellation was attempted."
 
 paths_args=()
@@ -153,12 +195,26 @@ while IFS= read -r run_id; do
 done < <(jq -r '.[]' <<<"$target_ids")
 
 # 4) Observe until every target is terminal, bounded. A successful POST is not
-#    proof that the process stopped.
+#    proof that the process stopped. Active inventory plus an explicit read of
+#    each target run distinguishes a genuinely terminal run from a run that
+#    vanished from the first page of history.
 state="CANCEL_PENDING"
-for _attempt in 1 2 3 4 5 6; do
+for _attempt in $(seq 1 24); do
   sleep 5
-  if ! gh api "repos/$run_repo/actions/runs?per_page=100" >"$work/runs-observed.json"; then
+  if ! list_active_runs "$work/runs-observed-active.json" "$work/runs-observed-pages.jsonl"; then
     cancel_failure="${cancel_failure}run inventory unavailable; "
+    break
+  fi
+  : >"$work/runs-observed-targets.json"
+  while IFS= read -r run_id; do
+    [[ -n "$run_id" ]] || continue
+    gh api "repos/$run_repo/actions/runs/$run_id" \
+      >>"$work/runs-observed-targets.json" 2>/dev/null || true
+  done < <(jq -r '.[]' <<<"$target_ids")
+  if ! jq -s '[.[] | if type == "array" then .[] else . end]' \
+      "$work/runs-observed-active.json" "$work/runs-observed-targets.json" \
+      >"$work/runs-observed.json" 2>/dev/null; then
+    cancel_failure="${cancel_failure}run observation unavailable; "
     break
   fi
   printf '{"fence":"%s","repo":"%s","issue":%s,"generation":%s}\n' \

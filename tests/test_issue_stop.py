@@ -136,6 +136,45 @@ class StopIntentTests(unittest.TestCase):
             is False
         )
 
+    def test_publication_block_follows_fence_order_not_comment_order(self):
+        intent = comment(
+            stop.render_stop_intent(REPO, ISSUE, fence="12:ccc"),
+            created_at="2026-10-22T10:00:00Z",
+            comment_id=12,
+        )
+        terminal = stop_comment(created_at="2026-10-22T10:02:00Z", comment_id=13)
+        recover = comment(
+            render_generation_recover(REPO, ISSUE, generation=1),
+            created_at="2026-10-22T10:01:00Z",
+            comment_id=14,
+        )
+        self.assertTrue(
+            stop.stop_blocks_publication(
+                [intent, terminal, recover], repo=REPO, issue=ISSUE, owner_login=OWNER
+            ),
+            "an older recovery must not clear a newer stop",
+        )
+
+    def test_untrusted_recovery_never_rearms(self):
+        intent = comment(
+            stop.render_stop_intent(REPO, ISSUE, fence="12:ccc"),
+            created_at="2026-10-22T10:00:00Z",
+            comment_id=12,
+        )
+        terminal = stop_comment(created_at="2026-10-22T10:00:01Z", comment_id=13)
+        forged = comment(
+            render_generation_recover(REPO, ISSUE, generation=1),
+            created_at="2026-10-22T10:03:00Z",
+            comment_id=14,
+            author="stranger",
+            association="NONE",
+        )
+        self.assertTrue(
+            stop.stop_blocks_publication(
+                [intent, terminal, forged], repo=REPO, issue=ISSUE, owner_login=OWNER
+            )
+        )
+
     def test_duplicate_stop_is_idempotent(self):
         intent = comment(
             stop.render_stop_intent(REPO, ISSUE, fence="12:ccc"),

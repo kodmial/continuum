@@ -10,6 +10,7 @@ from __future__ import annotations
 import unittest
 
 from continuum import opencode_commands as commands
+from continuum.task_snapshot import build_snapshot, render_snapshot_comment
 
 
 DISPATCH_MARKER = commands.DEFAULT_DISPATCH_MARKER
@@ -173,6 +174,31 @@ class NoSelfTriggerTests(unittest.TestCase):
         results = [commands.classify_issue_comment(body) for body in conversation]
         self.assertEqual(results, ["run", "ignore", "ignore", "ignore"])
         self.assertEqual(results.count("run"), 1)
+
+    def test_snapshot_and_machine_comments_never_issue_commands(self):
+        snapshot = build_snapshot(
+            "owner/repo",
+            346,
+            "Implement STOP /oc-cancel handling",
+            "The issue body may literally mention /oc and /oc-cancel.",
+        )
+        rendered = render_snapshot_comment(snapshot)
+        self.assertIn("/oc", rendered)
+        self.assertIn("/oc-cancel", rendered)
+        self.assertEqual(commands.classify_issue_comment(rendered), "ignore")
+        self.assertFalse(commands.is_owner_stop_command(rendered, "owner", "owner"))
+
+        for body in (
+            "<!-- continuum-task-generation-stop repo=owner/repo issue=1 generation=1 "
+            "pinned-spec=" + "a" * 64 + " live-spec=" + "b" * 64 +
+            " reason=operator -->\n/oc-cancel",
+            "<!-- continuum-origin role=continuum component=opencode -->\n"
+            "Automation prose mentions /oc and /oc-cancel but grants no authority.",
+            "```json\n{\"body\": \"/oc-cancel\"}\n```",
+        ):
+            with self.subTest(body=body):
+                self.assertEqual(commands.classify_issue_comment(body), "ignore")
+                self.assertFalse(commands.is_owner_stop_command(body, "owner", "owner"))
 
     def test_explanatory_prose_through_the_owner_pat_dispatches_nothing(self):
         body = (

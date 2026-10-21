@@ -112,8 +112,8 @@ starts, including automatic scheduler dispatch, manual owner `/oc`, direct
 `issue` workflow dispatch, watchdog/429 recovery and delegated child work. It
 does **not** cancel an already-running Actions job.
 
-An owner (or explicitly authorized operator) comment whose first significant
-line is exactly `/oc-cancel` is a real operator STOP. It:
+An owner comment whose first significant line is exactly `/oc-cancel` is a
+real operator STOP. It:
 
 1. revokes `automation:ready`;
 2. persists a durable intent/fence and the shared terminal generation-stop
@@ -127,7 +127,31 @@ line is exactly `/oc-cancel` is a real operator STOP. It:
 Repeated STOP is idempotent. Restoring `automation:ready` never re-arms a
 stopped generation. An explicit owner recovery marker
 (`continuum-task-generation-recover`) re-arms it, after which a new owner
-command or scheduler pass may start exactly one new attempt.
+command or scheduler pass may start exactly one new attempt. STOP and recovery
+are separate operations: STOP is the only action that cancels a live run,
+while recovery only clears the fence for a future generation.
+
+Authorization is the repository owner's exact command. Prose, quoted examples,
+machine snapshots, bot comments and non-owner comments never grant STOP or
+recovery authority. Removing `automation:ready` manually is not a STOP: it
+prevents new starts but never cancels an in-flight job and does not persist the
+durable stop fence.
+
+A private Child may allocate a control-plane runner only for an owner comment
+that the shared parser classifies as an exact `/oc-cancel`; it never allocates
+a child coder or automatic scheduler runner.
+That STOP fences the Child issue and cancels the Parent's delegated
+`SubTask #<task>` run through the Parent PAT. Parent cron remains the
+authoritative discovery/recovery path, so child Actions availability is never
+required for ordinary scheduling.
+
+Migration and rollback are operator-controlled. Legacy compatibility inputs
+(`ready_label`, `pause_marker`, `pause_on_failure`, `post_pause_comment`) are
+still accepted by `workflow_call` but are inert: they never widen admission,
+write `automation:paused`, or suppress cancellation. To return a consumer to
+manual-only operation, remove `automation:ready` and stop dispatching new work;
+do not reintroduce pause labels as a substitute for STOP. Recovery after a STOP
+requires the explicit recovery marker and a fresh owner command.
 
 Automatic errors (no diff, 429, infrastructure, transient API failures) use
 bounded lease/backoff retry, not a terminal `automation:paused` label.

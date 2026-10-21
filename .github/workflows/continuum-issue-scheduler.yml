@@ -276,7 +276,11 @@ jobs:
     # called workflow). Bursts coalesce per issue: the parent dispatch is
     # idempotent, so a newer wake supersedes queued duplicates and cron stays
     # the missed-event backstop.
-    if: vars.CONTINUUM_ROLE == 'child' && (inputs.caller_event_name == 'issues' || inputs.caller_event_name == 'issue_comment')
+    if: >-
+      vars.CONTINUUM_ROLE == 'child' &&
+      (inputs.caller_event_name == 'issues' ||
+       (inputs.caller_event_name == 'issue_comment' &&
+        !contains(inputs.caller_comment_body, '/oc-cancel')))
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -534,7 +538,9 @@ jobs:
     if: >-
       inputs.caller_event_name == 'issue_comment' &&
       inputs.caller_comment_body != '' &&
-      inputs.caller_comment_author != ''
+      inputs.caller_comment_author != '' &&
+      inputs.caller_comment_author == github.repository_owner &&
+      contains(inputs.caller_comment_body, '/oc-cancel')
     runs-on: ubuntu-latest
     timeout-minutes: ${{ fromJSON(vars.AUTOMATION_SCHEDULER_TIMEOUT_MINUTES || '5') }}
     permissions:
@@ -3262,14 +3268,11 @@ jobs:
             for (const issueNumber of activeRunIssues) {
               const activeIssue = issueByNumber.get(issueNumber);
               if (!activeIssue) continue;
-              const activeLabels = labelsByIssue.get(issueNumber) || new Set();
-              // With explicit admission enabled, implementation WIP counts only
-              // admitted coding work. Qualification/control/manual runs may
-              // execute concurrently but must not consume automatic coding
-              // capacity.
-              if (!readyLabel || activeLabels.has(readyLabel)) {
-                activeIssueNumbers.add(issueNumber);
-              }
+              // An already-running coder always consumes WIP, even after
+              // automation:ready is removed. Removing ready prevents new
+              // starts; it never hides or cancels the running process
+              // (kodmial/continuum#346).
+              activeIssueNumbers.add(issueNumber);
               await addLabel(issueNumber, inProgressLabel);
               await removeLabel(issueNumber, pausedLabel);
             }
@@ -3300,11 +3303,16 @@ jobs:
               const labels = labelsByIssue.get(issueNumber);
               if (!labels.has(inProgressLabel)) continue;
 
-              // When explicit admission is enabled, a non-admitted in-progress
-              // issue belongs to another lane (qualification/control/manual).
-              // Leave its lifecycle label intact but do not reconcile/count it
-              // as automatic implementation WIP.
-              if (readyLabel && !labels.has(readyLabel)) {
+              // No active coder remains. A reservation without the fixed
+              // admission label is stale: release it so removing ready cannot
+              // leak a WIP slot. An active run was already handled above and
+              // still holds WIP regardless of ready.
+              if (!labels.has(readyLabel)) {
+                await removeLabel(issueNumber, inProgressLabel);
+                core.notice(
+                  'Released reservation on issue #' + issueNumber +
+                  ': missing required admission label `' + readyLabel + '`.'
+                );
                 continue;
               }
 
