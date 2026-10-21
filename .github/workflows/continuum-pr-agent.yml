@@ -1032,6 +1032,10 @@ jobs:
             evidenced by code visible in the current chunk or repository context.
             When confirmation depends on files outside the current chunk, put it under
             human verification instead of treating it as an actionable defect.
+            Return strictly valid YAML in the requested review schema for EACH chunk:
+            one top-level review mapping, properly nested ticket_compliance_check entries,
+            no stray second review key at list indentation, no Markdown fences, and
+            no truncated YAML blocks. Never invent findings to fill missing fields.
           PR_CODE_SUGGESTIONS__FOCUS_ONLY_ON_PROBLEMS: 'true'
           PR_CODE_SUGGESTIONS__PERSISTENT_COMMENT: 'true'
           PR_CODE_SUGGESTIONS__PUBLISH_OUTPUT_NO_SUGGESTIONS: 'false'
@@ -1125,6 +1129,16 @@ jobs:
             # Only recognized client/provider errors may retire a model.
             if grep -Eiq 'litellm[.]Timeout|APITimeoutError|Request timed out|timeout value=|Error code: 504|504 Gateway Timeout' "$review_log"; then
               echo "provider_failure=timeout" >> "$GITHUB_OUTPUT"
+            # AA #410: two live OpenCode responses completed with HTTP 200, but
+            # the second review chunk was malformed YAML. That is a *model
+            # output-contract failure*, not a code defect or provider outage.
+            # The frozen model route must be retired for this exact qualified
+            # execution so the bounded retry can choose another approved model.
+            # Do not retry a malformed chunk blindly inside PR-Agent or merge
+            # an incomplete review. Match only upstream parser diagnostics on
+            # a failed review command, never arbitrary PR diff/code text.
+            elif grep -Eiq 'pr_agent[.]algo[.]utils.*Failed to parse AI prediction after fallbacks|review chunk [0-9]+ did not contain a non-empty review mapping' "$review_log"; then
+              echo "provider_failure=invalid_review_format" >> "$GITHUB_OUTPUT"
             elif grep -Eiq 'FreeUsageLimitError|litellm[.]RateLimitError|429 Too Many Requests' "$review_log"; then
               echo "provider_failure=quota_429" >> "$GITHUB_OUTPUT"
             elif grep -Eiq 'litellm[.](InternalServerError|APIConnectionError)|503 Service Unavailable|502 Bad Gateway' "$review_log"; then
