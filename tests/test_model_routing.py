@@ -225,6 +225,19 @@ class RealExecutionFailureTests(unittest.TestCase):
             route.Configuration.parse(f"{A},{B}"), updated, 1201), (B,))
         self.assertEqual(updated["last_successful_real_execution"]["model"], A)
 
+    def test_malformed_live_review_response_retires_only_qualified_model(self):
+        state = self._selection()
+        updated = route.attest_retryable_failure(
+            state, "run", A, 1200, "f", "invalid_review_format", 900)
+        self.assertEqual(updated["qualified_selections"], {})
+        self.assertEqual(updated["cooldowns"][A], 2100)
+        self.assertEqual(
+            updated["last_failed_real_execution"],
+            {"model": A, "at": 1200, "reason": "invalid_review_format"})
+        self.assertEqual(
+            route.route_order(route.Configuration.parse(f"{A},{B}"),
+                              updated, 1201), (B,))
+
     def test_invalid_reason_and_wrong_run_cannot_retire_model(self):
         state = self._selection()
         for ticket, model, reason in (
