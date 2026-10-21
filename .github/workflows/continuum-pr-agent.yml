@@ -649,6 +649,7 @@ jobs:
           BRIDGE_SCRIPT="$RUNTIME_ROOT/.github/scripts/pr_agent_bridge.py"
           POLICY_SCRIPT="$RUNTIME_ROOT/.github/scripts/pr_agent_policy.js"
           FALLBACK_SCRIPT="$RUNTIME_ROOT/src/continuum/pr_agent_fallback_state.py"
+          EVIDENCE_SCRIPT="$RUNTIME_ROOT/src/continuum/pr_agent_evidence.py"
           mkdir -p "$RUNTIME_ROOT/.github/scripts" "$RUNTIME_ROOT/src/continuum"
           gh api --method GET \
             "repos/kodmial/continuum/contents/.github/scripts/pr_agent_bridge.py" \
@@ -666,9 +667,13 @@ jobs:
             "repos/kodmial/continuum/contents/src/continuum/pr_agent_fallback_state.py" \
             -f ref="$CONTINUUM_REF" --jq .content \
             | tr -d '\n' | continuum_b64_decode > "$FALLBACK_SCRIPT"
+          gh api --method GET \
+            "repos/kodmial/continuum/contents/src/continuum/pr_agent_evidence.py" \
+            -f ref="$CONTINUUM_REF" --jq .content \
+            | tr -d '\n' | continuum_b64_decode > "$EVIDENCE_SCRIPT"
           : > "$RUNTIME_ROOT/src/continuum/__init__.py"
           PYTHONPATH="$RUNTIME_ROOT/src" python3 -m py_compile \
-            "$BRIDGE_SCRIPT" "$RUNTIME_ROOT/src/continuum/pr_agent.py" "$FALLBACK_SCRIPT"
+            "$BRIDGE_SCRIPT" "$RUNTIME_ROOT/src/continuum/pr_agent.py" "$FALLBACK_SCRIPT" "$EVIDENCE_SCRIPT"
           node --check "$POLICY_SCRIPT"
           # Policy-bundle sync: the gate/route/threshold steps below require
           # these exports with fail-closed semantics. Validate immediately so
@@ -684,7 +689,10 @@ jobs:
               "hasBlockingSecuritySignal",
               "isSkippedCleanImprovePayload",
               "qualifyingImproveSuggestions",
-              "unwrapReview"
+              "unwrapReview",
+              "canPromoteEvidenceFilteredReview",
+              "setMergeRecommendation",
+              "ticketComplianceIsClean"
             ]) {
               if (typeof p[key] !== "function") {
                 console.error("::error::Continuum PR-Agent policy bundle is missing export: " + key);
@@ -707,6 +715,7 @@ jobs:
           echo "bridge_script=$BRIDGE_SCRIPT" >> "$GITHUB_OUTPUT"
           echo "policy_script=$POLICY_SCRIPT" >> "$GITHUB_OUTPUT"
           echo "fallback_pythonpath=$RUNTIME_ROOT/src" >> "$GITHUB_OUTPUT"
+          echo "evidence_script=$EVIDENCE_SCRIPT" >> "$GITHUB_OUTPUT"
 
       - name: Qualify trusted review-model route
         id: model_route
@@ -827,17 +836,120 @@ jobs:
           echo "sha=$ADMITTED_SHA" >> "$GITHUB_OUTPUT"
           echo "Exact CI-qualified HEAD $ADMITTED_SHA is still current."
 
+      - name: Build canonical full-PR evidence manifest for the exact HEAD
+        if: steps.stack.outputs.enabled == 'true' && steps.admit.outputs.admitted == 'true'
+        id: evidence
+        env:
+          # Manifest evidence is read from the resolved target. Local
+          # same-repository reads use github.token; delegated cross-repository
+          # reads require TAP_PAT, with the same empty-token fail-closed shape
+          # as every other target-aware read in this workflow.
+          GH_TOKEN: ${{ env.CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED == 'true' && secrets.TAP_PAT || (env.CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED != 'true' && github.token || '') }}
+          TAP_PAT: ${{ secrets.TAP_PAT }}
+          PR_NUMBER: ${{ steps.stack.outputs.pr_number }}
+          HEAD_SHA: ${{ steps.before.outputs.sha }}
+          EVIDENCE_SCRIPT: ${{ steps.runtime.outputs.evidence_script }}
+        run: |
+          set -euo pipefail
+          if [[ "${CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED:-false}" == "true" && -z "${TAP_PAT:-}" ]]; then
+            echo "::error::Delegated PR-Agent evidence manifest requires TAP_PAT; refusing to fall back to github.token."
+            exit 1
+          fi
+          : "${EVIDENCE_SCRIPT:?PR-Agent evidence script is unavailable.}"
+          [[ -s "$EVIDENCE_SCRIPT" ]] || { echo "::error::PR-Agent evidence script is missing."; exit 1; }
+          : "${CONTINUUM_PR_AGENT_WORKTREE:?PR-Agent worktree is unavailable.}"
+          : "${CONTINUUM_PR_AGENT_TARGET_REPOSITORY:?PR-Agent target repository is unset.}"
+          if ! [[ "${HEAD_SHA:-}" =~ ^([0-9a-fA-F]{40}|[0-9a-fA-F]{64})$ ]]; then
+            echo "::error::PR-Agent evidence manifest requires the exact full HEAD."
+            exit 1
+          fi
+          if ! [[ "${PR_NUMBER:-}" =~ ^[0-9]+$ ]]; then
+            echo "::error::PR-Agent evidence manifest requires a PR number."
+            exit 1
+          fi
+          CURRENT_SHA="$(gh api "repos/$CONTINUUM_PR_AGENT_TARGET_REPOSITORY/pulls/$PR_NUMBER" --jq .head.sha)"
+          if [[ "${CURRENT_SHA,,}" != "${HEAD_SHA,,}" ]]; then
+            echo "::error::PR head moved before evidence manifest construction ($HEAD_SHA -> $CURRENT_SHA); refusing stale scope."
+            exit 1
+          fi
+          EVIDENCE_DIR="$RUNNER_TEMP/continuum-pr-evidence"
+          rm -rf "$EVIDENCE_DIR"
+          mkdir -p "$EVIDENCE_DIR"
+          PAGES_JSONL="$EVIDENCE_DIR/changed-files-pages.jsonl"
+          FILES_JSON="$EVIDENCE_DIR/changed-files.json"
+          TREE_FILE="$EVIDENCE_DIR/tree-paths.txt"
+          MANIFEST_FILE="$EVIDENCE_DIR/manifest.json"
+          PROMPT_FILE="$EVIDENCE_DIR/manifest-prompt.txt"
+          : > "$PAGES_JSONL"
+          COMPLETE=false
+          PAGES=0
+          # Bounded pagination: GitHub caps this endpoint at 100 entries per
+          # page. Twenty pages cover 2000 changed files, far beyond the P0
+          # >40-file incident and every supported large PR. Reaching the bound
+          # without a short final page fails closed instead of treating a
+          # truncated list as complete evidence.
+          for page in $(seq 1 20); do
+            PAGE_FILE="$EVIDENCE_DIR/changed-files-page-$page.json"
+            if ! gh api "repos/$CONTINUUM_PR_AGENT_TARGET_REPOSITORY/pulls/$PR_NUMBER/files?per_page=100&page=$page" > "$PAGE_FILE"; then
+              echo "::error::Unable to read the full PR changed-files manifest page $page."
+              exit 1
+            fi
+            PAGE_LEN="$(jq 'length' "$PAGE_FILE" 2>/dev/null || echo invalid)"
+            [[ "$PAGE_LEN" =~ ^[0-9]+$ ]] || { echo "::error::Malformed PR changed-files manifest page $page."; exit 1; }
+            if [[ "$PAGE_LEN" -eq 0 ]]; then
+              # An empty page after a full page proves the list ended without
+              # reaching the 20-page bound, so the manifest is complete.
+              rm -f "$PAGE_FILE"
+              COMPLETE=true
+              break
+            fi
+            jq -c '.[]' "$PAGE_FILE" >> "$PAGES_JSONL"
+            PAGES=$page
+            rm -f "$PAGE_FILE"
+            if [[ "$PAGE_LEN" -lt 100 ]]; then
+              COMPLETE=true
+              break
+            fi
+          done
+          if [[ "$COMPLETE" != "true" ]]; then
+            echo "::error::PR changed-files pagination reached its bounded 20-page limit without a final short page; refusing incomplete evidence."
+            exit 1
+          fi
+          jq -s '.' "$PAGES_JSONL" > "$FILES_JSON"
+          git -C "$CONTINUUM_PR_AGENT_WORKTREE" ls-tree -r --name-only "$HEAD_SHA" > "$TREE_FILE"
+          python3 "$EVIDENCE_SCRIPT" build \
+            --head-sha "$HEAD_SHA" \
+            --files-json "$FILES_JSON" \
+            --tree-file "$TREE_FILE" \
+            --pages "$PAGES" \
+            --out "$MANIFEST_FILE" \
+            --prompt-out "$PROMPT_FILE"
+          chmod 600 "$MANIFEST_FILE" "$PROMPT_FILE"
+          MANIFEST_DIGEST="$(jq -r .digest "$MANIFEST_FILE")"
+          FILE_COUNT="$(jq -r .file_count "$MANIFEST_FILE")"
+          echo "manifest_file=$MANIFEST_FILE" >> "$GITHUB_OUTPUT"
+          echo "prompt_file=$PROMPT_FILE" >> "$GITHUB_OUTPUT"
+          echo "complete=true" >> "$GITHUB_OUTPUT"
+          echo "digest=$MANIFEST_DIGEST" >> "$GITHUB_OUTPUT"
+          echo "file_count=$FILE_COUNT" >> "$GITHUB_OUTPUT"
+          echo "Canonical full-PR manifest for $HEAD_SHA contains $FILE_COUNT changed file(s) (digest $MANIFEST_DIGEST)."
+
       # CodeRabbit-style follow-up: after a workflow-owned repair commit,
       # verify the ORIGINAL findings instead of restarting discovery over the
       # entire PR. Initial/non-repair heads still receive full PR-Agent review.
       - name: Resolve exact-HEAD original findings for targeted verification
-        if: steps.stack.outputs.enabled == 'true' && steps.admit.outputs.admitted == 'true'
+        if: >-
+          steps.stack.outputs.enabled == 'true' &&
+          steps.admit.outputs.admitted == 'true' &&
+          steps.evidence.outcome == 'success'
         id: targeted_verify
         uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
         env:
           PR_NUMBER: ${{ steps.stack.outputs.pr_number }}
           REVIEWED_SHA: ${{ steps.before.outputs.sha }}
           TAP_PAT: ${{ secrets.TAP_PAT }}
+          EVIDENCE_MANIFEST_FILE: ${{ steps.evidence.outputs.manifest_file }}
+          EVIDENCE_PROMPT_FILE: ${{ steps.evidence.outputs.prompt_file }}
         with:
           github-token: ${{ env.CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED == 'true' && secrets.TAP_PAT || (env.CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED != 'true' && github.token || '') }}
           script: |
@@ -884,7 +996,7 @@ jobs:
               ? (await github.rest.users.getAuthenticated()).data.login
               : 'github-actions[bot]';
             // Find the original repair handoff at the exact parent SHA.
-            const marker = /<!-- continuum-pr-agent-repair-batch:v1 head=([0-9a-f]{40}) fingerprint=([0-9a-f]{64}) payload=([A-Za-z0-9_-]+) -->/;
+            const marker = /<!-- continuum-pr-agent-repair-batch:v1 head=([0-9a-f]{40}) fingerprint=([0-9a-f]{64})(?: manifest=([0-9a-f]{64}))?(?: changed=(\d+))? payload=([A-Za-z0-9_-]+) -->/;
             const total = Number(pr.comments || 0);
             const lastPage = Math.max(1, Math.ceil(total / 100));
             const firstPage = Math.max(1, lastPage - 9);
@@ -900,7 +1012,7 @@ jobs:
                     )) continue;
                 const found = String(comment.body).match(marker);
                 if (found && found[1].toLowerCase() === priorHead) {
-                  matches.push({ id: comment.id, fingerprint: found[2], encoded: found[3] });
+                  matches.push({ id: comment.id, fingerprint: found[2], encoded: found[5] });
                 }
               }
             }
@@ -953,12 +1065,30 @@ jobs:
               core.setOutput('mode', 'full');
               return;
             }
+            const evidenceManifest = JSON.parse(
+              fs.readFileSync(process.env.EVIDENCE_MANIFEST_FILE, 'utf8')
+            );
+            if (evidenceManifest.head_sha !== head) {
+              core.setFailed('Full-PR evidence manifest is not for the reviewed HEAD.');
+              return;
+            }
             const instructions = [
               'TARGETED REPAIR VERIFICATION (CodeRabbit RESOLVED/UNRESOLVED semantics).',
               'The initial complete PR review has already happened. The current HEAD is',
               'a trusted workflow-owned repair of exact parent ' + priorHead + '.',
-              'Check EACH original finding against the CURRENT code and the repair diff.',
-              'Decide whether that specific defect is genuinely RESOLVED or remains UNRESOLVED.',
+              'The authoritative full-PR evidence manifest for the CURRENT exact HEAD is:',
+              '  HEAD=' + head + ' changed_files=' + evidenceManifest.file_count +
+                ' digest=' + evidenceManifest.digest + '.',
+              'The full changed-file list is supplied separately in the canonical',
+              'FULL-PR EVIDENCE block. A repair-only diff is NOT the full base..head PR',
+              'diff: unchanged, previously reviewed files do not appear in an incremental',
+              'repair diff and are still present in the current checkout.',
+              'Check EACH original finding against the CURRENT exact-HEAD repository code.',
+              'Never infer that a file, symbol, or implementation is absent from the PR or',
+              'from the current code because it is missing from the repair diff or from a',
+              'single review chunk.',
+              'Decide with concrete code evidence (and tests where applicable) whether that',
+              'specific defect is genuinely RESOLVED or remains UNRESOLVED.',
               'Populate key_issues_to_review with the original UNRESOLVED findings only,',
               'using their original file/title and precise remaining defect.',
               'Do not start a new whole-PR discovery/polish pass or create unrelated findings.',
@@ -978,7 +1108,10 @@ jobs:
               ' original findings on repair HEAD ' + head + '; full discovery suppressed.');
 
       - name: Run upstream full review on the exact HEAD
-        if: steps.stack.outputs.enabled == 'true' && steps.admit.outputs.admitted == 'true'
+        if: >-
+          steps.stack.outputs.enabled == 'true' &&
+          steps.admit.outputs.admitted == 'true' &&
+          steps.evidence.outcome == 'success'
         id: pragent
         env:
           GH_TOKEN: ${{ env.CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED == 'true' && secrets.TAP_PAT || (env.CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED != 'true' && github.token || '') }}
@@ -1051,6 +1184,7 @@ jobs:
           REVIEWED_SHA: ${{ steps.before.outputs.sha }}
           POLICY_SCRIPT: ${{ steps.runtime.outputs.policy_script }}
           TARGETED_VERIFICATION_FILE: ${{ steps.targeted_verify.outputs.scope_file }}
+          PR_EVIDENCE_PROMPT_FILE: ${{ steps.evidence.outputs.prompt_file }}
         run: |
           set -euo pipefail
           if [[ "${CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED:-false}" == "true" && -z "${TAP_PAT:-}" ]]; then
@@ -1065,11 +1199,17 @@ jobs:
           [[ "$IMPROVE_REPAIR_THRESHOLD" =~ ^[0-9]+$ ]] || { echo "::error::Invalid centralized PR-Agent improve threshold."; exit 1; }
           mkdir -p pr-agent-outputs
           : > pr-agent-outputs/continuum.jsonl
+          if [[ -n "${PR_EVIDENCE_PROMPT_FILE:-}" ]]; then
+            [[ -s "$PR_EVIDENCE_PROMPT_FILE" ]] || {
+              echo "::error::Canonical full-PR evidence prompt is unavailable."; exit 1;
+            }
+            export PR_REVIEWER__EXTRA_INSTRUCTIONS="${PR_REVIEWER__EXTRA_INSTRUCTIONS}"$'\n\n'"$(cat "$PR_EVIDENCE_PROMPT_FILE")"
+          fi
           if [[ -n "${TARGETED_VERIFICATION_FILE:-}" ]]; then
             [[ -s "$TARGETED_VERIFICATION_FILE" ]] || {
               echo "::error::Targeted verification scope is unavailable."; exit 1;
             }
-            export PR_REVIEWER__EXTRA_INSTRUCTIONS="${PR_REVIEWER__EXTRA_INSTRUCTIONS}"$(printf ' ')"$(cat "$TARGETED_VERIFICATION_FILE")"
+            export PR_REVIEWER__EXTRA_INSTRUCTIONS="${PR_REVIEWER__EXTRA_INSTRUCTIONS}"$'\n\n'"$(cat "$TARGETED_VERIFICATION_FILE")"
             echo "Using CodeRabbit-style original-finding verification on exact repair HEAD."
           fi
           # The authoritative re-review is CI-gated by this controller: after
@@ -1285,8 +1425,107 @@ jobs:
             core.setOutput('head_sha', currentSha);
             core.notice(`Native PR-Agent review output for ${reviewedSha} is current and machine-readable.`);
 
+      - name: Validate review claims against canonical full-PR evidence
+        if: >-
+          steps.stack.outputs.enabled == 'true' &&
+          steps.admit.outputs.admitted == 'true' &&
+          steps.result.outcome == 'success'
+        id: evidence_validation
+        env:
+          REVIEW_FILE: ${{ steps.pragent.outputs.review_file }}
+          MANIFEST_FILE: ${{ steps.evidence.outputs.manifest_file }}
+          EVIDENCE_SCRIPT: ${{ steps.runtime.outputs.evidence_script }}
+          EXPECTED_HEAD: ${{ steps.result.outputs.head_sha }}
+        run: |
+          set -euo pipefail
+          : "${REVIEW_FILE:?Runner-local PR-Agent review file is unavailable.}"
+          : "${MANIFEST_FILE:?Canonical full-PR manifest is unavailable.}"
+          : "${EVIDENCE_SCRIPT:?PR-Agent evidence script is unavailable.}"
+          [[ -s "$REVIEW_FILE" ]] || { echo "::error::Runner-local PR-Agent review file is missing."; exit 1; }
+          [[ -s "$MANIFEST_FILE" ]] || { echo "::error::Canonical full-PR manifest is missing."; exit 1; }
+          REPORT_FILE="$RUNNER_TEMP/continuum-pr-evidence/validation-report.json"
+          # Deterministic validation runs before improve/route/merge: only
+          # structural file-absence claims objectively contradicted by the
+          # complete manifest (or the current exact-HEAD tree) are removed.
+          # Ambiguous aliases, absent paths, security findings, and incomplete
+          # evidence all survive and therefore keep blocking.
+          python3 "$EVIDENCE_SCRIPT" validate \
+            --review-file "$REVIEW_FILE" \
+            --manifest-file "$MANIFEST_FILE" \
+            --out-review "$REVIEW_FILE" \
+            --report-out "$REPORT_FILE" \
+            --expected-head "$EXPECTED_HEAD"
+          chmod 600 "$REVIEW_FILE" "$REPORT_FILE"
+          echo "report_file=$REPORT_FILE" >> "$GITHUB_OUTPUT"
+          jq -r '"unsupported_count=\(.unsupported_count)", "ambiguous=\(.ambiguous)", "max_key_issues_count=\(.max_key_issues_count)", "manifest_digest=\(.manifest_digest)"' "$REPORT_FILE" >> "$GITHUB_OUTPUT"
+          jq -r '"Evidence validation on '"$EXPECTED_HEAD"': dropped \(.unsupported_count) manifest-contradicted finding(s); kept \(.kept); ambiguous=\(.ambiguous)."' "$REPORT_FILE" | while IFS= read -r line; do echo "::notice::$line"; done
+
+      - name: Apply evidence-backed merge recommendation
+        if: >-
+          steps.stack.outputs.enabled == 'true' &&
+          steps.admit.outputs.admitted == 'true' &&
+          steps.evidence_validation.outcome == 'success'
+        id: evidence_promotion
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
+        env:
+          REVIEW_FILE: ${{ steps.pragent.outputs.review_file }}
+          REPORT_FILE: ${{ steps.evidence_validation.outputs.report_file }}
+          POLICY_SCRIPT: ${{ steps.runtime.outputs.policy_script }}
+        with:
+          github-token: ${{ github.token }}
+          script: |
+            const fs = require('fs');
+            const reviewFile = String(process.env.REVIEW_FILE || '').trim();
+            const reportFile = String(process.env.REPORT_FILE || '').trim();
+            if (!reviewFile || !reportFile || !fs.existsSync(reviewFile) || !fs.existsSync(reportFile)) {
+              core.setFailed('Evidence promotion requires runner-local review and evidence-report files.');
+              return;
+            }
+            const policy = require(process.env.POLICY_SCRIPT);
+            let review;
+            let report;
+            try {
+              review = JSON.parse(fs.readFileSync(reviewFile, 'utf8'));
+              report = JSON.parse(fs.readFileSync(reportFile, 'utf8'));
+            } catch (err) {
+              core.setFailed('Evidence promotion could not parse review/report JSON: ' + err.message);
+              return;
+            }
+            const maxIssues = Number(report.max_key_issues_count);
+            const capReached = Number.isFinite(maxIssues) && maxIssues >= policy.REVIEW_MAX_FINDINGS;
+            core.setOutput('cap_reached', capReached ? 'true' : 'false');
+            core.setOutput('unsupported_count', String(report.unsupported_count || 0));
+            let decision;
+            try {
+              decision = policy.canPromoteEvidenceFilteredReview(review, report);
+            } catch (err) {
+              core.setFailed('Evidence promotion policy failed: ' + err.message);
+              return;
+            }
+            core.setOutput('promoted', decision.promote ? 'true' : 'false');
+            if (!decision.promote) {
+              core.notice('Evidence-filtered review stays behind the normal gate: ' + decision.reason);
+              return;
+            }
+            // A complete review whose only actionable items were objectively
+            // false file-absence claims may converge. This is not a bypass:
+            // coverage, security, tool-error, ticket, and findings-cap checks
+            // all had to pass just above, and the merge gate revalidates the
+            // exact HEAD and CI immediately before merging.
+            const promoted = policy.setMergeRecommendation(review, 'safe_to_merge');
+            fs.writeFileSync(reviewFile, JSON.stringify(promoted, null, 2));
+            fs.chmodSync(reviewFile, 0o600);
+            core.notice(
+              'Evidence-filtered complete review promoted to safe_to_merge: ' +
+              decision.reason + '.'
+            );
+
       - name: Export native persistent finding state for the reviewed HEAD
-        if: steps.stack.outputs.enabled == 'true' && steps.admit.outputs.admitted == 'true'
+        if: >-
+          steps.stack.outputs.enabled == 'true' &&
+          steps.admit.outputs.admitted == 'true' &&
+          steps.evidence_validation.outcome == 'success' &&
+          steps.evidence_promotion.outcome == 'success'
         id: persistent
         env:
           GH_TOKEN: ${{ env.CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED == 'true' && secrets.TAP_PAT || (env.CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED != 'true' && github.token || '') }}
@@ -1543,6 +1782,8 @@ jobs:
           steps.stack.outputs.enabled == 'true' &&
           steps.admit.outputs.admitted == 'true' &&
           steps.result.outcome == 'success' &&
+          steps.evidence_validation.outcome == 'success' &&
+          steps.evidence_promotion.outcome == 'success' &&
           steps.persistent.outcome == 'success'
         id: improve_gate
         uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
@@ -1554,6 +1795,7 @@ jobs:
           PR_NUMBER: ${{ steps.stack.outputs.pr_number }}
           PRAGENT_OUTCOME: ${{ steps.pragent.outcome }}
           POLICY_SCRIPT: ${{ steps.runtime.outputs.policy_script }}
+          EVIDENCE_REPORT_FILE: ${{ steps.evidence_validation.outputs.report_file }}
         with:
           github-token: ${{ env.CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED == 'true' && secrets.TAP_PAT || (env.CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED != 'true' && github.token || '') }}
           script: |
@@ -1577,6 +1819,23 @@ jobs:
             }
             const reviewJson = fs.readFileSync(reviewFile, 'utf8');
             const persistentStateJson = fs.readFileSync(persistentFile, 'utf8');
+            const evidenceReportFile = String(process.env.EVIDENCE_REPORT_FILE || '').trim();
+            if (!evidenceReportFile || !fs.existsSync(evidenceReportFile)) {
+              core.setFailed('Improve gate requires the canonical evidence report.');
+              return;
+            }
+            const evidenceReport = JSON.parse(fs.readFileSync(evidenceReportFile, 'utf8'));
+            const evidenceMaxIssues = Number(evidenceReport.max_key_issues_count);
+            if (Number.isFinite(evidenceMaxIssues) &&
+                evidenceMaxIssues >= policy.REVIEW_MAX_FINDINGS) {
+              // The original structured review hit the findings cap. Even if
+              // evidence validation removed some entries, hidden findings may
+              // remain, so never authorize an improve skip or a clean route.
+              core.setOutput('skip_improve', 'false');
+              core.setOutput('reason', 'evidence-filtered review reached the findings cap: potentially truncated');
+              core.notice('Automatic improve required: the evidence-filtered review reached the findings cap.');
+              return;
+            }
             const headSha = String(process.env.HEAD_SHA || '').trim().toLowerCase();
             const reviewedSha = String(process.env.REVIEWED_SHA || '').trim().toLowerCase();
             if (!headSha || !reviewedSha) {
@@ -1738,6 +1997,7 @@ jobs:
           REVIEWED_SHA: ${{ steps.before.outputs.sha }}
           POLICY_SCRIPT: ${{ steps.runtime.outputs.policy_script }}
           TARGETED_VERIFICATION_FILE: ${{ steps.targeted_verify.outputs.scope_file }}
+          PR_EVIDENCE_PROMPT_FILE: ${{ steps.evidence.outputs.prompt_file }}
         run: |
           set -euo pipefail
           if [[ "${CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED:-false}" == "true" && -z "${TAP_PAT:-}" ]]; then
@@ -1758,11 +2018,17 @@ jobs:
           [[ "$IMPROVE_REPAIR_THRESHOLD" =~ ^[0-9]+$ ]] || { echo "::error::Invalid centralized PR-Agent improve threshold."; exit 1; }
           mkdir -p pr-agent-outputs
           : > pr-agent-outputs/continuum.jsonl
+          if [[ -n "${PR_EVIDENCE_PROMPT_FILE:-}" ]]; then
+            [[ -s "$PR_EVIDENCE_PROMPT_FILE" ]] || {
+              echo "::error::Canonical full-PR evidence prompt is unavailable."; exit 1;
+            }
+            export PR_CODE_SUGGESTIONS__EXTRA_INSTRUCTIONS="$(cat "$PR_EVIDENCE_PROMPT_FILE")"
+          fi
           if [[ -n "${TARGETED_VERIFICATION_FILE:-}" ]]; then
             [[ -s "$TARGETED_VERIFICATION_FILE" ]] || {
               echo "::error::Targeted improve scope is unavailable."; exit 1;
             }
-            export PR_CODE_SUGGESTIONS__EXTRA_INSTRUCTIONS="$(cat "$TARGETED_VERIFICATION_FILE")"
+            export PR_CODE_SUGGESTIONS__EXTRA_INSTRUCTIONS="${PR_CODE_SUGGESTIONS__EXTRA_INSTRUCTIONS:-}"$'\n\n'"$(cat "$TARGETED_VERIFICATION_FILE")"
             echo "Restricting optional improve suggestions to the original repair findings."
           fi
           # The authoritative review carried actionable findings, so run one
@@ -2017,7 +2283,9 @@ jobs:
         if: >-
           steps.stack.outputs.enabled == 'true' &&
           steps.admit.outputs.admitted == 'true' &&
-          steps.post_improve.outcome == 'success'
+          steps.post_improve.outcome == 'success' &&
+          steps.evidence_validation.outcome == 'success' &&
+          steps.evidence_promotion.outcome == 'success'
         id: route
         uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
         env:
@@ -2025,6 +2293,7 @@ jobs:
           IMPROVE_FILE: ${{ steps.improve_output.outputs.improve_file }}
           IMPROVE_SKIPPED: ${{ steps.improve_skipped.outcome == 'success' }}
           POLICY_SCRIPT: ${{ steps.runtime.outputs.policy_script }}
+          EVIDENCE_REPORT_FILE: ${{ steps.evidence_validation.outputs.report_file }}
         with:
           github-token: ${{ github.token }}
           script: |
@@ -2038,6 +2307,15 @@ jobs:
             }
             const review = JSON.parse(fs.readFileSync(reviewFile, 'utf8'));
             const improveJsonl = fs.readFileSync(improveFile, 'utf8');
+            const evidenceReportFile = String(process.env.EVIDENCE_REPORT_FILE || '').trim();
+            if (!evidenceReportFile || !fs.existsSync(evidenceReportFile)) {
+              core.setFailed('PR-Agent routing requires the canonical evidence report.');
+              return;
+            }
+            const evidenceReport = JSON.parse(fs.readFileSync(evidenceReportFile, 'utf8'));
+            const evidenceMaxIssues = Number(evidenceReport.max_key_issues_count);
+            const evidenceCapReached = Number.isFinite(evidenceMaxIssues) &&
+              evidenceMaxIssues >= policy.REVIEW_MAX_FINDINGS;
             // Split envelopes share the merged helper: checking only one
             // side would miss nested findings or nested blocking security.
             let inner;
@@ -2065,10 +2343,22 @@ jobs:
               );
             }
             // One canonical policy owns repair/merge/re-review routing.
-            const disposition = policy.reviewDisposition(
+            let disposition = policy.reviewDisposition(
               review,
               improveJsonl
             );
+            if (evidenceCapReached && disposition.action === 'merge') {
+              // The original structured review hit the findings cap, so the
+              // evidence-filtered view may be truncated rather than clean.
+              // Repair may still proceed, but a merge disposition is refused
+              // and routed to a bounded re-review instead.
+              disposition = {
+                action: 'rereview',
+                reason: 'evidence-filtered review reached the findings cap; merge refused',
+                reviewCount: disposition.reviewCount,
+                qualifyingSuggestionCount: disposition.qualifyingSuggestionCount,
+              };
+            }
             const needsRepair = disposition.action === 'repair';
             const readyToMerge = disposition.action === 'merge';
             const needsRereview = disposition.action === 'rereview';
@@ -2078,6 +2368,7 @@ jobs:
             core.setOutput('review_disposition', disposition.action);
             core.setOutput('review_findings', String(disposition.reviewCount));
             core.setOutput('improve_suggestions', String(disposition.qualifyingSuggestionCount));
+            core.setOutput('cap_reached', evidenceCapReached ? 'true' : 'false');
             core.notice(
               'PR-Agent disposition=' + disposition.action + ': ' + disposition.reason
             );
@@ -2145,6 +2436,7 @@ jobs:
           REVIEW_FILE: ${{ steps.pragent.outputs.review_file }}
           IMPROVE_FILE: ${{ steps.improve_output.outputs.improve_file }}
           POLICY_SCRIPT: ${{ steps.runtime.outputs.policy_script }}
+          EVIDENCE_REPORT_FILE: ${{ steps.evidence_validation.outputs.report_file }}
           TAP_PAT: ${{ secrets.TAP_PAT }}
         with:
           github-token: ${{ env.CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED == 'true' && secrets.TAP_PAT || (env.CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED != 'true' && github.token || '') }}
@@ -2183,6 +2475,19 @@ jobs:
               return;
             }
 
+            const evidenceReportFile = String(process.env.EVIDENCE_REPORT_FILE || '').trim();
+            if (!evidenceReportFile || !fs.existsSync(evidenceReportFile)) {
+              core.setFailed('PR-Agent repair handoff requires the canonical evidence report.');
+              return;
+            }
+            const evidenceReport = JSON.parse(fs.readFileSync(evidenceReportFile, 'utf8'));
+            if (
+              String(evidenceReport.head_sha || '').trim().toLowerCase() !== headSha ||
+              evidenceReport.manifest_complete !== true
+            ) {
+              core.setFailed('PR-Agent repair handoff evidence does not cover the exact HEAD.');
+              return;
+            }
             const policy = require(process.env.POLICY_SCRIPT);
             const review = JSON.parse(fs.readFileSync(reviewFile, 'utf8'));
             const improve = fs.readFileSync(improveFile, 'utf8');
@@ -2191,21 +2496,37 @@ jobs:
               core.setFailed('Repair was requested but the runner-local repair batch is empty.');
               return;
             }
+            const maxIssues = Number(evidenceReport.max_key_issues_count);
             const payloadObject = {
               schema_version: 1,
               pr_number: prNumber,
               head_sha: headSha,
               fingerprint: batch.fingerprint,
+              evidence: {
+                manifest_complete: true,
+                manifest_digest: String(evidenceReport.manifest_digest || ''),
+                changed_file_count: Number(evidenceReport.changed_file_count || 0),
+                unsupported_count: Number(evidenceReport.unsupported_count || 0),
+                ambiguous: evidenceReport.ambiguous === true,
+                max_key_issues_count: Number.isFinite(maxIssues) ? maxIssues : 0,
+                cap_reached: Number.isFinite(maxIssues) && maxIssues >= policy.REVIEW_MAX_FINDINGS,
+              },
               items: batch.items,
             };
             const payloadJson = JSON.stringify(payloadObject);
             const payload = Buffer.from(payloadJson, 'utf8').toString('base64url');
             const body = [
               '<!-- continuum-pr-agent-repair-batch:v1 head=' + headSha +
-                ' fingerprint=' + batch.fingerprint + ' payload=' + payload + ' -->',
+                ' fingerprint=' + batch.fingerprint +
+                ' manifest=' + String(evidenceReport.manifest_digest || '') +
+                ' changed=' + String(evidenceReport.changed_file_count || 0) +
+                ' payload=' + payload + ' -->',
               '⚡ **Continuum · pr-agent-repair-handoff**',
               '<!-- continuum-origin role=continuum component=pr-agent-repair-handoff -->',
-              'Runner-local repair evidence staged for exact HEAD `' + headSha + '`.',
+              'Runner-local repair evidence staged for exact HEAD `' + headSha + '` ' +
+                '(' + String(evidenceReport.changed_file_count || 0) + ' changed file(s), manifest `' +
+                String(evidenceReport.manifest_digest || '') + '`, ' +
+                String(evidenceReport.unsupported_count || 0) + ' unsupported claim(s) dropped).',
             ].join('\n');
             if (Buffer.byteLength(body, 'utf8') > 60000) {
               core.setFailed('PR-Agent repair handoff exceeds the bounded comment payload size.');

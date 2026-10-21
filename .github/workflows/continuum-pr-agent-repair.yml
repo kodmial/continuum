@@ -310,7 +310,7 @@ jobs:
                 return;
               }
               const marker = body.match(
-                /<!-- continuum-pr-agent-repair-batch:v1 head=([0-9a-f]{40,64}) fingerprint=([0-9a-f]{64}) payload=([A-Za-z0-9_-]+) -->/i
+                /<!-- continuum-pr-agent-repair-batch:v1 head=([0-9a-f]{40,64}) fingerprint=([0-9a-f]{64})(?: manifest=([0-9a-f]{64}))?(?: changed=(\d+))? payload=([A-Za-z0-9_-]+) -->/i
               );
               if (!marker) {
                 core.setFailed('PR-Agent repair handoff marker is malformed or missing.');
@@ -323,7 +323,7 @@ jobs:
               }
               let payload;
               try {
-                payload = JSON.parse(Buffer.from(marker[3], 'base64url').toString('utf8'));
+                payload = JSON.parse(Buffer.from(marker[5], 'base64url').toString('utf8'));
               } catch (err) {
                 core.setFailed('PR-Agent repair handoff payload is invalid JSON: ' + err.message);
                 return;
@@ -338,6 +338,18 @@ jobs:
               ) {
                 core.setFailed('PR-Agent repair handoff payload does not match the exact PR/HEAD contract.');
                 return;
+              }
+              if (payload.evidence !== undefined) {
+                const evidence = payload.evidence;
+                if (
+                  !evidence ||
+                  typeof evidence !== 'object' ||
+                  evidence.manifest_complete !== true ||
+                  (marker[3] && String(evidence.manifest_digest || '').toLowerCase() !== marker[3].toLowerCase())
+                ) {
+                  core.setFailed('PR-Agent repair handoff evidence is incomplete or does not match its marker.');
+                  return;
+                }
               }
               items = payload.items;
               fingerprint = policy.logicalFingerprint(items);

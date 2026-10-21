@@ -4643,7 +4643,7 @@ class ImproveSkipWorkflowTests(unittest.TestCase):
         persistent = body.index("Export native persistent finding state for the reviewed HEAD")
         gate = body.index("Decide whether automatic improve can be skipped")
         self.assertLess(persistent, gate)
-        gate_window = body[gate:gate + 6000]
+        gate_window = body[gate:gate + 9000]
         self.assertIn("PERSISTENT_STATE_FILE", gate_window)
         self.assertIn("last_run", gate_window)
 
@@ -4653,7 +4653,7 @@ class ImproveSkipWorkflowTests(unittest.TestCase):
         # The window must cover the whole gate step. Delegated target-aware
         # live-head revalidation uses longer owner/repo lines than a
         # same-repository lookup, so allow margin beyond the gate body.
-        window = body[gate:gate + 7000]
+        window = body[gate:gate + 10000]
         self.assertIn("REVIEWED_SHA", window)
         self.assertIn("HEAD_SHA", window)
         self.assertIn("headSha !== reviewedSha", window)
@@ -4673,7 +4673,7 @@ class ImproveSkipWorkflowTests(unittest.TestCase):
         # discards each carry their own flag before the live-head decision.
         # Delegated target-aware revalidation is longer than a same-repository
         # lookup, so allow margin beyond the gate body.
-        window = body[gate:gate + 7000]
+        window = body[gate:gate + 10000]
         self.assertIn("pulls.get", window)
         self.assertIn("liveSha", window)
         self.assertIn("reviewedHeadSha", window)

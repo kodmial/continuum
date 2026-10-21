@@ -1012,6 +1012,23 @@ function isSkippedCleanImprovePayload(raw) {
   return sawLine && foundMarker;
 }
 
+function ticketComplianceIsClean(value) {
+  // An issue-less PR legitimately has no ticket_compliance_check entry.
+  // Missing/empty ticket checks are not positive non-compliance. But an
+  // explicitly supplied ticket result must prove no non-compliant requirements;
+  // malformed or nonempty non-compliance keeps the merge gate closed.
+  if (value === undefined || value === null) return true;
+  if (!Array.isArray(value)) return false;
+  const empty = new Set(['', '-', 'none', 'n/a', 'na', 'no']);
+  for (const entry of value) {
+    if (!entry || typeof entry !== 'object' || Array.isArray(entry)) return false;
+    if (!Object.prototype.hasOwnProperty.call(entry, 'not_compliant_requirements')) return false;
+    const text = String(entry.not_compliant_requirements ?? '').trim().toLowerCase();
+    if (!empty.has(text)) return false;
+  }
+  return true;
+}
+
 function nonActionableCautionIsMergeable(review) {
   // Upstream can legitimately choose merge_with_caution for risk/advisory
   // prose even when its exact-HEAD review found no actionable issues.
@@ -1025,22 +1042,80 @@ function nonActionableCautionIsMergeable(review) {
   if (hasBlockingSecuritySignal(review) ||
       hasToolErrorSignal(review) ||
       hasIncompleteCoverageSignal(review)) return false;
+  return ticketComplianceIsClean(review && review.ticket_compliance_check);
+}
 
-  // An issue-less PR legitimately has no ticket_compliance_check entry.
-  // Missing/empty ticket checks are not positive non-compliance. But an
-  // explicitly supplied ticket result must prove no non-compliant requirements;
-  // malformed or nonempty non-compliance keeps the merge gate closed.
-  const ticket = review && review.ticket_compliance_check;
-  if (ticket === undefined || ticket === null) return true;
-  if (!Array.isArray(ticket)) return false;
-  const empty = new Set(['', '-', 'none', 'n/a', 'na', 'no']);
-  for (const entry of ticket) {
-    if (!entry || typeof entry !== 'object' || Array.isArray(entry)) return false;
-    if (!Object.prototype.hasOwnProperty.call(entry, 'not_compliant_requirements')) return false;
-    const value = String(entry.not_compliant_requirements ?? '').trim().toLowerCase();
-    if (!empty.has(value)) return false;
+function canPromoteEvidenceFilteredReview(reviewPayload, evidenceReport) {
+  // A complete review may contain only file-absence claims that the canonical
+  // full-PR manifest objectively contradicts. Dropping those findings is not
+  // enough to declare the PR safe by itself: promotion requires complete
+  // trusted evidence, zero remaining key issues, clean security/coverage/tool
+  // signals, clean ticket compliance, and a finding list below the truncation
+  // cap. Anything else stays blocking and must be re-reviewed.
+  const report = evidenceReport && typeof evidenceReport === 'object' && !Array.isArray(evidenceReport)
+    ? evidenceReport
+    : null;
+  if (!report) return { promote: false, reason: 'evidence report is missing' };
+  if (report.manifest_complete !== true) {
+    return { promote: false, reason: 'full-PR manifest is incomplete' };
   }
-  return true;
+  const unsupported = Number(report.unsupported_count);
+  if (!Number.isFinite(unsupported) || unsupported < 1) {
+    return { promote: false, reason: 'no evidence-filtered findings' };
+  }
+  const maxIssues = Number(report.max_key_issues_count);
+  if (Number.isFinite(maxIssues) && maxIssues >= REVIEW_MAX_FINDINGS) {
+    return { promote: false, reason: 'evidence-filtered review reached the findings cap: potentially truncated' };
+  }
+  let review;
+  try {
+    review = unwrapReview(reviewPayload);
+  } catch (err) {
+    return { promote: false, reason: 'invalid review payload: ' + err.message };
+  }
+  if (!Array.isArray(review.key_issues_to_review)) {
+    return { promote: false, reason: 'review has no key_issues_to_review list' };
+  }
+  if (review.key_issues_to_review.length !== 0) {
+    return { promote: false, reason: 'actionable findings remain after evidence validation' };
+  }
+  if (hasBlockingSecuritySignal(review)) {
+    return { promote: false, reason: 'blocking security signal remains' };
+  }
+  if (hasToolErrorSignal(review)) {
+    return { promote: false, reason: 'tool error signal remains' };
+  }
+  if (hasIncompleteCoverageSignal(review)) {
+    return { promote: false, reason: 'review coverage is incomplete' };
+  }
+  if (!ticketComplianceIsClean(review.ticket_compliance_check)) {
+    return { promote: false, reason: 'ticket compliance is not clean' };
+  }
+  const recommendation = String(review.merge_recommendation || '').trim();
+  if (recommendation === REVIEW_MERGE_SAFE) {
+    return { promote: false, reason: 'review is already safe_to_merge' };
+  }
+  if (recommendation !== 'changes_required' && recommendation !== 'merge_with_caution') {
+    return { promote: false, reason: 'unsupported merge recommendation: ' + (recommendation || '<empty>') };
+  }
+  return {
+    promote: true,
+    reason: 'complete review with only manifest-contradicted absence findings',
+  };
+}
+
+function setMergeRecommendation(reviewPayload, value) {
+  if (!reviewPayload || typeof reviewPayload !== 'object' || Array.isArray(reviewPayload)) {
+    throw new Error('PR-Agent review payload must be an object.');
+  }
+  const recommendation = String(value || '').trim();
+  if (!recommendation) throw new Error('merge recommendation must not be empty');
+  const copy = JSON.parse(JSON.stringify(reviewPayload));
+  if (copy.review && typeof copy.review === 'object' && !Array.isArray(copy.review)) {
+    copy.review.merge_recommendation = recommendation;
+  }
+  copy.merge_recommendation = recommendation;
+  return copy;
 }
 
 function reviewDisposition(reviewPayload, improveJsonl, threshold = IMPROVE_REPAIR_THRESHOLD) {
@@ -1129,6 +1204,7 @@ module.exports = {
   REVIEW_MERGE_SAFE,
   attributionHeader,
   buildRepairBatch,
+  canPromoteEvidenceFilteredReview,
   controllerAttributionComponent,
   controllerStateBody,
   hasBlockingSecuritySignal,
@@ -1146,5 +1222,7 @@ module.exports = {
   reviewDisposition,
   nonActionableCautionIsMergeable,
   sameLogicalDefect,
+  setMergeRecommendation,
+  ticketComplianceIsClean,
   unwrapReview,
 };

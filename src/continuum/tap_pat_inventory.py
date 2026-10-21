@@ -796,6 +796,7 @@ PR_AGENT_FAMILY = {
         "Mark PR-Agent review in flight",
         "Checkout the pull request head without exposing delegated repository metadata",
         "Revalidate the admitted exact HEAD immediately before review",
+        "Build canonical full-PR evidence manifest for the exact HEAD",
         "Resolve exact-HEAD original findings for targeted verification",
         "Run upstream full review on the exact HEAD",
         "Revalidate the PR head and native review output after review",

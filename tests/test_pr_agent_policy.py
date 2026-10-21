@@ -59,6 +59,8 @@ else if (expr === 'unwrap') result = policy.unwrapReview(review);
 else if (expr === 'skipped') result = policy.isSkippedCleanImprovePayload(raw);
 else if (expr === 'skip') result = policy.isCleanReviewForImproveSkip(review, state, options);
 else if (expr === 'disposition') result = policy.reviewDisposition(review, raw);
+else if (expr === 'promote') result = policy.canPromoteEvidenceFilteredReview(review, options.report || null);
+else if (expr === 'recommend') result = policy.setMergeRecommendation(review, options.value);
 else throw new Error('unknown expr');
 process.stdout.write(JSON.stringify(result === undefined ? null : result));
 """
@@ -679,6 +681,99 @@ class PrAgentWorkflowContractTests(unittest.TestCase):
         self.assertIn("tool error: failing closed", merge)
         self.assertIn("incomplete review coverage: failing closed", merge)
         self.assertIn("blocking security signal remains", merge)
+
+
+class EvidenceFilteredReviewTests(unittest.TestCase):
+    """A complete review whose only findings are contradicted file-absence
+    claims may converge, but only behind strict evidence/security/coverage/
+    ticket/truncation gates. Anything less fails closed to re-review/repair.
+    """
+
+    def _read(self, *parts):
+        with open(os.path.join(ROOT, *parts), encoding="utf-8") as handle:
+            return handle.read()
+
+    def _report(self, **overrides):
+        report = {
+            "manifest_complete": True,
+            "unsupported_count": 1,
+            "max_key_issues_count": 1,
+        }
+        report.update(overrides)
+        return report
+
+    def test_complete_review_with_only_contradicted_claims_can_promote(self):
+        review = make_review([], recommendation="changes_required",
+                             extra={"security_concerns": "No security concerns identified",
+                                    "coverage_complete": True})
+        result = run_js("promote", review=review,
+                        options={"report": self._report()})
+        self.assertTrue(result["promote"], result)
+
+    def test_remaining_findings_block_promotion(self):
+        review = make_review([issue_entry(n=0)], recommendation="changes_required")
+        result = run_js("promote", review=review,
+                        options={"report": self._report()})
+        self.assertFalse(result["promote"])
+
+    def test_incomplete_manifest_or_coverage_blocks_promotion(self):
+        review = make_review([], recommendation="changes_required",
+                             extra={"coverage_complete": True})
+        for report in (
+            self._report(manifest_complete=False),
+            self._report(unsupported_count=0),
+            self._report(max_key_issues_count=6),
+        ):
+            with self.subTest(report=report):
+                result = run_js("promote", review=review, options={"report": report})
+                self.assertFalse(result["promote"])
+
+    def test_security_tool_ticket_signals_block_promotion(self):
+        cases = [
+            make_review([], recommendation="changes_required",
+                        extra={"security_concerns": ["hardcoded credential"]}),
+            make_review([], recommendation="changes_required",
+                        extra={"tool_errors": "upstream tool failed"}),
+            make_review([], recommendation="changes_required",
+                        extra={"coverage_complete": False}),
+            make_review([], recommendation="changes_required",
+                        extra={"ticket_compliance_check": [
+                            {"not_compliant_requirements": "AA #408 runtime policy"}]}),
+        ]
+        for review in cases:
+            with self.subTest(review=review):
+                result = run_js("promote", review=review,
+                                options={"report": self._report()})
+                self.assertFalse(result["promote"])
+
+    def test_missing_or_invalid_report_never_promotes(self):
+        review = make_review([], recommendation="changes_required")
+        for report in (None, {}, {"manifest_complete": True}):
+            with self.subTest(report=report):
+                result = run_js("promote", review=review, options={"report": report})
+                self.assertFalse(result["promote"])
+
+    def test_set_merge_recommendation_handles_split_envelope(self):
+        review = {
+            "review": make_review([], recommendation="changes_required"),
+            "coverage_complete": True,
+        }
+        promoted = run_js("recommend", review=review,
+                          options={"value": "safe_to_merge"})
+        self.assertEqual(promoted["review"]["merge_recommendation"], "safe_to_merge")
+        self.assertEqual(promoted["merge_recommendation"], "safe_to_merge")
+        self.assertEqual(review["review"]["merge_recommendation"], "changes_required")
+
+    def test_workflow_wires_manifest_prompt_and_evidence_validation(self):
+        body = self._read(".github", "workflows", "continuum-pr-agent.yml")
+        self.assertIn("Build canonical full-PR evidence manifest", body)
+        self.assertIn("pulls/$PR_NUMBER/files", body)
+        self.assertIn("Validate review claims against canonical full-PR evidence", body)
+        self.assertIn("Apply evidence-backed merge recommendation", body)
+        self.assertIn("pr_agent_evidence.py", body)
+        self.assertIn("PR_EVIDENCE_PROMPT_FILE", body)
+        self.assertIn("repair-only diff", body)
+        self.assertIn("canPromoteEvidenceFilteredReview", body)
 
 
 class SecurityNormalizationRegressionTests(unittest.TestCase):
