@@ -3450,6 +3450,42 @@ jobs:
                     );
                     continue;
                   }
+                  // A trusted operator STOP or drift stop for this
+                  // generation blocks automated merge even when the live
+                  // issue text is unchanged. Restoring readiness never
+                  // clears the fence; only a strictly later trusted
+                  // generation-recover record re-arms it.
+                  const stopMarkerRe =
+                    /<!--\s*continuum-task-generation-stop\s+repo=([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)\s+issue=(\d+)\s+generation=(\d+)\s+pinned-spec=([0-9a-fA-F]{64})\s+live-spec=([0-9a-fA-F]{64})\s+reason=(drift|tampered|operator)\s*-->/;
+                  const recoverMarkerRe =
+                    /<!--\s*continuum-task-generation-recover\s+repo=([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)\s+issue=(\d+)\s+generation=(\d+)\s*-->/;
+                  const stopOrder = (comment) =>
+                    `${comment.created_at || ''}:${String(comment.id || 0).padStart(20, '0')}`;
+                  let latestStop = null;
+                  let latestRecover = null;
+                  for (const comment of snapshotComments || []) {
+                    if (!isTrustedSnapshotComment(comment || {})) continue;
+                    const text = String((comment && comment.body) || '');
+                    const stop = text.match(stopMarkerRe);
+                    if (stop && stop[1].toLowerCase() === taskRepoFull.toLowerCase() &&
+                        Number(stop[2]) === taskIssue && Number(stop[3]) === 1) {
+                      const order = stopOrder(comment || {});
+                      if (!latestStop || order > latestStop) latestStop = order;
+                      continue;
+                    }
+                    const recover = text.match(recoverMarkerRe);
+                    if (recover && recover[1].toLowerCase() === taskRepoFull.toLowerCase() &&
+                        Number(recover[2]) === taskIssue && Number(recover[3]) === 1) {
+                      const order = stopOrder(comment || {});
+                      if (!latestRecover || order > latestRecover) latestRecover = order;
+                    }
+                  }
+                  if (latestStop && (!latestRecover || latestStop > latestRecover)) {
+                    core.warning(
+                      `PR #${pr.number}: ${taskRepoFull}#${taskIssue} generation 1 has an effective terminal STOP; merge held.`
+                    );
+                    continue;
+                  }
                   let liveIssue = null;
                   try {
                     if (taskRepoFull.toLowerCase() === repoFullName.toLowerCase()) {

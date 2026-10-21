@@ -75,10 +75,9 @@ on:
         default: ''
       pause_on_failure:
         description: >-
-          Whether exhausted watchdog recovery enters a terminal pause. Empty
-          falls back to AUTOMATION_PAUSE_ON_FAILURE. When false, the watchdog
-          leaves the reservation to the scheduler lease/backoff instead of
-          requiring human intervention.
+          Deprecated compatibility input. Exhausted recovery never enters a
+          terminal pause; the scheduler lease/backoff remains authoritative
+          and automation:ready is re-checked before any new attempt.
         required: false
         type: string
         default: ''
@@ -116,7 +115,6 @@ jobs:
       IN_PROGRESS_LABEL: ${{ inputs.in_progress_label || vars.AUTOMATION_IN_PROGRESS_LABEL || 'automation:in-progress' }}
       PAUSE_LABEL: ${{ inputs.pause_marker || vars.AUTOMATION_PAUSE_LABEL || 'automation:paused' }}
       DISPATCH_MARKER: ${{ inputs.dispatch_marker || vars.AUTOMATION_DISPATCH_MARKER || '<!-- issue-scheduler-dispatch -->' }}
-      PAUSE_ON_FAILURE: ${{ inputs.pause_on_failure || vars.AUTOMATION_PAUSE_ON_FAILURE || 'false' }}
       READ_GITHUB_TOKEN: ${{ github.token }}
 
     steps:
@@ -137,8 +135,6 @@ jobs:
             const inProgressLabel = process.env.IN_PROGRESS_LABEL || 'automation:in-progress';
             const pausedLabel = process.env.PAUSE_LABEL || 'automation:paused';
             const dispatchMarker = process.env.DISPATCH_MARKER || '<!-- issue-scheduler-dispatch -->';
-            const pauseOnFailure =
-              (process.env.PAUSE_ON_FAILURE || 'false') !== 'false';
 
             // Use the repository-scoped token for same-repository reads.
             // Keep the github-script action client PAT-authenticated below for
@@ -737,8 +733,10 @@ jobs:
               )
             );
 
-            // Explicit pause always wins over automatic recovery.
-            if (issueLabels.has(pausedLabel)) {
+            // Canonical admission always wins over automatic recovery:
+            // without automation:ready the watchdog starts zero new runs.
+            // A stale legacy pause label is inert and never re-created.
+            if (!issueLabels.has('automation:ready')) {
               try {
                 await github.rest.issues.removeLabel({
                   owner,
@@ -751,7 +749,7 @@ jobs:
               }
               core.notice(
                 'Issue #' + issueNumber +
-                ' is ' + pausedLabel + '; watchdog will not retry it.'
+                ' is missing automation:ready; watchdog will not start a new coder run.'
               );
               return;
             }
@@ -998,47 +996,18 @@ jobs:
               '5319E7',
               'Actively reserved or implemented by the automatic issue scheduler.'
             );
-            await ensureLabel(
-              pausedLabel,
-              'BFDADC',
-              'Automation is paused after a failed/stopped implementation; remove to retry.'
-            );
+            // automation:paused is retired (kodmial/continuum#346). A stale
+            // label is removed, never created or read.
+            await removeLabel(pausedLabel);
 
             if (previousRetries >= maxRetries) {
-              if (!pauseOnFailure) {
-                // Keep the reservation so the scheduler lease provides a
-                // bounded cooldown. The scheduler releases and retries it
-                // automatically after lease expiry, avoiding both a terminal
-                // human pause and a tight retry loop.
-                await removeLabel(pausedLabel);
-                core.warning(
-                  'Issue #' + issueNumber +
-                    ' exhausted automatic OpenCode recovery; pause_on_failure=false, ' +
-                    'so scheduler lease/backoff remains authoritative.'
-                );
-                return;
-              }
-              await removeLabel(inProgressLabel);
-              await addLabel(pausedLabel);
-              await github.rest.issues.createComment({
-                owner,
-                repo,
-                issue_number: issueNumber,
-                body: [
-                  '⚡ **Continuum · opencode-watchdog**',
-                  '<!-- continuum-origin role=continuum component=opencode-watchdog -->',
-                  '',
-                  'OpenCode automation paused after ' + previousRetries +
-                    ' automatic recovery retries.',
-                  '',
-                  'Last run: ' + run.html_url,
-                  'Conclusion: ' + run.conclusion,
-                  '',
-                  'Remove the `' + pausedLabel + '` label and post `/oc` to retry manually.',
-                ].join('\n'),
-              });
+              // Keep the reservation so the scheduler lease provides a
+              // bounded cooldown. No terminal human pause and no tight retry
+              // loop: the next eligible attempt still requires ready.
               core.warning(
-                'Issue #' + issueNumber + ' exhausted automatic OpenCode recovery.'
+                'Issue #' + issueNumber +
+                  ' exhausted automatic OpenCode recovery; scheduler ' +
+                  'lease/backoff remains authoritative and ready is re-checked.'
               );
               return;
             }
@@ -1061,7 +1030,8 @@ jobs:
                 'Automatic recovery retry ' + (previousRetries + 1) +
                   '/' + maxRetries + ' after OpenCode run ' + run.id +
                   ' ended with ' + run.conclusion +
-                  (run.conclusion === 'success' ? ' but produced no PR.' : '.') ,
+                  (run.conclusion === 'success' ? ' but produced no PR.' : '.'),
+                'Run: ' + (run.html_url || ('https://github.com/' + repoFullName + '/actions/runs/' + run.id)),
               ].join('\n'),
             });
 

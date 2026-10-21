@@ -81,7 +81,7 @@ whose live issue is byte-identical to its pinned snapshot.
 A truly drifted or tampered generation stops **exactly once** and is
 never redispatched. The stop is a deterministic typed issue comment:
 
-`<!-- continuum-task-generation-stop repo=… issue=… generation=… pinned-spec=… live-spec=… reason=drift|tampered -->`
+`<!-- continuum-task-generation-stop repo=… issue=… generation=… pinned-spec=… live-spec=… reason=drift|tampered|operator -->`
 
 * **Key:** `(repo, issue, generation, pinned/live hashes, reason)`.
   Digests only — never title/body text — so the record cannot leak

@@ -48,7 +48,7 @@ def p0_issue(number: int = 156) -> IssueState:
         number=number,
         title="Fix cancellation races and Homebrew quarantine regression",
         body="## Priority\n\nP0 repair task.",
-        labels={"priority:p0"},
+        labels={"priority:p0", "automation:ready"},
         is_open=True,
     )
 
@@ -228,11 +228,11 @@ class StaleReservationAndRetryTests(unittest.TestCase):
         self.assertEqual(len(markers), 1)
         self.assertIn("WIP slot held", replay.skip_reasons[156])
 
-    def test_exhausted_attempts_pause_only_when_configured(self):
+    def test_exhausted_attempts_never_write_a_terminal_pause(self):
         now = utcnow()
         old = now - timedelta(minutes=120)
 
-        for pause_on_failure, expect_paused in ((True, True), (False, False)):
+        for pause_on_failure in (True, False):
             with self.subTest(pause_on_failure=pause_on_failure):
                 config = SchedulerConfig(
                     lease_minutes=45,
@@ -256,16 +256,10 @@ class StaleReservationAndRetryTests(unittest.TestCase):
                 result = reconcile(
                     now, issues, set(), set(), comments, {}, {}, set(), config
                 )
-                if expect_paused:
-                    self.assertIn(156, result.paused)
-                    self.assertIn(config.pause_label, issues[156].labels)
-                    self.assertEqual(result.dispatched, [])
-                else:
-                    # Autonomous consumers keep retrying without a terminal
-                    # human-required pause path for recoverable failures.
-                    self.assertNotIn(156, result.paused)
-                    self.assertNotIn(config.pause_label, issues[156].labels)
-                    self.assertEqual(result.dispatched, [156])
+                self.assertEqual(result.paused, [])
+                self.assertNotIn(config.pause_label, issues[156].labels)
+                # Recovery stays autonomous and bounded by the next lease.
+                self.assertEqual(result.dispatched, [156])
 
     def test_failed_dispatch_rolls_back_and_cron_retries(self):
         config = SchedulerConfig()
@@ -305,9 +299,9 @@ class WipStarvationVisibilityTests(unittest.TestCase):
         config = SchedulerConfig(wip_limit=2)
         now = utcnow()
         issues = {
-            25: IssueState(25, "P2 work one", "", {"priority:p2"}, True),
-            35: IssueState(35, "P2 work two", "", {"priority:p2"}, True),
-            77: IssueState(77, "P1 work three", "", {"priority:p1"}, True),
+            25: IssueState(25, "P2 work one", "", {"priority:p2", "automation:ready"}, True),
+            35: IssueState(35, "P2 work two", "", {"priority:p2", "automation:ready"}, True),
+            77: IssueState(77, "P1 work three", "", {"priority:p1", "automation:ready"}, True),
             156: p0_issue(),
         }
         open_prs = {25, 35, 77}
@@ -332,8 +326,8 @@ class WipStarvationVisibilityTests(unittest.TestCase):
         config = SchedulerConfig(wip_limit=2)
         now = utcnow()
         issues = {
-            25: IssueState(25, "P2 work one", "", {"priority:p2"}, True),
-            35: IssueState(35, "P2 work two", "", {"priority:p2"}, True),
+            25: IssueState(25, "P2 work one", "", {"priority:p2", "automation:ready"}, True),
+            35: IssueState(35, "P2 work two", "", {"priority:p2", "automation:ready"}, True),
         }
         result = reconcile(
             now, issues, {25, 35}, set(), {}, {}, {}, set(), config
@@ -347,9 +341,9 @@ class OrderingAndBlockerTests(unittest.TestCase):
         config = SchedulerConfig(wip_limit=1)
         now = utcnow()
         issues = {
-            10: IssueState(10, "P2 work", "", {"priority:p2"}, True),
-            11: IssueState(11, "P0 work", "", {"priority:p0"}, True),
-            12: IssueState(12, "P1 work", "", {"priority:p1"}, True),
+            10: IssueState(10, "P2 work", "", {"priority:p2", "automation:ready"}, True),
+            11: IssueState(11, "P0 work", "", {"priority:p0", "automation:ready"}, True),
+            12: IssueState(12, "P1 work", "", {"priority:p1", "automation:ready"}, True),
         }
         result = reconcile(
             now, issues, set(), set(), {}, {}, {}, set(), config
@@ -392,6 +386,101 @@ class OrderingAndBlockerTests(unittest.TestCase):
         )
         self.assertEqual(result.dispatched, [])
         self.assertIn("race window", result.skip_reasons[156])
+
+
+class UnifiedReadyAdmissionTests(unittest.TestCase):
+    """automation:ready is the single mandatory permission for a new attempt."""
+
+    def test_missing_ready_never_dispatches_even_with_legacy_ready_config(self):
+        for configured in ("", "some-other-label"):
+            with self.subTest(configured=configured):
+                config = SchedulerConfig(ready_label=configured)
+                issues = {156: p0_issue()}
+                issues[156].labels.discard("automation:ready")
+                result = reconcile(
+                    utcnow(), issues, set(), set(), {}, {}, {}, set(), config
+                )
+                self.assertEqual(result.dispatched, [])
+                self.assertIn("missing required admission label", result.skip_reasons[156])
+
+    def test_ready_admits_exactly_one_generation(self):
+        config = SchedulerConfig()
+        issues = {156: p0_issue()}
+        comments: dict = {}
+        now = utcnow()
+        first = reconcile(now, issues, set(), set(), comments, {}, {}, set(), config)
+        second = reconcile(
+            now + timedelta(minutes=1),
+            issues,
+            set(),
+            set(),
+            comments,
+            {},
+            {},
+            set(),
+            config,
+        )
+        self.assertEqual(first.dispatched, [156])
+        self.assertEqual(second.dispatched, [])
+        self.assertEqual(
+            len([c for c in comments[156] if config.dispatch_marker in c.body]), 1
+        )
+
+    def test_ready_removed_after_scheduling_blocks_just_in_time_dispatch(self):
+        config = SchedulerConfig()
+        issues = {156: p0_issue()}
+
+        def remove_ready(number):
+            issues[number].labels.discard("automation:ready")
+
+        # dispatch_hook runs after selection but before the reservation is
+        # recorded; the JIT guard must still have admitted on current labels.
+        result = reconcile(
+            utcnow(),
+            issues,
+            set(),
+            set(),
+            {},
+            {},
+            {},
+            set(),
+            config,
+            dispatch_hook=remove_ready,
+        )
+        self.assertEqual(result.dispatched, [156])
+
+        # A second issue whose ready label disappears before the pass never
+        # becomes a candidate at all.
+        issues2 = {157: p0_issue(157)}
+        issues2[157].labels.discard("automation:ready")
+        blocked = reconcile(
+            utcnow(), issues2, set(), set(), {}, {}, {}, set(), config
+        )
+        self.assertEqual(blocked.dispatched, [])
+        self.assertIn("missing required admission label", blocked.skip_reasons[157])
+
+    def test_ready_removal_does_not_cancel_active_runs_or_free_wip(self):
+        config = SchedulerConfig(wip_limit=1)
+        issues = {156: p0_issue(), 157: p0_issue(157)}
+        issues[156].labels.discard("automation:ready")
+        result = reconcile(
+            utcnow(), issues, set(), {156}, {}, {}, {}, set(), config
+        )
+        # The running coder still holds the only WIP slot.
+        self.assertEqual(result.dispatched, [])
+        self.assertTrue(result.failed)
+        self.assertIn("waiting for a free WIP slot", result.skip_reasons[157])
+
+    def test_legacy_pause_label_is_inert_and_cleared(self):
+        config = SchedulerConfig(pause_on_failure=True)
+        issues = {156: p0_issue()}
+        issues[156].labels.add(config.pause_label)
+        result = reconcile(
+            utcnow(), issues, set(), set(), {}, {}, {}, set(), config
+        )
+        self.assertEqual(result.dispatched, [156])
+        self.assertNotIn(config.pause_label, issues[156].labels)
+        self.assertEqual(result.paused, [])
 
 
 class WorkflowContractPinTests(unittest.TestCase):

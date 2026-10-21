@@ -237,6 +237,14 @@ ENTRIES = (
         "reason": "Explicit downstream workflow dispatch keeps PAT so the caller needs no actions:write elevation; a GITHUB_TOKEN dispatch would require a consumer permission change.",
         "evidence": ("GH_TOKEN: ${{ secrets.TAP_PAT }}", "dispatches"),
     },
+    {
+        "workflow": "continuum-issue-scheduler.yml",
+        "step": "Execute authenticated operator STOP",
+        "capability": CHAINING,
+        "same_repo": True,
+        "reason": "Operator STOP revokes ready, persists the durable generation stop marker, and cancels provenance-matched runs; those mutations must fan out into the scheduler/OpenCode issue and workflow_run triggers, which GITHUB_TOKEN writes suppress, and run cancellation needs the owner-visible actor.",
+        "evidence": ("GH_TOKEN: ${{ secrets.TAP_PAT }}", "issue_stop_control.sh"),
+    },
     # -- OpenCode agent (17 steps) --------------------------------------
     {
         "workflow": "continuum-opencode.yml",

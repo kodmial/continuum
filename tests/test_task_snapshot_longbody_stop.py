@@ -313,7 +313,7 @@ class SchedulerStopGatingTests(unittest.TestCase):
         now = datetime.now(timezone.utc)
         issues = {
             315: IssueState(315, LONG_TITLE[:80], LONG_BODY[:200], {"automation:ready"}, True),
-            400: IssueState(400, "P1: unrelated work", "Do it.", {"priority:p1"}, True),
+            400: IssueState(400, "P1: unrelated work", "Do it.", {"priority:p1", "automation:ready"}, True),
         }
         return now, issues
 
@@ -357,7 +357,7 @@ class SchedulerStopGatingTests(unittest.TestCase):
         config = SchedulerConfig()
         issues = {
             315: IssueState(315, "old", "old", {"automation:ready"}, True),
-            327: IssueState(327, "P0: successor", "Follows #315.", {"priority:p0"}, True),
+            327: IssueState(327, "P0: successor", "Follows #315.", {"priority:p0", "automation:ready"}, True),
         }
         # Successor declares a dependency on the stopped generation: it
         # stays gated until #315 closes, then enters automatically while

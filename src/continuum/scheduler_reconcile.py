@@ -18,13 +18,15 @@ Covered lifecycle:
 - priority normalization (labels authoritative, legacy ``P0:`` title
   prefix migrates only when no priority label exists; shared with
   :mod:`continuum.delegation_priority`);
-- pause / in-progress / qualification lifecycle filtering;
+- fixed fail-closed ``automation:ready`` admission (legacy pause state is
+  inert and never written);
+- in-progress / qualification lifecycle filtering;
 - declared (``automation-blocked-by`` marker) and native Blocked-By
   filtering;
 - WIP accounting over active runs and open implementation PRs;
 - dispatch-attempt accounting with lease expiry, stale-reservation
-  recovery, and bounded retry (``max_dispatch_attempts`` with
-  ``pause_on_failure`` gating only the terminal pause);
+  recovery, and autonomous bounded retry (legacy ``pause_on_failure`` and
+  ``automation:paused`` never decide runtime state);
 - owner ``/oc`` race grace window;
 - exactly-once automatic dispatch per reservation (idempotent second
   pass);
@@ -39,6 +41,11 @@ import re
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 from .delegation_priority import effective_priority
+from .issue_admission import (
+    LEGACY_PAUSE_LABEL,
+    READY_LABEL,
+    decide_issue_admission,
+)
 
 
 @dataclass
@@ -50,11 +57,14 @@ class SchedulerConfig:
     max_dispatch_attempts: int = 2
     dispatch_marker: str = "<!-- issue-scheduler-dispatch -->"
     in_progress_label: str = "automation:in-progress"
-    pause_label: str = "automation:paused"
+    #: Deprecated compatibility fields. Runtime admission is fixed to
+    #: :data:`continuum.issue_admission.READY_LABEL`; these values are never
+    #: consulted for eligibility and ``pause_label`` is only cleared.
+    pause_label: str = LEGACY_PAUSE_LABEL
     qualifying_label: str = "automation:qualifying"
     blocked_label: str = "automation:blocked"
     require_priority_label: bool = False
-    ready_label: str = ""
+    ready_label: str = READY_LABEL
     command_grace_minutes: int = 5
     count_open_prs_as_wip: bool = True
     pause_on_failure: bool = False
@@ -214,8 +224,10 @@ def reconcile(
         if number not in issues or not issues[number].is_open:
             continue
         labels = labels_of(number)
-        if not config.ready_label or config.ready_label in labels:
-            active.add(number)
+        # An already-running coder always consumes WIP, even after ready was
+        # removed. Removing ready prevents new starts; it never hides or
+        # cancels the running process.
+        active.add(number)
         labels.add(in_progress)
         labels.discard(config.pause_label)
     for number in sorted(open_pr_issues):
@@ -238,9 +250,12 @@ def reconcile(
         labels = issue.labels
         if in_progress not in labels:
             continue
-        if config.ready_label and config.ready_label not in labels:
+        if READY_LABEL not in labels:
+            labels.discard(in_progress)
+            result.reservations_removed.append(number)
             result.skip_reasons[number] = (
-                "reservation belongs to another lane: missing ready label"
+                "released reservation: missing required admission label "
+                "`%s`" % READY_LABEL
             )
             continue
         if config.qualifying_label in labels or config.blocked_label in labels:
@@ -275,27 +290,14 @@ def reconcile(
             active.add(number)
             continue
         labels.discard(in_progress)
+        labels.discard(config.pause_label)
         result.reservations_removed.append(number)
-        if (
-            len(scheduler_dispatches) >= config.max_dispatch_attempts
-            and config.pause_on_failure
-        ):
-            labels.add(config.pause_label)
-            result.paused.append(number)
-            result.skip_reasons[number] = (
-                "paused after %d scheduler dispatch attempt(s) with no "
-                "OpenCode PR" % len(scheduler_dispatches)
-            )
-        else:
-            labels.discard(config.pause_label)
-            result.skip_reasons[number] = (
-                "lease expired: eligible for an automatic retry"
-                + (
-                    " because pause_on_failure=false"
-                    if len(scheduler_dispatches) >= config.max_dispatch_attempts
-                    else ""
-                )
-            )
+        # Recovery is autonomous and bounded per lease. Legacy
+        # pause_on_failure/pause markers are never written again.
+        result.skip_reasons[number] = (
+            "lease expired after %d dispatch attempt(s): eligible for an "
+            "automatic bounded retry" % len(scheduler_dispatches)
+        )
 
     total_active = len(active)
     free_slots = max(0, config.wip_limit - total_active)
@@ -349,24 +351,24 @@ def reconcile(
             )
             continue
         labels = issue.labels
-        if config.pause_on_failure and config.pause_label in labels:
-            result.skip_reasons[number] = "automation is paused"
-            continue
-        if config.qualifying_label in labels or config.blocked_label in labels:
-            result.skip_reasons[number] = (
-                "capability is in qualification lifecycle"
-            )
-            continue
+        # A stale legacy pause label is inert and is cleared on sight.
+        labels.discard(LEGACY_PAUSE_LABEL)
+        labels.discard(config.pause_label)
         priority, _rank = priority_of(issue)
         if config.require_priority_label and priority is None:
             result.skip_reasons[number] = (
                 "no priority label and require_priority_label is enabled"
             )
             continue
-        if config.ready_label and config.ready_label not in labels:
-            result.skip_reasons[number] = (
-                "missing required ready label `%s`" % config.ready_label
-            )
+        admission = decide_issue_admission(
+            labels=labels,
+            is_open=issue.is_open,
+            generation_stopped=(number, active_generation) in stopped,
+            blocked=config.blocked_label in labels,
+            qualifying=config.qualifying_label in labels,
+        )
+        if not admission.admitted:
+            result.skip_reasons[number] = admission.reason
             continue
         blockers = [
             b for b in declared_open_blockers.get(number, []) if b != number
@@ -426,17 +428,21 @@ def reconcile(
                 number, _active_generation(number, generations)
             )
             continue
-        if (
-            not issue.is_open
-            or (config.pause_on_failure and config.pause_label in labels)
-            or in_progress in labels
-        ):
+        if not issue.is_open or in_progress in labels:
             result.skip_reasons[number] = "state changed before dispatch"
             continue
-        if config.ready_label and config.ready_label not in labels:
-            result.skip_reasons[number] = (
-                "missing required ready label `%s`" % config.ready_label
-            )
+        # Just-in-time admission: re-read the current labels rather than
+        # trusting the pass-start snapshot. Ready removal between selection
+        # and dispatch must produce zero coder launches.
+        admission = decide_issue_admission(
+            labels=labels,
+            is_open=issue.is_open,
+            generation_stopped=(number, _active_generation(number, generations)) in stopped,
+            blocked=config.blocked_label in labels,
+            qualifying=config.qualifying_label in labels,
+        )
+        if not admission.admitted:
+            result.skip_reasons[number] = admission.reason
             continue
         if number in qualification_trackers:
             result.skip_reasons[number] = (

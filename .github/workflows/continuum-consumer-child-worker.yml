@@ -178,6 +178,14 @@ jobs:
           [[ "$issue_state" == "open" ]] || exit 0
           issue_title="$(jq -r '.title // ""' <"$CHILD_ISSUE_JSON" 2>/dev/null || echo "")"
           issue_body="$(jq -r '.body // ""' <"$CHILD_ISSUE_JSON" 2>/dev/null || echo "")"
+          # Canonical admission (kodmial/continuum#346): delegated work also
+          # starts zero coder runs without the fixed ready label. The parent
+          # scheduler filters too; this is the execution-time re-check.
+          if ! jq -e '[.labels[]?.name] | index("automation:ready") != null' \
+              <"$CHILD_ISSUE_JSON" >/dev/null 2>&1; then
+            echo "::notice::Child task $child_repo#$TASK_NUMBER is missing automation:ready; no agent work started."
+            exit 0
+          fi
 
           # kodmial/continuum#295: freeze the child task specification at
           # admission with the canonical engine

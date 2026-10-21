@@ -397,7 +397,8 @@ jobs:
         !github.event.issue.pull_request) &&
        github.actor == github.repository_owner &&
        (contains(github.event.comment.body, '/oc') ||
-        contains(github.event.comment.body, '/opencode'))) ||
+        contains(github.event.comment.body, '/opencode')) &&
+       !contains(github.event.comment.body, '/oc-cancel')) ||
       ((github.event_name == 'issue_comment' &&
         github.event.issue.pull_request) &&
        github.actor == github.repository_owner &&
@@ -698,6 +699,124 @@ jobs:
             core.setOutput('task_url', String(issue.html_url || ''));
             core.notice(`Resolved authoritative task ${taskRepository}#${taskNumber} via ${source}.`);
 
+      # kodmial/continuum#346: canonical fail-closed admission. Every new
+      # issue-coder attempt -- manual owner command, direct issue dispatch,
+      # watchdog/429 resumption, scheduler wake-up -- re-reads the actual
+      # target issue here, before model/tool bootstrap. Missing
+      # automation:ready, a closed target, or a terminal generation stop
+      # starts zero coder work. PR review/repair is deliberately unaffected.
+      - name: Enforce unified issue admission
+        id: issue_admission
+        if: >-
+          steps.task_context.outputs.present == 'true' &&
+          ((github.event_name == 'workflow_dispatch' && inputs.mode == 'issue') ||
+           (github.event_name == 'issue_comment' &&
+            !github.event.issue.pull_request &&
+            github.actor == github.repository_owner &&
+            (contains(github.event.comment.body, '/oc') ||
+             contains(github.event.comment.body, '/opencode')) &&
+            !contains(github.event.comment.body, '/oc-cancel') &&
+            !contains(github.event.comment.body, 'continuum-qualification-dispatch')))
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
+        env:
+          TASK_REPO: ${{ steps.task_context.outputs.task_repo }}
+          TASK_NUMBER: ${{ steps.task_context.outputs.task_number }}
+          REPO_OWNER: ${{ github.repository_owner }}
+        with:
+          github-token: ${{ github.token }}
+          script: |
+            const READY_LABEL = 'automation:ready';
+            const taskRepo = String(process.env.TASK_REPO || '').trim().toLowerCase();
+            const taskNumber = Number(process.env.TASK_NUMBER || 0);
+            const ownerLogin = String(process.env.REPO_OWNER || '').trim().toLowerCase();
+            const sameRepository = taskRepo === `${context.repo.owner}/${context.repo.repo}`.toLowerCase();
+            if (!taskRepo || !Number.isInteger(taskNumber) || taskNumber <= 0) {
+              core.setFailed('Issue admission: invalid target identity.');
+              return;
+            }
+            if (!sameRepository) {
+              // Cross-repository child admission is owned by the child worker,
+              // which applies the same fixed ready policy in the child repo.
+              core.info(`Issue admission: ${taskRepo}#${taskNumber} is cross-repository; child admission owns it.`);
+              return;
+            }
+            let issue;
+            try {
+              issue = (await github.rest.issues.get({
+                owner: context.repo.owner, repo: context.repo.repo,
+                issue_number: taskNumber,
+              })).data;
+            } catch (err) {
+              core.setFailed(`Issue admission: authoritative issue read failed: ${err.message || err}`);
+              return;
+            }
+            if (issue.pull_request) {
+              core.setFailed('Issue admission: implementation target is a pull request.');
+              return;
+            }
+            if (issue.state !== 'open') {
+              core.setFailed(`Issue admission: #${taskNumber} is closed; no coder launch.`);
+              return;
+            }
+            const labels = new Set((issue.labels || []).map(label =>
+              typeof label === 'string' ? label : label.name
+            ));
+            if (!labels.has(READY_LABEL)) {
+              core.setFailed(
+                `Issue admission: #${taskNumber} is missing required label \`${READY_LABEL}\`; no coder launch. ` +
+                'Add the label and post an explicit owner command to start a new attempt.'
+              );
+              return;
+            }
+            // Durable operator STOP and the existing drift/tamper stop share
+            // one generation identity. A recovery marker strictly after the
+            // stop re-arms; restoring ready never does.
+            let comments = [];
+            for (let page = 1; page <= 10; page += 1) {
+              const batch = (await github.rest.issues.listComments({
+                owner: context.repo.owner, repo: context.repo.repo,
+                issue_number: taskNumber, per_page: 100, page,
+              })).data;
+              comments = comments.concat(batch);
+              if (batch.length < 100) break;
+            }
+            const stopRe = /<!--\s*continuum-task-generation-stop\s+repo=([A-Za-z0-9_.\-]+\/[A-Za-z0-9_.\-]+)\s+issue=(\d+)\s+generation=(\d+)\s+pinned-spec=([0-9a-fA-F]{64})\s+live-spec=([0-9a-fA-F]{64})\s+reason=(drift|tampered|operator)\s*-->/;
+            const recoverRe = /<!--\s*continuum-task-generation-recover\s+repo=([A-Za-z0-9_.\-]+\/[A-Za-z0-9_.\-]+)\s+issue=(\d+)\s+generation=(\d+)\s*-->/;
+            const trusted = (comment) => {
+              const association = String(comment.author_association || '').toUpperCase();
+              if (['OWNER', 'MEMBER', 'COLLABORATOR'].includes(association)) return true;
+              const login = String((comment.user && comment.user.login) || '').toLowerCase();
+              return login === 'github-actions[bot]' || (ownerLogin && login === ownerLogin);
+            };
+            const order = (comment) => `${comment.created_at || ''}:${String(comment.id || 0).padStart(20, '0')}`;
+            const stops = [];
+            const recovers = [];
+            for (const comment of comments) {
+              if (!trusted(comment)) continue;
+              const body = String(comment.body || '');
+              const stop = body.match(stopRe);
+              if (stop && stop[1].toLowerCase() === taskRepo &&
+                  Number(stop[2]) === taskNumber && Number(stop[3]) === 1) {
+                stops.push(order(comment));
+                continue;
+              }
+              const recover = body.match(recoverRe);
+              if (recover && recover[1].toLowerCase() === taskRepo &&
+                  Number(recover[2]) === taskNumber && Number(recover[3]) === 1) {
+                recovers.push(order(comment));
+              }
+            }
+            stops.sort();
+            recovers.sort();
+            if (stops.length && (!recovers.length || recovers[recovers.length - 1] <= stops[stops.length - 1])) {
+              core.setFailed(
+                `Issue admission: #${taskNumber} generation 1 is terminally stopped; ` +
+                'no coder launch until an explicit owner recovery re-arms it.'
+              );
+              return;
+            }
+            core.notice(`Issue admission: #${taskNumber} admitted (${READY_LABEL}).`);
+
       # kodmial/continuum#295: freeze the issue requirements at admission.
       # The issue title/body are immutable for one implementation
       # generation once admission starts. This step pins the exact
@@ -864,7 +983,7 @@ jobs:
             // record cannot leak content. Mirrors
             // src/continuum/task_snapshot.py render/parse_generation_stop.
             const stopMarkerRe =
-              /<!--\s*continuum-task-generation-stop\s+repo=([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)\s+issue=(\d+)\s+generation=(\d+)\s+pinned-spec=([0-9a-fA-F]{64})\s+live-spec=([0-9a-fA-F]{64})\s+reason=(drift|tampered)\s*-->/;
+              /<!--\s*continuum-task-generation-stop\s+repo=([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)\s+issue=(\d+)\s+generation=(\d+)\s+pinned-spec=([0-9a-fA-F]{64})\s+live-spec=([0-9a-fA-F]{64})\s+reason=(drift|tampered|operator)\s*-->/;
             const recoverMarkerRe =
               /<!--\s*continuum-task-generation-recover\s+repo=([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)\s+issue=(\d+)\s+generation=(\d+)\s*-->/;
             const stopMarkerLine = (pinnedSpec, liveSpec, reason) =>
@@ -2057,7 +2176,6 @@ jobs:
           COMMIT_PREFIX: ${{ inputs.issue_commit_prefix || vars.CONTINUUM_ISSUE_COMMIT_PREFIX || 'fix' }}
           IN_PROGRESS_LABEL: ${{ inputs.in_progress_label || vars.AUTOMATION_IN_PROGRESS_LABEL || 'automation:in-progress' }}
           PAUSE_LABEL: ${{ inputs.pause_marker || vars.AUTOMATION_PAUSE_LABEL || 'automation:paused' }}
-          PAUSE_ON_FAILURE: ${{ inputs.pause_on_failure || vars.AUTOMATION_PAUSE_ON_FAILURE || 'true' }}
           CI_WORKFLOW_ID: ${{ inputs.ci_workflow_id }}
           RECOVERY_RESUMED: ${{ steps.recovery_restore.outputs.resumed }}
           RECOVERY_SKIP_OPENCODE: ${{ steps.recovery_restore.outputs.skip_opencode }}
@@ -2117,6 +2235,30 @@ jobs:
           # (UTF-8, NFC, LF, SHA-256 over the hex pair). On drift, posts a
           # diagnostic and fails; never publishes or implements for a
           # stale contract.
+          continuum_trusted_stop_state() {
+            local stop_page stop_json stop_count stop_pages stop_file
+            stop_pages="$(mktemp)"
+            stop_file="$(mktemp)"
+            : > "$stop_pages"
+            for stop_page in $(seq 1 50); do
+              if ! stop_json="$(gh api "repos/$GITHUB_REPOSITORY/issues/$ISSUE_NUMBER/comments?per_page=100&page=$stop_page" 2>/dev/null)"; then
+                rm -f "$stop_pages" "$stop_file"
+                echo "active"
+                return 0
+              fi
+              echo "$stop_json" >> "$stop_pages"
+              stop_count="$(jq 'length' <<<"$stop_json" 2>/dev/null || echo 0)"
+              [[ "$stop_count" == "100" ]] || break
+            done
+            if ! jq -s 'add // []' "$stop_pages" > "$stop_file" 2>/dev/null; then
+              rm -f "$stop_pages" "$stop_file"
+              echo "active"
+              return 0
+            fi
+            rm -f "$stop_pages"
+            CONTINUUM_STOP_FILE="$stop_file" CONTINUUM_STOP_REPO="${GITHUB_REPOSITORY,,}" CONTINUUM_STOP_ISSUE="$ISSUE_NUMBER" python3 -c 'import json,os,re; path=os.environ.get("CONTINUUM_STOP_FILE") or ""; repo=(os.environ.get("CONTINUUM_STOP_REPO") or "").lower(); issue=os.environ.get("CONTINUUM_STOP_ISSUE") or ""; data=json.load(open(path,encoding="utf-8")) if path else []; data=[data] if isinstance(data,dict) else (data if isinstance(data,list) else []); pat=re.compile(r"<!--\s*continuum-task-generation-stop\s+repo=([A-Za-z0-9_.\-]+/[A-Za-z0-9_.\-]+)\s+issue=(\d+)\s+generation=(\d+)\s+pinned-spec=([0-9a-fA-F]{64})\s+live-spec=([0-9a-fA-F]{64})\s+reason=(drift|tampered|operator)\s*-->"); rec=re.compile(r"<!--\s*continuum-task-generation-recover\s+repo=([A-Za-z0-9_.\-]+/[A-Za-z0-9_.\-]+)\s+issue=(\d+)\s+generation=(\d+)\s*-->"); owner=(repo.split("/")[0] if "/" in repo else ""); stops=[]; recs=[]; [((stops.append(((c.get("created_at") or ""),int(c.get("id") or 0)))) if (m and m.group(1).lower()==repo and m.group(2)==issue and m.group(3)=="1") else (recs.append(((c.get("created_at") or ""),int(c.get("id") or 0)))) if (r and r.group(1).lower()==repo and r.group(2)==issue and r.group(3)=="1") else None) for c in data if isinstance(c,dict) for u in [c.get("user") if isinstance(c.get("user"),dict) else {}] if (str(c.get("author_association") or "").upper() in ("OWNER","MEMBER","COLLABORATOR") or str(u.get("login") or "").lower() in ("github-actions[bot]",owner)) for m in [pat.search(str(c.get("body") or ""))] for r in [rec.search(str(c.get("body") or ""))]]; stops.sort(); recs.sort(); print("stopped" if (stops and not (recs and recs[-1]>stops[-1])) else "active",end="")' 2>/dev/null || echo "active"
+            rm -f "$stop_file"
+          }
           verify_snapshot_live() {
             local phase="$1"
             local live_json live_title live_body live_spec
@@ -2140,30 +2282,6 @@ jobs:
               # converge on the earliest stop via first-writer-wins
               # selection. When the stop already exists this run only
               # fails; it posts nothing more and leaks no WIP.
-              continuum_trusted_stop_state() {
-                local stop_page stop_json stop_count stop_pages stop_file
-                stop_pages="$(mktemp)"
-                stop_file="$(mktemp)"
-                : > "$stop_pages"
-                for stop_page in $(seq 1 50); do
-                  if ! stop_json="$(gh api "repos/$GITHUB_REPOSITORY/issues/$ISSUE_NUMBER/comments?per_page=100&page=$stop_page" 2>/dev/null)"; then
-                    rm -f "$stop_pages" "$stop_file"
-                    echo "active"
-                    return 0
-                  fi
-                  echo "$stop_json" >> "$stop_pages"
-                  stop_count="$(jq 'length' <<<"$stop_json" 2>/dev/null || echo 0)"
-                  [[ "$stop_count" == "100" ]] || break
-                done
-                if ! jq -s 'add // []' "$stop_pages" > "$stop_file" 2>/dev/null; then
-                  rm -f "$stop_pages" "$stop_file"
-                  echo "active"
-                  return 0
-                fi
-                rm -f "$stop_pages"
-                CONTINUUM_STOP_FILE="$stop_file" CONTINUUM_STOP_REPO="${GITHUB_REPOSITORY,,}" CONTINUUM_STOP_ISSUE="$ISSUE_NUMBER" python3 -c 'import json,os,re; path=os.environ.get("CONTINUUM_STOP_FILE") or ""; repo=(os.environ.get("CONTINUUM_STOP_REPO") or "").lower(); issue=os.environ.get("CONTINUUM_STOP_ISSUE") or ""; data=json.load(open(path,encoding="utf-8")) if path else []; data=[data] if isinstance(data,dict) else (data if isinstance(data,list) else []); pat=re.compile(r"<!--\s*continuum-task-generation-stop\s+repo=([A-Za-z0-9_.\-]+/[A-Za-z0-9_.\-]+)\s+issue=(\d+)\s+generation=(\d+)\s+pinned-spec=([0-9a-fA-F]{64})\s+live-spec=([0-9a-fA-F]{64})\s+reason=(drift|tampered)\s*-->"); rec=re.compile(r"<!--\s*continuum-task-generation-recover\s+repo=([A-Za-z0-9_.\-]+/[A-Za-z0-9_.\-]+)\s+issue=(\d+)\s+generation=(\d+)\s*-->"); owner=(repo.split("/")[0] if "/" in repo else ""); stops=[]; recs=[]; [((stops.append(((c.get("created_at") or ""),int(c.get("id") or 0)))) if (m and m.group(1).lower()==repo and m.group(2)==issue and m.group(3)=="1") else (recs.append(((c.get("created_at") or ""),int(c.get("id") or 0)))) if (r and r.group(1).lower()==repo and r.group(2)==issue and r.group(3)=="1") else None) for c in data if isinstance(c,dict) for u in [c.get("user") if isinstance(c.get("user"),dict) else {}] if (str(c.get("author_association") or "").upper() in ("OWNER","MEMBER","COLLABORATOR") or str(u.get("login") or "").lower() in ("github-actions[bot]",owner)) for m in [pat.search(str(c.get("body") or ""))] for r in [rec.search(str(c.get("body") or ""))]]; stops.sort(); recs.sort(); print("stopped" if (stops and not (recs and recs[-1]>stops[-1])) else "active",end="")' 2>/dev/null || echo "active"
-                rm -f "$stop_file"
-              }
               if [[ "$(continuum_trusted_stop_state)" != "stopped" ]]; then
                 gh issue comment "$ISSUE_NUMBER" --repo "$GITHUB_REPOSITORY" \
                   --body "$(printf '%s\n%s\n%s\n%s' '<!-- continuum-task-snapshot-drift -->' '⚡ **Continuum · opencode**' '<!-- continuum-origin role=continuum component=opencode -->' "Task contract drift detected before $phase: the live issue no longer matches the pinned snapshot. This generation is stopped; open a new follow-up issue with an explicit dependency instead of editing the working issue.")" >/dev/null 2>&1 || true
@@ -2342,15 +2460,12 @@ jobs:
               exit 0
             fi
             echo "OpenCode produced no repository changes."
-            if [[ "${PAUSE_ON_FAILURE,,}" == "false" ]]; then
-              echo "::error::No repository changes; autonomous mode delegates bounded retry/recovery instead of pausing."
-              exit 1
-            fi
-            gh issue comment "$ISSUE_NUMBER" --repo "$GITHUB_REPOSITORY" \
-              --body "$(printf '%s\n%s\n%s' '⚡ **Continuum · opencode**' '<!-- continuum-origin role=continuum component=opencode -->' 'Automation produced no code changes; pausing this issue for manual inspection.')"
+            # No permanent pause: release for autonomous bounded retry. The
+            # next attempt still requires automation:ready (kodmial/continuum#346).
             gh issue edit "$ISSUE_NUMBER" --repo "$GITHUB_REPOSITORY" \
-              --add-label "$PAUSE_LABEL" --remove-label "$IN_PROGRESS_LABEL" >/dev/null 2>&1 || true
-            exit 0
+              --remove-label "$PAUSE_LABEL" --remove-label "$IN_PROGRESS_LABEL" >/dev/null 2>&1 || true
+            echo "::error::No repository changes; released for autonomous bounded retry instead of pausing."
+            exit 1
           fi
 
           # Keep generated Python bytecode out of task commits even when an
@@ -2392,6 +2507,11 @@ jobs:
           # branch and never falls back to the default branch.
           continuum_assert_safe_push "$BRANCH" || exit 1
 
+          if [[ "$(continuum_trusted_stop_state)" == "stopped" ]]; then
+            echo "::error::Trusted operator STOP is active for $GITHUB_REPOSITORY#$ISSUE_NUMBER generation 1; refusing to publish code."
+            exit 1
+          fi
+
           gh api --method POST "repos/$GITHUB_REPOSITORY/git/refs" \
             -f ref="refs/heads/$BRANCH" \
             -f sha="$BASE_SHA" >/dev/null
@@ -2406,6 +2526,10 @@ jobs:
             # time-of-check/time-of-use gaps. On drift, stop with an
             # actionable diagnostic; never publish a PR for a stale contract.
             verify_snapshot_live "PR publication" || exit 1
+            if [[ "$(continuum_trusted_stop_state)" == "stopped" ]]; then
+              echo "::error::Trusted operator STOP is active for $GITHUB_REPOSITORY#$ISSUE_NUMBER generation 1; refusing to create the implementation PR."
+              exit 1
+            fi
             # A capability with mandatory live qualification must never be
             # auto-closed by PR keywords: `Closes #N` would bypass the
             # qualification gate, so a qualifying issue gets a non-closing
@@ -3902,7 +4026,6 @@ jobs:
       DISPATCH_BACKOFF_SECONDS: ${{ vars.AUTOMATION_DISPATCH_BACKOFF_SECONDS || '120' }}
       IN_PROGRESS_LABEL: ${{ inputs.in_progress_label || vars.AUTOMATION_IN_PROGRESS_LABEL || 'automation:in-progress' }}
       PAUSE_LABEL: ${{ inputs.pause_marker || vars.AUTOMATION_PAUSE_LABEL || 'automation:paused' }}
-      PAUSE_ON_FAILURE: ${{ inputs.pause_on_failure || vars.AUTOMATION_PAUSE_ON_FAILURE || 'true' }}
 
     steps:
       - name: Brief backoff before retrying scheduler
@@ -3930,8 +4053,6 @@ jobs:
             const marker = process.env.DISPATCH_MARKER || '<!-- issue-scheduler-dispatch -->';
             const inProgress = process.env.IN_PROGRESS_LABEL || 'automation:in-progress';
             const paused = process.env.PAUSE_LABEL || 'automation:paused';
-            const pauseOnFailure =
-              (process.env.PAUSE_ON_FAILURE || 'true') !== 'false';
             const maxAttempts = Number.parseInt(
               process.env.MAX_DISPATCH_ATTEMPTS || '2',
               10
@@ -4040,36 +4161,23 @@ jobs:
               return;
             }
 
-            if (attempts >= maxAttempts && pauseOnFailure) {
-              await github.rest.issues.addLabels({
+            // automation:paused is retired (kodmial/continuum#346): always
+            // clear a stale pause and release for autonomous bounded retry.
+            try {
+              await github.rest.issues.removeLabel({
                 owner,
                 repo,
                 issue_number: issueNumber,
-                labels: [paused],
+                name: paused,
               });
-              core.warning(
-                `Issue #${issueNumber} failed after ${attempts} scheduler dispatch attempt(s); automation paused.`
-              );
-              return;
-            }
-
-            if (!pauseOnFailure) {
-              try {
-                await github.rest.issues.removeLabel({
-                  owner,
-                  repo,
-                  issue_number: issueNumber,
-                  name: paused,
-                });
-              } catch (err) {
-                if (err.status !== 404) throw err;
-              }
+            } catch (err) {
+              if (err.status !== 404) throw err;
             }
 
             // Removing automation:in-progress with TAP_PAT emits an issue
             // event, waking issue-scheduler immediately. The scheduler then
             // re-evaluates all priorities and WIP slots from current state.
             core.notice(
-              `Released failed reservation for issue #${issueNumber} after attempt ${attempts}/${maxAttempts}; scheduler will retry from live priority state${attempts >= maxAttempts && !pauseOnFailure ? ' (terminal pause disabled)' : ''}.`
+              `Released failed reservation for issue #${issueNumber} after attempt ${attempts}/${maxAttempts}; scheduler will retry from live priority state with ready re-checked.`
             );
 

@@ -2736,45 +2736,45 @@ class ContinuumTest < Minitest::Test
                  'child review must use the configured label in the label URL')
   end
 
-  # The documented semantics of post_pause_comment are subtle and the workflow
-  # comment is the only place they are written down: an unset/empty value keeps
-  # the comment, and only the exact string `false` disables it. Assert them on
-  # the implementation rather than on the prose, so a mutated description or a
-  # mutated comparison is both caught.
-  def test_post_pause_comment_only_exact_false_disables_the_comment
-    scheduler = events(yaml(File.join(ROOT, '.github/workflows/continuum-issue-scheduler.yml')))
-                  .fetch('workflow_call').fetch('inputs').fetch('post_pause_comment')
-    description = scheduler.fetch('description')
-    assert_includes description, 'false',
-                    'the description must name the exact value that disables the comment'
-    assert_includes description, 'disables',
-                    'the description must say which value turns the comment off'
+  # automation:paused is retired (kodmial/continuum#346). The legacy input is
+  # accepted so old callers do not fail, but no runtime decision may read it,
+  # write the label, or post a pause comment.
+  def test_terminal_pause_inputs_are_accepted_but_inert
+    workflow_path = File.join(ROOT, '.github/workflows/continuum-issue-scheduler.yml')
+    inputs = events(yaml(workflow_path)).fetch('workflow_call').fetch('inputs')
+    pause = inputs.fetch('post_pause_comment')
+    assert_includes pause.fetch('description'), 'Deprecated'
+    assert_equal '', inputs.fetch('ready_label').fetch('default')
 
     body = workflow_body('continuum-issue-scheduler.yml')
-    expression = body[/postPauseComment\s*=\s*\n?\s*(\(process\.env\.POST_PAUSE_COMMENT \|\| '[^']*'\) [!==]+ '[^']*')/m, 1]
-    refute_nil expression, 'postPauseComment is not derived from POST_PAUSE_COMMENT'
-    # The env default must not itself be the disabling value, or an empty input
-    # would silence the comment.
-    fallback = expression[/process\.env\.POST_PAUSE_COMMENT \|\| '([^']*)'/, 1]
-    refute_equal 'false', fallback,
-                 'an empty POST_PAUSE_COMMENT must keep the comment enabled'
-    refute_equal '', fallback, 'POST_PAUSE_COMMENT has no fallback default'
+    refute_includes body, 'postPauseComment'
+    refute_includes body, 'POST_PAUSE_COMMENT'
+    refute_includes body, 'pauseOnFailure'
+    refute_match(/labels: \[pausedLabel\]/, body,
+                 'no runtime path may add the retired pause label')
+    assert_includes body, 'await removeLabel(issueNumber, pausedLabel);'
+    assert_includes body, 'eligible for an automatic bounded retry'
+  end
 
-    # Re-implement the parsed expression in Ruby and run the documented cases
-    # through it, so the assertion is on behaviour rather than on the wording.
-    operator = expression[/\) (\S+) /, 1]
-    expected = expression[/\) \S+ '([^']*)'/, 1]
-    assert_includes %w[=== !==], operator, "unexpected comparison #{operator}"
-    enabled = lambda do |value|
-      subject = value.to_s.empty? ? fallback : value.to_s
-      operator == '===' ? subject == expected : subject != expected
-    end
-    # The comment stays on for every value except the exact string `false`:
-    # an empty input, an explicit true, and any other text all keep it enabled.
-    ['', 'true', 'anything', 'False', 'FALSE', '0', 'no'].each do |value|
-      assert enabled.call(value), "POST_PAUSE_COMMENT=#{value.inspect} must keep the pause comment enabled"
-    end
-    refute enabled.call('false'), "POST_PAUSE_COMMENT='false' must disable the pause comment"
+  # A private Child STOP fences the Child issue while cancelling the Parent
+  # delegated worker run, and no publication or merge path may outrun a STOP.
+  def test_operator_stop_reaches_parent_delegated_runs_and_publication
+    scheduler = workflow_body('continuum-issue-scheduler.yml')
+    assert_includes scheduler,
+                    "RUN_REPO_FULL: ${{ vars.CONTINUUM_ROLE == 'child' && vars.CONTINUUM_PARENT || github.repository }}"
+    assert_includes scheduler,
+                    "'.github/workflows/continuum-child-worker.yml' || format("
+    control = File.read(File.join(ROOT, '.github/scripts/issue_stop_control.sh'))
+    assert_includes control, 'run_repo="${RUN_REPO_FULL:-$REPO_FULL}"'
+    assert_includes control, 'gh api "repos/$run_repo/actions/runs?per_page=100"'
+    assert_includes control, 'gh api --method POST "repos/$run_repo/actions/runs/$run_id/cancel"'
+    assert_includes scheduler, 'RUN_REPO_FULL="$GITHUB_REPOSITORY" \\'
+    assert_includes scheduler, 'WORKFLOW_PATHS="$LOCAL_WORKFLOW_PATHS" \\'
+    opencode = workflow_body('continuum-opencode.yml')
+    assert_includes opencode, 'refusing to publish code'
+    assert_includes opencode, 'refusing to create the implementation PR'
+    auto_merge = workflow_body('continuum-auto-merge.yml')
+    assert_includes auto_merge, 'has an effective terminal STOP; merge held.'
   end
 
   # The scheduler's label/marker knobs must drive the code, not just be parsed.
@@ -2783,8 +2783,10 @@ class ContinuumTest < Minitest::Test
   def test_scheduler_naming_knobs_drive_implementation
     body = File.read(File.join(ROOT, '.github/workflows/continuum-issue-scheduler.yml'))
 
-    # post_pause_comment gates the actual comment creation.
-    assert_match(/if \(postPauseComment\)/, body)
+    # automation:paused is retired: no pause marker may be written, and the
+    # legacy toggle cannot resurrect a pause comment.
+    refute_includes body, 'postPauseComment'
+    refute_match(/labels: \[pausedLabel\]/, body)
     assert_includes body, 'issues.createComment'
 
     # reset_markers gates the marker deletion.
@@ -3001,15 +3003,17 @@ class ContinuumTest < Minitest::Test
     assert_includes body, 'item.title === run.display_title'
     assert_includes body, 'if (titleMatches.length === 1)'
 
-    # Exhausting the budget must pause, not loop forever.
+    # Exhausting the budget must not write a terminal pause: the reservation
+    # stays with the scheduler lease/backoff and ready is re-checked.
     assert_match(/if \(previousRetries >= maxRetries\) \{/, body)
-    assert_includes body, 'await addLabel(pausedLabel);'
-    assert_includes body, "'Remove the `' + pausedLabel + '` label and post `/oc` to retry manually.'"
+    refute_includes body, 'await addLabel(pausedLabel);'
+    refute_includes body, "Remove the `"
+    assert_includes body, 'lease/backoff remains authoritative and ready is re-checked'
 
     # Everything that makes a retry unsafe must be an early return.
     %w[
       issue.state !== 'open'
-      issueLabels.has(pausedLabel)
+      !issueLabels.has('automation:ready')
       declaredOpenBlockers.length > 0
       openBlockers.length > 0
       if (issuePr) {
@@ -3918,7 +3922,8 @@ class ContinuumTest < Minitest::Test
       dispatch_ref opencode_dispatch execution_label_routes
       child_dispatch_workflow
       count_open_prs_as_wip pause_on_failure
-      caller_event_name caller_issue_number
+      caller_event_name caller_issue_number caller_comment_body
+      caller_comment_author caller_comment_id caller_comment_created_at
     ],
     'continuum-opencode.yml' => %w[
       continuum_ref mode issue_number pr_number head_ref review_id unresolved_items_json run_id
@@ -3994,8 +3999,7 @@ class ContinuumTest < Minitest::Test
         next if key == 'watched_workflow'
         # Event plumbing carries the caller's own trigger context, not a
         # consumer knob: it binds github.* rather than inputs.* by design.
-        next if base == 'continuum-issue-scheduler.yml' &&
-                %w[caller_event_name caller_issue_number].include?(key)
+        next if base == 'continuum-issue-scheduler.yml' && key.start_with?('caller_')
         # kodmial/continuum#290: the 429 recovery keys are watchdog-owned
         # dispatch identity, not consumer knobs (they never read a vars.
         # fallback). A caller-stub workflow_dispatch accepts at most 25
@@ -4031,8 +4035,7 @@ class ContinuumTest < Minitest::Test
       'PAUSE_LABEL' => ['pause_marker', 'AUTOMATION_PAUSE_LABEL', 'automation:paused'],
       'QUALIFYING_LABEL' => ['qualifying_label', 'AUTOMATION_QUALIFYING_LABEL', 'automation:qualifying'],
       'BLOCKED_LABEL' => ['blocked_label', 'AUTOMATION_BLOCKED_LABEL', 'automation:blocked'],
-      'COUNT_OPEN_PRS_AS_WIP' => ['count_open_prs_as_wip', 'AUTOMATION_COUNT_OPEN_PRS_AS_WIP', 'true'],
-      'PAUSE_ON_FAILURE' => ['pause_on_failure', 'AUTOMATION_PAUSE_ON_FAILURE', 'false']
+      'COUNT_OPEN_PRS_AS_WIP' => ['count_open_prs_as_wip', 'AUTOMATION_COUNT_OPEN_PRS_AS_WIP', 'true']
     }.each do |env_key, (input, variable, literal)|
       assert_includes scheduler,
                       "#{env_key}: \${{ inputs.#{input} || vars.#{variable} || '#{literal}' }}",
@@ -4043,8 +4046,6 @@ class ContinuumTest < Minitest::Test
                     "REVIEW_PROVIDER: ${{ inputs.review_provider || vars.CONTINUUM_REVIEW_PROVIDER || 'none' }}"
     assert_includes watchdog_body,
                     "MAX_RECOVERY_RETRIES: ${{ inputs.max_recovery_retries || vars.AUTOMATION_WATCHDOG_MAX_RETRIES || '1' }}"
-    assert_includes watchdog_body,
-                    "PAUSE_ON_FAILURE: ${{ inputs.pause_on_failure || vars.AUTOMATION_PAUSE_ON_FAILURE || 'false' }}"
   end
 
   # Adding a `vars.` fallback to a `inputs.x || 'literal'` chain must not change
@@ -4242,9 +4243,9 @@ class ContinuumTest < Minitest::Test
                     'a stale child pause from a failed wake must be clearable by parent reconciliation instead of stranding delegated work'
     assert_includes scheduler, "select(.name != $pause)",
                     'cleared pauses must re-enter admission instead of staying terminal'
-    assert_includes scheduler, "PAUSE_ON_FAILURE: ${{ inputs.pause_on_failure || vars.AUTOMATION_PAUSE_ON_FAILURE || 'false' }}",
-                    'delegated retries must default to automatic instead of terminal pause'
-    assert_includes scheduler, 'because pause_on_failure=false',
+    refute_includes scheduler, 'PAUSE_ON_FAILURE:',
+                    'terminal pause controls are retired'
+    assert_includes scheduler, 'eligible for an automatic bounded retry',
                     'an exhausted lease must be retryable without a human label toggle'
 
     # 3. Duplicate event wake + parent cron coalesce to one logical dispatch:
@@ -4348,11 +4349,11 @@ class ContinuumTest < Minitest::Test
     assert_includes reservation, 'await addLabel(eventIssue.number, inProgressLabel);'
     assert_includes reservation, 'Reserved issue #'
 
-    # A manual command must not consume the scheduler's own attempt budget, or
-    # two manual runs would pause an issue the scheduler never dispatched.
+    # A manual command must not consume the scheduler's own attempt budget, and
+    # exhaustion never writes a terminal pause: it releases for bounded retry.
     assert_includes scheduler, 'const schedulerDispatches = comments.filter(comment =>'
-    assert_includes scheduler, 'schedulerDispatches.length >= maxDispatchAttempts'
-    assert_includes scheduler, 'pauseOnFailure'
+    assert_includes scheduler, 'eligible for an automatic bounded retry'
+    refute_includes scheduler, 'pauseOnFailure'
     refute_includes scheduler, 'if (dispatches.length >= maxDispatchAttempts) {'
   end
 
@@ -4367,11 +4368,10 @@ class ContinuumTest < Minitest::Test
     [
       'const freshIssueResponse = await readGithub.rest.issues.get({',
       "freshIssue.state !== 'open'",
-      '(pauseOnFailure && freshLabels.has(pausedLabel))',
       'freshLabels.has(inProgressLabel)',
       'if (readyLabel && !freshLabels.has(readyLabel)) {',
       'shouldAdmitToImplementation(',
-      'qualification tracker needs explicit dispatch, not generic implementation.',
+      'freshAdmission.reason',
       'const freshDeclaredBlockers = await openDeclaredBlockers(freshIssue);',
       'freshOpenBlockers.length > 0',
       'if (commandAgeMs < commandGraceMs) {',
@@ -4384,78 +4384,68 @@ class ContinuumTest < Minitest::Test
                  'every local just-in-time guard must be a skip, not a fall-through'
   end
 
-  # kodmial/continuum#266: the optional `automation:ready` admission gate.
-  # Empty configuration preserves current behavior; when configured, automatic
-  # dispatch admits only issues carrying the label. Priority stays a ranking
-  # signal, qualification dispatch and manual owner `/oc` never require it.
-  def test_scheduler_ready_label_admission_gate_is_optional
+  # kodmial/continuum#346: admission is fixed to `automation:ready`.
+  # Priority stays a ranking signal; qualification has its own lifecycle.
+  def test_scheduler_ready_label_admission_is_fixed
     workflow_path = File.join(ROOT, '.github/workflows/continuum-issue-scheduler.yml')
     scheduler = workflow_body('continuum-issue-scheduler.yml')
     inputs = events(yaml(workflow_path)).fetch('workflow_call').fetch('inputs')
 
-    # Optional `ready_label` input with an empty safe default.
     ready = inputs.fetch('ready_label')
-    assert_equal '', ready.fetch('default'), 'ready_label must default to empty so current behavior is unchanged'
+    assert_equal '', ready.fetch('default'),
+                 'legacy ready_label stays empty and inert'
+    assert_includes ready.fetch('description'), 'Deprecated'
     assert_equal 'string', ready.fetch('type')
     assert_equal false, ready.fetch('required')
-    assert_includes ready.fetch('description'), 'AUTOMATION_READY_LABEL'
 
-    # Env binding follows the consumer knob with no literal default.
-    assert_includes scheduler, 'READY_LABEL: ${{ inputs.ready_label || vars.AUTOMATION_READY_LABEL }}'
-    assert_includes scheduler, "const readyLabel = (process.env.READY_LABEL || '').trim();"
+    assert_includes scheduler, 'READY_LABEL: automation:ready'
+    assert_includes scheduler, "LEGACY_READY_LABEL: ${{ inputs.ready_label || vars.AUTOMATION_READY_LABEL }}"
+    assert_includes scheduler, "const readyLabel = 'automation:ready';"
+    refute_includes scheduler, "const readyLabel = (process.env.READY_LABEL || '').trim();"
 
-    # The configured label is created so it can be applied from the issue page;
-    # empty creates nothing.
     assert_includes scheduler, '...(readyLabel ? [{'
     assert_includes scheduler, 'name: readyLabel,'
     assert_includes scheduler, 'Admits this issue to automatic implementation by the issue scheduler.'
 
-    # Selection-time gate: present stays eligible, absent is skipped. The gate
-    # must be conditional on configuration so empty preserves behavior.
     assert_includes scheduler, 'if (readyLabel && !labels.has(readyLabel)) {'
-    assert_includes scheduler, 'missing required ready label `'
+    assert_includes scheduler, 'missing required admission label `'
 
-    # Delegated child selection applies the same gate in the bash queue step
-    # without disturbing priority ranking.
     assert_includes scheduler, '--arg ready "$READY_LABEL"'
     assert_includes scheduler, 'select($ready == "" or ([.labels[]?.name] | index($ready) != null))'
     assert_includes scheduler, 'sort_by(._rank, .number)'
 
-    # Just-in-time re-verification for both local and delegated dispatch: a
-    # label removed after selection must prevent dispatch.
     assert_includes scheduler, 'if (readyLabel && !freshLabels.has(readyLabel)) {'
     assert_includes scheduler, 'if (readyLabel) {'
     assert_includes scheduler, 'if (!freshChildLabels.has(readyLabel)) {'
 
-    # Priority ordering is unchanged: P0 -> P1 -> P2 -> unprioritized.
     assert_includes scheduler, "'priority:p0',"
     assert_includes scheduler, "'priority:p1',"
     assert_includes scheduler, "'priority:p2',"
     assert_includes scheduler, 'a.rank - b.rank'
 
-    # Qualification dispatch never requires the ready label.
     qualification = scheduler[/async function dispatchQualificationIssue\(.*?return wasPaused \? 'unpause-and-dispatch' : 'dispatch';\s*\}/m]
     refute_nil qualification, 'the qualification dispatch helper is gone'
     refute_includes qualification, 'readyLabel',
                      'qualification dispatch must not require automation:ready'
 
-    # Manual owner `/oc` reservation never requires the ready label.
     reservation = scheduler[/if \(context\.eventName === 'issue_comment'\) \{\s*\n\s*const eventIssue.*?\n            \}/m]
     refute_nil reservation, 'the owner-command reservation block is gone'
-    refute_includes reservation, 'readyLabel',
-                     'manual owner /oc must start without automation:ready'
+    assert_includes reservation, 'eventLabels.has(readyLabel)',
+                    'manual owner /oc must require automation:ready'
+    assert_includes reservation, 'isStopCommand',
+                    'operator /oc-cancel must never reserve coder work'
+    assert_includes reservation, '/^\\/oc-cancel(?:\\s|$)/'
 
-    # Caller stub exposes and forwards the knob as a bare passthrough.
     stub = yaml(File.join(ROOT, '.github/caller-stubs/continuum-issue-scheduler.yml'))
     stub_inputs = events(stub).fetch('workflow_dispatch').fetch('inputs')
-    assert stub_inputs.key?('ready_label'), 'caller stub must expose ready_label'
+    assert stub_inputs.key?('ready_label'), 'caller stub must expose the legacy input'
     call_with = stub.fetch('jobs').fetch('call').fetch('with')
     assert_equal '${{ inputs.ready_label }}', call_with.fetch('ready_label'),
                  'the stub must forward ready_label as a bare passthrough'
 
-    # Consumer contract documents the repository fallback.
     doc = File.read(File.join(ROOT, 'docs/consumer-variables.md'))
     assert_includes doc, 'AUTOMATION_READY_LABEL'
+    assert_includes doc, 'automation:ready'
   end
 
   # Closed issues are terminal scheduler state. A stale in-progress label on a
@@ -4874,13 +4864,14 @@ class ContinuumTest < Minitest::Test
 
     state_check = body.index('ISSUE_STATE="$(gh issue view "$ISSUE_NUMBER"')
     closed_check = body.index('if [[ "$ISSUE_STATE" == "CLOSED" ]]')
-    pause = body.index('Automation produced no code changes; pausing this issue for manual inspection.')
+    retry_path = body.index('released for autonomous bounded retry instead of pausing')
     refute_nil state_check, 'no-change handling does not inspect whether the issue was completed'
     refute_nil closed_check, 'no-change handling does not recognize a completed operational task'
-    refute_nil pause, 'failed no-change tasks must still pause rather than loop'
+    refute_nil retry_path, 'failed no-change tasks must release for bounded retry'
     assert_operator state_check, :<, closed_check
-    assert_operator closed_check, :<, pause,
-                    'a successfully closed operational task must exit before the failure pause path'
+    assert_operator closed_check, :<, retry_path,
+                    'a successfully closed operational task must exit before the failure retry path'
+    refute_includes body, 'pausing this issue for manual inspection.'
   end
 
   # CodeRabbit can submit CHANGES_REQUESTED for a policy/pre-merge failure with
@@ -6032,7 +6023,9 @@ class ContinuumTest < Minitest::Test
     assert_includes step, 'gh api --method POST "repos/$GITHUB_REPOSITORY/git/refs"'
     assert_includes step, 'git push --force-with-lease="refs/heads/$BRANCH:$BASE_SHA"'
     assert_includes step, 'gh pr create --repo "$GITHUB_REPOSITORY"'
-    assert_includes step, '--add-label "$PAUSE_LABEL" --remove-label "$IN_PROGRESS_LABEL"'
+    refute_includes step, '--add-label "$PAUSE_LABEL"'
+    assert_includes step, '--remove-label "$PAUSE_LABEL" --remove-label "$IN_PROGRESS_LABEL"'
+    assert_includes step, 'released for autonomous bounded retry instead of pausing'
 
     # A burnt issue-mode run must release the scheduler's reservation, exactly
     # as an issue_comment run does, or the WIP slot leaks until the lease

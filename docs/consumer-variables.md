@@ -95,14 +95,42 @@ publication are not part of the Swift profile.
 | `AUTOMATION_DISPATCH_BACKOFF_SECONDS` | `120` | Dispatch retry backoff. |
 | `AUTOMATION_DISPATCH_MARKER` | `<!-- issue-scheduler-dispatch -->` | Scheduler dispatch marker. |
 | `AUTOMATION_IN_PROGRESS_LABEL` | `automation:in-progress` | Reservation label. |
-| `AUTOMATION_PAUSE_LABEL` | `automation:paused` | Pause label. |
+| `AUTOMATION_PAUSE_LABEL` | `automation:paused` | Retired compatibility value. No runtime decision reads or writes this label; a stale label is cleared. |
 | `AUTOMATION_QUALIFYING_LABEL` | `automation:qualifying` | Implementation-merged capabilities waiting on mandatory live qualification. |
 | `AUTOMATION_BLOCKED_LABEL` | `automation:blocked` | Capabilities whose mandatory qualification failed and need repair. |
-| `AUTOMATION_READY_LABEL` | empty | Optional admission label for automatic implementation. When set (for example `automation:ready`), the scheduler auto-dispatches only issues carrying that label; empty keeps the current behavior. Qualification dispatch and manual owner `/oc` never require it. |
+| `AUTOMATION_READY_LABEL` | ignored | Deprecated compatibility variable. Admission is fixed to `automation:ready` for every new issue-coder attempt (scheduler, owner `/oc`, direct issue dispatch, watchdog/429 recovery, delegated child worker). Qualification dispatch uses its own lifecycle. |
 | `CONTINUUM_CHILD_OWNED_MARKER` | `<!-- continuum-child-owned -->` | Current delegated-child ownership marker. |
 | `CONTINUUM_LEGACY_CHILD_OWNED_MARKER` | empty | Optional legacy marker supplied by a migrating consumer. |
 | `CONTINUUM_REVIEW_PROVIDER` | `none` | Authoritative review selector: `none`, `coderabbit`, or `pr-agent`. |
 | `CONTINUUM_VERSION_FILE` | empty | Optional version file used only by the generic stale-release-run optimization. |
+
+## Issue admission, STOP and recovery
+
+`automation:ready` is mandatory for a **new** implementation attempt. It is a
+fixed core label, not an input or repository variable. Removing it prevents new
+starts, including automatic scheduler dispatch, manual owner `/oc`, direct
+`issue` workflow dispatch, watchdog/429 recovery and delegated child work. It
+does **not** cancel an already-running Actions job.
+
+An owner (or explicitly authorized operator) comment whose first significant
+line is exactly `/oc-cancel` is a real operator STOP. It:
+
+1. revokes `automation:ready`;
+2. persists a durable intent/fence and the shared terminal generation-stop
+   record for `repository + issue + generation`;
+3. cancels only Actions runs whose workflow path and issue/generation
+   provenance match (a private Child STOP fences the Child issue and cancels
+   the Parent's delegated `SubTask #<task>` worker run);
+4. observes the real terminal outcome (`STOP_REQUESTED`, `CANCEL_PENDING`,
+   `STOPPED`, `PARTIAL`, `FAILED`) and blocks late code/PR/merge publication.
+
+Repeated STOP is idempotent. Restoring `automation:ready` never re-arms a
+stopped generation. An explicit owner recovery marker
+(`continuum-task-generation-recover`) re-arms it, after which a new owner
+command or scheduler pass may start exactly one new attempt.
+
+Automatic errors (no diff, 429, infrastructure, transient API failures) use
+bounded lease/backoff retry, not a terminal `automation:paused` label.
 
 ## Optional PR-Agent review provider
 

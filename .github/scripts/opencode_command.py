@@ -12,7 +12,8 @@ The rule, briefly: a comment qualifies only when its first significant line
 is exactly ``/oc`` or ``/opencode`` (surrounding whitespace allowed).
 Prose, inline code, quotes, and Markdown blocks that merely mention the token
 never qualify. ``/oc-cancel`` as the first significant line classifies as
-``cancel`` and must suppress any launch; it is a launch guard only.
+``cancel`` and is an authenticated operator STOP: it suppresses any launch
+and routes to the durable STOP handler.
 
 Usage (body via argument, file, or stdin)::
 
@@ -52,6 +53,8 @@ from continuum.opencode_commands import (  # noqa: E402
     is_cancel_command,
     is_manual_command,
     is_owner_command,
+    is_owner_stop_command,
+    is_stop_command,
     is_scheduler_dispatch,
     is_watchdog_recovery,
 )
@@ -97,6 +100,23 @@ def _cmd_is_owner_command(args) -> int:
     return 0
 
 
+def _cmd_is_stop(args) -> int:
+    print("true" if is_stop_command(_read_body(args)) else "false")
+    return 0
+
+
+def _cmd_is_owner_stop(args) -> int:
+    operators = [item.strip() for item in (args.capable_operator or []) if item.strip()]
+    print(
+        "true"
+        if is_owner_stop_command(
+            _read_body(args), args.author, args.owner, operators
+        )
+        else "false"
+    )
+    return 0
+
+
 def _cmd_is_scheduler_dispatch(args) -> int:
     print("true" if is_scheduler_dispatch(_read_body(args), args.marker) else "false")
     return 0
@@ -131,6 +151,25 @@ def build_parser() -> argparse.ArgumentParser:
     owner_command.add_argument("--author", required=True, help="Comment author login.")
     owner_command.add_argument("--owner", required=True, help="Repository owner login.")
     owner_command.set_defaults(func=_cmd_is_owner_command)
+
+    is_stop = sub.add_parser("is-stop", help="Print true for an exact operator STOP command.")
+    _add_body_options(is_stop)
+    is_stop.set_defaults(func=_cmd_is_stop)
+
+    owner_stop = sub.add_parser(
+        "is-owner-stop",
+        help="Print true only for an exact STOP command from an authorized operator.",
+    )
+    _add_body_options(owner_stop)
+    owner_stop.add_argument("--author", required=True, help="Comment author login.")
+    owner_stop.add_argument("--owner", required=True, help="Repository owner login.")
+    owner_stop.add_argument(
+        "--capable-operator",
+        action="append",
+        default=[],
+        help="Additional authorized operator login (repeatable).",
+    )
+    owner_stop.set_defaults(func=_cmd_is_owner_stop)
 
     is_dispatch = sub.add_parser(
         "is-scheduler-dispatch",

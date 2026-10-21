@@ -1146,7 +1146,7 @@ GENERATION_STOP_MARKER = "continuum-task-generation-stop"
 GENERATION_RECOVER_MARKER = "continuum-task-generation-recover"
 
 #: Allowed stop reasons (privacy-safe, no free-form text).
-GENERATION_STOP_REASONS = frozenset({"drift", "tampered"})
+GENERATION_STOP_REASONS = frozenset({"drift", "tampered", "operator"})
 
 _GENERATION_STOP_RE = re.compile(
     r"<!--\s*continuum-task-generation-stop\s+"
@@ -1155,7 +1155,7 @@ _GENERATION_STOP_RE = re.compile(
     r"generation=(\d+)\s+"
     r"pinned-spec=([0-9a-fA-F]{64})\s+"
     r"live-spec=([0-9a-fA-F]{64})\s+"
-    r"reason=(drift|tampered)\s*-->"
+    r"reason=(drift|tampered|operator)\s*-->"
 )
 
 _GENERATION_RECOVER_RE = re.compile(
@@ -1364,7 +1364,7 @@ def render_generation_stop(
     if not _HEX64_RE.fullmatch(live):
         raise TaskSnapshotError("live-spec must be a 64-hex digest")
     if why not in GENERATION_STOP_REASONS:
-        raise TaskSnapshotError("reason must be one of: drift, tampered")
+        raise TaskSnapshotError("reason must be one of: drift, tampered, operator")
     marker = (
         "<!-- {} repo={} issue={} generation={} "
         "pinned-spec={} live-spec={} reason={} -->".format(

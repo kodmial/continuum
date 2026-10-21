@@ -24,7 +24,7 @@ on:
         required: false
         type: string
       pause_marker:
-        description: "Pause label"
+        description: "Deprecated pause label (ignored)"
         required: false
         type: string
       qualifying_label:
@@ -48,7 +48,7 @@ on:
         required: false
         type: string
       ready_label:
-        description: "Optional admission label for automatic implementation"
+        description: "Deprecated ready label (core uses automation:ready)"
         required: false
         type: string
       command_grace_minutes:
@@ -91,7 +91,7 @@ on:
         required: false
         type: string
       pause_on_failure:
-        description: "Pause after exhausted/closed failed automation"
+        description: "Deprecated pause switch (ignored)"
         required: false
         type: string
   # Parent repositories poll delegated child issues here. Keep this wake-up
@@ -146,7 +146,8 @@ jobs:
       (github.event_name != 'issue_comment' ||
        (github.actor == github.repository_owner &&
         (contains(github.event.comment.body, '/oc') ||
-         contains(github.event.comment.body, '/opencode'))) ||
+         contains(github.event.comment.body, '/opencode') ||
+         contains(github.event.comment.body, '/oc-cancel'))) ||
        ((github.actor == github.repository_owner ||
          github.actor == 'github-actions[bot]' ||
          github.event.comment.author_association == 'OWNER' ||
@@ -191,3 +192,7 @@ jobs:
       # so the caller forwards its own trigger name and issue number.
       caller_event_name: "${{ github.event_name }}"
       caller_issue_number: "${{ github.event.issue.number }}"
+      caller_comment_body: "${{ github.event.comment.body }}"
+      caller_comment_author: "${{ github.event.comment.user.login }}"
+      caller_comment_id: "${{ github.event.comment.id }}"
+      caller_comment_created_at: "${{ github.event.comment.created_at }}"

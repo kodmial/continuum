@@ -86,7 +86,7 @@ class CoverageTests(unittest.TestCase):
         # adds one delegated-aware PAT binding, also inventoried).
         # CodeRabbit batching now dispatches to canonical OpenCode: two
         # standalone PAT sites disappeared and one PAT dispatch remains.
-        self.assertEqual(len(bindings), 121)
+        self.assertEqual(len(bindings), 122)
         gaps = inventory.coverage_gaps(WORKFLOWS_DIR)
         self.assertEqual(gaps, [], f"uninventoried TAP_PAT bindings: {gaps}")
 

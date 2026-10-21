@@ -44,8 +44,8 @@ jobs:
       WORKER_WORKFLOW: ${{ inputs.worker_workflow }}
       REVIEW_WORKFLOW: ${{ inputs.review_workflow }}
       MANUAL_PR_REVIEW_WORKFLOW: ${{ inputs.manual_pr_review_workflow }}
-      # Same default as continuum-issue-scheduler.yml's pause_marker, so a parent that
-      # renames the scheduler's pause label must rename this knob too.
+      # automation:paused is retired (kodmial/continuum#346). It is only
+      # cleared on sight and never read as admission state.
       AUTOMATION_PAUSE_LABEL: ${{ vars.AUTOMATION_PAUSE_LABEL || 'automation:paused' }}
       COMMAND_GRACE_MINUTES: ${{ vars.AUTOMATION_COMMAND_GRACE_MINUTES || '5' }}
     steps:

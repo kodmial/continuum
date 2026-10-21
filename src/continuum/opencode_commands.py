@@ -45,8 +45,10 @@ What this module does not decide
   (``startsWith`` in the workflow expression, not ``contains``), so
   agent-generated prose that mentions ``/oc`` later can never chain a
   self-triggered run. Review comments keep their existing owner gate.
-* Cancellation of running work. ``/oc-cancel`` is a launch guard only:
-  Continuum has no mechanism that cancels an already-running run.
+* Cancellation of running work. ``/oc-cancel`` is an authenticated operator
+  STOP: it revokes ``automation:ready``, durably fences the generation, and
+  cancels the matching queued/running coder runs. The parser only classifies
+  the command; :mod:`continuum.issue_stop` owns the STOP state machine.
 
 Standard library only.
 """
@@ -56,12 +58,13 @@ from __future__ import annotations
 #: Tokens that launch an implementation run from an issue comment.
 IMPLEMENT_COMMANDS = ("/oc", "/opencode")
 
-#: Token that suppresses an agent launch. It is a launch guard only.
+#: Token that requests a real operator STOP for the current generation.
 CANCEL_COMMAND = "/oc-cancel"
 
 #: Classification results of :func:`classify_issue_comment`.
 RUN = "run"
 CANCEL = "cancel"
+STOP = CANCEL
 IGNORE = "ignore"
 
 #: Marker the scheduler writes into its dispatch comments.
@@ -132,6 +135,12 @@ def is_cancel_command(body) -> bool:
     return parse_cancel_command(body) is not None
 
 
+def is_stop_command(body) -> bool:
+    """Whether a comment is an explicit operator STOP command."""
+
+    return is_cancel_command(body)
+
+
 def classify_issue_comment(body) -> str:
     """Classify an issue comment as ``"run"``, ``"cancel"``, or ``"ignore"``.
 
@@ -164,6 +173,27 @@ def is_owner_command(body, author_login, owner_login) -> bool:
     """
 
     return is_manual_command(body) and _logins_equal(author_login, owner_login)
+
+
+def is_owner_stop_command(
+    body, author_login, owner_login, capable_operators=()
+) -> bool:
+    """Whether a comment is an authorized operator STOP.
+
+    The exact ``/oc-cancel`` token is required. Authorization accepts the
+    repository owner or an explicitly configured capable operator. Prose that
+    merely quotes the token is not a command, and an empty/machine snapshot is
+    never authority. GitHub logins compare case-insensitively.
+    """
+
+    if not is_cancel_command(body):
+        return False
+    if _logins_equal(author_login, owner_login):
+        return True
+    return any(
+        _logins_equal(author_login, operator)
+        for operator in (capable_operators or ())
+    )
 
 
 def is_scheduler_dispatch(body, dispatch_marker=DEFAULT_DISPATCH_MARKER) -> bool:

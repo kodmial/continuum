@@ -38,7 +38,8 @@ jobs:
       (github.event_name == 'issue_comment' &&
        github.actor == github.repository_owner &&
        (contains(github.event.comment.body, '/oc') ||
-        contains(github.event.comment.body, '/opencode'))) ||
+        contains(github.event.comment.body, '/opencode') ||
+        contains(github.event.comment.body, '/oc-cancel'))) ||
       (github.event_name == 'pull_request_target' && github.event.action == 'closed') ||
       (github.event_name == 'workflow_run' && github.event.workflow_run.path == '.github/workflows/opencode.yml')
     uses: ./.github/workflows/continuum-issue-scheduler.yml
@@ -48,6 +49,12 @@ jobs:
       wip_limit: '4'
       opencode_workflow_name: 'OpenCode agent'
       opencode_workflow_path: '.github/workflows/opencode.yml'
+      caller_event_name: "${{ github.event_name }}"
+      caller_issue_number: "${{ github.event.issue.number }}"
+      caller_comment_body: "${{ github.event.comment.body }}"
+      caller_comment_author: "${{ github.event.comment.user.login }}"
+      caller_comment_id: "${{ github.event.comment.id }}"
+      caller_comment_created_at: "${{ github.event.comment.created_at }}"
 
   watchdog:
     if: >-
