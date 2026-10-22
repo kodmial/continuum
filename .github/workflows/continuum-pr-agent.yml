@@ -3253,8 +3253,9 @@ jobs:
                   and str(run.get("head_sha") or "").lower() == head.lower()
                   and str(run.get("event") or "pull_request") == "pull_request"
               )
-          candidates = []
-          seen = set()
+          def updated_at(run):
+              return str(run.get("updated_at") or "")
+          by_key = {}
           rows = []
           if isinstance(proof, dict):
               rows.append(proof)
@@ -3263,14 +3264,29 @@ jobs:
           for run in rows:
               if not matches(run):
                   continue
-              key = str(run.get("id")) if run.get("id") is not None else (
-                  str(run.get("created_at") or ""), str(run.get("status") or ""),
-                  str(run.get("conclusion") or ""),
-              )
-              if key in seen:
+              if run.get("id") is not None:
+                  key = "id:" + str(run.get("id"))
+              else:
+                  key = "|".join([
+                      str(run.get("name") or ""),
+                      str(run.get("head_sha") or "").lower(),
+                      str(run.get("created_at") or ""),
+                      str(run.get("status") or ""),
+                      str(run.get("conclusion") or ""),
+                  ])
+              previous = by_key.get(key)
+              if previous is None:
+                  by_key[key] = run
                   continue
-              seen.add(key)
-              candidates.append(run)
+              previous_updated = updated_at(previous)
+              current_updated = updated_at(run)
+              if current_updated > previous_updated or (
+                  current_updated == previous_updated
+                  and previous.get("status") != "completed"
+                  and run.get("status") == "completed"
+              ):
+                  by_key[key] = run
+          candidates = list(by_key.values())
           if not candidates:
               print("unavailable")
               raise SystemExit(0)
@@ -3279,7 +3295,6 @@ jobs:
               key=lambda run: (
                   str(run.get("created_at") or ""),
                   int(run.get("id") or 0),
-                  str(run.get("updated_at") or ""),
               ),
               reverse=True,
           )[0]
