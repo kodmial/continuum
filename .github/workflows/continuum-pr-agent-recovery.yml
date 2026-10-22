@@ -173,14 +173,82 @@ jobs:
             const ciWorkflowName = String(process.env.CI_WORKFLOW_NAME || 'CI').trim();
             const delegatedTarget =
               process.env.CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED === 'true';
-            const ciRunAccepted = (run) => Boolean(
-              run &&
-              run.status === 'completed' &&
-              (
-                run.conclusion === 'success' ||
-                (delegatedTarget && run.conclusion === 'skipped')
-              )
-            );
+            // Canonical exact-HEAD CI proof shared with admission,
+            // pre-review revalidation, and the merge gate (issue #368). The
+            // newest matching pull_request run decides, so a stale/partial
+            // snapshot can neither hide a green run nor authorize a merge
+            // when a newer red or pending run exists.
+            function ciRunCreatedAt(run) {
+              const parsed = Date.parse(String((run && run.created_at) || ''));
+              return Number.isFinite(parsed) ? parsed : 0;
+            }
+            function ciRunUpdatedAt(run) {
+              const parsed = Date.parse(String((run && run.updated_at) || ''));
+              return Number.isFinite(parsed) ? parsed : 0;
+            }
+            function ciRunMatchesExactHead(run, workflowName, head) {
+              return Boolean(
+                run &&
+                String(run.name || '') === String(workflowName || '') &&
+                String(run.head_sha || '').trim().toLowerCase() ===
+                  String(head || '').trim().toLowerCase() &&
+                String(run.event || 'pull_request') === 'pull_request'
+              );
+            }
+            function decideExactHeadCi({ proofRun = null, runs = [], workflowName, headSha: head, delegated = false }) {
+              // Deduplicate by immutable run id while keeping the freshest
+              // observed state of that run: the proof run fetched by id and
+              // the filtered listing may describe the same run at different
+              // moments (pending -> completed), so the newer snapshot wins.
+              const byKey = new Map();
+              for (const run of [proofRun, ...(runs || [])]) {
+                if (!ciRunMatchesExactHead(run, workflowName, head)) continue;
+                const key = run.id !== undefined && run.id !== null
+                  ? 'id:' + String(run.id)
+                  : [
+                      String(run.name || ''),
+                      String(run.head_sha || '').toLowerCase(),
+                      String(run.created_at || ''),
+                      String(run.status || ''),
+                      String(run.conclusion || ''),
+                    ].join('|');
+                const previous = byKey.get(key);
+                if (!previous) {
+                  byKey.set(key, run);
+                  continue;
+                }
+                const previousUpdated = ciRunUpdatedAt(previous);
+                const currentUpdated = ciRunUpdatedAt(run);
+                if (
+                  currentUpdated > previousUpdated ||
+                  (
+                    currentUpdated === previousUpdated &&
+                    previous.status !== 'completed' &&
+                    run.status === 'completed'
+                  )
+                ) {
+                  byKey.set(key, run);
+                }
+              }
+              const candidates = [...byKey.values()];
+              const newest = candidates.sort((a, b) => {
+                const at = ciRunCreatedAt(a);
+                const bt = ciRunCreatedAt(b);
+                if (bt !== at) return bt - at;
+                return Number(b.id || 0) - Number(a.id || 0);
+              })[0] || null;
+              if (!newest) return { state: 'unavailable', run: null, runId: null };
+              const state =
+                newest.status === 'completed'
+                  ? (
+                      newest.conclusion === 'success' ||
+                      (delegated && newest.conclusion === 'skipped')
+                        ? 'green'
+                        : 'red'
+                    )
+                  : 'pending';
+              return { state, run: newest, runId: Number(newest.id) || null };
+            }
             // Single 10-execution transient budget (#224): default 10 total
             // executions per exact PR/HEAD/operation, configurable through a
             // safe bounded Continuum variable and always clamped to 1..10 so
@@ -896,12 +964,13 @@ jobs:
                       MAX_GATE_PAGES
                     )
                   );
-              const latest = runs
-                .filter(run => run.name === ciWorkflowName && run.head_sha === head)
-                .sort((a, b) =>
-                  Date.parse(b.created_at || 0) - Date.parse(a.created_at || 0)
-                )[0];
-              return ciRunAccepted(latest);
+              const decision = decideExactHeadCi({
+                runs,
+                workflowName: ciWorkflowName,
+                headSha: head,
+                delegated: delegatedTarget,
+              });
+              return decision.state === 'green';
             }
 
             // Bounded CI snapshot for the non-mutating initial scan
@@ -933,7 +1002,14 @@ jobs:
                   const sha = String(run.head_sha || '').toLowerCase();
                   if (!sha) continue;
                   const prev = byHead.get(sha);
-                  if (!prev || Date.parse(run.created_at || 0) > Date.parse(prev.created_at || 0)) {
+                  const newer =
+                    !prev ||
+                    ciRunCreatedAt(run) > ciRunCreatedAt(prev) ||
+                    (
+                      ciRunCreatedAt(run) === ciRunCreatedAt(prev) &&
+                      Number(run.id || 0) > Number(prev.id || 0)
+                    );
+                  if (newer) {
                     byHead.set(sha, run);
                   }
                 }
@@ -946,8 +1022,17 @@ jobs:
               if (!ciSnapshotByHead) return null;
               const key = String(head || '').toLowerCase();
               if (!ciSnapshotByHead.has(key)) return null;
-              const run = ciSnapshotByHead.get(key);
-              return ciRunAccepted(run);
+              const decision = decideExactHeadCi({
+                runs: [ciSnapshotByHead.get(key)],
+                workflowName: ciWorkflowName,
+                headSha: head,
+                delegated: delegatedTarget,
+              });
+              // Pending snapshot evidence falls back to a fresh exact-HEAD
+              // read instead of being treated as permanently red.
+              if (decision.state === 'green') return true;
+              if (decision.state === 'red') return false;
+              return null;
             }
             async function scanCiGreen(head) {
               const snapshotVerdict = ciSnapshotGreen(head);

@@ -4033,9 +4033,20 @@ class RepairWiringRegressionTests(unittest.TestCase):
                 self.assertIn(
                     "Could not revalidate PR state after backoff", body
                 )
-                self.assertIn(
-                    "Could not revalidate exact-HEAD CI after backoff", body
-                )
+                if path.endswith("continuum-pr-agent-repair.yml"):
+                    self.assertIn(
+                        "Could not revalidate exact-HEAD CI after backoff", body
+                    )
+                else:
+                    self.assertIn("ADMITTED_CI_RUN_ID", body)
+                    self.assertIn("pr-agent-ci-proof-run.json", body)
+                    self.assertIn("Exact HEAD has a red CI run", body)
+                    self.assertIn(
+                        "Exact HEAD CI is still running; retry cancelled", body
+                    )
+                    self.assertIn(
+                        "Exact HEAD CI evidence is temporarily unavailable", body
+                    )
                 self.assertNotIn('--ref main', body)
 
     def test_retry_workflow_target_is_allow_listed(self):

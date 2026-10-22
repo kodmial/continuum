@@ -167,6 +167,7 @@ jobs:
     timeout-minutes: ${{ fromJSON(vars.AUTOMATION_PR_AGENT_TIMEOUT_MINUTES || '60') }}
     outputs:
       admitted: ${{ steps.admit.outputs.admitted }}
+      ci_run_id: ${{ steps.admit.outputs.ci_run_id }}
       pr_number: ${{ steps.stack.outputs.pr_number }}
       review_provider: ${{ steps.stack.outputs.stack }}
       head_sha: ${{ steps.result.outputs.head_sha }}
@@ -450,6 +451,96 @@ jobs:
             // not the combined Statuses API. PR-Agent's own failure/pending
             // statuses must never make a recovered CI-green HEAD inadmissible.
             const ciWorkflowName = String(process.env.CI_WORKFLOW_NAME || 'CI').trim();
+            const delegatedTarget =
+              process.env.CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED === 'true';
+            // Canonical exact-HEAD CI proof shared with the pre-review
+            // revalidation and merge gate (issue #368). A run is accepted only
+            // when it is the exact pull_request CI workflow run for this SHA.
+            // The newest matching run always decides: a newer red or pending
+            // run must never be bypassed by an older green one, and a listing
+            // that momentarily goes empty must not erase a verified run.
+            function ciRunCreatedAt(run) {
+              const parsed = Date.parse(String((run && run.created_at) || ''));
+              return Number.isFinite(parsed) ? parsed : 0;
+            }
+            function ciRunUpdatedAt(run) {
+              const parsed = Date.parse(String((run && run.updated_at) || ''));
+              return Number.isFinite(parsed) ? parsed : 0;
+            }
+            function ciRunMatchesExactHead(run, workflowName, head) {
+              return Boolean(
+                run &&
+                String(run.name || '') === String(workflowName || '') &&
+                String(run.head_sha || '').trim().toLowerCase() ===
+                  String(head || '').trim().toLowerCase() &&
+                String(run.event || 'pull_request') === 'pull_request'
+              );
+            }
+            function ciRunProofState(run, delegated) {
+              if (!run) return 'unavailable';
+              if (String(run.status || '') !== 'completed') return 'pending';
+              const conclusion = String(run.conclusion || '');
+              if (conclusion === 'success') return 'green';
+              if (delegated && conclusion === 'skipped') return 'green';
+              return 'red';
+            }
+            function decideExactHeadCi({ proofRun = null, runs = [], workflowName, headSha: head, delegated = false }) {
+              // Deduplicate by immutable run id while keeping the freshest
+              // observed state of that run: the proof run fetched by id and
+              // the filtered listing may describe the same run at different
+              // moments (pending -> completed), so the newer snapshot wins.
+              const byKey = new Map();
+              for (const run of [proofRun, ...(runs || [])]) {
+                if (!ciRunMatchesExactHead(run, workflowName, head)) continue;
+                const key = run.id !== undefined && run.id !== null
+                  ? 'id:' + String(run.id)
+                  : [
+                      String(run.name || ''),
+                      String(run.head_sha || '').toLowerCase(),
+                      String(run.created_at || ''),
+                      String(run.status || ''),
+                      String(run.conclusion || ''),
+                    ].join('|');
+                const previous = byKey.get(key);
+                if (!previous) {
+                  byKey.set(key, run);
+                  continue;
+                }
+                const previousUpdated = ciRunUpdatedAt(previous);
+                const currentUpdated = ciRunUpdatedAt(run);
+                if (
+                  currentUpdated > previousUpdated ||
+                  (
+                    currentUpdated === previousUpdated &&
+                    previous.status !== 'completed' &&
+                    run.status === 'completed'
+                  )
+                ) {
+                  byKey.set(key, run);
+                }
+              }
+              const candidates = [...byKey.values()];
+              const newest = candidates.sort((a, b) => {
+                const at = ciRunCreatedAt(a);
+                const bt = ciRunCreatedAt(b);
+                if (bt !== at) return bt - at;
+                return Number(b.id || 0) - Number(a.id || 0);
+              })[0] || null;
+              if (!newest) {
+                return {
+                  state: 'unavailable',
+                  run: null,
+                  runId: null,
+                  reason: 'no exact-HEAD pull_request CI run is visible',
+                };
+              }
+              return {
+                state: ciRunProofState(newest, delegated),
+                run: newest,
+                runId: Number(newest.id) || null,
+                reason: 'newest exact-HEAD pull_request CI run decides',
+              };
+            }
             // Bounded gate read (#254): the head_sha filter is server-side
             // and only the newest matching run decides admission, so two
             // pages bound the cost without walking run history.
@@ -471,39 +562,35 @@ jobs:
               runs.push(...batch);
               if (batch.length < 100) break;
             }
-            const latestCi = runs
-              .filter(run => run.name === ciWorkflowName && run.head_sha === headSha)
-              .sort(
-                (a, b) =>
-                  new Date(b.created_at).getTime() -
-                  new Date(a.created_at).getTime()
-              )[0];
-            const delegatedTarget =
-              process.env.CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED === 'true';
+            const ciDecision = decideExactHeadCi({
+              runs,
+              workflowName: ciWorkflowName,
+              headSha,
+              delegated: delegatedTarget,
+            });
             const delegatedSkippedCi =
               delegatedTarget &&
-              latestCi &&
-              latestCi.status === 'completed' &&
-              latestCi.conclusion === 'skipped';
-            if (
-              !latestCi ||
-              latestCi.status !== 'completed' ||
-              (latestCi.conclusion !== 'success' && !delegatedSkippedCi)
-            ) {
+              ciDecision.state === 'green' &&
+              ciDecision.run &&
+              ciDecision.run.conclusion === 'skipped';
+            if (ciDecision.state !== 'green') {
               core.setOutput('admitted', 'false');
               core.notice(
                 `PR #${prNumber} HEAD ${headSha} has no acceptable current-head ` +
-                `${ciWorkflowName} evidence; PR-Agent waits for exact-head CI.`
+                `${ciWorkflowName} evidence (${ciDecision.state}); PR-Agent waits for exact-head CI.`
               );
               return;
             }
             core.setOutput('admitted', 'true');
             core.setOutput('head_sha', headSha);
+            if (ciDecision.runId) {
+              core.setOutput('ci_run_id', String(ciDecision.runId));
+            }
             core.notice(
               `PR #${prNumber} admitted at HEAD ${headSha} with ` +
               (delegatedSkippedCi
                 ? 'verified delegated child CI suppression.'
-                : 'green CI.')
+                : `green CI run ${ciDecision.runId || '<unknown>'}.`)
             );
 
       - name: Mark PR-Agent review in flight
@@ -775,57 +862,230 @@ jobs:
       - name: Revalidate the admitted exact HEAD immediately before review
         if: steps.stack.outputs.enabled == 'true' && steps.admit.outputs.admitted == 'true'
         id: before
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
         env:
-          # Target-aware revalidation (gh pr view plus exact-HEAD workflow-run
-          # evidence against the resolved target). Local same-repository reads
-          # use github.token; delegated cross-repository reads require TAP_PAT.
-          # The fallback is gated on non-delegated runs so a delegated run
-          # without PAT yields an empty token (auth itself fails closed).
-          GH_TOKEN: ${{ env.CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED == 'true' && secrets.TAP_PAT || (env.CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED != 'true' && github.token || '') }}
+          # Target-aware revalidation against the resolved target. Local
+          # same-repository reads use github.token; delegated cross-repository
+          # reads require TAP_PAT. The fallback is gated on non-delegated runs
+          # so a delegated run without PAT yields an empty token (auth itself
+          # fails closed).
           TAP_PAT: ${{ secrets.TAP_PAT }}
           PR_NUMBER: ${{ steps.stack.outputs.pr_number }}
           ADMITTED_SHA: ${{ steps.admit.outputs.head_sha }}
+          CI_RUN_ID: ${{ steps.admit.outputs.ci_run_id }}
           CI_WORKFLOW_NAME: ${{ inputs.ci_workflow_name || vars.CONTINUUM_CI_WORKFLOW_NAME || 'CI' }}
-        run: |
-          set -euo pipefail
-          if [[ "${CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED:-false}" == "true" && -z "${TAP_PAT:-}" ]]; then
-            echo "::error::Delegated PR-Agent execution requires TAP_PAT; refusing to fall back to github.token."
-            exit 1
-          fi
-          CURRENT_SHA="$(gh pr view "$PR_NUMBER" --repo "$CONTINUUM_PR_AGENT_TARGET_REPOSITORY" --json headRefOid --jq .headRefOid)"
-          if [[ "${CURRENT_SHA,,}" != "${ADMITTED_SHA,,}" ]]; then
-            echo "::error::PR head moved after CI admission ($ADMITTED_SHA -> $CURRENT_SHA); refusing to review an unqualified HEAD."
-            exit 1
-          fi
-          CI_JSON="$RUNNER_TEMP/pr-agent-before-review-ci-runs.json"
-          gh api "repos/$CONTINUUM_PR_AGENT_TARGET_REPOSITORY/actions/runs?event=pull_request&head_sha=$ADMITTED_SHA&per_page=100" > "$CI_JSON"
-          if ! python3 - "$CI_JSON" "$CI_WORKFLOW_NAME" "$ADMITTED_SHA" "${CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED:-false}" <<'PY'
-          import json, sys
-          path, workflow, head, delegated = sys.argv[1:5]
-          with open(path, "r", encoding="utf-8") as handle:
-              runs = json.load(handle).get("workflow_runs", [])
-          current = sorted(
-              (run for run in runs if run.get("name") == workflow and run.get("head_sha") == head),
-              key=lambda run: run.get("created_at") or "",
-              reverse=True,
-          )
-          conclusion = current[0].get("conclusion") if current else None
-          accepted = (
-              current
-              and current[0].get("status") == "completed"
-              and (
-                  conclusion == "success"
-                  or (delegated == "true" and conclusion == "skipped")
-              )
-          )
-          raise SystemExit(0 if accepted else 1)
-          PY
-          then
-            echo "::error::CI for admitted HEAD $ADMITTED_SHA is no longer completed:success."
-            exit 1
-          fi
-          echo "sha=$ADMITTED_SHA" >> "$GITHUB_OUTPUT"
-          echo "Exact CI-qualified HEAD $ADMITTED_SHA is still current."
+        with:
+          github-token: ${{ env.CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED == 'true' && secrets.TAP_PAT || (env.CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED != 'true' && github.token || '') }}
+          script: |
+            if (process.env.CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED === 'true' &&
+                !String(process.env.TAP_PAT || '').trim()) {
+              core.setFailed(
+                'Delegated PR-Agent execution requires TAP_PAT; refusing to fall back to github.token.'
+              );
+              return;
+            }
+            const prNumber = Number(process.env.PR_NUMBER);
+            const admittedSha = String(process.env.ADMITTED_SHA || '').trim().toLowerCase();
+            const ciRunId = String(process.env.CI_RUN_ID || '').trim();
+            const ciWorkflowName = String(process.env.CI_WORKFLOW_NAME || 'CI').trim();
+            const delegated =
+              process.env.CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED === 'true';
+            // Same canonical exact-HEAD proof as admission (issue #368): the
+            // immutable run delivered by admission is re-fetched by id, and a
+            // filtered listing is only a cross-check. A listing that returns
+            // zero/stale rows can no longer erase a verified green run, while
+            // a newer red or pending run still blocks the HEAD.
+            function ciRunCreatedAt(run) {
+              const parsed = Date.parse(String((run && run.created_at) || ''));
+              return Number.isFinite(parsed) ? parsed : 0;
+            }
+            function ciRunUpdatedAt(run) {
+              const parsed = Date.parse(String((run && run.updated_at) || ''));
+              return Number.isFinite(parsed) ? parsed : 0;
+            }
+            function ciRunMatchesExactHead(run, workflowName, head) {
+              return Boolean(
+                run &&
+                String(run.name || '') === String(workflowName || '') &&
+                String(run.head_sha || '').trim().toLowerCase() ===
+                  String(head || '').trim().toLowerCase() &&
+                String(run.event || 'pull_request') === 'pull_request'
+              );
+            }
+            function ciRunProofState(run, delegatedTarget) {
+              if (!run) return 'unavailable';
+              if (String(run.status || '') !== 'completed') return 'pending';
+              const conclusion = String(run.conclusion || '');
+              if (conclusion === 'success') return 'green';
+              if (delegatedTarget && conclusion === 'skipped') return 'green';
+              return 'red';
+            }
+            function decideExactHeadCi({ proofRun = null, runs = [], workflowName, headSha: head, delegated: delegatedTarget = false }) {
+              // Deduplicate by immutable run id while keeping the freshest
+              // observed state of that run: the proof run fetched by id and
+              // the filtered listing may describe the same run at different
+              // moments (pending -> completed), so the newer snapshot wins.
+              const byKey = new Map();
+              for (const run of [proofRun, ...(runs || [])]) {
+                if (!ciRunMatchesExactHead(run, workflowName, head)) continue;
+                const key = run.id !== undefined && run.id !== null
+                  ? 'id:' + String(run.id)
+                  : [
+                      String(run.name || ''),
+                      String(run.head_sha || '').toLowerCase(),
+                      String(run.created_at || ''),
+                      String(run.status || ''),
+                      String(run.conclusion || ''),
+                    ].join('|');
+                const previous = byKey.get(key);
+                if (!previous) {
+                  byKey.set(key, run);
+                  continue;
+                }
+                const previousUpdated = ciRunUpdatedAt(previous);
+                const currentUpdated = ciRunUpdatedAt(run);
+                if (
+                  currentUpdated > previousUpdated ||
+                  (
+                    currentUpdated === previousUpdated &&
+                    previous.status !== 'completed' &&
+                    run.status === 'completed'
+                  )
+                ) {
+                  byKey.set(key, run);
+                }
+              }
+              const candidates = [...byKey.values()];
+              const newest = candidates.sort((a, b) => {
+                const at = ciRunCreatedAt(a);
+                const bt = ciRunCreatedAt(b);
+                if (bt !== at) return bt - at;
+                return Number(b.id || 0) - Number(a.id || 0);
+              })[0] || null;
+              if (!newest) {
+                return {
+                  state: 'unavailable',
+                  run: null,
+                  runId: null,
+                  reason: 'no exact-HEAD pull_request CI run is visible',
+                };
+              }
+              return {
+                state: ciRunProofState(newest, delegatedTarget),
+                run: newest,
+                runId: Number(newest.id) || null,
+                reason: 'newest exact-HEAD pull_request CI run decides',
+              };
+            }
+            async function readProofRun() {
+              if (!/^[0-9]+$/.test(ciRunId)) return null;
+              try {
+                const { data } = await github.rest.actions.getWorkflowRun({
+                  owner: process.env.CONTINUUM_PR_AGENT_TARGET_OWNER,
+                  repo: process.env.CONTINUUM_PR_AGENT_TARGET_REPO,
+                  run_id: Number(ciRunId),
+                });
+                return data;
+              } catch (err) {
+                core.info(
+                  `Could not re-read admitted CI run ${ciRunId}; falling back to the exact-HEAD listing: ${err.message}`
+                );
+                return null;
+              }
+            }
+            async function readRuns() {
+              try {
+                const runs = [];
+                for (let page = 1; page <= 2; page += 1) {
+                  const { data } = await github.rest.actions.listWorkflowRunsForRepo({
+                    owner: process.env.CONTINUUM_PR_AGENT_TARGET_OWNER,
+                    repo: process.env.CONTINUUM_PR_AGENT_TARGET_REPO,
+                    event: 'pull_request',
+                    head_sha: admittedSha,
+                    per_page: 100,
+                    page,
+                  });
+                  const batch = data.workflow_runs || [];
+                  if (batch.length === 0) break;
+                  runs.push(...batch);
+                  if (batch.length < 100) break;
+                }
+                return runs;
+              } catch (err) {
+                core.info(
+                  `Could not re-read the exact-HEAD CI listing; relying on the verified run id if available: ${err.message}`
+                );
+                return null;
+              }
+            }
+            let pr;
+            try {
+              const response = await github.rest.pulls.get({
+                owner: process.env.CONTINUUM_PR_AGENT_TARGET_OWNER,
+                repo: process.env.CONTINUUM_PR_AGENT_TARGET_REPO,
+                pull_number: prNumber,
+              });
+              pr = response.data;
+            } catch (err) {
+              core.setOutput('transient', 'true');
+              core.setFailed(
+                `Could not revalidate PR #${prNumber} before review; will re-evaluate from latest state: ${err.message}`
+              );
+              return;
+            }
+            const currentSha = String((pr && pr.head && pr.head.sha) || '').trim().toLowerCase();
+            if (currentSha !== admittedSha) {
+              core.setOutput('result', 'moved');
+              core.setFailed(
+                `PR head moved after CI admission (${admittedSha} -> ${currentSha}); refusing to review an unqualified HEAD.`
+              );
+              return;
+            }
+            let proofRun = await readProofRun();
+            let decision = decideExactHeadCi({
+              proofRun,
+              runs: await readRuns(),
+              workflowName: ciWorkflowName,
+              headSha: admittedSha,
+              delegated,
+            });
+            // Pending or unreadable CI is not a deterministic red verdict.
+            // Re-evaluate from latest state with a short bounded backoff before
+            // handing the operation to the shared recovery controller.
+            for (let attempt = 1; attempt <= 2 && ['pending', 'unavailable'].includes(decision.state); attempt += 1) {
+              await new Promise(resolve => setTimeout(resolve, attempt * 5000));
+              proofRun = await readProofRun();
+              decision = decideExactHeadCi({
+                proofRun,
+                runs: await readRuns(),
+                workflowName: ciWorkflowName,
+                headSha: admittedSha,
+                delegated,
+              });
+            }
+            core.setOutput('result', decision.state);
+            if (decision.state === 'green') {
+              core.setOutput('sha', admittedSha);
+              if (decision.runId) {
+                core.setOutput('ci_run_id', String(decision.runId));
+              }
+              core.notice(
+                `Exact CI-qualified HEAD ${admittedSha} is still current (run ${decision.runId || '<unknown>'}).`
+              );
+              return;
+            }
+            if (decision.state === 'red') {
+              core.setFailed(
+                `CI for admitted HEAD ${admittedSha} is not completed:success; the newest exact-HEAD run is red.`
+              );
+              return;
+            }
+            core.setOutput('transient', 'true');
+            core.setFailed(
+              decision.state === 'pending'
+                ? `CI for admitted HEAD ${admittedSha} is still running; will re-evaluate from latest state.`
+                : `CI evidence for admitted HEAD ${admittedSha} is temporarily unavailable; will re-evaluate from latest state.`
+            );
 
       # CodeRabbit-style follow-up: after a workflow-owned repair commit,
       # verify the ORIGINAL findings instead of restarting discovery over the
@@ -2619,7 +2879,7 @@ jobs:
         env:
           HEAD_SHA: ${{ steps.admit.outputs.head_sha }}
           PR_NUMBER: ${{ steps.stack.outputs.pr_number }}
-          RETRYABLE_FAILURE: ${{ (steps.model_route.outcome == 'failure' || steps.install_pragent.outcome == 'failure' || steps.install_opencode.outcome == 'failure' || steps.start_opencode.outcome == 'failure' || steps.runtime.outcome == 'failure' || steps.start_bridge.outcome == 'failure' || steps.pragent.outcome == 'failure' || steps.result.outcome == 'failure' || steps.persistent.outcome == 'failure' || steps.improve_gate.outcome == 'failure' || steps.improve.outcome == 'failure' || steps.improve_skipped.outcome == 'failure' || steps.post_improve.outcome == 'failure' || steps.improve_output.outcome == 'failure') && steps.result.outputs.stale_head != 'true' && steps.persistent.outputs.stale_head != 'true' && steps.improve_gate.outputs.stale_head != 'true' && steps.improve.outputs.stale_head != 'true' && steps.improve_skipped.outputs.stale_head != 'true' && steps.post_improve.outputs.stale_head != 'true' && 'true' || 'false' }}
+          RETRYABLE_FAILURE: ${{ (steps.model_route.outcome == 'failure' || steps.install_pragent.outcome == 'failure' || steps.install_opencode.outcome == 'failure' || steps.start_opencode.outcome == 'failure' || steps.runtime.outcome == 'failure' || steps.start_bridge.outcome == 'failure' || steps.pragent.outcome == 'failure' || steps.before.outputs.transient == 'true' || steps.result.outcome == 'failure' || steps.persistent.outcome == 'failure' || steps.improve_gate.outcome == 'failure' || steps.improve.outcome == 'failure' || steps.improve_skipped.outcome == 'failure' || steps.post_improve.outcome == 'failure' || steps.improve_output.outcome == 'failure') && steps.result.outputs.stale_head != 'true' && steps.persistent.outputs.stale_head != 'true' && steps.improve_gate.outputs.stale_head != 'true' && steps.improve.outputs.stale_head != 'true' && steps.improve_skipped.outputs.stale_head != 'true' && steps.post_improve.outputs.stale_head != 'true' && 'true' || 'false' }}
         with:
           github-token: ${{ env.CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED == 'true' && secrets.TAP_PAT || (env.CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED != 'true' && github.token || '') }}
           script: |
@@ -2731,6 +2991,7 @@ jobs:
            steps.runtime.outcome == 'failure' ||
            steps.start_bridge.outcome == 'failure' ||
            steps.pragent.outcome == 'failure' ||
+           steps.before.outputs.transient == 'true' ||
            steps.result.outcome == 'failure' ||
            steps.persistent.outcome == 'failure' ||
            steps.improve_gate.outcome == 'failure' ||
@@ -2868,6 +3129,7 @@ jobs:
            steps.runtime.outcome == 'failure' ||
            steps.start_bridge.outcome == 'failure' ||
            steps.pragent.outcome == 'failure' ||
+           steps.before.outputs.transient == 'true' ||
            steps.result.outcome == 'failure' ||
            steps.persistent.outcome == 'failure' ||
            steps.improve_gate.outcome == 'failure' ||
@@ -2891,6 +3153,7 @@ jobs:
           TAP_PAT: ${{ secrets.TAP_PAT }}
           PR_NUMBER: ${{ steps.stack.outputs.pr_number }}
           HEAD_SHA: ${{ steps.admit.outputs.head_sha }}
+          ADMITTED_CI_RUN_ID: ${{ steps.admit.outputs.ci_run_id }}
           RETRY_ATTEMPT: ${{ steps.stack.outputs.retry_attempt }}
           RETRY_WORKFLOW: ${{ steps.stack.outputs.retry_workflow }}
           CURRENT_RECOVERY_KIND: ${{ steps.stack.outputs.recovery_kind }}
@@ -2952,36 +3215,97 @@ jobs:
             echo "PR state changed during retry backoff; stale retry cancelled."
             exit 0
           fi
+          # Same canonical exact-HEAD proof as admission (issue #368): the
+          # immutable run id delivered by admission is the primary evidence
+          # and the filtered listing is a cross-check. A listing that
+          # momentarily returns zero/stale rows must not erase a verified
+          # green run, while a newer red or pending run still blocks.
+          PROOF_JSON="$RUNNER_TEMP/pr-agent-ci-proof-run.json"
           CI_JSON="$RUNNER_TEMP/pr-agent-ci-runs.json"
-          if ! gh api "repos/$CONTINUUM_PR_AGENT_TARGET_REPOSITORY/actions/runs?event=pull_request&head_sha=$HEAD_SHA&per_page=100" > "$CI_JSON"; then
-            echo "Could not revalidate exact-HEAD CI after backoff; stale retry cancelled."
-            exit 0
+          rm -f "$PROOF_JSON" "$CI_JSON"
+          if [[ "${ADMITTED_CI_RUN_ID:-}" =~ ^[0-9]+$ ]]; then
+            if ! gh api "repos/$CONTINUUM_PR_AGENT_TARGET_REPOSITORY/actions/runs/$ADMITTED_CI_RUN_ID" > "$PROOF_JSON" 2>/dev/null; then
+              rm -f "$PROOF_JSON"
+            fi
           fi
-          if ! python3 - "$CI_JSON" "$CI_WORKFLOW_NAME" "$HEAD_SHA" "${CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED:-false}" <<'PY'
-          import json, sys
-          path, workflow, head, delegated = sys.argv[1:5]
-          with open(path, "r", encoding="utf-8") as handle:
-              runs = json.load(handle).get("workflow_runs", [])
-          current = sorted(
-              (run for run in runs if run.get("name") == workflow and run.get("head_sha") == head),
-              key=lambda run: run.get("created_at") or "",
-              reverse=True,
-          )
-          conclusion = current[0].get("conclusion") if current else None
-          accepted = (
-              current
-              and current[0].get("status") == "completed"
-              and (
-                  conclusion == "success"
-                  or (delegated == "true" and conclusion == "skipped")
+          if ! gh api "repos/$CONTINUUM_PR_AGENT_TARGET_REPOSITORY/actions/runs?event=pull_request&head_sha=$HEAD_SHA&per_page=100" > "$CI_JSON" 2>/dev/null; then
+            rm -f "$CI_JSON"
+          fi
+          CI_STATE="$(python3 - "$PROOF_JSON" "$CI_JSON" "$CI_WORKFLOW_NAME" "$HEAD_SHA" "${CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED:-false}" <<'PY'
+          import json, os, sys
+          proof_path, list_path, workflow, head, delegated = sys.argv[1:6]
+          def load(path):
+              if not path or not os.path.exists(path):
+                  return None
+              try:
+                  with open(path, "r", encoding="utf-8") as handle:
+                      return json.load(handle)
+              except (OSError, ValueError):
+                  return None
+          proof = load(proof_path)
+          listing = load(list_path)
+          def matches(run):
+              return (
+                  isinstance(run, dict)
+                  and run.get("name") == workflow
+                  and str(run.get("head_sha") or "").lower() == head.lower()
+                  and str(run.get("event") or "pull_request") == "pull_request"
               )
-          )
-          raise SystemExit(0 if accepted else 1)
+          candidates = []
+          seen = set()
+          rows = []
+          if isinstance(proof, dict):
+              rows.append(proof)
+          if isinstance(listing, dict):
+              rows.extend(listing.get("workflow_runs") or [])
+          for run in rows:
+              if not matches(run):
+                  continue
+              key = str(run.get("id")) if run.get("id") is not None else (
+                  str(run.get("created_at") or ""), str(run.get("status") or ""),
+                  str(run.get("conclusion") or ""),
+              )
+              if key in seen:
+                  continue
+              seen.add(key)
+              candidates.append(run)
+          if not candidates:
+              print("unavailable")
+              raise SystemExit(0)
+          newest = sorted(
+              candidates,
+              key=lambda run: (
+                  str(run.get("created_at") or ""),
+                  int(run.get("id") or 0),
+                  str(run.get("updated_at") or ""),
+              ),
+              reverse=True,
+          )[0]
+          if newest.get("status") != "completed":
+              print("pending")
+          elif newest.get("conclusion") == "success":
+              print("green")
+          elif delegated == "true" and newest.get("conclusion") == "skipped":
+              print("green")
+          else:
+              print("red")
           PY
-          then
-            echo "Exact HEAD no longer has green CI; retry cancelled until a fresh CI event."
-            exit 0
-          fi
+          )"
+          case "$CI_STATE" in
+            green) ;;
+            red)
+              echo "Exact HEAD has a red CI run; retry cancelled."
+              exit 0
+              ;;
+            pending)
+              echo "Exact HEAD CI is still running; retry cancelled until a fresh CI event."
+              exit 0
+              ;;
+            *)
+              echo "Exact HEAD CI evidence is temporarily unavailable; retry cancelled until a fresh CI event."
+              exit 0
+              ;;
+          esac
 
           DEFAULT_BRANCH="$(gh repo view "$GITHUB_REPOSITORY" --json defaultBranchRef --jq .defaultBranchRef.name 2>/dev/null || echo main)"
           DEFAULT_BRANCH="$(printf '%s' "${DEFAULT_BRANCH:-main}" | tr -d ' \t\r\n')"
@@ -3052,6 +3376,7 @@ jobs:
       review_provider: ${{ needs.pr_agent.outputs.review_provider }}
       pr_number: ${{ needs.pr_agent.outputs.pr_number }}
       head_sha: ${{ needs.pr_agent.outputs.head_sha }}
+      ci_run_id: ${{ needs.pr_agent.outputs.ci_run_id }}
       gate_verified: ${{ needs.pr_agent.outputs.merge_gate_verified }}
       target_child_id: ${{ inputs.target_child_id }}
       post_merge_wakeups: ${{ vars.CONTINUUM_POST_MERGE_WAKEUPS || 'continuum-issue-scheduler.yml' }}

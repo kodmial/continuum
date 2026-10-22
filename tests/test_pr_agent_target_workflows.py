@@ -213,7 +213,9 @@ class PrAgentTargetWorkflowContractTests(unittest.TestCase):
         # Exact-HEAD: CI evidence and dispatch identity are per exact HEAD;
         # only same-repository PRs against the resolved target are considered.
         self.assertIn("head_sha: head", body)
-        self.assertIn("run.head_sha === head", body)
+        self.assertIn("const decision = decideExactHeadCi({", body)
+        self.assertIn("headSha: head", body)
+        self.assertIn("decision.state === 'green'", body)
         self.assertIn("pr.head.repo.full_name !== repoFullName", body)
         # Privacy: only the opaque child id is ever an input; concrete
         # repository identity stays runner-local via env.
@@ -578,11 +580,10 @@ class PrAgentTargetWorkflowContractTests(unittest.TestCase):
         recovery = read(".github/workflows/continuum-pr-agent-recovery.yml")
         merge = read(".github/workflows/continuum-pr-agent-auto-merge.yml")
         self.assertIn("delegatedSkippedCi", review)
-        self.assertIn("conclusion == \"skipped\"", review)
-        self.assertIn("const ciRunAccepted = (run)", recovery)
-        self.assertIn("delegatedTarget && run.conclusion === 'skipped'", recovery)
-        self.assertIn("delegatedSkippedCi", merge)
-        self.assertIn("ci.conclusion === 'skipped'", merge)
+        self.assertIn("conclusion === 'skipped'", review)
+        self.assertIn("delegated && newest.conclusion === 'skipped'", recovery)
+        self.assertIn("delegated", merge)
+        self.assertIn("conclusion === 'skipped'", merge)
 
     def test_delegated_target_bootstrap_fetches_config_runtime_dependencies(self):
         for path in self.reusable:
@@ -630,6 +631,166 @@ class PrAgentTargetWorkflowContractTests(unittest.TestCase):
         self.assertIn("target_child_id:", body)
         self.assertIn("target_child_id: \"${{ inputs.target_child_id }}\"", body)
         self.assertNotIn("target_repository", body)
+
+
+class ExactHeadCiProofRegressionTests(unittest.TestCase):
+    """Issue #368: one exact-HEAD CI proof across review, merge and recovery."""
+
+    @staticmethod
+    def _extract(source: str, name: str, start: int = 0) -> str:
+        import re
+
+        match = re.search(
+            r"(?:async\s+)?function\s+" + re.escape(name) + r"\s*\(",
+            source[start:],
+        )
+        if match is None:
+            raise AssertionError(f"JS function {name} not found")
+        offset = start + match.start()
+        # Skip the parameter list (which may contain destructuring braces)
+        # and start counting at the function body brace.
+        opening = source.index(") {", start + match.end()) + 2
+        depth = 0
+        for index in range(opening, len(source)):
+            char = source[index]
+            if char == "{":
+                depth += 1
+            elif char == "}":
+                depth -= 1
+                if depth == 0:
+                    return source[offset : index + 1]
+        raise AssertionError(f"JS function {name} is unterminated")
+
+    def test_canonical_decision_rejects_the_incident_paradox_for_every_consumer(self):
+        import json
+        import re
+        import shutil
+        import subprocess
+        import tempfile
+
+        review = read(".github/workflows/continuum-pr-agent.yml")
+        merge = read(".github/workflows/continuum-pr-agent-auto-merge.yml")
+        recovery = read(".github/workflows/continuum-pr-agent-recovery.yml")
+
+        review_starts = [
+            match.start()
+            for match in re.finditer(r"function decideExactHeadCi\b", review)
+        ]
+        self.assertGreaterEqual(len(review_starts), 2)
+        decisions = [
+            self._extract(review, "decideExactHeadCi", start)
+            for start in review_starts
+        ]
+        decisions.append(self._extract(merge, "decideExactHeadCi"))
+        decisions.append(self._extract(recovery, "decideExactHeadCi"))
+
+        helpers = "\n".join(
+            self._extract(review, name)
+            for name in (
+                "ciRunCreatedAt",
+                "ciRunUpdatedAt",
+                "ciRunMatchesExactHead",
+                "ciRunProofState",
+            )
+        )
+        renamed = []
+        for index, source in enumerate(decisions):
+            renamed.append(re.sub(r"\bdecideExactHeadCi\b", f"decideExactHeadCi{index}", source))
+
+        scenario_source = """
+const HEAD = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
+const OTHER = 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb';
+function run(over = {}) {
+  return Object.assign({
+    id: 101,
+    name: 'CI',
+    head_sha: HEAD,
+    event: 'pull_request',
+    status: 'completed',
+    conclusion: 'success',
+    created_at: '2026-10-22T10:00:00Z',
+  }, over);
+}
+const scenarios = [
+  ['proof-green-empty-listing', { proofRun: run(), runs: [], workflowName: 'CI', headSha: HEAD }, 'green', 101],
+  ['proof-green-stale-older-red', { proofRun: run(), runs: [run({ id: 99, conclusion: 'failure', created_at: '2026-10-22T09:00:00Z' })], workflowName: 'CI', headSha: HEAD }, 'green', 101],
+  ['newer-red-blocks', { proofRun: run(), runs: [run({ id: 102, conclusion: 'failure', created_at: '2026-10-22T11:00:00Z' })], workflowName: 'CI', headSha: HEAD }, 'red', 102],
+  ['newer-pending-blocks', { proofRun: run(), runs: [run({ id: 102, status: 'in_progress', conclusion: null, created_at: '2026-10-22T11:00:00Z' })], workflowName: 'CI', headSha: HEAD }, 'pending', 102],
+  ['empty-all-is-unavailable', { proofRun: null, runs: [], workflowName: 'CI', headSha: HEAD }, 'unavailable', null],
+  ['wrong-workflow-is-not-proof', { proofRun: run({ name: 'Other' }), runs: [], workflowName: 'CI', headSha: HEAD }, 'unavailable', null],
+  ['moved-head-is-not-proof', { proofRun: run({ head_sha: OTHER }), runs: [], workflowName: 'CI', headSha: HEAD }, 'unavailable', null],
+  ['non-pr-event-is-not-proof', { proofRun: run({ event: 'push' }), runs: [], workflowName: 'CI', headSha: HEAD }, 'unavailable', null],
+  ['listing-only-green', { proofRun: null, runs: [run()], workflowName: 'CI', headSha: HEAD }, 'green', 101],
+  ['same-run-completed-state-wins', { proofRun: run({ status: 'in_progress', conclusion: null, updated_at: '2026-10-22T10:01:00Z' }), runs: [run({ updated_at: '2026-10-22T10:05:00Z' })], workflowName: 'CI', headSha: HEAD }, 'green', 101],
+  ['listing-only-red', { proofRun: null, runs: [run({ conclusion: 'failure' })], workflowName: 'CI', headSha: HEAD }, 'red', 101],
+  ['delegated-skipped-accepted', { proofRun: run({ conclusion: 'skipped' }), runs: [], workflowName: 'CI', headSha: HEAD, delegated: true }, 'green', 101],
+  ['skipped-not-accepted-locally', { proofRun: run({ conclusion: 'skipped' }), runs: [], workflowName: 'CI', headSha: HEAD, delegated: false }, 'red', 101],
+  ['older-green-does-not-bypass-newer-red', { proofRun: null, runs: [run({ id: 99, created_at: '2026-10-22T09:00:00Z' }), run({ id: 102, conclusion: 'failure', created_at: '2026-10-22T11:00:00Z' })], workflowName: 'CI', headSha: HEAD }, 'red', 102],
+];
+for (let fnIndex = 0; fnIndex < DECISION_COUNT; fnIndex += 1) {
+  for (const [name, payload, expectedState, expectedRunId] of scenarios) {
+    const decision = decisionFns[fnIndex](payload);
+    assert.strictEqual(decision.state, expectedState, name + ' state');
+    assert.strictEqual(decision.runId, expectedRunId, name + ' run id');
+  }
+}
+console.log('CI_PROOF_OK');
+"""
+        harness = (
+            "const assert = require('assert');\n"
+            + helpers
+            + "\n"
+            + "\n".join(renamed)
+            + "\nconst decisionFns = ["
+            + ", ".join(f"decideExactHeadCi{i}" for i in range(len(renamed)))
+            + "];\nconst DECISION_COUNT = "
+            + str(len(renamed))
+            + ";\n"
+            + scenario_source
+        )
+        node = shutil.which("node")
+        self.assertIsNotNone(node, "node is required to execute the shipped CI proof")
+        temp_dir = ROOT / ".opencode-tmp"
+        temp_dir.mkdir(exist_ok=True)
+        with tempfile.NamedTemporaryFile(
+            "w", suffix=".js", dir=str(temp_dir), delete=False
+        ) as handle:
+            handle.write(harness)
+            script = handle.name
+        try:
+            completed = subprocess.run(
+                [node, script], capture_output=True, text=True, timeout=30
+            )
+        finally:
+            import os
+
+            os.unlink(script)
+        self.assertEqual(completed.returncode, 0, completed.stderr or completed.stdout)
+        self.assertIn("CI_PROOF_OK", completed.stdout)
+
+    def test_run_id_is_carried_from_admission_to_merge_and_recovery(self):
+        review = read(".github/workflows/continuum-pr-agent.yml")
+        merge = read(".github/workflows/continuum-pr-agent-auto-merge.yml")
+        recovery = read(".github/workflows/continuum-pr-agent-recovery.yml")
+        stub = read(".github/caller-stubs/continuum-pr-agent-auto-merge.yml")
+
+        self.assertIn("core.setOutput('ci_run_id'", review)
+        self.assertIn("ci_run_id: ${{ steps.admit.outputs.ci_run_id }}", review)
+        self.assertIn("CI_RUN_ID: ${{ steps.admit.outputs.ci_run_id }}", review)
+        self.assertIn("ADMITTED_CI_RUN_ID: ${{ steps.admit.outputs.ci_run_id }}", review)
+        self.assertIn("ci_run_id: ${{ needs.pr_agent.outputs.ci_run_id }}", review)
+        self.assertIn("github.rest.actions.getWorkflowRun", review)
+
+        self.assertIn("ci_run_id:", merge)
+        self.assertIn("CI_RUN_ID: ${{ inputs.ci_run_id }}", merge)
+        self.assertIn("github.rest.actions.getWorkflowRun", merge)
+        self.assertIn("resolveExactHeadCi", merge)
+
+        self.assertIn("function decideExactHeadCi", recovery)
+        self.assertIn("decideExactHeadCi({", recovery)
+
+        self.assertIn("ci_run_id:", stub)
+        self.assertIn('ci_run_id: "${{ inputs.ci_run_id }}"', stub)
 
 
 if __name__ == "__main__":

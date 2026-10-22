@@ -1093,8 +1093,14 @@ console.log('sandbox construction OK');
             review,
             "pre-review revalidation must not fall back to combined commit status",
         )
+        self.assertIn("CI_RUN_ID", review)
         self.assertIn(
-            'actions/runs?event=pull_request&head_sha=$ADMITTED_SHA',
+            "github.rest.actions.getWorkflowRun",
+            review,
+            "pre-review revalidation must re-fetch the immutable admitted CI run",
+        )
+        self.assertIn(
+            "actions/runs?event=pull_request&head_sha=$HEAD_SHA",
             review,
         )
 
