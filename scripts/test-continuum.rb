@@ -1886,7 +1886,7 @@ class ContinuumTest < Minitest::Test
     refute_includes pr_agent, 'REVIEW_JSON: ${{ steps.pragent.outputs.review }}'
     # The runtime loads the canonical fallback helper from Continuum itself,
     # so old PR heads cannot keep the broken inline implementation alive.
-    assert_includes pr_agent, 'contents/src/continuum/pr_agent_fallback_state.py'
+    assert_includes pr_agent, 'copy_runtime_file "src/continuum/pr_agent_fallback_state.py"'
     assert_includes pr_agent, 'fallback_pythonpath'
     assert_includes pr_agent, 'derive_fallback_state'
     assert_includes pr_agent, 'FallbackStateError'
@@ -2071,9 +2071,22 @@ class ContinuumTest < Minitest::Test
     [runtime, retry_step, review_tool, improve_tool, in_flight, normalize, publish].each { |step| refute_nil step }
     refute_includes body, 'Run upstream full review and full improve on the exact HEAD',
                       'issue #231 splits review and conditional improve; the combined step must stay removed'
-    assert_includes runtime, 'GH_TOKEN: ${{ github.token }}',
-                    'public Continuum runtime-bundle fetch must not consume shared PAT quota'
-    assert_includes runtime, 'repos/kodmial/continuum/contents'
+    # The public runtime bundle travels over one shallow Git checkout of the
+    # pinned Continuum source, never the REST contents API and never a shared
+    # credential. The requested ref is honored exactly; there is no fallback.
+    assert_includes runtime, 'https://github.com/kodmial/continuum.git'
+    assert_includes runtime, 'fetch --quiet --depth=1 --no-tags origin "$CONTINUUM_REF"'
+    assert_includes runtime, 'checkout --quiet --detach FETCH_HEAD'
+    assert_includes runtime, 'GIT_TERMINAL_PROMPT=0'
+    assert_includes runtime, 'credential.helper='
+    refute_includes runtime, 'gh api',
+                    'the runtime bundle must not use REST source GETs'
+    refute_includes runtime, 'repos/kodmial/continuum/contents',
+                    'the runtime bundle must not use REST contents GETs'
+    refute_includes runtime, 'secrets.TAP_PAT',
+                    'public Continuum runtime loading must not consume the shared PAT'
+    refute_includes runtime, 'github.token',
+                    'public Continuum runtime loading must not consume a GitHub token'
     # Target-aware (#243) retry revalidation reads the resolved target:
     # local same-repository reads use github.token while delegated
     # cross-repository reads require TAP_PAT with a fail-closed empty token
@@ -2354,7 +2367,8 @@ class ContinuumTest < Minitest::Test
                     'review workflow must not consume the shared user PAT unconditionally for tool execution'
     assert_includes body, 'GITHUB__USER_TOKEN: ${{ env.CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED',
                     'PR-Agent tool execution must select its user token through the target-aware conditional'
-    assert_includes body, 'GH_TOKEN: ${{ github.token }}'
+    assert_includes body, "env.CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED != 'true' && github.token",
+                    'local same-repository reads must keep using github.token through the scoped conditional'
     assert_includes body, "CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED == 'true' && secrets.TAP_PAT",
                     'delegated target-aware reads must select TAP_PAT through the fail-closed conditional'
     workflow = yaml(File.join(ROOT, '.github/caller-stubs/continuum-pr-agent.yml'))

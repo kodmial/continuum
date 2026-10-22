@@ -717,47 +717,67 @@ jobs:
         if: steps.stack.outputs.enabled == 'true' && steps.admit.outputs.admitted == 'true'
         id: runtime
         env:
-          GH_TOKEN: ${{ github.token }}
           CONTINUUM_REF: ${{ inputs.continuum_ref }}
         run: |
           set -euo pipefail
-          continuum_b64_decode() {
-            if printf '' | base64 --decode >/dev/null 2>&1; then
-              base64 --decode
-            elif printf '' | base64 -d >/dev/null 2>&1; then
-              base64 -d
-            elif printf '' | base64 -D >/dev/null 2>&1; then
-              base64 -D
-            elif command -v python3 >/dev/null 2>&1; then
-              python3 -c 'import sys,base64; sys.stdout.buffer.write(base64.b64decode(sys.stdin.read()))'
-            else
-              openssl base64 -d
-            fi
-          }
+          if ! command -v git >/dev/null 2>&1; then
+            echo "::error::Git is required to resolve the Continuum-owned PR-Agent runtime bundle."
+            exit 1
+          fi
+          if [[ -z "${CONTINUUM_REF:-}" ]]; then
+            echo "::error::CONTINUUM_REF is required to resolve the Continuum-owned PR-Agent runtime bundle."
+            exit 1
+          fi
           RUNTIME_ROOT="$RUNNER_TEMP/continuum-pr-agent-runtime"
+          SOURCE_ROOT="$RUNNER_TEMP/continuum-pr-agent-source"
           BRIDGE_SCRIPT="$RUNTIME_ROOT/.github/scripts/pr_agent_bridge.py"
+          PR_AGENT_MODULE="$RUNTIME_ROOT/src/continuum/pr_agent.py"
           POLICY_SCRIPT="$RUNTIME_ROOT/.github/scripts/pr_agent_policy.js"
           FALLBACK_SCRIPT="$RUNTIME_ROOT/src/continuum/pr_agent_fallback_state.py"
+          rm -rf "$SOURCE_ROOT" "$RUNTIME_ROOT"
           mkdir -p "$RUNTIME_ROOT/.github/scripts" "$RUNTIME_ROOT/src/continuum"
-          gh api --method GET \
-            "repos/kodmial/continuum/contents/.github/scripts/pr_agent_bridge.py" \
-            -f ref="$CONTINUUM_REF" --jq .content \
-            | tr -d '\n' | continuum_b64_decode > "$BRIDGE_SCRIPT"
-          gh api --method GET \
-            "repos/kodmial/continuum/contents/src/continuum/pr_agent.py" \
-            -f ref="$CONTINUUM_REF" --jq .content \
-            | tr -d '\n' | continuum_b64_decode > "$RUNTIME_ROOT/src/continuum/pr_agent.py"
-          gh api --method GET \
-            "repos/kodmial/continuum/contents/.github/scripts/pr_agent_policy.js" \
-            -f ref="$CONTINUUM_REF" --jq .content \
-            | tr -d '\n' | continuum_b64_decode > "$POLICY_SCRIPT"
-          gh api --method GET \
-            "repos/kodmial/continuum/contents/src/continuum/pr_agent_fallback_state.py" \
-            -f ref="$CONTINUUM_REF" --jq .content \
-            | tr -d '\n' | continuum_b64_decode > "$FALLBACK_SCRIPT"
+          export GIT_TERMINAL_PROMPT=0
+          export GIT_ASKPASS=true
+          git init --quiet "$SOURCE_ROOT"
+          git -C "$SOURCE_ROOT" remote add origin "https://github.com/kodmial/continuum.git"
+          # The public runtime source travels over standard Git transport in
+          # an isolated directory, never through a REST contents read, the
+          # target PR worktree, or a shared credential. A missing or moving
+          # requested ref fails closed; it never falls back to main, a PR
+          # HEAD, or whatever revision the runner already has.
+          if ! git -C "$SOURCE_ROOT" -c credential.helper= \
+            fetch --quiet --depth=1 --no-tags origin "$CONTINUUM_REF"; then
+            echo "::error::Unable to fetch the pinned Continuum PR-Agent runtime ref '$CONTINUUM_REF'; refusing to review with an unverified runtime."
+            exit 1
+          fi
+          if ! git -C "$SOURCE_ROOT" checkout --quiet --detach FETCH_HEAD; then
+            echo "::error::Unable to check out the pinned Continuum PR-Agent runtime ref '$CONTINUUM_REF'."
+            exit 1
+          fi
+          RESOLVED_SHA="$(git -C "$SOURCE_ROOT" rev-parse HEAD)"
+          if [[ "$CONTINUUM_REF" =~ ^[0-9a-fA-F]{40}$ ]] && [[ "${RESOLVED_SHA,,}" != "${CONTINUUM_REF,,}" ]]; then
+            echo "::error::Continuum PR-Agent runtime checkout resolved to $RESOLVED_SHA instead of the pinned commit $CONTINUUM_REF."
+            exit 1
+          fi
+          copy_runtime_file() {
+            local path="$1" dest="$2"
+            if [[ ! -s "$SOURCE_ROOT/$path" ]]; then
+              echo "::error::Continuum PR-Agent runtime source '$CONTINUUM_REF' is missing required file: $path"
+              exit 1
+            fi
+            cp -- "$SOURCE_ROOT/$path" "$dest"
+            if [[ ! -s "$dest" ]]; then
+              echo "::error::Continuum PR-Agent runtime source '$CONTINUUM_REF' produced an empty required file: $path"
+              exit 1
+            fi
+          }
+          copy_runtime_file ".github/scripts/pr_agent_bridge.py" "$BRIDGE_SCRIPT"
+          copy_runtime_file "src/continuum/pr_agent.py" "$PR_AGENT_MODULE"
+          copy_runtime_file ".github/scripts/pr_agent_policy.js" "$POLICY_SCRIPT"
+          copy_runtime_file "src/continuum/pr_agent_fallback_state.py" "$FALLBACK_SCRIPT"
           : > "$RUNTIME_ROOT/src/continuum/__init__.py"
           PYTHONPATH="$RUNTIME_ROOT/src" python3 -m py_compile \
-            "$BRIDGE_SCRIPT" "$RUNTIME_ROOT/src/continuum/pr_agent.py" "$FALLBACK_SCRIPT"
+            "$BRIDGE_SCRIPT" "$PR_AGENT_MODULE" "$FALLBACK_SCRIPT"
           node --check "$POLICY_SCRIPT"
           # Policy-bundle sync: the gate/route/threshold steps below require
           # these exports with fail-closed semantics. Validate immediately so
