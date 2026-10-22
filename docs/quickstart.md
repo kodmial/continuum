@@ -65,9 +65,9 @@ export CONTINUUM_REF="$(git -C "$CONTINUUM_DIR" rev-parse HEAD)"
 
 curl -fsSL \
   "https://raw.githubusercontent.com/kodmial/continuum/${CONTINUUM_REF}/install.sh" \
-  -o continuum-install.sh
-less continuum-install.sh
-sha256sum continuum-install.sh
+  -o ../continuum-install.sh
+less ../continuum-install.sh
+sha256sum ../continuum-install.sh
 ```
 
 Pin the project-owned CI to the same revision. The installer rewrites the
@@ -114,14 +114,14 @@ explicitly:
 bash "$CONTINUUM_DIR/install.sh" . "$CONTINUUM_REF" core
 ```
 
-Use the downloaded `continuum-install.sh` instead if you are not working from a
-trusted local checkout.
+Use the downloaded `../continuum-install.sh` instead if you are not working from
+a trusted local checkout.
 
 ## 3. Install the core callers
 
 ```sh
-bash continuum-install.sh . "$CONTINUUM_REF" core
-rm continuum-install.sh
+bash ../continuum-install.sh . "$CONTINUUM_REF" core
+rm ../continuum-install.sh
 ls .github/workflows/continuum-*.yml
 ```
 
@@ -196,7 +196,10 @@ No paid provider key is required by core.
 In the repository settings, add a branch protection rule or ruleset for `main`:
 
 - require a pull request before merging;
-- require status checks, including the `CI` workflow;
+- require status checks by the exact names the runs publish. Validation comes
+  from the reusable workflow's `Validate` job (plus the `continuum/validation`
+  commit-status context); no check run is literally named `CI`. Copy the real
+  names from the first pull-request run before saving the rule;
 - require branches to be up to date before merging;
 - block force pushes and deletion;
 - do not grant routine bypass permissions.
@@ -265,8 +268,8 @@ gh label create automation:ready \
 
 ISSUE="$(gh issue create \
   --repo "$TEST_REPO" \
-  --title "Quick Start: add a friendly greeting" \
-  --body "Add a small, tested greeting helper in app.py. Keep the change minimal and keep the existing tests passing." \
+  --title "Quick Start: add a friendly farewell" \
+  --body "Add a small, tested farewell helper in app.py, for example farewell(name) returning 'Goodbye, <name>!'. Keep the change minimal and keep the existing tests passing." \
   | awk '{print $NF}')"
 echo "$ISSUE"
 
@@ -309,6 +312,10 @@ For a disposable test repository:
 ```sh
 gh repo delete "$TEST_REPO" --yes
 ```
+
+This command needs the `delete_repo` scope, which the default `gh` OAuth token
+does not carry; run `gh auth refresh -h github.com -s delete_repo` first, or
+delete the repository from the GitHub web UI instead.
 
 At minimum, close any remaining issue and delete leftover `opencode/*` branches.
 Do not point this Quick Start at an existing consumer repository.
