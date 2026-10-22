@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Contribution and support guide
+    url: https://github.com/kodmial/continuum/blob/main/CONTRIBUTING.md#issues-and-support
+    about: Choose the right path for a question, bug, feature request, or contribution.
+  - name: Report a security vulnerability
+    url: https://github.com/kodmial/continuum/blob/main/SECURITY.md
+    about: Do not disclose vulnerabilities, exploit details, or secrets in a public issue.
