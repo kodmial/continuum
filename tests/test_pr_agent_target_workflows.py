@@ -34,20 +34,69 @@ def bootstrap_sources(workflow: str) -> dict:
     return sources
 
 
-def continuum_imports(path: str) -> set:
-    imported = set()
-    for node in ast.walk(ast.parse(read(path))):
-        if isinstance(node, ast.ImportFrom) and node.module:
-            modules = [node.module]
-        elif isinstance(node, ast.Import):
-            modules = [alias.name for alias in node.names]
-        else:
-            continue
-        for module in modules:
-            if module == "continuum" or module.startswith("continuum."):
-                imported.add(
-                    str(Path("src", *module.split(".")).with_suffix(".py"))
+def continuum_imports(path: str, root: Path = ROOT) -> set:
+    def package_parts(source: str) -> tuple:
+        try:
+            relative = Path(source).relative_to("src")
+        except ValueError:
+            return ()
+        parts = list(relative.with_suffix("").parts)
+        if parts:
+            parts.pop()
+        return tuple(parts)
+
+    def module_path(module: str):
+        base = Path("src", *module.split("."))
+        if (root / base / "__init__.py").is_file():
+            return str(base / "__init__.py")
+        candidate = base.with_suffix(".py")
+        if (root / candidate).is_file():
+            return str(candidate)
+        return None
+
+    def node_modules(node, source: str) -> list:
+        if isinstance(node, ast.ImportFrom):
+            if node.level:
+                package = package_parts(source)
+                keep = len(package) - (node.level - 1)
+                if keep < 0:
+                    return []
+                base = list(package[:keep])
+                if node.module:
+                    base.extend(node.module.split("."))
+                    return [".".join(base)]
+                return [
+                    ".".join(base + [alias.name]) for alias in node.names
+                ]
+            modules = [node.module] if node.module else []
+            if node.module == "continuum":
+                modules.extend(
+                    "continuum." + alias.name for alias in node.names
                 )
+            return modules
+        if isinstance(node, ast.Import):
+            return [alias.name for alias in node.names]
+        return []
+
+    imported = set()
+    pending = [path]
+    visited = set()
+    # Resolve the full transitive closure, including lazy imports nested in
+    # function bodies: each fetched module is parsed just like the entry file.
+    while pending:
+        current = pending.pop()
+        if current in visited:
+            continue
+        visited.add(current)
+        source = (root / current).read_text(encoding="utf-8")
+        for node in ast.walk(ast.parse(source)):
+            for module in node_modules(node, current):
+                if module == "continuum" or module.startswith("continuum."):
+                    resolved = module_path(module)
+                    if resolved is None or resolved in imported:
+                        continue
+                    imported.add(resolved)
+                    pending.append(resolved)
     return imported
 
 
@@ -64,7 +113,8 @@ class PrAgentTargetWorkflowContractTests(unittest.TestCase):
 
     def test_delegated_bootstrap_runtime_supplies_python_dependency_closure(self):
         # delegation_runtime.py imports continuum.api_budget and
-        # continuum.delegation_discovery at module load time. Each delegated
+        # continuum.delegation_discovery at module load time, and those
+        # modules have their own transitive runtime imports. Each delegated
         # bootstrap downloads a hand-picked file set into an ephemeral
         # RUNTIME_ROOT, so an omitted module fails before any CLI command runs
         # (the reported generic exit 2). The environment below is exactly that
@@ -72,6 +122,9 @@ class PrAgentTargetWorkflowContractTests(unittest.TestCase):
         imported = continuum_imports(".github/scripts/delegation_runtime.py")
         self.assertIn("src/continuum/api_budget.py", imported)
         self.assertIn("src/continuum/delegation_discovery.py", imported)
+        # config.py imports yamlmini, so a direct-import-only closure would
+        # miss a dependency the ephemeral runtime actually needs.
+        self.assertIn("src/continuum/yamlmini.py", imported)
         TMP_PARENT.mkdir(exist_ok=True)
         for path in BOOTSTRAP_WORKFLOWS:
             with self.subTest(path=path):
@@ -108,6 +161,32 @@ class PrAgentTargetWorkflowContractTests(unittest.TestCase):
                     )
                     self.assertEqual(completed.returncode, 0, completed.stderr)
                     self.assertEqual(completed.stdout.strip(), "child-a")
+
+    def test_runtime_dependency_closure_follows_transitive_lazy_imports(self):
+        # The static closure must recurse into fetched modules. A lazy import
+        # hidden in a function body of one of those modules is not executed by
+        # the CLI smoke yet still breaks the ephemeral runtime when that code
+        # path runs, so it must be part of the required file set.
+        TMP_PARENT.mkdir(exist_ok=True)
+        with tempfile.TemporaryDirectory(
+            prefix="runtime-closure-", dir=str(TMP_PARENT)
+        ) as tmp:
+            root = Path(tmp)
+            package = root / "src/continuum"
+            package.mkdir(parents=True)
+            (package / "__init__.py").write_text("", encoding="utf-8")
+            (package / "entry.py").write_text(
+                "from continuum import lazy\n", encoding="utf-8"
+            )
+            (package / "lazy.py").write_text(
+                "def use():\n    from . import deep\n", encoding="utf-8"
+            )
+            (package / "deep.py").write_text("", encoding="utf-8")
+            (root / "runtime.py").write_text(
+                "from continuum import entry\n", encoding="utf-8"
+            )
+            imported = continuum_imports("runtime.py", root=root)
+            self.assertIn("src/continuum/deep.py", imported)
 
     reusable = (
         ".github/workflows/continuum-pr-agent.yml",
