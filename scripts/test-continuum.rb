@@ -207,10 +207,10 @@ class ContinuumTest < Minitest::Test
   end
 
   # The modes the OpenCode engine admits on the `workflow_dispatch` path,
-  # parsed out of the job's own `if` guard rather than hardcoded here.
+  # parsed out of the canonical admission module rather than hardcoded here.
   def dispatch_modes
-    body = workflow_body('continuum-opencode.yml')
-    body[/contains\(fromJSON\('\[([^\]]+)\]'\), inputs\.mode\)/, 1].to_s
+    body = File.read(File.join(ROOT, 'src/continuum/opencode_admission.py'))
+    body[/DISPATCH_MODES = \((.*?)\)/m, 1].to_s
         .scan(/"([^"]+)"/).flatten
   end
 
@@ -4344,9 +4344,16 @@ class ContinuumTest < Minitest::Test
     reservation = scheduler[/if \(context\.eventName === 'issue_comment'\) \{\s*\n\s*const eventIssue.*?\n            \}/m]
     refute_nil reservation, 'the owner-command reservation block is gone'
     assert_includes reservation, 'comment?.user?.login === owner'
-    assert_includes reservation, "body.includes('/oc') || body.includes('/opencode')"
+    assert_includes reservation, 'classifyComments([body])[0] === \'run\'',
+                    'owner-command reservations must use the canonical parser'
     assert_includes reservation, 'await addLabel(eventIssue.number, inProgressLabel);'
     assert_includes reservation, 'Reserved issue #'
+    assert_includes scheduler, "function classifyComments(bodies)",
+                    'the scheduler must call the canonical parser for command decisions'
+    assert_includes scheduler, "'classify-json'",
+                    'the scheduler must use the shared batch classifier'
+    assert_includes scheduler, 'commentClasses[index] === \'run\'',
+                    'scheduler dispatch reconciliation must use the canonical parser'
 
     # A manual command must not consume the scheduler's own attempt budget, or
     # two manual runs would pause an issue the scheduler never dispatched.
@@ -4550,7 +4557,10 @@ class ContinuumTest < Minitest::Test
     gate = stub.fetch('jobs').fetch('call').fetch('if')
     assert_includes gate, "github.event_name != 'issue_comment'"
     assert_includes gate, 'github.actor == github.repository_owner'
-    assert_includes gate, "contains(github.event.comment.body, '/oc')"
+    assert_includes gate, "startsWith(github.event.comment.body, '/oc')",
+                    'the stub may only cheap-prefilter; the reusable scheduler parses exactly'
+    refute_includes gate, "contains(github.event.comment.body, '/oc')",
+                    'a substring gate would wake the scheduler on internal prose'
   end
 
   # Issue #170: the exact manual-command rule lives in one shared module, and
@@ -5939,24 +5949,30 @@ class ContinuumTest < Minitest::Test
   end
 
   # Coordinator item 1: `/oc-cancel`. The command is a substring of `/oc`, so
-  # without an explicit negation on each agent-launching step the cancel
-  # comment starts the very agent it means to stop. Both launch sites must
-  # carry it, and no step may launch on a cancel comment.
+  # the canonical admission decision must reject it before any agent launch.
+  # No step may launch on a cancel comment.
   def test_opencode_cancel_command_guards_every_agent_launch
     body = File.read(File.join(ROOT, '.github/workflows/continuum-opencode.yml'))
 
     run_step = step_body(body, 'Run OpenCode')
     refute_nil run_step, 'the `Run OpenCode` step is missing'
-    assert_includes run_step, "!contains(github.event.comment.body, '/oc-cancel')",
-                    'Run OpenCode must not launch on an /oc-cancel comment'
+    assert_includes run_step, 'needs.admit.outputs.route',
+                    'Run OpenCode must consume the admission decision'
 
     recover = step_body(body, 'Recover agent-managed issue branch')
     refute_nil recover, 'the branch-recovery step is missing'
-    assert_includes recover, "!contains(github.event.comment.body, '/oc-cancel')",
-                    'branch recovery must not run on an /oc-cancel comment'
+    assert_includes recover, 'needs.admit.outputs.route',
+                    'branch recovery must consume the admission decision'
 
     issue_step = step_body(body, 'Implement issue')
     refute_nil issue_step, 'the `issue` mode step is missing'
+    assert_includes issue_step, 'needs.admit.outputs.route',
+                    'issue implementation must consume the admission decision'
+
+    admission = File.read(File.join(ROOT, 'src/continuum/opencode_admission.py'))
+    assert_includes admission, 'cancellation suppresses the PR launch'
+    assert_includes admission, 'cancellation suppresses the review launch'
+    assert_equal 'cancel', opencode_command('classify', '--body', '/oc-cancel')
 
     # The cancellation is a launch guard only: Continuum has no mechanism that
     # cancels an already-running run, so nothing may claim otherwise.
@@ -5988,6 +6004,16 @@ class ContinuumTest < Minitest::Test
     assert_includes guard, "state: 'open'"
     assert_includes guard, '[401, 403, 429].includes(status)'
     assert_includes guard, 'const prefix = `opencode/issue${issueNumber}-`'
+    assert_includes guard, 'github.rest.actions.getWorkflowRun'
+    assert_includes guard, 'github.rest.actions.listWorkflowRunsForRepo'
+    assert_includes guard, 'RUN_HISTORY_LOOKBACK_MS'
+    assert_includes guard, 'created: `>=${createdSince}`'
+    assert_includes guard, 'listRunsWithPat(createdSince)'
+    assert_includes guard, "created=${encodeURIComponent('>=' + createdSince)}"
+    refute_includes guard, 'legacy_title'
+    refute_includes guard, 'EVENT_ISSUE_TITLE'
+    assert_includes guard, "'duplicate-run-decision'",
+                    'the duplicate guard must use the canonical generation decision'
     assert_includes guard, "core.setOutput('skip', 'true')"
     assert_includes guard, "core.setOutput('skip', 'false')"
 
@@ -5996,6 +6022,11 @@ class ContinuumTest < Minitest::Test
     issue_step = step_body(body, 'Implement issue')
     refute_nil issue_step
     assert_includes issue_step, "steps.duplicate_guard.outputs.skip != 'true'"
+
+    model_route = step_body(body, 'Qualify trusted OpenCode route')
+    refute_nil model_route
+    assert_includes model_route, "steps.duplicate_guard.outputs.skip != 'true'",
+                    'the model route must also wait for the duplicate decision'
   end
 
   # Coordinator item 3: run-name. The watchdog and the scheduler both find a
@@ -6684,116 +6715,116 @@ class ContinuumTest < Minitest::Test
     assert_includes cli, 'qualification_result_tuple'
   end
 
-  # kodmial/continuum#248: an `issue_comment` on a PR must start the
-  # interactive agent only for an explicit owner command at the start of the
-  # comment on a still-open PR. Substring matching let agent-generated
-  # verification prose (which mentions /oc later) chain one run per minute on
-  # a closed PR. The job gate and the `Run OpenCode` step gate must both pin
-  # the open-PR + owner + startsWith + cancel-exclusion rule, while the
-  # plain-issue, qualification, workflow_dispatch, and review-comment paths
-  # keep their existing behavior.
-  def test_opencode_pr_interactive_path_requires_explicit_open_command
+  # kodmial/continuum#347: a plain-issue comment is admitted only by the
+  # canonical parser, before any code runner starts. The PR interactive route
+  # keeps its historical open-PR + owner + startsWith + cancel rule, but it too
+  # consumes the same admission decision rather than re-evaluating substrings
+  # in each step.
+  def test_opencode_admission_precedes_every_code_runner
     body = File.read(File.join(ROOT, '.github/workflows/continuum-opencode.yml'))
+    workflow = yaml(File.join(ROOT, '.github/workflows/continuum-opencode.yml'))
+    jobs = workflow.fetch('jobs')
+    admit = jobs.fetch('admit')
+    opencode = jobs.fetch('opencode')
 
-    job = body[/  opencode:\n(?:.*\n)*?    if: >-\n((?:      .*\n)+)/, 1]
-    refute_nil job, 'the opencode job gate is missing'
+    assert_equal 'needs.admit.outputs.run == \'true\'', opencode.fetch('if').strip
+    assert_equal 'admit', opencode.fetch('needs')
+    admit_steps = admit.fetch('steps')
+    assert(admit_steps.any? { |step| step['id'] == 'admit' },
+           'the admission job must publish the canonical decision')
+    assert(admit_steps.any? { |step| step['run'].to_s.include?('opencode_command.py') },
+           'admission must call the shared parser CLI')
+    assert(admit_steps.any? { |step| step['run'].to_s.include?(' admit ') },
+           'admission must use the event admission subcommand')
 
-    # The PR issue_comment route: open PR, owner, command at the start,
-    # cancel excluded. startsWith (not contains) is what stops later-prose
-    # mentions from self-triggering.
-    assert_includes job, 'github.event.issue.pull_request',
-                    'the job gate must distinguish PR comments from plain issues'
-    assert_includes job, "github.event.issue.state == 'open'",
-                    'the job gate must require a still-open PR'
-    assert_includes job, 'github.actor == github.repository_owner',
-                    'the job gate must require the repository owner'
-    assert_includes job, "startsWith(github.event.comment.body, '/oc')",
-                    'the PR route must use startsWith, not contains'
-    assert_includes job, "startsWith(github.event.comment.body, '/opencode')",
-                    'the PR route must accept /opencode at the start'
-    assert_includes job, "!contains(github.event.comment.body, '/oc-cancel')",
-                    'the PR route must keep the /oc-cancel exclusion'
+    # No plain-issue command substring gate may survive anywhere in the workflow.
+    refute_includes body, "contains(github.event.comment.body, '/oc')",
+                    'plain-issue routing must use the admission decision, not a substring gate'
+    refute_includes body, "contains(github.event.comment.body, '/opencode')",
+                    'plain-issue routing must use the admission decision, not a substring gate'
 
-    # The plain-issue route keeps substring matching so scheduler dispatch
-    # comments (which open with /oc plus a marker) keep working.
-    assert_includes job, '!github.event.issue.pull_request',
-                    'the job gate must keep a distinct plain-issue route'
-    assert_includes job, "contains(github.event.comment.body, '/oc')",
-                    'the plain-issue route must keep contains matching'
-
-    # The review-comment route is deliberately unchanged.
-    assert_includes job, "github.event_name == 'pull_request_review_comment'",
-                    'the job gate must keep the review-comment route'
-
-    # workflow_dispatch repair/qualification modes are untouched.
-    assert_includes job, "contains(fromJSON('[\"coderabbit-fix\",\"resolve-conflict\",\"ci-fix\",\"issue\",\"qualification\"]'), inputs.mode)"
+    %w[
+      Resolve\ authoritative\ task\ context
+      Pin\ and\ verify\ task\ specification\ snapshot
+      Check\ issue\ Definition\ of\ Ready
+      Recover\ agent-managed\ issue\ branch
+      Implement\ issue
+    ].each do |name|
+      step = step_body(body, name.gsub('\\ ', ' '))
+      refute_nil step, "step #{name} is missing"
+      assert_includes step, "needs.admit.outputs.route == 'issue'",
+                      "step #{name} must consume the plain-issue admission decision"
+    end
 
     run_step = step_body(body, 'Run OpenCode')
     refute_nil run_step, 'the `Run OpenCode` step is missing'
-    assert_includes run_step, "github.event.issue.state == 'open'",
-                    'Run OpenCode must require a still-open PR'
-    assert_includes run_step, 'github.actor == github.repository_owner',
-                    'Run OpenCode must require the repository owner on PR comments'
-    assert_includes run_step, "startsWith(github.event.comment.body, '/oc')",
-                    'Run OpenCode must use startsWith on PR comments'
-    assert_includes run_step, "startsWith(github.event.comment.body, '/opencode')",
-                    'Run OpenCode must accept /opencode at the start'
-    assert_includes run_step, "!contains(github.event.comment.body, '/oc-cancel')",
-                    'Run OpenCode must keep the /oc-cancel exclusion'
-    assert_includes run_step, "steps.duplicate_guard.outputs.skip != 'true'",
-                    'Run OpenCode must keep the duplicate guard'
-    # The review-comment branch of the step keeps its existing shape.
-    assert_includes run_step, "github.event_name == 'pull_request_review_comment'",
-                    'Run OpenCode must keep the review-comment branch'
+    assert_includes run_step, "needs.admit.outputs.route == 'pr'"
+    assert_includes run_step, "needs.admit.outputs.route == 'review'"
+    assert_includes run_step, "steps.duplicate_guard.outputs.skip != 'true'"
+    refute_includes run_step, "contains(github.event.comment.body, '/oc')"
+
+    admission = File.read(File.join(ROOT, 'src/continuum/opencode_admission.py'))
+    assert_includes admission, "issue_state != \"open\""
+    assert_includes admission, "body.startswith(\"/oc\")"
+    assert_includes admission, "body.startswith(\"/opencode\")"
+    assert_includes admission, "cancellation suppresses the PR launch"
+    assert_includes admission, "review comment author is not the repository owner"
   end
 
-  # The closed-PR and later-prose cases must not match the PR route: the
-  # gate text is re-evaluated here as a boolean over the issue state and the
-  # comment body, so a weakened expression (contains instead of startsWith,
-  # or a dropped open check) fails here rather than in production.
+  # A consumer's OpenCode caller is only a forwarder: the reusable workflow's
+  # admission job is the sole place that reads the comment body. A caller-side
+  # command prefilter would be a second parser that could drift from the
+  # canonical grammar and launch costly work before admission runs.
+  def test_opencode_consumer_routing_cannot_bypass_admission
+    stub_path = File.join(ROOT, '.github/caller-stubs/continuum-opencode.yml')
+    stub = File.read(stub_path)
+    call = yaml(stub_path).fetch('jobs').fetch('call')
+    refute call.key?('if'), 'the OpenCode caller must not gate on the comment body'
+    assert_equal 'kodmial/continuum/.github/workflows/continuum-opencode.yml@main',
+                 call.fetch('uses')
+    refute_match(/contains\(github\.event\.comment\.body,\s*'\/(?:oc|opencode)'\)/, stub)
+    refute_match(/startsWith\(github\.event\.comment\.body,\s*'\/(?:oc|opencode)'\)/, stub)
+
+    dogfood_path = File.join(ROOT, '.github/workflows/opencode.yml')
+    dogfood = File.read(dogfood_path)
+    assert_equal './.github/workflows/continuum-opencode.yml',
+                 yaml(dogfood_path).fetch('jobs').fetch('call').fetch('uses')
+    refute_match(/contains\(github\.event\.comment\.body,\s*'\/(?:oc|opencode)'\)/, dogfood)
+  end
+
+  # The closed-PR and later-prose cases must not match the PR route. Exercise
+  # the real CLI admission decision, then pin the PR rule it implements.
   def test_opencode_pr_gate_logic_rejects_loops_and_accepts_commands
     evaluate = lambda do |issue_state, actor_is_owner, comment_body|
-      opens = issue_state == 'open'
-      owner = actor_is_owner
-      starts = comment_body.start_with?('/oc') || comment_body.start_with?('/opencode')
-      cancelled = comment_body.include?('/oc-cancel')
-      opens && owner && starts && !cancelled
+      output = opencode_command(
+        'admit', '--event', 'issue_comment', '--body', comment_body,
+        '--author', actor_is_owner ? 'octocat' : 'stranger',
+        '--actor', actor_is_owner ? 'octocat' : 'stranger',
+        '--owner', 'octocat', '--is-pull-request',
+        '--issue-state', issue_state
+      )
+      output.lines.find { |line| line.start_with?('run=') }.strip == 'run=true'
     end
 
-    # Closed PR + arbitrary comment -> no run.
     refute evaluate.call('closed', true, '/oc please continue'),
            'a closed PR must never start the interactive agent'
     refute evaluate.call('closed', true, 'any bot prose'),
            'a closed PR must never start the interactive agent'
-    # Open PR + generated prose mentioning /oc later -> no run.
     refute evaluate.call('open', true,
                          'OpenCode run 37176701843 completed; the /oc token was mentioned while explaining why.'),
            'later-prose mentions must never start the interactive agent'
     refute evaluate.call('open', true, 'Please run /oc for me'),
            'later-prose mentions must never start the interactive agent'
-    # Open PR + owner /oc at the start -> exactly one run.
     assert evaluate.call('open', true, '/oc'),
            'a bare owner /oc must start the interactive agent'
     assert evaluate.call('open', true, "/oc\n\nplease fix the flake"),
            'an owner /oc command must start the interactive agent'
     assert evaluate.call('open', true, '/opencode fix the flake'),
            'an owner /opencode command must start the interactive agent'
-    # Open PR + owner /oc-cancel -> no run.
     refute evaluate.call('open', true, '/oc-cancel'),
            '/oc-cancel must never start the interactive agent'
-    # Non-owner commands never run.
     refute evaluate.call('open', false, '/oc'),
            'a non-owner command must never start the interactive agent'
-
-    # The evaluated rule above must be the rule the workflow actually
-    # expresses: every operator it depends on has to be present in the gate.
-    body = File.read(File.join(ROOT, '.github/workflows/continuum-opencode.yml'))
-    run_step = step_body(body, 'Run OpenCode')
-    refute_nil run_step
-    %w[state\ ==\ 'open' repository_owner startsWith !contains].each do |token|
-      assert_includes run_step, token.gsub('\\ ', ' '),
-                      "Run OpenCode gate lost its #{token.inspect} term"
-    end
   end
 
   # kodmial/continuum#253 P0: the auto-merge obsolete-run scan walked the

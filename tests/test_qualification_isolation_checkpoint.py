@@ -33,8 +33,13 @@ class QualificationIsolationTests(unittest.TestCase):
         ):
             with self.subTest(step=name):
                 block = step_block(self.opencode, name)
-                self.assertIn("continuum-qualification-dispatch", block)
-                self.assertIn("!contains(github.event.comment.body", block)
+                # Qualification dispatch is classified by the canonical
+                # admission job as its own route, so every generic issue step
+                # consumes only the plain-issue decision and never re-evaluates
+                # the comment body with a substring gate.
+                self.assertIn("needs.admit.outputs.route == 'issue'", block)
+                self.assertNotIn("contains(github.event.comment.body", block)
+                self.assertNotIn("!contains(github.event.comment.body", block)
 
     def test_validation_only_marker_blocks_generic_manual_implementation(self) -> None:
         readiness = step_block(self.opencode, "Check issue Definition of Ready")

@@ -140,13 +140,15 @@ jobs:
     # Parent filtering is unchanged: unrelated issue comments stay cheap
     # caller skips. A manual owner `/oc` is in-flight work the scheduler must
     # reserve, and trusted qualification result comments wake the scheduler
-    # immediately; cron remains the missed-event backstop.
+    # immediately; cron remains the missed-event backstop. This stub is only
+    # a cheap prefilter: the reusable scheduler applies the canonical exact
+    # parser before it reserves or dispatches anything.
     if: >-
       vars.CONTINUUM_ROLE != 'child' &&
       (github.event_name != 'issue_comment' ||
        (github.actor == github.repository_owner &&
-        (contains(github.event.comment.body, '/oc') ||
-         contains(github.event.comment.body, '/opencode'))) ||
+        (startsWith(github.event.comment.body, '/oc') ||
+         startsWith(github.event.comment.body, '/opencode'))) ||
        ((github.actor == github.repository_owner ||
          github.actor == 'github-actions[bot]' ||
          github.event.comment.author_association == 'OWNER' ||
