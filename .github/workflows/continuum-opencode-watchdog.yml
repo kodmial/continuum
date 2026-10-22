@@ -126,6 +126,11 @@ jobs:
       RETRY_MARKER: ${{ inputs.retry_marker || vars.AUTOMATION_WATCHDOG_RETRY_MARKER || '<!-- opencode-watchdog-retry -->' }}
       IN_PROGRESS_LABEL: ${{ inputs.in_progress_label || vars.AUTOMATION_IN_PROGRESS_LABEL || 'automation:in-progress' }}
       PAUSE_LABEL: ${{ inputs.pause_marker || vars.AUTOMATION_PAUSE_LABEL || 'automation:paused' }}
+      # Legacy 429 replay only follows issues the owner already admitted.
+      # These are read-only admission gates; the watchdog never adds a label.
+      READY_LABEL: ${{ vars.AUTOMATION_READY_LABEL }}
+      BLOCKED_LABEL: ${{ vars.AUTOMATION_BLOCKED_LABEL || 'automation:blocked' }}
+      QUALIFYING_LABEL: ${{ vars.AUTOMATION_QUALIFYING_LABEL || 'automation:qualifying' }}
       DISPATCH_MARKER: ${{ inputs.dispatch_marker || vars.AUTOMATION_DISPATCH_MARKER || '<!-- issue-scheduler-dispatch -->' }}
       PAUSE_ON_FAILURE: ${{ inputs.pause_on_failure || vars.AUTOMATION_PAUSE_ON_FAILURE || 'false' }}
       READ_GITHUB_TOKEN: ${{ github.token }}
@@ -573,6 +578,192 @@ jobs:
               }
             }
 
+            // Read the legacy issue checkpoint, if present, and bind it to the
+            // expected 429 operation+generation. Any difference (different
+            // tip, other issue, metadata present, missing stage file) fails
+            // closed: the raw refs are preserved and no replay is dispatched.
+            async function inspectLegacy429Checkpoint({
+              operation, generation, checkpointRef, checkpointSha, issueNumber,
+            }) {
+              const issue = String(issueNumber || '').trim();
+              if (!/^[0-9]+$/.test(issue)) {
+                return { ok: false, reason: 'legacy checkpoint is not issue scoped' };
+              }
+              const parsed = parseCheckpointRef(checkpointRef);
+              if (
+                !parsed ||
+                parsed.operationId !== operation ||
+                parsed.generation !== Number(generation)
+              ) {
+                return { ok: false, reason: 'checkpoint ref does not match operation/generation' };
+              }
+              const legacyRef = legacyIssueCheckpointRef(issue);
+              const pointerSha = String(checkpointSha || '').trim().toLowerCase();
+              let legacySha = '';
+              for (let attempt = 0; attempt < 7; attempt += 1) {
+                try {
+                  const response = await readGithub.rest.git.getRef({
+                    owner, repo, ref: 'heads/' + legacyRef,
+                  });
+                  legacySha = String(response.data.object.sha || '').toLowerCase();
+                  break;
+                } catch (err) {
+                  const status = Number(err && err.status || 0);
+                  if (status !== 404) {
+                    return { ok: false, reason: 'legacy-ref-http-' + (status || 'unknown') };
+                  }
+                  if (attempt < 6) {
+                    await new Promise(resolve => setTimeout(
+                      resolve, 1000 * Math.pow(2, attempt)
+                    ));
+                  }
+                }
+              }
+              if (!legacySha) {
+                return { ok: false, reason: 'legacy-ref-missing' };
+              }
+              let stageFileContent = '';
+              try {
+                const content = await readGithub.rest.repos.getContent({
+                  owner, repo, path: '.continuum-429-stage', ref: legacySha,
+                });
+                if (Array.isArray(content.data) || content.data.type !== 'file') {
+                  return { ok: false, reason: 'legacy-stage-is-not-a-file' };
+                }
+                stageFileContent = Buffer.from(
+                  content.data.content || '', 'base64'
+                ).toString('utf8');
+              } catch (err) {
+                const status = Number(err && err.status || 0);
+                // Absence of the optional progress line must not block a
+                // provable legacy checkpoint; other read failures do.
+                if (status !== 404 && status !== 422) {
+                  return { ok: false, reason: 'legacy-stage-http-' + (status || 'unknown') };
+                }
+                stageFileContent = '';
+              }
+              let metadataPresent = false;
+              try {
+                await readGithub.rest.repos.getContent({
+                  owner, repo, path: '.continuum-429-recovery.json', ref: legacySha,
+                });
+                metadataPresent = true;
+              } catch (err) {
+                const status = Number(err && err.status || 0);
+                if (status !== 404 && status !== 422) {
+                  return { ok: false, reason: 'legacy-metadata-http-' + (status || 'unknown') };
+                }
+              }
+              return bindLegacy429Checkpoint({
+                issueNumber: issue,
+                legacyRef,
+                legacySha,
+                checkpointRefs: [{
+                  ref: checkpointRef,
+                  sha: pointerSha,
+                }],
+                stageFileContent,
+                metadataPresent,
+              });
+            }
+
+            async function findActiveIssueRun({ target, issueNumber }) {
+              const title = 'OpenCode issue #' + String(issueNumber);
+              try {
+                const runs = await readGithub.paginate(
+                  readGithub.rest.actions.listWorkflowRuns,
+                  {
+                    owner, repo, workflow_id: target.workflowId,
+                    per_page: 50,
+                  }
+                );
+                return runs.find(candidate => {
+                  if (candidate.status === 'completed') return false;
+                  if (candidate.path && candidate.path !== target.path) return false;
+                  return candidate.display_title === title;
+                }) || null;
+              } catch (err) {
+                core.warning(
+                  'OpenCode legacy recovery could not inspect active runs for issue #' +
+                  issueNumber + ': ' + (err.message || err)
+                );
+                return null;
+              }
+            }
+
+            async function legacyRecoveryAdmission(issueNumber) {
+              const { data: issue } = await readGithub.rest.issues.get({
+                owner, repo, issue_number: issueNumber,
+              });
+              const labels = (issue.labels || []).map(label =>
+                typeof label === 'string' ? label : label && label.name
+              );
+              let openIssuePullRequests = false;
+              try {
+                const pulls = await readGithub.paginate(
+                  readGithub.rest.pulls.list,
+                  { owner, repo, state: 'open', per_page: 100 }
+                );
+                const prefix = 'opencode/issue' + issueNumber + '-';
+                openIssuePullRequests = pulls.some(pr =>
+                  pr.head && pr.head.repo &&
+                  pr.head.repo.full_name === repoFullName &&
+                  String(pr.head.ref || '').startsWith(prefix)
+                );
+              } catch (err) {
+                return { ok: false, reason: 'open-pr-read-failed' };
+              }
+              const openBlockers = [];
+              const declared = String(issue.body || '').match(
+                /<!--\s*automation-blocked-by:\s*([0-9#\s,]+?)\s*-->/i
+              );
+              if (declared) {
+                const numbers = [...new Set(
+                  [...declared[1].matchAll(/\d+/g)]
+                    .map(item => Number.parseInt(item[0], 10))
+                    .filter(Number.isInteger)
+                )];
+                for (const blockerNumber of numbers) {
+                  if (blockerNumber === Number(issueNumber)) continue;
+                  try {
+                    const blocker = await readGithub.rest.issues.get({
+                      owner, repo, issue_number: blockerNumber,
+                    });
+                    if (blocker.data.state === 'open') openBlockers.push(blockerNumber);
+                  } catch (err) {
+                    return { ok: false, reason: 'blocker-read-failed' };
+                  }
+                }
+              }
+              let nativeBlockers = [];
+              try {
+                nativeBlockers = await readGithub.paginate(
+                  'GET /repos/{owner}/{repo}/issues/{issue_number}/dependencies/blocked_by',
+                  { owner, repo, issue_number: issueNumber, per_page: 100 }
+                );
+              } catch (err) {
+                if (Number(err && err.status || 0) !== 404) {
+                  return { ok: false, reason: 'native-blocker-read-failed' };
+                }
+              }
+              for (const blocker of nativeBlockers) {
+                if (blocker && blocker.state === 'open') {
+                  openBlockers.push(Number(blocker.number) || 0);
+                }
+              }
+              return decideLegacyRecoveryAdmission({
+                issueState: issue.state,
+                labels,
+                openIssuePullRequests,
+                openBlockers,
+                readyLabel: process.env.READY_LABEL || 'automation:ready',
+                pausedLabel,
+                blockedLabel: process.env.BLOCKED_LABEL || 'automation:blocked',
+                qualifyingLabel:
+                  process.env.QUALIFYING_LABEL || 'automation:qualifying',
+              });
+            }
+
             async function resolveDispatchTarget(runPath) {
               const helper = process.env.CONTINUUM_DISPATCH_HELPER || '';
               let dispatchRouting;
@@ -626,6 +817,158 @@ jobs:
             function recoveryRunName(operation, generation) {
               return 'OpenCode 429 recovery ' + String(operation) +
                 ' gen ' + String(generation);
+            }
+
+            // kodmial/continuum#373: pre-#366 429 interruptions left only the
+            // workflow-owned `opencode/checkpoint-issue<N>` branch and a
+            // `.continuum-429-stage` progress line; they have no signed
+            // recovery metadata. Such a checkpoint is never promoted to an
+            // authoritative metadata-bearing checkpoint. It may only be
+            // replayed through the standard issue mode, which re-runs the
+            // agent/tests and revalidates the pinned snapshot. The pure
+            // binder below proves the ref belongs to exactly this issue and a
+            // same-tip 429/infra generation; the workflow refuses anything
+            // else.
+            const LEGACY_ISSUE_CHECKPOINT_PREFIX = 'opencode/checkpoint-issue';
+            const LEGACY_STAGES = new Set([
+              'implementation-incomplete',
+              'implementation-complete',
+              'tests-running',
+              'tests-passed',
+              'publish-pr',
+              'review-repair',
+              'qualification',
+            ]);
+
+            function legacyIssueCheckpointRef(issueNumber) {
+              const text = String(issueNumber || '').trim();
+              return /^[0-9]+$/.test(text)
+                ? LEGACY_ISSUE_CHECKPOINT_PREFIX + text
+                : '';
+            }
+
+            function parseCheckpointRef(ref) {
+              const text = String(ref || '').trim();
+              for (const prefix of [
+                'opencode/429-checkpoint-',
+                'opencode/infra-checkpoint-',
+              ]) {
+                if (!text.startsWith(prefix)) continue;
+                const rest = text.slice(prefix.length);
+                const at = rest.lastIndexOf('-gen-');
+                if (at <= 0) return null;
+                const generation = rest.slice(at + 5);
+                if (!/^[0-9]+$/.test(generation)) return null;
+                return {
+                  operationId: rest.slice(0, at),
+                  generation: Number(generation),
+                };
+              }
+              return null;
+            }
+
+            // Pure production decision shared by the watchdog and its
+            // deterministic regression test. Never returns a skip stage: the
+            // stage file is untrusted for pre-metadata checkpoints.
+            function bindLegacy429Checkpoint({
+              issueNumber, legacyRef, legacySha, checkpointRefs,
+              stageFileContent, metadataPresent,
+            }) {
+              const issue = String(issueNumber || '').trim();
+              if (!/^[0-9]+$/.test(issue)) {
+                return { ok: false, reason: 'legacy checkpoint requires an issue number' };
+              }
+              const expectedRef = legacyIssueCheckpointRef(issue);
+              if (String(legacyRef || '').trim() !== expectedRef) {
+                return { ok: false, reason: 'legacy checkpoint ref does not belong to the issue' };
+              }
+              const sha = String(legacySha || '').trim().toLowerCase();
+              if (!/^[0-9a-f]{40}$/.test(sha)) {
+                return { ok: false, reason: 'legacy checkpoint SHA is malformed' };
+              }
+              const rawStage = String(stageFileContent || '')
+                .split(/\r?\n/)[0].trim();
+              if (rawStage && !LEGACY_STAGES.has(rawStage)) {
+                return { ok: false, reason: 'legacy checkpoint has no valid recorded stage' };
+              }
+              // Absence is not a blocker: the replay is conservative and
+              // never uses the record to skip work.
+              const stage = rawStage || 'implementation-incomplete';
+              if (metadataPresent) {
+                return { ok: false, reason: 'legacy checkpoint unexpectedly carries recovery metadata' };
+              }
+              const operation = 'opencode-429-issue-issue' + issue;
+              let generation = 0;
+              for (const item of Array.isArray(checkpointRefs) ? checkpointRefs : []) {
+                const parsed = parseCheckpointRef(item && item.ref);
+                if (!parsed || parsed.operationId !== operation) continue;
+                if (parsed.generation < 1) continue;
+                if (String(item.sha || '').trim().toLowerCase() !== sha) continue;
+                if (parsed.generation > generation) generation = parsed.generation;
+              }
+              if (!generation) {
+                return {
+                  ok: false,
+                  reason: 'legacy checkpoint has no matching 429 generation ref',
+                };
+              }
+              return {
+                ok: true,
+                checkpointRef: expectedRef,
+                checkpointSha: sha,
+                generation,
+                stage,
+                skipAgent: false,
+              };
+            }
+
+            function legacyRecoveryDispatchInputs(issueNumber) {
+              return {
+                mode: 'issue',
+                issue_number: String(issueNumber || ''),
+              };
+            }
+
+            function decideLegacyRecoveryAdmission({
+              issueState, labels, openIssuePullRequests, activeRunId,
+              openBlockers, readyLabel, pausedLabel, blockedLabel,
+              qualifyingLabel,
+            }) {
+              if (String(issueState || '') !== 'open') {
+                return { ok: false, reason: 'issue-closed' };
+              }
+              const names = new Set(
+                (Array.isArray(labels) ? labels : []).map(label =>
+                  typeof label === 'string' ? label : label && label.name
+                ).filter(Boolean)
+              );
+              if (names.has(pausedLabel || 'automation:paused')) {
+                return { ok: false, reason: 'owner-paused' };
+              }
+              if (
+                names.has(blockedLabel || 'automation:blocked') ||
+                names.has(qualifyingLabel || 'automation:qualifying')
+              ) {
+                return { ok: false, reason: 'held-label' };
+              }
+              // Owner authorization is the admission label when the consumer
+              // enables explicit admission. A legacy checkpoint must never
+              // auto-grant that label, and an issue whose owner removed it
+              // (for example a cancelled task) stays untouched.
+              const requiredReady = String(readyLabel || '').trim();
+              if (requiredReady && !names.has(requiredReady)) {
+                return { ok: false, reason: 'not-owner-authorized' };
+              }
+              if (openIssuePullRequests) {
+                return { ok: false, reason: 'open-pr' };
+              }
+              if (Number(activeRunId || 0) > 0) {
+                return { ok: false, reason: 'run-already-active' };
+              }
+              if (Array.isArray(openBlockers) && openBlockers.length > 0) {
+                return { ok: false, reason: 'blocked' };
+              }
+              return { ok: true };
             }
 
             async function observeDispatchedRun({
@@ -683,20 +1026,98 @@ jobs:
               return null;
             }
 
+            // Pre-#366 runs may only log the restart marker without the newer
+            // evacuation line. Recover the trusted issue identity from the
+            // caller's `run-name` and bind the legacy branch to the same-tip
+            // 429/infra generation ref instead of guessing a checkpoint.
+            async function synthesizeLegacyEvacuation(run) {
+              const match = String(run && run.display_title || '')
+                .match(/^OpenCode issue #(\d+)$/);
+              if (!match) return null;
+              const issue = match[1];
+              const legacyRef = legacyIssueCheckpointRef(issue);
+              let legacySha = '';
+              try {
+                const response = await readGithub.rest.git.getRef({
+                  owner, repo, ref: 'heads/' + legacyRef,
+                });
+                legacySha = String(response.data.object.sha || '').toLowerCase();
+              } catch (err) {
+                return null;
+              }
+              if (!/^[0-9a-f]{40}$/.test(legacySha)) return null;
+              const operation = 'opencode-429-issue-issue' + issue;
+              const refs = [];
+              for (const prefix of [
+                'opencode/429-checkpoint-',
+                'opencode/infra-checkpoint-',
+              ]) {
+                try {
+                  const response = await readGithub.rest.git.listMatchingRefs({
+                    owner, repo, ref: prefix + operation,
+                  });
+                  for (const item of response.data || []) {
+                    refs.push({
+                      ref: String(item.ref || '').replace(/^refs\/heads\//, ''),
+                      sha: String(item.object && item.object.sha || '')
+                        .toLowerCase(),
+                    });
+                  }
+                } catch (err) {
+                  return null;
+                }
+              }
+              let best = null;
+              for (const item of refs) {
+                const parsed = parseCheckpointRef(item.ref);
+                if (!parsed || parsed.operationId !== operation) continue;
+                if (parsed.generation < 1) continue;
+                if (item.sha !== legacySha) continue;
+                if (!best || parsed.generation > best.generation) {
+                  best = { ref: item.ref, generation: parsed.generation };
+                }
+              }
+              if (!best) return null;
+              return {
+                checkpointRef: best.ref,
+                checkpointSha: legacySha,
+                operationId: operation,
+                stage: 'implementation-incomplete',
+                generation: best.generation,
+                mode: 'issue',
+                issueNumber: issue,
+                prNumber: '',
+                branch: '',
+              };
+            }
+
             async function recoverFrom429OnFreshVm({
               owner, repo, run, evacuated429,
               max429Restarts,
             }) {
-              const operation = String(evacuated429 && evacuated429.operationId || '').trim();
-              const checkpointRef = String(evacuated429 && evacuated429.checkpointRef || '').trim();
-              let generation = Number(evacuated429 && evacuated429.generation || 0);
+              let resolvedEvacuation = evacuated429;
+              if (!resolvedEvacuation) {
+                try {
+                  resolvedEvacuation = await synthesizeLegacyEvacuation(run);
+                } catch (err) {
+                  core.warning(
+                    'OpenCode legacy 429 identity synthesis failed closed for run ' +
+                    (run && run.id) + ': ' + (err.message || err)
+                  );
+                  resolvedEvacuation = null;
+                }
+              }
+              const operation = String(resolvedEvacuation && resolvedEvacuation.operationId || '').trim();
+              let checkpointRef = String(resolvedEvacuation && resolvedEvacuation.checkpointRef || '').trim();
+              let generation = Number(resolvedEvacuation && resolvedEvacuation.generation || 0);
               if (!Number.isInteger(generation) || generation < 0) generation = 0;
-              const pointerSha = String(evacuated429 && evacuated429.checkpointSha || '')
+              let pointerSha = String(resolvedEvacuation && resolvedEvacuation.checkpointSha || '')
                 .trim().toLowerCase();
+              let legacyReplay = false;
               const runPath = String(run && run.path || '');
               const numberTexts = [
-                String(evacuated429 && evacuated429.issueNumber || '').trim(),
-                String(evacuated429 && evacuated429.prNumber || '').trim(),
+                String(resolvedEvacuation && resolvedEvacuation.issueNumber || '').trim(),
+                String(resolvedEvacuation && resolvedEvacuation.prNumber || '').trim(),
               ].filter(text => /^[0-9]+$/.test(text));
               const threadNumber = numberTexts.length ? Number(numberTexts[0]) : 0;
               const baseState = {
@@ -707,7 +1128,7 @@ jobs:
                 checkpointSha: pointerSha,
               };
 
-              if (!evacuated429) {
+              if (!resolvedEvacuation) {
                 core.notice(
                   'OpenCode infrastructure marker without a workflow-owned evacuation ' +
                   'pointer in run ' + (run && run.id) + '; scheduling a bounded ' +
@@ -728,7 +1149,7 @@ jobs:
               }
               const now = Math.floor(Date.now() / 1000);
               const comments = await listThreadComments(threadNumber);
-              const previous = latestRecoveryState(comments, operation, generation);
+              let previous = latestRecoveryState(comments, operation, generation);
 
               if (generation > max429Restarts) {
                 // Honor the durable window instead of recording a fresh
@@ -770,69 +1191,151 @@ jobs:
                 operation, generation, checkpointRef,
                 checkpointSha: pointerSha,
               });
+              let identity = null;
+              let stage = 'implementation-incomplete';
+              let mode = '';
+              let issueText = '';
+              let prText = '';
+              let checkpointSha = pointerSha;
               if (!metadata.ok) {
-                const now = Math.floor(Date.now() / 1000);
-                const nextDue = now + (metadata.kind === 'missing' ? 60 : 300);
-                const failed = metadata.kind === 'missing' || metadata.kind === 'invalid';
-                await recordRecoveryState({
-                  ...baseState,
-                  checkpointSha: metadata.exactSha || pointerSha,
-                  state: failed ? 'metadata-failed' : 'metadata-pending',
-                  attempt: 1,
-                  nextDue,
-                  detail: 'metadata-' + metadata.kind,
-                  summary: failed
-                    ? 'Checkpoint `' + checkpointRef + '` exists but its recovery metadata is provably missing or invalid. Raw work is preserved; no resume is dispatched from an unproven checkpoint.'
-                    : 'Checkpoint `' + checkpointRef + '` metadata is not readable yet (' + metadata.kind + '). A scheduled watchdog catch-up will retry; no pause was applied.',
-                });
-                core.warning(
-                  'OpenCode infrastructure checkpoint ' + checkpointRef +
-                  ' metadata is not recoverable yet (' + metadata.kind + ': ' +
-                  (metadata.reason || 'unknown') + '); recorded durable ' +
-                  (failed ? 'metadata-failed' : 'metadata-pending') + ' state. ' +
-                  'No pause was applied.'
-                );
-                return;
-              }
-
-              const identity = metadata.identity;
-              const stage = String(identity.stage || 'implementation-incomplete');
-              const mode = String(identity.mode || '');
-              const issueText = String(identity.issue_number || '').trim();
-              const prText = String(identity.pr_number || '').trim();
-              const expected = {
-                operation, generation, stage, mode,
-                issueNumber: issueText,
-                prNumber: prText,
-                checkpointRef,
-              };
-              const validationError = validateRecoveryMetadata(identity, expected);
-              if (validationError) {
-                await recordRecoveryState({
-                  ...baseState,
-                  checkpointSha: metadata.exactSha,
-                  state: 'metadata-failed',
-                  attempt: 1,
-                  nextDue: Math.floor(Date.now() / 1000) + 300,
-                  detail: 'metadata-invalid',
-                  summary: 'Checkpoint `' + checkpointRef + '` recovery metadata failed validation (' + validationError + '). Raw work is preserved; no resume is dispatched.',
-                });
-                core.warning(
-                  'OpenCode infrastructure checkpoint ' + checkpointRef +
-                  ' metadata failed validation: ' + validationError
-                );
-                return;
-              }
-              // The ref tip is authoritative for a fetchable checkpoint; a
-              // stale event pointer must not dispatch an older SHA than the
-              // ref now exposes.
-              const checkpointSha = metadata.exactSha || pointerSha;
-              if (metadata.stalePointer) {
-                core.warning(
-                  'OpenCode infrastructure checkpoint ' + checkpointRef +
-                  ' advanced from stale event pointer ' + pointerSha +
-                  ' to current ref tip ' + checkpointSha + '; using the tip.'
-                );
+                let legacy = null;
+                // Only a provably *absent* metadata file is a pre-fix
+                // checkpoint. A malformed metadata file is tampering and
+                // stays fail-closed.
+                if (
+                  metadata.kind === 'missing' &&
+                  String(resolvedEvacuation.mode || '').trim() === 'issue'
+                ) {
+                  const legacyIssue = String(resolvedEvacuation.issueNumber || '').trim();
+                  try {
+                    legacy = await inspectLegacy429Checkpoint({
+                      operation,
+                      generation,
+                      checkpointRef,
+                      checkpointSha: metadata.exactSha || pointerSha,
+                      issueNumber: legacyIssue,
+                    });
+                  } catch (err) {
+                    core.warning(
+                      'OpenCode legacy 429 checkpoint inspection for issue #' +
+                      legacyIssue + ' failed closed: ' + (err.message || err)
+                    );
+                    legacy = null;
+                  }
+                  if (legacy && legacy.ok) {
+                    const admission = await legacyRecoveryAdmission(legacyIssue);
+                    if (!admission.ok) {
+                      await recordRecoveryState({
+                        ...baseState,
+                        checkpointRef: legacy.checkpointRef,
+                        checkpointSha: legacy.checkpointSha,
+                        state: admission.reason === 'run-already-active'
+                          ? 'observed'
+                          : 'metadata-pending',
+                        attempt: 1,
+                        nextDue: Math.floor(Date.now() / 1000) + 300,
+                        runId: '',
+                        detail: 'legacy-' + admission.reason,
+                        summary: admission.reason === 'run-already-active'
+                          ? 'A real issue-mode runner already owns the preserved legacy checkpoint; no duplicate replay was dispatched.'
+                          : 'Legacy 429 checkpoint is preserved, but the issue is not currently owner-authorized for an automatic replay (' +
+                            admission.reason + '). No label was added or removed and no task budget was consumed.',
+                      });
+                      core.notice(
+                        'OpenCode legacy 429 recovery for issue #' + legacyIssue +
+                        ' is held (' + admission.reason + '); checkpoint ' +
+                        legacy.checkpointRef + ' preserved.'
+                      );
+                      return;
+                    }
+                    legacyReplay = true;
+                    checkpointRef = legacy.checkpointRef;
+                    pointerSha = legacy.checkpointSha;
+                    checkpointSha = legacy.checkpointSha;
+                    generation = legacy.generation;
+                    baseState.checkpointRef = checkpointRef;
+                    baseState.checkpointSha = pointerSha;
+                    baseState.generation = generation;
+                    mode = 'issue';
+                    issueText = legacyIssue;
+                    prText = '';
+                    // The pre-fix stage file is evidence only. It must never
+                    // authorize skipping the agent or tests; a standard
+                    // issue-mode replay revalidates everything.
+                    stage = 'implementation-incomplete';
+                    previous = latestRecoveryState(comments, operation, generation);
+                    core.warning(
+                      'OpenCode legacy 429 checkpoint ' + checkpointRef + ' at ' +
+                      checkpointSha + ' has no recovery metadata (recorded stage `' +
+                      legacy.stage + '`); replaying through the standard issue mode ' +
+                      'without trusting that stage or fabricating metadata.'
+                    );
+                  }
+                }
+                if (!legacyReplay) {
+                  const failureNow = Math.floor(Date.now() / 1000);
+                  const nextDue = failureNow + (metadata.kind === 'missing' ? 60 : 300);
+                  const failed = metadata.kind === 'missing' || metadata.kind === 'invalid';
+                  await recordRecoveryState({
+                    ...baseState,
+                    checkpointSha: metadata.exactSha || pointerSha,
+                    state: failed ? 'metadata-failed' : 'metadata-pending',
+                    attempt: 1,
+                    nextDue,
+                    detail: 'metadata-' + metadata.kind,
+                    summary: failed
+                      ? 'Checkpoint `' + checkpointRef + '` exists but its recovery metadata is provably missing or invalid and it is not a trusted legacy issue checkpoint. Raw work is preserved; no resume is dispatched from an unproven checkpoint.'
+                      : 'Checkpoint `' + checkpointRef + '` metadata is not readable yet (' + metadata.kind + '). A scheduled watchdog catch-up will retry; no pause was applied.',
+                  });
+                  core.warning(
+                    'OpenCode infrastructure checkpoint ' + checkpointRef +
+                    ' metadata is not recoverable yet (' + metadata.kind + ': ' +
+                    (metadata.reason || 'unknown') + '); recorded durable ' +
+                    (failed ? 'metadata-failed' : 'metadata-pending') + ' state. ' +
+                    'No pause was applied.'
+                  );
+                  return;
+                }
+              } else {
+                identity = metadata.identity;
+                stage = String(identity.stage || 'implementation-incomplete');
+                mode = String(identity.mode || '');
+                issueText = String(identity.issue_number || '').trim();
+                prText = String(identity.pr_number || '').trim();
+                const expected = {
+                  operation, generation, stage, mode,
+                  issueNumber: issueText,
+                  prNumber: prText,
+                  checkpointRef,
+                };
+                const validationError = validateRecoveryMetadata(identity, expected);
+                if (validationError) {
+                  await recordRecoveryState({
+                    ...baseState,
+                    checkpointSha: metadata.exactSha,
+                    state: 'metadata-failed',
+                    attempt: 1,
+                    nextDue: Math.floor(Date.now() / 1000) + 300,
+                    detail: 'metadata-invalid',
+                    summary: 'Checkpoint `' + checkpointRef + '` recovery metadata failed validation (' + validationError + '). Raw work is preserved; no resume is dispatched.',
+                  });
+                  core.warning(
+                    'OpenCode infrastructure checkpoint ' + checkpointRef +
+                    ' metadata failed validation: ' + validationError
+                  );
+                  return;
+                }
+                // The ref tip is authoritative for a fetchable checkpoint; a
+                // stale event pointer must not dispatch an older SHA than the
+                // ref now exposes.
+                checkpointSha = metadata.exactSha || pointerSha;
+                if (metadata.stalePointer) {
+                  core.warning(
+                    'OpenCode infrastructure checkpoint ' + checkpointRef +
+                    ' advanced from stale event pointer ' + pointerSha +
+                    ' to current ref tip ' + checkpointSha + '; using the tip.'
+                  );
+                }
               }
 
               const displayTitle = mode === 'issue'
@@ -867,7 +1370,7 @@ jobs:
                     target: observedTarget,
                     notBefore: Math.max(0, previous.nextDue - 300) * 1000,
                     displayTitle,
-                    recoveryRunName: recoveryTitle,
+                    recoveryRunName: legacyReplay ? '' : recoveryTitle,
                     oldRunId: run && run.id,
                   });
                   if (recovered) {
@@ -983,26 +1486,57 @@ jobs:
                 return;
               }
 
-              const dispatchInputs = {
-                mode: mode,
-                issue_number: issueText,
-                pr_number: prText,
-                head_ref: String(identity.head_ref || identity.branch || ''),
-                review_id: String(identity.review_id || ''),
-                unresolved_items_json: String(identity.unresolved_items_json || ''),
-                run_id: String(identity.run_id || ''),
-                base_ref: String(identity.base_ref || ''),
-                capability_number: String(identity.capability_number || ''),
-                qualification_number: String(identity.qualification_number || ''),
-                required_sha: String(identity.required_sha || ''),
-                recovery_identity: JSON.stringify({
-                  recovery_operation_id: operation,
-                  recovery_checkpoint_ref: checkpointRef,
-                  recovery_checkpoint_sha: checkpointSha,
-                  recovery_stage: stage,
-                  recovery_generation: String(generation),
-                }),
-              };
+              // A standard issue-mode replay must not compete with a runner
+              // the owner (or the scheduler) already started. Adopting the
+              // live run as observed evidence also keeps the scheduler
+              // reservation alive without a duplicate model invocation.
+              if (legacyReplay) {
+                const active = await findActiveIssueRun({
+                  target, issueNumber: issueText,
+                });
+                if (active) {
+                  await recordRecoveryState({
+                    ...baseState,
+                    checkpointSha,
+                    state: 'observed',
+                    attempt,
+                    nextDue: 0,
+                    runId: String(active.id),
+                    detail: 'legacy-run-already-active',
+                    summary: 'A real issue-mode runner ' + active.id +
+                      ' already owns the preserved legacy checkpoint `' +
+                      checkpointRef + '`; no duplicate replay was dispatched.',
+                  });
+                  core.notice(
+                    'OpenCode legacy 429: adopted already-active issue-mode run ' +
+                    active.id + ' for issue #' + issueText + '; no duplicate dispatch.'
+                  );
+                  return;
+                }
+              }
+
+              const dispatchInputs = legacyReplay
+                ? legacyRecoveryDispatchInputs(issueText)
+                : {
+                    mode: mode,
+                    issue_number: issueText,
+                    pr_number: prText,
+                    head_ref: String(identity.head_ref || identity.branch || ''),
+                    review_id: String(identity.review_id || ''),
+                    unresolved_items_json: String(identity.unresolved_items_json || ''),
+                    run_id: String(identity.run_id || ''),
+                    base_ref: String(identity.base_ref || ''),
+                    capability_number: String(identity.capability_number || ''),
+                    qualification_number: String(identity.qualification_number || ''),
+                    required_sha: String(identity.required_sha || ''),
+                    recovery_identity: JSON.stringify({
+                      recovery_operation_id: operation,
+                      recovery_checkpoint_ref: checkpointRef,
+                      recovery_checkpoint_sha: checkpointSha,
+                      recovery_stage: stage,
+                      recovery_generation: String(generation),
+                    }),
+                  };
               // Exactly-once fence: claim before dispatch with a fresh comment.
               // A concurrent workflow_run/catch-up pass for the same
               // operation+generation either sees the claim (and stands down) or
@@ -1093,7 +1627,7 @@ jobs:
                 target,
                 notBefore: dispatchStarted,
                 displayTitle,
-                recoveryRunName: recoveryTitle,
+                recoveryRunName: legacyReplay ? '' : recoveryTitle,
                 oldRunId: run && run.id,
               });
               if (!observed) {
@@ -1104,7 +1638,9 @@ jobs:
                   attempt,
                   nextDue: now + 120,
                   detail: 'dispatch-not-observed',
-                  summary: 'GitHub accepted the fresh-VM dispatch through `' + target.path +
+                  summary: 'GitHub accepted the ' + (legacyReplay
+                    ? 'standard issue-mode legacy replay'
+                    : 'fresh-VM dispatch') + ' through `' + target.path +
                     '`, but no new run was observed yet. A scheduled watchdog catch-up will verify it; a claim alone is not treated as proof that a runner started.',
                 });
                 core.warning(
@@ -1120,15 +1656,24 @@ jobs:
                 attempt,
                 nextDue: 0,
                 runId: String(observed.id),
-                detail: 'run-started',
-                summary: 'Dispatched a fresh-VM resumption through `' + target.path +
-                  '` and observed new run ' + observed.id + ' for checkpoint `' +
-                  checkpointRef + '` at exact SHA `' + checkpointSha + '` (stage `' +
-                  stage + '`, generation ' + generation + '). Completed stages are not ' +
-                  'repeated and no task/review/qualification budget was consumed.',
+                detail: legacyReplay ? 'legacy-run-started' : 'run-started',
+                summary: (legacyReplay
+                  ? 'Dispatched the standard issue-mode legacy replay through `' +
+                    target.path + '` and observed new run ' + observed.id +
+                    ' for preserved checkpoint `' + checkpointRef +
+                    '` at exact SHA `' + checkpointSha + '`. The untrusted pre-fix ' +
+                    'stage was not used to skip the agent or tests and no recovery ' +
+                    'metadata was fabricated.'
+                  : 'Dispatched a fresh-VM resumption through `' + target.path +
+                    '` and observed new run ' + observed.id + ' for checkpoint `' +
+                    checkpointRef + '` at exact SHA `' + checkpointSha + '` (stage `' +
+                    stage + '`, generation ' + generation + '). Completed stages are not ' +
+                    'repeated and no task/review/qualification budget was consumed.'),
               });
               core.notice(
-                'OpenCode 429: observed fresh-VM run ' + observed.id +
+                'OpenCode 429: observed ' + (legacyReplay
+                  ? 'legacy issue-mode replay'
+                  : 'fresh-VM') + ' run ' + observed.id +
                 ' for operation ' + operation + ' generation ' + generation +
                 ' stage ' + stage + ' through ' + target.path +
                 ' from checkpoint ' + checkpointRef + ' at exact SHA ' +
@@ -1258,6 +1803,15 @@ jobs:
                       (failed.salvageRef || 'none') + '` but could not produce valid ' +
                       'recovery metadata. No recoverable checkpoint pointer was published.',
                   });
+                } else {
+                  // No newer evacuation line: a pre-#366 run may still own a
+                  // legacy issue checkpoint. Identify it from the caller's
+                  // stable run-name, never from a guessed ref.
+                  await recoverFrom429OnFreshVm({
+                    owner, repo, run: candidate,
+                    evacuated429: null,
+                    max429Restarts,
+                  });
                 }
               }
               core.notice(
@@ -1372,10 +1926,19 @@ jobs:
                   (failed.salvageRef || 'no salvage ref') + '.'
                 );
               } else {
+                // Pre-#366 runs logged only the restart marker. Recover a
+                // trusted issue identity from the stable run-name and bind the
+                // legacy branch to its same-tip generation ref; if that fails
+                // closed the catch-up simply re-scans without pausing.
+                await recoverFrom429OnFreshVm({
+                  owner, repo, run,
+                  evacuated429: null,
+                  max429Restarts,
+                });
                 core.warning(
                   'OpenCode infrastructure marker in run ' + run.id +
-                  ' has neither a valid checkpoint pointer nor metadata-failure ' +
-                  'evidence; a scheduled catch-up will re-scan it. No pause was applied.'
+                  ' has no newer checkpoint pointer; legacy issue-checkpoint ' +
+                  'binding (if any) owns the next step. No pause was applied.'
                 );
               }
               return;

@@ -3366,6 +3366,292 @@ jobs:
                   runId: latest[5] === '-' ? '' : latest[5],
                 };
               };
+              // kodmial/continuum#373: pre-#366 429 interruptions have no
+              // recovery metadata, so the watchdog cannot safely resume them
+              // from a signed checkpoint. They may only be replayed through
+              // the standard issue mode after proving the legacy
+              // `opencode/checkpoint-issue<N>` branch is bound to a same-tip
+              // 429/infra generation ref. While that bounded replay is
+              // pending, historical scheduler dispatch markers are
+              // infrastructure evidence and must not re-pause the issue
+              // before a real runner can make durable progress.
+              const LEGACY_ISSUE_CHECKPOINT_PREFIX = 'opencode/checkpoint-issue';
+              const LEGACY_LEASE_MARKER_PREFIX = '<!-- continuum-429-legacy-lease';
+              const LEGACY_LEASE_SECONDS = 900;
+              const MAX_LEGACY_RECOVERY_LEASES = 4;
+              const LEGACY_STAGES = new Set([
+                'implementation-incomplete',
+                'implementation-complete',
+                'tests-running',
+                'tests-passed',
+                'publish-pr',
+                'review-repair',
+                'qualification',
+              ]);
+
+              function legacyIssueCheckpointRef(issueNumber) {
+                const text = String(issueNumber || '').trim();
+                return /^[0-9]+$/.test(text)
+                  ? LEGACY_ISSUE_CHECKPOINT_PREFIX + text
+                  : '';
+              }
+
+              function parseCheckpointRef(ref) {
+                const text = String(ref || '').trim();
+                for (const prefix of [
+                  'opencode/429-checkpoint-',
+                  'opencode/infra-checkpoint-',
+                ]) {
+                  if (!text.startsWith(prefix)) continue;
+                  const rest = text.slice(prefix.length);
+                  const at = rest.lastIndexOf('-gen-');
+                  if (at <= 0) return null;
+                  const generation = rest.slice(at + 5);
+                  if (!/^[0-9]+$/.test(generation)) return null;
+                  return {
+                    operationId: rest.slice(0, at),
+                    generation: Number(generation),
+                  };
+                }
+                return null;
+              }
+
+              // Pure production decision. The recorded legacy stage is never
+              // returned as a skip authorization: this path only decides
+              // whether the scheduler may hold the reservation for a bounded
+              // issue-mode replay.
+              function bindLegacy429Checkpoint({
+                issueNumber, legacyRef, legacySha, checkpointRefs,
+                stageFileContent, metadataPresent,
+              }) {
+                const issue = String(issueNumber || '').trim();
+                if (!/^[0-9]+$/.test(issue)) {
+                  return { ok: false, reason: 'legacy checkpoint requires an issue number' };
+                }
+                const expectedRef = legacyIssueCheckpointRef(issue);
+                if (String(legacyRef || '').trim() !== expectedRef) {
+                  return { ok: false, reason: 'legacy checkpoint ref does not belong to the issue' };
+                }
+                const sha = String(legacySha || '').trim().toLowerCase();
+                if (!/^[0-9a-f]{40}$/.test(sha)) {
+                  return { ok: false, reason: 'legacy checkpoint SHA is malformed' };
+                }
+                const rawStage = String(stageFileContent || '')
+                  .split(/\r?\n/)[0].trim();
+                if (rawStage && !LEGACY_STAGES.has(rawStage)) {
+                  return { ok: false, reason: 'legacy checkpoint has no valid recorded stage' };
+                }
+                // Absence is not a blocker: replay never uses the record to
+                // skip the agent or tests.
+                const stage = rawStage || 'implementation-incomplete';
+                if (metadataPresent) {
+                  return { ok: false, reason: 'legacy checkpoint unexpectedly carries recovery metadata' };
+                }
+                const operation = 'opencode-429-issue-issue' + issue;
+                let generation = 0;
+                for (const item of Array.isArray(checkpointRefs) ? checkpointRefs : []) {
+                  const parsed = parseCheckpointRef(item && item.ref);
+                  if (!parsed || parsed.operationId !== operation) continue;
+                  if (parsed.generation < 1) continue;
+                  if (String(item.sha || '').trim().toLowerCase() !== sha) continue;
+                  if (parsed.generation > generation) generation = parsed.generation;
+                }
+                if (!generation) {
+                  return {
+                    ok: false,
+                    reason: 'legacy checkpoint has no matching 429 generation ref',
+                  };
+                }
+                return {
+                  ok: true,
+                  checkpointRef: expectedRef,
+                  checkpointSha: sha,
+                  generation,
+                  stage,
+                  skipAgent: false,
+                };
+              }
+
+              function decideExpiredLeaseOutcome({
+                hasFresh429Recovery, legacyCheckpoint, legacyLeaseFresh,
+                legacyLeaseAttempt, maxLegacyLeases, schedulerDispatchCount,
+                maxDispatchAttempts, pauseOnFailure,
+              }) {
+                if (hasFresh429Recovery) return 'hold-429';
+                if (legacyCheckpoint && legacyCheckpoint.ok) {
+                  if (legacyLeaseFresh) return 'hold-legacy';
+                  if (
+                    Math.max(0, Number(legacyLeaseAttempt) || 0) <
+                    Math.max(1, Number(maxLegacyLeases) || 1)
+                  ) {
+                    return 'hold-legacy';
+                  }
+                  // Exhausting the bounded lease never pauses proven legacy
+                  // work: release the reservation without a new coding
+                  // dispatch so the watchdog (or the owner) retains control.
+                  return 'retry-legacy';
+                }
+                if (
+                  schedulerDispatchCount >= maxDispatchAttempts &&
+                  pauseOnFailure
+                ) {
+                  return 'pause';
+                }
+                return 'retry';
+              }
+
+              function legacyLeaseMarker({
+                operation, generation, checkpointRef, checkpointSha,
+                attempt, nextDue,
+              }) {
+                const clean = value => String(value || '').trim() || '-';
+                return LEGACY_LEASE_MARKER_PREFIX +
+                  ' op=' + clean(operation) +
+                  ' gen=' + Math.max(0, Number(generation) || 0) +
+                  ' attempt=' + Math.max(0, Number(attempt) || 0) +
+                  ' next_due=' + Math.max(0, Number(nextDue) || 0) +
+                  ' checkpoint=' + clean(checkpointRef) +
+                  ' sha=' + clean(checkpointSha) + ' -->';
+              }
+
+              function parseLegacyLeaseState(body, operation, generation) {
+                const re = /<!--\s*continuum-429-legacy-lease\s+op=(\S+)\s+gen=(\d+)\s+attempt=(\d+)\s+next_due=(\d+)\s+checkpoint=(\S*)\s+sha=(\S*)\s*-->/g;
+                const text = String(body || '');
+                let match;
+                let latest = null;
+                while ((match = re.exec(text)) !== null) {
+                  if (match[1] !== operation) continue;
+                  if (Number(match[2]) !== Number(generation)) continue;
+                  latest = {
+                    attempt: Number(match[3]),
+                    nextDue: Number(match[4]),
+                    checkpointRef: match[5] === '-' ? '' : match[5],
+                    checkpointSha: match[6] === '-' ? '' : match[6],
+                  };
+                }
+                return latest;
+              }
+
+              async function detectLegacy429Checkpoint(issueNumber) {
+                const legacyRef = legacyIssueCheckpointRef(issueNumber);
+                if (!legacyRef) return null;
+                let legacySha = '';
+                try {
+                  const response = await readGithub.rest.git.getRef({
+                    owner, repo, ref: 'heads/' + legacyRef,
+                  });
+                  legacySha = String(response.data.object.sha || '').toLowerCase();
+                } catch (err) {
+                  if (Number(err && err.status || 0) !== 404) {
+                    core.warning(
+                      'Legacy 429 checkpoint read for issue #' + issueNumber +
+                      ' failed closed: HTTP ' + Number(err && err.status || 0)
+                    );
+                  }
+                  return null;
+                }
+                if (!/^[0-9a-f]{40}$/.test(legacySha)) return null;
+                let stageFileContent = '';
+                try {
+                  const content = await readGithub.rest.repos.getContent({
+                    owner, repo, path: '.continuum-429-stage', ref: legacySha,
+                  });
+                  if (Array.isArray(content.data) || content.data.type !== 'file') {
+                    return null;
+                  }
+                  stageFileContent = Buffer.from(
+                    content.data.content || '', 'base64'
+                  ).toString('utf8');
+                } catch (err) {
+                  const status = Number(err && err.status || 0);
+                  // The progress file is optional pre-fix evidence; only an
+                  // unreadable repository state fails closed.
+                  if (status !== 404 && status !== 422) return null;
+                  stageFileContent = '';
+                }
+                let metadataPresent = false;
+                try {
+                  await readGithub.rest.repos.getContent({
+                    owner, repo, path: '.continuum-429-recovery.json',
+                    ref: legacySha,
+                  });
+                  metadataPresent = true;
+                } catch (err) {
+                  const status = Number(err && err.status || 0);
+                  if (status !== 404 && status !== 422) return null;
+                }
+                const operation = 'opencode-429-issue-issue' + issueNumber;
+                const checkpointRefs = [];
+                for (const prefix of [
+                  'opencode/429-checkpoint-',
+                  'opencode/infra-checkpoint-',
+                ]) {
+                  try {
+                    const response = await readGithub.rest.git.listMatchingRefs({
+                      owner, repo, ref: prefix + operation,
+                    });
+                    for (const item of response.data || []) {
+                      checkpointRefs.push({
+                        ref: String(item.ref || '').replace(/^refs\/heads\//, ''),
+                        sha: String(item.object && item.object.sha || '')
+                          .toLowerCase(),
+                      });
+                    }
+                  } catch (err) {
+                    return null;
+                  }
+                }
+                return bindLegacy429Checkpoint({
+                  issueNumber,
+                  legacyRef,
+                  legacySha,
+                  checkpointRefs,
+                  stageFileContent,
+                  metadataPresent,
+                });
+              }
+
+              async function recordLegacyLease(
+                issueNumber, legacy, previousLease, commentsForIssue
+              ) {
+                const operation = 'opencode-429-issue-issue' + issueNumber;
+                const attempt = (previousLease ? previousLease.attempt : 0) + 1;
+                const nextDue = Math.floor(Date.now() / 1000) + LEGACY_LEASE_SECONDS;
+                const marker = legacyLeaseMarker({
+                  operation,
+                  generation: legacy.generation,
+                  checkpointRef: legacy.checkpointRef,
+                  checkpointSha: legacy.checkpointSha,
+                  attempt,
+                  nextDue,
+                });
+                const body = [
+                  marker,
+                  '⚡ **Continuum · issue-scheduler**',
+                  '<!-- continuum-origin role=continuum component=issue-scheduler -->',
+                  'Pre-fix 429 work is preserved on `' + legacy.checkpointRef +
+                    '`. A bounded standard issue-mode replay will revalidate it; ' +
+                    'historical scheduler dispatch markers are infrastructure, ' +
+                    'not task failures. No label was added or removed.',
+                ].join('\n');
+                const existing = commentsForIssue
+                  .filter(comment => parseLegacyLeaseState(
+                    comment.body || '', operation, legacy.generation
+                  ))
+                  .sort((a, b) => Number(a.id || 0) - Number(b.id || 0));
+                if (existing.length) {
+                  const latest = existing[existing.length - 1];
+                  await github.rest.issues.updateComment({
+                    owner, repo, comment_id: latest.id, body,
+                  });
+                } else {
+                  await github.rest.issues.createComment({
+                    owner, repo, issue_number: issueNumber, body,
+                  });
+                }
+                return { attempt, nextDue };
+              }
+
               const newestRecovery = recoveryComments
                 .map(comment => ({
                   at: new Date(comment.updated_at || comment.created_at || 0).getTime(),
@@ -3506,7 +3792,61 @@ jobs:
                 continue;
               }
 
-              if (hasFresh429Recovery) {
+              let legacyCheckpoint = null;
+              let legacyLease = null;
+              let leaseOutcome = decideExpiredLeaseOutcome({
+                hasFresh429Recovery,
+                legacyCheckpoint: null,
+                legacyLeaseFresh: false,
+                legacyLeaseAttempt: 0,
+                maxLegacyLeases: MAX_LEGACY_RECOVERY_LEASES,
+                schedulerDispatchCount: schedulerDispatches.length,
+                maxDispatchAttempts,
+                pauseOnFailure,
+              });
+              // Only an owner-admitted, non-paused, non-blocked issue may use
+              // the legacy 429 replay path. The cache evidence is read at most
+              // once and only when the ordinary decision would pause.
+              if (
+                leaseOutcome === 'pause' &&
+                !labels.has(pausedLabel) &&
+                !labels.has(blockedLabel) &&
+                !labels.has(qualifyingLabel) &&
+                (!readyLabel || labels.has(readyLabel))
+              ) {
+                legacyCheckpoint = await detectLegacy429Checkpoint(issueNumber);
+                if (legacyCheckpoint && legacyCheckpoint.ok) {
+                  const operation = 'opencode-429-issue-issue' + issueNumber;
+                  legacyLease = comments
+                    .map(comment => ({
+                      at: new Date(
+                        comment.updated_at || comment.created_at || 0
+                      ).getTime(),
+                      ...(parseLegacyLeaseState(
+                        comment.body || '', operation, legacyCheckpoint.generation
+                      ) || {}),
+                    }))
+                    .filter(item => Number.isFinite(item.attempt))
+                    .sort((a, b) => a.at - b.at)
+                    .at(-1) || null;
+                  leaseOutcome = decideExpiredLeaseOutcome({
+                    hasFresh429Recovery,
+                    legacyCheckpoint,
+                    legacyLeaseFresh: Boolean(
+                      legacyLease &&
+                      legacyLease.nextDue > 0 &&
+                      legacyLease.nextDue * 1000 > Date.now()
+                    ),
+                    legacyLeaseAttempt: legacyLease ? legacyLease.attempt : 0,
+                    maxLegacyLeases: MAX_LEGACY_RECOVERY_LEASES,
+                    schedulerDispatchCount: schedulerDispatches.length,
+                    maxDispatchAttempts,
+                    pauseOnFailure,
+                  });
+                }
+              }
+
+              if (leaseOutcome === 'hold-429') {
                 activeIssueNumbers.add(issueNumber);
                 core.notice(
                   'Issue #' + issueNumber +
@@ -3517,13 +3857,27 @@ jobs:
                 continue;
               }
 
+              if (leaseOutcome === 'hold-legacy') {
+                const lease = await recordLegacyLease(
+                  issueNumber, legacyCheckpoint, legacyLease, comments
+                );
+                activeIssueNumbers.add(issueNumber);
+                core.notice(
+                  'Issue #' + issueNumber +
+                  ' has a proven pre-fix 429 checkpoint `' +
+                  legacyCheckpoint.checkpointRef + '` at exact SHA `' +
+                  legacyCheckpoint.checkpointSha + '` (generation ' +
+                  legacyCheckpoint.generation + '). Holding the reservation ' +
+                  'for a bounded standard issue-mode replay until ' + lease.nextDue +
+                  '; historical scheduler dispatch attempts are infrastructure ' +
+                  'and do not cause automation:paused.'
+                );
+                continue;
+              }
+
               await removeLabel(issueNumber, inProgressLabel);
 
-              if (
-                schedulerDispatches.length >= maxDispatchAttempts &&
-                pauseOnFailure &&
-                !hasFresh429Recovery
-              ) {
+              if (leaseOutcome === 'pause') {
                 await addLabel(issueNumber, pausedLabel);
                 core.warning(
                   'Issue #' + issueNumber + ' produced no OpenCode PR after ' +
@@ -3536,7 +3890,9 @@ jobs:
                   'Lease expired for issue #' + issueNumber +
                   '; it is eligible for an automatic retry' +
                   (schedulerDispatches.length >= maxDispatchAttempts
-                    ? ' because pause_on_failure=false.'
+                    ? legacyCheckpoint && legacyCheckpoint.ok
+                      ? ' without pausing: proven legacy 429 work remains recoverable.'
+                      : ' because pause_on_failure=false.'
                     : '.')
                 );
               }

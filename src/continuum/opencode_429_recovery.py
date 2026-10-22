@@ -106,6 +106,13 @@ DEFAULT_MAX_429_RUNNER_RESTARTS = 3
 #: Prefix for workflow-owned durable checkpoint refs.
 CHECKPOINT_REF_PREFIX = "opencode/429-checkpoint-"
 
+#: Workflow-owned issue-mode interruption checkpoint. Before the durable
+#: recovery metadata existed (#350/#366), an interrupted issue run only left
+#: this branch behind. It is bound to exactly one issue, never to a generation,
+#: so a legacy recovery must additionally prove a same-tip 429/infra checkpoint
+#: ref for the expected operation+generation before it may be replayed.
+LEGACY_ISSUE_CHECKPOINT_PREFIX = "opencode/checkpoint-issue"
+
 #: Infrastructure-unavailable (non-429) checkpoints use a sibling namespace
 #: so a provider outage is still recoverable with the same exact-SHA
 #: contract. Both namespaces validate and restore identically.
@@ -379,6 +386,141 @@ def parse_checkpoint_ref(ref: Any) -> Optional[Dict[str, Any]]:
             return None
         return {"operation_id": operation, "generation": int(generation)}
     return None
+
+
+def legacy_issue_checkpoint_ref(issue_number: Any) -> str:
+    """Workflow-owned legacy issue-mode checkpoint ref for one issue."""
+
+    text = str(issue_number or "").strip()
+    if not text.isdigit():
+        return ""
+    return "{}{}".format(LEGACY_ISSUE_CHECKPOINT_PREFIX, text)
+
+
+def parse_legacy_issue_checkpoint_ref(ref: Any) -> Optional[int]:
+    """Parse ``opencode/checkpoint-issue<N>`` back into ``N``, or ``None``."""
+
+    text = str(ref or "").strip()
+    if not text.startswith(LEGACY_ISSUE_CHECKPOINT_PREFIX):
+        return None
+    issue = text[len(LEGACY_ISSUE_CHECKPOINT_PREFIX):]
+    return int(issue) if issue.isdigit() else None
+
+
+def validate_legacy_checkpoint(
+    *,
+    issue_number: Any,
+    legacy_ref: Any,
+    legacy_sha: Any,
+    checkpoint_refs: Any,
+    stage_file_content: Any,
+    metadata_present: Any,
+) -> Tuple[bool, str]:
+    """Validate a pre-metadata 429 checkpoint for a conservative replay.
+
+    A legacy checkpoint is only eligible when **all** of the following are
+    proven from durable Git evidence:
+
+    * the ref is the workflow-owned ``opencode/checkpoint-issue<N>`` for the
+      expected issue;
+    * the tip SHA is well formed;
+    * the tip carries a known ``.continuum-429-stage`` progress line;
+    * the tip does **not** carry ``.continuum-429-recovery.json`` (otherwise
+      the normal metadata-bearing recovery owns it);
+    * a ``429``/``infra`` checkpoint ref for exactly this issue operation and
+      one of its generations points at the same tip.
+
+    The recorded stage is returned for visibility only. It is never proof that
+    tests passed or that a PR may be published: a legacy replay must always
+    re-run the agent/tests. The function returns ``(ok, reason)``; the caller
+    can recover the bound generation with :func:`legacy_checkpoint_generation`.
+    """
+
+    issue = str(issue_number or "").strip()
+    if not issue.isdigit():
+        return False, "legacy checkpoint requires an issue number"
+    expected_ref = legacy_issue_checkpoint_ref(issue)
+    if str(legacy_ref or "").strip() != expected_ref:
+        return False, "legacy checkpoint ref does not belong to the issue"
+    sha = str(legacy_sha or "").strip().lower()
+    if not _SHA_RE.fullmatch(sha):
+        return False, "legacy checkpoint SHA is malformed"
+    recorded_stage = parse_stage_file(stage_file_content)
+    if recorded_stage is None:
+        # The pre-fix stage file is optional recovery evidence. Its absence
+        # must not strand otherwise-provable work, but a present, malformed
+        # value still fails closed.
+        if str(stage_file_content or "").strip():
+            return False, "legacy checkpoint has no valid recorded stage"
+    if bool(metadata_present):
+        return False, "legacy checkpoint unexpectedly carries recovery metadata"
+    operation = operation_id("issue", issue_number=issue)
+    if not isinstance(checkpoint_refs, (list, tuple)):
+        return False, "legacy checkpoint ref list is malformed"
+    for item in checkpoint_refs:
+        if isinstance(item, Mapping):
+            ref = item.get("ref")
+            item_sha = item.get("sha")
+        elif isinstance(item, (list, tuple)) and len(item) == 2:
+            ref, item_sha = item
+        else:
+            continue
+        parsed = parse_checkpoint_ref(ref)
+        if parsed is None:
+            continue
+        if parsed["operation_id"] != operation:
+            continue
+        if parsed["generation"] < 1:
+            continue
+        if str(item_sha or "").strip().lower() != sha:
+            continue
+        return True, "legacy checkpoint is bound to issue and generation"
+    return False, "legacy checkpoint has no matching 429 generation ref"
+
+
+def legacy_checkpoint_generation(
+    *,
+    issue_number: Any,
+    legacy_sha: Any,
+    checkpoint_refs: Any,
+) -> int:
+    """Highest generation whose 429 checkpoint points at the legacy tip."""
+
+    issue = str(issue_number or "").strip()
+    if not issue.isdigit():
+        return 0
+    operation = operation_id("issue", issue_number=issue)
+    sha = str(legacy_sha or "").strip().lower()
+    generations = []
+    if isinstance(checkpoint_refs, (list, tuple)):
+        for item in checkpoint_refs:
+            if isinstance(item, Mapping):
+                ref = item.get("ref")
+                item_sha = item.get("sha")
+            elif isinstance(item, (list, tuple)) and len(item) == 2:
+                ref, item_sha = item
+            else:
+                continue
+            parsed = parse_checkpoint_ref(ref)
+            if parsed is None or parsed["operation_id"] != operation:
+                continue
+            if parsed["generation"] < 1:
+                continue
+            if str(item_sha or "").strip().lower() != sha:
+                continue
+            generations.append(parsed["generation"])
+    return max(generations) if generations else 0
+
+
+def legacy_recovery_stage(stage_file_content: Any) -> str:
+    """Conservative replay stage for a legacy checkpoint.
+
+    The unverified pre-fix stage file is never allowed to skip the agent or
+    tests, so a legacy replay always resumes from the earliest incomplete
+    stage regardless of what the file claims (for example ``publish-pr``).
+    """
+
+    return "implementation-incomplete"
 
 
 def next_generation(generation: Any) -> int:
@@ -928,6 +1070,7 @@ __all__ = [
     "INFRA_BACKOFF_SCHEDULE",
     "INFRA_CHECKPOINT_REF_PREFIX",
     "CHECKPOINT_REF_PREFIXES",
+    "LEGACY_ISSUE_CHECKPOINT_PREFIX",
     "MODES_HONORING_STAGE_FILE",
     "PUBLISH_RACE_MARKER",
     "RECOVERY_METADATA_FAILED_MARKER",
@@ -948,9 +1091,13 @@ __all__ = [
     "infra_backoff_seconds",
     "is_opencode_429",
     "is_valid_stage",
+    "legacy_checkpoint_generation",
+    "legacy_issue_checkpoint_ref",
+    "legacy_recovery_stage",
     "next_generation",
     "operation_id",
     "parse_checkpoint_ref",
+    "parse_legacy_issue_checkpoint_ref",
     "parse_stage_file",
     "parse_metadata_failure_line",
     "parse_recovery_state_markers",
@@ -969,5 +1116,6 @@ __all__ = [
     "should_skip_opencode",
     "stage_index",
     "unpack_recovery_identity",
+    "validate_legacy_checkpoint",
     "validate_recovery_inputs",
 ]

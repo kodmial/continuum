@@ -75,7 +75,7 @@ MUTATION_COUNTS = {
     "continuum-consumer-child-review.yml": 11,
     "continuum-consumer-child-worker.yml": 7,
     "continuum-docker-qualification.yml": 1,
-    "continuum-issue-scheduler.yml": 11,
+    "continuum-issue-scheduler.yml": 13,
     "continuum-opencode-repair.yml": 2,
     "continuum-opencode-watchdog.yml": 4,
     "continuum-opencode.yml": 12,  # additional functional batch-verification reply
