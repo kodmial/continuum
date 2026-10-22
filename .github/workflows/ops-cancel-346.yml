@@ -36,7 +36,7 @@ jobs:
             const { data: run } = await github.rest.actions.getWorkflowRun({
               owner, repo, run_id,
             });
-            if (run.name !== 'OpenCode agent' || run.display_title !== 'OpenCode issue #346') {
+            if (run.path !== '.github/workflows/opencode.yml' || run.display_title !== 'OpenCode issue #346' || run.event !== 'issue_comment') {
               core.setFailed('Target run identity mismatch: refusing to cancel unrelated work.');
               return;
             }
