@@ -6765,6 +6765,27 @@ class ContinuumTest < Minitest::Test
     assert_includes admission, "review comment author is not the repository owner"
   end
 
+  # A consumer's OpenCode caller is only a forwarder: the reusable workflow's
+  # admission job is the sole place that reads the comment body. A caller-side
+  # command prefilter would be a second parser that could drift from the
+  # canonical grammar and launch costly work before admission runs.
+  def test_opencode_consumer_routing_cannot_bypass_admission
+    stub_path = File.join(ROOT, '.github/caller-stubs/continuum-opencode.yml')
+    stub = File.read(stub_path)
+    call = yaml(stub_path).fetch('jobs').fetch('call')
+    refute call.key?('if'), 'the OpenCode caller must not gate on the comment body'
+    assert_equal 'kodmial/continuum/.github/workflows/continuum-opencode.yml@main',
+                 call.fetch('uses')
+    refute_match(/contains\(github\.event\.comment\.body,\s*'\/(?:oc|opencode)'\)/, stub)
+    refute_match(/startsWith\(github\.event\.comment\.body,\s*'\/(?:oc|opencode)'\)/, stub)
+
+    dogfood_path = File.join(ROOT, '.github/workflows/opencode.yml')
+    dogfood = File.read(dogfood_path)
+    assert_equal './.github/workflows/continuum-opencode.yml',
+                 yaml(dogfood_path).fetch('jobs').fetch('call').fetch('uses')
+    refute_match(/contains\(github\.event\.comment\.body,\s*'\/(?:oc|opencode)'\)/, dogfood)
+  end
+
   # The closed-PR and later-prose cases must not match the PR route. Exercise
   # the real CLI admission decision, then pin the PR rule it implements.
   def test_opencode_pr_gate_logic_rejects_loops_and_accepts_commands

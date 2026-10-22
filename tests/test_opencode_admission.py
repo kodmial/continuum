@@ -339,5 +339,104 @@ class DuplicateRunTests(unittest.TestCase):
         self.assertFalse(self.decision(current, [current], issue=0)["skip"])
 
 
+
+class HistoricalReplayTests(unittest.TestCase):
+    """Replay the nano dictation incident without consumer-specific runtime code."""
+
+    SCHEDULER_DISPATCH = (
+        "/oc\n\n"
+        "<!-- issue-scheduler-dispatch -->\n"
+        "⚡ **Continuum · issue-scheduler**\n"
+        "<!-- continuum-origin role=continuum component=issue-scheduler -->\n"
+        "Automatically dispatched by the issue scheduler (priority:p0)."
+    )
+
+    PINNED_SNAPSHOT = (
+        "<!-- continuum-task-snapshot repo=example/project issue=234 "
+        "generation=1 title-sha256={title} body-sha256={body} spec-sha256={spec} -->\n"
+        "⚡ **Continuum · opencode**\n"
+        "<!-- continuum-origin role=continuum component=opencode -->\n"
+        "Continuum task snapshot (machine-owned, do not edit or delete).\n"
+        "\n"
+        "```json\n"
+        '{{"schema_version":1,"repo":"example/project","issue":234,"generation":1,'
+        '"title":"P0 Windows installer hang","body":"NanoDictate/oc documents the '
+        'manual /oc command in prose. This is a snapshot, not a launch."}}\n'
+        "```\n"
+        "\n"
+        "The product path NanoDictate/oc and the /opencode token are narrative only."
+    ).format(title="a" * 64, body="b" * 64, spec="c" * 64)
+
+    def admit_issue_comment(self, body, author=OWNER, actor=OWNER):
+        return admission.admit_event(
+            event="issue_comment",
+            body=body,
+            author=author,
+            actor=actor,
+            owner=OWNER,
+        )
+
+    def test_historical_events_launch_exactly_one_coder_and_no_snapshot_run(self):
+        results = [
+            self.admit_issue_comment(self.SCHEDULER_DISPATCH),
+            self.admit_issue_comment(self.PINNED_SNAPSHOT),
+        ]
+        self.assertEqual([result["run"] for result in results], [True, False])
+        self.assertEqual(results[0]["route"], "issue")
+        self.assertEqual(results[1]["route"], "ignore")
+        self.assertEqual(sum(1 for result in results if result["run"]), 1)
+
+    def test_marker_only_or_prose_after_marker_never_launches(self):
+        for body in (
+            "Automatically dispatched.\n\n<!-- issue-scheduler-dispatch -->",
+            "Automatic retry.\n\n<!-- opencode-watchdog-retry -->\nPost /oc manually if needed.",
+            "<!-- continuum-task-snapshot repo=example/project issue=234 generation=1 "
+            + "title-sha256={} body-sha256={} spec-sha256={} -->\n".format(
+                "a" * 64, "b" * 64, "c" * 64
+            )
+            + "NanoDictate/oc prose mentions /opencode.",
+        ):
+            with self.subTest(body=body[:60]):
+                result = self.admit_issue_comment(body)
+                self.assertFalse(result["run"])
+                self.assertEqual(result["route"], "ignore")
+
+    def test_paths_urls_json_and_case_variants_are_ignored(self):
+        for body in (
+            "/home/runner/work/oc",
+            "https://github.com/example/project/tree/main/oc",
+            '{"command":"/oc"}',
+            '{"body":"run /opencode now"}',
+            "/OC",
+            "/OpenCode",
+            " /oc\tplease",
+        ):
+            with self.subTest(body=body):
+                self.assertFalse(self.admit_issue_comment(body)["run"], body)
+
+    def test_historical_queued_duplicate_is_skipped_after_first_run_finishes(self):
+        first = run(
+            39691042302,
+            "OpenCode issue #234",
+            created="2026-10-21T23:05:06Z",
+            updated="2026-10-21T23:41:03Z",
+        )
+        duplicate = run(
+            39691076267,
+            "OpenCode issue #234",
+            created="2026-10-21T23:05:23Z",
+            updated="2026-10-21T23:41:28Z",
+        )
+        result = admission.duplicate_run_decision(
+            current=duplicate,
+            runs=[first, duplicate],
+            issue_number=234,
+            workflow_name="OpenCode agent",
+        )
+        self.assertTrue(result["skip"])
+        self.assertEqual(result["duplicate_run_id"], 39691042302)
+        self.assertEqual(result["duplicate_run_status"], "completed")
+
+
 if __name__ == "__main__":
     unittest.main()
