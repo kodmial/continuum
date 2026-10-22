@@ -2888,6 +2888,12 @@ class ContinuumTest < Minitest::Test
     assert_includes scheduler, 'hasFresh429Recovery'
     assert_includes scheduler, 'continuum-429-(?:recovery|resumption|backoff)',
                     'scheduler must recognise durable 429 recovery state'
+    assert_includes scheduler, 'newestRecovery.runId',
+                    'scheduler must follow the recorded resumption run, not a fixed 2h window'
+    assert_includes scheduler, "recoveryRun.status !== 'completed'",
+                    'a still-running recovery must hold the reservation for as long as it runs'
+    assert_includes scheduler, '48 * 60 * 60 * 1000',
+                    'observed/accepted state must use the bounded catch-up horizon'
   end
 
   # ---------------------------------------------------------------- watchdog

@@ -135,7 +135,9 @@ jobs:
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           repository: kodmial/continuum
-          ref: ${{ inputs.continuum_ref || 'main' }}
+          # Pinned: this file is executed by require(); never leave it on a
+          # mutable ref. Advance the pin only in the same PR that changes it.
+          ref: b06bd207d8ff5ad079d14626eb10669c13d56435
           path: .continuum-watchdog-engine
           fetch-depth: 1
           persist-credentials: false
@@ -327,29 +329,46 @@ jobs:
             function latestRecoveryState(comments, operation, generation) {
               const all = [];
               for (const comment of comments) {
-                all.push(...parseRecoveryStates(comment.body || '', operation, generation));
+                for (const state of parseRecoveryStates(
+                  comment.body || '', operation, generation
+                )) {
+                  all.push({ ...state, commentId: Number(comment.id || 0) });
+                }
               }
               return all.length ? all[all.length - 1] : null;
+            }
+
+            function recoveryCommentBody(marker, summary) {
+              return [
+                marker,
+                '⚡ **Continuum · opencode-watchdog**',
+                '<!-- continuum-origin role=continuum component=opencode-watchdog -->',
+                summary,
+              ].join('\n');
             }
 
             async function recordRecoveryState({
               threadNumber, operation, generation, state, checkpointRef,
               checkpointSha, runId, attempt, nextDue, detail, summary,
+              fresh = false,
             }) {
               if (!Number.isInteger(threadNumber) || threadNumber <= 0) return null;
               const marker = recoveryStateMarker({
                 operation, generation, state, checkpointRef, checkpointSha,
                 runId, attempt, nextDue, detail,
               });
-              const body = [
-                marker,
-                '⚡ **Continuum · opencode-watchdog**',
-                '<!-- continuum-origin role=continuum component=opencode-watchdog -->',
-                summary,
-              ].join('\n');
-              const comments = await listThreadComments(threadNumber);
+              const body = recoveryCommentBody(marker, summary);
+              // A claim must be a brand-new comment so concurrent passes get
+              // distinct ids; every other update coalesces onto the existing
+              // durable state comment for this exact operation+generation.
+              const comments = fresh ? [] : await listThreadComments(threadNumber);
+              // Match the machine-readable marker exactly (same operation and
+              // arithmetic generation), never an unanchored substring: a
+              // `gen=1` lookup must not update a `gen=10` comment.
               const existing = comments
-                .filter(comment => (comment.body || '').includes('continuum-429-recovery op=' + operation + ' gen=' + generation))
+                .filter(comment => parseRecoveryStates(
+                  comment.body || '', operation, generation
+                ).length > 0)
                 .sort((a, b) => Number(a.id || 0) - Number(b.id || 0));
               if (existing.length) {
                 const latest = existing[existing.length - 1];
@@ -362,6 +381,61 @@ jobs:
                 owner, repo, issue_number: threadNumber, body,
               });
               return created.data;
+            }
+
+            // kodmial/continuum#350: the pre-dispatch claim must be a fresh
+            // comment so concurrent passes get distinct ids. Two passes can
+            // read the same previous state and both reach dispatch; the lower
+            // comment id wins, the loser deletes its own claim and stands
+            // down, exactly like the original exactly-once fence.
+            async function createRecoveryClaim({
+              threadNumber, operation, generation, checkpointRef, checkpointSha,
+              attempt, nextDue, summary,
+            }) {
+              return recordRecoveryState({
+                threadNumber, operation, generation, state: 'claimed',
+                checkpointRef, checkpointSha, runId: '', attempt, nextDue,
+                detail: 'dispatch-starting', summary, fresh: true,
+              });
+            }
+
+            async function holdsRecoveryClaim(claim, {
+              threadNumber, operation, generation, attempt,
+            }) {
+              if (!claim) return true;
+              if (!Number.isInteger(threadNumber) || threadNumber <= 0) return true;
+              const comments = await listThreadComments(threadNumber);
+              const claimIds = [];
+              for (const comment of comments) {
+                const states = parseRecoveryStates(
+                  comment.body || '', operation, generation
+                );
+                // Any same-attempt marker (claimed, accepted, observed) is a
+                // competing claim. A failed dispatch is retryable and must not
+                // block another pass.
+                const isCurrentClaim = states.some(state =>
+                  state.attempt === attempt &&
+                  state.state !== 'dispatch-failed'
+                );
+                if (isCurrentClaim) claimIds.push(Number(comment.id || 0));
+              }
+              claimIds.sort((a, b) => a - b);
+              return claimIds.length > 0 &&
+                claimIds[0] === Number(claim.id || 0);
+            }
+
+            async function deleteRecoveryClaim(claim) {
+              if (!claim) return;
+              try {
+                await github.rest.issues.deleteComment({
+                  owner, repo, comment_id: claim.id,
+                });
+              } catch (err) {
+                core.warning(
+                  'OpenCode infrastructure recovery claim cleanup failed: ' +
+                  (err.message || err)
+                );
+              }
             }
 
             function validateRecoveryMetadata(identity, expected) {
@@ -625,21 +699,43 @@ jobs:
                 });
                 return;
               }
+              const now = Math.floor(Date.now() / 1000);
+              const comments = await listThreadComments(threadNumber);
+              const previous = latestRecoveryState(comments, operation, generation);
+
               if (generation > max429Restarts) {
-                await recordRecoveryState({
-                  ...baseState,
-                  state: 'backoff',
-                  attempt: generation,
-                  nextDue: Math.floor(Date.now() / 1000) + Math.min(3600, 60 * generation),
-                  detail: 'generation-exhausted',
-                  summary: 'Repeated model 429s on fresh runners; entering bounded infrastructure backoff. No pause was applied and no task/review/qualification budget was consumed.',
-                });
-                core.warning(
-                  'OpenCode infrastructure operation ' + operation + ' entered bounded ' +
-                  'infrastructure backoff after ' + generation +
-                  ' fresh-runner generation(s); checkpoint ' + checkpointRef +
-                  ' preserved for automatic resume.'
-                );
+                // Honor the durable window instead of recording a fresh
+                // `next_due` on every */15 catch-up pass, which would slide the
+                // cooldown forever and strand the reservation.
+                const backoffSchedule = [60, 300, 900, 1800, 3600];
+                const backoffDue = backoffSchedule[
+                  Math.min(
+                    Math.max(0, generation - max429Restarts - 1),
+                    backoffSchedule.length - 1
+                  )
+                ];
+                if (!previous || previous.nextDue <= now) {
+                  await recordRecoveryState({
+                    ...baseState,
+                    state: 'backoff',
+                    attempt: generation,
+                    nextDue: now + backoffDue,
+                    detail: 'generation-exhausted',
+                    summary: 'Repeated model 429s on fresh runners; entering bounded infrastructure backoff. No pause was applied and no task/review/qualification budget was consumed.',
+                  });
+                  core.warning(
+                    'OpenCode infrastructure operation ' + operation + ' entered bounded ' +
+                    'infrastructure backoff after ' + generation +
+                    ' fresh-runner generation(s); checkpoint ' + checkpointRef +
+                    ' preserved for automatic resume.'
+                  );
+                } else {
+                  core.notice(
+                    'OpenCode infrastructure operation ' + operation + ' generation ' +
+                    generation + ' is already in bounded infrastructure backoff until ' +
+                    previous.nextDue + '; not resetting the window.'
+                  );
+                }
                 return;
               }
 
@@ -712,15 +808,28 @@ jobs:
                 );
               }
 
-              const comments = await listThreadComments(threadNumber);
-              const previous = latestRecoveryState(comments, operation, generation);
-              const now = Math.floor(Date.now() / 1000);
               if (previous) {
                 if (previous.state === 'observed') {
                   core.notice(
                     'OpenCode infrastructure operation ' + operation + ' generation ' +
                     generation + ' was already resumed by observed run ' + previous.runId + '; ' +
                     'watchdog will not create a competing resumption.'
+                  );
+                  return;
+                }
+                if (previous.state === 'accepted') {
+                  core.notice(
+                    'OpenCode infrastructure operation ' + operation + ' generation ' +
+                    generation + ' already has an accepted (not yet observed) dispatch; ' +
+                    'watchdog will not create a competing resumption.'
+                  );
+                  return;
+                }
+                if (previous.state === 'claimed' && previous.nextDue > now) {
+                  core.notice(
+                    'OpenCode infrastructure operation ' + operation + ' generation ' +
+                    generation + ' already has a live pre-dispatch claim until ' +
+                    previous.nextDue + '; no duplicate dispatch.'
                   );
                   return;
                 }
@@ -799,6 +908,61 @@ jobs:
                   recovery_generation: String(generation),
                 }),
               };
+              // Exactly-once fence: claim before dispatch with a fresh comment.
+              // A concurrent workflow_run/catch-up pass for the same
+              // operation+generation either sees the claim (and stands down) or
+              // creates a later id (and loses the recheck), so only one pass can
+              // reach createWorkflowDispatch.
+              let claim = null;
+              try {
+                claim = await createRecoveryClaim({
+                  ...baseState,
+                  checkpointSha,
+                  attempt,
+                  nextDue: now + 300,
+                  summary: 'Claiming fresh-VM resumption dispatch for checkpoint `' +
+                    checkpointRef + '` at exact SHA `' + checkpointSha +
+                    '` (stage `' + stage + '`, generation ' + generation +
+                    '); a concurrent pass must stand down.',
+                });
+              } catch (claimErr) {
+                core.warning(
+                  'OpenCode infrastructure operation ' + operation + ' generation ' +
+                  generation + ' could not record the pre-dispatch claim (' +
+                  (claimErr.message || claimErr) +
+                  '); keeping the reservation for a later pass.'
+                );
+                return;
+              }
+              if (claim) {
+                try {
+                  // Give a concurrent create a moment to become visible, then
+                  // let the lowest comment id be the single claim winner.
+                  await new Promise(resolve => setTimeout(resolve, 1000));
+                  const claimed = await holdsRecoveryClaim(claim, {
+                    threadNumber, operation, generation, attempt,
+                  });
+                  if (!claimed) {
+                    await deleteRecoveryClaim(claim);
+                    core.notice(
+                      'OpenCode 429 recovery claim for operation ' + operation +
+                      ' generation ' + generation +
+                      ' is already held by another pass; standing down.'
+                    );
+                    return;
+                  }
+                } catch (claimCheckErr) {
+                  await deleteRecoveryClaim(claim);
+                  core.warning(
+                    'OpenCode infrastructure operation ' + operation + ' generation ' +
+                    generation + ' could not verify the pre-dispatch claim (' +
+                    (claimCheckErr.message || claimCheckErr) +
+                    '); keeping the reservation for a later pass.'
+                  );
+                  return;
+                }
+              }
+
               const dispatchStarted = Date.now();
               try {
                 await github.rest.actions.createWorkflowDispatch({
@@ -810,6 +974,7 @@ jobs:
                 });
               } catch (dispatchErr) {
                 const status = Number(dispatchErr && dispatchErr.status || 0);
+                await deleteRecoveryClaim(claim);
                 await recordRecoveryState({
                   ...baseState,
                   checkpointSha,

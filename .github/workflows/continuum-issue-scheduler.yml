@@ -3356,13 +3356,14 @@ jobs:
               });
               const parse429RecoveryState = body => {
                 const states = [...String(body || '').matchAll(
-                  /<!--\s*continuum-429-recovery\s+op=\S+\s+gen=\d+\s+state=(\S+)\s+attempt=\d+\s+next_due=(\d+)/g
+                  /<!--\s*continuum-429-recovery\s+op=\S+\s+gen=\d+\s+state=(\S+)\s+attempt=\d+\s+next_due=(\d+)\s+checkpoint=(\S*)\s+sha=(\S*)\s+run=(\S*)/g
                 )];
-                if (!states.length) return { state: '', nextDue: 0 };
+                if (!states.length) return { state: '', nextDue: 0, runId: '' };
                 const latest = states[states.length - 1];
                 return {
                   state: latest[1],
                   nextDue: Math.max(0, Number(latest[2]) || 0),
+                  runId: latest[5] === '-' ? '' : latest[5],
                 };
               };
               const newestRecovery = recoveryComments
@@ -3385,8 +3386,38 @@ jobs:
                   return newestRecovery.nextDue > 0 &&
                     newestRecovery.nextDue * 1000 > now;
                 }
-                if (newestRecovery.nextDue > 0) {
-                  return newestRecovery.nextDue * 1000 > now;
+                // A recorded resumption run is authoritative while it is not
+                // completed, however long it runs. The old fixed 2h window
+                // released (and re-dispatched) an issue whose recovery runner
+                // was still working after a slow start.
+                const recoveryRunId = Number(newestRecovery.runId);
+                let recordedRunCompleted = false;
+                if (Number.isInteger(recoveryRunId) && recoveryRunId > 0) {
+                  const recoveryRun = workflowRuns.find(
+                    run => Number(run.id) === recoveryRunId
+                  );
+                  if (recoveryRun) {
+                    if (recoveryRun.status !== 'completed') return true;
+                    recordedRunCompleted = true;
+                  }
+                }
+                if (newestRecovery.nextDue > 0 &&
+                    newestRecovery.nextDue * 1000 > now) {
+                  return true;
+                }
+                // `observed` records next_due=0 and `accepted` only covers the
+                // short dispatch-observation window. Both can precede a
+                // multi-hour run, so keep the reservation for the watchdog's
+                // bounded 48h catch-up horizon instead of 2h. A recorded run
+                // that has already completed still gets the old 2h grace for
+                // the watchdog to write the next durable state.
+                if (newestRecovery.state === 'observed' ||
+                    newestRecovery.state === 'accepted') {
+                  const horizon = recordedRunCompleted
+                    ? 2 * 60 * 60 * 1000
+                    : 48 * 60 * 60 * 1000;
+                  return Number.isFinite(newestRecovery.at) &&
+                    (now - newestRecovery.at) < horizon;
                 }
                 return Number.isFinite(newestRecovery.at) &&
                   (now - newestRecovery.at) < 2 * 60 * 60 * 1000;

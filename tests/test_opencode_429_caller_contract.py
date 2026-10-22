@@ -201,6 +201,7 @@ class WatchdogContractTest(unittest.TestCase):
 
     def test_recovery_states_cover_every_required_outcome(self):
         for state in (
+            "claimed",
             "metadata-pending",
             "metadata-failed",
             "dispatch-failed",
@@ -214,6 +215,38 @@ class WatchdogContractTest(unittest.TestCase):
         self.assertIn("kind: 'missing'", self.body)
         self.assertIn("'auth'", self.body)
         self.assertIn("'transient'", self.body)
+
+    def test_recovery_state_updates_match_the_exact_marker(self):
+        self.assertNotIn(
+            "includes('continuum-429-recovery op=' + operation",
+            self.body,
+            "generation matching must never be an unanchored prefix substring",
+        )
+        self.assertIn(
+            "parseRecoveryStates(\n                  comment.body || '', operation, generation\n                ).length > 0",
+            self.body,
+            "state updates must locate the exact operation+generation marker",
+        )
+
+    def test_infrastructure_backoff_honors_the_durable_window(self):
+        recovery = self.body.split("async function recoverFrom429OnFreshVm")[-1]
+        self.assertIn(
+            "const backoffSchedule = [60, 300, 900, 1800, 3600]", recovery
+        )
+        self.assertIn("if (!previous || previous.nextDue <= now) {", recovery)
+        self.assertIn("not resetting the window", recovery)
+
+    def test_pre_dispatch_claim_fences_concurrent_recovery(self):
+        recovery = self.body.split("async function recoverFrom429OnFreshVm")[-1]
+        self.assertIn("previous.state === 'accepted'", recovery)
+        self.assertIn("createRecoveryClaim({", recovery)
+        self.assertIn("holdsRecoveryClaim(claim", recovery)
+        self.assertIn("deleteRecoveryClaim(claim)", recovery)
+        self.assertLess(
+            recovery.index("createRecoveryClaim({"),
+            recovery.index("createWorkflowDispatch({"),
+            "the durable claim must be recorded before dispatching",
+        )
 
     def test_engine_never_dispatches_a_workflow_call_only_target(self):
         engine = ENGINE.read_text(encoding="utf-8")
