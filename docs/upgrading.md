@@ -7,15 +7,18 @@ tool.
 
 ## What the revision controls
 
-Every installed caller contains a Continuum `uses:` line and a matching
-`continuum_ref`/`engine_ref` value. The installer writes the requested ref to
-both, so the workflow and the scripts it resolves use the same revision.
+Every installed caller contains a Continuum `uses:` line naming one revision.
+Callers that also run fallback engine scripts carry a matching
+`continuum_ref`/`engine_ref` value; the installer writes the requested ref to
+both, so the workflow and the scripts it resolves use the same revision. The
+metadata-only child run-cleanup caller has no engine ref because it executes no
+fallback script.
 
 - `@main` means the live, moving shared implementation. It receives fixes
   without a consumer change, but the same caller can behave differently between
   runs.
-- A full commit SHA is the reproducible choice. It freezes both the workflow and
-  its fallback scripts until the consumer reinstalls at another SHA.
+- A full commit SHA is the reproducible choice. It freezes the workflow and its
+  fallback scripts (where present) until the consumer reinstalls at another SHA.
 - A branch or tag is also accepted by the installer, but a mutable branch/tag
   does not give the reproducibility of a commit SHA.
 
@@ -50,8 +53,9 @@ uses, and only those sets, when changing revisions.
    bash install.sh /path/to/consumer <target-ref> parent --dry-run # if installed
    ```
 
-4. Apply the same commands without `--dry-run`. A remote ref fetches that
-   revision's templates; a local checkout uses its templates.
+4. Apply the same commands without `--dry-run`. An explicit ref fetches that
+   revision's templates over the network. From a local checkout, an install
+   with no explicit ref uses the local `main` working-tree templates instead.
 5. Update the project-owned `ci.yml` Continuum `uses:` ref if it is pinned
    separately.
 6. Inspect the resulting diff and let the consumer's normal CI validate it.

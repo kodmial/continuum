@@ -221,8 +221,10 @@ bash install.sh /path/to/parent main core
 bash install.sh /path/to/parent main parent
 ```
 
-For production, replace `main` with a tested full Continuum commit SHA. Both
-`uses:` and `engine_ref` are set to that revision. The parent set installs only `continuum-child-worker.yml`,
+For production, replace `main` with a tested full Continuum commit SHA. The
+`uses:` calls are set to that revision, plus `engine_ref` where the caller runs
+fallback engine scripts; the cleanup caller has no engine ref. The parent set
+installs only `continuum-child-worker.yml`,
 `continuum-child-review.yml`, `continuum-child-pr-review.yml`, and
 `continuum-child-run-cleanup.yml`. The
 ordinary scheduler comes from the core set. The parent set preserves existing

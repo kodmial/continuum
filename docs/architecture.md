@@ -52,10 +52,12 @@ Two boundaries are deliberate:
   `CI` that calls
   [`continuum-validation.yml`](../.github/workflows/continuum-validation.yml).
   The installer does not create a second CI workflow.
-- **Every installed caller pins one Continuum revision.** A caller's `uses:`
-  line and its `continuum_ref`/`engine_ref` input name the same ref, so the
-  workflow and its fallback scripts move together. `main` is a live branch; a
-  commit SHA is reproducible. See [Upgrading and rollback](upgrading.md).
+- **Every installed caller pins one Continuum revision.** The caller's `uses:`
+  line names that ref. Callers that also run fallback engine scripts carry a
+  matching `continuum_ref`/`engine_ref`, so the workflow and its scripts move
+  together. The metadata-only child run-cleanup caller has no engine ref
+  because it executes no fallback script. `main` is a live branch; a commit SHA
+  is reproducible. See [Upgrading and rollback](upgrading.md).
 
 The layers are installed independently: `core` (task-domain lifecycle), `tech`
 (opt-in technology profiles, currently the Swift CI caller), and `parent`

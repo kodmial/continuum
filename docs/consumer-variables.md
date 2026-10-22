@@ -124,7 +124,7 @@ Most callers are optional; the defaults below are the installed-caller behavior.
 | `AUTOMATION_COMMAND_GRACE_MINUTES` | `5` | Window after a manual owner command during which the scheduler does not enqueue a duplicate run. |
 | `AUTOMATION_REQUIRE_PRIORITY_LABEL` | `false` | Dispatch only issues carrying a priority label. |
 | `AUTOMATION_COUNT_OPEN_PRS_AS_WIP` | `true` | Count an open implementation PR against WIP. |
-| `AUTOMATION_PAUSE_ON_FAILURE` | `false` for installed callers | Enter a terminal pause after exhausted dispatches or a closed failed PR. The reusable input's literal default is `true` for a direct call that omits it. |
+| `AUTOMATION_PAUSE_ON_FAILURE` | scheduler `false`; OpenCode issue path `true` | Enter a terminal pause after exhausted dispatches or a closed failed PR. Installed callers forward an empty value: the scheduler then falls back to `false`, while the OpenCode issue path falls back to `true`. A direct reusable scheduler call that omits the input gets its literal `true` default. |
 | `AUTOMATION_READY_LABEL` | empty | Optional admission label for automatic implementation. Empty keeps normal behavior. Qualification dispatch and manual owner `/oc` never require it. |
 | `AUTOMATION_DISPATCH_MARKER` | `<!-- issue-scheduler-dispatch -->` | Scheduler dispatch marker. Must match the OpenCode and watchdog callers. |
 | `AUTOMATION_IN_PROGRESS_LABEL` | `automation:in-progress` | Reservation label. |
@@ -151,7 +151,12 @@ Recovery settings for
 
 ## Review provider and merge
 
-`CONTINUUM_REVIEW_PROVIDER` is the single authoritative selector.
+`CONTINUUM_REVIEW_PROVIDER` is the single authoritative selector. The generic
+merge path lives in
+[`continuum-auto-merge.yml`](../.github/workflows/continuum-auto-merge.yml); the
+PR-Agent path is
+[`continuum-pr-agent.yml`](../.github/workflows/continuum-pr-agent.yml), and the
+CodeRabbit path is the retry/unresolved controller pair.
 
 | Repository variable | Default | Meaning |
 | --- | --- | --- |
@@ -235,6 +240,21 @@ variables; every one also has a matching input.
 A Docker qualification run is dispatched with an issue number; a run with no
 target fails explicitly.
 
+## Technology library (tech set)
+
+`tech` installs
+[`continuum-tech-swift-ci.yml`](../.github/workflows/continuum-tech-swift-ci.yml),
+a consumer-neutral Swift profile over the validation engine. It disables generic
+auto-detection and reuses the validation hooks, artifact, status, and repair
+variables above. Signing, packaging, and release publication remain
+consumer-owned.
+
+| Repository variable | Default | Meaning |
+| --- | --- | --- |
+| `CONTINUUM_SWIFT_RUNNER` | `macos-latest` | Runner for the Swift profile. |
+| `CONTINUUM_SWIFT_BUILD_COMMAND` | `swift build` | Swift build command. |
+| `CONTINUUM_SWIFT_TEST_COMMAND` | `swift test` | Swift test command. |
+
 ## Parent/child delegation
 
 Relationships live in repository variables, not tracked files. See
@@ -279,7 +299,9 @@ example `actions: write`, `contents: write`, `issues: write`,
 `pull-requests: write`, and `statuses: write` for the relevant controllers).
 Reducing them can break dispatch, label, status, or merge behavior. Mutation
 paths that must fan out use `TAP_PAT`; read-only controller paths use the
-run-scoped `GITHUB_TOKEN`.
+run-scoped `GITHUB_TOKEN`. The declarations live in each installed caller under
+[`.github/caller-stubs/`](../.github/caller-stubs/) and are consumed by the
+reusable workflows under [`.github/workflows/`](../.github/workflows/).
 
 ## Minimal setup
 
