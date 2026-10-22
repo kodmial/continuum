@@ -83,10 +83,11 @@ on:
 permissions: {}
 
 concurrency:
-  # Serialize completed runs that share a PR head so two approved workflows
-  # cannot race a lock decision for the same SHA. The other trigger paths keep
-  # their pre-existing granularity.
-  group: opencode-repair-${{ github.event_name }}-${{ github.event.workflow_run.head_sha || github.event.pull_request.number || inputs.pr_number || github.sha }}
+  # Serialize both admission paths on the reported head SHA, so a completed
+  # approved workflow and a reported CI result for the same commit cannot race
+  # a shared lock decision. The pull_request_target path keeps its pre-existing
+  # per-PR granularity because it has no reported head SHA.
+  group: opencode-repair-${{ github.event.workflow_run.head_sha || inputs.head_sha || github.event.pull_request.number || inputs.pr_number || github.sha }}
   cancel-in-progress: false
 
 jobs:
@@ -463,6 +464,15 @@ jobs:
           CI_REPAIR_WORKFLOWS: ${{ inputs.ci_repair_workflows || vars.CONTINUUM_CI_REPAIR_WORKFLOWS || 'CI' }}
         run: |
           set -euo pipefail
+
+          # The caller already excludes its own completion in the
+          # workflow_run filter. Keep a second, configuration-independent
+          # guard here so a broad or mistaken allow-list can never make this
+          # controller repair its own run in a loop.
+          if [[ "$RUN_NAME" == "OpenCode repair controller" ]]; then
+            echo "Workflow '$RUN_NAME' is this controller itself; refusing a recursive repair."
+            exit 0
+          fi
 
           # The caller wakes this controller on the broad workflow_run glob
           # because an event filter cannot read repository variables. This

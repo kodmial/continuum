@@ -3473,6 +3473,41 @@ class ContinuumTest < Minitest::Test
                     'the hard-coded CI-only admission must be gone'
   end
 
+  # The broad wake-up must stay an admission trigger only: only completed
+  # pull_request runs of an approved workflow may reach the shell at all.
+  def test_opencode_repair_job_admits_only_completed_pull_request_runs
+    job = yaml(File.join(ROOT, '.github/workflows/continuum-opencode-repair.yml'))
+          .fetch('jobs').fetch('ci-repair')
+    condition = job.fetch('if')
+    assert_includes condition, "github.event_name == 'workflow_run'"
+    assert_includes condition, "github.event.workflow_run.event == 'pull_request'",
+                    'non-PR runs must be skipped before any repair work'
+    %w[success failure timed_out].each do |conclusion|
+      assert_includes condition, "github.event.workflow_run.conclusion == '#{conclusion}'"
+    end
+    refute_includes condition, 'cancelled',
+                    'a cancellation is not a repairable defect'
+  end
+
+  # Both admission paths take the same shared label. They must also share one
+  # concurrency key per reported head, otherwise a reported CI success and a
+  # completed Windows host failure for the same SHA could interleave their
+  # run-list read and label write and lose the repair lock.
+  def test_opencode_repair_serializes_both_paths_by_reported_head
+    concurrency = yaml(File.join(ROOT, '.github/workflows/continuum-opencode-repair.yml'))
+                  .fetch('concurrency')
+    group = concurrency.fetch('group')
+    assert_includes group, 'github.event.workflow_run.head_sha',
+                    'completed-workflow runs must key on their reported head'
+    assert_includes group, 'inputs.head_sha',
+                    'reported-CI runs must key on the same reported head'
+    assert_operator group.index('inputs.head_sha'), :<, group.index('inputs.pr_number'),
+                    'the head must take precedence over the PR-only fallback'
+    refute_includes group, 'github.event_name',
+                    'event name must not split the shared per-head lock key'
+    assert_equal false, concurrency.fetch('cancel-in-progress')
+  end
+
   def repair_ci_script
     job = yaml(File.join(ROOT, '.github/workflows/continuum-opencode-repair.yml'))
           .fetch('jobs').fetch('ci-repair')
@@ -3737,9 +3772,12 @@ class ContinuumTest < Minitest::Test
 
     own = run_repair_ci_job(
       run_name: 'OpenCode repair controller', conclusion: 'failure', pr_number: 238,
-      run_head_sha: head, pr_json: repair_pr_json(head_sha: head), workflows: approved
+      run_head_sha: head, pr_json: repair_pr_json(head_sha: head),
+      workflows: "#{approved},OpenCode repair controller"
     )
-    assert_empty own.fetch(:dispatches), 'the controller must never repair itself'
+    assert_empty own.fetch(:dispatches),
+                 'the controller must never repair itself, even if misconfigured'
+    assert_includes own.fetch(:output), 'refusing a recursive repair'
 
     non_pr = run_repair_ci_job(
       run_name: 'Windows host', conclusion: 'failure', pr_number: '',
@@ -3769,6 +3807,27 @@ class ContinuumTest < Minitest::Test
       workflows: approved
     )
     assert_empty repeated.fetch(:dispatches), 'a repeated event for the same head must not dispatch'
+  end
+
+  # A PR that advertises a pinned snapshot is not repairable when the durable
+  # snapshot comment is missing: the contract cannot be verified, so the
+  # approved workflow failure must hold instead of dispatching blind.
+  def test_opencode_repair_holds_when_the_pinned_task_snapshot_is_missing
+    head = '6' * 40
+    ref = '<!-- continuum-task-snapshot-ref repo=kodmial/continuum issue=361 ' \
+          "generation=1 title-sha256=#{'a' * 64} body-sha256=#{'b' * 64} " \
+          "spec-sha256=#{'c' * 64} -->"
+    result = run_repair_ci_job(
+      run_name: 'Windows host', conclusion: 'failure', pr_number: 238,
+      run_head_sha: head,
+      pr_json: repair_pr_json(head_sha: head, body: ref),
+      workflows: 'CI,Windows host'
+    )
+    assert_empty result.fetch(:dispatches),
+                 'an unverifiable snapshot contract must not dispatch a repair'
+    assert_empty result.fetch(:lock_adds),
+                 'an unverifiable snapshot contract must not consume the attempt'
+    assert_includes result.fetch(:output), 'No trusted task snapshot comment found'
   end
 
   # Requirement #3: one shared per-head lock across approved workflows. A green
