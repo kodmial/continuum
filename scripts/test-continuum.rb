@@ -3649,6 +3649,44 @@ class ContinuumTest < Minitest::Test
                  'the README must say plainly that no workflow reads a paid provider key')
   end
 
+  # CONTRIBUTING and the issue chooser are reporter-facing entry points. Point
+  # both at GitHub's repository security policy entrypoint rather than a fixed
+  # blob path, so neither strands a report while the policy file's merge
+  # ordering is outside this change's ownership. The policy content and file
+  # existence are verified where that file is owned.
+  def test_security_reporting_guidance_links_to_the_security_policy
+    contributing = File.read(File.join(ROOT, 'CONTRIBUTING.md'))
+    assert_match(%r{https://github\.com/kodmial/continuum/security/policy}, contributing)
+    refute_match(%r{/blob/[^/]+/SECURITY\.md}, contributing,
+                 'CONTRIBUTING must not link a fixed SECURITY.md blob path')
+    refute_match(/private vulnerability reporting is/i, contributing,
+                 'CONTRIBUTING must not cache a reporting status owned by SECURITY.md')
+
+    config = yaml(File.join(ROOT, '.github/ISSUE_TEMPLATE/config.yml'))
+    security_link = Array(config['contact_links']).find do |link|
+      link['url'].to_s.end_with?('/security/policy')
+    end
+    refute_nil security_link,
+               'the issue chooser must keep a link to the security policy'
+  end
+
+  # GitHub silently drops a template label that does not exist. The forms must
+  # name the scheduler-owned admission hold. The scheduler's creation of that
+  # label is covered with the scheduler contracts, so an unrelated scheduler
+  # edit cannot break the issue-form assertions here.
+  def test_issue_forms_apply_the_admission_hold_label
+    form_paths = Dir[File.join(ROOT, '.github/ISSUE_TEMPLATE/*.yml')].sort
+    form_paths -= [File.join(ROOT, '.github/ISSUE_TEMPLATE/config.yml')]
+    refute_empty form_paths, 'the issue chooser must keep at least one form'
+    form_paths.each do |path|
+      labels = Array(yaml(path)['labels']).map(&:to_s)
+      assert_includes labels, 'automation:blocked',
+                      "#{File.basename(path)} must keep the automation:blocked admission hold"
+      refute_includes labels, 'automation:ready',
+                      "#{File.basename(path)} must not apply automation:ready at creation"
+    end
+  end
+
   # CONTINUUM_HOMEBREW_TAP and CONTINUUM_MACPORTS_TREE were documented as
   # repository variables that nothing reads. Naming a variable a consumer
   # cannot set is worse than not documenting it: it implies a knob that does
