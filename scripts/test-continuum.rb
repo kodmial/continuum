@@ -4391,6 +4391,34 @@ class ContinuumTest < Minitest::Test
                  'every local just-in-time guard must be a skip, not a fall-through'
   end
 
+  # Regression for kodmial/continuum#351: the self-dogfood scheduler must opt
+  # in to explicit `automation:ready` admission. With an empty effective label
+  # a planning-only issue that merely carried `priority:p1` was dispatched as
+  # implementation work. The gate is label-only and re-checked immediately
+  # before dispatch, so issue body prose is never an admission substitute.
+  def test_self_dogfood_scheduler_requires_explicit_ready_label
+    automation = yaml(File.join(ROOT, '.github/workflows/automation.yml'))
+    scheduler_inputs = automation.fetch('jobs').fetch('scheduler').fetch('with')
+    assert_equal 'automation:ready', scheduler_inputs.fetch('ready_label'),
+                 'the self-dogfood scheduler must explicitly require automation:ready'
+
+    scheduler = workflow_body('continuum-issue-scheduler.yml')
+    selection_gate = scheduler.rindex('if (readyLabel && !labels.has(readyLabel)) {')
+    refute_nil selection_gate, 'the label-based selection gate is missing'
+    assert_includes scheduler, 'missing required ready label `'
+
+    jit_gate = scheduler.index('if (readyLabel && !freshLabels.has(readyLabel)) {')
+    refute_nil jit_gate, 'the just-in-time ready-label gate is missing'
+    assert_operator selection_gate, :<, jit_gate,
+                    'the ready label must be re-checked before dispatch'
+
+    local_dispatch = scheduler[scheduler.index('Re-check mutable state immediately before dispatch.')..]
+    refute_nil local_dispatch, 'the local just-in-time re-check block is gone'
+    assert_includes local_dispatch, 'missing required ready label `'
+    refute_includes local_dispatch, 'issue.body',
+                    'issue body content must not substitute for the ready label'
+  end
+
   # kodmial/continuum#266: the optional `automation:ready` admission gate.
   # Empty configuration preserves current behavior; when configured, automatic
   # dispatch admits only issues carrying the label. Priority stays a ranking

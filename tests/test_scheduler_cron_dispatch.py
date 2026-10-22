@@ -394,6 +394,63 @@ class OrderingAndBlockerTests(unittest.TestCase):
         self.assertIn("race window", result.skip_reasons[156])
 
 
+class _ReadyLabelRemovedBeforeDispatch(set):
+    """Simulate an external label removal after candidate selection."""
+
+    def __init__(self, values, removed):
+        super().__init__(values)
+        self.removed = removed
+        self.checks = 0
+
+    def __contains__(self, item):
+        if item == self.removed:
+            self.checks += 1
+            if self.checks > 1:
+                return False
+        return super().__contains__(item)
+
+
+class ReadyLabelAdmissionRegressionTests(unittest.TestCase):
+    """Priority is a ranking signal, never automatic implementation admission."""
+
+    def test_priority_only_planning_issue_is_ineligible_without_ready_label(self):
+        config = SchedulerConfig(ready_label="automation:ready")
+        issue = p0_issue()
+        issue.title = "Planning only: choose an approach"
+        issue.body = "Planning-only issue. Do not implement any code."
+        issue.labels = {"priority:p1"}
+
+        result = reconcile(
+            utcnow(), {156: issue}, set(), set(), {}, {}, {}, set(), config
+        )
+
+        self.assertEqual(result.dispatched, [])
+        self.assertIn(
+            "missing required ready label `automation:ready`",
+            result.skip_reasons[156],
+        )
+        self.assertNotIn(config.in_progress_label, issue.labels)
+
+    def test_ready_label_is_rechecked_immediately_before_dispatch(self):
+        config = SchedulerConfig(ready_label="automation:ready")
+        issue = p0_issue()
+        issue.labels = _ReadyLabelRemovedBeforeDispatch(
+            {"priority:p0", "automation:ready"}, "automation:ready"
+        )
+
+        result = reconcile(
+            utcnow(), {156: issue}, set(), set(), {}, {}, {}, set(), config
+        )
+
+        self.assertEqual(result.dispatched, [])
+        self.assertEqual(result.reservations_added, [])
+        self.assertIn(
+            "missing required ready label `automation:ready`",
+            result.skip_reasons[156],
+        )
+        self.assertNotIn(config.in_progress_label, issue.labels)
+
+
 class WorkflowContractPinTests(unittest.TestCase):
     """The shipped workflow must mirror this contract byte-for-byte in
     semantics: deterministic skip reasons, visible WIP starvation, no
