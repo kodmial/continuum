@@ -115,7 +115,28 @@ Expected result:
 The installer never installs into Continuum's own checkout, and on a fresh
 repository there is nothing to prune.
 
-## 4. Set admission and credentials before opening any issue
+## 4. Commit and push the baseline
+
+The new repository is still empty on the remote. GitHub Actions only schedules
+workflows that exist on the default branch, and branch protection needs an
+existing `main`, so commit the sample project, `ci.yml`, and installed callers,
+then push them before opening any issue:
+
+```sh
+git add -A
+git commit -m "Add Quick Start baseline and Continuum core callers"
+git branch -M main
+git push -u origin main
+```
+
+Confirm the remote now has `main` and the installed workflows:
+
+```sh
+git ls-remote --heads origin main
+gh workflow list --repo "$TEST_REPO"
+```
+
+## 5. Set admission and credentials before opening any issue
 
 ```sh
 gh variable set AUTOMATION_READY_LABEL \
@@ -151,7 +172,7 @@ The default is `none`. See [PR-Agent review](pr-agent-opencode.md) and
 [consumer variables](consumer-variables.md) for provider-specific configuration.
 No paid provider key is required by core.
 
-## 5. Protect `main`
+## 6. Protect `main`
 
 In the repository settings, add a branch protection rule or ruleset for `main`:
 
@@ -164,7 +185,7 @@ In the repository settings, add a branch protection rule or ruleset for `main`:
 Continuum's merge path reads current-HEAD evidence, but server-side protection is
 what prevents a human or misconfigured workflow from writing directly to `main`.
 
-## 6. Negative check: an unadmitted issue must not dispatch
+## 7. Negative check: an unadmitted issue must not dispatch
 
 Open an ordinary issue with no admission label:
 
@@ -212,7 +233,7 @@ PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=src \
   python3 -m unittest discover -s examples/minimal-consumer/verification -v
 ```
 
-## 7. Positive check: admit one harmless issue
+## 8. Positive check: admit one harmless issue
 
 Create the admission label if it does not exist yet, then open a small issue and
 explicitly add the label:
@@ -262,7 +283,7 @@ If the run fails, read the failed step. Common causes are a missing/under-scoped
 protection, or a failing `CI` check. Do not assume a repair or review will always
 succeed.
 
-## 8. Clean up
+## 9. Clean up
 
 For a disposable test repository:
 
