@@ -4,8 +4,16 @@ on:
   # This trusted metadata workflow never checks out or executes PR code.
   pull_request_target:
     types: [opened, reopened, synchronize]
+  # Wake on every completed workflow run because the approved repair set is a
+  # repository variable that this event filter cannot read. The reusable
+  # controller is the allow-list: it repairs only the exact workflow names in
+  # that set, which defaults to CI. The negative pattern excludes this caller's
+  # own `name:` so a completion of this controller can never feed itself. A
+  # rename of this workflow must update the exclusion with it.
   workflow_run:
-    workflows: ["CI"]
+    workflows:
+      - "*"
+      - "!OpenCode repair controller"
     types: [completed]
   # A consumer whose CI lives in a repository Continuum cannot watch with
   # `workflow_run` reports its result here. All four are required: a result
@@ -49,6 +57,10 @@ on:
         description: "Workflow a ci-fix is dispatched to"
         required: false
         type: string
+      ci_repair_workflows:
+        description: "Comma- or newline-separated exact workflow names allowed to dispatch a repair"
+        required: false
+        type: string
 
 permissions: {}
 
@@ -69,3 +81,4 @@ jobs:
       head_ref_pattern: "${{ inputs.head_ref_pattern }}"
       auto_merge_workflow: "${{ inputs.auto_merge_workflow }}"
       opencode_workflow: "${{ inputs.opencode_workflow }}"
+      ci_repair_workflows: "${{ inputs.ci_repair_workflows }}"

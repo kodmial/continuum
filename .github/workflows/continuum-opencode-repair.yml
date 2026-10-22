@@ -70,12 +70,31 @@ on:
         type: string
         default: ''
         required: false
+      ci_repair_workflows:
+        description: >-
+          Comma- or newline-separated exact workflow names whose completed PR
+          runs may trigger a repair. Empty falls back to
+          CONTINUUM_CI_REPAIR_WORKFLOWS, then to CI.
+        type: string
+        default: ''
+        required: false
   # This trusted metadata workflow never checks out or executes PR code.
 
 permissions: {}
 
 concurrency:
-  group: opencode-repair-${{ github.event_name }}-${{ github.event.pull_request.number || github.event.workflow_run.id || inputs.pr_number || github.sha }}
+  # Serialize both admission paths on the reported head SHA, so a completed
+  # approved workflow and a reported CI result for the same commit cannot race
+  # a shared lock decision. The pull_request_target path keeps its pre-existing
+  # per-PR granularity because it has no reported head SHA.
+  #
+  # GitHub keeps at most one running and one pending run per group, so a burst
+  # of same-head completions can replace an older pending controller run. That
+  # is safe because both repair jobs re-reconcile the LATEST approved-workflow
+  # state for the head instead of acting only on their own event: whichever
+  # event survives the queue still repairs a real failure or processes the
+  # green lock decision.
+  group: opencode-repair-${{ github.event.workflow_run.head_sha || inputs.head_sha || github.event.pull_request.number || inputs.pr_number || github.sha }}
   cancel-in-progress: false
 
 jobs:
@@ -211,9 +230,24 @@ jobs:
     timeout-minutes: 5
 
     steps:
+      - name: Checkout shared CI repair state classifier
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: kodmial/continuum
+          ref: ${{ inputs.continuum_ref || 'main' }}
+          path: .continuum-repair-engine
+          fetch-depth: 1
+          persist-credentials: false
+          token: ''
+          sparse-checkout-cone-mode: false
+          sparse-checkout: |
+            .github/scripts/opencode_repair_state.py
+            src/continuum
+
       - name: Reconcile one CI result reported by the consumer's own CI
         env:
           GH_TOKEN: ${{ secrets.TAP_PAT }}
+          REPAIR_STATE_HELPER: ${{ github.workspace }}/.continuum-repair-engine/.github/scripts/opencode_repair_state.py
           PR_NUMBER: ${{ inputs.pr_number }}
           REPORTED_HEAD_SHA: ${{ inputs.head_sha }}
           REPORTED_CONCLUSION: ${{ inputs.conclusion }}
@@ -222,6 +256,7 @@ jobs:
           HEAD_REF_PATTERN: ${{ inputs.head_ref_pattern || vars.CONTINUUM_HEAD_REF_PATTERN || '^opencode/issue[0-9]+-' }}
           AUTO_MERGE_WORKFLOW: ${{ inputs.auto_merge_workflow || vars.CONTINUUM_AUTO_MERGE_WORKFLOW || 'continuum-auto-merge.yml' }}
           OPENCODE_WORKFLOW: ${{ inputs.opencode_workflow || vars.CONTINUUM_OPENCODE_WORKFLOW || 'continuum-opencode.yml' }}
+          CI_REPAIR_WORKFLOWS: ${{ inputs.ci_repair_workflows || vars.CONTINUUM_CI_REPAIR_WORKFLOWS || 'CI' }}
         run: |
           set -euo pipefail
 
@@ -331,49 +366,89 @@ jobs:
             --description "One automatic OpenCode CI repair attempt per failing PR head." \
             --force >/dev/null
 
-          # A green head clears the lock so a later red head on a new commit
-          # gets a fresh attempt, and wakes the merge reconciler. This is the
-          # dispatch path's only success action: there is nothing to repair.
-          if [[ "$REPORTED_CONCLUSION" == "success" ]]; then
-            gh api --method DELETE \
-              "repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/labels/$CI_REPAIR_LABEL" \
-              >/dev/null 2>&1 || true
-            gh api --method POST \
-              "repos/$GITHUB_REPOSITORY/actions/workflows/$AUTO_MERGE_WORKFLOW/dispatches" \
-              -f ref=main >/dev/null
-            echo "PR #$PR_NUMBER reported CI success; repair lock cleared and auto-merge reconciler woken."
-            exit 0
-          fi
-
-          # Only the conclusions this controller repairs consume the lock. A
-          # cancelled or skipped run is not a defect to fix, and must not burn
-          # the one attempt this head is allowed.
-          if [[ "$REPORTED_CONCLUSION" != "failure" && "$REPORTED_CONCLUSION" != "timed_out" ]]; then
+          # GitHub keeps only one running and one pending run per concurrency
+          # group: a burst of completions for the same head can replace a
+          # pending controller run. Each run therefore reconciles the LATEST
+          # state of every approved workflow at the head instead of acting only
+          # on its own event. Whichever event survives the queue repairs a real
+          # failure or processes the green lock decision, so a superseded event
+          # cannot silently suppress the P1 repair guarantee.
+          if [[ "$REPORTED_CONCLUSION" != "success" && "$REPORTED_CONCLUSION" != "failure" && "$REPORTED_CONCLUSION" != "timed_out" ]]; then
             echo "Conclusion '$REPORTED_CONCLUSION' is not a repairable CI failure; ignoring."
             exit 0
           fi
 
-          if grep -Fxq "$CI_REPAIR_LABEL" <<<"$PR_LABELS"; then
-            echo "An automatic CI repair was already attempted for this exact PR head; waiting for a new head or a successful rerun."
-            exit 0
+          runs_json=""
+          runs_trusted=0
+          if runs_json="$(gh api "repos/$GITHUB_REPOSITORY/actions/runs?head_sha=$REPORTED_HEAD_SHA&event=pull_request&per_page=100" 2>/dev/null)"; then
+            runs_trusted=1
           fi
+          # The latest-state classification is shared with the other
+          # admission path through the committed state helper; only the
+          # action taken below is path-specific.
+          state_output="$(printf '%s' "$runs_json" | python3 -B "$REPAIR_STATE_HELPER" \
+            --runs-trusted "$runs_trusted" \
+            --allowed-workflows "$CI_REPAIR_WORKFLOWS" \
+            --own-name "__reported__" \
+            --own-id "$REPORTED_RUN_ID" \
+            --own-conclusion "$REPORTED_CONCLUSION" \
+            --own-force)"
+          state="$(sed -n '1p' <<<"$state_output")"
+          failing_run_id="$(sed -n '2p' <<<"$state_output")"
+          failing_name="$(sed -n '3p' <<<"$state_output")"
 
-          gh api --method POST "repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/labels" \
-            -f "labels[]=$CI_REPAIR_LABEL" >/dev/null
-
-          if ! gh api --method POST \
-            "repos/$GITHUB_REPOSITORY/actions/workflows/$OPENCODE_WORKFLOW/dispatches" \
-            -f ref=main \
-            -f "inputs[mode]=ci-fix" \
-            -f "inputs[pr_number]=$PR_NUMBER" \
-            -f "inputs[head_ref]=$head_ref" \
-            -f "inputs[run_id]=$REPORTED_RUN_ID"; then
-            gh api --method DELETE \
-              "repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/labels/$CI_REPAIR_LABEL" \
-              >/dev/null 2>&1 || true
-            echo "::error::Failed to dispatch OpenCode repair for reported CI run; lock cleared for retry."
-            exit 1
-          fi
+          case "$state" in
+            failure)
+              if grep -Fxq "$CI_REPAIR_LABEL" <<<"$PR_LABELS"; then
+                echo "An automatic CI repair was already attempted for this exact PR head; waiting for a new head or a successful rerun."
+                exit 0
+              fi
+              echo "Latest approved workflow '$failing_name' failed for $REPORTED_HEAD_SHA; dispatching its repair."
+              gh api --method POST "repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/labels" \
+                -f "labels[]=$CI_REPAIR_LABEL" >/dev/null
+              if ! gh api --method POST \
+                "repos/$GITHUB_REPOSITORY/actions/workflows/$OPENCODE_WORKFLOW/dispatches" \
+                -f ref=main \
+                -f "inputs[mode]=ci-fix" \
+                -f "inputs[pr_number]=$PR_NUMBER" \
+                -f "inputs[head_ref]=$head_ref" \
+                -f "inputs[run_id]=${failing_run_id:-$REPORTED_RUN_ID}"; then
+                gh api --method DELETE \
+                  "repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/labels/$CI_REPAIR_LABEL" \
+                  >/dev/null 2>&1 || true
+                echo "::error::Failed to dispatch OpenCode repair for reported CI run; lock cleared for retry."
+                exit 1
+              fi
+              ;;
+            green)
+              gh api --method DELETE \
+                "repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/labels/$CI_REPAIR_LABEL" \
+                >/dev/null 2>&1 || true
+              echo "All approved workflows passed for $REPORTED_HEAD_SHA; repair lock cleared and auto-merge reconciler woken."
+              gh api --method POST \
+                "repos/$GITHUB_REPOSITORY/actions/workflows/$AUTO_MERGE_WORKFLOW/dispatches" \
+                -f ref=main >/dev/null
+              ;;
+            inflight)
+              echo "Another approved workflow is still in flight for $REPORTED_HEAD_SHA; keeping repair lock '$CI_REPAIR_LABEL'."
+              if [[ "$REPORTED_CONCLUSION" == "success" ]]; then
+                gh api --method POST \
+                  "repos/$GITHUB_REPOSITORY/actions/workflows/$AUTO_MERGE_WORKFLOW/dispatches" \
+                  -f ref=main >/dev/null
+              fi
+              ;;
+            unknown)
+              echo "Could not verify current approved workflow state for $REPORTED_HEAD_SHA; keeping repair lock '$CI_REPAIR_LABEL'."
+              if [[ "$REPORTED_CONCLUSION" == "success" ]]; then
+                gh api --method POST \
+                  "repos/$GITHUB_REPOSITORY/actions/workflows/$AUTO_MERGE_WORKFLOW/dispatches" \
+                  -f ref=main >/dev/null
+              fi
+              ;;
+            *)
+              echo "No approved workflow result is known for $REPORTED_HEAD_SHA; nothing to reconcile."
+              ;;
+          esac
 
   ci-repair:
     if: >-
@@ -387,9 +462,24 @@ jobs:
     timeout-minutes: 5
 
     steps:
+      - name: Checkout shared CI repair state classifier
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: kodmial/continuum
+          ref: ${{ inputs.continuum_ref || 'main' }}
+          path: .continuum-repair-engine
+          fetch-depth: 1
+          persist-credentials: false
+          token: ''
+          sparse-checkout-cone-mode: false
+          sparse-checkout: |
+            .github/scripts/opencode_repair_state.py
+            src/continuum
+
       - name: Dispatch one automatic OpenCode fix for failed blocking workflow
         env:
           GH_TOKEN: ${{ secrets.TAP_PAT }}
+          REPAIR_STATE_HELPER: ${{ github.workspace }}/.continuum-repair-engine/.github/scripts/opencode_repair_state.py
           RUN_ID: ${{ github.event.workflow_run.id }}
           RUN_NAME: ${{ github.event.workflow_run.name }}
           RUN_HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
@@ -397,11 +487,48 @@ jobs:
           CI_REPAIR_LABEL: ${{ inputs.ci_repair_label || vars.CONTINUUM_CI_REPAIR_LABEL || 'opencode-ci-repair' }}
           AUTO_MERGE_WORKFLOW: ${{ inputs.auto_merge_workflow || vars.CONTINUUM_AUTO_MERGE_WORKFLOW || 'continuum-auto-merge.yml' }}
           OPENCODE_WORKFLOW: ${{ inputs.opencode_workflow || vars.CONTINUUM_OPENCODE_WORKFLOW || 'continuum-opencode.yml' }}
+          CI_REPAIR_WORKFLOWS: ${{ inputs.ci_repair_workflows || vars.CONTINUUM_CI_REPAIR_WORKFLOWS || 'CI' }}
         run: |
           set -euo pipefail
 
-          if [[ "$RUN_NAME" != "CI" ]]; then
-            echo "Unsupported workflow '$RUN_NAME'; nothing to repair."
+          # The caller already excludes its own completion in the
+          # workflow_run filter. Keep a second, configuration-independent
+          # guard here so a broad or mistaken allow-list can never make this
+          # controller repair its own run in a loop.
+          if [[ "$RUN_NAME" == "OpenCode repair controller" ]]; then
+            echo "Workflow '$RUN_NAME' is this controller itself; refusing a recursive repair."
+            exit 0
+          fi
+
+          # The caller wakes this controller on the broad workflow_run glob
+          # because an event filter cannot read repository variables. This
+          # admission is therefore the authoritative allow-list: only a
+          # workflow whose exact name appears in the configured set may repair
+          # its own run. CI stays the default so an unconfigured consumer keeps
+          # its previous behaviour. Matching is exact and case-sensitive; a
+          # workflow can never authorize itself.
+          #
+          # An unapproved completion is not discarded before reconciliation:
+          # GitHub may have replaced an approved failure's controller run in the
+          # single pending concurrency slot, so the surviving event must still
+          # be allowed to notice that approved failure. The allow-list below
+          # still decides which runs may be repaired, so this never authorizes
+          # the unapproved workflow's own run.
+          repairable=no
+          while IFS= read -r candidate; do
+            candidate="${candidate#"${candidate%%[![:space:]]*}"}"
+            candidate="${candidate%"${candidate##*[![:space:]]}"}"
+            [[ -z "$candidate" ]] && continue
+            if [[ "$candidate" == "$RUN_NAME" ]]; then
+              repairable=yes
+              break
+            fi
+          done < <(printf '%s\n' "$CI_REPAIR_WORKFLOWS" | tr ',' '\n')
+          if [[ "$repairable" != "yes" ]]; then
+            echo "Workflow '$RUN_NAME' is not in the approved repair set; it cannot repair its own run but may still wake reconciliation of an approved failure."
+          fi
+          if [[ "$CONCLUSION" != "success" && "$CONCLUSION" != "failure" && "$CONCLUSION" != "timed_out" ]]; then
+            echo "Conclusion '$CONCLUSION' for '$RUN_NAME' is not repairable; nothing to repair."
             exit 0
           fi
           lock_label="$CI_REPAIR_LABEL"
@@ -517,32 +644,67 @@ jobs:
             --description "$lock_description" \
             --force >/dev/null
 
-          if [[ "$CONCLUSION" == "success" ]]; then
-            gh api --method DELETE \
-              "repos/$GITHUB_REPOSITORY/issues/$pr/labels/$lock_label" \
-              >/dev/null 2>&1 || true
-            echo "$RUN_NAME passed; automatic repair lock '$lock_label' cleared."
-            exit 0
+          # GitHub keeps only one running and one pending run per concurrency
+          # group: a burst of completions for the same head can replace a
+          # pending controller run. Each admitted run therefore reconciles the
+          # LATEST state of every approved workflow at the head instead of
+          # acting only on its own event. Whichever event survives the queue
+          # repairs a real failure or processes the green lock decision, so a
+          # superseded event cannot silently suppress the P1 repair guarantee.
+          runs_json=""
+          runs_trusted=0
+          if runs_json="$(gh api "repos/$GITHUB_REPOSITORY/actions/runs?head_sha=$RUN_HEAD_SHA&event=pull_request&per_page=100" 2>/dev/null)"; then
+            runs_trusted=1
           fi
+          # The latest-state classification is shared with the other
+          # admission path through the committed state helper; only the
+          # action taken below is path-specific.
+          state_output="$(printf '%s' "$runs_json" | python3 -B "$REPAIR_STATE_HELPER" \
+            --runs-trusted "$runs_trusted" \
+            --allowed-workflows "$CI_REPAIR_WORKFLOWS" \
+            --own-name "$RUN_NAME" \
+            --own-id "$RUN_ID" \
+            --own-conclusion "$CONCLUSION")"
+          state="$(sed -n '1p' <<<"$state_output")"
+          failing_run_id="$(sed -n '2p' <<<"$state_output")"
+          failing_name="$(sed -n '3p' <<<"$state_output")"
 
-          if grep -Fxq "$lock_label" <<<"$PR_LABELS"; then
-            echo "An automatic $RUN_NAME repair was already attempted for this exact PR head; waiting for a new head or a successful rerun."
-            exit 0
-          fi
-
-          gh api --method POST "repos/$GITHUB_REPOSITORY/issues/$pr/labels" \
-            -f "labels[]=$lock_label" >/dev/null
-
-          if ! gh api --method POST \
-            "repos/$GITHUB_REPOSITORY/actions/workflows/$OPENCODE_WORKFLOW/dispatches" \
-            -f ref=main \
-            -f "inputs[mode]=ci-fix" \
-            -f "inputs[pr_number]=$pr" \
-            -f "inputs[head_ref]=$head_ref" \
-            -f "inputs[run_id]=$RUN_ID"; then
-            gh api --method DELETE \
-              "repos/$GITHUB_REPOSITORY/issues/$pr/labels/$lock_label" \
-              >/dev/null 2>&1 || true
-            echo "::error::Failed to dispatch OpenCode repair for $RUN_NAME; lock cleared for retry."
-            exit 1
-          fi
+          case "$state" in
+            failure)
+              if grep -Fxq "$lock_label" <<<"$PR_LABELS"; then
+                echo "An automatic $RUN_NAME repair was already attempted for this exact PR head; waiting for a new head or a successful rerun."
+                exit 0
+              fi
+              echo "Latest approved workflow '$failing_name' failed for $RUN_HEAD_SHA; dispatching its repair."
+              gh api --method POST "repos/$GITHUB_REPOSITORY/issues/$pr/labels" \
+                -f "labels[]=$lock_label" >/dev/null
+              if ! gh api --method POST \
+                "repos/$GITHUB_REPOSITORY/actions/workflows/$OPENCODE_WORKFLOW/dispatches" \
+                -f ref=main \
+                -f "inputs[mode]=ci-fix" \
+                -f "inputs[pr_number]=$pr" \
+                -f "inputs[head_ref]=$head_ref" \
+                -f "inputs[run_id]=${failing_run_id:-$RUN_ID}"; then
+                gh api --method DELETE \
+                  "repos/$GITHUB_REPOSITORY/issues/$pr/labels/$lock_label" \
+                  >/dev/null 2>&1 || true
+                echo "::error::Failed to dispatch OpenCode repair for $RUN_NAME; lock cleared for retry."
+                exit 1
+              fi
+              ;;
+            green)
+              gh api --method DELETE \
+                "repos/$GITHUB_REPOSITORY/issues/$pr/labels/$lock_label" \
+                >/dev/null 2>&1 || true
+              echo "All approved workflows passed for $RUN_HEAD_SHA; automatic repair lock '$lock_label' cleared."
+              ;;
+            inflight)
+              echo "$RUN_NAME passed, but another approved workflow for $RUN_HEAD_SHA is still in flight; keeping repair lock '$lock_label'."
+              ;;
+            unknown)
+              echo "Could not verify current approved workflow state for $RUN_HEAD_SHA; keeping repair lock '$lock_label'."
+              ;;
+            *)
+              echo "No approved workflow result is known for $RUN_HEAD_SHA; nothing to reconcile."
+              ;;
+          esac
