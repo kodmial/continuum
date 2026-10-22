@@ -8,6 +8,17 @@ on:
         type: string
         default: main
         required: false
+      periodic_wake:
+        description: >-
+          Optional external periodic signal. The exact value `true` marks a
+          workflow_dispatch as periodic so a second delivery in the same
+          native scheduling window is a cheap NOOP. Native schedule runs are
+          always periodic. Any other value keeps ordinary manual dispatch
+          behavior unchanged; this is a mode selector, never an authorization
+          override.
+        type: string
+        default: 'false'
+        required: false
       wip_limit:
         description: >-
           Concurrent in-progress issues the scheduler may hold. Empty falls
@@ -549,14 +560,97 @@ jobs:
       READ_GITHUB_TOKEN: ${{ github.token }}
 
     steps:
+      # Cheap cross-source guard (kodmial/continuum#375). Native schedule is
+      # always periodic; an external cron sends workflow_dispatch with
+      # periodic_wake=true. Both map to the same native 10-minute window. A
+      # successful completed periodic run from either source is processing
+      # evidence, so a second periodic signal exits before any checkout,
+      # pagination, runtime download or domain dispatch. This is not an
+      # authorization gate: ordinary manual dispatches, issue/PR events and
+      # time-critical recovery keep their existing behavior.
+      - name: Admit periodic wake for this scheduling window
+        id: periodic_gate
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PERIODIC_WAKE: ${{ inputs.periodic_wake || 'false' }}
+          CALLER_EVENT_NAME: ${{ inputs.caller_event_name }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          set -uo pipefail
+          emit() {
+            echo "run=$1" >> "$GITHUB_OUTPUT"
+            echo "reason=$2" >> "$GITHUB_OUTPUT"
+          }
+
+          periodic=false
+          if [[ "${CALLER_EVENT_NAME,,}" == "schedule" ]]; then
+            periodic=true
+          fi
+          case "${PERIODIC_WAKE,,}" in
+            true|1|yes|on) periodic=true ;;
+          esac
+          if [[ "$periodic" != "true" ]]; then
+            emit true "non-periodic"
+            exit 0
+          fi
+
+          # The native Issue scheduler cron is 7,17,27,37,47,57 * * * *.
+          # Map receipt time onto that anchored 10-minute window instead of
+          # treating two nearby HTTP requests as one window. A native run
+          # delayed by a few minutes stays in its intended window.
+          now="$(date -u +%s)"
+          offset=$((7 * 60))
+          interval=$((10 * 60))
+          window_start=$(( now - ((now - offset) % interval) ))
+
+          if ! workflow_id="$(gh api \
+            "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
+            --jq '.workflow_id' 2>/dev/null)" || [[ -z "$workflow_id" || "$workflow_id" == "null" ]]; then
+            echo "::warning::Periodic wake dedupe lookup is unavailable; running the pass without the guard."
+            emit true "lookup-unavailable"
+            exit 0
+          fi
+
+          created="$(date -u -d "@$window_start" +%Y-%m-%dT%H:%M:%SZ)"
+          filter='[.workflow_runs[]
+            | select(.id != '"$GITHUB_RUN_ID"')
+            | select(.status == "completed" and .conclusion == "success")
+            | select(.event == "schedule" or
+                (.event == "workflow_dispatch" and
+                 ((.display_title // "") | contains("[continuum-periodic]"))))'
+          if [[ -n "${DEFAULT_BRANCH:-}" ]]; then
+            filter="$filter"'
+            | select((.head_branch // "") == "'"$DEFAULT_BRANCH"'")'
+          fi
+          filter="$filter"'
+          ] | length'
+
+          if ! evidence="$(gh api \
+            "repos/$GITHUB_REPOSITORY/actions/workflows/$workflow_id/runs?per_page=100&created=%3E%3D$created" \
+            --jq "$filter" 2>/dev/null)" || [[ -z "$evidence" ]]; then
+            echo "::warning::Periodic wake dedupe evidence could not be read; running the pass without the guard."
+            emit true "lookup-unavailable"
+            exit 0
+          fi
+
+          if [[ "$evidence" -gt 0 ]]; then
+            echo "::notice::Periodic pass for this scheduling window already completed; skipping duplicate periodic work."
+            emit false "duplicate-window"
+            exit 0
+          fi
+
+          emit true "window-due"
+
       - name: Checkout parent control plane for delegated scheduling
-        if: vars.CONTINUUM_ROLE == 'parent'
+        if: steps.periodic_gate.outputs.run == 'true' && vars.CONTINUUM_ROLE == 'parent'
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           fetch-depth: 1
           persist-credentials: false
 
       - name: Checkout Continuum engine for admission and delegated scheduling
+        if: steps.periodic_gate.outputs.run == 'true'
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           repository: kodmial/continuum
@@ -567,7 +661,7 @@ jobs:
 
       - name: Build delegated child queue
         id: child_queue
-        if: vars.CONTINUUM_ROLE == 'parent'
+        if: steps.periodic_gate.outputs.run == 'true' && vars.CONTINUUM_ROLE == 'parent'
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.TAP_PAT }}
@@ -1205,6 +1299,7 @@ jobs:
           fi
 
       - name: Reconcile state and dispatch ready issues
+        if: steps.periodic_gate.outputs.run == 'true'
         uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
         env:
           CHILD_ACTIVE_WIP: ${{ steps.child_queue.outputs.active_wip || '0' }}
@@ -4156,7 +4251,7 @@ jobs:
             }
 
       - name: Wake the configured downstream dispatcher
-        if: env.CHILD_DISPATCH_WORKFLOW != '' && vars.CONTINUUM_ROLE != 'parent'
+        if: steps.periodic_gate.outputs.run == 'true' && env.CHILD_DISPATCH_WORKFLOW != '' && vars.CONTINUUM_ROLE != 'parent'
         env:
           GH_TOKEN: ${{ secrets.TAP_PAT }}
           CHILD_DISPATCH_WORKFLOW: ${{ env.CHILD_DISPATCH_WORKFLOW }}
