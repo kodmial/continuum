@@ -239,6 +239,7 @@ jobs:
           fetch-depth: 1
           persist-credentials: false
           token: ''
+          sparse-checkout-cone-mode: false
           sparse-checkout: |
             .github/scripts/opencode_repair_state.py
             src/continuum
@@ -430,6 +431,11 @@ jobs:
               ;;
             inflight)
               echo "Another approved workflow is still in flight for $REPORTED_HEAD_SHA; keeping repair lock '$CI_REPAIR_LABEL'."
+              if [[ "$REPORTED_CONCLUSION" == "success" ]]; then
+                gh api --method POST \
+                  "repos/$GITHUB_REPOSITORY/actions/workflows/$AUTO_MERGE_WORKFLOW/dispatches" \
+                  -f ref=main >/dev/null
+              fi
               ;;
             unknown)
               echo "Could not verify current approved workflow state for $REPORTED_HEAD_SHA; keeping repair lock '$CI_REPAIR_LABEL'."
@@ -465,6 +471,7 @@ jobs:
           fetch-depth: 1
           persist-credentials: false
           token: ''
+          sparse-checkout-cone-mode: false
           sparse-checkout: |
             .github/scripts/opencode_repair_state.py
             src/continuum
