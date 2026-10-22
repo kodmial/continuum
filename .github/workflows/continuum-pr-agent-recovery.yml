@@ -19,9 +19,11 @@ on:
         default: continuum-pr-agent.yml
         required: false
       ci_workflow_name:
-        description: Exact workflow name that proves current-head CI.
+        description: >-
+          Exact workflow name that proves current-head CI. Empty falls back to
+          vars.CONTINUUM_CI_WORKFLOW_NAME, then to 'CI'.
         type: string
-        default: CI
+        default: ''
         required: false
       stale_minutes:
         description: Pending operation age after which missing liveness becomes recoverable.
@@ -151,7 +153,7 @@ jobs:
         uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
         env:
           REVIEW_WORKFLOW: ${{ inputs.review_workflow }}
-          CI_WORKFLOW_NAME: ${{ inputs.ci_workflow_name || 'CI' }}
+          CI_WORKFLOW_NAME: ${{ inputs.ci_workflow_name || vars.CONTINUUM_CI_WORKFLOW_NAME || 'CI' }}
           STALE_MINUTES: ${{ inputs.stale_minutes || vars.PR_AGENT_RECOVERY_STALE_MINUTES || '70' }}
           DISPATCH_GRACE_SECONDS: ${{ inputs.dispatch_grace_seconds || vars.PR_AGENT_RECOVERY_DISPATCH_GRACE_SECONDS || '90' }}
           TARGET_CHILD_ID: ${{ inputs.target_child_id || vars.CONTINUUM_PR_AGENT_TARGET_CHILD_ID }}

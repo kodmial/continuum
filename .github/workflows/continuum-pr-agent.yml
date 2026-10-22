@@ -3449,6 +3449,7 @@ jobs:
       pr_number: ${{ needs.pr_agent.outputs.pr_number }}
       head_sha: ${{ needs.pr_agent.outputs.head_sha }}
       ci_run_id: ${{ needs.pr_agent.outputs.ci_run_id }}
+      ci_workflow_name: ${{ inputs.ci_workflow_name || vars.CONTINUUM_CI_WORKFLOW_NAME || 'CI' }}
       gate_verified: ${{ needs.pr_agent.outputs.merge_gate_verified }}
       target_child_id: ${{ inputs.target_child_id }}
       post_merge_wakeups: ${{ vars.CONTINUUM_POST_MERGE_WAKEUPS || 'continuum-issue-scheduler.yml' }}

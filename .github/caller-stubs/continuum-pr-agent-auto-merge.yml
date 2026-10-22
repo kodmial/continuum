@@ -19,6 +19,10 @@ on:
         description: "Immutable CI workflow run id verified on the exact HEAD at admission"
         required: false
         type: string
+      ci_workflow_name:
+        description: "Exact CI workflow name verified on the exact HEAD at admission"
+        required: false
+        type: string
       gate_verified:
         description: "Safe scalar attestation from the runner-local PR-Agent gate"
         required: false
@@ -69,6 +73,7 @@ jobs:
       target_child_id: "${{ inputs.target_child_id }}"
       head_sha: "${{ inputs.head_sha }}"
       ci_run_id: "${{ inputs.ci_run_id }}"
+      ci_workflow_name: "${{ inputs.ci_workflow_name }}"
       gate_verified: "${{ inputs.gate_verified }}"
       review_json: "${{ inputs.review_json }}"
       improve_jsonl: "${{ inputs.improve_jsonl }}"

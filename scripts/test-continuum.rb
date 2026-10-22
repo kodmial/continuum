@@ -4108,7 +4108,7 @@ class ContinuumTest < Minitest::Test
       retry_attempt retry_workflow
     ],
     'continuum-pr-agent-auto-merge.yml' => %w[
-      continuum_ref pr_number target_child_id head_sha ci_run_id gate_verified review_json improve_jsonl persistent_state_json
+      continuum_ref pr_number target_child_id head_sha ci_run_id ci_workflow_name gate_verified review_json improve_jsonl persistent_state_json
       post_merge_wakeups post_merge_wakeup_ref
       required_workflow_gate_label required_workflow_gate_name
     ],

@@ -1036,6 +1036,28 @@ class ExactHeadCiProofRegressionTests(unittest.TestCase):
                 "green",
                 101,
             ),
+            (
+                "custom-workflow-name-is-proof",
+                {
+                    "proofRun": run(name="Build and test"),
+                    "runs": [],
+                    "workflowName": "Build and test",
+                    "headSha": head,
+                },
+                "green",
+                101,
+            ),
+            (
+                "custom-workflow-name-rejects-default-ci",
+                {
+                    "proofRun": run(name="CI"),
+                    "runs": [run(name="CI")],
+                    "workflowName": "Build and test",
+                    "headSha": head,
+                },
+                "unavailable",
+                None,
+            ),
         ]
 
     @staticmethod
@@ -1233,11 +1255,32 @@ console.log('CI_PROOF_OK');
         self.assertIn("github.rest.actions.getWorkflowRun", merge)
         self.assertIn("resolveExactHeadCi", merge)
 
+        # The merge gate resolves the same configurable CI workflow name as
+        # admission and recovery (issue #368 follow-up): a non-default
+        # CONTINUUM_CI_WORKFLOW_NAME must not degrade the verified run-id proof
+        # to 'unavailable' on a missing 'CI' run name.
+        resolved_ci_name = (
+            "inputs.ci_workflow_name || vars.CONTINUUM_CI_WORKFLOW_NAME || 'CI'"
+        )
+        self.assertIn(resolved_ci_name, review)
+        self.assertIn("ci_workflow_name: ${{ " + resolved_ci_name + " }}", review)
+        self.assertIn("ci_workflow_name:", merge)
+        self.assertIn("CI_WORKFLOW_NAME: ${{ " + resolved_ci_name + " }}", merge)
+        self.assertIn(
+            "resolveExactHeadCi(pr, pr.head.sha, ciWorkflowName)", merge
+        )
+        self.assertNotIn("resolveExactHeadCi(pr, pr.head.sha, 'CI')", merge)
+        self.assertIn("CI_WORKFLOW_NAME: ${{ " + resolved_ci_name + " }}", recovery)
+
         self.assertIn("function decideExactHeadCi", recovery)
         self.assertIn("decideExactHeadCi({", recovery)
 
         self.assertIn("ci_run_id:", stub)
         self.assertIn('ci_run_id: "${{ inputs.ci_run_id }}"', stub)
+        self.assertIn("ci_workflow_name:", stub)
+        self.assertIn(
+            'ci_workflow_name: "${{ inputs.ci_workflow_name }}"', stub
+        )
 
 
 if __name__ == "__main__":
