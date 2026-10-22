@@ -131,6 +131,7 @@ APPROVED_346_OPENCODE_REMOVED_LINES = (
     '                CONTINUUM_STOP_FILE="$stop_file" CONTINUUM_STOP_REPO="${GITHUB_REPOSITORY,,}" CONTINUUM_STOP_ISSUE="$ISSUE_NUMBER" python3 -c \'import json,os,re; path=os.environ.get("CONTINUUM_STOP_FILE") or ""; repo=(os.environ.get("CONTINUUM_STOP_REPO") or "").lower(); issue=os.environ.get("CONTINUUM_STOP_ISSUE") or ""; data=json.load(open(path,encoding="utf-8")) if path else []; data=[data] if isinstance(data,dict) else (data if isinstance(data,list) else []); pat=re.compile(r"<!--\\s*continuum-task-generation-stop\\s+repo=([A-Za-z0-9_.\\-]+/[A-Za-z0-9_.\\-]+)\\s+issue=(\\d+)\\s+generation=(\\d+)\\s+pinned-spec=([0-9a-fA-F]{64})\\s+live-spec=([0-9a-fA-F]{64})\\s+reason=(drift|tampered)\\s*-->"); rec=re.compile(r"<!--\\s*continuum-task-generation-recover\\s+repo=([A-Za-z0-9_.\\-]+/[A-Za-z0-9_.\\-]+)\\s+issue=(\\d+)\\s+generation=(\\d+)\\s*-->"); owner=(repo.split("/")[0] if "/" in repo else ""); stops=[]; recs=[]; [((stops.append(((c.get("created_at") or ""),int(c.get("id") or 0)))) if (m and m.group(1).lower()==repo and m.group(2)==issue and m.group(3)=="1") else (recs.append(((c.get("created_at") or ""),int(c.get("id") or 0)))) if (r and r.group(1).lower()==repo and r.group(2)==issue and r.group(3)=="1") else None) for c in data if isinstance(c,dict) for u in [c.get("user") if isinstance(c.get("user"),dict) else {}] if (str(c.get("author_association") or "").upper() in ("OWNER","MEMBER","COLLABORATOR") or str(u.get("login") or "").lower() in ("github-actions[bot]",owner)) for m in [pat.search(str(c.get("body") or ""))] for r in [rec.search(str(c.get("body") or ""))]]; stops.sort(); recs.sort(); print("stopped" if (stops and not (recs and recs[-1]>stops[-1])) else "active",end="")\' 2>/dev/null || echo "active"',
     '                rm -f "$stop_file"',
     '              }',
+    "                JSON.stringify(record),",
     '            if [[ "${PAUSE_ON_FAILURE,,}" == "false" ]]; then',
     '              echo "::error::No repository changes; autonomous mode delegates bounded retry/recovery instead of pausing."',
     '              exit 1',
@@ -333,6 +334,14 @@ APPROVED_346_OPENCODE_ADDED_LINES = (
     '            } catch (err) {',
     '              if (err.status !== 404) throw err;',
     '              `Released failed reservation for issue #${issueNumber} after attempt ${attempts}/${maxAttempts}; scheduler will retry from live priority state with ready re-checked.`',
+    "                // Keep a specification that quotes `/oc`, `/opencode`, or",
+    "                // `/oc-cancel`, or that embeds a generation-stop/recover",
+    "                // marker, from turning this machine-owned comment into fresh",
+    "                // authority. JSON `\\u002f`/`\\u003c` are escaped, so the",
+    "                // parsed record stays byte-for-byte identical.",
+    "                JSON.stringify(record)",
+    "                  .replace(/\\//g, '\\\\u002f')",
+    "                  .replace(/</g, '\\\\u003c'),",
 )
 
 PROTECTED_FILES = [

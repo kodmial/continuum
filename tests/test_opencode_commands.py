@@ -10,7 +10,11 @@ from __future__ import annotations
 import unittest
 
 from continuum import opencode_commands as commands
-from continuum.task_snapshot import build_snapshot, render_snapshot_comment
+from continuum.task_snapshot import (
+    build_snapshot,
+    parse_snapshot_comment,
+    render_snapshot_comment,
+)
 
 
 DISPATCH_MARKER = commands.DEFAULT_DISPATCH_MARKER
@@ -183,8 +187,16 @@ class NoSelfTriggerTests(unittest.TestCase):
             "The issue body may literally mention /oc and /oc-cancel.",
         )
         rendered = render_snapshot_comment(snapshot)
-        self.assertIn("/oc", rendered)
-        self.assertIn("/oc-cancel", rendered)
+        # JSON `\u002f` stays a valid escaped solidus, so the parsed record
+        # is byte-for-byte identical while the comment contains no literal
+        # command token that a future parser could resurrect.
+        self.assertNotIn("/oc", rendered)
+        self.assertNotIn("/opencode", rendered)
+        self.assertIn("\\u002foc", rendered)
+        parsed = parse_snapshot_comment(rendered)
+        self.assertIsNotNone(parsed)
+        self.assertEqual(parsed.record["title"], snapshot["title"])
+        self.assertEqual(parsed.record["body"], snapshot["body"])
         self.assertEqual(commands.classify_issue_comment(rendered), "ignore")
         self.assertFalse(commands.is_owner_stop_command(rendered, "owner", "owner"))
 

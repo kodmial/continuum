@@ -27,6 +27,11 @@ behavior for legacy work.
   `<!-- continuum-task-snapshot repo=… issue=… generation=… title-sha256=… body-sha256=… spec-sha256=… -->`
   followed by a fenced `json` block with the full record (recoverable
   exact title/body). Human prose in the comment is never parsed as state.
+  Every solidus and `<` in that JSON block is written as a JSON escape
+  (`\u002f`, `\u003c`), so a task that quotes `/oc`, `/opencode`, or
+  `/oc-cancel`, or that embeds a generation-stop/recover marker, cannot turn a
+  machine-owned snapshot comment into fresh authority; parsing still yields the
+  exact original title/body.
 * **PR provenance:** implementation PRs carry the short reference
   `<!-- continuum-task-snapshot-ref repo=… issue=… generation=… … -->`
   next to the existing `continuum-task-context` marker. Reviews and

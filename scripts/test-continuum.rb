@@ -3034,9 +3034,14 @@ class ContinuumTest < Minitest::Test
       if (issuePr) {
       if (anotherActiveRun) {
       if (newerSchedulerDispatch) {
+      generationStopActive(comments, repoFullName, issueNumber, 1)
     ].each do |guard|
       assert_includes body, guard
     end
+    assert_includes body, 'issueRecoveryAdmission(',
+                    '429 recovery must re-apply fixed ready admission before dispatch'
+    assert_includes body, 'is not admitted',
+                    '429 recovery must refuse a stopped/not-ready issue'
     assert_includes body, "retryableConclusions.has(run.conclusion)"
     assert_equal %w[action_required failure stale startup_failure timed_out],
                  body[/const retryableConclusions = new Set\(\[(.*?)\]\);/m, 1].scan(/'(\w+)'/).flatten.sort
@@ -4539,7 +4544,9 @@ class ContinuumTest < Minitest::Test
     refute_includes scheduler, "readGithub.paginate(\n              readGithub.rest.actions.listWorkflowRunsForRepo"
     refute_includes scheduler, 'gh api --paginate "repos/$GITHUB_REPOSITORY/actions/runs?per_page=100"'
     refute_includes scheduler, 'gh api --paginate "repos/$child_repo/actions/runs?per_page=100"'
-    assert_includes scheduler, "run.event !== 'issue_comment'"
+    assert_includes scheduler, "!['issue_comment', 'workflow_dispatch'].includes(run.event)"
+    refute_includes scheduler, "run.event !== 'issue_comment'",
+                    'workflow_dispatch issue runs must also reserve active work'
     assert_includes scheduler, 'run.path === opencodeWorkflowPath ||'
     assert_includes scheduler, 'run.name === opencodeWorkflowName'
     assert_includes scheduler, "if (\n                openPrIssues.has(issueNumber) ||\n                activeRunIssues.has(issueNumber)\n              ) continue;"
@@ -8307,6 +8314,13 @@ class ContinuumTest < Minitest::Test
                      'child drift needs its own deduplicated diagnostic'
     assert_includes worker, 'render-pr-ref',
                      'child PRs must carry the snapshot reference'
+    assert_includes worker, 'render-json',
+                     'child snapshot publication must use the command-neutral renderer'
+    assert_includes worker, 'terminally stopped before publication',
+                     'a late STOP must block child commit/push/PR publication'
+    assert_operator worker.index('terminally stopped before publication'), :<,
+                    worker.index('git add -A'),
+                    'the child STOP re-check must precede commit/push'
     review = workflow_body('continuum-consumer-child-review.yml')
     assert_includes review, 'task_snapshot_admission.py',
                      'child review must verify through the canonical engine'

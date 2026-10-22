@@ -14,6 +14,7 @@ Usage::
         --repo owner/name --issue 123 [--owner owner-login] \\
         [--generation 1] --record-out record.json --decision-out decision.json
     task_snapshot_admission.py render-comment --record-file record.json
+    task_snapshot_admission.py render-json --record-file record.json
     task_snapshot_admission.py render-pr-ref --record-file record.json
     task_snapshot_admission.py render-marker --record-file record.json
     task_snapshot_admission.py render-stop --repo o/n --issue 1
@@ -64,6 +65,7 @@ from continuum.task_snapshot import (  # noqa: E402
     render_generation_stop,
     render_pr_snapshot_ref,
     render_snapshot_comment,
+    render_snapshot_json,
     select_snapshot,
     snapshot_marker_line,
     spec_digest,
@@ -218,6 +220,18 @@ def cmd_render_comment(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_render_json(args: argparse.Namespace) -> int:
+    try:
+        record = _read_json_file(args.record_file)
+    except TaskSnapshotError as exc:
+        return _fail(str(exc))
+    try:
+        print(render_snapshot_json(record))
+    except (KeyError, TaskSnapshotError, TypeError) as exc:
+        return _fail(f"cannot render snapshot JSON: {exc}")
+    return 0
+
+
 def cmd_render_pr_ref(args: argparse.Namespace) -> int:
     try:
         record = _read_json_file(args.record_file)
@@ -324,6 +338,12 @@ def build_parser() -> argparse.ArgumentParser:
     render_comment = sub.add_parser("render-comment", help="render snapshot comment")
     render_comment.add_argument("--record-file", required=True)
     render_comment.set_defaults(func=cmd_render_comment)
+
+    render_json = sub.add_parser(
+        "render-json", help="render the escaped snapshot JSON record"
+    )
+    render_json.add_argument("--record-file", required=True)
+    render_json.set_defaults(func=cmd_render_json)
 
     render_ref = sub.add_parser("render-pr-ref", help="render PR snapshot reference")
     render_ref.add_argument("--record-file", required=True)

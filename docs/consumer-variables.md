@@ -125,11 +125,14 @@ real operator STOP. It:
    `STOPPED`, `PARTIAL`, `FAILED`) and blocks late code/PR/merge publication.
 
 Repeated STOP is idempotent. Restoring `automation:ready` never re-arms a
-stopped generation. An explicit owner recovery marker
-(`continuum-task-generation-recover`) re-arms it, after which a new owner
-command or scheduler pass may start exactly one new attempt. STOP and recovery
-are separate operations: STOP is the only action that cancels a live run,
-while recovery only clears the fence for a future generation.
+stopped generation. Only an explicit trusted recovery marker
+(`continuum-task-generation-recover`) posted after the stop re-arms that
+generation, after which a new owner command or scheduler pass may start exactly
+one new attempt. STOP and recovery are separate operations: STOP is the only
+action that cancels a live run, while recovery only clears a terminal fence.
+Every recovery path, including an ordinary watchdog retry and a fresh-VM 429
+resumption, re-checks readiness and the durable stop immediately before
+creating the new attempt.
 
 Authorization is the repository owner's exact command. Prose, quoted examples,
 machine snapshots, bot comments and non-owner comments never grant STOP or

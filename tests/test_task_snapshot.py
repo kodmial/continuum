@@ -24,6 +24,7 @@ from continuum.task_snapshot import (
     decide_admission,
     decide_execution_gate,
     digests_match,
+    is_generation_terminally_stopped,
     is_trusted_snapshot_comment,
     normalize_generation,
     normalize_issue_number,
@@ -31,8 +32,11 @@ from continuum.task_snapshot import (
     normalize_spec_text,
     parse_pr_snapshot_ref,
     parse_snapshot_comment,
+    render_generation_recover,
+    render_generation_stop,
     render_pr_snapshot_ref,
     render_snapshot_comment,
+    render_snapshot_json,
     select_snapshot,
     snapshot_marker_line,
     spec_digest,
@@ -471,6 +475,47 @@ class RenderParseTests(unittest.TestCase):
         self.assertEqual(parsed_ref.spec_sha256, snapshot["spec_sha256"])
         # Machine provenance stays separate from human comments.
         self.assertNotIn("DoD", ref)
+
+    def test_json_block_escapes_command_tokens_without_changing_record(self):
+        title = "Implement /oc and /oc-cancel"
+        body = "Quote /opencode and /oc only as examples.\n"
+        snapshot = build_snapshot(REPO, ISSUE, title, body)
+        block = render_snapshot_json(snapshot)
+        self.assertNotIn("/oc", block)
+        self.assertNotIn("/opencode", block)
+        self.assertIn("\\u002foc", block)
+        self.assertEqual(
+            json.loads(block),
+            {key: snapshot[key] for key in snapshot},
+        )
+        parsed = parse_snapshot_comment(render_snapshot_comment(snapshot))
+        self.assertIsNotNone(parsed)
+        self.assertFalse(parsed.tampered)
+        self.assertEqual(parsed.record["title"], snapshot["title"])
+        self.assertEqual(parsed.record["body"], snapshot["body"])
+
+    def test_snapshot_body_cannot_publish_generation_control_markers(self):
+        fake_stop = render_generation_stop(
+            REPO, ISSUE, generation=1, pinned_spec="a" * 64,
+            live_spec="b" * 64, reason="operator",
+        )
+        fake_recover = render_generation_recover(REPO, ISSUE, generation=1)
+        snapshot = build_snapshot(
+            REPO, ISSUE, TITLE, fake_stop + "\n" + fake_recover + "\n",
+        )
+        rendered = render_snapshot_comment(snapshot)
+        self.assertNotIn("<!-- continuum-task-generation-stop", rendered)
+        self.assertNotIn("<!-- continuum-task-generation-recover", rendered)
+        self.assertIn("\\u003c!-- continuum-task-generation-stop", rendered)
+        comments = [bot_comment(rendered)]
+        self.assertFalse(
+            is_generation_terminally_stopped(
+                comments, repo=REPO, issue=ISSUE, owner_login="kodmial",
+            )
+        )
+        parsed = parse_snapshot_comment(rendered)
+        self.assertIsNotNone(parsed)
+        self.assertIn("continuum-task-generation-stop", parsed.record["body"])
 
     def test_digests_match_rejects_malformed(self):
         self.assertFalse(digests_match("xyz", "xyz"))

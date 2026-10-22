@@ -208,6 +208,31 @@ class OpenCode429RunnerRecoveryContractTest(unittest.TestCase):
         self.assertIn('git push origin "HEAD:${HEAD_REF}"', self.body)
         self.assertNotIn("git rebase", self.body)
 
+    def test_issue_recovery_rechecks_ready_and_generation_stop_before_dispatch(self):
+        self.assertIn("issueRecoveryAdmission", self.watchdog)
+        self.assertIn("missing automation:ready", self.watchdog)
+        self.assertIn("generationStopActive", self.watchdog)
+        self.assertIn("terminally stopped", self.watchdog)
+        admission = self.watchdog.split(
+            "async function issueRecoveryAdmission"
+        )[-1].split("// kodmial/continuum#290")[0]
+        for marker in (
+            "readGithub.rest.issues.get",
+            "readGithub.rest.issues.listComments",
+            "issue.pull_request",
+            "issue.state !== 'open'",
+            "labels.has('automation:ready')",
+            "generationStopActive",
+            "comment history read failed",
+            "authoritative issue read failed",
+        ):
+            self.assertIn(marker, admission)
+        recovery_fn = self.watchdog.split(
+            "async function recoverFrom429OnFreshVm"
+        )[-1].split("if (publishRaceRestartRequired)")[0]
+        self.assertIn("issueRecoveryAdmission(", recovery_fn)
+        self.assertIn("is not admitted", recovery_fn)
+
     def test_recovery_inputs_are_a_published_contract(self):
         # New workflow_call inputs must be mirrored by the caller stub
         # (dispatch inputs + with forwarding) per the callable contract.

@@ -1303,7 +1303,14 @@ jobs:
                 'Later issue edits never change it; they belong in a new follow-up issue.',
                 '',
                 '```json',
-                JSON.stringify(record),
+                // Keep a specification that quotes `/oc`, `/opencode`, or
+                // `/oc-cancel`, or that embeds a generation-stop/recover
+                // marker, from turning this machine-owned comment into fresh
+                // authority. JSON `\u002f`/`\u003c` are escaped, so the
+                // parsed record stays byte-for-byte identical.
+                JSON.stringify(record)
+                  .replace(/\//g, '\\u002f')
+                  .replace(/</g, '\\u003c'),
                 '```',
               ].join('\n');
               const parts = taskRepo.split('/');

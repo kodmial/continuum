@@ -3241,10 +3241,15 @@ jobs:
               const isOpenCodeWorkflow =
                 run.path === opencodeWorkflowPath ||
                 run.name === opencodeWorkflowName;
+              // Issue-mode workflow_dispatch runs (the documented `/oc`
+              // path, a fresh-VM 429 recovery, and delegated dispatch) are
+              // just as active as issue_comment runs. Ignoring them lets the
+              // scheduler start a competing generation while one is queued
+              // or running (kodmial/continuum#346).
               if (
                 !isOpenCodeWorkflow ||
                 run.status === 'completed' ||
-                run.event !== 'issue_comment'
+                !['issue_comment', 'workflow_dispatch'].includes(run.event)
               ) {
                 continue;
               }

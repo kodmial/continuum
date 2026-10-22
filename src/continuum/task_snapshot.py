@@ -256,16 +256,36 @@ def snapshot_marker_line(snapshot: Mapping[str, Any]) -> str:
     )
 
 
+def render_snapshot_json(snapshot: Mapping[str, Any]) -> str:
+    """Render the snapshot record as a command-token-neutral JSON block.
+
+    Until the canonical command parser from Work-Lock #72 is the only
+    admission gate, a machine-authored comment must not contain a literal
+    launch token (``/oc``, ``/opencode``, ``/oc-cancel``) or a literal HTML
+    control marker (``<!-- continuum-task-generation-stop ... -->``) even
+    when the issue specification quotes one. JSON permits ``\\u002f`` and
+    ``\\u003c`` escapes, so encoding every slash and ``<`` keeps the parsed
+    record byte-for-byte identical while the rendered comment cannot become a
+    fresh command or a forged trust record.
+    """
+
+    payload = json.dumps(dict(snapshot), ensure_ascii=False, sort_keys=True)
+    return payload.replace("/", "\\u002f").replace("<", "\\u003c")
+
+
 def render_snapshot_comment(snapshot: Mapping[str, Any]) -> str:
     """Render the GitHub-native durable snapshot comment body.
 
     The marker line is machine-readable without JSON parsing; the fenced
     JSON block carries the recoverable exact title/body. Human prose is
-    informational only and is never parsed as state.
+    informational only and is never parsed as state. The JSON block escapes
+    soliduses and ``<`` so a specification that quotes a command token or a
+    generation-stop/recover marker never becomes fresh authority in a machine
+    comment.
     """
 
     record = dict(snapshot)
-    payload = json.dumps(record, ensure_ascii=False, sort_keys=True)
+    payload = render_snapshot_json(record)
     return "\n".join(
         [
             snapshot_marker_line(record),
@@ -1463,6 +1483,7 @@ __all__ = [
     "normalize_issue_number",
     "build_snapshot",
     "snapshot_marker_line",
+    "render_snapshot_json",
     "render_snapshot_comment",
     "render_pr_snapshot_ref",
     "parse_snapshot_comment",

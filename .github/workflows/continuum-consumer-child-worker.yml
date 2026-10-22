@@ -237,7 +237,10 @@ jobs:
               echo "::error::Could not render child task snapshot; refusing delegated work."
               exit 4
             fi
-            snapshot_record_json="$(cat "$CHILD_SNAPSHOT_RECORD")"
+            if ! snapshot_record_json="$(python3 "$SNAPSHOT_ADMISSION" render-json --record-file "$CHILD_SNAPSHOT_RECORD")"; then
+              echo "::error::Could not render the command-neutral child snapshot JSON; refusing delegated work." >&2
+              exit 4
+            fi
             snapshot_comment="$(printf '%s\n%s\n%s\n%s\n%s\n%s\n%s' "$snapshot_marker_line" '⚡ **Continuum · delegation-worker**' '<!-- continuum-origin role=continuum component=delegation-worker -->' 'Continuum task snapshot (machine-owned, do not edit or delete). This comment pins the exact issue title/body accepted for this implementation generation. Later issue edits never change it; they belong in a new follow-up issue.' '```json' "$snapshot_record_json" '```')"
             if ! gh api --method POST "repos/$child_repo/issues/$TASK_NUMBER/comments" -f body="$snapshot_comment" >/dev/null 2>&1; then
               echo "::error::Could not pin child task snapshot for $child_repo#$TASK_NUMBER; refusing to implement live mutable text."
@@ -445,6 +448,15 @@ jobs:
             exit 31
           fi
 
+          # A trusted operator STOP or drift/tamper fence must block late
+          # publication even when it landed after the agent started. Re-read
+          # the live comment history immediately before commit/push/PR.
+          fetch_snapshot_comments || exit 4
+          if [[ "$(python3 "$SNAPSHOT_ADMISSION" has-stop --comments-json "$CHILD_COMMENTS_JSON" --repo "$child_repo" --issue "$TASK_NUMBER" --owner "$CHILD_OWNER" --generation 1 2>/dev/null || echo active)" == "stopped" ]]; then
+            echo "::notice::Child task $child_repo#$TASK_NUMBER generation 1 is terminally stopped before publication; refusing to push or open a PR."
+            exit 1
+          fi
+
           if [[ -n "$(git status --porcelain)" ]]; then
             git add -A
             # kodmial/continuum#260: workflow-owned delegated commit uses the
@@ -467,6 +479,13 @@ jobs:
           fi
           if [[ -z "$child_snapshot_ref" || "$child_snapshot_ref" != *"continuum-task-snapshot-ref"* ]]; then
             echo "::error::Task snapshot reference is missing for child task #$TASK_NUMBER; refusing to open an unprotected PR." >&2
+            exit 1
+          fi
+          # A STOP that landed while the accepted branch was being pushed must
+          # still suppress PR publication. The branch alone is not completion.
+          fetch_snapshot_comments || exit 4
+          if [[ "$(python3 "$SNAPSHOT_ADMISSION" has-stop --comments-json "$CHILD_COMMENTS_JSON" --repo "$child_repo" --issue "$TASK_NUMBER" --owner "$CHILD_OWNER" --generation 1 2>/dev/null || echo active)" == "stopped" ]]; then
+            echo "::notice::Child task $child_repo#$TASK_NUMBER is terminally stopped before PR publication."
             exit 1
           fi
           pr_body="$(cat <<EOF

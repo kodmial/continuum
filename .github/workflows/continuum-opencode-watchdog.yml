@@ -208,6 +208,90 @@ jobs:
               );
             }
 
+            // kodmial/continuum#346: a watchdog recovery is a new coder
+            // attempt, so it re-applies the same fixed admission and the same
+            // durable generation-stop fence as the scheduler and OpenCode
+            // entry. Restoring automation:ready never clears a stop.
+            const generationStopRe =
+              /<!--\s*continuum-task-generation-stop\s+repo=([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)\s+issue=(\d+)\s+generation=(\d+)\s+pinned-spec=([0-9a-fA-F]{64})\s+live-spec=([0-9a-fA-F]{64})\s+reason=(drift|tampered|operator)\s*-->/;
+            const generationRecoverRe =
+              /<!--\s*continuum-task-generation-recover\s+repo=([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)\s+issue=(\d+)\s+generation=(\d+)\s*-->/;
+            const stopOrder = (comment) =>
+              `${(comment && comment.created_at) || ''}:${String((comment && comment.id) || 0).padStart(20, '0')}`;
+            function trustedOperatorComment(comment) {
+              const association = String((comment && comment.author_association) || '').toUpperCase();
+              if (['OWNER', 'MEMBER', 'COLLABORATOR'].includes(association)) return true;
+              const login = String((comment && comment.user && comment.user.login) || '').toLowerCase();
+              return login === 'github-actions[bot]' || login === String(owner).toLowerCase();
+            }
+            function generationStopActive(comments, repoFull, issueNumber, generation = 1) {
+              const stops = [];
+              const recovers = [];
+              for (const comment of comments || []) {
+                if (!trustedOperatorComment(comment)) continue;
+                const body = String((comment && comment.body) || '');
+                const stop = body.match(generationStopRe);
+                if (stop && stop[1].toLowerCase() === repoFull.toLowerCase() &&
+                    Number(stop[2]) === Number(issueNumber) &&
+                    Number(stop[3]) === Number(generation)) {
+                  stops.push(stopOrder(comment));
+                  continue;
+                }
+                const recover = body.match(generationRecoverRe);
+                if (recover && recover[1].toLowerCase() === repoFull.toLowerCase() &&
+                    Number(recover[2]) === Number(issueNumber) &&
+                    Number(recover[3]) === Number(generation)) {
+                  recovers.push(stopOrder(comment));
+                }
+              }
+              stops.sort();
+              recovers.sort();
+              return stops.length > 0 &&
+                !(recovers.length > 0 && recovers[recovers.length - 1] > stops[stops.length - 1]);
+            }
+            async function issueRecoveryAdmission(issueNumber, generation = 1) {
+              const number = Number(issueNumber);
+              if (!Number.isInteger(number) || number <= 0) {
+                return { admit: false, reason: 'invalid issue identity' };
+              }
+              let issue;
+              try {
+                issue = (await readGithub.rest.issues.get({
+                  owner, repo, issue_number: number,
+                })).data;
+              } catch (err) {
+                return { admit: false, reason: 'authoritative issue read failed: ' + (err.message || err) };
+              }
+              if (issue.pull_request) {
+                return { admit: false, reason: 'target is a pull request' };
+              }
+              if (issue.state !== 'open') {
+                return { admit: false, reason: 'target issue is closed' };
+              }
+              const labels = new Set((issue.labels || []).map(label =>
+                typeof label === 'string' ? label : label.name
+              ));
+              if (!labels.has('automation:ready')) {
+                return { admit: false, reason: 'missing automation:ready' };
+              }
+              let comments;
+              try {
+                comments = await readGithub.paginate(
+                  readGithub.rest.issues.listComments,
+                  { owner, repo, issue_number: number, per_page: 100 }
+                );
+              } catch (err) {
+                return { admit: false, reason: 'comment history read failed: ' + (err.message || err) };
+              }
+              if (generationStopActive(comments, repoFullName, number, generation)) {
+                return {
+                  admit: false,
+                  reason: 'generation ' + Number(generation) + ' is terminally stopped',
+                };
+              }
+              return { admit: true, reason: 'admitted' };
+            }
+
             // kodmial/continuum#290: fresh-VM 429 resumption. Dispatches a NEW
             // workflow_dispatch carrying the explicit recovery identity onto
             // a fresh VM. Never reRunWorkflow (that would replay completed
@@ -312,6 +396,31 @@ jobs:
                   'OpenCode infrastructure operation ' + operation + ' has no numeric ' +
                   'thread; resuming without a dedupe comment.'
                 );
+              }
+
+              // kodmial/continuum#346: a fresh-VM issue recovery is a new
+              // coder attempt. Require the fixed ready label and reject a
+              // terminal generation stop before claiming or dispatching.
+              if (mode === 'issue') {
+                if (!/^[0-9]+$/.test(issueText) || Number(issueText) <= 0) {
+                  core.notice(
+                    'OpenCode infrastructure issue recovery for operation ' + operation +
+                    ' has no valid issue identity; keeping the reservation.'
+                  );
+                  return;
+                }
+                const admission = await issueRecoveryAdmission(
+                  issueText, generation > 0 ? generation : 1
+                );
+                if (!admission.admit) {
+                  core.notice(
+                    'OpenCode infrastructure issue recovery for issue ' + issueText +
+                    ' generation ' + (generation > 0 ? generation : 1) +
+                    ' is not admitted (' + admission.reason +
+                    '); no fresh run was dispatched.'
+                  );
+                  return;
+                }
               }
 
               const resumptionMarker =
@@ -918,6 +1027,18 @@ jobs:
                 per_page: 100,
               }
             );
+
+            // kodmial/continuum#346: an ordinary watchdog retry is a new
+            // coder attempt. A terminal STOP (or drift/tamper caused by a
+            // late issue edit) blocks it even if automation:ready was later
+            // restored. Only an explicit newer recovery marker may rearm.
+            if (generationStopActive(comments, repoFullName, issueNumber, 1)) {
+              core.notice(
+                'Issue #' + issueNumber + ' generation 1 is terminally stopped; ' +
+                'watchdog will not start a new coder attempt.'
+              );
+              return;
+            }
 
             const previousRetries = comments.filter(comment =>
               (comment.body || '').includes(retryMarker)
