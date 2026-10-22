@@ -133,6 +133,8 @@ jobs:
           fetch_runtime_file "src/continuum/__init__.py" "$RUNTIME_ROOT/src/continuum/__init__.py"
           fetch_runtime_file "src/continuum/config.py" "$RUNTIME_ROOT/src/continuum/config.py"
           fetch_runtime_file "src/continuum/yamlmini.py" "$RUNTIME_ROOT/src/continuum/yamlmini.py"
+          fetch_runtime_file "src/continuum/api_budget.py" "$RUNTIME_ROOT/src/continuum/api_budget.py"
+          fetch_runtime_file "src/continuum/delegation_discovery.py" "$RUNTIME_ROOT/src/continuum/delegation_discovery.py"
           PARENT_CONFIG_FILE="$RUNTIME_ROOT/parent.continuum.yml"
           # The parent config lives in the execution repository: fetch its
           # default branch, never the Continuum engine pin (which may not
