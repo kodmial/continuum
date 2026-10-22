@@ -31,6 +31,14 @@ SHA = "a" * 40
 OPERATION = "opencode-429-issue-issue357"
 CHECKPOINT = "opencode/429-checkpoint-" + OPERATION + "-gen-2"
 LEGACY = "opencode/checkpoint-issue357"
+# Actual live #357 pre-#366 checkpoint (owner audit, 2026-10-22). Both the
+# issue-mode branch and the generation-1 429 ref pointed at this exact commit,
+# it carried code edits and `.continuum-429-stage = publish-pr`, and it had no
+# `.continuum-429-recovery.json`.
+LIVE_357_SHA = "85c9cff399e4791b472dc1f3b5f73d93f9b37bca"
+LIVE_357_CHECKPOINT = (
+    "opencode/429-checkpoint-opencode-429-issue-issue357-gen-1"
+)
 
 HARNESS = r"""
 const scenario = JSON.parse(process.env.SCENARIO_JSON || '{}');
@@ -54,6 +62,10 @@ for (const check of scenario.checks || []) {
       value = legacyIssueCheckpointRef(args.issueNumber);
     } else if (check.fn === 'parseRef') {
       value = parseCheckpointRef(args.ref);
+    } else if (check.fn === 'observed') {
+      value = decideObservedRecoveryState(args);
+    } else if (check.fn === 'checkoutRef') {
+      value = recoveryCheckoutHeadRef(args);
     } else {
       value = { unknown: check.fn };
     }
@@ -88,7 +100,7 @@ def watchdog_helpers() -> str:
     return extract_between(
         WATCHDOG,
         "const LEGACY_ISSUE_CHECKPOINT_PREFIX =",
-        "async function observeDispatchedRun(",
+        "async function recoverFrom429OnFreshVm(",
     )
 
 
@@ -112,6 +124,7 @@ class ProductionJavaScriptTest(unittest.TestCase):
             + "  'legacyLeaseMarker', 'parseLegacyLeaseState',\n"
             + "  'legacyRecoveryDispatchInputs', 'decideLegacyRecoveryAdmission',\n"
             + "  'legacyIssueCheckpointRef', 'parseCheckpointRef',\n"
+            + "  'decideObservedRecoveryState', 'recoveryCheckoutHeadRef',\n"
             + "]) {\n"
             + "  try {\n"
             + "    const fn = eval(name);\n"
@@ -235,97 +248,205 @@ class ProductionJavaScriptTest(unittest.TestCase):
         self.assertFalse(results[5]["value"]["ok"])
 
     def test_scheduler_lease_decision_holds_then_bounds(self):
+        common = {
+            "hasFresh429Recovery": False,
+            "legacyCheckpoint": {"ok": True},
+            "legacyLeaseAttempt": 1,
+            "maxLegacyLeases": 4,
+            "schedulerDispatchCount": 9,
+            "maxDispatchAttempts": 2,
+            "pauseOnFailure": True,
+        }
+        cases = [
+            # Fresh durable metadata recovery always wins.
+            {**common, "hasFresh429Recovery": True, "legacyLeasePresent": True},
+            # First detection opens a bounded watchdog window.
+            {**common, "legacyLeasePresent": False, "legacyLeaseFresh": False},
+            # The window must not slide on every pass.
+            {**common, "legacyLeasePresent": True, "legacyLeaseFresh": True},
+            # Expired window with no proven code runner: one bounded replay.
+            {**common, "legacyLeasePresent": True, "legacyLeaseFresh": False,
+             "legacyReplayObserved": False, "legacyReplayKnown": True},
+            # Branch proof unavailable: hold fail-closed, never pause.
+            {**common, "legacyLeasePresent": True, "legacyLeaseFresh": False,
+             "legacyReplayObserved": True, "legacyReplayKnown": False},
+            # A real replay ran and failed: ordinary pause contract applies.
+            {**common, "legacyLeasePresent": True, "legacyLeaseFresh": False,
+             "legacyReplayObserved": True, "legacyReplayKnown": True},
+            # Ordinary fail mode without legacy work is unchanged.
+            {**common, "legacyCheckpoint": None, "legacyLeasePresent": False,
+             "legacyLeaseFresh": False},
+            # pause_on_failure=false still retries ordinary work.
+            {**common, "legacyCheckpoint": None, "legacyLeasePresent": False,
+             "legacyLeaseFresh": False, "pauseOnFailure": False},
+        ]
         results = self.run_helpers(
             scheduler_helpers(),
-            [
-                {
-                    "fn": "decide",
-                    "args": {
-                        "hasFresh429Recovery": True,
-                        "legacyCheckpoint": None,
-                        "legacyLeaseFresh": False,
-                        "legacyLeaseAttempt": 0,
-                        "maxLegacyLeases": 4,
-                        "schedulerDispatchCount": 9,
-                        "maxDispatchAttempts": 2,
-                        "pauseOnFailure": True,
-                    },
-                },
-                {
-                    "fn": "decide",
-                    "args": {
-                        "hasFresh429Recovery": False,
-                        "legacyCheckpoint": {"ok": True},
-                        "legacyLeaseFresh": True,
-                        "legacyLeaseAttempt": 1,
-                        "maxLegacyLeases": 4,
-                        "schedulerDispatchCount": 9,
-                        "maxDispatchAttempts": 2,
-                        "pauseOnFailure": True,
-                    },
-                },
-                {
-                    "fn": "decide",
-                    "args": {
-                        "hasFresh429Recovery": False,
-                        "legacyCheckpoint": {"ok": True},
-                        "legacyLeaseFresh": False,
-                        "legacyLeaseAttempt": 1,
-                        "maxLegacyLeases": 4,
-                        "schedulerDispatchCount": 9,
-                        "maxDispatchAttempts": 2,
-                        "pauseOnFailure": True,
-                    },
-                },
-                {
-                    "fn": "decide",
-                    "args": {
-                        "hasFresh429Recovery": False,
-                        "legacyCheckpoint": {"ok": True},
-                        "legacyLeaseFresh": False,
-                        "legacyLeaseAttempt": 4,
-                        "maxLegacyLeases": 4,
-                        "schedulerDispatchCount": 9,
-                        "maxDispatchAttempts": 2,
-                        "pauseOnFailure": True,
-                    },
-                },
-                {
-                    "fn": "decide",
-                    "args": {
-                        "hasFresh429Recovery": False,
-                        "legacyCheckpoint": None,
-                        "legacyLeaseFresh": False,
-                        "legacyLeaseAttempt": 0,
-                        "maxLegacyLeases": 4,
-                        "schedulerDispatchCount": 9,
-                        "maxDispatchAttempts": 2,
-                        "pauseOnFailure": True,
-                    },
-                },
-                {
-                    "fn": "decide",
-                    "args": {
-                        "hasFresh429Recovery": False,
-                        "legacyCheckpoint": None,
-                        "legacyLeaseFresh": False,
-                        "legacyLeaseAttempt": 0,
-                        "maxLegacyLeases": 4,
-                        "schedulerDispatchCount": 9,
-                        "maxDispatchAttempts": 2,
-                        "pauseOnFailure": False,
-                    },
-                },
-            ],
+            [{"fn": "decide", "args": args} for args in cases],
         )
-        values = [item["value"] for item in results]
+        values = [item.get("value") for item in results]
         self.assertEqual(
             values,
             [
-                "hold-429", "hold-legacy", "hold-legacy",
-                "retry-legacy", "pause", "retry",
+                "hold-429",
+                "hold-legacy",
+                "hold-legacy",
+                "retry-legacy",
+                "hold-legacy",
+                "pause",
+                "pause",
+                "retry",
+            ],
+            results,
+        )
+
+    def test_live_357_legacy_checkpoint_regression(self):
+        # Reproduction of the live #357 terminal loop: two historical
+        # scheduler dispatch markers (14:43:19Z and 15:29:38Z), snapshot
+        # generation 1, an expired 45-minute lease, no PR, and the exact
+        # pre-fix metadata-less checkpoint with stage publish-pr.
+        def old_production_decision(state):
+            dispatch_count = state["dispatch_count"]
+            max_attempts = state["max_attempts"]
+            paused = state["paused"]
+            # Pre-fix production path: no legacy checkpoint binding existed,
+            # so an expired lease with exhausted dispatch markers always
+            # re-applied automation:paused.
+            return (
+                "pause"
+                if paused and dispatch_count >= max_attempts
+                else "retry"
+            )
+
+        dispatch_count, max_attempts = 2, 2
+        self.assertEqual(
+            old_production_decision({
+                "dispatch_count": dispatch_count,
+                "max_attempts": max_attempts,
+                "paused": True,
+            }),
+            "pause",
+        )
+        new = {
+            "hasFresh429Recovery": False,
+            "legacyCheckpoint": {
+                "ok": True,
+                "checkpointRef": LEGACY,
+                "checkpointSha": LIVE_357_SHA,
+                "generation": 1,
+                "stage": "publish-pr",
+                "skipAgent": False,
+            },
+            "legacyLeaseAttempt": 0,
+            "maxLegacyLeases": 4,
+            "schedulerDispatchCount": dispatch_count,
+            "maxDispatchAttempts": max_attempts,
+            "pauseOnFailure": True,
+        }
+        results = self.run_helpers(
+            scheduler_helpers(),
+            [
+                # First cron pass after unpause: bounded hold, not pause.
+                {"fn": "decide", "args": {
+                    **new,
+                    "legacyLeasePresent": False,
+                    "legacyLeaseFresh": False,
+                    "legacyReplayObserved": False,
+                    "legacyReplayKnown": True,
+                }},
+                # Window expired, no real runner: one standard issue replay.
+                {"fn": "decide", "args": {
+                    **new,
+                    "legacyLeaseAttempt": 1,
+                    "legacyLeasePresent": True,
+                    "legacyLeaseFresh": False,
+                    "legacyReplayObserved": False,
+                    "legacyReplayKnown": True,
+                }},
+                # The untrusted publish-pr stage never authorizes a skip.
+                {"fn": "bind", "args": {
+                    "issueNumber": ISSUE,
+                    "legacyRef": LEGACY,
+                    "legacySha": LIVE_357_SHA,
+                    "checkpointRefs": [{
+                        "ref": LIVE_357_CHECKPOINT,
+                        "sha": LIVE_357_SHA,
+                    }],
+                    "stageFileContent": "publish-pr\n",
+                    "metadataPresent": False,
+                }},
             ],
         )
+        self.assertEqual(results[0]["value"], "hold-legacy", results)
+        self.assertEqual(results[1]["value"], "retry-legacy", results)
+        bound = results[2]["value"]
+        self.assertTrue(bound["ok"], results)
+        self.assertEqual(bound["generation"], 1)
+        self.assertEqual(bound["checkpointRef"], LEGACY)
+        self.assertEqual(bound["checkpointSha"], LIVE_357_SHA)
+        self.assertEqual(bound["stage"], "publish-pr")
+        self.assertFalse(bound["skipAgent"])
+
+    def test_scheduler_replay_proof_requires_real_runner(self):
+        def replay(runs, refs, fail_status=0):
+            source = "\n".join([
+                "const owner = 'kodmial';",
+                "const repo = 'continuum';",
+                "const opencodeWorkflowPath = "
+                "'.github/workflows/continuum-opencode.yml';",
+                "const opencodeWorkflowName = 'OpenCode agent';",
+                "const workflowRuns = " + json.dumps(runs) + ";",
+                "const readGithub = { rest: { git: {",
+                "  listMatchingRefs: async (params) => {",
+                "    if (!String(params.ref || '').startsWith('heads/')) {",
+                "      throw new Error('missing heads/ prefix: ' + params.ref);",
+                "    }",
+                "    if (" + str(int(fail_status)) + ") {",
+                "      const error = new Error('forbidden');",
+                "      error.status = " + str(int(fail_status)) + ";",
+                "      throw error;",
+                "    }",
+                "    return { data: " + json.dumps(refs) + " };",
+                "  },",
+                "} } };",
+            ]) + "\n" + scheduler_helpers() + """
+(async () => {
+  const value = await legacyReplayObservedSince('357', 1000);
+  process.stdout.write(JSON.stringify({ value }));
+})().catch(error => {
+  process.stdout.write(JSON.stringify({ error: String(error.message || error) }));
+});
+"""
+            script = self.workdir / "replay.js"
+            script.write_text(source, encoding="utf-8")
+            completed = subprocess.run(
+                ["node", str(script)], capture_output=True, text=True,
+                env={**os.environ, "TMPDIR": str(self.workdir)},
+            )
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            return json.loads(completed.stdout)
+
+        runner = {
+            "id": 111, "path": ".github/workflows/continuum-opencode.yml",
+            "name": "OpenCode agent", "event": "issue_comment",
+            "display_title": "OpenCode issue #357",
+            "created_at": "2026-10-22T20:56:58Z",
+        }
+        ack_only = {**runner, "id": 222}
+        self.assertTrue(replay(
+            [runner],
+            [{"ref": "refs/heads/opencode/issue357-111"}],
+        )["value"])
+        self.assertFalse(replay(
+            [ack_only],
+            [{"ref": "refs/heads/opencode/issue357-111"}],
+        )["value"])
+        self.assertFalse(replay(
+            [{**runner, "display_title": "OpenCode issue #999"}],
+            [{"ref": "refs/heads/opencode/issue999-111"}],
+        )["value"])
+        failed = replay([runner], [], fail_status=403)
+        self.assertIn("HTTP 403", failed["error"])
 
     def test_scheduler_lease_marker_round_trips(self):
         results = self.run_helpers(
@@ -425,6 +546,108 @@ class ProductionJavaScriptTest(unittest.TestCase):
         )
         for (_, expected), result in zip(cases, results):
             self.assertEqual(result["value"]["ok"], expected, result)
+
+    def test_watchdog_observed_run_retries_only_bounded_failures(self):
+        results = self.run_helpers(
+            watchdog_helpers(),
+            [
+                {"fn": "observed", "args": {
+                    "recordedStatus": "in_progress", "recordedConclusion": "",
+                    "attempt": 1, "max429Restarts": 3,
+                }},
+                {"fn": "observed", "args": {
+                    "recordedStatus": "completed", "recordedConclusion": "success",
+                    "attempt": 1, "max429Restarts": 3,
+                }},
+                {"fn": "observed", "args": {
+                    "recordedStatus": "", "recordedConclusion": "",
+                    "attempt": 1, "max429Restarts": 3,
+                }},
+                {"fn": "observed", "args": {
+                    "recordedStatus": "completed", "recordedConclusion": "failure",
+                    "attempt": 1, "max429Restarts": 3,
+                }},
+                {"fn": "observed", "args": {
+                    "recordedStatus": "completed", "recordedConclusion": "failure",
+                    "attempt": 4, "max429Restarts": 3,
+                }},
+            ],
+        )
+        actions = [item["value"]["action"] for item in results]
+        self.assertEqual(
+            actions, ["hold", "hold", "retry", "retry", "backoff"], results
+        )
+
+    def test_watchdog_catchup_recovers_failed_recovery_run(self):
+        def synthesized(title, sha, fail_status=0):
+            source = "\n".join([
+                "const owner = 'kodmial';",
+                "const repo = 'continuum';",
+                "const readGithub = { rest: { git: {",
+                "  getRef: async ({ ref }) => {",
+                "    if (" + str(int(fail_status)) + ") {",
+                "      const error = new Error('forbidden');",
+                "      error.status = " + str(int(fail_status)) + ";",
+                "      throw error;",
+                "    }",
+                "    if (!ref.endsWith('-gen-1')) {",
+                "      const error = new Error('not found');",
+                "      error.status = 404;",
+                "      throw error;",
+                "    }",
+                "    return { data: { object: { sha: " + json.dumps(sha) + " } } };",
+                "  },",
+                "} } };",
+            ]) + "\n" + watchdog_helpers() + """
+(async () => {
+  const value = await synthesizeRecoveryEvacuation({
+    display_title: """ + json.dumps(title) + """,
+  });
+  process.stdout.write(JSON.stringify({ value }));
+})().catch(error => {
+  process.stdout.write(JSON.stringify({ error: String(error.message || error) }));
+});
+"""
+            script = self.workdir / "synthesize-recovery.js"
+            script.write_text(source, encoding="utf-8")
+            completed = subprocess.run(
+                ["node", str(script)], capture_output=True, text=True,
+                env={**os.environ, "TMPDIR": str(self.workdir)},
+            )
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            return json.loads(completed.stdout)
+
+        title = "OpenCode 429 recovery opencode-429-issue-issue357 gen 1"
+        result = synthesized(title, LIVE_357_SHA)
+        self.assertTrue(result["value"]["checkpointRef"].endswith("-gen-1"))
+        self.assertEqual(result["value"]["operationId"],
+                         "opencode-429-issue-issue357")
+        self.assertEqual(result["value"]["issueNumber"], "357")
+        self.assertEqual(result["value"]["checkpointSha"], LIVE_357_SHA)
+        self.assertIsNone(synthesized("OpenCode issue #357", LIVE_357_SHA)["value"])
+        failed = synthesized(title, LIVE_357_SHA, fail_status=403)
+        self.assertIn("forbidden", failed["error"])
+
+    def test_watchdog_issue_recovery_checkout_avoids_stale_head_ref(self):
+        results = self.run_helpers(
+            watchdog_helpers(),
+            [
+                {"fn": "checkoutRef", "args": {
+                    "mode": "issue",
+                    "headRef": "opencode/issue357-39852307581",
+                    "checkpointRef": LIVE_357_CHECKPOINT,
+                }},
+                {"fn": "checkoutRef", "args": {
+                    "mode": "coderabbit-fix",
+                    "headRef": "opencode/issue357-39852307581",
+                    "checkpointRef": LIVE_357_CHECKPOINT,
+                }},
+            ],
+        )
+        self.assertEqual(results[0]["value"], LIVE_357_CHECKPOINT)
+        self.assertEqual(
+            results[1]["value"], "opencode/issue357-39852307581"
+        )
 
     def test_watchdog_binder_matches_python_contract(self):
         results = self.run_helpers(

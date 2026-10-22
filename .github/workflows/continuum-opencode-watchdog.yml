@@ -200,6 +200,7 @@ jobs:
               typeof readGithub.rest?.pulls?.list !== 'function' ||
               typeof readGithub.rest?.actions?.listWorkflowRunsForRepo !== 'function' ||
               typeof readGithub.rest?.actions?.listWorkflowRuns !== 'function' ||
+              typeof readGithub.rest?.actions?.getWorkflowRun !== 'function' ||
               typeof readGithub.rest?.actions?.listJobsForWorkflowRun !== 'function' ||
               typeof readGithub.rest?.actions?.reRunWorkflow !== 'function' ||
               typeof readGithub.rest?.git?.getRef !== 'function' ||
@@ -971,6 +972,46 @@ jobs:
               return { ok: true };
             }
 
+            // A previously observed recovery run that later failed before it
+            // could make progress must not strand the operation. Active and
+            // successful runs stand down; a completed retryable failure opens
+            // one more bounded attempt from the same preserved checkpoint.
+            function decideObservedRecoveryState({
+              recordedStatus, recordedConclusion, attempt, max429Restarts,
+            }) {
+              const retryable = new Set([
+                'failure', 'timed_out', 'startup_failure',
+                'action_required', 'stale', 'cancelled',
+              ]);
+              if (!recordedStatus) {
+                // The recorded run is no longer readable; treat it as a failed
+                // attempt rather than assuming unverified progress.
+                return { action: 'retry', reason: 'run-missing' };
+              }
+              if (recordedStatus !== 'completed') {
+                return { action: 'hold', reason: 'run-active' };
+              }
+              if (!retryable.has(String(recordedConclusion || ''))) {
+                return { action: 'hold', reason: 'run-not-failed' };
+              }
+              const limit = Math.max(1, Number(max429Restarts) || 1) + 1;
+              if ((Number(attempt) || 0) >= limit) {
+                return { action: 'backoff', reason: 'attempts-exhausted' };
+              }
+              return { action: 'retry', reason: 'run-failed' };
+            }
+
+            // The checkout step runs before the exact-SHA restore. For issue
+            // recovery the original head_ref can be an already-deleted task
+            // branch, so check out the durable checkpoint ref instead; the
+            // restore step still pins and validates the exact commit.
+            function recoveryCheckoutHeadRef({ mode, headRef, checkpointRef }) {
+              if (String(mode || '') === 'issue') {
+                return String(checkpointRef || '');
+              }
+              return String(headRef || '');
+            }
+
             async function observeDispatchedRun({
               target, notBefore, displayTitle, recoveryRunName, oldRunId,
             }) {
@@ -1054,7 +1095,7 @@ jobs:
               ]) {
                 try {
                   const response = await readGithub.rest.git.listMatchingRefs({
-                    owner, repo, ref: prefix + operation,
+                    owner, repo, ref: 'heads/' + prefix + operation,
                   });
                   for (const item of response.data || []) {
                     refs.push({
@@ -1089,6 +1130,56 @@ jobs:
                 prNumber: '',
                 branch: '',
               };
+            }
+
+            // A recovery dispatch that failed before it could emit a fresh
+            // 429 marker (for example a checkout failure on an already-deleted
+            // task branch) still has a durable observed run id. The scheduled
+            // catch-up must be able to re-enter the same watchdog path from the
+            // stable `run-name` identity, otherwise the operation sits in
+            // `observed` until an unrelated workflow_run event arrives.
+            async function synthesizeRecoveryEvacuation(run) {
+              const match = String(run && run.display_title || '').match(
+                /^OpenCode 429 recovery (opencode-429-issue-issue[0-9]+) gen ([0-9]+)$/
+              );
+              if (!match) return null;
+              const operation = match[1];
+              const generation = Number.parseInt(match[2], 10);
+              if (!Number.isInteger(generation) || generation < 1) return null;
+              const issue = operation.replace(
+                /^opencode-429-issue-issue/, ''
+              );
+              if (!/^[0-9]+$/.test(issue)) return null;
+              for (const prefix of [
+                'opencode/429-checkpoint-',
+                'opencode/infra-checkpoint-',
+              ]) {
+                const checkpointRef = prefix + operation + '-gen-' + generation;
+                try {
+                  const response = await readGithub.rest.git.getRef({
+                    owner, repo, ref: 'heads/' + checkpointRef,
+                  });
+                  const sha = String(
+                    response.data.object && response.data.object.sha || ''
+                  ).toLowerCase();
+                  if (!/^[0-9a-f]{40}$/.test(sha)) continue;
+                  return {
+                    checkpointRef,
+                    checkpointSha: sha,
+                    operationId: operation,
+                    stage: 'implementation-incomplete',
+                    generation,
+                    mode: 'issue',
+                    issueNumber: issue,
+                    prNumber: '',
+                    branch: '',
+                  };
+                } catch (err) {
+                  const status = Number(err && err.status || 0);
+                  if (status !== 404) throw err;
+                }
+              }
+              return null;
             }
 
             async function recoverFrom429OnFreshVm({
@@ -1400,12 +1491,62 @@ jobs:
 
               if (previous) {
                 if (previous.state === 'observed') {
-                  core.notice(
-                    'OpenCode infrastructure operation ' + operation + ' generation ' +
-                    generation + ' was already resumed by observed run ' + previous.runId + '; ' +
-                    'watchdog will not create a competing resumption.'
+                  let recordedRun = null;
+                  const recordedRunId = Number(previous.runId);
+                  if (Number.isInteger(recordedRunId) && recordedRunId > 0) {
+                    try {
+                      const response = await readGithub.rest.actions.getWorkflowRun({
+                        owner, repo, run_id: recordedRunId,
+                      });
+                      recordedRun = response.data;
+                    } catch (err) {
+                      if (Number(err && err.status || 0) !== 404) {
+                        core.warning(
+                          'OpenCode infrastructure operation ' + operation +
+                          ' could not read observed run ' + recordedRunId +
+                          ': ' + (err.message || err) + '; holding fail-closed.'
+                        );
+                        return;
+                      }
+                    }
+                  }
+                  const observedDecision = decideObservedRecoveryState({
+                    recordedStatus: recordedRun ? recordedRun.status : '',
+                    recordedConclusion: recordedRun
+                      ? recordedRun.conclusion
+                      : '',
+                    attempt: previous.attempt,
+                    max429Restarts,
+                  });
+                  if (observedDecision.action === 'hold') {
+                    core.notice(
+                      'OpenCode infrastructure operation ' + operation + ' generation ' +
+                      generation + ' was already resumed by observed run ' +
+                      previous.runId + ' (' + observedDecision.reason +
+                      '); watchdog will not create a competing resumption.'
+                    );
+                    return;
+                  }
+                  if (observedDecision.action === 'backoff') {
+                    await recordRecoveryState({
+                      ...baseState,
+                      checkpointSha,
+                      state: 'backoff',
+                      attempt: previous.attempt,
+                      nextDue: now + 3600,
+                      detail: 'observed-run-attempts-exhausted',
+                      summary: 'Observed recovery run ' + previous.runId +
+                        ' completed without a PR and bounded attempts are exhausted. Checkpoint `' +
+                        checkpointRef + '` is preserved; no pause was applied.',
+                    });
+                    return;
+                  }
+                  core.warning(
+                    'Observed recovery run ' + (previous.runId || 'unknown') +
+                    ' for operation ' + operation + ' did not make progress (' +
+                    observedDecision.reason + '); dispatching one bounded retry ' +
+                    'from the same checkpoint without pausing.'
                   );
-                  return;
                 }
                 if (previous.state === 'accepted' && previous.nextDue > now) {
                   core.notice(
@@ -1521,7 +1662,11 @@ jobs:
                     mode: mode,
                     issue_number: issueText,
                     pr_number: prText,
-                    head_ref: String(identity.head_ref || identity.branch || ''),
+                    head_ref: recoveryCheckoutHeadRef({
+                      mode,
+                      headRef: String(identity.head_ref || identity.branch || ''),
+                      checkpointRef,
+                    }),
                     review_id: String(identity.review_id || ''),
                     unresolved_items_json: String(identity.unresolved_items_json || ''),
                     run_id: String(identity.run_id || ''),
@@ -1699,7 +1844,11 @@ jobs:
                 recentRuns.push(...(data.workflow_runs || []));
                 if ((data.workflow_runs || []).length < 100) break;
               }
-              const catchUpCandidates = recentRuns.filter(candidate => {
+              const catchUpRetryableConclusions = new Set([
+                'failure', 'timed_out', 'startup_failure',
+                'action_required', 'stale', 'cancelled',
+              ]);
+              const catchUpAll = recentRuns.filter(candidate => {
                 const path = String(candidate.path || '');
                 const sameWorkflow =
                   /(?:^|\/)continuum-opencode\.yml$/.test(path) ||
@@ -1709,8 +1858,71 @@ jobs:
                 if (candidate.status !== 'completed') return false;
                 const updated = new Date(candidate.updated_at || candidate.created_at || 0).getTime();
                 return Number.isFinite(updated) && (catchUpNow - updated) < 48 * 60 * 60 * 1000;
-              }).slice(0, 8);
+              });
+              // A failed recovery run is the highest-value catch-up input even
+              // when newer ordinary runs exist: it already holds a durable
+              // observed run id and may need only one bounded retry. Never let
+              // the ordinary 8-run window starve it.
+              const isFailedRecoveryRun = candidate =>
+                /^OpenCode 429 recovery .+ gen [0-9]+$/.test(
+                  String(candidate.display_title || '')
+                ) &&
+                catchUpRetryableConclusions.has(
+                  String(candidate.conclusion || '')
+                );
+              const catchUpCandidates = [
+                ...catchUpAll.filter(isFailedRecoveryRun).slice(0, 16),
+                ...catchUpAll.filter(candidate => !isFailedRecoveryRun(candidate))
+                  .slice(0, 8),
+              ];
               for (const candidate of catchUpCandidates) {
+                let candidateRecovery = null;
+                try {
+                  candidateRecovery = await synthesizeRecoveryEvacuation(candidate);
+                } catch (err) {
+                  core.warning(
+                    'OpenCode 429 catch-up could not inspect recovery identity for run ' +
+                    candidate.id + ': ' + (err.message || err)
+                  );
+                }
+                if (
+                  candidateRecovery &&
+                  catchUpRetryableConclusions.has(String(candidate.conclusion || ''))
+                ) {
+                  // A recovery run that failed before its 429 marker still
+                  // respects the same owner-authorization gate as every other
+                  // issue path. In particular an explicit automation:paused
+                  // is an owner STOP, not an invitation for the catch-up timer
+                  // to bypass it.
+                  let admission = null;
+                  try {
+                    admission = await legacyRecoveryAdmission(
+                      candidateRecovery.issueNumber
+                    );
+                  } catch (err) {
+                    core.warning(
+                      'OpenCode 429 catch-up could not verify issue admission for #' +
+                      candidateRecovery.issueNumber + ': ' +
+                      (err.message || err) + '; holding.'
+                    );
+                  }
+                  if (!admission || !admission.ok) {
+                    core.notice(
+                      'OpenCode 429 catch-up is holding failed recovery run ' +
+                      candidate.id + ' for issue #' +
+                      candidateRecovery.issueNumber + ' (' +
+                      (admission ? admission.reason : 'admission-unreadable') +
+                      '); no label or checkpoint was changed.'
+                    );
+                    continue;
+                  }
+                  await recoverFrom429OnFreshVm({
+                    owner, repo, run: candidate,
+                    evacuated429: candidateRecovery,
+                    max429Restarts,
+                  });
+                  continue;
+                }
                 let candidateJobs = [];
                 try {
                   candidateJobs = await readGithub.paginate(

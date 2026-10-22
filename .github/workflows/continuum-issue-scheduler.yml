@@ -3377,7 +3377,7 @@ jobs:
               // before a real runner can make durable progress.
               const LEGACY_ISSUE_CHECKPOINT_PREFIX = 'opencode/checkpoint-issue';
               const LEGACY_LEASE_MARKER_PREFIX = '<!-- continuum-429-legacy-lease';
-              const LEGACY_LEASE_SECONDS = 900;
+              const LEGACY_LEASE_SECONDS = 1200;
               const MAX_LEGACY_RECOVERY_LEASES = 4;
               const LEGACY_STAGES = new Set([
                 'implementation-incomplete',
@@ -3473,23 +3473,45 @@ jobs:
               }
 
               function decideExpiredLeaseOutcome({
-                hasFresh429Recovery, legacyCheckpoint, legacyLeaseFresh,
-                legacyLeaseAttempt, maxLegacyLeases, schedulerDispatchCount,
-                maxDispatchAttempts, pauseOnFailure,
+                hasFresh429Recovery, legacyCheckpoint, legacyLeasePresent,
+                legacyLeaseFresh, legacyLeaseAttempt, maxLegacyLeases,
+                legacyReplayObserved, legacyReplayKnown,
+                schedulerDispatchCount, maxDispatchAttempts, pauseOnFailure,
               }) {
                 if (hasFresh429Recovery) return 'hold-429';
                 if (legacyCheckpoint && legacyCheckpoint.ok) {
+                  // First detection holds a short, durable watchdog window
+                  // instead of immediately treating historical dispatch
+                  // markers as task failures.
+                  if (!legacyLeasePresent) return 'hold-legacy';
                   if (legacyLeaseFresh) return 'hold-legacy';
-                  if (
-                    Math.max(0, Number(legacyLeaseAttempt) || 0) <
-                    Math.max(1, Number(maxLegacyLeases) || 1)
-                  ) {
+                  if (legacyReplayKnown === false) return 'hold-legacy';
+                  if (!legacyReplayObserved) {
+                    // No real runner started from the previous attempt (or the
+                    // run died before making any progress). Release the
+                    // reservation for one bounded standard issue-mode replay;
+                    // a dispatch ACK alone is never treated as progress.
+                    if (
+                      Math.max(0, Number(legacyLeaseAttempt) || 0) <
+                      Math.max(1, Number(maxLegacyLeases) || 1)
+                    ) {
+                      return 'retry-legacy';
+                    }
+                    // Do not turn repeated pre-runner infrastructure failures
+                    // into a terminal pause. Keep the bounded lease window and
+                    // let the watchdog/owner retain control.
                     return 'hold-legacy';
                   }
-                  // Exhausting the bounded lease never pauses proven legacy
-                  // work: release the reservation without a new coding
-                  // dispatch so the watchdog (or the owner) retains control.
-                  return 'retry-legacy';
+                  // A real issue-mode replay ran and produced no PR. From here
+                  // the ordinary pause-on-failure contract applies; an actual
+                  // 429 is owned by fresh recovery state instead.
+                  if (
+                    schedulerDispatchCount >= maxDispatchAttempts &&
+                    pauseOnFailure
+                  ) {
+                    return 'pause';
+                  }
+                  return 'retry';
                 }
                 if (
                   schedulerDispatchCount >= maxDispatchAttempts &&
@@ -3498,6 +3520,51 @@ jobs:
                   return 'pause';
                 }
                 return 'retry';
+              }
+
+              // A run that only reached admission or died before creating its
+              // workflow-owned issue branch is not proof that a code runner
+              // started. Probe the exact branch namespace for the candidate
+              // run ids so a dispatch ACK cannot masquerade as progress.
+              async function legacyReplayObservedSince(issueNumber, sinceMs) {
+                const issue = String(issueNumber || '').trim();
+                if (!/^[0-9]+$/.test(issue)) return false;
+                const title = 'OpenCode issue #' + issue;
+                const since = Number.isFinite(Number(sinceMs))
+                  ? Number(sinceMs)
+                  : 0;
+                const candidates = workflowRuns.filter(run => {
+                  const sameWorkflow =
+                    run.path === opencodeWorkflowPath ||
+                    run.name === opencodeWorkflowName;
+                  if (!sameWorkflow) return false;
+                  if (
+                    run.event !== 'issue_comment' &&
+                    run.event !== 'workflow_dispatch'
+                  ) {
+                    return false;
+                  }
+                  if (String(run.display_title || '') !== title) return false;
+                  const at = new Date(run.created_at || 0).getTime();
+                  return Number.isFinite(at) && at >= since;
+                });
+                if (!candidates.length) return false;
+                let refs = [];
+                try {
+                  const response = await readGithub.rest.git.listMatchingRefs({
+                    owner, repo, ref: 'heads/opencode/issue' + issue + '-',
+                  });
+                  refs = (response.data || []).map(item => String(item.ref || ''));
+                } catch (err) {
+                  const status = Number(err && err.status || 0);
+                  throw new Error(
+                    'legacy replay branch proof failed (HTTP ' +
+                    (status || 'unknown') + ')'
+                  );
+                }
+                return candidates.some(run =>
+                  refs.some(ref => ref.endsWith('-' + String(run.id)))
+                );
               }
 
               function legacyLeaseMarker({
@@ -3542,11 +3609,13 @@ jobs:
                   });
                   legacySha = String(response.data.object.sha || '').toLowerCase();
                 } catch (err) {
-                  if (Number(err && err.status || 0) !== 404) {
+                  const status = Number(err && err.status || 0);
+                  if (status !== 404) {
                     core.warning(
                       'Legacy 429 checkpoint read for issue #' + issueNumber +
-                      ' failed closed: HTTP ' + Number(err && err.status || 0)
+                      ' failed closed: HTTP ' + (status || 'unknown')
                     );
+                    return { ok: false, uncertain: true };
                   }
                   return null;
                 }
@@ -3565,8 +3634,10 @@ jobs:
                 } catch (err) {
                   const status = Number(err && err.status || 0);
                   // The progress file is optional pre-fix evidence; only an
-                  // unreadable repository state fails closed.
-                  if (status !== 404 && status !== 422) return null;
+                  // unreadable repository state is indeterminate.
+                  if (status !== 404 && status !== 422) {
+                    return { ok: false, uncertain: true };
+                  }
                   stageFileContent = '';
                 }
                 let metadataPresent = false;
@@ -3578,7 +3649,9 @@ jobs:
                   metadataPresent = true;
                 } catch (err) {
                   const status = Number(err && err.status || 0);
-                  if (status !== 404 && status !== 422) return null;
+                  if (status !== 404 && status !== 422) {
+                    return { ok: false, uncertain: true };
+                  }
                 }
                 const operation = 'opencode-429-issue-issue' + issueNumber;
                 const checkpointRefs = [];
@@ -3588,7 +3661,7 @@ jobs:
                 ]) {
                   try {
                     const response = await readGithub.rest.git.listMatchingRefs({
-                      owner, repo, ref: prefix + operation,
+                      owner, repo, ref: 'heads/' + prefix + operation,
                     });
                     for (const item of response.data || []) {
                       checkpointRefs.push({
@@ -3598,7 +3671,7 @@ jobs:
                       });
                     }
                   } catch (err) {
-                    return null;
+                    return { ok: false, uncertain: true };
                   }
                 }
                 return bindLegacy429Checkpoint({
@@ -3678,6 +3751,7 @@ jobs:
                 // was still working after a slow start.
                 const recoveryRunId = Number(newestRecovery.runId);
                 let recordedRunCompleted = false;
+                let recordedRunFailed = false;
                 if (Number.isInteger(recoveryRunId) && recoveryRunId > 0) {
                   const recoveryRun = workflowRuns.find(
                     run => Number(run.id) === recoveryRunId
@@ -3685,6 +3759,10 @@ jobs:
                   if (recoveryRun) {
                     if (recoveryRun.status !== 'completed') return true;
                     recordedRunCompleted = true;
+                    recordedRunFailed = [
+                      'failure', 'timed_out', 'startup_failure',
+                      'action_required', 'stale', 'cancelled',
+                    ].includes(String(recoveryRun.conclusion || ''));
                   }
                 }
                 if (newestRecovery.nextDue > 0 &&
@@ -3695,11 +3773,14 @@ jobs:
                 // short dispatch-observation window. Both can precede a
                 // multi-hour run, so keep the reservation for the watchdog's
                 // bounded 48h catch-up horizon instead of 2h. A recorded run
-                // that has already completed still gets the old 2h grace for
-                // the watchdog to write the next durable state.
+                // that already succeeded gets a short 2h grace for the watchdog
+                // to see the PR. A completed failed/aborted recovery is still
+                // 429 infrastructure, not an implementation failure: the
+                // watchdog owns its bounded retry, so do not race it with an
+                // ordinary pause when the 2h grace expires.
                 if (newestRecovery.state === 'observed' ||
                     newestRecovery.state === 'accepted') {
-                  const horizon = recordedRunCompleted
+                  const horizon = recordedRunCompleted && !recordedRunFailed
                     ? 2 * 60 * 60 * 1000
                     : 48 * 60 * 60 * 1000;
                   return Number.isFinite(newestRecovery.at) &&
@@ -3797,9 +3878,12 @@ jobs:
               let leaseOutcome = decideExpiredLeaseOutcome({
                 hasFresh429Recovery,
                 legacyCheckpoint: null,
+                legacyLeasePresent: false,
                 legacyLeaseFresh: false,
                 legacyLeaseAttempt: 0,
                 maxLegacyLeases: MAX_LEGACY_RECOVERY_LEASES,
+                legacyReplayObserved: false,
+                legacyReplayKnown: true,
                 schedulerDispatchCount: schedulerDispatches.length,
                 maxDispatchAttempts,
                 pauseOnFailure,
@@ -3815,6 +3899,15 @@ jobs:
                 (!readyLabel || labels.has(readyLabel))
               ) {
                 legacyCheckpoint = await detectLegacy429Checkpoint(issueNumber);
+                if (legacyCheckpoint && legacyCheckpoint.uncertain) {
+                  activeIssueNumbers.add(issueNumber);
+                  core.warning(
+                    'Issue #' + issueNumber +
+                    ': legacy 429 checkpoint proof is temporarily unreadable; ' +
+                    'holding the reservation without pausing.'
+                  );
+                  continue;
+                }
                 if (legacyCheckpoint && legacyCheckpoint.ok) {
                   const operation = 'opencode-429-issue-issue' + issueNumber;
                   legacyLease = comments
@@ -3829,9 +3922,26 @@ jobs:
                     .filter(item => Number.isFinite(item.attempt))
                     .sort((a, b) => a.at - b.at)
                     .at(-1) || null;
+                  let legacyReplayObserved = false;
+                  let legacyReplayKnown = true;
+                  if (legacyLease) {
+                    try {
+                      legacyReplayObserved = await legacyReplayObservedSince(
+                        issueNumber, legacyLease.at
+                      );
+                    } catch (err) {
+                      legacyReplayKnown = false;
+                      core.warning(
+                        'Issue #' + issueNumber +
+                        ': legacy replay branch proof failed closed (' +
+                        (err.message || err) + '); holding without pausing.'
+                      );
+                    }
+                  }
                   leaseOutcome = decideExpiredLeaseOutcome({
                     hasFresh429Recovery,
                     legacyCheckpoint,
+                    legacyLeasePresent: Boolean(legacyLease),
                     legacyLeaseFresh: Boolean(
                       legacyLease &&
                       legacyLease.nextDue > 0 &&
@@ -3839,6 +3949,8 @@ jobs:
                     ),
                     legacyLeaseAttempt: legacyLease ? legacyLease.attempt : 0,
                     maxLegacyLeases: MAX_LEGACY_RECOVERY_LEASES,
+                    legacyReplayObserved,
+                    legacyReplayKnown,
                     schedulerDispatchCount: schedulerDispatches.length,
                     maxDispatchAttempts,
                     pauseOnFailure,
@@ -3858,9 +3970,13 @@ jobs:
               }
 
               if (leaseOutcome === 'hold-legacy') {
-                const lease = await recordLegacyLease(
-                  issueNumber, legacyCheckpoint, legacyLease, comments
-                );
+                // Never slide the durable window on every cron pass: refresh
+                // only on first detection or immediately before a replay.
+                const lease = legacyLease
+                  ? legacyLease
+                  : await recordLegacyLease(
+                      issueNumber, legacyCheckpoint, null, comments
+                    );
                 activeIssueNumbers.add(issueNumber);
                 core.notice(
                   'Issue #' + issueNumber +
@@ -3868,11 +3984,27 @@ jobs:
                   legacyCheckpoint.checkpointRef + '` at exact SHA `' +
                   legacyCheckpoint.checkpointSha + '` (generation ' +
                   legacyCheckpoint.generation + '). Holding the reservation ' +
-                  'for a bounded standard issue-mode replay until ' + lease.nextDue +
+                  'until ' + (lease.nextDue || 'the next bounded review') +
                   '; historical scheduler dispatch attempts are infrastructure ' +
                   'and do not cause automation:paused.'
                 );
                 continue;
+              }
+
+              if (leaseOutcome === 'retry-legacy') {
+                const lease = await recordLegacyLease(
+                  issueNumber, legacyCheckpoint, legacyLease, comments
+                );
+                core.warning(
+                  'Issue #' + issueNumber +
+                  ' has a proven pre-fix 429 checkpoint `' +
+                  legacyCheckpoint.checkpointRef + '` at exact SHA `' +
+                  legacyCheckpoint.checkpointSha + '` (generation ' +
+                  legacyCheckpoint.generation + ') but no real replay runner ' +
+                  'started. Dispatching one bounded standard issue-mode replay ' +
+                  '(lease attempt ' + lease.attempt + '); the untrusted recorded ' +
+                  'stage is not used to skip agent/tests.'
+                );
               }
 
               await removeLabel(issueNumber, inProgressLabel);
