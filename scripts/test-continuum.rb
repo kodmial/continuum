@@ -439,7 +439,7 @@ class ContinuumTest < Minitest::Test
 
   def test_workflow_run_dependencies_exist
     names = ALL_STUBS.map { |path| yaml(path).fetch('name') }
-    each_pair do |caller, _|
+    each_pair do |caller, _, path|
       watched = events(caller).fetch('workflow_run', {}).fetch('workflows', [])
       watched.each do |name|
         # A glob is a deliberate broad wake-up, never a workflow name. The
@@ -452,7 +452,13 @@ class ContinuumTest < Minitest::Test
                        'a workflow_run negation may only exclude the caller itself'
           next
         end
-        next if name.match?(/[*?+\[\]]/)
+        if name.match?(/[*?+\[\]]/)
+          assert_equal 'continuum-opencode-repair.yml', File.basename(path),
+                       "#{caller['name']}: only the repair caller may use a " \
+                       'workflow_run glob, because a broad wake-up makes every ' \
+                       'controller react to every workflow in the repository'
+          next
+        end
 
         assert_includes names + PROJECT_OWNED_WORKFLOW_NAMES + LEGACY_WORKFLOW_RUN_NAMES, name
       end
