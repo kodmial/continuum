@@ -89,6 +89,7 @@ class RuntimeBootstrapExecutionTests(unittest.TestCase):
         subprocess.run([cls.real_git, "init", "--quiet", "--initial-branch=main", cls.fixture], check=True)
         cls._git("config", "user.email", "fixture@example.invalid")
         cls._git("config", "user.name", "Fixture")
+        cls._git("config", "uploadpack.allowAnySHA1InWant", "true")
         cls.first_bytes = {}
         for source, _ in RUNTIME_FILES:
             destination = cls.fixture / source
