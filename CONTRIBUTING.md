@@ -129,11 +129,10 @@ Use the GitHub issue forms:
 - **Question / support** for usage and integration questions that are not a bug
   report or a feature request.
 - **Security vulnerability**: do not open a public issue. Follow
-  [SECURITY.md](SECURITY.md). That policy states the current reporting status
-  (private vulnerability reporting is disabled at the time of writing), what to
-  do while it is disabled, and how a repository administrator enables it. Never
-  include exploit details, credentials, or consumer data in a public issue, and
-  do not send reports to a guessed email address.
+  [SECURITY.md](SECURITY.md); it is the source of truth for the current reporting
+  status and instructions. Never include exploit details, credentials, or
+  consumer data in a public issue, and do not send reports to a guessed email
+  address.
 
 The bug, feature, and question forms apply the `automation:blocked` admission
 hold at creation time and never add `automation:ready`. This keeps a new report
