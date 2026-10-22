@@ -823,6 +823,12 @@
           "workflows": [
             "OpenCode agent"
           ]
+        },
+        {
+          "event": "schedule",
+          "crons": [
+            "*/15 * * * *"
+          ]
         }
       ],
       "jobs": [

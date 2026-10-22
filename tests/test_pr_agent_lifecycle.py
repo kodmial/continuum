@@ -65,6 +65,18 @@ APPROVED_347_OPENCODE_SHA256 = (
     "ef386865af72c1f3205e44f8c1df33db8cdb935af05733c766fcd75c890979aa"
 )
 
+# kodmial/continuum#350 exact protected-workflow artifact pins. The 429
+# evacuation helper now validates/pushes recovery metadata, the watchdog
+# dispatches a real workflow_dispatch caller, and the self-dogfood caller
+# forwards packed recovery identity. Both files are pinned byte-for-byte so
+# any unrelated drift still fails closed.
+APPROVED_350_OPENCODE_SHA256 = (
+    "7445354c05e4a9ca8597b545789d9bec7ad2a4bc263adde015070205a25e29ec"
+)
+APPROVED_350_CALLER_SHA256 = (
+    "5ae873799a580154158d89a4b45aeb2427fa82e72060d786cb00a24c6551c751"
+)
+
 # Previous protected baseline before the PAUSE_ON_FAILURE advance above.
 # The empty-drift fallback below verifies the old-to-new baseline range
 # carries only the approved #179 probe plus this PAUSE change, so a new
@@ -2472,19 +2484,21 @@ class ProtectedBaselineTests(unittest.TestCase):
                     self.assertIn("CONTINUUM_OPENCODE_PUBLISH_RACE_RETRY_REQUIRED", original)
                     self.assertIn("steps.model_route.outputs.model", original)
                 if path == ".github/workflows/continuum-opencode.yml":
-                    # #347 is reviewed as one exact artifact: the digest changes
-                    # if any byte of the admission, route-gating, duplicate-run,
-                    # or cleanup change drifts. Other protected files still
-                    # require zero diff against their historical baseline.
+                    # #350 is reviewed as one exact artifact: metadata
+                    # validation, fail-closed salvage, and dispatch routing.
                     self.assertEqual(
                         protected_file_digest(path),
-                        APPROVED_347_OPENCODE_SHA256,
-                        f"{path}: unexpected drift outside reviewed #347 admission patch",
+                        APPROVED_350_OPENCODE_SHA256,
+                        f"{path}: unexpected drift outside reviewed #350 recovery patch",
                     )
                 else:
+                    # The self-dogfood caller is the dispatchable surface that
+                    # #350 repairs; pin it exactly instead of comparing it to
+                    # a historical caller baseline.
                     self.assertEqual(
-                        read_repo(path), original,
-                        f"{path}: unexpected drift outside reviewed protected baseline",
+                        protected_file_digest(path),
+                        APPROVED_350_CALLER_SHA256,
+                        f"{path}: unexpected drift outside reviewed #350 caller patch",
                     )
                 if path == ".github/workflows/continuum-opencode.yml":
                     self.assertIn("Restore verified cached OpenCode for coder and repair", read_repo(path))
