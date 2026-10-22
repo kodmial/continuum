@@ -2638,6 +2638,7 @@ class ContinuumTest < Minitest::Test
     scheduler = events(yaml(File.join(ROOT, '.github/workflows/continuum-issue-scheduler.yml')))
                   .fetch('workflow_call').fetch('inputs')
     {
+      'periodic_wake' => 'false',
       'wip_limit' => '',
       'lease_minutes' => '',
       'max_dispatch_attempts' => '',
@@ -2716,6 +2717,59 @@ class ContinuumTest < Minitest::Test
     assert_includes body, "expected 'merge' or 'checkout'"
     # The prompt must select a whole strategy block, not interpolate one verb.
     assert_includes body, 'STRATEGY_BLOCK'
+  end
+
+  # An optional external periodic wake must not become a second scheduler or
+  # change any ordinary event path. Both sources share the same domain pass and
+  # the cheap window guard runs before checkout/pagination.
+  def test_external_periodic_wake_is_a_gated_mode_of_the_existing_scheduler
+    workflow = yaml(File.join(ROOT, '.github/workflows/continuum-issue-scheduler.yml'))
+    schedule = workflow.fetch('jobs').fetch('schedule')
+    gate = schedule.fetch('steps').first
+    assert_equal 'periodic_gate', gate.fetch('id')
+    assert_equal 'Admit periodic wake for this scheduling window', gate.fetch('name')
+    schedule.fetch('steps').drop(1).each do |step|
+      assert_includes step.fetch('if').to_s,
+                      "steps.periodic_gate.outputs.run == 'true'",
+                      "#{step.fetch('name')}: periodic NOOP must skip this step"
+    end
+
+    gate_run = gate.fetch('run')
+    assert_equal '${{ inputs.caller_event_name }}',
+                 gate.fetch('env').fetch('CALLER_EVENT_NAME')
+    assert_includes gate_run, '7 * 60'
+    assert_includes gate_run, '10 * 60'
+    assert_includes gate_run, '[continuum-periodic]'
+    assert_includes gate_run, 'window-due'
+    assert_includes gate_run, 'duplicate-window'
+    assert_includes gate_run, 'lookup-unavailable'
+    assert_includes gate_run, 'conclusion == "success"'
+    refute_includes gate_run, 'cron-job.org'
+
+    # Native schedule stays authoritative and keeps its exact expression.
+    stub = yaml(File.join(ROOT, '.github/caller-stubs/continuum-issue-scheduler.yml'))
+    crons = events(stub).fetch('schedule').map { |entry| entry.fetch('cron') }
+    assert_equal ['7,17,27,37,47,57 * * * *'], crons
+    assert_includes stub.fetch('run-name'), '[continuum-periodic]'
+    dispatch = events(stub).fetch('workflow_dispatch').fetch('inputs').fetch('periodic_wake')
+    assert_equal 'string', dispatch.fetch('type')
+    assert_equal 'false', dispatch.fetch('default')
+    assert_equal false, dispatch.fetch('required')
+    assert_equal '${{ inputs.periodic_wake }}',
+                 stub.fetch('jobs').fetch('call').fetch('with').fetch('periodic_wake')
+
+    # The guard is periodic-only: ordinary dispatch/event runs are never
+    # routed through it, and the self-dogfood fan-out is not an external target.
+    automation = File.read(File.join(ROOT, '.github/workflows/automation.yml'))
+    refute_includes automation, 'periodic_wake',
+                    'automation.yml fans out multiple jobs and is not a supported external endpoint'
+    doc = File.read(File.join(ROOT, 'docs/cron-job-org.md'))
+    assert_includes doc, 'continuum-issue-scheduler.yml'
+    assert_includes doc, 'periodic_wake'
+    assert_includes doc, 'Actions: write'
+    assert_includes doc, 'not supported external target'
+    assert_includes File.read(File.join(ROOT, 'README.md')), 'docs/cron-job-org.md'
+    refute_includes doc, 'CRON_JOB_ORG_API_KEY'
   end
 
   # The unified scheduler and child review must share the configured labels.
@@ -4006,7 +4060,7 @@ class ContinuumTest < Minitest::Test
       dispatch_ref opencode_dispatch execution_label_routes
       child_dispatch_workflow
       count_open_prs_as_wip pause_on_failure
-      caller_event_name caller_issue_number
+      caller_event_name caller_issue_number periodic_wake
     ],
     'continuum-opencode.yml' => %w[
       continuum_ref mode issue_number pr_number head_ref review_id unresolved_items_json run_id
@@ -5677,7 +5731,7 @@ class ContinuumTest < Minitest::Test
     # (b) the child wake-up is one step, gated on the knob being non-empty.
     wakeup = step_body(body, 'Wake the configured downstream dispatcher')
     refute_nil wakeup, 'the child-dispatch wake-up step is missing'
-    assert_includes wakeup, "if: env.CHILD_DISPATCH_WORKFLOW != ''",
+    assert_includes wakeup, "env.CHILD_DISPATCH_WORKFLOW != ''",
                     'the child wake-up must not run when no dispatcher is configured'
     assert_match(%r{repos/\$GITHUB_REPOSITORY/actions/workflows/\$CHILD_DISPATCH_WORKFLOW/dispatches}, wakeup)
     assert_includes wakeup, '::warning::'
