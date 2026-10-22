@@ -15,6 +15,15 @@ on:
         required: false
         type: string
         default: ''
+      opencode_workflow:
+        description: >-
+          Optional repository-local OpenCode caller workflow (bare file name or
+          `.github/workflows/...` path) that actually declares
+          `workflow_dispatch`. Empty resolves the completed run's own path,
+          then the known caller names; the reusable engine is never dispatched.
+        required: false
+        type: string
+        default: ''
       watched_workflow:
         description: >-
           `name:` of the workflow whose completed runs this watchdog recovers.
@@ -86,7 +95,7 @@ on:
 permissions: {}
 
 concurrency:
-  group: ${{ github.workflow }}-opencode-watchdog-${{ github.event.workflow_run.id }}
+  group: ${{ github.workflow }}-opencode-watchdog-${{ github.event_name == 'schedule' && 'catch-up' || github.event.workflow_run.id }}
   cancel-in-progress: false
 
 jobs:
@@ -109,6 +118,8 @@ jobs:
 
     env:
       WATCHED_WORKFLOW: ${{ inputs.watched_workflow }}
+      OPENCODE_WORKFLOW: ${{ inputs.opencode_workflow || vars.CONTINUUM_OPENCODE_WORKFLOW }}
+      DISPATCH_REF: ${{ vars.CONTINUUM_DISPATCH_REF || '' }}
       MAX_RECOVERY_RETRIES: ${{ inputs.max_recovery_retries || vars.AUTOMATION_WATCHDOG_MAX_RETRIES || '1' }}
       MAX_429_RUNNER_RESTARTS: ${{ inputs.max_429_runner_restarts || vars.AUTOMATION_WATCHDOG_MAX_429_RUNNER_RESTARTS || '3' }}
       GITHUB_API_URL: ${{ github.api_url }}
@@ -120,8 +131,23 @@ jobs:
       READ_GITHUB_TOKEN: ${{ github.token }}
 
     steps:
+      - name: Checkout Continuum watchdog routing helper
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: kodmial/continuum
+          # Pinned: this file is executed by require(); never leave it on a
+          # mutable ref. Advance the pin only in the same PR that changes it.
+          ref: b06bd207d8ff5ad079d14626eb10669c13d56435
+          path: .continuum-watchdog-engine
+          fetch-depth: 1
+          persist-credentials: false
+          sparse-checkout: |
+            .github/scripts/opencode_429_dispatch.js
+
       - name: Recover failed OpenCode issue run
         uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
+        env:
+          CONTINUUM_DISPATCH_HELPER: ${{ github.workspace }}/.continuum-watchdog-engine/.github/scripts/opencode_429_dispatch.js
         with:
           # TAP_PAT is intentional: the recovery writes labels and comments,
           # and only a PAT (not GITHUB_TOKEN) reliably fans those writes out
@@ -131,6 +157,7 @@ jobs:
             const owner = context.repo.owner;
             const repo = context.repo.repo;
             const run = context.payload.workflow_run;
+            const dispatchRouting = require(process.env.CONTINUUM_DISPATCH_HELPER);
             const repoFullName = owner + '/' + repo;
             const watchedWorkflow = process.env.WATCHED_WORKFLOW || '';
             const retryMarker = process.env.RETRY_MARKER || '<!-- opencode-watchdog-retry -->';
@@ -167,8 +194,12 @@ jobs:
               typeof readGithub.rest?.issues?.listComments !== 'function' ||
               typeof readGithub.rest?.pulls?.list !== 'function' ||
               typeof readGithub.rest?.actions?.listWorkflowRunsForRepo !== 'function' ||
+              typeof readGithub.rest?.actions?.listWorkflowRuns !== 'function' ||
               typeof readGithub.rest?.actions?.listJobsForWorkflowRun !== 'function' ||
-              typeof readGithub.rest?.actions?.reRunWorkflow !== 'function'
+              typeof readGithub.rest?.actions?.reRunWorkflow !== 'function' ||
+              typeof readGithub.rest?.git?.getRef !== 'function' ||
+              typeof readGithub.rest?.repos?.get !== 'function' ||
+              typeof readGithub.rest?.repos?.getContent !== 'function'
             ) {
               throw new Error(
                 'readGithub client lacks the paginate/rest plugins; ' +
@@ -195,12 +226,38 @@ jobs:
               'CONTINUUM_OPENCODE_UPSTREAM_UNAVAILABLE_RESTART_REQUIRED';
             const publishRaceMarker =
               'CONTINUUM_OPENCODE_PUBLISH_RACE_RETRY_REQUIRED';
+            const metadataFailedMarker =
+              'CONTINUUM_OPENCODE_429_RECOVERY_METADATA_FAILED';
+            // Legacy claim/backoff markers remain readable so an older
+            // in-flight watchdog pass cannot duplicate a resumption.
+            const legacyResumptionPrefix = '<!-- continuum-429-resumption';
+            const legacyBackoffPrefix = '<!-- continuum-429-backoff';
             // Evacuation line written by the workflow-owned 429 evacuator:
             // "Evacuated 429 checkpoint <ref> at exact SHA <sha> (operation
             // <op>, stage <stage>, generation <gen>, mode <mode>, issue <i>,
             // pr <p>, branch <b>)."
             const evacuatedRe =
               /Evacuated (?:429|infrastructure) checkpoint (\S+) at exact SHA ([0-9a-f]{40}) \(operation (\S+), stage (\S+), generation (\d+), mode (\S+), issue ([^,]*), pr ([^,]*), branch ([^)]*)\)/;
+            const metadataFailedRe =
+              /CONTINUUM_OPENCODE_429_RECOVERY_METADATA_FAILED operation=(\S+) generation=(\d+) stage=(\S*) mode=(\S*) issue=(\S*) pr=(\S*) salvage_ref=(\S*) reason=(.*)$/;
+            function parseMetadataFailure(logText) {
+              for (const line of String(logText || '').split('\n')) {
+                const match = line.match(metadataFailedRe);
+                if (!match) continue;
+                const clean = (value) => (value === '-' ? '' : value);
+                return {
+                  operationId: match[1],
+                  generation: Number.parseInt(match[2], 10),
+                  stage: clean(match[3]),
+                  mode: clean(match[4]),
+                  issueNumber: clean(match[5]),
+                  prNumber: clean(match[6]),
+                  salvageRef: clean(match[7]),
+                  reason: (match[8] || '').trim(),
+                };
+              }
+              return null;
+            }
             const max429Restarts = Number.parseInt(
               process.env.MAX_429_RUNNER_RESTARTS || '3',
               10
@@ -220,177 +277,716 @@ jobs:
             // requires manual /oc. Identity and numbers only: repository
             // names never enter logs or comments, so public Parent logs keep
             // Child identities opaque.
+            function recoveryStateMarker({
+              operation, generation, state, checkpointRef, checkpointSha,
+              runId, attempt, nextDue, detail,
+            }) {
+              const clean = (value, fallback) => {
+                const text = String(value || '').trim().replace(/[\s"<>]+/g, '-');
+                return text || (fallback || '-');
+              };
+              return '<!-- continuum-429-recovery op=' + clean(operation, 'unknown') +
+                ' gen=' + Math.max(0, Number(generation) || 0) +
+                ' state=' + clean(state) +
+                ' attempt=' + Math.max(0, Number(attempt) || 0) +
+                ' next_due=' + Math.max(0, Number(nextDue) || 0) +
+                ' checkpoint=' + clean(checkpointRef) +
+                ' sha=' + clean(checkpointSha) +
+                ' run=' + clean(runId) +
+                ' detail=' + clean(detail) + ' -->';
+            }
+
+            function parseRecoveryStates(body, operation, generation) {
+              const re = /<!--\s*continuum-429-recovery\s+op=(\S+)\s+gen=(\d+)\s+state=(\S+)\s+attempt=(\d+)\s+next_due=(\d+)\s+checkpoint=(\S*)\s+sha=(\S*)\s+run=(\S*)\s+detail=(\S*)\s*-->/g;
+              const text = String(body || '');
+              const found = [];
+              let match;
+              while ((match = re.exec(text)) !== null) {
+                if (match[1] !== operation || Number(match[2]) !== Number(generation)) continue;
+                found.push({
+                  operation: match[1],
+                  generation: Number(match[2]),
+                  state: match[3],
+                  attempt: Number(match[4]),
+                  nextDue: Number(match[5]),
+                  checkpointRef: match[6] === '-' ? '' : match[6],
+                  checkpointSha: match[7] === '-' ? '' : match[7],
+                  runId: match[8] === '-' ? '' : match[8],
+                  detail: match[9] === '-' ? '' : match[9],
+                });
+              }
+              return found;
+            }
+
+            async function listThreadComments(threadNumber) {
+              if (!Number.isInteger(threadNumber) || threadNumber <= 0) return [];
+              return readGithub.paginate(
+                readGithub.rest.issues.listComments,
+                { owner, repo, issue_number: threadNumber, per_page: 100 }
+              );
+            }
+
+            function latestRecoveryState(comments, operation, generation) {
+              const all = [];
+              for (const comment of comments) {
+                for (const state of parseRecoveryStates(
+                  comment.body || '', operation, generation
+                )) {
+                  all.push({ ...state, commentId: Number(comment.id || 0) });
+                }
+              }
+              return all.length ? all[all.length - 1] : null;
+            }
+
+            function recoveryCommentBody(marker, summary) {
+              return [
+                marker,
+                '⚡ **Continuum · opencode-watchdog**',
+                '<!-- continuum-origin role=continuum component=opencode-watchdog -->',
+                summary,
+              ].join('\n');
+            }
+
+            async function recordRecoveryState({
+              threadNumber, operation, generation, state, checkpointRef,
+              checkpointSha, runId, attempt, nextDue, detail, summary,
+              fresh = false,
+            }) {
+              if (!Number.isInteger(threadNumber) || threadNumber <= 0) return null;
+              const marker = recoveryStateMarker({
+                operation, generation, state, checkpointRef, checkpointSha,
+                runId, attempt, nextDue, detail,
+              });
+              const body = recoveryCommentBody(marker, summary);
+              // A claim must be a brand-new comment so concurrent passes get
+              // distinct ids; every other update coalesces onto the existing
+              // durable state comment for this exact operation+generation.
+              const comments = fresh ? [] : await listThreadComments(threadNumber);
+              // Match the machine-readable marker exactly (same operation and
+              // arithmetic generation), never an unanchored substring: a
+              // `gen=1` lookup must not update a `gen=10` comment.
+              const existing = comments
+                .filter(comment => parseRecoveryStates(
+                  comment.body || '', operation, generation
+                ).length > 0)
+                .sort((a, b) => Number(a.id || 0) - Number(b.id || 0));
+              if (existing.length) {
+                const latest = existing[existing.length - 1];
+                await github.rest.issues.updateComment({
+                  owner, repo, comment_id: latest.id, body,
+                });
+                return latest;
+              }
+              const created = await github.rest.issues.createComment({
+                owner, repo, issue_number: threadNumber, body,
+              });
+              return created.data;
+            }
+
+            // kodmial/continuum#350: the pre-dispatch claim must be a fresh
+            // comment so concurrent passes get distinct ids. Two passes can
+            // read the same previous state and both reach dispatch; the lower
+            // comment id wins, the loser deletes its own claim and stands
+            // down, exactly like the original exactly-once fence.
+            async function createRecoveryClaim({
+              threadNumber, operation, generation, checkpointRef, checkpointSha,
+              attempt, nextDue, summary,
+            }) {
+              return recordRecoveryState({
+                threadNumber, operation, generation, state: 'claimed',
+                checkpointRef, checkpointSha, runId: '', attempt, nextDue,
+                detail: 'dispatch-starting', summary, fresh: true,
+              });
+            }
+
+            async function holdsRecoveryClaim(claim, {
+              threadNumber, operation, generation, attempt,
+            }) {
+              if (!claim) return true;
+              if (!Number.isInteger(threadNumber) || threadNumber <= 0) return true;
+              const comments = await listThreadComments(threadNumber);
+              const claimIds = [];
+              for (const comment of comments) {
+                const states = parseRecoveryStates(
+                  comment.body || '', operation, generation
+                );
+                // Any same-attempt marker (claimed, accepted, observed) is a
+                // competing claim. A failed dispatch is retryable and must not
+                // block another pass.
+                const isCurrentClaim = states.some(state =>
+                  state.attempt === attempt &&
+                  state.state !== 'dispatch-failed'
+                );
+                if (isCurrentClaim) claimIds.push(Number(comment.id || 0));
+              }
+              claimIds.sort((a, b) => a - b);
+              return claimIds.length > 0 &&
+                claimIds[0] === Number(claim.id || 0);
+            }
+
+            async function deleteRecoveryClaim(claim) {
+              if (!claim) return;
+              try {
+                await github.rest.issues.deleteComment({
+                  owner, repo, comment_id: claim.id,
+                });
+              } catch (err) {
+                core.warning(
+                  'OpenCode infrastructure recovery claim cleanup failed: ' +
+                  (err.message || err)
+                );
+              }
+            }
+
+            function validateRecoveryMetadata(identity, expected) {
+              if (!identity || typeof identity !== 'object' || Array.isArray(identity)) {
+                return 'recovery metadata is not an object';
+              }
+              if (Number(identity.schema_version) !== 1) {
+                return 'recovery metadata schema version is unsupported';
+              }
+              for (const field of [
+                'operation_id', 'failure_kind', 'generation', 'stage', 'mode',
+                'issue_number', 'pr_number', 'head_ref', 'base_sha', 'head_sha',
+                'branch', 'checkpoint_ref',
+              ]) {
+                if (!(field in identity)) return 'recovery metadata is missing ' + field;
+              }
+              if (String(identity.operation_id) !== expected.operation) {
+                return 'recovery metadata operation mismatch';
+              }
+              if (Number(identity.generation) !== Number(expected.generation)) {
+                return 'recovery metadata generation mismatch';
+              }
+              if (String(identity.stage) !== expected.stage) {
+                return 'recovery metadata stage mismatch';
+              }
+              if (String(identity.mode) !== expected.mode) {
+                return 'recovery metadata mode mismatch';
+              }
+              if (String(identity.issue_number || '') !== String(expected.issueNumber || '')) {
+                return 'recovery metadata issue mismatch';
+              }
+              if (String(identity.pr_number || '') !== String(expected.prNumber || '')) {
+                return 'recovery metadata PR mismatch';
+              }
+              if (String(identity.checkpoint_ref || '') !== expected.checkpointRef) {
+                return 'recovery metadata checkpoint ref mismatch';
+              }
+              if (!/^[0-9a-f]{40}$/i.test(String(identity.head_sha || ''))) {
+                return 'recovery metadata head SHA is malformed';
+              }
+              if (!String(identity.head_ref || '').trim()) {
+                return 'recovery metadata head ref is empty';
+              }
+              if (!['issue', 'qualification', 'coderabbit-fix', 'resolve-conflict', 'ci-fix'].includes(expected.mode)) {
+                return 'recovery metadata mode is not dispatchable';
+              }
+              if (expected.mode === 'issue' && !/^[0-9]+$/.test(String(expected.issueNumber || ''))) {
+                return 'recovery metadata issue mode requires an issue number';
+              }
+              return '';
+            }
+
+            async function readCheckpointMetadata({
+              operation, generation, checkpointRef, checkpointSha,
+            }) {
+              const pointerSha = String(checkpointSha || '').trim().toLowerCase();
+              let refSha = '';
+              let refError = null;
+              // Resolve the durable ref first. The ref tip, not a possibly
+              // stale event pointer, is what a fresh runner can actually
+              // fetch. A transient 404 is retried (eventual visibility), but
+              // a ref that never appears is a provably missing checkpoint.
+              for (let attempt = 0; attempt < 7; attempt += 1) {
+                try {
+                  const refResponse = await readGithub.rest.git.getRef({
+                    owner, repo, ref: 'heads/' + checkpointRef,
+                  });
+                  refSha = String(refResponse.data.object.sha || '').toLowerCase();
+                  refError = null;
+                  break;
+                } catch (err) {
+                  refError = err;
+                  const status = Number(err && err.status || 0);
+                  if (status !== 404) {
+                    return {
+                      ok: false,
+                      kind: status === 401 || status === 403 ? 'auth' : 'transient',
+                      status,
+                      reason: String(err && err.message || err),
+                      exactSha: pointerSha,
+                      stalePointer: false,
+                    };
+                  }
+                  if (attempt < 6) {
+                    await new Promise(resolve => setTimeout(resolve, 1000 * Math.pow(2, attempt)));
+                  }
+                }
+              }
+              if (!refSha) {
+                return {
+                  ok: false,
+                  kind: 'missing',
+                  status: Number(refError && refError.status || 0),
+                  reason: 'checkpoint ref ' + checkpointRef + ' is not visible',
+                  exactSha: pointerSha,
+                  stalePointer: false,
+                };
+              }
+              // The event pointer can be stale after a duplicate evacuation
+              // force-updated the same generation. The ref tip is newer and
+              // reviewable, so prefer it; record the mismatch for operators.
+              const exactSha = refSha;
+              const stalePointer = Boolean(pointerSha) && pointerSha !== refSha;
+              try {
+                const content = await readGithub.rest.repos.getContent({
+                  owner, repo, path: '.continuum-429-recovery.json', ref: exactSha,
+                });
+                if (Array.isArray(content.data) || content.data.type !== 'file') {
+                  return {
+                    ok: false, kind: 'invalid',
+                    reason: 'recovery metadata is not a file',
+                    exactSha, stalePointer,
+                  };
+                }
+                const identity = JSON.parse(
+                  Buffer.from(content.data.content, 'base64').toString('utf8')
+                );
+                return { ok: true, identity, exactSha, stalePointer };
+              } catch (err) {
+                const status = Number(err && err.status || 0);
+                // The commit is known (the ref resolved), so a 404 here
+                // proves the metadata file is absent rather than merely
+                // still becoming visible.
+                let kind = 'transient';
+                if (status === 404 || status === 422) kind = 'missing';
+                else if (status === 401 || status === 403) kind = 'auth';
+                return {
+                  ok: false,
+                  kind,
+                  status,
+                  reason: String(err && err.message || err),
+                  exactSha,
+                  stalePointer,
+                };
+              }
+            }
+
+            async function resolveDispatchTarget(runPath) {
+              const helper = process.env.CONTINUUM_DISPATCH_HELPER || '';
+              let dispatchRouting;
+              try {
+                dispatchRouting = require(helper);
+              } catch (err) {
+                throw new Error(
+                  'OpenCode 429 dispatch routing helper is unavailable: ' +
+                  (err.message || err)
+                );
+              }
+              const repoResponse = await readGithub.rest.repos.get({ owner, repo });
+              const ref = String(process.env.DISPATCH_REF || '').trim() ||
+                String(repoResponse.data.default_branch || 'main');
+              const configured = String(process.env.OPENCODE_WORKFLOW || '').trim();
+              const candidates = new Set([
+                dispatchRouting.normalizeWorkflowPath(configured),
+                dispatchRouting.normalizeWorkflowPath(runPath),
+                ...dispatchRouting.DEFAULT_CANDIDATES,
+              ].filter(Boolean));
+              const workflows = {};
+              for (const candidate of candidates) {
+                try {
+                  const content = await readGithub.rest.repos.getContent({
+                    owner, repo, path: candidate, ref,
+                  });
+                  if (Array.isArray(content.data) || content.data.type !== 'file') {
+                    workflows[candidate] = null;
+                    continue;
+                  }
+                  workflows[candidate] = Buffer.from(
+                    content.data.content || '', 'base64'
+                  ).toString('utf8');
+                } catch (err) {
+                  workflows[candidate] = null;
+                }
+              }
+              const target = dispatchRouting.resolveDispatchWorkflow({
+                configured,
+                watchedRunPath: runPath,
+                workflows,
+              });
+              if (!target) return null;
+              return { ...target, ref, configured };
+            }
+
+            // Stable run identity for one operation+generation. The callers put
+            // this exact value into `run-name`, so a later pass can find an
+            // already accepted dispatch even when the pass that made it died
+            // before recording the run id.
+            function recoveryRunName(operation, generation) {
+              return 'OpenCode 429 recovery ' + String(operation) +
+                ' gen ' + String(generation);
+            }
+
+            async function observeDispatchedRun({
+              target, notBefore, displayTitle, recoveryRunName, oldRunId,
+            }) {
+              for (let attempt = 0; attempt < 10; attempt += 1) {
+                try {
+                  const runs = await readGithub.paginate(
+                    readGithub.rest.actions.listWorkflowRuns,
+                    {
+                      owner, repo, workflow_id: target.workflowId,
+                      per_page: 50,
+                    }
+                  );
+                  const candidates = runs.filter(candidate => {
+                    if (Number(candidate.id) === Number(oldRunId || 0)) return false;
+                    if (candidate.event !== 'workflow_dispatch') return false;
+                    if (candidate.path && candidate.path !== target.path) return false;
+                    if (new Date(candidate.created_at || 0).getTime() + 5000 < notBefore) {
+                      return false;
+                    }
+                    return true;
+                  });
+                  const byTitle = title => title
+                    ? candidates.find(candidate =>
+                        candidate.display_title === title)
+                    : null;
+                  // Prefer the recovery identity embedded in run-name. Fall
+                  // back to the caller's mode/issue title and finally, only
+                  // when it is unambiguous, to the single new dispatch run. A
+                  // missing/unrelated display_title must never turn an
+                  // observable dispatch into an accepted-but-unowned one.
+                  let match = byTitle(recoveryRunName) || byTitle(displayTitle);
+                  if (!match) {
+                    const ordered = candidates.slice().sort((a, b) =>
+                      new Date(a.created_at || 0).getTime() -
+                        new Date(b.created_at || 0).getTime() ||
+                      Number(a.id || 0) - Number(b.id || 0)
+                    );
+                    if (ordered.length === 1) {
+                      match = ordered[0];
+                    }
+                  }
+                  if (match) return match;
+                } catch (err) {
+                  core.warning(
+                    'OpenCode 429 dispatch observation attempt failed for ' +
+                    target.path + ': ' + (err.message || err)
+                  );
+                }
+                if (attempt < 9) {
+                  await new Promise(resolve => setTimeout(resolve, 5000));
+                }
+              }
+              return null;
+            }
+
             async function recoverFrom429OnFreshVm({
               owner, repo, run, evacuated429,
               max429Restarts,
             }) {
+              const operation = String(evacuated429 && evacuated429.operationId || '').trim();
+              const checkpointRef = String(evacuated429 && evacuated429.checkpointRef || '').trim();
+              let generation = Number(evacuated429 && evacuated429.generation || 0);
+              if (!Number.isInteger(generation) || generation < 0) generation = 0;
+              const pointerSha = String(evacuated429 && evacuated429.checkpointSha || '')
+                .trim().toLowerCase();
+              const runPath = String(run && run.path || '');
+              const numberTexts = [
+                String(evacuated429 && evacuated429.issueNumber || '').trim(),
+                String(evacuated429 && evacuated429.prNumber || '').trim(),
+              ].filter(text => /^[0-9]+$/.test(text));
+              const threadNumber = numberTexts.length ? Number(numberTexts[0]) : 0;
+              const baseState = {
+                threadNumber,
+                operation,
+                generation,
+                checkpointRef,
+                checkpointSha: pointerSha,
+              };
+
               if (!evacuated429) {
                 core.notice(
                   'OpenCode infrastructure marker without a workflow-owned evacuation ' +
-                  'pointer in run ' + run.id + '; keeping the automation ' +
-                  'reservation so the scheduler lease retries it. No task ' +
-                  'budget was consumed and no pause was applied.'
+                  'pointer in run ' + (run && run.id) + '; scheduling a bounded ' +
+                  'watchdog catch-up without pausing or consuming task budget.'
                 );
                 return;
               }
-              const operation = String(evacuated429.operationId || '').trim();
-              const checkpointRef = String(evacuated429.checkpointRef || '').trim();
-              let generation = Number(evacuated429.generation || 0);
-              if (!Number.isInteger(generation) || generation < 0) generation = 0;
               if (!operation || !/^opencode\/(?:429|infra)-checkpoint-/.test(checkpointRef)) {
-                core.warning(
-                  'OpenCode infrastructure evacuation identity is malformed in run ' +
-                  run.id + '; keeping the reservation for scheduler retry.'
-                );
+                await recordRecoveryState({
+                  ...baseState,
+                  state: 'metadata-failed',
+                  attempt: 1,
+                  nextDue: Math.floor(Date.now() / 1000) + 300,
+                  detail: 'malformed-pointer',
+                  summary: 'OpenCode infrastructure evacuation identity is malformed; the durable checkpoint is preserved and no task budget was consumed.',
+                });
+                return;
+              }
+              const now = Math.floor(Date.now() / 1000);
+              const comments = await listThreadComments(threadNumber);
+              const previous = latestRecoveryState(comments, operation, generation);
+
+              if (generation > max429Restarts) {
+                // Honor the durable window instead of recording a fresh
+                // `next_due` on every */15 catch-up pass, which would slide the
+                // cooldown forever and strand the reservation.
+                const backoffSchedule = [60, 300, 900, 1800, 3600];
+                const backoffDue = backoffSchedule[
+                  Math.min(
+                    Math.max(0, generation - max429Restarts - 1),
+                    backoffSchedule.length - 1
+                  )
+                ];
+                if (!previous || previous.nextDue <= now) {
+                  await recordRecoveryState({
+                    ...baseState,
+                    state: 'backoff',
+                    attempt: generation,
+                    nextDue: now + backoffDue,
+                    detail: 'generation-exhausted',
+                    summary: 'Repeated model 429s on fresh runners; entering bounded infrastructure backoff. No pause was applied and no task/review/qualification budget was consumed.',
+                  });
+                  core.warning(
+                    'OpenCode infrastructure operation ' + operation + ' entered bounded ' +
+                    'infrastructure backoff after ' + generation +
+                    ' fresh-runner generation(s); checkpoint ' + checkpointRef +
+                    ' preserved for automatic resume.'
+                  );
+                } else {
+                  core.notice(
+                    'OpenCode infrastructure operation ' + operation + ' generation ' +
+                    generation + ' is already in bounded infrastructure backoff until ' +
+                    previous.nextDue + '; not resetting the window.'
+                  );
+                }
                 return;
               }
 
-              // The durable checkpoint metadata is the source of truth for
-              // the full recovery identity (mode, issue/PR, SHAs, stage).
-              let identity;
-              try {
-                const content = await readGithub.rest.repos.getContent({
-                  owner,
-                  repo,
-                  path: '.continuum-429-recovery.json',
-                  ref: checkpointRef,
+              const metadata = await readCheckpointMetadata({
+                operation, generation, checkpointRef,
+                checkpointSha: pointerSha,
+              });
+              if (!metadata.ok) {
+                const now = Math.floor(Date.now() / 1000);
+                const nextDue = now + (metadata.kind === 'missing' ? 60 : 300);
+                const failed = metadata.kind === 'missing' || metadata.kind === 'invalid';
+                await recordRecoveryState({
+                  ...baseState,
+                  checkpointSha: metadata.exactSha || pointerSha,
+                  state: failed ? 'metadata-failed' : 'metadata-pending',
+                  attempt: 1,
+                  nextDue,
+                  detail: 'metadata-' + metadata.kind,
+                  summary: failed
+                    ? 'Checkpoint `' + checkpointRef + '` exists but its recovery metadata is provably missing or invalid. Raw work is preserved; no resume is dispatched from an unproven checkpoint.'
+                    : 'Checkpoint `' + checkpointRef + '` metadata is not readable yet (' + metadata.kind + '). A scheduled watchdog catch-up will retry; no pause was applied.',
                 });
-                if (Array.isArray(content.data) || content.data.type !== 'file') {
-                  throw new Error('recovery metadata is not a file');
-                }
-                identity = JSON.parse(
-                  Buffer.from(content.data.content, 'base64').toString('utf8')
-                );
-              } catch (err) {
                 core.warning(
                   'OpenCode infrastructure checkpoint ' + checkpointRef +
-                  ' metadata is not readable yet (' + (err.message || err) +
-                  '); keeping the reservation for a later watchdog pass. ' +
+                  ' metadata is not recoverable yet (' + metadata.kind + ': ' +
+                  (metadata.reason || 'unknown') + '); recorded durable ' +
+                  (failed ? 'metadata-failed' : 'metadata-pending') + ' state. ' +
                   'No pause was applied.'
                 );
                 return;
               }
-              // The durable checkpoint ref tip is the recovery-metadata
-              // commit on top of the working-tree HEAD recorded inside the
-              // metadata file, so identity.head_sha (working-tree HEAD) is
-              // the parent of the evacuated tip, not the tip itself.
-              // Identity match is operation + generation; the exact
-              // checkpoint SHA dispatched is the evacuated ref tip from the
-              // workflow-owned evacuation pointer (falling back to the
-              // metadata working-tree HEAD only when the pointer SHA is
-              // malformed).
-              if (
-                String(identity.operation_id || '') !== operation ||
-                Number(identity.generation || 0) !== generation
-              ) {
-                core.warning(
-                  'OpenCode infrastructure checkpoint metadata does not match the ' +
-                  'evacuation pointer for operation ' + operation + '; ' +
-                  'keeping the reservation for a later watchdog pass.'
-                );
-                return;
-              }
+
+              const identity = metadata.identity;
               const stage = String(identity.stage || 'implementation-incomplete');
-              const pointerSha = String(evacuated429.checkpointSha || '');
-              const checkpointSha = /^[0-9a-f]{40}$/i.test(pointerSha)
-                ? pointerSha.toLowerCase()
-                : String(identity.head_sha || '').toLowerCase();
               const mode = String(identity.mode || '');
-              if (!['issue', 'qualification', 'coderabbit-fix', 'resolve-conflict', 'ci-fix'].includes(mode)) {
-                core.warning(
-                  'OpenCode infrastructure checkpoint has unknown mode for operation ' + operation +
-                  '; keeping reservation for later pass.'
-                );
-                return;
-              }
               const issueText = String(identity.issue_number || '').trim();
               const prText = String(identity.pr_number || '').trim();
-              const qualText = String(identity.qualification_number || '').trim();
-              const threadNumber = Number(issueText || prText || qualText || 0);
-              if (!/^[0-9]+$/.test(String(threadNumber)) || threadNumber <= 0) {
-                // No issue/PR thread owns this operation (or the number is
-                // not trustworthy): dispatch the resumption without a
-                // marker thread, but still never pause and never consume
-                // task budgets.
-                core.notice(
-                  'OpenCode infrastructure operation ' + operation + ' has no numeric ' +
-                  'thread; resuming without a dedupe comment.'
+              const expected = {
+                operation, generation, stage, mode,
+                issueNumber: issueText,
+                prNumber: prText,
+                checkpointRef,
+              };
+              const validationError = validateRecoveryMetadata(identity, expected);
+              if (validationError) {
+                await recordRecoveryState({
+                  ...baseState,
+                  checkpointSha: metadata.exactSha,
+                  state: 'metadata-failed',
+                  attempt: 1,
+                  nextDue: Math.floor(Date.now() / 1000) + 300,
+                  detail: 'metadata-invalid',
+                  summary: 'Checkpoint `' + checkpointRef + '` recovery metadata failed validation (' + validationError + '). Raw work is preserved; no resume is dispatched.',
+                });
+                core.warning(
+                  'OpenCode infrastructure checkpoint ' + checkpointRef +
+                  ' metadata failed validation: ' + validationError
+                );
+                return;
+              }
+              // The ref tip is authoritative for a fetchable checkpoint; a
+              // stale event pointer must not dispatch an older SHA than the
+              // ref now exposes.
+              const checkpointSha = metadata.exactSha || pointerSha;
+              if (metadata.stalePointer) {
+                core.warning(
+                  'OpenCode infrastructure checkpoint ' + checkpointRef +
+                  ' advanced from stale event pointer ' + pointerSha +
+                  ' to current ref tip ' + checkpointSha + '; using the tip.'
                 );
               }
 
-              const resumptionMarker =
-                '<!-- continuum-429-resumption op=' + operation +
-                ' gen=' + generation + ' -->';
-              if (Number.isInteger(threadNumber) && threadNumber > 0) {
-                const comments = await readGithub.paginate(
-                  readGithub.rest.issues.listComments,
-                  { owner, repo, issue_number: threadNumber, per_page: 100 }
-                );
-                if (comments.some(comment => (comment.body || '').includes(resumptionMarker))) {
+              const displayTitle = mode === 'issue'
+                ? 'OpenCode issue #' + issueText
+                : (prText ? 'OpenCode repair PR #' + prText : '');
+              const recoveryTitle = recoveryRunName(operation, generation);
+
+              // Crash-after-ack fence: an expired `claimed`/`accepted` marker
+              // may describe a dispatch GitHub already accepted even though
+              // the pass that made it died before recording the run id. Adopt
+              // the durable operation+generation run identity before creating
+              // a new attempt; never treat the claim alone as proof either
+              // way.
+              if (
+                previous &&
+                previous.nextDue <= now &&
+                (previous.state === 'claimed' || previous.state === 'accepted')
+              ) {
+                let observedTarget = null;
+                try {
+                  observedTarget = await resolveDispatchTarget(runPath);
+                } catch (err) {
+                  core.warning(
+                    'OpenCode infrastructure operation ' + operation + ' generation ' +
+                    generation + ' could not resolve a dispatch target while ' +
+                    'checking for an already accepted run (' +
+                    (err.message || err) + ').'
+                  );
+                }
+                if (observedTarget) {
+                  const recovered = await observeDispatchedRun({
+                    target: observedTarget,
+                    notBefore: Math.max(0, previous.nextDue - 300) * 1000,
+                    displayTitle,
+                    recoveryRunName: recoveryTitle,
+                    oldRunId: run && run.id,
+                  });
+                  if (recovered) {
+                    await recordRecoveryState({
+                      ...baseState,
+                      checkpointSha,
+                      state: 'observed',
+                      attempt: previous.attempt,
+                      nextDue: 0,
+                      runId: String(recovered.id),
+                      detail: 'run-recovered',
+                      summary: 'Adopted already-dispatched fresh-VM run ' +
+                        recovered.id + ' for checkpoint `' + checkpointRef +
+                        '` at exact SHA `' + checkpointSha + '` (stage `' +
+                        stage + '`, generation ' + generation +
+                        ') instead of dispatching a duplicate.',
+                    });
+                    core.notice(
+                      'OpenCode 429: adopted existing fresh-VM run ' + recovered.id +
+                      ' for operation ' + operation + ' generation ' + generation +
+                      '; no duplicate dispatch.'
+                    );
+                    return;
+                  }
+                }
+              }
+
+              if (previous) {
+                if (previous.state === 'observed') {
                   core.notice(
                     'OpenCode infrastructure operation ' + operation + ' generation ' +
-                    generation + ' was already resumed; watchdog will not ' +
-                    'create a competing resumption.'
+                    generation + ' was already resumed by observed run ' + previous.runId + '; ' +
+                    'watchdog will not create a competing resumption.'
                   );
                   return;
                 }
-              }
-
-              // Repeated fresh-VM 429s enter bounded infrastructure
-              // backoff: the checkpoint is preserved, the reservation is
-              // kept, and the scheduler/cron resumes automatically with the
-              // same checkpoint/operation identity. Never paused, never /oc.
-              if (generation > max429Restarts) {
-                const backoffMarker =
-                  '<!-- continuum-429-backoff op=' + operation +
-                  ' gen=' + generation + ' -->';
-                if (Number.isInteger(threadNumber) && threadNumber > 0) {
-                  const comments = await readGithub.paginate(
-                    readGithub.rest.issues.listComments,
-                    { owner, repo, issue_number: threadNumber, per_page: 100 }
+                if (previous.state === 'accepted' && previous.nextDue > now) {
+                  core.notice(
+                    'OpenCode infrastructure operation ' + operation + ' generation ' +
+                    generation + ' already has an accepted (not yet observed) dispatch; ' +
+                    'watchdog will not create a competing resumption.'
                   );
-                  if (!comments.some(comment => (comment.body || '').includes(backoffMarker))) {
-                    await github.rest.issues.createComment({
-                      owner,
-                      repo,
-                      issue_number: threadNumber,
-                      body: [
-                        backoffMarker,
-                        '⚡ **Continuum · opencode-watchdog**',
-                        '<!-- continuum-origin role=continuum component=opencode-watchdog -->',
-                        'Model infrastructure unavailable across fresh runners (generation ' + generation +
-                          ', operation `' + operation + '`, stage `' + stage + '`): ' +
-                          'entering bounded infrastructure backoff.',
-                        '',
-                        'This is infrastructure exhaustion, not a task failure: no ' +
-                          'task/review/qualification budget was consumed and no pause was applied.',
-                        '',
-                        'Checkpoint `' + checkpointRef + '` at exact SHA `' + checkpointSha + '` is preserved. ' +
-                          'The scheduler resumes this operation automatically with the same ' +
-                          'checkpoint/operation identity; no manual `/oc` is required.',
-                      ].join('\n'),
-                    });
-                  }
+                  return;
                 }
+                if (previous.state === 'claimed' && previous.nextDue > now) {
+                  core.notice(
+                    'OpenCode infrastructure operation ' + operation + ' generation ' +
+                    generation + ' already has a live pre-dispatch claim until ' +
+                    previous.nextDue + '; no duplicate dispatch.'
+                  );
+                  return;
+                }
+                if (previous.nextDue > now) {
+                  core.notice(
+                    'OpenCode infrastructure operation ' + operation + ' generation ' +
+                    generation + ' is in durable ' + previous.state +
+                    ' state until ' + previous.nextDue + '; no duplicate dispatch.'
+                  );
+                  return;
+                }
+                // An expired durable backoff window opens one fresh bounded
+                // attempt cycle from the still-valid checkpoint instead of
+                // re-recording the same exhausted backoff forever.
+                const backoffExpired =
+                  previous.state === 'backoff' && previous.nextDue <= now;
+                if (
+                  previous.attempt >= Math.max(1, max429Restarts + 1) &&
+                  !backoffExpired
+                ) {
+                  await recordRecoveryState({
+                    ...baseState,
+                    checkpointSha,
+                    state: 'backoff',
+                    attempt: previous.attempt,
+                    nextDue: now + 3600,
+                    detail: 'attempts-exhausted',
+                    summary: 'Bounded recovery attempts are exhausted for this generation. Checkpoint `' + checkpointRef + '` is preserved; no pause was applied.',
+                  });
+                  return;
+                }
+              }
+              const attempt = (previous ? previous.attempt : 0) + 1;
+
+              let target;
+              try {
+                target = await resolveDispatchTarget(runPath);
+              } catch (err) {
+                await recordRecoveryState({
+                  ...baseState,
+                  checkpointSha,
+                  state: 'metadata-pending',
+                  attempt,
+                  nextDue: now + 300,
+                  detail: 'routing-error',
+                  summary: 'Could not resolve a repository-local workflow_dispatch caller (' + (err.message || err) + '). Checkpoint is preserved; a scheduled catch-up will retry.',
+                });
+                return;
+              }
+              if (!target) {
+                await recordRecoveryState({
+                  ...baseState,
+                  checkpointSha,
+                  state: 'metadata-pending',
+                  attempt,
+                  nextDue: now + 300,
+                  detail: 'no-dispatchable-caller',
+                  summary: 'No repository-local OpenCode caller declaring `workflow_dispatch` was found. The reusable engine is never dispatched directly; a scheduled catch-up will retry.',
+                });
                 core.warning(
-                  'OpenCode infrastructure operation ' + operation + ' entered bounded ' +
-                  'infrastructure backoff after ' + generation +
-                  ' fresh-runner generation(s); checkpoint ' + checkpointRef +
-                  ' preserved for automatic resume.'
+                  'OpenCode 429 recovery could not find a dispatchable local caller; ' +
+                  'checkpoint ' + checkpointRef + ' preserved.'
                 );
                 return;
               }
 
-              // kodmial/continuum#290: the caller stub's workflow_dispatch
-              // accepts at most 25 inputs, so the explicit recovery identity
-              // (operation id + checkpoint ref/SHA + stage + generation)
-              // travels packed into the single recovery_identity input. The
-              // stub unpacks it into the reusable workflow's explicit
-              // recovery inputs; every field stays explicit, none is elided.
               const dispatchInputs = {
                 mode: mode,
-                issue_number: String(identity.issue_number || ''),
-                pr_number: String(identity.pr_number || ''),
+                issue_number: issueText,
+                pr_number: prText,
                 head_ref: String(identity.head_ref || identity.branch || ''),
                 review_id: String(identity.review_id || ''),
                 unresolved_items_json: String(identity.unresolved_items_json || ''),
@@ -407,166 +1003,268 @@ jobs:
                   recovery_generation: String(generation),
                 }),
               };
-              // Exactly-once resumption claim: the durable resumption
-              // marker is recorded BEFORE createWorkflowDispatch via a
-              // fresh createComment, so two concurrent watchdog passes for
-              // the same operation/generation cannot both observe an empty
-              // marker and both dispatch competing resumptions. The loser
-              // of the claim race deletes its own claim and stands down;
-              // a dispatch failure deletes the claim so a retry that never
-              // dispatched is never mistaken for a completed resumption.
-              let resumptionClaim = null;
-              if (Number.isInteger(threadNumber) && threadNumber > 0) {
-                const claimBody = [
-                  resumptionMarker,
-                  '⚡ **Continuum · opencode-watchdog**',
-                  '<!-- continuum-origin role=continuum component=opencode-watchdog -->',
-                  'Model provider/transport failed; restarting from an exact-SHA checkpoint (not a task failure).',
-                  '',
-                  'Resumption claim for operation `' + operation + '` ' +
-                    'from checkpoint `' + checkpointRef + '` at exact SHA `' + checkpointSha + '` ' +
-                    '(stage `' + stage + '`, generation ' + generation + '); ' +
-                    'dispatch in progress.',
-                ].join('\n');
+              // Exactly-once fence: claim before dispatch with a fresh comment.
+              // A concurrent workflow_run/catch-up pass for the same
+              // operation+generation either sees the claim (and stands down) or
+              // creates a later id (and loses the recheck), so only one pass can
+              // reach createWorkflowDispatch.
+              let claim = null;
+              try {
+                claim = await createRecoveryClaim({
+                  ...baseState,
+                  checkpointSha,
+                  attempt,
+                  nextDue: now + 300,
+                  summary: 'Claiming fresh-VM resumption dispatch for checkpoint `' +
+                    checkpointRef + '` at exact SHA `' + checkpointSha +
+                    '` (stage `' + stage + '`, generation ' + generation +
+                    '); a concurrent pass must stand down.',
+                });
+              } catch (claimErr) {
+                core.warning(
+                  'OpenCode infrastructure operation ' + operation + ' generation ' +
+                  generation + ' could not record the pre-dispatch claim (' +
+                  (claimErr.message || claimErr) +
+                  '); keeping the reservation for a later pass.'
+                );
+                return;
+              }
+              if (claim) {
                 try {
-                  const created = await github.rest.issues.createComment({
-                    owner,
-                    repo,
-                    issue_number: threadNumber,
-                    body: claimBody,
+                  // Give a concurrent create a moment to become visible, then
+                  // let the lowest comment id be the single claim winner.
+                  await new Promise(resolve => setTimeout(resolve, 1000));
+                  const claimed = await holdsRecoveryClaim(claim, {
+                    threadNumber, operation, generation, attempt,
                   });
-                  resumptionClaim = created.data;
-                } catch (claimErr) {
-                  core.warning(
-                    'OpenCode infrastructure operation ' + operation + ' generation ' +
-                    generation + ' could not record the resumption claim (' +
-                    (claimErr.message || claimErr) +
-                    '); keeping the reservation for a later watchdog pass.'
-                  );
-                  return;
-                }
-                try {
-                  const recheck = await readGithub.paginate(
-                    readGithub.rest.issues.listComments,
-                    { owner, repo, issue_number: threadNumber, per_page: 100 }
-                  );
-                  const markers = recheck
-                    .filter(comment => (comment.body || '').includes(resumptionMarker))
-                    .sort((a, b) => Number(a.id || 0) - Number(b.id || 0));
-                  if (markers.length > 0 && markers[0].id !== resumptionClaim.id) {
-                    try {
-                      await github.rest.issues.deleteComment({
-                        owner,
-                        repo,
-                        comment_id: resumptionClaim.id,
-                      });
-                    } catch (pruneErr) {
-                      core.warning(
-                        'OpenCode infrastructure operation ' + operation +
-                        ': duplicate resumption claim prune failed: ' +
-                        (pruneErr.message || pruneErr)
-                      );
-                    }
+                  if (!claimed) {
+                    await deleteRecoveryClaim(claim);
                     core.notice(
-                      'OpenCode infrastructure operation ' + operation + ' generation ' +
-                      generation + ' was already claimed; watchdog will not ' +
-                      'create a competing resumption.'
+                      'OpenCode 429 recovery claim for operation ' + operation +
+                      ' generation ' + generation +
+                      ' is already held by another pass; standing down.'
                     );
                     return;
                   }
-                } catch (recheckErr) {
-                  try {
-                    await github.rest.issues.deleteComment({
-                      owner,
-                      repo,
-                      comment_id: resumptionClaim.id,
-                    });
-                  } catch (cleanupErr) {
-                    core.warning(
-                      'OpenCode infrastructure operation ' + operation +
-                      ': pre-dispatch claim cleanup failed: ' +
-                      (cleanupErr.message || cleanupErr)
-                    );
-                  }
-                  resumptionClaim = null;
+                } catch (claimCheckErr) {
+                  await deleteRecoveryClaim(claim);
                   core.warning(
                     'OpenCode infrastructure operation ' + operation + ' generation ' +
-                    generation + ' could not verify the resumption claim (' +
-                    (recheckErr.message || recheckErr) +
-                    '); keeping the reservation for a later watchdog pass.'
+                    generation + ' could not verify the pre-dispatch claim (' +
+                    (claimCheckErr.message || claimCheckErr) +
+                    '); keeping the reservation for a later pass.'
                   );
                   return;
                 }
               }
+
+              const dispatchStarted = Date.now();
               try {
                 await github.rest.actions.createWorkflowDispatch({
                   owner,
                   repo,
-                  workflow_id: 'continuum-opencode.yml',
-                  ref: 'main',
+                  workflow_id: target.workflowId,
+                  ref: target.ref,
                   inputs: dispatchInputs,
                 });
               } catch (dispatchErr) {
-                if (resumptionClaim) {
-                  try {
-                    await github.rest.issues.deleteComment({
-                      owner,
-                      repo,
-                      comment_id: resumptionClaim.id,
-                    });
-                  } catch (cleanupErr) {
-                    core.warning(
-                      'OpenCode infrastructure operation ' + operation +
-                      ': pre-dispatch claim cleanup failed: ' +
-                      (cleanupErr.message || cleanupErr)
-                    );
-                  }
-                }
+                const status = Number(dispatchErr && dispatchErr.status || 0);
+                await deleteRecoveryClaim(claim);
+                await recordRecoveryState({
+                  ...baseState,
+                  checkpointSha,
+                  state: 'dispatch-failed',
+                  attempt,
+                  nextDue: now + 300,
+                  detail: 'http-' + (status || 'unknown'),
+                  summary: 'Fresh-VM recovery dispatch through `' + target.path + '` failed (' +
+                    (dispatchErr.message || dispatchErr) + '). Checkpoint is preserved; no pause was applied.',
+                });
                 core.warning(
                   'OpenCode infrastructure operation ' + operation + ' generation ' +
-                  generation + ' dispatch failed (' +
-                  (dispatchErr.message || dispatchErr) +
-                  '); keeping the reservation for a later watchdog pass. ' +
-                  'No pause was applied.'
+                  generation + ' dispatch through ' + target.path + ' failed (' +
+                  (dispatchErr.message || dispatchErr) + '); keeping the reservation ' +
+                  'for a later catch-up. No pause was applied.'
                 );
                 return;
               }
+
+              const observed = await observeDispatchedRun({
+                target,
+                notBefore: dispatchStarted,
+                displayTitle,
+                recoveryRunName: recoveryTitle,
+                oldRunId: run && run.id,
+              });
+              if (!observed) {
+                await recordRecoveryState({
+                  ...baseState,
+                  checkpointSha,
+                  state: 'accepted',
+                  attempt,
+                  nextDue: now + 120,
+                  detail: 'dispatch-not-observed',
+                  summary: 'GitHub accepted the fresh-VM dispatch through `' + target.path +
+                    '`, but no new run was observed yet. A scheduled watchdog catch-up will verify it; a claim alone is not treated as proof that a runner started.',
+                });
+                core.warning(
+                  'OpenCode 429 dispatch through ' + target.path + ' for operation ' +
+                  operation + ' was accepted but not observed; catch-up will verify.'
+                );
+                return;
+              }
+              await recordRecoveryState({
+                ...baseState,
+                checkpointSha,
+                state: 'observed',
+                attempt,
+                nextDue: 0,
+                runId: String(observed.id),
+                detail: 'run-started',
+                summary: 'Dispatched a fresh-VM resumption through `' + target.path +
+                  '` and observed new run ' + observed.id + ' for checkpoint `' +
+                  checkpointRef + '` at exact SHA `' + checkpointSha + '` (stage `' +
+                  stage + '`, generation ' + generation + '). Completed stages are not ' +
+                  'repeated and no task/review/qualification budget was consumed.',
+              });
               core.notice(
-                'OpenCode 429: dispatched fresh-VM resumption for operation ' +
-                operation + ' generation ' + generation + ' stage ' + stage +
+                'OpenCode 429: observed fresh-VM run ' + observed.id +
+                ' for operation ' + operation + ' generation ' + generation +
+                ' stage ' + stage + ' through ' + target.path +
                 ' from checkpoint ' + checkpointRef + ' at exact SHA ' +
                 checkpointSha + '.'
               );
-              if (Number.isInteger(threadNumber) && threadNumber > 0) {
-                const resumptionBody = [
-                  resumptionMarker,
-                  '⚡ **Continuum · opencode-watchdog**',
-                  '<!-- continuum-origin role=continuum component=opencode-watchdog -->',
-                  'Model provider/transport failed; restarting from an exact-SHA checkpoint (not a task failure).',
-                  '',
-                  'Dispatched a fresh-VM resumption for operation `' + operation + '` ' +
-                    'from checkpoint `' + checkpointRef + '` at exact SHA `' + checkpointSha + '` ' +
-                    '(stage `' + stage + '`, generation ' + generation + ').',
-                  '',
-                  'Completed stages are not repeated; no task/review/qualification budget was consumed.',
-                ].join('\n');
-                if (resumptionClaim) {
+            }
+            if (!run) {
+              // kodmial/continuum#350: scheduled/eventless catch-up. The normal
+              // path wakes only when a completed workflow_run is delivered. A
+              // late or lost delivery, an API outage, or an accepted dispatch
+              // that did not appear must still have a real owner. This bounded
+              // pass re-reads recent completed OpenCode runs and reuses the same
+              // recovery function; it is not a second controller.
+              const catchUpNow = Date.now();
+              const catchUpApiBase = String(
+                process.env.GITHUB_API_URL || 'https://api.github.com'
+              ).replace(/\/+$/, '');
+              const recentRuns = [];
+              for (let page = 1; page <= 2; page += 1) {
+                const { data } = await readGithub.rest.actions.listWorkflowRunsForRepo({
+                  owner, repo, per_page: 100, page,
+                });
+                recentRuns.push(...(data.workflow_runs || []));
+                if ((data.workflow_runs || []).length < 100) break;
+              }
+              const catchUpCandidates = recentRuns.filter(candidate => {
+                const path = String(candidate.path || '');
+                const sameWorkflow =
+                  /(?:^|\/)continuum-opencode\.yml$/.test(path) ||
+                  /(?:^|\/)opencode\.yml$/.test(path) ||
+                  (watchedWorkflow !== '' && candidate.name === watchedWorkflow);
+                if (!sameWorkflow) return false;
+                if (candidate.status !== 'completed') return false;
+                const updated = new Date(candidate.updated_at || candidate.created_at || 0).getTime();
+                return Number.isFinite(updated) && (catchUpNow - updated) < 48 * 60 * 60 * 1000;
+              }).slice(0, 8);
+              for (const candidate of catchUpCandidates) {
+                let candidateJobs = [];
+                try {
+                  candidateJobs = await readGithub.paginate(
+                    readGithub.rest.actions.listJobsForWorkflowRun,
+                    {
+                      owner, repo, run_id: candidate.id,
+                      filter: 'latest', per_page: 100,
+                    }
+                  );
+                } catch (err) {
+                  core.warning(
+                    'OpenCode 429 catch-up could not list jobs for run ' +
+                    candidate.id + ': ' + (err.message || err)
+                  );
+                  continue;
+                }
+                let candidateEvacuated = null;
+                let candidateMetadataFailed = null;
+                let candidateRestart = false;
+                for (const job of candidateJobs) {
+                  let response;
                   try {
-                    await github.rest.issues.updateComment({
-                      owner,
-                      repo,
-                      comment_id: resumptionClaim.id,
-                      body: resumptionBody,
-                    });
-                  } catch (updateErr) {
-                    core.warning(
-                      'OpenCode infrastructure operation ' + operation +
-                      ': resumption marker update failed: ' +
-                      (updateErr.message || updateErr)
+                    response = await fetch(
+                      catchUpApiBase + '/repos/' + owner + '/' + repo +
+                        '/actions/jobs/' + job.id + '/logs',
+                      {
+                        headers: {
+                          accept: 'application/vnd.github+json',
+                          authorization: 'Bearer ' + readToken,
+                          'x-github-api-version': '2022-11-28',
+                        },
+                        redirect: 'follow',
+                      }
                     );
+                  } catch (err) {
+                    continue;
                   }
+                  if (!response.ok) continue;
+                  const logText = await response.text();
+                  const emitted = logText.split('\n').some(line =>
+                    line.includes('##[error]') &&
+                    (line.includes(rateLimitMarker) ||
+                     line.includes(upstreamUnavailableMarker))
+                  );
+                  if (!emitted) continue;
+                  candidateRestart = true;
+                  const evacuated = logText.match(evacuatedRe);
+                  if (evacuated) {
+                    candidateEvacuated = {
+                      checkpointRef: evacuated[1],
+                      checkpointSha: evacuated[2],
+                      operationId: evacuated[3],
+                      stage: evacuated[4],
+                      generation: Number.parseInt(evacuated[5], 10),
+                      mode: evacuated[6],
+                      issueNumber: (evacuated[7] || '').trim(),
+                      prNumber: (evacuated[8] || '').trim(),
+                      branch: (evacuated[9] || '').trim(),
+                    };
+                  }
+                  if (logText.includes(metadataFailedMarker)) {
+                    candidateMetadataFailed = parseMetadataFailure(logText);
+                  }
+                  if (candidateEvacuated || candidateMetadataFailed) break;
+                }
+                if (!candidateRestart) continue;
+                if (candidateEvacuated) {
+                  await recoverFrom429OnFreshVm({
+                    owner, repo, run: candidate,
+                    evacuated429: candidateEvacuated,
+                    max429Restarts,
+                  });
+                } else if (candidateMetadataFailed) {
+                  const failed = candidateMetadataFailed;
+                  const threadText = failed.issueNumber || failed.prNumber;
+                  const threadNumber = /^[0-9]+$/.test(threadText)
+                    ? Number(threadText)
+                    : 0;
+                  await recordRecoveryState({
+                    threadNumber,
+                    operation: failed.operationId,
+                    generation: failed.generation,
+                    checkpointRef: failed.salvageRef,
+                    checkpointSha: '',
+                    state: 'metadata-failed',
+                    attempt: 1,
+                    nextDue: Math.floor(Date.now() / 1000) + 300,
+                    detail: 'workflow-metadata-failed',
+                    summary: 'The burned runner preserved raw work on salvage ref `' +
+                      (failed.salvageRef || 'none') + '` but could not produce valid ' +
+                      'recovery metadata. No recoverable checkpoint pointer was published.',
+                  });
                 }
               }
+              core.notice(
+                'OpenCode 429 scheduled catch-up inspected ' +
+                catchUpCandidates.length + ' recent completed run(s).'
+              );
+              return;
             }
             const jobs = await readGithub.paginate(
               readGithub.rest.actions.listJobsForWorkflowRun,
@@ -581,6 +1279,7 @@ jobs:
             let runnerRestartRequired = false;
             let publishRaceRestartRequired = false;
             let evacuated429 = null;
+            let metadataFailure429 = null;
             const apiBase = String(process.env.GITHUB_API_URL || 'https://api.github.com')
               .replace(/\/+$/, '');
             for (const job of jobs) {
@@ -629,16 +1328,56 @@ jobs:
                   };
                 }
               }
+              if (logText.includes(metadataFailedMarker)) {
+                const failed = parseMetadataFailure(logText);
+                if (failed) metadataFailure429 = failed;
+              }
               if (logText.includes(publishRaceMarker)) {
                 publishRaceRestartRequired = true;
               }
-              if ((runnerRestartRequired && evacuated429) || publishRaceRestartRequired) break;
+              if ((runnerRestartRequired && (evacuated429 || metadataFailure429)) ||
+                  publishRaceRestartRequired) break;
             }
             if (runnerRestartRequired) {
-              await recoverFrom429OnFreshVm({
-                owner, repo, run, evacuated429,
-                max429Restarts,
-              });
+              if (evacuated429) {
+                await recoverFrom429OnFreshVm({
+                  owner, repo, run, evacuated429,
+                  max429Restarts,
+                });
+              } else if (metadataFailure429) {
+                const failed = metadataFailure429;
+                const threadText = failed.issueNumber || failed.prNumber;
+                const threadNumber = /^[0-9]+$/.test(threadText)
+                  ? Number(threadText)
+                  : 0;
+                await recordRecoveryState({
+                  threadNumber,
+                  operation: failed.operationId,
+                  generation: failed.generation,
+                  checkpointRef: failed.salvageRef,
+                  checkpointSha: '',
+                  state: 'metadata-failed',
+                  attempt: 1,
+                  nextDue: Math.floor(Date.now() / 1000) + 300,
+                  detail: 'workflow-metadata-failed',
+                  summary: 'The burned runner preserved raw work on salvage ref `' +
+                    (failed.salvageRef || 'none') + '` but could not produce valid ' +
+                    'recovery metadata. No recoverable checkpoint pointer was ' +
+                    'published, no task budget was consumed, and no pause was applied. ' +
+                    'A bounded repair/catch-up owns the next step.',
+                });
+                core.warning(
+                  'OpenCode 429 metadata failure for operation ' + failed.operationId +
+                  ' generation ' + failed.generation + '; raw work preserved at ' +
+                  (failed.salvageRef || 'no salvage ref') + '.'
+                );
+              } else {
+                core.warning(
+                  'OpenCode infrastructure marker in run ' + run.id +
+                  ' has neither a valid checkpoint pointer nor metadata-failure ' +
+                  'evidence; a scheduled catch-up will re-scan it. No pause was applied.'
+                );
+              }
               return;
             }
 
