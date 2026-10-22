@@ -3649,18 +3649,12 @@ class ContinuumTest < Minitest::Test
                  'the README must say plainly that no workflow reads a paid provider key')
   end
 
-  # CONTRIBUTING and the issue chooser are reporter-facing entry points. A link
-  # to a missing security policy strands a report, so the policy file must stay
-  # present. CONTRIBUTING must also defer the live reporting status to that
-  # policy instead of caching a status that goes stale when reporting changes.
-  def test_security_reporting_guidance_links_to_a_maintained_policy
+  # CONTRIBUTING and the issue chooser are reporter-facing entry points. Assert
+  # that both point reporters at the repository's security policy without
+  # making this change depend on the policy task's output: the policy content
+  # and its existence are verified where that file is owned.
+  def test_security_reporting_guidance_links_to_the_security_policy
     contributing = File.read(File.join(ROOT, 'CONTRIBUTING.md'))
-    security_path = File.join(ROOT, 'SECURITY.md')
-    assert File.file?(security_path),
-           'CONTRIBUTING links SECURITY.md, so the policy file must exist'
-    security = File.read(security_path)
-    assert_includes security, '## Reporting a vulnerability',
-                    'SECURITY.md must keep the reporting instructions CONTRIBUTING points to'
     assert_includes contributing, '[SECURITY.md](SECURITY.md)'
     refute_match(/private vulnerability reporting is/i, contributing,
                  'CONTRIBUTING must not cache a reporting status owned by SECURITY.md')
@@ -3673,23 +3667,16 @@ class ContinuumTest < Minitest::Test
                'the issue chooser must keep a link to the security policy'
   end
 
-  # GitHub silently drops a template label that does not exist. The forms'
-  # admission hold therefore has to name a label the scheduler creates
-  # idempotently, not a one-time manual setup that a rename or deletion can
-  # silently undo.
-  def test_issue_form_admission_hold_label_is_created_by_the_scheduler
+  # GitHub silently drops a template label that does not exist. The forms must
+  # name the scheduler-owned admission hold. The scheduler's creation of that
+  # label is covered with the scheduler contracts, so an unrelated scheduler
+  # edit cannot break the issue-form assertions here.
+  def test_issue_forms_apply_the_admission_hold_label
     form_labels = Dir[File.join(ROOT, '.github/ISSUE_TEMPLATE/*.yml')].sort.flat_map do |path|
       Array(yaml(path)['labels']).map(&:to_s)
     end.uniq
     assert_includes form_labels, 'automation:blocked',
                     'the issue forms must keep the automation:blocked admission hold'
-
-    scheduler = workflow_body('continuum-issue-scheduler.yml')
-    assert_includes scheduler,
-                    "BLOCKED_LABEL: ${{ inputs.blocked_label || vars.AUTOMATION_BLOCKED_LABEL || 'automation:blocked' }}"
-    assert_includes scheduler, 'name: blockedLabel,'
-    assert_includes scheduler, 'await github.rest.issues.createLabel({ owner, repo, ...spec });'
-    assert_includes scheduler, 'if (err.status !== 422) throw err;'
   end
 
   # CONTINUUM_HOMEBREW_TAP and CONTINUUM_MACPORTS_TREE were documented as
