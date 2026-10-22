@@ -1,0 +1,64 @@
+name: One-shot cancel OpenCode issue 346 run 39850816845
+
+on:
+  pull_request:
+    types: [opened, reopened, synchronize]
+
+permissions:
+  actions: write
+  contents: read
+  issues: read
+
+jobs:
+  cancel-specific-run:
+    if: >-
+      github.event.pull_request.head.repo.full_name == 'kodmial/continuum' &&
+      github.event.pull_request.head.ref == 'ops/cancel-346-run-39850816845'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Cancel verified OpenCode run for paused issue 346
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
+        with:
+          github-token: ${{ github.token }}
+          script: |
+            const owner = 'kodmial';
+            const repo = 'continuum';
+            const run_id = 39850816845;
+            const { data: issue } = await github.rest.issues.get({
+              owner, repo, issue_number: 346,
+            });
+            const labels = new Set((issue.labels || []).map(l => typeof l === 'string' ? l : l.name));
+            if (!labels.has('automation:blocked') || labels.has('automation:ready')) {
+              core.setFailed('Issue #346 must be blocked and not ready before cancel.');
+              return;
+            }
+            const { data: run } = await github.rest.actions.getWorkflowRun({
+              owner, repo, run_id,
+            });
+            if (run.name !== 'OpenCode agent' || run.display_title !== 'OpenCode issue #346') {
+              core.setFailed('Target run identity mismatch: refusing to cancel unrelated work.');
+              return;
+            }
+            if (run.status === 'completed') {
+              core.notice('Target run already terminal: ' + run.conclusion);
+              return;
+            }
+            try {
+              await github.rest.actions.cancelWorkflowRun({ owner, repo, run_id });
+              core.notice('Sent GitHub Actions cancellation request for #' + run_id);
+            } catch (err) {
+              if (err.status !== 409 && err.status !== 422) throw err;
+              core.notice('Cancellation raced terminal state: ' + err.status);
+            }
+            for (let i = 0; i < 18; i++) {
+              await new Promise(resolve => setTimeout(resolve, 5000));
+              const { data: updated } = await github.rest.actions.getWorkflowRun({
+                owner, repo, run_id,
+              });
+              if (updated.status === 'completed') {
+                core.notice('Observed terminal status for #' + run_id + ': ' + updated.conclusion);
+                return;
+              }
+            }
+            core.setFailed('Cancel submitted but target run has not reached terminal state.');
