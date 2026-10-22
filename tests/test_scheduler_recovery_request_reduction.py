@@ -15,6 +15,8 @@ import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+from continuum.opencode_commands import classify_issue_comment
+
 
 ROOT = Path(__file__).resolve().parents[1]
 SCHEDULER = ROOT / ".github" / "workflows" / "continuum-issue-scheduler.yml"
@@ -210,10 +212,10 @@ class OwnerCommandWindowTests(unittest.TestCase):
         self.assertLessEqual(len(window), 5)
         self.assertLess(store.items_scanned_since, store.items_scanned_full)
 
-    def test_bounded_lookup_still_catches_just_posted_command(self):
+    def test_bounded_lookup_still_catches_just_posted_exact_command(self):
         owner = "octocat"
         history = [make_comment("hello", owner, 3600)] * 50 + [
-            make_comment("/oc please", owner, 20)
+            make_comment("/oc", owner, 20)
         ]
         store = CommentStore(history)
         grace_seconds = 5 * 60
@@ -223,16 +225,18 @@ class OwnerCommandWindowTests(unittest.TestCase):
         owner_hits = [
             c for c in window
             if c["user"]["login"] == owner
-            and ("/oc" in c["body"] or "/opencode" in c["body"])
+            and classify_issue_comment(c["body"]) == "run"
         ]
         self.assertEqual(len(owner_hits), 1)
         age = (now - owner_hits[0]["created_at"]).total_seconds()
         self.assertLess(age, grace_seconds)
-        # Both spellings are honored.
-        oc = make_comment("/oc run", owner, 10)
-        ope = make_comment("please /opencode this", owner, 10)
+        # Both exact spellings are honored, while prose with arguments is not.
+        oc = make_comment("/oc", owner, 10)
+        ope = make_comment("/opencode", owner, 10)
+        prose = make_comment("/oc please do this", owner, 10)
         for comment in (oc, ope):
-            self.assertTrue("/oc" in comment["body"] or "/opencode" in comment["body"])
+            self.assertEqual(classify_issue_comment(comment["body"]), "run")
+        self.assertEqual(classify_issue_comment(prose["body"]), "ignore")
 
     def test_scheduler_dispatch_guard_is_bounded_but_exact(self):
         body = scheduler_body()
@@ -240,7 +244,10 @@ class OwnerCommandWindowTests(unittest.TestCase):
         self.assertIn("commandGraceSinceIso", body)
         self.assertIn("since: commandGraceSinceIso()", body)
         self.assertIn("comment.user?.login === owner", body)
-        self.assertIn("(body.includes('/oc') || body.includes('/opencode'))", body)
+        self.assertIn("classifyComments(", body)
+        self.assertIn("commandClasses[index] === 'run'", body)
+        self.assertNotIn("body.includes('/oc')", body)
+        self.assertNotIn("body.includes('/opencode')", body)
         self.assertIn("if (commandAgeMs < commandGraceMs) {", body)
 
 
@@ -249,17 +256,19 @@ class DelegatedChildCommandTests(unittest.TestCase):
         body = scheduler_body()
         start = body.index("local_override_active() {")
         # Window covers the whole function body (bounded since-scan loop
-        # grew the function past the previous 2200-char slice).
-        window = body[start:start + 3000]
+        # grew the function past the previous 3000-char slice).
+        window = body[start:start + 4200]
         self.assertIn("since=$grace_since", window)
         self.assertIn("grace_since=", window)
-        # Owner identity, both spellings and the grace comparison survive.
+        # Owner identity, canonical parser classification and the grace
+        # comparison survive.
         # Owner is bound via --arg (injection-safe) rather than inline
         # shell interpolation: equivalent identity, safer quoting.
         self.assertIn("select(.user.login == $owner)", window)
         self.assertIn("--arg owner", window)
         self.assertIn('"$child_owner"', window)
-        self.assertIn("/(oc|opencode)", window)
+        self.assertIn('"$command_parser" classify-json', window)
+        self.assertIn('$classes[.key] == "run"', window)
         self.assertIn("now_epoch - command_epoch < command_grace_seconds", window)
         # PAT credential for the cross-repository read is unchanged.
         self.assertIn("GH_TOKEN: ${{ secrets.TAP_PAT }}", body)

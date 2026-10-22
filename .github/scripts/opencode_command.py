@@ -22,10 +22,16 @@ Usage (body via argument, file, or stdin)::
     opencode_command.py is-manual --body-file comment.md
     opencode_command.py is-owner-command --body-file comment.md \\
         --author "$COMMENT_AUTHOR" --owner "$REPO_OWNER"
+    opencode_command.py admit --event issue_comment --body-file comment.md \\
+        --author "$COMMENT_AUTHOR" --actor "$ACTOR" --owner "$REPO_OWNER"
+    opencode_command.py classify-json < comments.json
+    opencode_command.py duplicate-run-decision < duplicate-input.json
 
 ``classify`` prints ``run``, ``cancel``, or ``ignore`` and always exits 0.
-The ``is-*`` predicates print ``true``/``false`` and always exit 0. Any
-usage or I/O failure is reported as ``::error::`` with exit 2.
+The ``is-*`` predicates print ``true``/``false`` and always exit 0.
+``admit`` prints ``GITHUB_OUTPUT`` key/value lines for the event decision.
+``classify-json`` and ``duplicate-run-decision`` print JSON. Any usage or
+I/O failure is reported as ``::error::`` with exit 2.
 
 Standard library only, so it runs on stock ``ubuntu-latest`` runners without
 dependency installation.
@@ -34,6 +40,7 @@ dependency installation.
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import sys
 
@@ -42,6 +49,11 @@ SRC = os.path.join(ROOT, "src")
 if SRC not in sys.path:
     sys.path.insert(0, SRC)
 
+from continuum.opencode_admission import (  # noqa: E402
+    admit_event,
+    classify_commands,
+    duplicate_run_decision,
+)
 from continuum.opencode_commands import (  # noqa: E402
     CANCEL,
     DEFAULT_DISPATCH_MARKER,
@@ -107,6 +119,62 @@ def _cmd_is_watchdog_recovery(args) -> int:
     return 0
 
 
+def _read_json(args):
+    if args.input_file is not None:
+        try:
+            with open(args.input_file, "r", encoding="utf-8") as handle:
+                return json.load(handle)
+        except OSError as exc:
+            raise RuntimeError("Cannot read JSON file {}: {}".format(args.input_file, exc))
+        except ValueError as exc:
+            raise RuntimeError("Cannot parse JSON file {}: {}".format(args.input_file, exc))
+    return json.load(sys.stdin)
+
+
+def _cmd_admit(args) -> int:
+    result = admit_event(
+        event=args.event,
+        body=_read_body(args),
+        author=args.author,
+        owner=args.owner,
+        actor=args.actor,
+        is_pull_request=args.is_pull_request,
+        issue_state=args.issue_state,
+        mode=args.mode,
+    )
+    print("run={}".format("true" if result["run"] else "false"))
+    print("route={}".format(result["route"]))
+    print("command={}".format(result["command"]))
+    print("reason={}".format(" ".join(str(result["reason"]).split())))
+    return 0
+
+
+def _cmd_classify_json(args) -> int:
+    try:
+        print(json.dumps(classify_commands(_read_json(args))))
+    except ValueError as exc:
+        raise RuntimeError(str(exc))
+    return 0
+
+
+def _cmd_duplicate_run_decision(args) -> int:
+    payload = _read_json(args)
+    if not isinstance(payload, dict):
+        raise RuntimeError("duplicate-run-decision input must be a JSON object")
+    try:
+        result = duplicate_run_decision(
+            current=payload.get("current"),
+            runs=payload.get("runs"),
+            issue_number=payload.get("issue_number"),
+            workflow_name=payload.get("workflow_name", ""),
+            legacy_title=payload.get("legacy_title", ""),
+        )
+    except ValueError as exc:
+        raise RuntimeError(str(exc))
+    print(json.dumps(result))
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Exact manual OpenCode command gate.")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -148,6 +216,34 @@ def build_parser() -> argparse.ArgumentParser:
     is_recovery.add_argument("--marker", default=DEFAULT_RETRY_MARKER)
     is_recovery.set_defaults(func=_cmd_is_watchdog_recovery)
 
+    admit = sub.add_parser(
+        "admit",
+        help="Admit one workflow event before an expensive runner starts.",
+    )
+    _add_body_options(admit)
+    admit.add_argument("--event", required=True, help="GitHub event name.")
+    admit.add_argument("--author", default="", help="Comment author login.")
+    admit.add_argument("--owner", default="", help="Repository owner login.")
+    admit.add_argument("--actor", default="", help="Event actor login.")
+    admit.add_argument("--is-pull-request", action="store_true")
+    admit.add_argument("--issue-state", default="", help="Issue or PR state.")
+    admit.add_argument("--mode", default="", help="workflow_dispatch mode.")
+    admit.set_defaults(func=_cmd_admit)
+
+    classify_json = sub.add_parser(
+        "classify-json",
+        help="Classify a JSON array of bodies or {body: ...} records.",
+    )
+    classify_json.add_argument("--input-file", default=None)
+    classify_json.set_defaults(func=_cmd_classify_json)
+
+    duplicate = sub.add_parser(
+        "duplicate-run-decision",
+        help="Decide whether the current run is a queued duplicate.",
+    )
+    duplicate.add_argument("--input-file", default=None)
+    duplicate.set_defaults(func=_cmd_duplicate_run_decision)
+
     return parser
 
 
@@ -155,7 +251,7 @@ def main(argv=None) -> int:
     args = build_parser().parse_args(argv)
     try:
         return args.func(args)
-    except RuntimeError as exc:
+    except (RuntimeError, ValueError) as exc:
         print("::error::{}".format(" ".join(str(exc).split())), file=sys.stderr)
         return 2
 

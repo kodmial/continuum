@@ -7,6 +7,7 @@ qualification remains in #184.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -50,6 +51,17 @@ BASELINE_SHA = "0d1c3fb63299e2321f719b4e66cae70b309efbf0"
 # continuum-opencode.yml drift is therefore checked directly against this
 # tighter baseline instead of composing multiple generations of allowlists.
 OPENCODE_PROTECTED_BASELINE_SHA = "0f388e15929adb33307f27aecff325f4df47bf72"
+
+# kodmial/continuum#347 exact protected-workflow artifact pin. A plain-issue
+# OpenCode launch must be admitted by the canonical command parser before any
+# code runner starts; the interactive PR and review routes keep their historical
+# behavior but consume the same admission decision. This digest pins the entire
+# reviewed workflow content (admit job, route gates, duplicate-run
+# inventory/admission, and cleanup) exactly as reviewed. Any later byte change
+# still fails the protected baseline test.
+APPROVED_347_OPENCODE_SHA256 = (
+    "803ebd4502abe7a5f63e83ca6cd0e3b45376ebb7b786064f8ca24a1a7fa20370"
+)
 
 # Previous protected baseline before the PAUSE_ON_FAILURE advance above.
 # The empty-drift fallback below verifies the old-to-new baseline range
@@ -2220,6 +2232,11 @@ def read_repo(path: str) -> str:
         return handle.read()
 
 
+def protected_file_digest(path: str) -> str:
+    with open(os.path.join(ROOT, path), "rb") as handle:
+        return hashlib.sha256(handle.read()).hexdigest()
+
+
 # Any write to the image-digest stamp, not just the canonical
 # `> "$STAMP_FILE"` redirect: append redirects (`>>`), unquoted/braced
 # paths (`$STAMP_FILE`, `${STAMP_FILE}`), redirects to the literal
@@ -2452,8 +2469,21 @@ class ProtectedBaselineTests(unittest.TestCase):
                     self.assertIn("Qualify current CodeRabbit unresolved batch", original)
                     self.assertIn("CONTINUUM_OPENCODE_PUBLISH_RACE_RETRY_REQUIRED", original)
                     self.assertIn("steps.model_route.outputs.model", original)
-                self.assertEqual(read_repo(path), original,
-                                 f"{path}: unexpected drift outside reviewed protected baseline")
+                if path == ".github/workflows/continuum-opencode.yml":
+                    # #347 is reviewed as one exact artifact: the digest changes
+                    # if any byte of the admission, route-gating, duplicate-run,
+                    # or cleanup change drifts. Other protected files still
+                    # require zero diff against their historical baseline.
+                    self.assertEqual(
+                        protected_file_digest(path),
+                        APPROVED_347_OPENCODE_SHA256,
+                        f"{path}: unexpected drift outside reviewed #347 admission patch",
+                    )
+                else:
+                    self.assertEqual(
+                        read_repo(path), original,
+                        f"{path}: unexpected drift outside reviewed protected baseline",
+                    )
                 if path == ".github/workflows/continuum-opencode.yml":
                     self.assertIn("Restore verified cached OpenCode for coder and repair", read_repo(path))
                     self.assertNotIn("https://opencode.ai/install", read_repo(path))

@@ -556,8 +556,7 @@ jobs:
           fetch-depth: 1
           persist-credentials: false
 
-      - name: Checkout Continuum engine for delegated scheduling
-        if: vars.CONTINUUM_ROLE == 'parent'
+      - name: Checkout Continuum engine for admission and delegated scheduling
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           repository: kodmial/continuum
@@ -840,6 +839,7 @@ jobs:
             )"
             child_owner="$(gh api "repos/$child_repo" --jq '.owner.login' 2>/dev/null || true)"
             command_grace_seconds=$(( COMMAND_GRACE_MINUTES * 60 ))
+            command_parser="$CONTINUUM_ENGINE_ROOT/.github/scripts/opencode_command.py"
 
             local_override_active() {
               local task_number="$1"
@@ -873,7 +873,15 @@ jobs:
                   break
                 fi
                 [[ "$override_count" =~ ^[0-9]+$ ]] || { override_failed=1; break; }
-                if ! override_cmds="$(jq -r --arg owner "$child_owner" '.[] | select(.user.login == $owner) | select((.body // "") | test("(^|[[:space:]])/(oc|opencode)([[:space:]]|$)")) | .created_at' <<<"$override_json" 2>/dev/null)"; then
+                if ! override_records="$(jq -c --arg owner "$child_owner" '[.[] | select(.user.login == $owner) | {body: (.body // ""), created_at: .created_at}]' <<<"$override_json" 2>/dev/null)"; then
+                  override_failed=1
+                  break
+                fi
+                if ! override_classes="$(python3 "$command_parser" classify-json <<<"$override_records" 2>/dev/null)"; then
+                  override_failed=1
+                  break
+                fi
+                if ! override_cmds="$(jq -r --argjson classes "$override_classes" 'to_entries[] | select($classes[.key] == "run") | .value.created_at' <<<"$override_records" 2>/dev/null)"; then
                   override_failed=1
                   break
                 fi
@@ -1208,7 +1216,9 @@ jobs:
           # mutations and comments created here visible as normal owner actions.
           github-token: ${{ secrets.TAP_PAT }}
           script: |
+            const { execFileSync } = require('child_process');
             const fs = require('fs');
+            const path = require('path');
             const owner = context.repo.owner;
             const repo = context.repo.repo;
             const repoFullName = owner + '/' + repo;
@@ -1223,6 +1233,34 @@ jobs:
               process.env.GITHUB_API_URL ||
               'https://api.github.com'
             );
+            const commandParser = path.join(
+              process.env.GITHUB_WORKSPACE || '',
+              '.continuum-engine',
+              '.github',
+              'scripts',
+              'opencode_command.py'
+            );
+            // The scheduler never reimplements the command grammar. One
+            // parser call classifies a whole comment page, and every owner
+            // command decision below consumes that canonical result.
+            function classifyComments(bodies) {
+              const output = execFileSync(
+                'python3',
+                [commandParser, 'classify-json'],
+                {
+                  input: JSON.stringify(bodies),
+                  encoding: 'utf8',
+                  maxBuffer: 16 * 1024 * 1024,
+                }
+              );
+              const result = JSON.parse(output);
+              if (!Array.isArray(result) || result.length !== bodies.length) {
+                throw new Error(
+                  'Canonical command parser returned an unexpected batch result.'
+                );
+              }
+              return result;
+            }
             const readGithub = new github.constructor({
               auth: readToken,
               baseUrl: readBaseUrl,
@@ -1514,12 +1552,14 @@ jobs:
                   since: commandGraceSinceIso(),
                 }
               );
+              const commandClasses = classifyComments(
+                comments.map(comment => comment.body || '')
+              );
               return comments
-                .filter(comment => {
-                  const body = comment.body || '';
-                  return comment.user?.login === owner &&
-                    (body.includes('/oc') || body.includes('/opencode'));
-                })
+                .filter((comment, index) =>
+                  comment.user?.login === owner &&
+                  commandClasses[index] === 'run'
+                )
                 .sort(
                   (a, b) =>
                     new Date(a.created_at).getTime() -
@@ -3051,7 +3091,7 @@ jobs:
               const body = comment?.body || '';
               const isOwnerCommand =
                 comment?.user?.login === owner &&
-                (body.includes('/oc') || body.includes('/opencode'));
+                classifyComments([body])[0] === 'run';
 
               if (
                 eventIssue &&
@@ -3279,12 +3319,15 @@ jobs:
                   per_page: 100,
                 }
               );
+              const commentClasses = classifyComments(
+                comments.map(comment => comment.body || '')
+              );
               const dispatches = comments
-                .filter(comment => {
+                .filter((comment, index) => {
                   const body = comment.body || '';
                   const ownerOpenCodeCommand =
                     comment.user?.login === owner &&
-                    (body.includes('/oc') || body.includes('/opencode'));
+                    commentClasses[index] === 'run';
                   return body.includes(dispatchMarker) || ownerOpenCodeCommand;
                 })
                 .sort(

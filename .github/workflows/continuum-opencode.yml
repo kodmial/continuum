@@ -377,6 +377,66 @@ jobs:
               `Dispatched OpenCode for CodeRabbit review ${reviewId} on PR #${pullNumber} with ${findings.length} inline finding(s).`
             );
 
+  admit:
+    # Cheap, secretless admission. The canonical parser runs before any
+    # code-runner checkout, model route, or agent process. Every expensive
+    # OpenCode path below consumes this single decision, so a machine-authored
+    # snapshot that merely mentions /oc can never start coding work.
+    name: Admit OpenCode event
+    runs-on: ubuntu-latest
+    timeout-minutes: ${{ fromJSON(vars.AUTOMATION_DISPATCH_TIMEOUT_MINUTES || '5') }}
+
+    permissions:
+      contents: read
+
+    outputs:
+      run: ${{ steps.admit.outputs.run }}
+      route: ${{ steps.admit.outputs.route }}
+      command: ${{ steps.admit.outputs.command }}
+
+    steps:
+      - name: Checkout canonical command parser
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: kodmial/continuum
+          ref: ${{ inputs.continuum_ref || 'main' }}
+          path: .continuum-admission-engine
+          fetch-depth: 1
+          persist-credentials: false
+          sparse-checkout: |
+            src/continuum
+            .github/scripts
+
+      - name: Classify event before starting a code runner
+        id: admit
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_MODE: ${{ inputs.mode }}
+          COMMENT_BODY: ${{ github.event.comment.body }}
+          COMMENT_AUTHOR: ${{ github.event.comment.user.login }}
+          COMMENT_ACTOR: ${{ github.actor }}
+          REPOSITORY_OWNER: ${{ github.repository_owner }}
+          ISSUE_IS_PULL_REQUEST: ${{ github.event.issue.pull_request != null }}
+          ISSUE_STATE: ${{ github.event.issue.state }}
+        run: |
+          set -euo pipefail
+          parser="$GITHUB_WORKSPACE/.continuum-admission-engine/.github/scripts/opencode_command.py"
+          comment_file="$RUNNER_TEMP/continuum-admission-comment.md"
+          printf '%s' "${COMMENT_BODY:-}" > "$comment_file"
+          args=(
+            --event "$EVENT_NAME"
+            --body-file "$comment_file"
+            --author "${COMMENT_AUTHOR:-}"
+            --actor "${COMMENT_ACTOR:-}"
+            --owner "${REPOSITORY_OWNER:-}"
+            --issue-state "${ISSUE_STATE:-}"
+            --mode "${INPUT_MODE:-}"
+          )
+          if [[ "${ISSUE_IS_PULL_REQUEST:-false}" == "true" ]]; then
+            args+=(--is-pull-request)
+          fi
+          python3 "$parser" admit "${args[@]}" >> "$GITHUB_OUTPUT"
+
   opencode:
     # Manual invocations remain owner-only. Automated repair modes arrive via
     # internal workflow_dispatch events from trusted workflows on main.
@@ -385,30 +445,11 @@ jobs:
     # issue_comment carrying a trusted qualification-dispatch marker is also
     # recognized as qualification mode and bound to that marker's triple, so
     # a later main advance can never retarget an already-started run.
-    # Interactive PR comments are gated narrowly: an issue_comment on a PR
-    # runs only for an explicit owner command at the start of the comment on
-    # a still-open PR. Substring matching is forbidden on that route because
-    # OpenCode-generated prose itself can mention /oc while documenting the
-    # contract, which chained one run per minute on a closed PR.
-    if: >-
-      (github.event_name == 'workflow_dispatch' &&
-       contains(fromJSON('["coderabbit-fix","resolve-conflict","ci-fix","issue","qualification"]'), inputs.mode)) ||
-      ((github.event_name == 'issue_comment' &&
-        !github.event.issue.pull_request) &&
-       github.actor == github.repository_owner &&
-       (contains(github.event.comment.body, '/oc') ||
-        contains(github.event.comment.body, '/opencode'))) ||
-      ((github.event_name == 'issue_comment' &&
-        github.event.issue.pull_request) &&
-       github.actor == github.repository_owner &&
-       github.event.issue.state == 'open' &&
-       (startsWith(github.event.comment.body, '/oc') ||
-        startsWith(github.event.comment.body, '/opencode')) &&
-       !contains(github.event.comment.body, '/oc-cancel')) ||
-      ((github.event_name == 'pull_request_review_comment') &&
-       github.actor == github.repository_owner &&
-       (contains(github.event.comment.body, '/oc') ||
-        contains(github.event.comment.body, '/opencode')))
+    #
+    # This job never evaluates command text itself. It starts only after the
+    # canonical parser has admitted the event and its trusted route.
+    needs: admit
+    if: needs.admit.outputs.run == 'true'
     runs-on: ${{ inputs.runner_os || vars.AUTOMATION_OPENCODE_RUNNER || 'ubuntu-latest' }}
     # Execution environment is a consumer decision. Core defaults to Linux;
     # consumers select another runner and prepare its toolchain explicitly.
@@ -510,13 +551,7 @@ jobs:
         if: >-
           (github.event_name == 'workflow_dispatch' &&
            (inputs.mode == 'issue' || inputs.mode == 'ci-fix')) ||
-          (github.event_name == 'issue_comment' &&
-           !github.event.issue.pull_request &&
-           github.actor == github.repository_owner &&
-           (contains(github.event.comment.body, '/oc') ||
-            contains(github.event.comment.body, '/opencode')) &&
-           !contains(github.event.comment.body, '/oc-cancel') &&
-           !contains(github.event.comment.body, 'continuum-qualification-dispatch'))
+          needs.admit.outputs.route == 'issue'
         uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
         env:
           MODE: ${{ inputs.mode }}
@@ -713,13 +748,7 @@ jobs:
         if: >-
           steps.task_context.outputs.present == 'true' &&
           ((github.event_name == 'workflow_dispatch' && inputs.mode == 'issue') ||
-           (github.event_name == 'issue_comment' &&
-            !github.event.issue.pull_request &&
-            github.actor == github.repository_owner &&
-            (contains(github.event.comment.body, '/oc') ||
-             contains(github.event.comment.body, '/opencode')) &&
-            !contains(github.event.comment.body, '/oc-cancel') &&
-            !contains(github.event.comment.body, 'continuum-qualification-dispatch')))
+           needs.admit.outputs.route == 'issue')
         uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
         env:
           TASK_REPO: ${{ steps.task_context.outputs.task_repo }}
@@ -1286,13 +1315,7 @@ jobs:
         id: issue_readiness
         if: >-
           (github.event_name == 'workflow_dispatch' && inputs.mode == 'issue') ||
-          (github.event_name == 'issue_comment' &&
-           !github.event.issue.pull_request &&
-           github.actor == github.repository_owner &&
-           (contains(github.event.comment.body, '/oc') ||
-            contains(github.event.comment.body, '/opencode')) &&
-           !contains(github.event.comment.body, '/oc-cancel') &&
-           !contains(github.event.comment.body, 'continuum-qualification-dispatch'))
+          needs.admit.outputs.route == 'issue'
         uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
         env:
           ISSUE_NUMBER: ${{ inputs.issue_number || github.event.issue.number }}
@@ -1537,23 +1560,43 @@ jobs:
       # Pre-emptive duplicate guard. The only other open-PR check in this
       # workflow lives in `recover-scheduled-issue`, which runs AFTER a burnt
       # run, so without this step a second dispatch for the same issue would
-      # launch a second agent against work that already has a PR. The branch
-      # prefix is the one the scheduler, the watchdog, and the repair
-      # controller all use.
+      # launch a second agent against work that already has a PR or an
+      # overlapping run. The branch prefix is the one the scheduler, the
+      # watchdog, and the repair controller all use.
+      - name: Checkout duplicate-run decision engine
+        if: >-
+          steps.issue_readiness.outputs.ready != 'false' &&
+          ((github.event_name == 'workflow_dispatch' && inputs.mode == 'issue') ||
+           needs.admit.outputs.route == 'issue')
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: kodmial/continuum
+          ref: ${{ inputs.continuum_ref || 'main' }}
+          path: .continuum-admission-engine
+          fetch-depth: 1
+          persist-credentials: false
+          sparse-checkout: |
+            src/continuum
+            .github/scripts
+
       - name: Skip duplicate issue implementation
         id: duplicate_guard
         if: >-
           steps.issue_readiness.outputs.ready != 'false' &&
           ((github.event_name == 'workflow_dispatch' && inputs.mode == 'issue') ||
-           (github.event_name == 'issue_comment' && !github.event.issue.pull_request))
+           needs.admit.outputs.route == 'issue')
         uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
         env:
           ISSUE_NUMBER: ${{ inputs.issue_number || github.event.issue.number }}
+          EVENT_ISSUE_TITLE: ${{ github.event.issue.title || '' }}
           TAP_PAT: ${{ secrets.TAP_PAT }}
           GITHUB_API_URL: ${{ github.api_url }}
+          CONTINUUM_ENGINE_ROOT: ${{ github.workspace }}/.continuum-admission-engine
         with:
           github-token: ${{ github.token }}
           script: |
+            const { execFileSync } = require('child_process');
+            const path = require('path');
             const owner = context.repo.owner;
             const repo = context.repo.repo;
             const issueNumber = Number(process.env.ISSUE_NUMBER || 0);
@@ -1595,6 +1638,37 @@ jobs:
               return all;
             }
 
+            async function listRunsWithPat() {
+              if (!tapPat) throw new Error('TAP_PAT is unavailable for duplicate-run fallback.');
+              const all = [];
+              for (let page = 1; ; page += 1) {
+                const response = await fetch(
+                  `${apiBase}/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/actions/runs?per_page=100&page=${page}`,
+                  {
+                    headers: {
+                      accept: 'application/vnd.github+json',
+                      authorization: `Bearer ${tapPat}`,
+                      'x-github-api-version': '2022-11-28',
+                    },
+                  }
+                );
+                if (!response.ok) {
+                  const details = (await response.text()).slice(0, 500);
+                  throw new Error(
+                    `Duplicate-run PAT fallback failed with HTTP ${response.status}` +
+                    (details ? `: ${details}` : '')
+                  );
+                }
+                const payload = await response.json();
+                if (!payload || !Array.isArray(payload.workflow_runs)) {
+                  throw new Error('Unexpected duplicate-run response.');
+                }
+                all.push(...payload.workflow_runs);
+                if (payload.workflow_runs.length < 100) break;
+              }
+              return all;
+            }
+
             let openPrs;
             try {
               openPrs = await github.paginate(
@@ -1621,9 +1695,80 @@ jobs:
                 'skipping duplicate OpenCode run.'
               );
               core.setOutput('skip', 'true');
+              return;
+            }
+
+            const currentRun = (await github.rest.actions.getWorkflowRun({
+              owner,
+              repo,
+              run_id: context.runId,
+            })).data;
+
+            let runs;
+            try {
+              runs = await github.paginate(
+                github.rest.actions.listWorkflowRunsForRepo,
+                { owner, repo, per_page: 100 }
+              );
+            } catch (err) {
+              const status = err ? (err.status ?? err.response?.status) : undefined;
+              if (![401, 403, 429].includes(status)) throw err;
+              core.warning(
+                `Repository-token run inventory failed (${status}); ` +
+                'retrying with TAP_PAT for liveness.'
+              );
+              runs = await listRunsWithPat();
+            }
+
+            const parser = path.join(
+              process.env.CONTINUUM_ENGINE_ROOT || '',
+              '.github/scripts/opencode_command.py'
+            );
+            let decision;
+            try {
+              decision = JSON.parse(execFileSync(
+                'python3',
+                [parser, 'duplicate-run-decision'],
+                {
+                  input: JSON.stringify({
+                    current: currentRun,
+                    runs,
+                    issue_number: issueNumber,
+                    workflow_name: context.workflow,
+                    legacy_title: process.env.EVENT_ISSUE_TITLE || '',
+                  }),
+                  encoding: 'utf8',
+                  maxBuffer: 16 * 1024 * 1024,
+                }
+              ));
+            } catch (err) {
+              core.setFailed(
+                `Duplicate-run admission failed closed: ${err.message || err}`
+              );
+              return;
+            }
+
+            if (decision.skip) {
+              core.info(
+                `Issue #${issueNumber} duplicate-run guard skipped this run: ` +
+                `${decision.reason}` +
+                (decision.duplicate_run_id
+                  ? ` (overlapping run ${decision.duplicate_run_id}).`
+                  : '.')
+              );
+              core.setOutput('skip', 'true');
             } else {
+              core.info(
+                `Issue #${issueNumber} duplicate-run guard admitted this run: ` +
+                `${decision.reason}.`
+              );
               core.setOutput('skip', 'false');
             }
+      - name: Remove duplicate-run decision engine
+        if: always()
+        shell: bash
+        run: rm -rf .continuum-admission-engine
+
       # workflow_dispatch repair modes must NOT use "opencode github run":
       # that integration owns a branch/PR lifecycle and can open a new PR even
       # when the prompt says not to. Plain "opencode run" works in this already
@@ -1883,7 +2028,10 @@ jobs:
       # #66: resolve a trusted model before any OpenCode agent side effects.
       - name: Qualify trusted OpenCode route
         id: model_route
-        if: steps.issue_readiness.outputs.ready != 'false' && steps.recovery_restore.outputs.skip_opencode != 'true'
+        if: >-
+          steps.issue_readiness.outputs.ready != 'false' &&
+          steps.recovery_restore.outputs.skip_opencode != 'true' &&
+          steps.duplicate_guard.outputs.skip != 'true'
         uses: kodmial/continuum/.github/actions/model-route@main
         with:
           models: ${{ vars.OPENCODE_MODELS }}
@@ -1900,16 +2048,9 @@ jobs:
       - name: Run OpenCode
         if: >-
           github.event_name != 'workflow_dispatch' &&
-          ((github.event_name == 'pull_request_review_comment') ||
-           (github.event_name == 'issue_comment' &&
-            github.event.issue.pull_request &&
-            github.actor == github.repository_owner &&
-            github.event.issue.state == 'open' &&
-            (startsWith(github.event.comment.body, '/oc') ||
-             startsWith(github.event.comment.body, '/opencode')))) &&
-          steps.duplicate_guard.outputs.skip != 'true' &&
-          !contains(github.event.comment.body, '/oc-cancel') &&
-          !contains(github.event.comment.body, 'continuum-qualification-dispatch')
+          (needs.admit.outputs.route == 'pr' ||
+           needs.admit.outputs.route == 'review') &&
+          steps.duplicate_guard.outputs.skip != 'true'
         env:
           GITHUB_TOKEN: ${{ secrets.TAP_PAT }}
           ISSUE_NUMBER: ${{ inputs.issue_number }}
@@ -1929,13 +2070,7 @@ jobs:
       - name: Recover agent-managed issue branch
         if: >-
           steps.issue_readiness.outputs.ready != 'false' &&
-          github.event_name == 'issue_comment' &&
-          !github.event.issue.pull_request &&
-          github.actor == github.repository_owner &&
-          (contains(github.event.comment.body, '/oc') ||
-           contains(github.event.comment.body, '/opencode')) &&
-          !contains(github.event.comment.body, '/oc-cancel') &&
-          !contains(github.event.comment.body, 'continuum-qualification-dispatch')
+          needs.admit.outputs.route == 'issue'
         env:
           GH_TOKEN: ${{ secrets.TAP_PAT }}
           ISSUE_NUMBER: ${{ inputs.issue_number || github.event.issue.number }}
@@ -2028,13 +2163,7 @@ jobs:
         if: >-
           steps.issue_readiness.outputs.ready != 'false' &&
           ((github.event_name == 'workflow_dispatch' && inputs.mode == 'issue') ||
-           (github.event_name == 'issue_comment' &&
-            !github.event.issue.pull_request &&
-            github.actor == github.repository_owner &&
-            (contains(github.event.comment.body, '/oc') ||
-             contains(github.event.comment.body, '/opencode')) &&
-            !contains(github.event.comment.body, '/oc-cancel') &&
-           !contains(github.event.comment.body, 'continuum-qualification-dispatch'))) &&
+           needs.admit.outputs.route == 'issue') &&
           steps.duplicate_guard.outputs.skip != 'true'
         env:
           GH_TOKEN: ${{ secrets.TAP_PAT }}
@@ -2439,7 +2568,7 @@ jobs:
           steps.model_route.outcome == 'success' &&
           steps.duplicate_guard.outputs.skip != 'true' &&
           ((github.event_name == 'workflow_dispatch' && inputs.mode == 'issue') ||
-           (github.event_name == 'issue_comment' && !github.event.issue.pull_request))
+           needs.admit.outputs.route == 'issue')
         uses: kodmial/continuum/.github/actions/model-route@main
         with:
           operation: record
