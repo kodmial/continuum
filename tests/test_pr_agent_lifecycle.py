@@ -57,10 +57,12 @@ OPENCODE_PROTECTED_BASELINE_SHA = "0f388e15929adb33307f27aecff325f4df47bf72"
 # code runner starts; the interactive PR and review routes keep their historical
 # behavior but consume the same admission decision. This digest pins the entire
 # reviewed workflow content (admit job, route gates, duplicate-run
-# inventory/admission, and cleanup) exactly as reviewed. Any later byte change
-# still fails the protected baseline test.
+# inventory/admission, and cleanup) exactly as reviewed. The reviewed repair
+# bounds the run inventory to a recent `created` window and stops treating a
+# legacy display title as issue identity. Any later byte change still fails the
+# protected baseline test.
 APPROVED_347_OPENCODE_SHA256 = (
-    "803ebd4502abe7a5f63e83ca6cd0e3b45376ebb7b786064f8ca24a1a7fa20370"
+    "ef386865af72c1f3205e44f8c1df33db8cdb935af05733c766fcd75c890979aa"
 )
 
 # Previous protected baseline before the PAUSE_ON_FAILURE advance above.

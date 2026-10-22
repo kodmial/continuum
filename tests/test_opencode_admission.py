@@ -310,18 +310,20 @@ class DuplicateRunTests(unittest.TestCase):
             with self.subTest(candidate=candidate["display_title"]):
                 self.assertFalse(self.decision(current, [candidate, current])["skip"])
 
-    def test_legacy_issue_title_is_recognized(self):
-        previous = run(20, "Fix the parser", status="in_progress",
-                       created="2026-01-01T10:00:00Z",
-                       updated="2026-01-01T10:05:00Z")
+    def test_legacy_title_is_not_an_issue_identity(self):
         current = run(21, "OpenCode issue #234", status="in_progress",
                       created="2026-01-01T10:02:00Z")
-        result = self.decision(
-            current,
-            [previous, current],
-            legacy_title="Fix the parser",
-        )
-        self.assertTrue(result["skip"])
+        for status in ("in_progress", "completed"):
+            previous = run(20, "Fix the parser", status=status,
+                           created="2026-01-01T10:00:00Z",
+                           updated="2026-01-01T10:05:00Z")
+            with self.subTest(status=status):
+                result = self.decision(
+                    current,
+                    [previous, current],
+                    legacy_title="Fix the parser",
+                )
+                self.assertFalse(result["skip"])
 
     def test_malformed_run_inventory_fails_closed(self):
         current = run(21, "OpenCode issue #234", status="in_progress")

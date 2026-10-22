@@ -6006,6 +6006,12 @@ class ContinuumTest < Minitest::Test
     assert_includes guard, 'const prefix = `opencode/issue${issueNumber}-`'
     assert_includes guard, 'github.rest.actions.getWorkflowRun'
     assert_includes guard, 'github.rest.actions.listWorkflowRunsForRepo'
+    assert_includes guard, 'RUN_HISTORY_LOOKBACK_MS'
+    assert_includes guard, 'created: `>=${createdSince}`'
+    assert_includes guard, 'listRunsWithPat(createdSince)'
+    assert_includes guard, "created=${encodeURIComponent('>=' + createdSince)}"
+    refute_includes guard, 'legacy_title'
+    refute_includes guard, 'EVENT_ISSUE_TITLE'
     assert_includes guard, "'duplicate-run-decision'",
                     'the duplicate guard must use the canonical generation decision'
     assert_includes guard, "core.setOutput('skip', 'true')"

@@ -1588,7 +1588,6 @@ jobs:
         uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
         env:
           ISSUE_NUMBER: ${{ inputs.issue_number || github.event.issue.number }}
-          EVENT_ISSUE_TITLE: ${{ github.event.issue.title || '' }}
           TAP_PAT: ${{ secrets.TAP_PAT }}
           GITHUB_API_URL: ${{ github.api_url }}
           CONTINUUM_ENGINE_ROOT: ${{ github.workspace }}/.continuum-admission-engine
@@ -1603,6 +1602,7 @@ jobs:
             const tapPat = String(process.env.TAP_PAT || '').trim();
             const apiBase = String(process.env.GITHUB_API_URL || 'https://api.github.com')
               .replace(/\/+$/, '');
+            const RUN_HISTORY_LOOKBACK_MS = 24 * 60 * 60 * 1000;
 
             if (!Number.isInteger(issueNumber) || issueNumber <= 0) {
               core.setOutput('skip', 'false');
@@ -1638,12 +1638,15 @@ jobs:
               return all;
             }
 
-            async function listRunsWithPat() {
+            async function listRunsWithPat(createdSince) {
               if (!tapPat) throw new Error('TAP_PAT is unavailable for duplicate-run fallback.');
               const all = [];
               for (let page = 1; ; page += 1) {
+                const query =
+                  `per_page=100&page=${page}` +
+                  `&created=${encodeURIComponent('>=' + createdSince)}`;
                 const response = await fetch(
-                  `${apiBase}/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/actions/runs?per_page=100&page=${page}`,
+                  `${apiBase}/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/actions/runs?${query}`,
                   {
                     headers: {
                       accept: 'application/vnd.github+json',
@@ -1704,11 +1707,25 @@ jobs:
               run_id: context.runId,
             })).data;
 
+            // The overlap decision only compares runs created near this one.
+            // Bound the inventory so repository history size cannot turn the
+            // pre-model-route gate into an unbounded pagination walk.
+            const currentCreatedMs = Date.parse(currentRun.created_at || '');
+            const createdSince = new Date(
+              (Number.isFinite(currentCreatedMs) ? currentCreatedMs : Date.now()) -
+              RUN_HISTORY_LOOKBACK_MS
+            ).toISOString();
+
             let runs;
             try {
               runs = await github.paginate(
                 github.rest.actions.listWorkflowRunsForRepo,
-                { owner, repo, per_page: 100 }
+                {
+                  owner,
+                  repo,
+                  per_page: 100,
+                  created: `>=${createdSince}`,
+                }
               );
             } catch (err) {
               const status = err ? (err.status ?? err.response?.status) : undefined;
@@ -1717,7 +1734,7 @@ jobs:
                 `Repository-token run inventory failed (${status}); ` +
                 'retrying with TAP_PAT for liveness.'
               );
-              runs = await listRunsWithPat();
+              runs = await listRunsWithPat(createdSince);
             }
 
             const parser = path.join(
@@ -1735,7 +1752,6 @@ jobs:
                     runs,
                     issue_number: issueNumber,
                     workflow_name: context.workflow,
-                    legacy_title: process.env.EVENT_ISSUE_TITLE || '',
                   }),
                   encoding: 'utf8',
                   maxBuffer: 16 * 1024 * 1024,

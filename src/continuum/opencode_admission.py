@@ -176,15 +176,9 @@ def _run_order(run):
     return created, run_id
 
 
-def _same_issue(run, issue_number, legacy_title):
+def _same_issue(run, issue_number):
     title = str(run.get("display_title") or "")
-    if title == "OpenCode issue #{}".format(issue_number):
-        return True
-    return bool(
-        legacy_title
-        and run.get("event") == "issue_comment"
-        and title == legacy_title
-    )
+    return title == "OpenCode issue #{}".format(issue_number)
 
 
 def _same_workflow(run, current, workflow_name):
@@ -216,6 +210,10 @@ def duplicate_run_decision(
     while an earlier same-issue run was still active is stale even if it
     starts after that earlier run completes. A run created after the earlier
     run completed is a legitimate recovery or a new owner command.
+
+    ``legacy_title`` is accepted for caller compatibility but ignored: an
+    issue title is not an identity, so two different issues with the same
+    title must never be treated as the same issue.
     """
 
     if not isinstance(current, dict):
@@ -246,7 +244,7 @@ def duplicate_run_decision(
             continue
         if not _same_workflow(run, current, workflow_name):
             continue
-        if not _same_issue(run, issue_number, legacy_title):
+        if not _same_issue(run, issue_number):
             continue
 
         order = _run_order(run)
