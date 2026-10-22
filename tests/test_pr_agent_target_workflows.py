@@ -924,6 +924,17 @@ class ExactHeadCiProofRegressionTests(unittest.TestCase):
                 None,
             ),
             (
+                "missing-event-is-not-proof",
+                {
+                    "proofRun": run(event=None),
+                    "runs": [],
+                    "workflowName": "CI",
+                    "headSha": head,
+                },
+                "unavailable",
+                None,
+            ),
+            (
                 "listing-only-green",
                 {"proofRun": None, "runs": [run()], "workflowName": "CI", "headSha": head},
                 "green",

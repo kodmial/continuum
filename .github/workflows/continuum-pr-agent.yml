@@ -475,7 +475,7 @@ jobs:
                 String(run.name || '') === String(workflowName || '') &&
                 String(run.head_sha || '').trim().toLowerCase() ===
                   String(head || '').trim().toLowerCase() &&
-                String(run.event || 'pull_request') === 'pull_request'
+                String(run.event || '') === 'pull_request'
               );
             }
             function ciRunProofState(run, delegated) {
@@ -911,7 +911,7 @@ jobs:
                 String(run.name || '') === String(workflowName || '') &&
                 String(run.head_sha || '').trim().toLowerCase() ===
                   String(head || '').trim().toLowerCase() &&
-                String(run.event || 'pull_request') === 'pull_request'
+                String(run.event || '') === 'pull_request'
               );
             }
             function ciRunProofState(run, delegatedTarget) {
@@ -1015,10 +1015,30 @@ jobs:
                 return runs;
               } catch (err) {
                 core.info(
-                  `Could not re-read the exact-HEAD CI listing; relying on the verified run id if available: ${err.message}`
+                  `Could not re-read the exact-HEAD CI listing; refusing to treat verified run evidence as newest: ${err.message}`
                 );
                 return null;
               }
+            }
+            function decideWithCiListing({ proofRun, runs, workflowName, headSha }) {
+              // A failed listing read cannot prove the verified run is still
+              // the newest exact-HEAD run: fail closed rather than authorize
+              // review on potentially stale-green evidence.
+              if (runs === null) {
+                return {
+                  state: 'unavailable',
+                  run: null,
+                  runId: null,
+                  reason: 'exact-HEAD CI listing could not be read',
+                };
+              }
+              return decideExactHeadCi({
+                proofRun,
+                runs,
+                workflowName,
+                headSha,
+                delegated,
+              });
             }
             let pr;
             try {
@@ -1044,12 +1064,11 @@ jobs:
               return;
             }
             let proofRun = await readProofRun();
-            let decision = decideExactHeadCi({
+            let decision = decideWithCiListing({
               proofRun,
               runs: await readRuns(),
               workflowName: ciWorkflowName,
               headSha: admittedSha,
-              delegated,
             });
             // Pending or unreadable CI is not a deterministic red verdict.
             // Re-evaluate from latest state with a short bounded backoff before
@@ -1057,12 +1076,11 @@ jobs:
             for (let attempt = 1; attempt <= 2 && ['pending', 'unavailable'].includes(decision.state); attempt += 1) {
               await new Promise(resolve => setTimeout(resolve, attempt * 5000));
               proofRun = await readProofRun();
-              decision = decideExactHeadCi({
+              decision = decideWithCiListing({
                 proofRun,
                 runs: await readRuns(),
                 workflowName: ciWorkflowName,
                 headSha: admittedSha,
-                delegated,
               });
             }
             core.setOutput('result', decision.state);
@@ -3221,7 +3239,9 @@ jobs:
           # immutable run id delivered by admission is the primary evidence
           # and the filtered listing is a cross-check. A listing that
           # momentarily returns zero/stale rows must not erase a verified
-          # green run, while a newer red or pending run still blocks.
+          # green run, while a newer red or pending run still blocks. An
+          # unreadable listing fails closed because it cannot prove the
+          # verified run is still the newest exact-HEAD run.
           PROOF_JSON="$RUNNER_TEMP/pr-agent-ci-proof-run.json"
           CI_JSON="$RUNNER_TEMP/pr-agent-ci-runs.json"
           rm -f "$PROOF_JSON" "$CI_JSON"
@@ -3247,12 +3267,15 @@ jobs:
                   return None
           proof = load(proof_path)
           listing = load(list_path)
+          if listing is None:
+              print("unavailable")
+              raise SystemExit(0)
           def matches(run):
               return (
                   isinstance(run, dict)
                   and str(run.get("name") or "") == str(workflow or "")
                   and str(run.get("head_sha") or "").strip().lower() == head.strip().lower()
-                  and str(run.get("event") or "pull_request") == "pull_request"
+                  and str(run.get("event") or "") == "pull_request"
               )
           def timestamp(run, field):
               raw = str(run.get(field) or "")

@@ -194,7 +194,7 @@ jobs:
                 String(run.name || '') === String(workflowName || '') &&
                 String(run.head_sha || '').trim().toLowerCase() ===
                   String(head || '').trim().toLowerCase() &&
-                String(run.event || 'pull_request') === 'pull_request'
+                String(run.event || '') === 'pull_request'
               );
             }
             function decideExactHeadCi({ proofRun = null, runs = [], workflowName, headSha: head, delegated = false }) {

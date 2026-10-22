@@ -750,7 +750,8 @@ jobs:
             // admission is re-fetched as immutable evidence; the filtered
             // listing is a cross-check. An empty/stale listing can never
             // erase a verified green run, while a newer red or pending run
-            // still blocks the merge.
+            // still blocks the merge. An unreadable listing fails closed
+            // because it cannot prove the verified run is still the newest.
             function ciRunCreatedAt(run) {
               const parsed = Date.parse(String((run && run.created_at) || ''));
               return Number.isFinite(parsed) ? parsed : 0;
@@ -765,7 +766,7 @@ jobs:
                 String(run.name || '') === String(workflowName || '') &&
                 String(run.head_sha || '').trim().toLowerCase() ===
                   String(head || '').trim().toLowerCase() &&
-                String(run.event || 'pull_request') === 'pull_request'
+                String(run.event || '') === 'pull_request'
               );
             }
             function ciRunProofState(run, delegatedTarget) {
@@ -871,19 +872,38 @@ jobs:
                 return runs;
               } catch (err) {
                 core.info(
-                  `Could not read the exact-HEAD CI listing; relying on the verified run id if available: ${err.message}`
+                  `Could not read the exact-HEAD CI listing; refusing to treat verified run evidence as newest: ${err.message}`
                 );
                 return null;
               }
             }
+            function decideWithCiListing({ proofRun, runs, workflowName, headSha }) {
+              // A failed listing read is not evidence that the verified run
+              // is the newest exact-HEAD run: fail closed instead of letting
+              // a transient API failure hide a superseding red/pending run.
+              if (runs === null) {
+                return {
+                  state: 'unavailable',
+                  run: null,
+                  runId: null,
+                  reason: 'exact-HEAD CI listing could not be read',
+                };
+              }
+              return decideExactHeadCi({
+                proofRun,
+                runs,
+                workflowName,
+                headSha,
+                delegated,
+              });
+            }
             async function resolveExactHeadCi(pr, headSha, workflowName) {
               let proofRun = await readCiProofRun();
-              let decision = decideExactHeadCi({
+              let decision = decideWithCiListing({
                 proofRun,
                 runs: await listCiRunsForHead(pr, headSha),
                 workflowName,
                 headSha,
-                delegated,
               });
               // Pending or unreadable evidence is not a deterministic red
               // verdict: re-evaluate from latest state with short bounded
@@ -891,12 +911,11 @@ jobs:
               for (let attempt = 1; attempt <= 2 && ['pending', 'unavailable'].includes(decision.state); attempt += 1) {
                 await new Promise(resolve => setTimeout(resolve, attempt * 5000));
                 proofRun = await readCiProofRun();
-                decision = decideExactHeadCi({
+                decision = decideWithCiListing({
                   proofRun,
                   runs: await listCiRunsForHead(pr, headSha),
                   workflowName,
                   headSha,
-                  delegated,
                 });
               }
               return decision;
