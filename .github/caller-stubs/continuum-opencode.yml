@@ -5,7 +5,12 @@ name: OpenCode agent
 # and an `issue`-mode dispatch therefore report the issue number; the repair
 # modes report the pull request number.
 run-name: >-
-  ${{ github.event_name == 'issue_comment' &&
+  ${{ github.event_name == 'workflow_dispatch' &&
+      inputs.recovery_identity &&
+      format('OpenCode 429 recovery {0} gen {1}',
+        fromJSON(inputs.recovery_identity).recovery_operation_id,
+        fromJSON(inputs.recovery_identity).recovery_generation) ||
+      github.event_name == 'issue_comment' &&
       format('OpenCode issue #{0}', github.event.issue.number) ||
       github.event_name == 'workflow_dispatch' &&
       inputs.mode == 'issue' &&

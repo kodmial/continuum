@@ -619,7 +619,18 @@ jobs:
               return { ...target, ref, configured };
             }
 
-            async function observeDispatchedRun({ target, notBefore, displayTitle, oldRunId }) {
+            // Stable run identity for one operation+generation. The callers put
+            // this exact value into `run-name`, so a later pass can find an
+            // already accepted dispatch even when the pass that made it died
+            // before recording the run id.
+            function recoveryRunName(operation, generation) {
+              return 'OpenCode 429 recovery ' + String(operation) +
+                ' gen ' + String(generation);
+            }
+
+            async function observeDispatchedRun({
+              target, notBefore, displayTitle, recoveryRunName, oldRunId,
+            }) {
               for (let attempt = 0; attempt < 10; attempt += 1) {
                 try {
                   const runs = await readGithub.paginate(
@@ -629,19 +640,35 @@ jobs:
                       per_page: 50,
                     }
                   );
-                  const match = runs.find(candidate => {
+                  const candidates = runs.filter(candidate => {
                     if (Number(candidate.id) === Number(oldRunId || 0)) return false;
                     if (candidate.event !== 'workflow_dispatch') return false;
                     if (candidate.path && candidate.path !== target.path) return false;
                     if (new Date(candidate.created_at || 0).getTime() + 5000 < notBefore) {
                       return false;
                     }
-                    if (displayTitle && candidate.display_title &&
-                        candidate.display_title !== displayTitle) {
-                      return false;
-                    }
                     return true;
                   });
+                  const byTitle = title => title
+                    ? candidates.find(candidate =>
+                        candidate.display_title === title)
+                    : null;
+                  // Prefer the recovery identity embedded in run-name. Fall
+                  // back to the caller's mode/issue title and finally, only
+                  // when it is unambiguous, to the single new dispatch run. A
+                  // missing/unrelated display_title must never turn an
+                  // observable dispatch into an accepted-but-unowned one.
+                  let match = byTitle(recoveryRunName) || byTitle(displayTitle);
+                  if (!match) {
+                    const ordered = candidates.slice().sort((a, b) =>
+                      new Date(a.created_at || 0).getTime() -
+                        new Date(b.created_at || 0).getTime() ||
+                      Number(a.id || 0) - Number(b.id || 0)
+                    );
+                    if (ordered.length === 1) {
+                      match = ordered[0];
+                    }
+                  }
                   if (match) return match;
                 } catch (err) {
                   core.warning(
@@ -808,6 +835,66 @@ jobs:
                 );
               }
 
+              const displayTitle = mode === 'issue'
+                ? 'OpenCode issue #' + issueText
+                : (prText ? 'OpenCode repair PR #' + prText : '');
+              const recoveryTitle = recoveryRunName(operation, generation);
+
+              // Crash-after-ack fence: an expired `claimed`/`accepted` marker
+              // may describe a dispatch GitHub already accepted even though
+              // the pass that made it died before recording the run id. Adopt
+              // the durable operation+generation run identity before creating
+              // a new attempt; never treat the claim alone as proof either
+              // way.
+              if (
+                previous &&
+                previous.nextDue <= now &&
+                (previous.state === 'claimed' || previous.state === 'accepted')
+              ) {
+                let observedTarget = null;
+                try {
+                  observedTarget = await resolveDispatchTarget(runPath);
+                } catch (err) {
+                  core.warning(
+                    'OpenCode infrastructure operation ' + operation + ' generation ' +
+                    generation + ' could not resolve a dispatch target while ' +
+                    'checking for an already accepted run (' +
+                    (err.message || err) + ').'
+                  );
+                }
+                if (observedTarget) {
+                  const recovered = await observeDispatchedRun({
+                    target: observedTarget,
+                    notBefore: Math.max(0, previous.nextDue - 300) * 1000,
+                    displayTitle,
+                    recoveryRunName: recoveryTitle,
+                    oldRunId: run && run.id,
+                  });
+                  if (recovered) {
+                    await recordRecoveryState({
+                      ...baseState,
+                      checkpointSha,
+                      state: 'observed',
+                      attempt: previous.attempt,
+                      nextDue: 0,
+                      runId: String(recovered.id),
+                      detail: 'run-recovered',
+                      summary: 'Adopted already-dispatched fresh-VM run ' +
+                        recovered.id + ' for checkpoint `' + checkpointRef +
+                        '` at exact SHA `' + checkpointSha + '` (stage `' +
+                        stage + '`, generation ' + generation +
+                        ') instead of dispatching a duplicate.',
+                    });
+                    core.notice(
+                      'OpenCode 429: adopted existing fresh-VM run ' + recovered.id +
+                      ' for operation ' + operation + ' generation ' + generation +
+                      '; no duplicate dispatch.'
+                    );
+                    return;
+                  }
+                }
+              }
+
               if (previous) {
                 if (previous.state === 'observed') {
                   core.notice(
@@ -817,7 +904,7 @@ jobs:
                   );
                   return;
                 }
-                if (previous.state === 'accepted') {
+                if (previous.state === 'accepted' && previous.nextDue > now) {
                   core.notice(
                     'OpenCode infrastructure operation ' + operation + ' generation ' +
                     generation + ' already has an accepted (not yet observed) dispatch; ' +
@@ -841,7 +928,15 @@ jobs:
                   );
                   return;
                 }
-                if (previous.attempt >= Math.max(1, max429Restarts + 1)) {
+                // An expired durable backoff window opens one fresh bounded
+                // attempt cycle from the still-valid checkpoint instead of
+                // re-recording the same exhausted backoff forever.
+                const backoffExpired =
+                  previous.state === 'backoff' && previous.nextDue <= now;
+                if (
+                  previous.attempt >= Math.max(1, max429Restarts + 1) &&
+                  !backoffExpired
+                ) {
                   await recordRecoveryState({
                     ...baseState,
                     checkpointSha,
@@ -994,13 +1089,11 @@ jobs:
                 return;
               }
 
-              const displayTitle = mode === 'issue'
-                ? 'OpenCode issue #' + issueText
-                : (prText ? 'OpenCode repair PR #' + prText : '');
               const observed = await observeDispatchedRun({
                 target,
                 notBefore: dispatchStarted,
                 displayTitle,
+                recoveryRunName: recoveryTitle,
                 oldRunId: run && run.id,
               });
               if (!observed) {

@@ -108,6 +108,22 @@ class CallerDeclarationTest(unittest.TestCase):
         for path in (SELF_CALLER, CONSUMER_CALLER):
             self.assertIn("workflow_dispatch", workflow_events(path), path)
 
+    def test_both_callers_name_recovery_runs_by_operation_and_generation(self):
+        for path in (SELF_CALLER, CONSUMER_CALLER):
+            body = path.read_text(encoding="utf-8")
+            self.assertIn("inputs.recovery_identity", body)
+            self.assertIn(
+                "format('OpenCode 429 recovery {0} gen {1}',", body
+            )
+            self.assertIn(
+                "fromJSON(inputs.recovery_identity).recovery_operation_id",
+                body,
+            )
+            self.assertIn(
+                "fromJSON(inputs.recovery_identity).recovery_generation",
+                body,
+            )
+
 
 class DispatchResolutionTest(unittest.TestCase):
     def setUp(self):
@@ -247,6 +263,32 @@ class WatchdogContractTest(unittest.TestCase):
             recovery.index("createWorkflowDispatch({"),
             "the durable claim must be recorded before dispatching",
         )
+
+    def test_expired_claim_is_observed_before_a_second_dispatch(self):
+        recovery = self.body.split("async function recoverFrom429OnFreshVm")[-1]
+        self.assertIn("previous.state === 'claimed' || previous.state === 'accepted'", recovery)
+        self.assertIn("state: 'observed'", recovery)
+        self.assertIn("detail: 'run-recovered'", recovery)
+        self.assertLess(
+            recovery.index("const recovered = await observeDispatchedRun({"),
+            recovery.index("createRecoveryClaim({"),
+            "an expired claim must adopt an already-created run before re-dispatching",
+        )
+
+    def test_observation_prefers_the_durable_recovery_run_identity(self):
+        observation = self.body.split("async function observeDispatchedRun")[-1]
+        self.assertIn("function recoveryRunName(operation, generation)", self.body)
+        self.assertIn("byTitle(recoveryRunName)", observation)
+        self.assertIn("byTitle(displayTitle)", observation)
+        self.assertIn("ordered.length === 1", observation)
+
+    def test_expired_attempt_backoff_opens_a_fresh_cycle(self):
+        recovery = self.body.split("async function recoverFrom429OnFreshVm")[-1]
+        self.assertIn(
+            "previous.state === 'backoff' && previous.nextDue <= now",
+            recovery,
+        )
+        self.assertIn("!backoffExpired", recovery)
 
     def test_engine_never_dispatches_a_workflow_call_only_target(self):
         engine = ENGINE.read_text(encoding="utf-8")

@@ -67,14 +67,18 @@ APPROVED_347_OPENCODE_SHA256 = (
 
 # kodmial/continuum#350 exact protected-workflow artifact pins. The 429
 # evacuation helper now validates/pushes recovery metadata, the watchdog
-# dispatches a real workflow_dispatch caller, and the self-dogfood caller
-# forwards packed recovery identity. Both files are pinned byte-for-byte so
-# any unrelated drift still fails closed.
+# dispatches a real workflow_dispatch caller, and both the self-dogfood caller
+# and the installed consumer caller stub forward packed recovery identity and
+# name the dispatched run by operation+generation. All three files are pinned
+# byte-for-byte so any unrelated drift still fails closed.
 APPROVED_350_OPENCODE_SHA256 = (
     "f9368c6939f4343a27f28d3bdc0653d1b1822de56c1b963454543cbed60fb03b"
 )
+APPROVED_350_SELF_CALLER_SHA256 = (
+    "f06cdcb9affc06f976aed97945ff9d31496e5954ca225971164f87ec4e1ca22c"
+)
 APPROVED_350_CALLER_SHA256 = (
-    "5ae873799a580154158d89a4b45aeb2427fa82e72060d786cb00a24c6551c751"
+    "a595362c8353001d5f7af138ab848df8fac3a6c924d5d337f6819084f79b3938"
 )
 
 # Previous protected baseline before the PAUSE_ON_FAILURE advance above.
@@ -2492,13 +2496,13 @@ class ProtectedBaselineTests(unittest.TestCase):
                         f"{path}: unexpected drift outside reviewed #350 recovery patch",
                     )
                 else:
-                    # The self-dogfood caller is the dispatchable surface that
-                    # #350 repairs; pin it exactly instead of comparing it to
-                    # a historical caller baseline.
+                    # The self-dogfood caller is the dispatchable surface
+                    # that #350 repairs; pin it exactly instead of comparing
+                    # it to a historical caller baseline.
                     self.assertEqual(
                         protected_file_digest(path),
-                        APPROVED_350_CALLER_SHA256,
-                        f"{path}: unexpected drift outside reviewed #350 caller patch",
+                        APPROVED_350_SELF_CALLER_SHA256,
+                        f"{path}: unexpected drift outside reviewed #350 self-caller patch",
                     )
                 if path == ".github/workflows/continuum-opencode.yml":
                     self.assertIn("Restore verified cached OpenCode for coder and repair", read_repo(path))
@@ -2507,6 +2511,17 @@ class ProtectedBaselineTests(unittest.TestCase):
                                   "migration must retain 429 stop-the-runner protection")
                     self.assertIn("Check issue Definition of Ready", read_repo(path),
                                   "migration must preserve task-admission gate")
+
+        # The installed consumer caller stub is a separate protected artifact:
+        # pin it explicitly so its recovery run-name/dispatch contract cannot
+        # drift outside a reviewed change.
+        self.assertEqual(
+            protected_file_digest(
+                ".github/caller-stubs/continuum-opencode.yml"
+            ),
+            APPROVED_350_CALLER_SHA256,
+            "consumer caller stub: unexpected drift outside reviewed #350 patch",
+        )
 
     def test_worktree_probe_contract_without_baseline(self):
         # Independent of git history: only the reviewed SHA-pinned composite
