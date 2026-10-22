@@ -284,7 +284,7 @@ Swift-profile variable list.
 | Review never starts | `CONTINUUM_REVIEW_PROVIDER` is `none` or the selected provider is not configured. Optional review is not guaranteed to run or approve. |
 | A green PR does not merge | Branch protection, required checks, exact-HEAD evidence, conflict state, or a required gate label/name. Read the auto-merge run log. |
 | `workflow not found` after a Continuum upgrade | Reinstall every set you use, then review the prune output. |
-| Repeated model or rate-limit failures | The free anonymous route can be unavailable. Retry later; this is not a Continuum SLA. |
+| Repeated model or rate-limit failures | The free anonymous route can be unavailable. An explicit OpenCode 429 marker starts a bounded fresh-runner recovery checkpoint through a repository-local `workflow_dispatch` caller; a bounded timer catches up when `workflow_run` delivery is late or lost. This is not a Continuum SLA. |
 
 ## What has been live-qualified
 
