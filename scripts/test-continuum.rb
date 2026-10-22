@@ -3649,19 +3649,22 @@ class ContinuumTest < Minitest::Test
                  'the README must say plainly that no workflow reads a paid provider key')
   end
 
-  # CONTRIBUTING and the issue chooser are reporter-facing entry points. Assert
-  # that both point reporters at the repository's security policy without
-  # making this change depend on the policy task's output: the policy content
-  # and its existence are verified where that file is owned.
+  # CONTRIBUTING and the issue chooser are reporter-facing entry points. Point
+  # both at GitHub's repository security policy entrypoint rather than a fixed
+  # blob path, so neither strands a report while the policy file's merge
+  # ordering is outside this change's ownership. The policy content and file
+  # existence are verified where that file is owned.
   def test_security_reporting_guidance_links_to_the_security_policy
     contributing = File.read(File.join(ROOT, 'CONTRIBUTING.md'))
-    assert_includes contributing, '[SECURITY.md](SECURITY.md)'
+    assert_match(%r{https://github\.com/kodmial/continuum/security/policy}, contributing)
+    refute_match(%r{/blob/[^/]+/SECURITY\.md}, contributing,
+                 'CONTRIBUTING must not link a fixed SECURITY.md blob path')
     refute_match(/private vulnerability reporting is/i, contributing,
                  'CONTRIBUTING must not cache a reporting status owned by SECURITY.md')
 
     config = yaml(File.join(ROOT, '.github/ISSUE_TEMPLATE/config.yml'))
     security_link = Array(config['contact_links']).find do |link|
-      link['url'].to_s.end_with?('/SECURITY.md')
+      link['url'].to_s.end_with?('/security/policy')
     end
     refute_nil security_link,
                'the issue chooser must keep a link to the security policy'

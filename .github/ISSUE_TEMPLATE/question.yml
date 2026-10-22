@@ -10,7 +10,8 @@ body:
       value: |
         Use this form for usage and integration questions that are not a bug
         report or a feature request. For bugs, use the bug report form. For a
-        security vulnerability, stop and follow [SECURITY.md](https://github.com/kodmial/continuum/blob/main/SECURITY.md)
+        security vulnerability, stop and follow the
+        [security policy](https://github.com/kodmial/continuum/security/policy)
         instead of opening a public issue.
 
         This form applies the `automation:blocked` admission hold. A maintainer
