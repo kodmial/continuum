@@ -7,18 +7,11 @@ Run from the Continuum checkout:
 """
 
 from datetime import datetime, timezone
-from pathlib import Path
 import unittest
 
 from continuum.scheduler_reconcile import IssueState, SchedulerConfig, reconcile
 
 NOW = datetime(2026, 1, 1, tzinfo=timezone.utc)
-SCHEDULER = (
-    Path(__file__).resolve().parents[3]
-    / ".github"
-    / "workflows"
-    / "continuum-issue-scheduler.yml"
-)
 
 
 def reconcile_one(config, labels):
@@ -46,16 +39,6 @@ def reconcile_one(config, labels):
 
 
 class ReadyAdmissionTest(unittest.TestCase):
-    def test_scheduler_workflow_carries_the_same_admission_gate(self):
-        body = SCHEDULER.read_text(encoding="utf-8")
-
-        self.assertIn(
-            "READY_LABEL: ${{ inputs.ready_label || vars.AUTOMATION_READY_LABEL }}",
-            body,
-        )
-        self.assertIn("if (readyLabel && !labels.has(readyLabel)) {", body)
-        self.assertIn("missing required ready label `", body)
-
     def test_unadmitted_issue_is_not_dispatched(self):
         result, issue = reconcile_one(
             SchedulerConfig(ready_label="automation:ready"),

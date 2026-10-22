@@ -76,17 +76,36 @@ callers, but it deliberately never edits your `ci.yml`.
 ```sh
 python3 - "$CONTINUUM_REF" <<'PY'
 from pathlib import Path
+import re
 import sys
 
 ref = sys.argv[1]
 path = Path(".github/workflows/ci.yml")
-text = path.read_text()
-text = text.replace("continuum-validation.yml@main",
-                    f"continuum-validation.yml@{ref}")
-text = text.replace("continuum_ref: main", f"continuum_ref: {ref}")
-path.write_text(text)
+text = path.read_text(encoding="utf-8")
+
+text, uses_count = re.subn(
+    r"(continuum-validation\.yml@)[^\s\"']+",
+    lambda match: match.group(1) + ref,
+    text,
+)
+text, ref_count = re.subn(
+    r"(?m)^(\s*continuum_ref:\s*)[^\s#]+",
+    lambda match: match.group(1) + ref,
+    text,
+)
+
+if uses_count != 1 or ref_count != 1:
+    raise SystemExit(
+        "expected exactly one continuum-validation.yml ref and one "
+        f"continuum_ref in {path}; found {uses_count} and {ref_count}"
+    )
+
+path.write_text(text, encoding="utf-8")
 PY
 ```
+
+The script fails instead of silently skipping a replacement when the example
+`ci.yml` drifts, so CI cannot be left unpinned by an unmatched constant.
 
 You can also create the installer locally from the checkout and pass the ref
 explicitly:
