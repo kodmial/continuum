@@ -106,6 +106,17 @@ DEFAULT_MAX_429_RUNNER_RESTARTS = 3
 #: Prefix for workflow-owned durable checkpoint refs.
 CHECKPOINT_REF_PREFIX = "opencode/429-checkpoint-"
 
+#: Infrastructure-unavailable (non-429) checkpoints use a sibling namespace
+#: so a provider outage is still recoverable with the same exact-SHA
+#: contract. Both namespaces validate and restore identically.
+INFRA_CHECKPOINT_REF_PREFIX = "opencode/infra-checkpoint-"
+
+#: Every accepted workflow-owned checkpoint namespace.
+CHECKPOINT_REF_PREFIXES = (
+    CHECKPOINT_REF_PREFIX,
+    INFRA_CHECKPOINT_REF_PREFIX,
+)
+
 #: Workflow-owned progress file an agent maintains while it works. The agent
 #: writes a single lifecycle stage name (see :data:`STAGES`) as it completes
 #: each phase; the workflow-owned 429 evacuator reads it back (no LLM call)
@@ -115,6 +126,43 @@ CHECKPOINT_REF_PREFIX = "opencode/429-checkpoint-"
 #: staging task commits, and a fresh-VM restore deletes it so only progress
 #: made on the current run can authorize a skip.
 STAGE_FILE_NAME = ".continuum-429-stage"
+
+#: Workflow-owned recovery metadata file committed into every recoverable
+#: checkpoint. A checkpoint is only *recoverable* when this file is present
+#: in the checkpoint commit and validates against the operation identity.
+METADATA_FILE_NAME = ".continuum-429-recovery.json"
+
+#: Version of the durable recovery metadata schema. Bump only with a
+#: compatible reader in the watchdog.
+RECOVERY_METADATA_SCHEMA_VERSION = 1
+
+#: Distinct terminal-for-this-run state emitted when the workflow cannot
+#: produce complete recovery metadata. The raw code is still preserved on a
+#: salvage ref; no false checkpoint pointer is ever published.
+RECOVERY_METADATA_FAILED_MARKER = (
+    "CONTINUUM_OPENCODE_429_RECOVERY_METADATA_FAILED"
+)
+
+#: Durable comment marker recording a bounded, still-recoverable wait. The
+#: scheduler and the scheduled watchdog catch-up pass read this so a missing
+#: or delayed checkpoint file never becomes a silent, permanently stranded
+#: operation.
+RECOVERY_STATE_MARKER_PREFIX = "<!-- continuum-429-recovery"
+
+_REQUIRED_METADATA_FIELDS = (
+    "operation_id",
+    "failure_kind",
+    "generation",
+    "stage",
+    "mode",
+    "issue_number",
+    "pr_number",
+    "head_ref",
+    "base_sha",
+    "head_sha",
+    "branch",
+    "checkpoint_ref",
+)
 
 #: Modes whose fresh-run path can continue without the agent, so an honest
 #: recorded stage may skip it. Issue mode publishes workflow-side and
@@ -320,15 +368,17 @@ def parse_checkpoint_ref(ref: Any) -> Optional[Dict[str, Any]]:
     """Parse a checkpoint ref back into operation+generation, or None."""
 
     text = str(ref or "").strip()
-    if not text.startswith(CHECKPOINT_REF_PREFIX):
-        return None
-    rest = text[len(CHECKPOINT_REF_PREFIX):]
-    if "-gen-" not in rest:
-        return None
-    operation, _, generation = rest.rpartition("-gen-")
-    if not operation or not generation.isdigit():
-        return None
-    return {"operation_id": operation, "generation": int(generation)}
+    for prefix in CHECKPOINT_REF_PREFIXES:
+        if not text.startswith(prefix):
+            continue
+        rest = text[len(prefix):]
+        if "-gen-" not in rest:
+            return None
+        operation, _, generation = rest.rpartition("-gen-")
+        if not operation or not generation.isdigit():
+            return None
+        return {"operation_id": operation, "generation": int(generation)}
+    return None
 
 
 def next_generation(generation: Any) -> int:
@@ -539,6 +589,288 @@ def unpack_recovery_identity(payload: Any) -> Dict[str, str]:
     }
 
 
+def validate_recovery_metadata(
+    metadata: Any,
+    *,
+    operation_id: Any = None,
+    generation: Any = None,
+    mode: Any = None,
+    issue_number: Any = None,
+    pr_number: Any = None,
+    stage: Any = None,
+    head_sha: Any = None,
+    branch: Any = None,
+    checkpoint_ref: Any = None,
+) -> Tuple[bool, str]:
+    """Validate complete checkpoint recovery metadata. Returns (ok, reason).
+
+    A checkpoint pointer is only published after this returns ``True``. The
+    schema is deliberately strict: recovery must be provable from durable
+    evidence, never guessed from a mutable issue or a partial commit.
+    """
+
+    if not isinstance(metadata, Mapping):
+        return False, "recovery metadata is not an object"
+    version = metadata.get("schema_version", RECOVERY_METADATA_SCHEMA_VERSION)
+    try:
+        version_int = int(version)
+    except (TypeError, ValueError):
+        return False, "recovery metadata schema version is not an integer"
+    if version_int != RECOVERY_METADATA_SCHEMA_VERSION:
+        return False, "recovery metadata schema version is unsupported"
+    for field in _REQUIRED_METADATA_FIELDS:
+        if field not in metadata:
+            return False, "recovery metadata is missing {}".format(field)
+    operation = str(metadata.get("operation_id") or "").strip()
+    if not operation or _safe_token(operation) != operation:
+        return False, "recovery metadata operation id is malformed"
+    try:
+        gen = int(metadata.get("generation"))
+    except (TypeError, ValueError):
+        return False, "recovery metadata generation is not an integer"
+    if gen < 0:
+        return False, "recovery metadata generation is negative"
+    metadata_stage = str(metadata.get("stage") or "")
+    if not is_valid_stage(metadata_stage):
+        return False, "recovery metadata stage is unknown"
+    metadata_mode = str(metadata.get("mode") or "").strip().lower()
+    if metadata_mode not in AGENT_MODES:
+        return False, "recovery metadata mode is unknown"
+    failure_kind = str(metadata.get("failure_kind") or "")
+    if failure_kind not in ("quota_429", "unavailable"):
+        return False, "recovery metadata failure kind is unknown"
+    issue_text = str(metadata.get("issue_number") or "").strip()
+    pr_text = str(metadata.get("pr_number") or "").strip()
+    if issue_text and not issue_text.isdigit():
+        return False, "recovery metadata issue number is malformed"
+    if pr_text and not pr_text.isdigit():
+        return False, "recovery metadata PR number is malformed"
+    if not issue_text and not pr_text and metadata_mode in ("issue",):
+        return False, "recovery metadata issue mode requires an issue number"
+    if not pr_text and metadata_mode in (
+        "coderabbit-fix",
+        "resolve-conflict",
+        "ci-fix",
+    ):
+        return False, "recovery metadata repair mode requires a PR number"
+    if metadata_mode == "qualification" and not str(
+        metadata.get("qualification_number") or ""
+    ).strip().isdigit():
+        return False, "recovery metadata qualification mode requires a tracker"
+    head = str(metadata.get("head_sha") or "").strip().lower()
+    base = str(metadata.get("base_sha") or "").strip().lower()
+    if not _SHA_RE.fullmatch(head or ""):
+        return False, "recovery metadata head SHA is malformed"
+    if base and not _SHA_RE.fullmatch(base):
+        return False, "recovery metadata base SHA is malformed"
+    if not str(metadata.get("branch") or "").strip():
+        return False, "recovery metadata branch is empty"
+    if not str(metadata.get("head_ref") or "").strip():
+        return False, "recovery metadata head ref is empty"
+    metadata_checkpoint = str(metadata.get("checkpoint_ref") or "").strip()
+    if not metadata_checkpoint.startswith(CHECKPOINT_REF_PREFIX) and not (
+        metadata_checkpoint.startswith("opencode/infra-checkpoint-")
+    ):
+        return False, "recovery metadata checkpoint ref is malformed"
+    parsed_checkpoint = parse_checkpoint_ref(metadata_checkpoint)
+    if parsed_checkpoint is None:
+        return False, "recovery metadata checkpoint ref is malformed"
+    if parsed_checkpoint["operation_id"] != operation:
+        return False, "recovery metadata checkpoint ref does not match the operation"
+    if parsed_checkpoint["generation"] != gen:
+        return False, "recovery metadata checkpoint ref does not match the generation"
+
+    if operation_id not in (None, "") and _safe_token(operation_id) != operation:
+        return False, "recovery metadata operation does not match the pointer"
+    if generation not in (None, "") and int(generation) != gen:
+        return False, "recovery metadata generation does not match the pointer"
+    if mode not in (None, "") and str(mode).strip().lower() != metadata_mode:
+        return False, "recovery metadata mode does not match the pointer"
+    if issue_number not in (None, "") and str(issue_number).strip() != issue_text:
+        return False, "recovery metadata issue does not match the pointer"
+    if pr_number not in (None, "") and str(pr_number).strip() != pr_text:
+        return False, "recovery metadata PR does not match the pointer"
+    if stage not in (None, "") and str(stage) != metadata_stage:
+        return False, "recovery metadata stage does not match the pointer"
+    if head_sha not in (None, "") and str(head_sha).strip().lower() != head:
+        return False, "recovery metadata head SHA does not match the pointer"
+    if branch not in (None, "") and str(branch).strip() != str(
+        metadata.get("branch") or ""
+    ).strip():
+        return False, "recovery metadata branch does not match the pointer"
+    if checkpoint_ref not in (None, "") and str(checkpoint_ref).strip() != metadata_checkpoint:
+        return False, "recovery metadata checkpoint ref does not match the pointer"
+    return True, "recovery metadata is valid"
+
+
+def metadata_failure_marker(
+    operation: Any,
+    generation: Any,
+    *,
+    stage: Any = "",
+    mode: Any = "",
+    issue_number: Any = "",
+    pr_number: Any = "",
+    salvage_ref: Any = "",
+    reason: Any = "",
+) -> str:
+    """Durable log line for a checkpoint whose metadata could not be proven."""
+
+    def clean(value: Any) -> str:
+        text = re.sub(r"\s+", "-", str(value or "").strip())
+        return text or "-"
+
+    try:
+        gen = int(generation)
+    except (TypeError, ValueError):
+        gen = 0
+    return (
+        "{} operation={} generation={} stage={} mode={} issue={} pr={} "
+        "salvage_ref={} reason={}".format(
+            RECOVERY_METADATA_FAILED_MARKER,
+            _safe_token(operation) or "unknown",
+            max(0, gen),
+            clean(stage),
+            clean(mode),
+            clean(issue_number),
+            clean(pr_number),
+            clean(salvage_ref),
+            clean(reason),
+        )
+    )
+
+
+_METADATA_FAILURE_RE = re.compile(
+    re.escape(RECOVERY_METADATA_FAILED_MARKER)
+    + r"\s+operation=(\S+)\s+generation=(\d+)\s+stage=(\S*)\s+mode=(\S*)\s+"
+    r"issue=(\S*)\s+pr=(\S*)\s+salvage_ref=(\S*)\s+reason=(.*)$"
+)
+
+
+def parse_metadata_failure_line(text: Any) -> Optional[Dict[str, str]]:
+    """Parse the workflow-owned metadata-failure line, or return None."""
+
+    if not isinstance(text, str):
+        return None
+    for line in text.splitlines():
+        match = _METADATA_FAILURE_RE.search(line)
+        if not match:
+            continue
+        return {
+            "operation_id": match.group(1),
+            "generation": match.group(2),
+            "stage": "" if match.group(3) == "-" else match.group(3),
+            "mode": "" if match.group(4) == "-" else match.group(4),
+            "issue_number": "" if match.group(5) == "-" else match.group(5),
+            "pr_number": "" if match.group(6) == "-" else match.group(6),
+            "salvage_ref": "" if match.group(7) == "-" else match.group(7),
+            "reason": (match.group(8) or "").strip(),
+        }
+    return None
+
+
+def _marker_value(value: Any) -> str:
+    text = re.sub(r'[\s"<>]+', "-", str(value or "").strip())
+    return text or "-"
+
+
+def recovery_state_marker(
+    operation: Any,
+    generation: Any,
+    state: Any,
+    *,
+    checkpoint_ref: Any = "",
+    checkpoint_sha: Any = "",
+    run_id: Any = "",
+    attempt: Any = 0,
+    next_due: Any = 0,
+    detail: Any = "",
+) -> str:
+    """One durable, machine-readable recovery-state marker.
+
+    ``state`` is one of ``claimed``, ``dispatch-failed``, ``accepted``,
+    ``observed``, ``metadata-pending``, ``metadata-failed``, or ``backoff``.
+    ``next_due`` is an epoch-second lower bound for the next retry. A claim
+    alone is never proof that a runner started; only ``observed`` (with a
+    run id) is.
+    """
+
+    try:
+        gen = int(generation)
+    except (TypeError, ValueError):
+        gen = 0
+    try:
+        attempt_int = max(0, int(attempt))
+    except (TypeError, ValueError):
+        attempt_int = 0
+    try:
+        due = max(0, int(next_due))
+    except (TypeError, ValueError):
+        due = 0
+    return (
+        "{} op={} gen={} state={} attempt={} next_due={} checkpoint={} "
+        "sha={} run={} detail={} -->".format(
+            RECOVERY_STATE_MARKER_PREFIX,
+            _safe_token(operation) or "unknown",
+            max(0, gen),
+            _marker_value(state),
+            attempt_int,
+            due,
+            _marker_value(checkpoint_ref),
+            _marker_value(checkpoint_sha),
+            _marker_value(run_id),
+            _marker_value(detail),
+        )
+    )
+
+
+_RECOVERY_STATE_RE = re.compile(
+    r"<!--\s*continuum-429-recovery\s+"
+    r"op=(\S+)\s+gen=(\d+)\s+state=(\S+)\s+attempt=(\d+)\s+"
+    r"next_due=(\d+)\s+checkpoint=(\S*)\s+sha=(\S*)\s+run=(\S*)\s+"
+    r"detail=(\S*)\s*-->"
+)
+
+
+def parse_recovery_state_markers(text: Any) -> list:
+    """Return every machine-readable recovery-state marker in ``text``."""
+
+    if not isinstance(text, str):
+        return []
+    found = []
+    for match in _RECOVERY_STATE_RE.finditer(text):
+        found.append(
+            {
+                "operation_id": match.group(1),
+                "generation": int(match.group(2)),
+                "state": match.group(3),
+                "attempt": int(match.group(4)),
+                "next_due": int(match.group(5)),
+                "checkpoint_ref": "" if match.group(6) == "-" else match.group(6),
+                "checkpoint_sha": "" if match.group(7) == "-" else match.group(7),
+                "run_id": "" if match.group(8) == "-" else match.group(8),
+                "detail": "" if match.group(9) == "-" else match.group(9),
+            }
+        )
+    return found
+
+
+def latest_recovery_state(text: Any, operation: Any, generation: Any) -> Optional[Dict[str, Any]]:
+    """Latest durable recovery state for one operation+generation, if any."""
+
+    try:
+        gen = int(generation)
+    except (TypeError, ValueError):
+        gen = 0
+    operation_token = _safe_token(operation)
+    states = [
+        item
+        for item in parse_recovery_state_markers(text)
+        if item["operation_id"] == operation_token and item["generation"] == gen
+    ]
+    return states[-1] if states else None
+
+
 def redact_child_identity(text: Any) -> str:
     """Redact ``owner/repo`` identities so Parent logs stay opaque.
 
@@ -594,8 +926,14 @@ __all__ = [
     "DEFAULT_MAX_429_RUNNER_RESTARTS",
     "FAIL_CLOSED_STATUSES",
     "INFRA_BACKOFF_SCHEDULE",
+    "INFRA_CHECKPOINT_REF_PREFIX",
+    "CHECKPOINT_REF_PREFIXES",
     "MODES_HONORING_STAGE_FILE",
     "PUBLISH_RACE_MARKER",
+    "RECOVERY_METADATA_FAILED_MARKER",
+    "RECOVERY_METADATA_SCHEMA_VERSION",
+    "RECOVERY_STATE_MARKER_PREFIX",
+    "METADATA_FILE_NAME",
     "RESTART_REQUIRED_MARKER",
     "RECOVERY_IDENTITY_FIELDS",
     "RUNNER_DEATH_EXIT_CODE",
@@ -614,6 +952,12 @@ __all__ = [
     "operation_id",
     "parse_checkpoint_ref",
     "parse_stage_file",
+    "parse_metadata_failure_line",
+    "parse_recovery_state_markers",
+    "latest_recovery_state",
+    "metadata_failure_marker",
+    "recovery_state_marker",
+    "validate_recovery_metadata",
     "pack_recovery_identity",
     "recovery_dispatch_inputs",
     "redact_child_identity",

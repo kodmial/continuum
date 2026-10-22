@@ -204,6 +204,13 @@ class OperationIdentityTest(unittest.TestCase):
         self.assertEqual(parsed["operation_id"], operation)
         self.assertEqual(parsed["generation"], 2)
 
+    def test_infrastructure_checkpoint_ref_roundtrip(self):
+        ref = "opencode/infra-checkpoint-opencode-429-issue-issue290-gen-3"
+        parsed = parse_checkpoint_ref(ref)
+        self.assertIsNotNone(parsed)
+        self.assertEqual(parsed["operation_id"], "opencode-429-issue-issue290")
+        self.assertEqual(parsed["generation"], 3)
+
     def test_malformed_refs_rejected(self):
         self.assertIsNone(parse_checkpoint_ref("main"))
         self.assertIsNone(parse_checkpoint_ref("opencode/429-checkpoint-"))

@@ -2852,6 +2852,50 @@ class ContinuumTest < Minitest::Test
     end
   end
 
+  # kodmial/continuum#350: a failed OpenCode run must be resumed only through
+  # a caller that really declares `workflow_dispatch`, and a lost/late
+  # workflow_run delivery must still be caught by a bounded timer.
+  def test_429_recovery_uses_a_dispatchable_caller_and_a_catch_up_timer
+    opencode = yaml(File.join(ROOT, '.github/workflows/opencode.yml'))
+    caller_inputs = opencode.fetch('jobs').fetch('call').fetch('with')
+    assert_match(/inputs\.recovery_identity/,
+                 caller_inputs.fetch('recovery_operation_id').to_s,
+                 'self-dogfood caller must unpack recovery identity')
+    recovery_identity = events(opencode).fetch('workflow_dispatch').fetch('inputs')
+      .fetch('recovery_identity')
+    assert_equal false, recovery_identity.fetch('required')
+    refute recovery_identity.key?('default')
+
+    watchdog = watchdog_body
+    assert_includes watchdog, 'opencode_429_dispatch.js'
+    assert_includes watchdog, 'resolveDispatchWorkflow'
+    assert_includes File.read(File.join(ROOT, '.github/scripts/opencode_429_dispatch.js')), 'workflowSupportsDispatch'
+    assert_includes watchdog, 'recoveryStateMarker'
+    refute_match(/readGithub\.rest\.actions\.reRunWorkflow\(/, watchdog[/async function recoverFrom429OnFreshVm.*?if \(publishRaceRestartRequired\)/m].to_s,
+                 '429 recovery must dispatch a fresh run, never re-run the workflow_call engine')
+
+    stub_events = events(watchdog_stub)
+    assert_equal ['*/15 * * * *'], stub_events.fetch('schedule').map { |entry| entry.fetch('cron') },
+                 'consumer watchdog needs a bounded catch-up timer'
+
+    automation = File.read(File.join(ROOT, '.github/workflows/automation.yml'))
+    assert_includes automation, "github.event_name == 'schedule'"
+    assert_includes automation, "opencode_workflow: 'opencode.yml'"
+
+    scheduler = File.read(File.join(ROOT, '.github/workflows/continuum-issue-scheduler.yml'))
+    assert_includes scheduler, "run.event !== 'workflow_dispatch'",
+                    'scheduler must treat a recovery dispatch as in-flight work'
+    assert_includes scheduler, 'hasFresh429Recovery'
+    assert_includes scheduler, 'continuum-429-(?:recovery|resumption|backoff)',
+                    'scheduler must recognise durable 429 recovery state'
+    assert_includes scheduler, 'newestRecovery.runId',
+                    'scheduler must follow the recorded resumption run, not a fixed 2h window'
+    assert_includes scheduler, "recoveryRun.status !== 'completed'",
+                    'a still-running recovery must hold the reservation for as long as it runs'
+    assert_includes scheduler, '48 * 60 * 60 * 1000',
+                    'observed/accepted state must use the bounded catch-up horizon'
+  end
+
   # ---------------------------------------------------------------- watchdog
 
   WATCHDOG = 'continuum-opencode-watchdog.yml'
