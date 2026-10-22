@@ -1,0 +1,22 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  actions: write
+  contents: read
+  pull-requests: read
+  statuses: write
+
+jobs:
+  validate:
+    uses: kodmial/continuum/.github/workflows/continuum-validation.yml@main
+    with:
+      continuum_ref: main
+      auto_detect: 'false'
+      build_command: python3 -m compileall -q app.py tests
+      test_command: python3 -m unittest discover -s tests -v
