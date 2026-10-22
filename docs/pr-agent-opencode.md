@@ -18,7 +18,7 @@ same runner:
 PR-Agent (pinned pip release, on the runner)
   -> POST 127.0.0.1:<bridge_port>/v1/chat/completions (this bridge)
   -> POST 127.0.0.1:<server_port>/session + /session/:id/message (opencode serve)
-  -> configured OpenCode provider/model (default: the free anonymous route)
+  -> configured OpenCode provider/model from OPENCODE_MODELS/OPENCODE_MODEL
 ```
 
 `opencode serve` is **not** OpenAI Chat Completions compatible: it speaks
@@ -72,7 +72,8 @@ Provider, model, and limit details are configuration, not product policy:
 | `PR_AGENT_API_BASE` | `http://127.0.0.1:<bridge_port>/v1` | OpenAI-compatible backend base. |
 | `PR_AGENT_MODEL` | `openai/continuum-review` | LiteLLM routing id (`openai/` prefix selects the bridge path). |
 | `PR_AGENT_MAX_TOKENS` | `128000` | Custom-model context cap used by PR-Agent prompt budgeting. |
-| `OPENCODE_MODEL` | `opencode/muse-spark-1.3-contributor-free` | Model the bridge infers with. |
+| `OPENCODE_MODELS` | empty | Trusted ordered route pool. This is the production policy. |
+| `OPENCODE_MODEL` | empty | Legacy single route, used only when `OPENCODE_MODELS` is unset. |
 | `PR_AGENT_BRIDGE_PORT` | `18000` | Loopback port of the bridge. |
 | `PR_AGENT_OPENCODE_PORT` | `4096` | Loopback port of `opencode serve`. |
 | `PR_AGENT_VERSION` | `0.46.0` | Pinned `pr-agent` release. |
@@ -81,7 +82,10 @@ Provider, model, and limit details are configuration, not product policy:
 The same knobs exist as reusable-workflow inputs (`review_provider`,
 `api_base`, `model`, `max_tokens`, `opencode_model`, `bridge_port`,
 `server_port`, `pr_agent_version`); an empty input falls back to the
-repository variable, then to the default. `review_provider` is an explicit
+repository variable, then to the literal default where one exists. The
+`opencode_model` input has no literal fallback: it resolves through
+`OPENCODE_MODELS`/`OPENCODE_MODEL`, and fails closed when neither is set.
+`review_provider` is an explicit
 override for controlled calls; ordinary consumers set only
 `CONTINUUM_REVIEW_PROVIDER`. Authentication is loopback-only by default and needs nothing;
 LiteLLM still requires a key *string* on the OpenAI route, so the workflow

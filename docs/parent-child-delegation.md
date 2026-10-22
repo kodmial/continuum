@@ -72,13 +72,14 @@ authoritative relationship contract.
 
 ## Parent workflows
 
-Install the ordinary core `continuum-issue-scheduler.yml` caller plus the three
+Install the ordinary core `continuum-issue-scheduler.yml` caller plus the four
 thin entry workflows in `.github/caller-stubs/parent/`. The parent callers
 invoke:
 
 - `continuum-consumer-child-worker.yml`
 - `continuum-consumer-child-review.yml`
 - `continuum-consumer-child-pr-review.yml`
+- `continuum-consumer-child-run-cleanup.yml`
 
 There is no separate parent/child dispatcher caller. The core Issue scheduler
 resolves the verified child relationships, reconciles child reviews, and merges
@@ -212,17 +213,18 @@ The installer has three explicit sets:
 # Core task-domain callers: scheduling, review, repair, auto-merge.
 bash install.sh /path/to/myapp main core
 
-# Opt-in technology library: CI, release, release PR, packaging smoke.
+# Opt-in technology library: the consumer-neutral Swift CI profile.
 bash install.sh /path/to/myapp main tech
 
-# Parent scheduling is the ordinary core scheduler; parent adds worker/review entry points.
+# Parent scheduling is the ordinary core scheduler; parent adds worker, review, and cleanup entry points.
 bash install.sh /path/to/parent main core
 bash install.sh /path/to/parent main parent
 ```
 
 For production, replace `main` with a tested full Continuum commit SHA. Both
 `uses:` and `engine_ref` are set to that revision. The parent set installs only `continuum-child-worker.yml`,
-`continuum-child-review.yml`, and `continuum-child-pr-review.yml`. The
+`continuum-child-review.yml`, `continuum-child-pr-review.yml`, and
+`continuum-child-run-cleanup.yml`. The
 ordinary scheduler comes from the core set. The parent set preserves existing
 CI, issue scheduling, OpenCode,
 release, Render, and artifact workflows. The token is supplied through the
