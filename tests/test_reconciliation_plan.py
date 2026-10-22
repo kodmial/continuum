@@ -1,0 +1,199 @@
+"""Read-only repository-wide planning, pagination, and dry-run tests (#343)."""
+
+from __future__ import annotations
+
+import copy
+import json
+import unittest
+from datetime import datetime, timezone
+from pathlib import Path
+
+from continuum.reconciliation_adapters import ACTION, WAIT
+from continuum.reconciliation_plan import (
+    Continuation,
+    PlanContext,
+    ReconciliationPlanError,
+    SnapshotStateSource,
+    StatePage,
+    plan_repository,
+    plan_snapshot,
+)
+
+
+ROOT = Path(__file__).resolve().parents[1]
+FIXTURES = ROOT / "tests" / "fixtures" / "reconciliation"
+NOW = datetime(2026, 10, 21, 12, 0, tzinfo=timezone.utc)
+
+
+def load_trace(name):
+    return json.loads((FIXTURES / name).read_text(encoding="utf-8"))
+
+
+def context_for(trace, *, event=None):
+    payload = dict(trace["context"])
+    payload["now"] = NOW
+    if event is not None:
+        payload["event"] = event
+    return PlanContext(**payload)
+
+
+class FixtureTraceTests(unittest.TestCase):
+    def assert_trace(self, trace):
+        plan = plan_snapshot(
+            trace["issues"],
+            trace["pull_requests"],
+            context=context_for(trace),
+        )
+        kinds = {decision.subject: decision.kind for decision in plan.decisions}
+        for subject, expected_kind in trace["expect"].items():
+            if subject.startswith("issue:"):
+                self.assertEqual(kinds[subject], expected_kind, subject)
+        pr_subject = next(subject for subject in kinds if subject.startswith("pull_request:"))
+        domains = {
+            decision.domain
+            for decision in plan.decisions
+            if decision.subject == pr_subject
+        }
+        for expected in trace["expect"]["pull_request:%s domains" % pr_subject.split(":")[1]]:
+            self.assertIn(expected, domains)
+        return plan
+
+    def test_continuum_trace_plans_beyond_the_unrelated_wakeup(self):
+        self.assert_trace(load_trace("continuum-trace.json"))
+
+    def test_consumer_trace_plans_beyond_the_unrelated_wakeup(self):
+        self.assert_trace(load_trace("consumer-trace.json"))
+
+    def test_unrelated_event_does_not_change_any_decision(self):
+        for name in ("continuum-trace.json", "consumer-trace.json"):
+            trace = load_trace(name)
+            without_event = plan_snapshot(
+                trace["issues"],
+                trace["pull_requests"],
+                context=context_for(trace),
+            )
+            with_event = plan_snapshot(
+                trace["issues"],
+                trace["pull_requests"],
+                context=context_for(trace, event=trace["event"]),
+            )
+            self.assertEqual(
+                [decision.to_dict() for decision in without_event.decisions],
+                [decision.to_dict() for decision in with_event.decisions],
+            )
+
+    def test_dry_run_never_mutates_the_source_snapshot(self):
+        trace = load_trace("continuum-trace.json")
+        issues = copy.deepcopy(trace["issues"])
+        pulls = copy.deepcopy(trace["pull_requests"])
+        source = SnapshotStateSource(issues, pulls)
+        plan = plan_repository(source, context=context_for(trace))
+        self.assertTrue(plan.dry_run)
+        self.assertTrue(any(decision.kind == ACTION for decision in plan.decisions))
+        self.assertEqual(issues, trace["issues"])
+        self.assertEqual(pulls, trace["pull_requests"])
+        for forbidden in ("dispatch", "merge", "write", "comment", "publish"):
+            self.assertFalse(hasattr(source, forbidden), forbidden)
+
+
+class PaginationTests(unittest.TestCase):
+    def make_source(self, issue_count=250, pull_count=150):
+        issues = [
+            {"number": number, "title": "P1: issue", "labels": ["P1"], "state": "open"}
+            for number in range(1, issue_count + 1)
+        ]
+        pulls = [
+            {
+                "number": 1000 + number,
+                "title": "fix: pr",
+                "state": "open",
+                "head_sha": ("%040x" % number),
+                "head_repo": "o/r",
+                "base_repo": "o/r",
+                "mergeable": True,
+                "mergeable_state": "clean",
+            }
+            for number in range(1, pull_count + 1)
+        ]
+        return SnapshotStateSource(issues, pulls)
+
+    def test_bounded_pages_resume_from_persisted_continuation(self):
+        source = self.make_source()
+        context = PlanContext(now=NOW)
+        seen_issues = set()
+        seen_pulls = set()
+        continuation = None
+        passes = 0
+        while True:
+            plan = plan_repository(
+                source,
+                context=context,
+                continuation=continuation,
+                page_size=100,
+                max_pages_per_pass=1,
+            )
+            passes += 1
+            seen_issues.update(
+                decision.subject for decision in plan.decisions if decision.subject.startswith("issue:")
+            )
+            seen_pulls.update(
+                decision.subject for decision in plan.decisions if decision.subject.startswith("pull_request:")
+            )
+            continuation = plan.continuation
+            self.assertLessEqual(plan.pages_read, 2)
+            if continuation.issues_exhausted and continuation.pull_requests_exhausted:
+                break
+            self.assertLess(passes, 10)
+        self.assertEqual(len(seen_issues), 250)
+        self.assertEqual(len(seen_pulls), 150)
+        self.assertEqual(passes, 3)
+        self.assertEqual(continuation.completed_passes, 3)
+
+    def test_max_pages_bounds_one_pass_and_keeps_a_cursor(self):
+        source = self.make_source()
+        plan = plan_repository(
+            source,
+            context=PlanContext(now=NOW),
+            page_size=100,
+            max_pages_per_pass=2,
+        )
+        self.assertEqual(plan.issues_scanned, 200)
+        self.assertEqual(plan.continuation.issue_cursor, "200")
+        self.assertFalse(plan.continuation.issues_exhausted)
+        self.assertEqual(plan.pages_read, 4)
+
+    def test_continuation_round_trips_through_json_state(self):
+        continuation = Continuation(
+            issue_cursor="200",
+            pull_cursor=None,
+            issues_exhausted=False,
+            pull_requests_exhausted=True,
+            completed_passes=4,
+        )
+        self.assertEqual(
+            Continuation.from_dict(continuation.to_dict()),
+            continuation,
+        )
+        self.assertEqual(continuation.restart().issue_cursor, None)
+
+    def test_non_advancing_cursor_fails_closed(self):
+        class StuckSource:
+            def list_issues(self, cursor, limit):
+                return StatePage(({"number": 1, "state": "open"},), "same")
+
+            def list_pull_requests(self, cursor, limit):
+                return StatePage((), None)
+
+        with self.assertRaises(ReconciliationPlanError):
+            plan_repository(StuckSource(), context=PlanContext(now=NOW))
+
+    def test_invalid_bounds_are_rejected(self):
+        source = self.make_source(1, 1)
+        with self.assertRaises(ReconciliationPlanError):
+            plan_repository(source, context=PlanContext(now=NOW), page_size=0)
+        with self.assertRaises(ReconciliationPlanError):
+            plan_repository(source, context=PlanContext(now=NOW), max_pages_per_pass=0)
+
+
+if __name__ == "__main__":
+    unittest.main()
