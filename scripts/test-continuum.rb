@@ -3672,11 +3672,16 @@ class ContinuumTest < Minitest::Test
   # label is covered with the scheduler contracts, so an unrelated scheduler
   # edit cannot break the issue-form assertions here.
   def test_issue_forms_apply_the_admission_hold_label
-    form_labels = Dir[File.join(ROOT, '.github/ISSUE_TEMPLATE/*.yml')].sort.flat_map do |path|
-      Array(yaml(path)['labels']).map(&:to_s)
-    end.uniq
-    assert_includes form_labels, 'automation:blocked',
-                    'the issue forms must keep the automation:blocked admission hold'
+    form_paths = Dir[File.join(ROOT, '.github/ISSUE_TEMPLATE/*.yml')].sort
+    form_paths -= [File.join(ROOT, '.github/ISSUE_TEMPLATE/config.yml')]
+    refute_empty form_paths, 'the issue chooser must keep at least one form'
+    form_paths.each do |path|
+      labels = Array(yaml(path)['labels']).map(&:to_s)
+      assert_includes labels, 'automation:blocked',
+                      "#{File.basename(path)} must keep the automation:blocked admission hold"
+      refute_includes labels, 'automation:ready',
+                      "#{File.basename(path)} must not apply automation:ready at creation"
+    end
   end
 
   # CONTINUUM_HOMEBREW_TAP and CONTINUUM_MACPORTS_TREE were documented as
