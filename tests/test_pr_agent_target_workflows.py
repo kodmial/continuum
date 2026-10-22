@@ -1,12 +1,54 @@
+import ast
+import os
+import re
+import subprocess
+import sys
+import tempfile
 import unittest
 from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
+TMP_PARENT = ROOT / ".opencode-tmp"
+
+BOOTSTRAP_WORKFLOWS = (
+    ".github/workflows/continuum-pr-agent.yml",
+    ".github/workflows/continuum-pr-agent-repair.yml",
+    ".github/workflows/continuum-pr-agent-recovery.yml",
+    # auto-merge carries the identical delegated target bootstrap, so it
+    # shares the same runtime dependency closure.
+    ".github/workflows/continuum-pr-agent-auto-merge.yml",
+)
 
 
 def read(path: str) -> str:
     return (ROOT / path).read_text(encoding="utf-8")
+
+
+def bootstrap_sources(workflow: str) -> dict:
+    sources = {}
+    for source, dest in re.findall(
+        r'fetch_runtime_file "([^"]+)" "\$RUNTIME_ROOT/([^"]+)"', workflow
+    ):
+        sources[dest] = source
+    return sources
+
+
+def continuum_imports(path: str) -> set:
+    imported = set()
+    for node in ast.walk(ast.parse(read(path))):
+        if isinstance(node, ast.ImportFrom) and node.module:
+            modules = [node.module]
+        elif isinstance(node, ast.Import):
+            modules = [alias.name for alias in node.names]
+        else:
+            continue
+        for module in modules:
+            if module == "continuum" or module.startswith("continuum."):
+                imported.add(
+                    str(Path("src", *module.split(".")).with_suffix(".py"))
+                )
+    return imported
 
 
 class PrAgentTargetWorkflowContractTests(unittest.TestCase):
@@ -19,6 +61,53 @@ class PrAgentTargetWorkflowContractTests(unittest.TestCase):
             with self.subTest(path=path):
                 body = read(path)
                 self.assertNotIn("secrets.CONTINUUM_CHILD_REPOSITORIES", body)
+
+    def test_delegated_bootstrap_runtime_supplies_python_dependency_closure(self):
+        # delegation_runtime.py imports continuum.api_budget and
+        # continuum.delegation_discovery at module load time. Each delegated
+        # bootstrap downloads a hand-picked file set into an ephemeral
+        # RUNTIME_ROOT, so an omitted module fails before any CLI command runs
+        # (the reported generic exit 2). The environment below is exactly that
+        # file set with no checkout, PYTHONPATH, or site-packages.
+        imported = continuum_imports(".github/scripts/delegation_runtime.py")
+        self.assertIn("src/continuum/api_budget.py", imported)
+        self.assertIn("src/continuum/delegation_discovery.py", imported)
+        TMP_PARENT.mkdir(exist_ok=True)
+        for path in BOOTSTRAP_WORKFLOWS:
+            with self.subTest(path=path):
+                sources = bootstrap_sources(read(path))
+                self.assertTrue(sources, f"{path} has no bootstrap file set")
+                missing = sorted(imported - set(sources.values()))
+                self.assertEqual(
+                    missing, [], f"{path} bootstrap omits runtime imports {missing}"
+                )
+                with tempfile.TemporaryDirectory(
+                    prefix="pr-agent-bootstrap-", dir=str(TMP_PARENT)
+                ) as tmp:
+                    runtime = Path(tmp)
+                    for dest, source in sources.items():
+                        target = runtime / dest
+                        target.parent.mkdir(parents=True, exist_ok=True)
+                        target.write_bytes((ROOT / source).read_bytes())
+                    completed = subprocess.run(
+                        [
+                            sys.executable,
+                            "-I",
+                            "-S",
+                            str(runtime / ".github/scripts/delegation_runtime.py"),
+                            "parent-variable-ids",
+                            "--role",
+                            "parent",
+                            "--children-json",
+                            '["child-a"]',
+                        ],
+                        cwd=runtime,
+                        env={"PATH": os.environ.get("PATH", "")},
+                        capture_output=True,
+                        text=True,
+                    )
+                    self.assertEqual(completed.returncode, 0, completed.stderr)
+                    self.assertEqual(completed.stdout.strip(), "child-a")
 
     reusable = (
         ".github/workflows/continuum-pr-agent.yml",
