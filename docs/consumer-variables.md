@@ -271,7 +271,7 @@ verification.
 | `CONTINUUM_CHILD_WORKER_WORKFLOW` | `continuum-child-worker.yml` | Parent-side child worker caller. |
 | `CONTINUUM_CHILD_REVIEW_WORKFLOW` | `continuum-child-review.yml` | Parent-side child task review caller. |
 | `CONTINUUM_CHILD_PR_REVIEW_WORKFLOW` | `continuum-child-pr-review.yml` | Parent-side child PR review caller. |
-| `CONTINUUM_CHILD_DISPATCH_WORKFLOW` | empty | Optional downstream workflow woken after a parent reconcile pass. |
+| `CONTINUUM_CHILD_DISPATCH_WORKFLOW` | empty | Optional downstream dispatcher woken after a non-parent reconcile pass (for example in a child). A parent skips this wake-up; empty wakes nothing. |
 
 The parent's `TAP_PAT` needs access to the child repositories and their Actions
 variables. Setting a role variable adds or removes no workflow files.
