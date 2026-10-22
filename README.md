@@ -197,7 +197,7 @@ Workflow names are identical to the reusable file names unless noted.
 | `continuum-opencode.yml` | OpenCode agent (`name: OpenCode agent`). | `mode`, `pr_number`, `head_ref`, `review_id`, `run_id` |
 | `continuum-opencode-repair.yml` | OpenCode repair controller. | `ci_repair_workflows` |
 | `continuum-opencode-unresolved.yml` | Retry OpenCode on unresolved CodeRabbit findings. | — |
-| `continuum-opencode-watchdog.yml` | Recover failed OpenCode runs; an explicit OpenCode 429 marker re-runs the same workflow on fresh hosted runner(s), while ordinary issue failures use the issue recovery path (`name: OpenCode watchdog`). | `watched_workflow`, `max_recovery_retries`, `max_429_runner_restarts`, `retry_marker`, `in_progress_label`, `pause_marker`, `dispatch_marker`, `timeout_minutes` |
+| `continuum-opencode-watchdog.yml` | Recover failed OpenCode runs. A 429 evacuation checkpoint is validated and resumed through a repository-local caller that declares `workflow_dispatch` (never the reusable `workflow_call` engine and never `reRunWorkflow`); a bounded timer catches up when `workflow_run` delivery is late or lost. Ordinary issue failures use the issue recovery path (`name: OpenCode watchdog`). | `watched_workflow`, `opencode_workflow`, `max_recovery_retries`, `max_429_runner_restarts`, `retry_marker`, `in_progress_label`, `pause_marker`, `dispatch_marker`, `timeout_minutes` |
 | `continuum-issue-scheduler.yml` | Scheduled issue dispatch. | — |
 | `continuum-auto-merge.yml` | Auto-merge reviewed pull requests. | `require_coderabbit` |
 | `continuum-pr-agent.yml` | Optional PR Agent review over the runner-local OpenCode backend. | `enabled`, `api_base`, `model`, `max_tokens`, `opencode_model` |
