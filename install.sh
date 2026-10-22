@@ -421,9 +421,9 @@ fi
 CREATED_DIRS=()
 ADDED_FILES=()
 TEMP_FILES=()
-RESTORE_FILES=("${UPDATE_FILES[@]}")
+RESTORE_FILES=(${UPDATE_FILES[@]+"${UPDATE_FILES[@]}"})
 if [[ "$PRUNE" == yes ]]; then
-  RESTORE_FILES+=("${SUPERSEDED[@]}")
+  RESTORE_FILES+=(${SUPERSEDED[@]+"${SUPERSEDED[@]}"})
 fi
 ensure_dir() {
   local dir="$1"
