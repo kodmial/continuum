@@ -3482,6 +3482,25 @@ class ContinuumTest < Minitest::Test
   end
 
 
+  # Both admission paths must classify the latest approved-workflow state
+  # through the same committed helper. Keeping the trust, allow-list, latest
+  # selection and failure/inflight/green/unknown rules in one place is what
+  # stops a future edit to one copy from clearing a lock on a failing head.
+  def test_opencode_repair_admission_paths_share_one_state_classifier
+    body = workflow_body('continuum-opencode-repair.yml')
+    %w[ci-repair-dispatch ci-repair].each do |job_name|
+      job = body[/^  #{Regexp.escape(job_name)}:\n(.*?)(?=^  \S|\z)/m, 1]
+      refute_nil job, "continuum-opencode-repair.yml has no #{job_name} job"
+      assert_includes job,
+                      'REPAIR_STATE_HELPER: ${{ github.workspace }}/.continuum-repair-engine/.github/scripts/opencode_repair_state.py',
+                      "#{job_name}: the shared state classifier must be the only source"
+      assert_includes job, 'python3 -B "$REPAIR_STATE_HELPER"',
+                      "#{job_name}: the shared state classifier must actually run"
+      refute_includes job, 'RUNS_JSON=',
+                      "#{job_name}: the inline state machine must not come back"
+    end
+  end
+
   # The caller wakes on every completed workflow because the approved set is a
   # repository variable that a `workflow_run` filter cannot read. The reusable
   # controller must therefore own the allow-list, and the caller must exclude
@@ -3619,6 +3638,7 @@ class ContinuumTest < Minitest::Test
       env = {
         'PATH' => "#{bin}:#{ENV.fetch('PATH', '')}",
         'GH_TOKEN' => 'test-token',
+        'REPAIR_STATE_HELPER' => File.join(ROOT, '.github/scripts/opencode_repair_state.py'),
         'GITHUB_REPOSITORY' => repo,
         'RUN_ID' => run_id,
         'RUN_NAME' => run_name,
@@ -3689,6 +3709,7 @@ class ContinuumTest < Minitest::Test
       env = {
         'PATH' => "#{bin}:#{ENV.fetch('PATH', '')}",
         'GH_TOKEN' => 'test-token',
+        'REPAIR_STATE_HELPER' => File.join(ROOT, '.github/scripts/opencode_repair_state.py'),
         'GITHUB_REPOSITORY' => repo,
         'PR_NUMBER' => pr_number.to_s,
         'REPORTED_HEAD_SHA' => head_sha,

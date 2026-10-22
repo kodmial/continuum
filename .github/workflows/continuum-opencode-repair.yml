@@ -230,9 +230,23 @@ jobs:
     timeout-minutes: 5
 
     steps:
+      - name: Checkout shared CI repair state classifier
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: kodmial/continuum
+          ref: ${{ inputs.continuum_ref || 'main' }}
+          path: .continuum-repair-engine
+          fetch-depth: 1
+          persist-credentials: false
+          token: ''
+          sparse-checkout: |
+            .github/scripts/opencode_repair_state.py
+            src/continuum
+
       - name: Reconcile one CI result reported by the consumer's own CI
         env:
           GH_TOKEN: ${{ secrets.TAP_PAT }}
+          REPAIR_STATE_HELPER: ${{ github.workspace }}/.continuum-repair-engine/.github/scripts/opencode_repair_state.py
           PR_NUMBER: ${{ inputs.pr_number }}
           REPORTED_HEAD_SHA: ${{ inputs.head_sha }}
           REPORTED_CONCLUSION: ${{ inputs.conclusion }}
@@ -368,64 +382,16 @@ jobs:
           if runs_json="$(gh api "repos/$GITHUB_REPOSITORY/actions/runs?head_sha=$REPORTED_HEAD_SHA&event=pull_request&per_page=100" 2>/dev/null)"; then
             runs_trusted=1
           fi
-          state_output="$(RUNS_JSON="$runs_json" RUNS_TRUSTED="$runs_trusted" ALLOWED_WORKFLOWS="$CI_REPAIR_WORKFLOWS" OWN_NAME="__reported__" OWN_ID="$REPORTED_RUN_ID" OWN_CONCLUSION="$REPORTED_CONCLUSION" OWN_FORCE=1 python3 -c '
-          import json, os, sys
-          trusted = os.environ.get("RUNS_TRUSTED") == "1"
-          try:
-              data = json.loads(os.environ.get("RUNS_JSON") or "{}")
-              runs = data.get("workflow_runs") or []
-              total = int(data.get("total_count") or 0)
-          except (TypeError, ValueError, json.JSONDecodeError):
-              runs, total, trusted = [], 0, False
-          if total > len(runs):
-              trusted = False
-          allowed = {
-              part.strip()
-              for part in os.environ.get("ALLOWED_WORKFLOWS", "").replace("\n", ",").split(",")
-              if part.strip()
-          }
-          latest = {}
-          if trusted:
-              for run in runs:
-                  if not isinstance(run, dict):
-                      continue
-                  name = str(run.get("name") or "")
-                  if name not in allowed:
-                      continue
-                  try:
-                      run_id = int(run.get("id") or 0)
-                  except (TypeError, ValueError):
-                      continue
-                  if name not in latest or run_id > latest[name][0]:
-                      latest[name] = (run_id, run)
-          own_name = os.environ.get("OWN_NAME") or ""
-          own_conclusion = os.environ.get("OWN_CONCLUSION") or ""
-          force = os.environ.get("OWN_FORCE") == "1"
-          try:
-              own_id = int(os.environ.get("OWN_ID") or 0)
-          except ValueError:
-              own_id = 0
-          if (force or own_name in allowed) and own_conclusion in ("success", "failure", "timed_out"):
-              if own_name not in latest or own_id >= latest[own_name][0]:
-                  latest[own_name] = (own_id, {"id": own_id, "name": own_name, "status": "completed", "conclusion": own_conclusion})
-          failures, inflight = [], []
-          for name, (run_id, run) in latest.items():
-              if str(run.get("status") or "") != "completed":
-                  inflight.append(name)
-              elif str(run.get("conclusion") or "") in ("failure", "timed_out"):
-                  failures.append((run_id, name))
-          if failures:
-              failures.sort()
-              print("failure"); print(failures[0][0]); print(failures[0][1])
-          elif inflight:
-              print("inflight"); print(""); print(",".join(sorted(inflight)))
-          elif latest and trusted:
-              print("green"); print(""); print("")
-          elif latest:
-              print("unknown"); print(""); print("")
-          else:
-              print("empty"); print(""); print("")
-          ')"
+          # The latest-state classification is shared with the other
+          # admission path through the committed state helper; only the
+          # action taken below is path-specific.
+          state_output="$(printf '%s' "$runs_json" | python3 -B "$REPAIR_STATE_HELPER" \
+            --runs-trusted "$runs_trusted" \
+            --allowed-workflows "$CI_REPAIR_WORKFLOWS" \
+            --own-name "__reported__" \
+            --own-id "$REPORTED_RUN_ID" \
+            --own-conclusion "$REPORTED_CONCLUSION" \
+            --own-force)"
           state="$(sed -n '1p' <<<"$state_output")"
           failing_run_id="$(sed -n '2p' <<<"$state_output")"
           failing_name="$(sed -n '3p' <<<"$state_output")"
@@ -490,9 +456,23 @@ jobs:
     timeout-minutes: 5
 
     steps:
+      - name: Checkout shared CI repair state classifier
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: kodmial/continuum
+          ref: ${{ inputs.continuum_ref || 'main' }}
+          path: .continuum-repair-engine
+          fetch-depth: 1
+          persist-credentials: false
+          token: ''
+          sparse-checkout: |
+            .github/scripts/opencode_repair_state.py
+            src/continuum
+
       - name: Dispatch one automatic OpenCode fix for failed blocking workflow
         env:
           GH_TOKEN: ${{ secrets.TAP_PAT }}
+          REPAIR_STATE_HELPER: ${{ github.workspace }}/.continuum-repair-engine/.github/scripts/opencode_repair_state.py
           RUN_ID: ${{ github.event.workflow_run.id }}
           RUN_NAME: ${{ github.event.workflow_run.name }}
           RUN_HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
@@ -669,64 +649,15 @@ jobs:
           if runs_json="$(gh api "repos/$GITHUB_REPOSITORY/actions/runs?head_sha=$RUN_HEAD_SHA&event=pull_request&per_page=100" 2>/dev/null)"; then
             runs_trusted=1
           fi
-          state_output="$(RUNS_JSON="$runs_json" RUNS_TRUSTED="$runs_trusted" ALLOWED_WORKFLOWS="$CI_REPAIR_WORKFLOWS" OWN_NAME="$RUN_NAME" OWN_ID="$RUN_ID" OWN_CONCLUSION="$CONCLUSION" OWN_FORCE=0 python3 -c '
-          import json, os, sys
-          trusted = os.environ.get("RUNS_TRUSTED") == "1"
-          try:
-              data = json.loads(os.environ.get("RUNS_JSON") or "{}")
-              runs = data.get("workflow_runs") or []
-              total = int(data.get("total_count") or 0)
-          except (TypeError, ValueError, json.JSONDecodeError):
-              runs, total, trusted = [], 0, False
-          if total > len(runs):
-              trusted = False
-          allowed = {
-              part.strip()
-              for part in os.environ.get("ALLOWED_WORKFLOWS", "").replace("\n", ",").split(",")
-              if part.strip()
-          }
-          latest = {}
-          if trusted:
-              for run in runs:
-                  if not isinstance(run, dict):
-                      continue
-                  name = str(run.get("name") or "")
-                  if name not in allowed:
-                      continue
-                  try:
-                      run_id = int(run.get("id") or 0)
-                  except (TypeError, ValueError):
-                      continue
-                  if name not in latest or run_id > latest[name][0]:
-                      latest[name] = (run_id, run)
-          own_name = os.environ.get("OWN_NAME") or ""
-          own_conclusion = os.environ.get("OWN_CONCLUSION") or ""
-          force = os.environ.get("OWN_FORCE") == "1"
-          try:
-              own_id = int(os.environ.get("OWN_ID") or 0)
-          except ValueError:
-              own_id = 0
-          if (force or own_name in allowed) and own_conclusion in ("success", "failure", "timed_out"):
-              if own_name not in latest or own_id >= latest[own_name][0]:
-                  latest[own_name] = (own_id, {"id": own_id, "name": own_name, "status": "completed", "conclusion": own_conclusion})
-          failures, inflight = [], []
-          for name, (run_id, run) in latest.items():
-              if str(run.get("status") or "") != "completed":
-                  inflight.append(name)
-              elif str(run.get("conclusion") or "") in ("failure", "timed_out"):
-                  failures.append((run_id, name))
-          if failures:
-              failures.sort()
-              print("failure"); print(failures[0][0]); print(failures[0][1])
-          elif inflight:
-              print("inflight"); print(""); print(",".join(sorted(inflight)))
-          elif latest and trusted:
-              print("green"); print(""); print("")
-          elif latest:
-              print("unknown"); print(""); print("")
-          else:
-              print("empty"); print(""); print("")
-          ')"
+          # The latest-state classification is shared with the other
+          # admission path through the committed state helper; only the
+          # action taken below is path-specific.
+          state_output="$(printf '%s' "$runs_json" | python3 -B "$REPAIR_STATE_HELPER" \
+            --runs-trusted "$runs_trusted" \
+            --allowed-workflows "$CI_REPAIR_WORKFLOWS" \
+            --own-name "$RUN_NAME" \
+            --own-id "$RUN_ID" \
+            --own-conclusion "$CONCLUSION")"
           state="$(sed -n '1p' <<<"$state_output")"
           failing_run_id="$(sed -n '2p' <<<"$state_output")"
           failing_name="$(sed -n '3p' <<<"$state_output")"
