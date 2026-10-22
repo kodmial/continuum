@@ -804,6 +804,229 @@ class PrAgentTargetWorkflowContractTests(unittest.TestCase):
 class ExactHeadCiProofRegressionTests(unittest.TestCase):
     """Issue #368: one exact-HEAD CI proof across review, merge and recovery."""
 
+    HEAD = "a" * 40
+    OTHER = "b" * 40
+
+    @classmethod
+    def _ci_run(cls, **overrides):
+        run = {
+            "id": 101,
+            "name": "CI",
+            "head_sha": cls.HEAD,
+            "event": "pull_request",
+            "status": "completed",
+            "conclusion": "success",
+            "created_at": "2026-10-22T10:00:00Z",
+        }
+        run.update(overrides)
+        return run
+
+    @classmethod
+    def _ci_scenarios(cls):
+        run = cls._ci_run
+        head = cls.HEAD
+        return [
+            (
+                "proof-green-empty-listing",
+                {"proofRun": run(), "runs": [], "workflowName": "CI", "headSha": head},
+                "green",
+                101,
+            ),
+            (
+                "proof-green-stale-older-red",
+                {
+                    "proofRun": run(),
+                    "runs": [
+                        run(
+                            id=99,
+                            conclusion="failure",
+                            created_at="2026-10-22T09:00:00Z",
+                        )
+                    ],
+                    "workflowName": "CI",
+                    "headSha": head,
+                },
+                "green",
+                101,
+            ),
+            (
+                "newer-red-blocks",
+                {
+                    "proofRun": run(),
+                    "runs": [
+                        run(
+                            id=102,
+                            conclusion="failure",
+                            created_at="2026-10-22T11:00:00Z",
+                        )
+                    ],
+                    "workflowName": "CI",
+                    "headSha": head,
+                },
+                "red",
+                102,
+            ),
+            (
+                "newer-pending-blocks",
+                {
+                    "proofRun": run(),
+                    "runs": [
+                        run(
+                            id=102,
+                            status="in_progress",
+                            conclusion=None,
+                            created_at="2026-10-22T11:00:00Z",
+                        )
+                    ],
+                    "workflowName": "CI",
+                    "headSha": head,
+                },
+                "pending",
+                102,
+            ),
+            (
+                "empty-all-is-unavailable",
+                {"proofRun": None, "runs": [], "workflowName": "CI", "headSha": head},
+                "unavailable",
+                None,
+            ),
+            (
+                "wrong-workflow-is-not-proof",
+                {
+                    "proofRun": run(name="Other"),
+                    "runs": [],
+                    "workflowName": "CI",
+                    "headSha": head,
+                },
+                "unavailable",
+                None,
+            ),
+            (
+                "moved-head-is-not-proof",
+                {
+                    "proofRun": run(head_sha=cls.OTHER),
+                    "runs": [],
+                    "workflowName": "CI",
+                    "headSha": head,
+                },
+                "unavailable",
+                None,
+            ),
+            (
+                "non-pr-event-is-not-proof",
+                {
+                    "proofRun": run(event="push"),
+                    "runs": [],
+                    "workflowName": "CI",
+                    "headSha": head,
+                },
+                "unavailable",
+                None,
+            ),
+            (
+                "listing-only-green",
+                {"proofRun": None, "runs": [run()], "workflowName": "CI", "headSha": head},
+                "green",
+                101,
+            ),
+            (
+                "same-run-completed-state-wins",
+                {
+                    "proofRun": run(
+                        status="in_progress",
+                        conclusion=None,
+                        updated_at="2026-10-22T10:01:00Z",
+                    ),
+                    "runs": [run(updated_at="2026-10-22T10:05:00Z")],
+                    "workflowName": "CI",
+                    "headSha": head,
+                },
+                "green",
+                101,
+            ),
+            (
+                "listing-only-red",
+                {
+                    "proofRun": None,
+                    "runs": [run(conclusion="failure")],
+                    "workflowName": "CI",
+                    "headSha": head,
+                },
+                "red",
+                101,
+            ),
+            (
+                "delegated-skipped-accepted",
+                {
+                    "proofRun": run(conclusion="skipped"),
+                    "runs": [],
+                    "workflowName": "CI",
+                    "headSha": head,
+                    "delegated": True,
+                },
+                "green",
+                101,
+            ),
+            (
+                "skipped-not-accepted-locally",
+                {
+                    "proofRun": run(conclusion="skipped"),
+                    "runs": [],
+                    "workflowName": "CI",
+                    "headSha": head,
+                    "delegated": False,
+                },
+                "red",
+                101,
+            ),
+            (
+                "older-green-does-not-bypass-newer-red",
+                {
+                    "proofRun": None,
+                    "runs": [
+                        run(id=99, created_at="2026-10-22T09:00:00Z"),
+                        run(
+                            id=102,
+                            conclusion="failure",
+                            created_at="2026-10-22T11:00:00Z",
+                        ),
+                    ],
+                    "workflowName": "CI",
+                    "headSha": head,
+                },
+                "red",
+                102,
+            ),
+            (
+                "trimmed-head-is-proof",
+                {
+                    "proofRun": run(head_sha="  " + head + "  "),
+                    "runs": [],
+                    "workflowName": "CI",
+                    "headSha": head,
+                },
+                "green",
+                101,
+            ),
+            (
+                "offset-created-at-orders-chronologically",
+                {
+                    "proofRun": run(created_at="2026-10-22T09:00:00-05:00"),
+                    "runs": [
+                        run(
+                            id=102,
+                            conclusion="failure",
+                            created_at="2026-10-22T10:00:00Z",
+                        )
+                    ],
+                    "workflowName": "CI",
+                    "headSha": head,
+                },
+                "green",
+                101,
+            ),
+        ]
+
     @staticmethod
     def _extract(source: str, name: str, start: int = 0) -> str:
         import re
@@ -828,6 +1051,20 @@ class ExactHeadCiProofRegressionTests(unittest.TestCase):
                 if depth == 0:
                     return source[offset : index + 1]
         raise AssertionError(f"JS function {name} is unterminated")
+
+    @staticmethod
+    def _extract_retry_decision(source: str) -> str:
+        import re
+        import textwrap
+
+        anchor = source.index('CI_STATE="$(python3 - "$PROOF_JSON"')
+        heredoc = source.index("<<'PY'", anchor)
+        body_start = source.index("\n", heredoc) + 1
+        terminator = re.search(r"^\s*PY\s*$", source[body_start:], re.MULTILINE)
+        if terminator is None:
+            raise AssertionError("retry-dispatch CI Python heredoc is unterminated")
+        body = source[body_start : body_start + terminator.start()]
+        return textwrap.dedent(body).strip("\n") + "\n"
 
     def test_canonical_decision_rejects_the_incident_paradox_for_every_consumer(self):
         import json
@@ -865,36 +1102,11 @@ class ExactHeadCiProofRegressionTests(unittest.TestCase):
         for index, source in enumerate(decisions):
             renamed.append(re.sub(r"\bdecideExactHeadCi\b", f"decideExactHeadCi{index}", source))
 
-        scenario_source = """
-const HEAD = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
-const OTHER = 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb';
-function run(over = {}) {
-  return Object.assign({
-    id: 101,
-    name: 'CI',
-    head_sha: HEAD,
-    event: 'pull_request',
-    status: 'completed',
-    conclusion: 'success',
-    created_at: '2026-10-22T10:00:00Z',
-  }, over);
-}
-const scenarios = [
-  ['proof-green-empty-listing', { proofRun: run(), runs: [], workflowName: 'CI', headSha: HEAD }, 'green', 101],
-  ['proof-green-stale-older-red', { proofRun: run(), runs: [run({ id: 99, conclusion: 'failure', created_at: '2026-10-22T09:00:00Z' })], workflowName: 'CI', headSha: HEAD }, 'green', 101],
-  ['newer-red-blocks', { proofRun: run(), runs: [run({ id: 102, conclusion: 'failure', created_at: '2026-10-22T11:00:00Z' })], workflowName: 'CI', headSha: HEAD }, 'red', 102],
-  ['newer-pending-blocks', { proofRun: run(), runs: [run({ id: 102, status: 'in_progress', conclusion: null, created_at: '2026-10-22T11:00:00Z' })], workflowName: 'CI', headSha: HEAD }, 'pending', 102],
-  ['empty-all-is-unavailable', { proofRun: null, runs: [], workflowName: 'CI', headSha: HEAD }, 'unavailable', null],
-  ['wrong-workflow-is-not-proof', { proofRun: run({ name: 'Other' }), runs: [], workflowName: 'CI', headSha: HEAD }, 'unavailable', null],
-  ['moved-head-is-not-proof', { proofRun: run({ head_sha: OTHER }), runs: [], workflowName: 'CI', headSha: HEAD }, 'unavailable', null],
-  ['non-pr-event-is-not-proof', { proofRun: run({ event: 'push' }), runs: [], workflowName: 'CI', headSha: HEAD }, 'unavailable', null],
-  ['listing-only-green', { proofRun: null, runs: [run()], workflowName: 'CI', headSha: HEAD }, 'green', 101],
-  ['same-run-completed-state-wins', { proofRun: run({ status: 'in_progress', conclusion: null, updated_at: '2026-10-22T10:01:00Z' }), runs: [run({ updated_at: '2026-10-22T10:05:00Z' })], workflowName: 'CI', headSha: HEAD }, 'green', 101],
-  ['listing-only-red', { proofRun: null, runs: [run({ conclusion: 'failure' })], workflowName: 'CI', headSha: HEAD }, 'red', 101],
-  ['delegated-skipped-accepted', { proofRun: run({ conclusion: 'skipped' }), runs: [], workflowName: 'CI', headSha: HEAD, delegated: true }, 'green', 101],
-  ['skipped-not-accepted-locally', { proofRun: run({ conclusion: 'skipped' }), runs: [], workflowName: 'CI', headSha: HEAD, delegated: false }, 'red', 101],
-  ['older-green-does-not-bypass-newer-red', { proofRun: null, runs: [run({ id: 99, created_at: '2026-10-22T09:00:00Z' }), run({ id: 102, conclusion: 'failure', created_at: '2026-10-22T11:00:00Z' })], workflowName: 'CI', headSha: HEAD }, 'red', 102],
-];
+        scenario_source = (
+            "const scenarios = "
+            + json.dumps(self._ci_scenarios())
+            + ";\n"
+            + """
 for (let fnIndex = 0; fnIndex < DECISION_COUNT; fnIndex += 1) {
   for (const [name, payload, expectedState, expectedRunId] of scenarios) {
     const decision = decisionFns[fnIndex](payload);
@@ -904,6 +1116,7 @@ for (let fnIndex = 0; fnIndex < DECISION_COUNT; fnIndex += 1) {
 }
 console.log('CI_PROOF_OK');
 """
+        )
         harness = (
             "const assert = require('assert');\n"
             + helpers
@@ -935,6 +1148,61 @@ console.log('CI_PROOF_OK');
             os.unlink(script)
         self.assertEqual(completed.returncode, 0, completed.stderr or completed.stdout)
         self.assertIn("CI_PROOF_OK", completed.stdout)
+
+    def test_retry_dispatch_python_decision_matches_canonical_scenarios(self):
+        import json
+        import shutil
+
+        source = read(".github/workflows/continuum-pr-agent.yml")
+        decision = self._extract_retry_decision(source)
+        python = shutil.which("python3")
+        self.assertIsNotNone(
+            python, "python3 is required to execute the shipped retry CI proof"
+        )
+        TMP_PARENT.mkdir(exist_ok=True)
+        with tempfile.TemporaryDirectory(
+            prefix="exact-head-ci-", dir=str(TMP_PARENT)
+        ) as temp:
+            script_path = Path(temp) / "decision.py"
+            script_path.write_text(decision, encoding="utf-8")
+            proof_path = Path(temp) / "proof.json"
+            list_path = Path(temp) / "runs.json"
+            for name, payload, expected_state, _ in self._ci_scenarios():
+                with self.subTest(scenario=name):
+                    proof = payload.get("proofRun")
+                    if proof is None:
+                        proof_path.unlink(missing_ok=True)
+                    else:
+                        proof_path.write_text(json.dumps(proof), encoding="utf-8")
+                    list_path.write_text(
+                        json.dumps({"workflow_runs": payload.get("runs") or []}),
+                        encoding="utf-8",
+                    )
+                    delegated = (
+                        "true" if payload.get("delegated") else "false"
+                    )
+                    completed = subprocess.run(
+                        [
+                            python,
+                            str(script_path),
+                            str(proof_path),
+                            str(list_path),
+                            payload["workflowName"],
+                            payload["headSha"],
+                            delegated,
+                        ],
+                        capture_output=True,
+                        text=True,
+                        timeout=30,
+                    )
+                    self.assertEqual(
+                        completed.returncode,
+                        0,
+                        completed.stderr or completed.stdout,
+                    )
+                    self.assertEqual(
+                        completed.stdout.strip(), expected_state, name
+                    )
 
     def test_run_id_is_carried_from_admission_to_merge_and_recovery(self):
         review = read(".github/workflows/continuum-pr-agent.yml")

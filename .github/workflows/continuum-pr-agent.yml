@@ -3235,6 +3235,7 @@ jobs:
           fi
           CI_STATE="$(python3 - "$PROOF_JSON" "$CI_JSON" "$CI_WORKFLOW_NAME" "$HEAD_SHA" "${CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED:-false}" <<'PY'
           import json, os, sys
+          from datetime import datetime
           proof_path, list_path, workflow, head, delegated = sys.argv[1:6]
           def load(path):
               if not path or not os.path.exists(path):
@@ -3249,12 +3250,23 @@ jobs:
           def matches(run):
               return (
                   isinstance(run, dict)
-                  and run.get("name") == workflow
-                  and str(run.get("head_sha") or "").lower() == head.lower()
+                  and str(run.get("name") or "") == str(workflow or "")
+                  and str(run.get("head_sha") or "").strip().lower() == head.strip().lower()
                   and str(run.get("event") or "pull_request") == "pull_request"
               )
-          def updated_at(run):
-              return str(run.get("updated_at") or "")
+          def timestamp(run, field):
+              raw = str(run.get(field) or "")
+              if not raw:
+                  return 0.0
+              try:
+                  return datetime.fromisoformat(raw.replace("Z", "+00:00")).timestamp()
+              except ValueError:
+                  return 0.0
+          def run_id(run):
+              try:
+                  return int(run.get("id") or 0)
+              except (TypeError, ValueError):
+                  return 0
           by_key = {}
           rows = []
           if isinstance(proof, dict):
@@ -3278,8 +3290,8 @@ jobs:
               if previous is None:
                   by_key[key] = run
                   continue
-              previous_updated = updated_at(previous)
-              current_updated = updated_at(run)
+              previous_updated = timestamp(previous, "updated_at")
+              current_updated = timestamp(run, "updated_at")
               if current_updated > previous_updated or (
                   current_updated == previous_updated
                   and previous.get("status") != "completed"
@@ -3293,8 +3305,8 @@ jobs:
           newest = sorted(
               candidates,
               key=lambda run: (
-                  str(run.get("created_at") or ""),
-                  int(run.get("id") or 0),
+                  timestamp(run, "created_at"),
+                  run_id(run),
               ),
               reverse=True,
           )[0]
