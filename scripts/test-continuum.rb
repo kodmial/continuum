@@ -3372,25 +3372,27 @@ class ContinuumTest < Minitest::Test
     assert_operator lock_check, :<, ci_fix, 'the lock must be checked before repair is dispatched'
     assert_operator lock_add, :<, ci_fix, 'the lock must be taken before repair is dispatched'
 
-    # Success clears the lock and wakes the reconciler; it must never dispatch
-    # a repair, which is the one ordering that would auto-fix a green PR.
-    success = script.index('"$REPORTED_CONCLUSION" == "success"')
-    assert_operator success, :<, ci_fix, 'success must be handled before the repair dispatch'
-    between = script[success...ci_fix]
-    assert_includes between, 'labels/$CI_REPAIR_LABEL', 'success must clear the repair lock'
-    assert_includes between, 'actions/workflows/$AUTO_MERGE_WORKFLOW/dispatches',
-                    'success must wake the auto-merge reconciler'
+    # A green state clears the lock and wakes the reconciler only after the
+    # latest approved-workflow state is known to be green.
+    assert_includes script, 'All approved workflows passed for $REPORTED_HEAD_SHA; repair lock cleared and auto-merge reconciler woken.'
+    assert_includes script, 'actions/workflows/$AUTO_MERGE_WORKFLOW/dispatches',
+                    'a green head must wake the auto-merge reconciler'
+
+    # A surviving event must recover a failure whose own completion was
+    # replaced by GitHub's single pending concurrency slot.
+    assert_includes script, 'Latest approved workflow',
+                    'the surviving event must reconcile the latest failure, not only its own'
 
     # A non-repairable conclusion must not consume the one attempt the head has.
-    assert_includes script, '"$REPORTED_CONCLUSION" != "failure" && "$REPORTED_CONCLUSION" != "timed_out"'
+    assert_includes script, '"$REPORTED_CONCLUSION" != "success" && "$REPORTED_CONCLUSION" != "failure" && "$REPORTED_CONCLUSION" != "timed_out"'
 
     # A failed dispatch must release the lock, or the head can never retry.
     tail = script[ci_fix..]
     assert_includes tail, 'labels/$CI_REPAIR_LABEL', 'a failed repair dispatch must clear the lock'
 
-    # The reported run id is what ci-fix reruns; dropping it turns the dispatch
-    # into a repair with no run to point at.
-    assert_includes script, '-f "inputs[run_id]=$REPORTED_RUN_ID"'
+    # The failing run id is what ci-fix reruns; the reported id is only the
+    # fallback when the state helper cannot name a newer failing run.
+    assert_includes script, '-f "inputs[run_id]=${failing_run_id:-$REPORTED_RUN_ID}"'
 
     # The PAT, not GITHUB_TOKEN: the whole point of this path is that the
     # reporting CI may live outside this repository's default token scope.
@@ -3948,6 +3950,74 @@ class ContinuumTest < Minitest::Test
     )
     assert_empty held.fetch(:lock_deletes),
                  'an in-flight approved workflow is not safe evidence to clear the lock'
+  end
+
+  # GitHub keeps a single pending slot per concurrency group: a failure
+  # completion can be replaced by a later green completion for the same head.
+  # The surviving green event must still repair the latest failing approved
+  # workflow instead of only recording its own green result.
+  def test_opencode_repair_green_event_recovers_a_superseded_failure
+    head = '7' * 40
+    runs = {
+      'total_count' => 2,
+      'workflow_runs' => [
+        repair_run(39777697375, 'Windows host', 'completed', 'failure'),
+        repair_run(39777697988, 'CI', 'completed', 'success')
+      ]
+    }
+    result = run_repair_ci_job(
+      run_name: 'CI', conclusion: 'success', pr_number: 238, run_head_sha: head,
+      run_id: '39777697988',
+      pr_json: repair_pr_json(head_sha: head),
+      workflows: 'CI,Windows host', runs_json: runs
+    )
+    assert_equal 1, result.fetch(:dispatches).size,
+                 'the surviving green event must recover the superseded failure'
+    assert_includes result.fetch(:dispatches).first, 'inputs[run_id]=39777697375'
+    assert_equal 1, result.fetch(:lock_adds).size,
+                 'the recovered failure must consume the one attempt for the head'
+  end
+
+  def test_opencode_repair_reported_green_recovers_a_superseded_failure
+    head = '8' * 40
+    runs = {
+      'total_count' => 2,
+      'workflow_runs' => [
+        repair_run(39777697375, 'Windows host', 'completed', 'failure'),
+        repair_run(39777697988, 'CI', 'completed', 'success')
+      ]
+    }
+    result = run_repair_dispatch_job(
+      conclusion: 'success', pr_number: 238, head_sha: head,
+      run_id: '39777697988',
+      pr_json: repair_pr_json(head_sha: head),
+      workflows: 'CI,Windows host', runs_json: runs
+    )
+    assert_equal 1, result.fetch(:dispatches).size,
+                 'a surviving reported-green event must recover the superseded failure'
+    assert_includes result.fetch(:dispatches).first, 'inputs[run_id]=39777697375'
+  end
+
+  # The broad caller glob also wakes unapproved workflows. Their completions
+  # cannot repair their own run, but they must still be able to notice an
+  # approved failure whose controller run the pending-slot queue replaced.
+  def test_opencode_repair_unapproved_wake_recovers_an_approved_failure
+    head = '9' * 40
+    runs = {
+      'total_count' => 1,
+      'workflow_runs' => [
+        repair_run(39777697375, 'Windows host', 'completed', 'failure')
+      ]
+    }
+    result = run_repair_ci_job(
+      run_name: 'Docs', conclusion: 'success', pr_number: 238,
+      run_head_sha: head,
+      pr_json: repair_pr_json(head_sha: head),
+      workflows: 'CI,Windows host', runs_json: runs
+    )
+    assert_equal 1, result.fetch(:dispatches).size,
+                 'an unapproved wake must still reconcile an approved failure'
+    assert_includes result.fetch(:dispatches).first, 'inputs[run_id]=39777697375'
   end
 
   def test_opencode_repair_success_holds_the_lock_on_unknown_or_truncated_run_state

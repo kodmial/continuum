@@ -87,6 +87,13 @@ concurrency:
   # approved workflow and a reported CI result for the same commit cannot race
   # a shared lock decision. The pull_request_target path keeps its pre-existing
   # per-PR granularity because it has no reported head SHA.
+  #
+  # GitHub keeps at most one running and one pending run per group, so a burst
+  # of same-head completions can replace an older pending controller run. That
+  # is safe because both repair jobs re-reconcile the LATEST approved-workflow
+  # state for the head instead of acting only on their own event: whichever
+  # event survives the queue still repairs a real failure or processes the
+  # green lock decision.
   group: opencode-repair-${{ github.event.workflow_run.head_sha || inputs.head_sha || github.event.pull_request.number || inputs.pr_number || github.sha }}
   cancel-in-progress: false
 
@@ -344,100 +351,132 @@ jobs:
             --description "One automatic OpenCode CI repair attempt per failing PR head." \
             --force >/dev/null
 
-          # A green report may only clear the shared per-head lock when every
-          # other approved workflow for the same head is also green. The
-          # reported run is excluded by id, so a success cannot clear a lock
-          # another approved workflow took for a concurrent failure. A
-          # truncated or unreadable run list is not safe evidence, so hold.
-          lock_clear_is_safe() {
-            local runs_json
-            if ! runs_json="$(gh api "repos/$GITHUB_REPOSITORY/actions/runs?head_sha=$REPORTED_HEAD_SHA&event=pull_request&per_page=100" 2>/dev/null)"; then
-              echo "Could not verify current approved workflow state for $REPORTED_HEAD_SHA; keeping repair lock '$CI_REPAIR_LABEL'."
-              return 1
-            fi
-            RUNS_JSON="$runs_json" ALLOWED_WORKFLOWS="$CI_REPAIR_WORKFLOWS" CURRENT_RUN_ID="$REPORTED_RUN_ID" python3 -c '
+          # GitHub keeps only one running and one pending run per concurrency
+          # group: a burst of completions for the same head can replace a
+          # pending controller run. Each run therefore reconciles the LATEST
+          # state of every approved workflow at the head instead of acting only
+          # on its own event. Whichever event survives the queue repairs a real
+          # failure or processes the green lock decision, so a superseded event
+          # cannot silently suppress the P1 repair guarantee.
+          if [[ "$REPORTED_CONCLUSION" != "success" && "$REPORTED_CONCLUSION" != "failure" && "$REPORTED_CONCLUSION" != "timed_out" ]]; then
+            echo "Conclusion '$REPORTED_CONCLUSION' is not a repairable CI failure; ignoring."
+            exit 0
+          fi
+
+          runs_json=""
+          runs_trusted=0
+          if runs_json="$(gh api "repos/$GITHUB_REPOSITORY/actions/runs?head_sha=$REPORTED_HEAD_SHA&event=pull_request&per_page=100" 2>/dev/null)"; then
+            runs_trusted=1
+          fi
+          state_output="$(RUNS_JSON="$runs_json" RUNS_TRUSTED="$runs_trusted" ALLOWED_WORKFLOWS="$CI_REPAIR_WORKFLOWS" OWN_NAME="__reported__" OWN_ID="$REPORTED_RUN_ID" OWN_CONCLUSION="$REPORTED_CONCLUSION" OWN_FORCE=1 python3 -c '
           import json, os, sys
+          trusted = os.environ.get("RUNS_TRUSTED") == "1"
           try:
               data = json.loads(os.environ.get("RUNS_JSON") or "{}")
               runs = data.get("workflow_runs") or []
               total = int(data.get("total_count") or 0)
           except (TypeError, ValueError, json.JSONDecodeError):
-              sys.exit(2)
+              runs, total, trusted = [], 0, False
           if total > len(runs):
-              sys.exit(2)
+              trusted = False
           allowed = {
               part.strip()
               for part in os.environ.get("ALLOWED_WORKFLOWS", "").replace("\n", ",").split(",")
               if part.strip()
           }
-          current = str(os.environ.get("CURRENT_RUN_ID") or "")
           latest = {}
-          for run in runs:
-              if not isinstance(run, dict):
-                  continue
-              if str(run.get("id") or "") == current:
-                  continue
-              name = str(run.get("name") or "")
-              if name not in allowed:
-                  continue
-              run_id = int(run.get("id") or 0)
-              if name not in latest or run_id > latest[name][0]:
-                  latest[name] = (run_id, run)
-          for name, (_, run) in sorted(latest.items()):
-              if str(run.get("status") or "") != "completed" or str(run.get("conclusion") or "") in ("failure", "timed_out"):
-                  print(name)
-                  sys.exit(1)
-          sys.exit(0)
-          '
-          }
+          if trusted:
+              for run in runs:
+                  if not isinstance(run, dict):
+                      continue
+                  name = str(run.get("name") or "")
+                  if name not in allowed:
+                      continue
+                  try:
+                      run_id = int(run.get("id") or 0)
+                  except (TypeError, ValueError):
+                      continue
+                  if name not in latest or run_id > latest[name][0]:
+                      latest[name] = (run_id, run)
+          own_name = os.environ.get("OWN_NAME") or ""
+          own_conclusion = os.environ.get("OWN_CONCLUSION") or ""
+          force = os.environ.get("OWN_FORCE") == "1"
+          try:
+              own_id = int(os.environ.get("OWN_ID") or 0)
+          except ValueError:
+              own_id = 0
+          if (force or own_name in allowed) and own_conclusion in ("success", "failure", "timed_out"):
+              if own_name not in latest or own_id >= latest[own_name][0]:
+                  latest[own_name] = (own_id, {"id": own_id, "name": own_name, "status": "completed", "conclusion": own_conclusion})
+          failures, inflight = [], []
+          for name, (run_id, run) in latest.items():
+              if str(run.get("status") or "") != "completed":
+                  inflight.append(name)
+              elif str(run.get("conclusion") or "") in ("failure", "timed_out"):
+                  failures.append((run_id, name))
+          if failures:
+              failures.sort()
+              print("failure"); print(failures[0][0]); print(failures[0][1])
+          elif inflight:
+              print("inflight"); print(""); print(",".join(sorted(inflight)))
+          elif latest and trusted:
+              print("green"); print(""); print("")
+          elif latest:
+              print("unknown"); print(""); print("")
+          else:
+              print("empty"); print(""); print("")
+          ')"
+          state="$(sed -n '1p' <<<"$state_output")"
+          failing_run_id="$(sed -n '2p' <<<"$state_output")"
+          failing_name="$(sed -n '3p' <<<"$state_output")"
 
-          # A green head clears the lock so a later red head on a new commit
-          # gets a fresh attempt, and wakes the merge reconciler. This is the
-          # dispatch path's only success action: there is nothing to repair.
-          if [[ "$REPORTED_CONCLUSION" == "success" ]]; then
-            if lock_clear_is_safe; then
+          case "$state" in
+            failure)
+              if grep -Fxq "$CI_REPAIR_LABEL" <<<"$PR_LABELS"; then
+                echo "An automatic CI repair was already attempted for this exact PR head; waiting for a new head or a successful rerun."
+                exit 0
+              fi
+              echo "Latest approved workflow '$failing_name' failed for $REPORTED_HEAD_SHA; dispatching its repair."
+              gh api --method POST "repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/labels" \
+                -f "labels[]=$CI_REPAIR_LABEL" >/dev/null
+              if ! gh api --method POST \
+                "repos/$GITHUB_REPOSITORY/actions/workflows/$OPENCODE_WORKFLOW/dispatches" \
+                -f ref=main \
+                -f "inputs[mode]=ci-fix" \
+                -f "inputs[pr_number]=$PR_NUMBER" \
+                -f "inputs[head_ref]=$head_ref" \
+                -f "inputs[run_id]=${failing_run_id:-$REPORTED_RUN_ID}"; then
+                gh api --method DELETE \
+                  "repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/labels/$CI_REPAIR_LABEL" \
+                  >/dev/null 2>&1 || true
+                echo "::error::Failed to dispatch OpenCode repair for reported CI run; lock cleared for retry."
+                exit 1
+              fi
+              ;;
+            green)
               gh api --method DELETE \
                 "repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/labels/$CI_REPAIR_LABEL" \
                 >/dev/null 2>&1 || true
-              echo "PR #$PR_NUMBER reported CI success; repair lock cleared and auto-merge reconciler woken."
-            else
-              echo "PR #$PR_NUMBER reported CI success, but another approved workflow is still failing or in flight for $REPORTED_HEAD_SHA; keeping repair lock."
-            fi
-            gh api --method POST \
-              "repos/$GITHUB_REPOSITORY/actions/workflows/$AUTO_MERGE_WORKFLOW/dispatches" \
-              -f ref=main >/dev/null
-            exit 0
-          fi
-
-          # Only the conclusions this controller repairs consume the lock. A
-          # cancelled or skipped run is not a defect to fix, and must not burn
-          # the one attempt this head is allowed.
-          if [[ "$REPORTED_CONCLUSION" != "failure" && "$REPORTED_CONCLUSION" != "timed_out" ]]; then
-            echo "Conclusion '$REPORTED_CONCLUSION' is not a repairable CI failure; ignoring."
-            exit 0
-          fi
-
-          if grep -Fxq "$CI_REPAIR_LABEL" <<<"$PR_LABELS"; then
-            echo "An automatic CI repair was already attempted for this exact PR head; waiting for a new head or a successful rerun."
-            exit 0
-          fi
-
-          gh api --method POST "repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/labels" \
-            -f "labels[]=$CI_REPAIR_LABEL" >/dev/null
-
-          if ! gh api --method POST \
-            "repos/$GITHUB_REPOSITORY/actions/workflows/$OPENCODE_WORKFLOW/dispatches" \
-            -f ref=main \
-            -f "inputs[mode]=ci-fix" \
-            -f "inputs[pr_number]=$PR_NUMBER" \
-            -f "inputs[head_ref]=$head_ref" \
-            -f "inputs[run_id]=$REPORTED_RUN_ID"; then
-            gh api --method DELETE \
-              "repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/labels/$CI_REPAIR_LABEL" \
-              >/dev/null 2>&1 || true
-            echo "::error::Failed to dispatch OpenCode repair for reported CI run; lock cleared for retry."
-            exit 1
-          fi
+              echo "All approved workflows passed for $REPORTED_HEAD_SHA; repair lock cleared and auto-merge reconciler woken."
+              gh api --method POST \
+                "repos/$GITHUB_REPOSITORY/actions/workflows/$AUTO_MERGE_WORKFLOW/dispatches" \
+                -f ref=main >/dev/null
+              ;;
+            inflight)
+              echo "Another approved workflow is still in flight for $REPORTED_HEAD_SHA; keeping repair lock '$CI_REPAIR_LABEL'."
+              ;;
+            unknown)
+              echo "Could not verify current approved workflow state for $REPORTED_HEAD_SHA; keeping repair lock '$CI_REPAIR_LABEL'."
+              if [[ "$REPORTED_CONCLUSION" == "success" ]]; then
+                gh api --method POST \
+                  "repos/$GITHUB_REPOSITORY/actions/workflows/$AUTO_MERGE_WORKFLOW/dispatches" \
+                  -f ref=main >/dev/null
+              fi
+              ;;
+            *)
+              echo "No approved workflow result is known for $REPORTED_HEAD_SHA; nothing to reconcile."
+              ;;
+          esac
 
   ci-repair:
     if: >-
@@ -477,10 +516,17 @@ jobs:
           # The caller wakes this controller on the broad workflow_run glob
           # because an event filter cannot read repository variables. This
           # admission is therefore the authoritative allow-list: only a
-          # workflow whose exact name appears in the configured set may spend
-          # the one repair attempt for a head. CI stays the default so an
-          # unconfigured consumer keeps its previous behaviour. Matching is
-          # exact and case-sensitive; a workflow can never authorize itself.
+          # workflow whose exact name appears in the configured set may repair
+          # its own run. CI stays the default so an unconfigured consumer keeps
+          # its previous behaviour. Matching is exact and case-sensitive; a
+          # workflow can never authorize itself.
+          #
+          # An unapproved completion is not discarded before reconciliation:
+          # GitHub may have replaced an approved failure's controller run in the
+          # single pending concurrency slot, so the surviving event must still
+          # be allowed to notice that approved failure. The allow-list below
+          # still decides which runs may be repaired, so this never authorizes
+          # the unapproved workflow's own run.
           repairable=no
           while IFS= read -r candidate; do
             candidate="${candidate#"${candidate%%[![:space:]]*}"}"
@@ -492,8 +538,7 @@ jobs:
             fi
           done < <(printf '%s\n' "$CI_REPAIR_WORKFLOWS" | tr ',' '\n')
           if [[ "$repairable" != "yes" ]]; then
-            echo "Workflow '$RUN_NAME' is not in the approved repair set; nothing to repair."
-            exit 0
+            echo "Workflow '$RUN_NAME' is not in the approved repair set; it cannot repair its own run but may still wake reconciliation of an approved failure."
           fi
           if [[ "$CONCLUSION" != "success" && "$CONCLUSION" != "failure" && "$CONCLUSION" != "timed_out" ]]; then
             echo "Conclusion '$CONCLUSION' for '$RUN_NAME' is not repairable; nothing to repair."
@@ -612,84 +657,116 @@ jobs:
             --description "$lock_description" \
             --force >/dev/null
 
-          # A green result may only clear the shared per-head lock when every
-          # other approved workflow for the same head is also green. The lock
-          # is shared across approved workflows so they cannot each spend a
-          # repair attempt on the same head; ownership is tracked by the exact
-          # current workflow runs, not by whichever event arrived last. A
-          # truncated or unreadable run list is not safe evidence, so hold.
-          lock_clear_is_safe() {
-            local runs_json
-            if ! runs_json="$(gh api "repos/$GITHUB_REPOSITORY/actions/runs?head_sha=$RUN_HEAD_SHA&event=pull_request&per_page=100" 2>/dev/null)"; then
-              echo "Could not verify current approved workflow state for $RUN_HEAD_SHA; keeping repair lock '$lock_label'."
-              return 1
-            fi
-            RUNS_JSON="$runs_json" ALLOWED_WORKFLOWS="$CI_REPAIR_WORKFLOWS" CURRENT_RUN_ID="$RUN_ID" python3 -c '
+          # GitHub keeps only one running and one pending run per concurrency
+          # group: a burst of completions for the same head can replace a
+          # pending controller run. Each admitted run therefore reconciles the
+          # LATEST state of every approved workflow at the head instead of
+          # acting only on its own event. Whichever event survives the queue
+          # repairs a real failure or processes the green lock decision, so a
+          # superseded event cannot silently suppress the P1 repair guarantee.
+          runs_json=""
+          runs_trusted=0
+          if runs_json="$(gh api "repos/$GITHUB_REPOSITORY/actions/runs?head_sha=$RUN_HEAD_SHA&event=pull_request&per_page=100" 2>/dev/null)"; then
+            runs_trusted=1
+          fi
+          state_output="$(RUNS_JSON="$runs_json" RUNS_TRUSTED="$runs_trusted" ALLOWED_WORKFLOWS="$CI_REPAIR_WORKFLOWS" OWN_NAME="$RUN_NAME" OWN_ID="$RUN_ID" OWN_CONCLUSION="$CONCLUSION" OWN_FORCE=0 python3 -c '
           import json, os, sys
+          trusted = os.environ.get("RUNS_TRUSTED") == "1"
           try:
               data = json.loads(os.environ.get("RUNS_JSON") or "{}")
               runs = data.get("workflow_runs") or []
               total = int(data.get("total_count") or 0)
           except (TypeError, ValueError, json.JSONDecodeError):
-              sys.exit(2)
+              runs, total, trusted = [], 0, False
           if total > len(runs):
-              sys.exit(2)
+              trusted = False
           allowed = {
               part.strip()
               for part in os.environ.get("ALLOWED_WORKFLOWS", "").replace("\n", ",").split(",")
               if part.strip()
           }
-          current = str(os.environ.get("CURRENT_RUN_ID") or "")
           latest = {}
-          for run in runs:
-              if not isinstance(run, dict):
-                  continue
-              if str(run.get("id") or "") == current:
-                  continue
-              name = str(run.get("name") or "")
-              if name not in allowed:
-                  continue
-              run_id = int(run.get("id") or 0)
-              if name not in latest or run_id > latest[name][0]:
-                  latest[name] = (run_id, run)
-          for name, (_, run) in sorted(latest.items()):
-              if str(run.get("status") or "") != "completed" or str(run.get("conclusion") or "") in ("failure", "timed_out"):
-                  print(name)
-                  sys.exit(1)
-          sys.exit(0)
-          '
-          }
+          if trusted:
+              for run in runs:
+                  if not isinstance(run, dict):
+                      continue
+                  name = str(run.get("name") or "")
+                  if name not in allowed:
+                      continue
+                  try:
+                      run_id = int(run.get("id") or 0)
+                  except (TypeError, ValueError):
+                      continue
+                  if name not in latest or run_id > latest[name][0]:
+                      latest[name] = (run_id, run)
+          own_name = os.environ.get("OWN_NAME") or ""
+          own_conclusion = os.environ.get("OWN_CONCLUSION") or ""
+          force = os.environ.get("OWN_FORCE") == "1"
+          try:
+              own_id = int(os.environ.get("OWN_ID") or 0)
+          except ValueError:
+              own_id = 0
+          if (force or own_name in allowed) and own_conclusion in ("success", "failure", "timed_out"):
+              if own_name not in latest or own_id >= latest[own_name][0]:
+                  latest[own_name] = (own_id, {"id": own_id, "name": own_name, "status": "completed", "conclusion": own_conclusion})
+          failures, inflight = [], []
+          for name, (run_id, run) in latest.items():
+              if str(run.get("status") or "") != "completed":
+                  inflight.append(name)
+              elif str(run.get("conclusion") or "") in ("failure", "timed_out"):
+                  failures.append((run_id, name))
+          if failures:
+              failures.sort()
+              print("failure"); print(failures[0][0]); print(failures[0][1])
+          elif inflight:
+              print("inflight"); print(""); print(",".join(sorted(inflight)))
+          elif latest and trusted:
+              print("green"); print(""); print("")
+          elif latest:
+              print("unknown"); print(""); print("")
+          else:
+              print("empty"); print(""); print("")
+          ')"
+          state="$(sed -n '1p' <<<"$state_output")"
+          failing_run_id="$(sed -n '2p' <<<"$state_output")"
+          failing_name="$(sed -n '3p' <<<"$state_output")"
 
-          if [[ "$CONCLUSION" == "success" ]]; then
-            if lock_clear_is_safe; then
+          case "$state" in
+            failure)
+              if grep -Fxq "$lock_label" <<<"$PR_LABELS"; then
+                echo "An automatic $RUN_NAME repair was already attempted for this exact PR head; waiting for a new head or a successful rerun."
+                exit 0
+              fi
+              echo "Latest approved workflow '$failing_name' failed for $RUN_HEAD_SHA; dispatching its repair."
+              gh api --method POST "repos/$GITHUB_REPOSITORY/issues/$pr/labels" \
+                -f "labels[]=$lock_label" >/dev/null
+              if ! gh api --method POST \
+                "repos/$GITHUB_REPOSITORY/actions/workflows/$OPENCODE_WORKFLOW/dispatches" \
+                -f ref=main \
+                -f "inputs[mode]=ci-fix" \
+                -f "inputs[pr_number]=$pr" \
+                -f "inputs[head_ref]=$head_ref" \
+                -f "inputs[run_id]=${failing_run_id:-$RUN_ID}"; then
+                gh api --method DELETE \
+                  "repos/$GITHUB_REPOSITORY/issues/$pr/labels/$lock_label" \
+                  >/dev/null 2>&1 || true
+                echo "::error::Failed to dispatch OpenCode repair for $RUN_NAME; lock cleared for retry."
+                exit 1
+              fi
+              ;;
+            green)
               gh api --method DELETE \
                 "repos/$GITHUB_REPOSITORY/issues/$pr/labels/$lock_label" \
                 >/dev/null 2>&1 || true
-              echo "$RUN_NAME passed; no other approved workflow is failing or in flight for $RUN_HEAD_SHA. Automatic repair lock '$lock_label' cleared."
-            else
-              echo "$RUN_NAME passed, but another approved workflow for $RUN_HEAD_SHA is still failing or in flight; keeping repair lock '$lock_label'."
-            fi
-            exit 0
-          fi
-
-          if grep -Fxq "$lock_label" <<<"$PR_LABELS"; then
-            echo "An automatic $RUN_NAME repair was already attempted for this exact PR head; waiting for a new head or a successful rerun."
-            exit 0
-          fi
-
-          gh api --method POST "repos/$GITHUB_REPOSITORY/issues/$pr/labels" \
-            -f "labels[]=$lock_label" >/dev/null
-
-          if ! gh api --method POST \
-            "repos/$GITHUB_REPOSITORY/actions/workflows/$OPENCODE_WORKFLOW/dispatches" \
-            -f ref=main \
-            -f "inputs[mode]=ci-fix" \
-            -f "inputs[pr_number]=$pr" \
-            -f "inputs[head_ref]=$head_ref" \
-            -f "inputs[run_id]=$RUN_ID"; then
-            gh api --method DELETE \
-              "repos/$GITHUB_REPOSITORY/issues/$pr/labels/$lock_label" \
-              >/dev/null 2>&1 || true
-            echo "::error::Failed to dispatch OpenCode repair for $RUN_NAME; lock cleared for retry."
-            exit 1
-          fi
+              echo "All approved workflows passed for $RUN_HEAD_SHA; automatic repair lock '$lock_label' cleared."
+              ;;
+            inflight)
+              echo "$RUN_NAME passed, but another approved workflow for $RUN_HEAD_SHA is still in flight; keeping repair lock '$lock_label'."
+              ;;
+            unknown)
+              echo "Could not verify current approved workflow state for $RUN_HEAD_SHA; keeping repair lock '$lock_label'."
+              ;;
+            *)
+              echo "No approved workflow result is known for $RUN_HEAD_SHA; nothing to reconcile."
+              ;;
+          esac
