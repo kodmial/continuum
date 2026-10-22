@@ -1,326 +1,323 @@
 # Continuum
 
-Continuum is a **reusable GitHub Actions control plane**. It holds the actual
-automation logic for CI, review, release, packaging, and parent/child delegated
-execution as `workflow_call` workflows. Consumer repositories hold only thin
-`continuum-*.yml` callers that call into this repository — they never copy the
-engine.
+Continuum is a reusable **GitHub Actions control plane for autonomous,
+gated issue-to-PR work**. It turns an admitted issue into a reviewed pull
+request and merges it only when the current HEAD passes the configured gates:
+
+```text
+admitted issue -> scheduler -> OpenCode implementation -> pull request
+      -> CI -> optional review -> repair / re-review -> exact-HEAD merge gate -> merge
+```
+
+Continuum is not a hosted service and not a replacement for GitHub Actions. It
+is a set of reusable `workflow_call` workflows plus thin `continuum-*.yml`
+callers that you install into a repository. The implementation lives in this
+repository; consumer repositories keep only the caller files, their own
+`ci.yml`, and their own project configuration.
+
+**Who this is for:** maintainers of GitHub repositories who want autonomous
+implementation with explicit human admission, pull-request-only writes, and
+merge gates they can audit. You should be comfortable with GitHub Actions,
+YAML, repository variables/secrets, and branch protection.
+
+**Start with one repository.** A single-repository install is the basic
+scenario. Parent/child delegated execution is an advanced, optional layer.
+
+## Prerequisites
+
+- A GitHub repository with Actions enabled and permission to add workflows.
+- A runner. Core defaults to `ubuntu-latest`; Linux is the supported default.
+  GitHub-hosted runner usage can consume GitHub Actions minutes depending on
+  your plan.
+- A **classic** personal access token stored as `TAP_PAT`, with `repo` and
+  `workflow` scopes, for the lifecycle workflows that need authenticated
+  GitHub writes.
+- Branch protection (recommended and required for the stated safety model):
+  no direct pushes to `main`, required pull requests, required current-HEAD
+  checks, no routine bypass, and force-push/deletion blocked.
+- Optional review provider: CodeRabbit, or Continuum's optional PR-Agent
+  stack. No paid provider key is part of the core contract.
+- Optional `RENDER_API_KEY` only if you enable the Render execution controller.
+
+## Status and limitations
+
+- This is open-source automation under active development. There is no uptime,
+  latency, reliability, or cost SLA.
+- Core workflows target free anonymous OpenCode models. Free routes can be
+  rate-limited, unavailable, or changed by their provider; they are not a
+  zero-cost or always-available guarantee.
+- Linux is the qualified hosted-runner default. Do not assume macOS or Windows
+  hosted-cache support.
+- Review and coding routes are not all equally proven. See
+  [what has been live-qualified](#what-has-been-live-qualified) before relying
+  on a route for production work.
+- Continuum cannot protect `main` by itself. Server-side branch protection and
+  repository access controls remain your responsibility.
+- The first-run walkthrough is a reproducible procedure, not a claim that an
+  external sandbox run was performed in this repository generation.
+
+## Safety model
+
+1. **Human admission is explicit.** Set `AUTOMATION_READY_LABEL` (for example
+   to `automation:ready`) before opening issues. When the variable is set, the
+   scheduler auto-dispatches only issues carrying that label. When it is empty,
+   the scheduler keeps its historical behavior and may enqueue any eligible open
+   issue. Qualification dispatch and an owner's manual `/oc` command do not
+   require the label.
+2. **Automation writes through pull requests.** Installed workflows create
+   branches and PRs; they do not push directly to `main`.
+3. **Every merge is exact-HEAD.** CI and review evidence must belong to the
+   current PR HEAD. Movement invalidates stale evidence.
+4. **Repairs are bounded.** A failing CI or unresolved review can trigger a
+   bounded repair path, followed by fresh CI and review. No path guarantees
+   that a review always approves or that a repair always succeeds.
+5. **Credentials stay named and scoped.** `TAP_PAT` is the lifecycle credential;
+   `RENDER_API_KEY` is a separate Render-only credential. Never add a paid
+   provider key to core.
+6. **Use an isolated test repository first.** Start with a disposable
+   repository and no valuable open issues, especially while tuning labels and
+   runner settings.
+
+## What this adds beyond plain GitHub Actions
+
+Plain workflow YAML gives you runners and triggers. You still have to assemble
+the lifecycle. Continuum supplies:
+
+- a scheduler with admission labels, leases, WIP limits, blockers, and
+  fail-closed reconciliation;
+- issue implementation and repair through OpenCode, with branch/PR publication
+  instead of direct writes;
+- one project-owned `CI` contract backed by reusable validation, with a
+  deterministic repair hand-off;
+- optional CodeRabbit or PR-Agent review, exact-HEAD review evidence, and a
+  provider-neutral merge gate;
+- thin, named callers installed by set, with pinning and safe superseded-caller
+  pruning;
+- optional parent/child delegation that keeps concrete child relationships in
+  repository variables rather than tracked files.
+
+## Architecture
+
+```text
+                    GitHub repository
+  issue (admitted)        branch + PR        CI / review / gates
+        |                     ^                      |
+        v                     |                      v
+  Issue scheduler  -->  OpenCode agent  -->  CI  -->  review?
+        |                     ^                      |
+        |                     |                      v
+        +---- repair / re-review loop <------ repair controller
+                                                     |
+                                                     v
+                                          exact-HEAD merge gate -> merge
+```
+
+Continuum's reusable workflows run from `kodmial/continuum` at the revision you
+pin. The consumer repository owns only the caller stubs, its own `ci.yml`, and
+its configuration. The detailed lifecycle routes are documented in
+[docs/contract-qualification.md](docs/contract-qualification.md) and
+[docs/provider-lifecycle-ownership.md](docs/provider-lifecycle-ownership.md).
+
+## Start here
+
+- **[Quick Start](docs/quickstart.md)** — a safe, copy-paste walkthrough for a
+  fresh isolated test consumer, including the negative admission check.
+- **[Example minimal consumer](examples/minimal-consumer/)** — a real sample
+  project and its project-owned `ci.yml`.
+- [Consumer configuration variables](docs/consumer-variables.md) — the complete
+  variable contract.
+- [Parent/child delegated execution](docs/parent-child-delegation.md) — the
+  advanced multi-repository scenario.
+- [PR-Agent review](docs/pr-agent-opencode.md) — the optional review stack.
+- [Contract qualification](docs/contract-qualification.md) — the exact-HEAD gate
+  model.
+
+## Single-repository setup (basic)
+
+1. Create a **fresh isolated test repository** and copy the sample files from
+   `examples/minimal-consumer/`, including its `.github/workflows/ci.yml`.
+2. Inspect `install.sh` and pin Continuum to a reviewed branch, tag, or full
+   commit SHA.
+3. Install the core callers.
+4. Set `AUTOMATION_READY_LABEL=automation:ready` **before opening any issue**.
+5. Add `TAP_PAT`; add `RENDER_API_KEY` only if you use Render execution.
+6. Configure branch protection for `main`.
+7. Open an ordinary issue without the ready label and confirm it is not
+   dispatched. Then open a harmless issue with the label and follow it through
+   the run, PR, CI, optional review, and merge.
+
+The exact commands and expected observations are in
+[docs/quickstart.md](docs/quickstart.md).
+
+## Install
+
+```sh
+# Default set (core) from a local checkout
+bash install.sh /path/to/consumer
+
+# Pin a branch, tag, or full commit SHA
+bash install.sh /path/to/consumer <ref> core
+
+# Opt into the consumer-neutral technology library
+bash install.sh /path/to/consumer <ref> tech
+
+# Add parent/child delegated execution
+bash install.sh /path/to/consumer <ref> parent
+
+# Also prune superseded callers without a terminal confirmation
+bash install.sh /path/to/consumer <ref> core --yes
+```
+
+The installer fetches caller templates from the requested revision and rewrites
+their Continuum references consistently. `--yes` may appear in any position.
+`CONTINUUM_INSTALL_ASSUME_YES=1` is the equivalent non-interactive opt-in.
+Installing into Continuum's own checkout is refused.
+
+| Set | Installs |
+| --- | --- |
+| `core` (default) | The task-domain callers installed by the `CORE_STUBS` array in `install.sh`: scheduling, implementation/repair, optional review controllers, validation hand-off, and merge. One legacy compatibility stub in `.github/caller-stubs/` (`continuum-opencode-unresolved.yml`) is intentionally not installed. |
+| `tech` | The caller under `.github/caller-stubs/tech/`. This is an opt-in technology library that Continuum never triggers itself; it currently contains a consumer-neutral Swift validation profile. |
+| `parent` | The callers under `.github/caller-stubs/parent/`. These are the delegated child worker/review/pr-review/cleanup wrappers. |
+
+The set arrays in `install.sh` are the authoritative inventory. This README does
+not duplicate a hand-maintained workflow list or a caller count.
+
+### CI ownership
+
+The consumer owns exactly one primary `.github/workflows/ci.yml` whose workflow
+`name:` is `CI`. That project-owned workflow calls the shared
+`continuum-validation.yml` engine and supplies project-specific hooks, tools, and
+versions. The installer never creates a second CI workflow and never replaces
+`ci.yml`.
+
+Example:
+
+```yaml
+name: CI
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+permissions:
+  actions: write
+  contents: read
+  pull-requests: read
+  statuses: write
+jobs:
+  validate:
+    uses: kodmial/continuum/.github/workflows/continuum-validation.yml@main
+    with:
+      continuum_ref: main
+```
+
+A complete runnable example is in
+[`examples/minimal-consumer/.github/workflows/ci.yml`](examples/minimal-consumer/.github/workflows/ci.yml).
+
+### Upgrading and safe pruning
+
+Re-run the installer for every set you use. That rewrites the stored stubs and
+can remove callers Continuum no longer ships. Deletion is fenced:
+
+1. a file is a candidate only if it is named `continuum-*.yml` **and** contains
+   a real `uses:` call to this repository;
+2. the exact list is confirmed at a terminal;
+3. non-interactive installs delete nothing and only report what they would
+   remove;
+4. `--yes` or `CONTINUUM_INSTALL_ASSUME_YES=1` is the explicit opt-out;
+5. installing into Continuum's own checkout is refused before any write.
+
+Do not hand-edit an installed `continuum-*.yml` caller. Put project-specific
+behavior in a project-owned workflow instead.
+
+## Advanced: delegated parent/child execution (optional)
+
+In a parent repository, install `core` plus `parent`, then set
+`CONTINUUM_ROLE=parent`, `CONTINUUM_CHILDREN`, and a runtime PAT with access to
+the child repositories. In each child, install `core`, set
+`CONTINUUM_ROLE=child`, `CONTINUUM_CHILD_ID`, and `CONTINUUM_PARENT`, and keep
+the relationship values in repository variables, not tracked files.
+
+The ordinary core `Issue scheduler` owns parent/child dispatch. The `parent` set
+adds only child execution wrappers. A child with `CONTINUUM_ROLE=child` never
+schedules local work; it verifies the relationship and wakes the parent. See
+[docs/parent-child-delegation.md](docs/parent-child-delegation.md) for the full
+contract, discovery rules, and failure semantics.
+
+## Secrets and variables
+
+Secret names are part of the interface and never change per consumer.
+
+| Secret | Required when | Purpose |
+| --- | --- | --- |
+| `TAP_PAT` | Lifecycle workflows need authenticated GitHub writes | Classic PAT with `repo` + `workflow` scopes. The `workflow` scope lets automation branches include `.github/workflows/**` changes; publication still goes through a PR and never directly to `main`. |
+| `RENDER_API_KEY` | Render execution is enabled | Render API credential, read only by the render executor. It is a different credential from `TAP_PAT`, with no fallback; the controller fails explicitly when it is unset. |
+| `CHILD_RUNTIME_TOKEN` | Direct parent reusable-workflow invocation | Delegated child access. Installed parent callers map it from the parent's own `TAP_PAT`. |
+| `CHILD_RUNTIME_REPOSITORIES` | Legacy parent configuration only | Optional compatibility path for pre-variable child relationships. |
+
+No paid provider key is part of the contract: **no workflow reads
+`OPENCODE_API_KEY`, `ANTHROPIC_API_KEY`, `GROQ_API_KEY`, or `GROQ.KEY`.** Core
+runs on free anonymous models. `secrets.GITHUB_TOKEN` is minted by GitHub
+automatically and is not a credential you define.
+
+Repository variables:
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `AUTOMATION_READY_LABEL` | empty | Optional admission label. When set, automatic implementation dispatches only issues carrying it. **When empty, any eligible open issue may be enqueued.** |
+| `CONTINUUM_REVIEW_PROVIDER` | `none` | Authoritative review selector: `none`, `coderabbit`, or `pr-agent`. |
+| `OPENCODE_MODEL` | free anonymous default | Optional model override for OpenCode. |
+| `MAINTAINERS` | empty | Optional maintainer allow-list for controllers. |
+| `AUTOMATION_WIP_LIMIT`, `AUTOMATION_LEASE_MINUTES`, `AUTOMATION_MAX_DISPATCH_ATTEMPTS` | scheduler defaults | Optional scheduler tuning. |
+
+See [Consumer configuration variables](docs/consumer-variables.md) for the
+complete validation, runner, lifecycle, delegation, review, Render, and
+Swift-profile variable list.
+
+## Failure diagnosis
+
+| Symptom | Check first |
+| --- | --- |
+| An issue is not dispatched | `AUTOMATION_READY_LABEL` is set and the issue carries it; no pause/qualification/blocked label; no open blocker; WIP limit not exhausted; the scheduler run log shows the exact skip reason. |
+| The scheduler ran but did nothing | That is expected for an unadmitted issue when `AUTOMATION_READY_LABEL` is configured. Check for `automation:in-progress`, the dispatch comment, and an `OpenCode agent` run to distinguish "skipped" from "dispatched". |
+| No PR appears after dispatch | Missing or under-scoped `TAP_PAT`; Actions permissions; model/rate-limit failure in the OpenCode run; the issue has no actionable acceptance criteria. |
+| CI never starts | The project workflow is not named `CI`, is not on the default branch, Actions is disabled, or the PR is from a fork without the required secrets. |
+| Review never starts | `CONTINUUM_REVIEW_PROVIDER` is `none` or the selected provider is not configured. Optional review is not guaranteed to run or approve. |
+| A green PR does not merge | Branch protection, required checks, exact-HEAD evidence, conflict state, or a required gate label/name. Read the auto-merge run log. |
+| `workflow not found` after a Continuum upgrade | Reinstall every set you use, then review the prune output. |
+| Repeated model or rate-limit failures | The free anonymous route can be unavailable. An explicit OpenCode 429 marker starts a bounded fresh-runner recovery checkpoint through a repository-local `workflow_dispatch` caller; a bounded timer catches up when `workflow_run` delivery is late or lost. This is not a Continuum SLA. |
+
+## What has been live-qualified
+
+This section deliberately separates deterministic coverage from live evidence.
+
+| Route | Honest status |
+| --- | --- |
+| Continuum's own contract suite, `CI`, Contract Gate, and Contract qualification | Live on this repository's pull requests. They check the exact PR HEAD. |
+| Hosted Linux OpenCode/PR-Agent toolchain | Cold/warm restore and a small anonymous-model inference were live-verified. This is not a complete real-consumer coding or review cycle; see [docs/agent-toolchain-cache.md](docs/agent-toolchain-cache.md). |
+| OpenCode issue implementation through an installed `core` set | Implemented and contract-tested. The Quick Start end-to-end walkthrough is **not live-verified for an external consumer in this repository generation**. |
+| CodeRabbit review route | Integrated and tested. No general claim that every review succeeds or approves. |
+| PR-Agent review route | Optional and disabled by default. The canary harness and offline checks exist; a live canary rerun is maintainer opt-in and is not asserted here. See [docs/pr-agent-canary.md](docs/pr-agent-canary.md). |
+| Parent/child delegated execution | Contract-tested. External live parent/child operation is not part of this Quick Start and is not asserted here. |
+
+The default-unadmitted behavior is covered by a deterministic fixture in
+[`examples/minimal-consumer/verification/`](examples/minimal-consumer/verification/).
+No consumer repository was created or changed to produce this documentation.
 
 ## Repository layout
 
 | Path | Purpose |
 | --- | --- |
-| `.github/workflows/continuum-*.yml` | Continuum-owned reusable (`on: workflow_call`) engine workflows. |
-| `.github/workflows/{ci,opencode,automation}.yml` | Project-owned entry workflows used only to dogfood Continuum on this repository. |
-| `.github/caller-stubs/*.yml` | Thin core callers installed by the default `core` set (task-domain). |
-| `.github/caller-stubs/tech/*.yml` | Thin callers for the opt-in technology library (`tech` set). |
+| `.github/workflows/continuum-*.yml` | Continuum-owned reusable (`on: workflow_call`) engine workflows. The directory is the authoritative workflow inventory. |
+| `.github/workflows/{ci,opencode,automation}.yml` and other project-owned entries | Workflows used only to dogfood Continuum on this repository. They intentionally carry no `continuum-` prefix. |
+| `.github/caller-stubs/*.yml` | Thin caller templates for the default `core` set; the `CORE_STUBS` array in `install.sh` is authoritative, and one legacy compatibility stub is intentionally not installed. |
+| `.github/caller-stubs/tech/*.yml` | Thin callers for the opt-in technology library. |
 | `.github/caller-stubs/parent/*.yml` | Thin callers installed by the `parent` set. |
 | `install.sh` | Installs one set into a consumer repository. |
-| `src/continuum/` | Dependency-free Python engine (config + YAML subset). |
-| `.github/scripts/` | Delegation resolver/runtime and the global instructions installer. |
-| `scripts/` | Continuum contract tests. Product build/release scripts stay in consumers. |
-| `docs/` | Design documentation (see [parent/child delegation](docs/parent-child-delegation.md) and [toolchain cache qualification](docs/agent-toolchain-cache.md)). |
-
-## Reuse model
-
-- Reusable engines are `on: workflow_call`. Lifecycle engines that need a
-  consumer trigger have install-managed caller stubs; shared capability engines
-  such as validation may be called directly from a project-owned entry point.
-- Every installed caller carries the **`continuum-` prefix**. In a consumer
-  repository, a `continuum-*.yml` file is Continuum-owned and is never hand-edited
-  there; any other workflow belongs to the project.
-- The consumer's primary `.github/workflows/ci.yml` is **project-owned** and is
-  the only primary workflow named `CI`. It calls the shared
-  `continuum-validation.yml` engine and supplies project-specific hooks/tooling.
-  The core installer never creates a second CI workflow.
-- Controllers and `workflow_run` triggers match on workflow `name:` values, so
-  names are part of the interface and stay stable.
-- Callers pin a revision. `install.sh` rewrites the `@main` in `uses:` and the
-  `continuum_ref`/`engine_ref` inputs to the requested ref, so one value governs
-  both the workflow and its fallback scripts. The rewrite covers a `uses:` line
-  at either level — job-level (`call:` then `uses:`) and step-level (`- uses:`) —
-  and keeps a trailing YAML comment. An unrelated `main` elsewhere in the file,
-  a third-party action, and an already-pinned Continuum ref are all left alone.
-
-### Fixed contracts
-
-These names are the interface and never change per consumer:
-
-- the `TAP_PAT` repository secret (classic PAT, `repo` + `workflow` scopes) —
-  every set expects a secret with exactly this name;
-- the `continuum-` prefix on every **Continuum-owned reusable workflow and installed caller stub**, and the
-  `continuum-tech-<tech>-` prefix for opt-in library callers; project-owned entry workflows are deliberately outside this namespace;
-- the installer sets (`core`, `tech`, and `parent`);
-- the `CONTINUUM_*` repository-variable names.
-
-Continuum is technology-neutral: `core` ships the task-domain controllers
-(issue scheduling, PR creation/repair/recovery, PR review, PR analysis,
-auto-merge, delegation) every project needs; `tech` is a separate, opt-in
-library of technology-specific workflows — the `continuum-tech-<tech>-` prefix
-(`continuum-tech-<tech>-<name>.yml`) marks them as a library that Continuum
-itself never triggers; `parent` drives delegated execution for any technology.
-
-Every **Continuum-owned reusable workflow** and every installed caller stub is named `continuum-<name>.yml`, and
-the installer writes each stub's stored name verbatim — it adds no prefix of
-its own. The technology library uses the longer
-`continuum-tech-<tech>-<name>.yml` name, where the `continuum-tech-<tech>-`
-prefix marks the opt-in layer. Project-owned workflow entry points are outside that ownership namespace.
-In this repository, `.github/workflows/ci.yml`, `.github/workflows/opencode.yml`,
-and `.github/workflows/automation.yml` are project-owned entry workflows forming
-the minimal self-dogfooding ingress; they deliberately carry no `continuum-`
-prefix and call the same reusable `continuum-*.yml` engines external consumers
-use. External consumer integration and caller stubs are unchanged.
-
-## Install
-
-```sh
-# Local working tree (default set: core)
-bash install.sh /path/to/consumer
-
-# Pin a specific revision (branch, tag, or full commit SHA)
-bash install.sh /path/to/consumer <ref> core
-
-# Opt into the consumer-neutral Swift validation profile
-bash install.sh /path/to/consumer <ref> tech
-
-# Add parent/child delegated execution to any repository
-bash install.sh /path/to/consumer <ref> parent
-
-# Also remove callers Continuum no longer ships, without a confirmation prompt
-bash install.sh /path/to/consumer <ref> core --yes
-```
-
-The installer fetches caller templates from the requested `<ref>` and rewrites
-their Continuum references consistently. Use `main` when consumers should track
-the live shared implementation, or an explicit ref when a deployment requires
-pinning.
-
-| Set | Installs |
-| --- | --- |
-| `core` (default) | 14 callers covering OpenCode, issue scheduling, qualification, CodeRabbit, PR Agent, and auto-merge. Validation is a shared engine called by the project-owned `ci.yml`, not a second installed CI caller. |
-| `tech` | 1 caller: the optional consumer-neutral Swift CI profile. |
-| `parent` | 4 callers: `continuum-child-worker.yml`, `continuum-child-review.yml`, `continuum-child-pr-review.yml`, and `continuum-child-run-cleanup.yml`. The ordinary core `Issue scheduler` owns parent/child dispatch; the cleanup caller removes completed delegated public runs. |
-
-The `parent` and `tech` sets add **only** their own callers; each preserves
-the consumer's own CI, release, and scheduling workflows. The `core` set also
-preserves `ci.yml`: validation is integrated by making that project-owned CI a
-thin caller of `kodmial/continuum/.github/workflows/continuum-validation.yml@main`.
-Any value other than `core`, `tech`, or `parent` is rejected.
-
-### CI ownership
-
-Do not hand-edit an installed `continuum-*.yml` caller. If a consumer needs a
-project-specific trigger, toolchain setup, or hook, keep that behavior in a
-project-owned file (for example `ci.yml`, `nanodictate-packaging-repair.yml`)
-and call the reusable Continuum engine from there.
-
-The primary CI contract is intentionally asymmetric:
-
-1. the consumer owns exactly one `ci.yml` / workflow named `CI`;
-2. that workflow calls the reusable `continuum-validation.yml@main` engine;
-3. project-specific commands/tool versions are inputs or repository variables;
-4. `install.sh` owns only the `continuum-*.yml` caller set and never creates
-   another primary CI.
-
-This makes a repeated core install idempotent: the installer converges its own
-callers without replacing the consumer's CI or duplicating its triggers.
-
-## Upgrading
-
-The technology set was renamed from `swift` to `tech`. Replace
-
-```sh
-bash install.sh <path-to-consumer-repo> <ref> swift
-```
-
-with
-
-```sh
-bash install.sh <path-to-consumer-repo> <ref> tech
-```
-
-`core` is the new default set, so `bash install.sh <path-to-consumer-repo> <ref>`
-now installs the core layer where the old command installed the technology
-library. `core` and `tech` are separate installs: installing `core` does not
-install `tech`, and a consumer that wants the technology library runs the `tech`
-command as well. Passing the old `swift` value is rejected with
-`invalid set: swift (the old 'swift' set is now 'tech')`.
-
-Every core and parent workflow file now carries the `continuum-` prefix, so an
-already installed layer does not update itself: the stubs in the consumer still
-carry `uses:` lines pointing at the old unprefixed file names and would fail with
-`workflow not found` after the merge. Before updating Continuum, a consumer must
-reinstall every set it uses,
-
-```sh
-bash install.sh <path-to-consumer-repo> <ref> core
-bash install.sh <path-to-consumer-repo> <ref> tech
-bash install.sh <path-to-consumer-repo> <ref> parent
-```
-
-Reinstalling rewrites those stubs and also removes any caller that no layer ships
-any more, so a renamed or dropped workflow cannot leave a stale caller running
-beside its replacement. Because that is the only destructive thing the installer
-does, it is fenced three ways:
-
-1. **Ownership.** The prefix alone is not evidence. A file is only a candidate if
-   it is named `continuum-*.yml` *and* its body references this repository. A
-   consumer's own `continuum-experiment.yml` is left alone even with `--yes`.
-2. **Confirmation.** At a terminal the exact list is printed and the install waits
-   for a `y`. Non-interactively — CI, a pipe, `< /dev/null` — the default is to
-   delete **nothing**: the install reports what it would remove and exits. A CI
-   install can never silently drop a file.
-3. **Self-install.** Installing into Continuum's own checkout is not a consumer
-   install, so the prune is skipped there entirely.
-
-To prune unattended, opt in explicitly:
-
-```sh
-bash install.sh <path> <ref> core --yes
-CONTINUUM_INSTALL_ASSUME_YES=1 bash install.sh <path> <ref> core
-```
-
-`--yes` may appear in any position and is removed before the positional
-arguments are parsed, so the documented argument shape stays `<path> <ref> <set>`.
-
-Stubs must never be patched by hand: every installed stub is a `continuum-*.yml`
-file carrying a `uses:` line, is owned by Continuum, and hand-editing one in a
-consumer repository is forbidden.
-
-## Reusable workflows
-
-Workflow names are identical to the reusable file names unless noted.
-
-| Workflow | Purpose | Notable extra inputs |
-| --- | --- | --- |
-| `continuum-tech-swift-ci.yml` | Consumer-neutral Swift profile over `continuum-validation.yml`; defaults to `macos-latest`, `swift build`, and `swift test`. (tech) | runner/build/test/prepare/validation overrides |
-| `continuum-opencode.yml` | OpenCode agent (`name: OpenCode agent`). | `mode`, `pr_number`, `head_ref`, `review_id`, `run_id` |
-| `continuum-opencode-repair.yml` | OpenCode repair controller. | — |
-| `continuum-opencode-unresolved.yml` | Retry OpenCode on unresolved CodeRabbit findings. | — |
-| `continuum-opencode-watchdog.yml` | Recover failed OpenCode runs. A 429 evacuation checkpoint is validated and resumed through a repository-local caller that declares `workflow_dispatch` (never the reusable `workflow_call` engine and never `reRunWorkflow`); a bounded timer catches up when `workflow_run` delivery is late or lost. Ordinary issue failures use the issue recovery path (`name: OpenCode watchdog`). | `watched_workflow`, `opencode_workflow`, `max_recovery_retries`, `max_429_runner_restarts`, `retry_marker`, `in_progress_label`, `pause_marker`, `dispatch_marker`, `timeout_minutes` |
-| `continuum-issue-scheduler.yml` | Scheduled issue dispatch. | — |
-| `continuum-auto-merge.yml` | Auto-merge reviewed pull requests. | `require_coderabbit` |
-| `continuum-pr-agent.yml` | Optional PR Agent review over the runner-local OpenCode backend. | `enabled`, `api_base`, `model`, `max_tokens`, `opencode_model` |
-| `continuum-add-review-label.yml` | Mark a PR ready for CodeRabbit. | — |
-| `continuum-remove-review-label.yml` | Remove the ready label on sync. | — |
-| `continuum-coderabbit-retry.yml` | Retry CodeRabbit after a rate limit. | — |
-| `continuum-coderabbit-unresolved.yml` | Retry unresolved CodeRabbit findings. | — |
-| `continuum-bootstrap-runtime-secret.yml` | Fetch an Actions secrets public key for secret bootstrapping. | — |
-| `continuum-consumer-child-dispatcher.yml` | Legacy compatibility callee for already-installed standalone dispatchers; parent-role runs are skipped. | `worker_workflow`, `review_workflow`, `manual_pr_review_workflow`, `engine_ref` |
-| `continuum-consumer-child-worker.yml` | Execute one delegated child task. | `child_id`, `task_number`, `model`, `max_agent_passes`, `python_version`, `engine_ref` |
-| `continuum-consumer-child-review.yml` | Independent review of a delegated child task. | `child_id`, `task_number`, `pr_number`, `model`, `max_review_passes`, `python_version`, `engine_ref` |
-| `continuum-consumer-child-pr-review.yml` | Independent review of a child pull request. | `child_id`, `pr_number`, `model`, `max_review_passes`, `python_version`, `engine_ref` |
-
-Every reusable workflow also accepts `continuum_ref` (default `main`), the
-revision that supplies fallback scripts.
-
-## Secrets and variables
-
-Secrets a consumer must provide, under exactly these names (secret names are
-part of the contract and never change per consumer):
-
-| Secret | Set | Used by | Purpose |
-| --- | --- | --- | --- |
-| `TAP_PAT` | `core`, `parent` | review, opencode, delegation | Classic PAT (`repo` + `workflow` scopes) for checkout/push/API. Also the child-runtime token the `parent` stubs forward. |
-| `RENDER_API_KEY` | `core` | `continuum-render-executor.yml` | Render API key. A different credential from `TAP_PAT`, with **no** fallback: the controller fails explicitly when it is unset. |
-| `CHILD_RUNTIME_TOKEN` | `parent` | `consumer-child-*` | Parent delegation token; the caller stubs map it from `TAP_PAT`. |
-| `CHILD_RUNTIME_REPOSITORIES` | `parent` | `consumer-child-*` (optional) | Pre-variables compatibility path; see `docs/parent-child-delegation.md`. |
-
-No paid provider key is part of this contract: **no workflow reads
-`OPENCODE_API_KEY` or `GROQ_API_KEY`.** The core runs on free anonymous models
-and requires no API key; `continuum-pr-agent.yml` is an opt-in review provider
-backed by the same free OpenCode route through a runner-local compatibility
-bridge, and it stays disabled unless `CONTINUUM_PR_AGENT_ENABLED` is `true`.
-`secrets.GITHUB_TOKEN` is minted by GitHub
-automatically, so it is not a credential a consumer defines.
-
-Repository variables:
-
-| Variable | Kind | Purpose |
-| --- | --- | --- |
-| `OPENCODE_MODEL` | optional | Default OpenCode model. |
-| `MAINTAINERS` | optional | Maintainer allow-list for controllers. |
-| `AUTOMATION_LEASE_MINUTES`, `AUTOMATION_MAX_DISPATCH_ATTEMPTS`, `AUTOMATION_WIP_LIMIT` | optional | Scheduler tuning. |
-
-Delegation relationships are stored as repository variables — see below.
-
-The complete project-agnostic validation, runner, lifecycle, delegation, and
-optional Swift-profile variables are listed in
-[Consumer configuration variables](docs/consumer-variables.md).
-
-## Unified consumer contract
-
-A new repository can install `core` and run the generic `CI` contract without
-copying lifecycle logic. Core defaults to `ubuntu-latest` and auto-detects common
-stacks; consumers can override runner plus prepare/build/test/validation/package/
-release hooks, artifacts, status publication, and repair dispatch with
-`CONTINUUM_*` variables. OpenCode also defaults to `ubuntu-latest`; projects
-that require a different agent environment set `AUTOMATION_OPENCODE_RUNNER`
-and `CONTINUUM_AGENT_PREPARE_COMMAND`.
-
-Technology-specific behavior is opt-in. The `tech` set currently contains only
-a generic Swift CI profile. Product release, signing, Homebrew/MacPorts or other
-distribution policy is deliberately outside Continuum.
-
-## Wiring the consumers
-
-Concrete parent/child relationships are **not** stored in tracked files; they
-live in GitHub Actions **repository variables**. See
-[docs/parent-child-delegation.md](docs/parent-child-delegation.md) for the full
-contract.
-
-### Swift application consumer (example: any Swift app repository)
-
-```sh
-bash install.sh /path/to/myapp <sha> core
-bash install.sh /path/to/myapp <sha> tech
-```
-
-- Keep the consumer's own `.continuum.yml` (the neutral `version: 1` file is
-  sufficient when there is no tracked relationship).
-- Configure only the runner/hooks the project needs; the Swift profile itself
-  contains no application identity, signing, packaging, or release policy.
-- Keep signing, package-manager manifests, publishing, release policy, and any
-  product-specific CI in the consumer repository.
-
-### Parent (delegation control plane, one example per child id)
-
-```sh
-bash install.sh /path/to/parent-plane <sha> core
-bash install.sh /path/to/parent-plane <sha> parent
-```
-
-The `core` install supplies the one ordinary `Issue scheduler`; the
-`parent` install adds only the child worker and review entry points.
-
-- Repository variables: `CONTINUUM_ROLE=parent`,
-  `CONTINUUM_CHILDREN=["<child-id>", ...]` (a JSON array of opaque child ids).
-- Provide a runtime PAT secret with access to the child repositories and to their
-  Actions variables.
-- The ordinary `Issue scheduler` considers the parent's own issues and all
-  verified child issues in one priority queue and one WIP budget. It wakes on
-  its normal schedule/events and on completion of child task/review workflows.
-
-### Child (a delegated repository, one id per child)
-
-- A neutral `.continuum.yml` (`version: 1`).
-- Repository variables: `CONTINUUM_ROLE=child`, `CONTINUUM_CHILD_ID=<id>` (must
-  match an id in the parent's `CONTINUUM_CHILDREN`), `CONTINUUM_PARENT=<owner>/<repo>`
-  (must equal the calling parent exactly), and optionally
-  `CONTINUUM_VALIDATION_SCRIPT=<repo-relative .sh path>`.
-- Every open issue is parent-routed automatically; priority labels are optional
-  ordering hints, not admission requirements, and issue-body ownership markers
-  are not required.
-- The local Issue scheduler remains installed. With `CONTINUUM_ROLE=child`, it
-  never schedules local work: event-driven runs verify the bidirectional
-  relationship and immediately wake the parent scheduler, while child cron runs
-  stay skipped so private runner minutes are not used for polling. Manual owner
-  `/oc` and `/opencode` commands still use the existing local OpenCode workflow.
-- A trusted validation script on the **base** branch is executed against the
-  candidate worktree with a minimal `env -i` environment.
-- Discovery is fail-closed: zero or multiple repositories matching the
-  relationship abort the run. Visibility (public/private) is never a routing
-  signal.
+| `src/continuum/` | Dependency-free Python engine. |
+| `.github/scripts/` | Delegation runtime and shared PR lifecycle scripts. |
+| `scripts/` | Continuum contract tests. |
+| `docs/` | Design documentation and the Quick Start. |
+| `examples/minimal-consumer/` | Runnable sample consumer project, CI workflow, and admission fixture. |
 
 ## Development
 
@@ -329,12 +326,13 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for the full list. Quick version:
 ```sh
 ruby -E UTF-8 scripts/test-continuum.rb
 bash -n install.sh
-actionlint -shellcheck= -pyflakes= .github/workflows/*.yml .github/caller-stubs/*.yml .github/caller-stubs/tech/*.yml .github/caller-stubs/parent/*.yml
+actionlint -shellcheck= -pyflakes= .github/workflows/*.yml .github/caller-stubs/*.yml .github/caller-stubs/tech/*.yml .github/caller-stubs/parent/*.yml examples/minimal-consumer/.github/workflows/*.yml
 
 mkdir -p .opencode-tmp
 export TMPDIR="$PWD/.opencode-tmp"
 PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=src python3 -m unittest discover -s tests
 PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s .github/scripts -p 'test_delegation_runtime.py'
+PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=src python3 -m unittest discover -s examples/minimal-consumer/verification
 ```
 
 Use `actionlint` 1.7.12 or newer.
