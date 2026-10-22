@@ -31,6 +31,7 @@ repository variable shown below.
 | `CONTINUUM_PUBLISH_STATUS` | `true` | Publish pending/final status. |
 | `CONTINUUM_DISPATCH_REPAIR` | `true` | Dispatch repair after a PR validation result. |
 | `CONTINUUM_REPAIR_WORKFLOW` | `continuum-opencode-repair.yml` | Repair caller file. |
+| `CONTINUUM_CI_REPAIR_WORKFLOWS` | `CI` | Comma- or newline-separated exact workflow names whose completed pull-request runs may dispatch an OpenCode `ci-fix`. Only these exact names are admitted; the repair caller wakes broadly because a `workflow_run` filter cannot read repository variables. |
 | `CONTINUUM_SKIP_OPENCODE_PR` | `false` | Suppress duplicate pull_request validation for `opencode/*` branches. |
 
 The reusable engine is **not** installed as a `continuum-validation.yml`
@@ -39,7 +40,11 @@ workflow `name:` is **CI** and calls
 `kodmial/continuum/.github/workflows/continuum-validation.yml@main`.
 That keeps trigger/toolchain differences project-owned without creating a second
 generic CI state machine. Core repair/watchdog logic treats the stable `CI`
-workflow name as the interface.
+workflow name as the interface, and `CONTINUUM_CI_REPAIR_WORKFLOWS` extends
+that interface only with the extra exact workflow names a consumer explicitly
+approves (for example a product-test workflow named `Windows host`). The
+repair lock is shared across those workflows per PR head, so one green workflow
+never clears a lock another approved workflow still needs.
 
 ## Agent execution
 

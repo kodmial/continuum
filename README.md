@@ -195,7 +195,7 @@ Workflow names are identical to the reusable file names unless noted.
 | --- | --- | --- |
 | `continuum-tech-swift-ci.yml` | Consumer-neutral Swift profile over `continuum-validation.yml`; defaults to `macos-latest`, `swift build`, and `swift test`. (tech) | runner/build/test/prepare/validation overrides |
 | `continuum-opencode.yml` | OpenCode agent (`name: OpenCode agent`). | `mode`, `pr_number`, `head_ref`, `review_id`, `run_id` |
-| `continuum-opencode-repair.yml` | OpenCode repair controller. | — |
+| `continuum-opencode-repair.yml` | OpenCode repair controller. | `ci_repair_workflows` |
 | `continuum-opencode-unresolved.yml` | Retry OpenCode on unresolved CodeRabbit findings. | — |
 | `continuum-opencode-watchdog.yml` | Recover failed OpenCode runs; an explicit OpenCode 429 marker re-runs the same workflow on fresh hosted runner(s), while ordinary issue failures use the issue recovery path (`name: OpenCode watchdog`). | `watched_workflow`, `max_recovery_retries`, `max_429_runner_restarts`, `retry_marker`, `in_progress_label`, `pause_marker`, `dispatch_marker`, `timeout_minutes` |
 | `continuum-issue-scheduler.yml` | Scheduled issue dispatch. | — |
@@ -241,6 +241,7 @@ Repository variables:
 | `OPENCODE_MODEL` | optional | Default OpenCode model. |
 | `MAINTAINERS` | optional | Maintainer allow-list for controllers. |
 | `AUTOMATION_LEASE_MINUTES`, `AUTOMATION_MAX_DISPATCH_ATTEMPTS`, `AUTOMATION_WIP_LIMIT` | optional | Scheduler tuning. |
+| `CONTINUUM_CI_REPAIR_WORKFLOWS` | optional | Comma- or newline-separated exact workflow names approved to trigger a CI repair (default `CI`). |
 
 Delegation relationships are stored as repository variables — see below.
 
