@@ -3236,8 +3236,9 @@ class IsolationTests(unittest.TestCase):
     def test_pr_agent_bridge_runtime_bundle_includes_python_dependency(self):
         body = read_repo(".github/workflows/continuum-pr-agent.yml")
         self.assertIn("Resolve the Continuum-owned PR-Agent runtime bundle", body)
-        self.assertIn("contents/src/continuum/pr_agent.py", body)
+        self.assertIn('copy_runtime_file "src/continuum/pr_agent.py"', body)
         self.assertIn("continuum-pr-agent-runtime", body)
+        self.assertIn("continuum-pr-agent-source", body)
 
     def test_pr_agent_review_uses_repository_token_not_shared_pat(self):
         body = read_repo(".github/workflows/continuum-pr-agent.yml")
@@ -3257,7 +3258,10 @@ class IsolationTests(unittest.TestCase):
             "GITHUB__USER_TOKEN: ${{ env.CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED",
             body,
         )
-        self.assertIn("GH_TOKEN: ${{ github.token }}", body)
+        self.assertIn(
+            "env.CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED != 'true' && github.token",
+            body,
+        )
         self.assertIn(
             "CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED == 'true' && secrets.TAP_PAT",
             body,
@@ -5565,7 +5569,7 @@ class ReviewDispositionIntegrationTests(unittest.TestCase):
     def test_runtime_fallback_is_loaded_from_continuum_ref(self):
         review = read_repo(".github/workflows/continuum-pr-agent.yml")
         self.assertIn(
-            "contents/src/continuum/pr_agent_fallback_state.py",
+            'copy_runtime_file "src/continuum/pr_agent_fallback_state.py"',
             review,
         )
         self.assertIn('FALLBACK_PYTHONPATH:', review)
