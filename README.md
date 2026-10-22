@@ -229,6 +229,13 @@ can remove callers Continuum no longer ships. Deletion is fenced:
 Do not hand-edit an installed `continuum-*.yml` caller. Put project-specific
 behavior in a project-owned workflow instead.
 
+### Optional external periodic wake
+
+Native GitHub `schedule` needs no extra setup. If you want a manual
+cron-job.org backstop for the installed Issue scheduler, see
+[docs/cron-job-org.md](docs/cron-job-org.md). It is an optional owner step after
+merge, not an installer feature or a new credential requirement.
+
 ## Advanced: delegated parent/child execution (optional)
 
 In a parent repository, install `core` plus `parent`, then set

@@ -1,8 +1,19 @@
 name: Issue scheduler
 
+# An external periodic wake is marked for cross-source dedupe. Native schedule
+# runs are identified by their event, so only the opt-in dispatch needs the
+# token. The input is a mode selector, never an authorization override.
+run-name: >-
+  Issue scheduler ${{ github.event.inputs.periodic_wake == 'true' && '[continuum-periodic]' || github.event_name }}
+
 on:
   workflow_dispatch:
     inputs:
+      periodic_wake:
+        description: "External periodic signal; only the periodic pass is deduplicated"
+        required: false
+        type: string
+        default: "false"
       wip_limit:
         description: "Concurrent in-progress issues"
         required: false
@@ -161,6 +172,7 @@ jobs:
     secrets: inherit
     with:
       continuum_ref: main
+      periodic_wake: "${{ inputs.periodic_wake }}"
       # Every knob below is forwarded as a bare `inputs.*` passthrough, never a
       # literal. An empty passthrough is what lets the engine fall back to the
       # consumer's `vars.AUTOMATION_*` value; pinning a literal here would
