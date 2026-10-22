@@ -70,6 +70,14 @@ on:
         type: string
         default: ''
         required: false
+      ci_repair_workflows:
+        description: >-
+          Comma- or newline-separated workflow names whose completed PR runs
+          may trigger a repair. Empty falls back to
+          CONTINUUM_CI_REPAIR_WORKFLOWS, then to CI.
+        type: string
+        default: ''
+        required: false
   # This trusted metadata workflow never checks out or executes PR code.
 
 permissions: {}
@@ -397,11 +405,28 @@ jobs:
           CI_REPAIR_LABEL: ${{ inputs.ci_repair_label || vars.CONTINUUM_CI_REPAIR_LABEL || 'opencode-ci-repair' }}
           AUTO_MERGE_WORKFLOW: ${{ inputs.auto_merge_workflow || vars.CONTINUUM_AUTO_MERGE_WORKFLOW || 'continuum-auto-merge.yml' }}
           OPENCODE_WORKFLOW: ${{ inputs.opencode_workflow || vars.CONTINUUM_OPENCODE_WORKFLOW || 'continuum-opencode.yml' }}
+          CI_REPAIR_WORKFLOWS: ${{ inputs.ci_repair_workflows || vars.CONTINUUM_CI_REPAIR_WORKFLOWS || 'CI' }}
         run: |
           set -euo pipefail
 
-          if [[ "$RUN_NAME" != "CI" ]]; then
-            echo "Unsupported workflow '$RUN_NAME'; nothing to repair."
+          # The caller wakes this controller on the broad workflow_run glob
+          # because an event filter cannot read repository variables. This
+          # admission is therefore the authoritative allow-list: only a
+          # workflow whose exact name appears in the configured set may spend
+          # the one repair attempt for a head. CI stays the default so an
+          # unconfigured consumer keeps its previous behaviour.
+          repairable=no
+          while IFS= read -r candidate; do
+            candidate="${candidate#"${candidate%%[![:space:]]*}"}"
+            candidate="${candidate%"${candidate##*[![:space:]]}"}"
+            [[ -z "$candidate" ]] && continue
+            if [[ "$candidate" == "$RUN_NAME" ]]; then
+              repairable=yes
+              break
+            fi
+          done < <(printf '%s\n' "$CI_REPAIR_WORKFLOWS" | tr ',' '\n')
+          if [[ "$repairable" != "yes" ]]; then
+            echo "Workflow '$RUN_NAME' is not in the approved repair set; nothing to repair."
             exit 0
           fi
           lock_label="$CI_REPAIR_LABEL"

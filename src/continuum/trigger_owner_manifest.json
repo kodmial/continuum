@@ -773,7 +773,8 @@
             "completed"
           ],
           "workflows": [
-            "CI"
+            "*",
+            "!OpenCode repair controller"
           ]
         },
         {

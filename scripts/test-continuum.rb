@@ -2,6 +2,7 @@
 
 require 'minitest/autorun'
 require 'yaml'
+require 'json'
 require 'tmpdir'
 require 'fileutils'
 require 'open3'
@@ -439,7 +440,20 @@ class ContinuumTest < Minitest::Test
   def test_workflow_run_dependencies_exist
     names = ALL_STUBS.map { |path| yaml(path).fetch('name') }
     each_pair do |caller, _|
-      events(caller).fetch('workflow_run', {}).fetch('workflows', []).each do |name|
+      watched = events(caller).fetch('workflow_run', {}).fetch('workflows', [])
+      watched.each do |name|
+        # A glob is a deliberate broad wake-up, never a workflow name. The
+        # repair caller is the only one allowed to use one, and its admission
+        # set (not this filter) decides what may dispatch a repair.
+        if name.start_with?('!')
+          assert watched.any? { |entry| entry.match?(/[*?+\[\]]/) },
+                 "#{caller['name']}: a negation must follow a glob"
+          assert_equal "!#{caller['name']}", name,
+                       'a workflow_run negation may only exclude the caller itself'
+          next
+        end
+        next if name.match?(/[*?+\[\]]/)
+
         assert_includes names + PROJECT_OWNED_WORKFLOW_NAMES + LEGACY_WORKFLOW_RUN_NAMES, name
       end
     end
@@ -3231,7 +3245,8 @@ class ContinuumTest < Minitest::Test
                 'the repair stub declares no workflow_dispatch: a consumer\'s CI report would be ' \
                 'rejected with "Unexpected inputs", which is the bug this path fixes'
     assert_equal (REPORTED_CI_INPUTS + %w[ci_repair_label head_ref_pattern
-                                          auto_merge_workflow opencode_workflow]).sort,
+                                          auto_merge_workflow opencode_workflow
+                                          ci_repair_workflows]).sort,
                  dispatch.fetch('inputs').keys.sort,
                  'the reported-CI-result dispatch contract plus its optional knobs'
 
@@ -3247,7 +3262,8 @@ class ContinuumTest < Minitest::Test
 
     # The knobs stay optional: the same stub is also triggered by
     # pull_request_target and workflow_run, where they have no value to carry.
-    %w[ci_repair_label head_ref_pattern auto_merge_workflow opencode_workflow].each do |key|
+    %w[ci_repair_label head_ref_pattern auto_merge_workflow opencode_workflow
+       ci_repair_workflows].each do |key|
       definition = dispatch.fetch('inputs').fetch(key)
       assert_equal false, definition.fetch('required'), "#{key}: a knob must not gate the dispatch"
       assert_equal 'string', definition.fetch('type'), key
@@ -3348,7 +3364,8 @@ class ContinuumTest < Minitest::Test
       'ci_repair_label' => '',
       'head_ref_pattern' => '',
       'auto_merge_workflow' => '',
-      'opencode_workflow' => ''
+      'opencode_workflow' => '',
+      'ci_repair_workflows' => ''
     }.each do |key, default|
       assert inputs.key?(key), "opencode-repair missing input #{key}"
       assert_equal default, inputs.fetch(key).fetch('default'), key
@@ -3361,7 +3378,8 @@ class ContinuumTest < Minitest::Test
       'CI_REPAIR_LABEL' => ['ci_repair_label', 'CONTINUUM_CI_REPAIR_LABEL', 'opencode-ci-repair'],
       'HEAD_REF_PATTERN' => ['head_ref_pattern', 'CONTINUUM_HEAD_REF_PATTERN', '^opencode/issue[0-9]+-'],
       'AUTO_MERGE_WORKFLOW' => ['auto_merge_workflow', 'CONTINUUM_AUTO_MERGE_WORKFLOW', 'continuum-auto-merge.yml'],
-      'OPENCODE_WORKFLOW' => ['opencode_workflow', 'CONTINUUM_OPENCODE_WORKFLOW', 'continuum-opencode.yml']
+      'OPENCODE_WORKFLOW' => ['opencode_workflow', 'CONTINUUM_OPENCODE_WORKFLOW', 'continuum-opencode.yml'],
+      'CI_REPAIR_WORKFLOWS' => ['ci_repair_workflows', 'CONTINUUM_CI_REPAIR_WORKFLOWS', 'CI']
     }.each do |key, (input, variable, literal)|
       assert_includes body, "#{key}: \${{ inputs.#{input} || vars.#{variable} || '#{literal}' }}",
                       "#{key}: missing inputs/vars/literal fallback"
@@ -3394,7 +3412,7 @@ class ContinuumTest < Minitest::Test
     with = yaml(File.join(ROOT, '.github/caller-stubs/continuum-opencode-repair.yml'))
            .fetch('jobs').fetch('call').fetch('with')
     %w[pr_number head_sha conclusion run_id ci_repair_label head_ref_pattern
-       auto_merge_workflow opencode_workflow].each do |key|
+       auto_merge_workflow opencode_workflow ci_repair_workflows].each do |key|
       assert_equal "\${{ inputs.#{key} }}", with.fetch(key), "#{key} must be a bare passthrough"
     end
 
@@ -3409,6 +3427,205 @@ class ContinuumTest < Minitest::Test
     # The workflow_run path keeps its looser `opencode/*` guard: tightening it
     # would stop repairing heads this controller repaired before.
     assert_includes body, '"$head_ref" != opencode/*'
+  end
+
+  # The caller wakes on every completed workflow because the approved set is a
+  # repository variable that a `workflow_run` filter cannot read. The reusable
+  # controller must therefore own the allow-list, and the caller must exclude
+  # its own name or GitHub rejects the workflow as listening to itself.
+  def test_opencode_repair_wakeup_is_broad_and_excludes_itself
+    stub = yaml(File.join(ROOT, '.github/caller-stubs/continuum-opencode-repair.yml'))
+    watched = events(stub).fetch('workflow_run').fetch('workflows')
+    assert_equal ['completed'], events(stub).fetch('workflow_run').fetch('types')
+    assert_includes watched, '*', 'the repair caller must receive non-CI PR workflows'
+    assert_includes watched, "!#{stub.fetch('name')}",
+                    'the broad wake-up must negate the caller itself'
+    assert_operator watched.index('*'), :<, watched.index("!#{stub.fetch('name')}"),
+                    'the self-exclusion must follow the positive glob'
+  end
+
+  # The old CI-only early return is replaced by an exact-name allow-list. It
+  # must be configurable, default to CI, and never admit a workflow merely
+  # because the broad caller woke it up.
+  def test_opencode_repair_admission_is_an_exact_configured_allow_list
+    body = workflow_body('continuum-opencode-repair.yml')
+    job = body[/^  ci-repair:\n(.*?)(?=^  \S|\z)/m, 1]
+    refute_nil job, 'continuum-opencode-repair.yml has no ci-repair job'
+    script = job[/run: \|\n(.*?)(?=^  \S|\z)/m, 1]
+    refute_nil script, 'the workflow_run repair job has no shell body'
+
+    assert_includes job, "CI_REPAIR_WORKFLOWS: \${{ inputs.ci_repair_workflows || vars.CONTINUUM_CI_REPAIR_WORKFLOWS || 'CI' }}",
+                    'the approved set must be input/vars/configurable and default to CI'
+    assert_includes script, 'while IFS= read -r candidate'
+    assert_includes script, 'tr \',\' \'\\n\''
+    assert_includes script, 'if [[ "$candidate" == "$RUN_NAME" ]]',
+                    'admission must compare the exact workflow name, not a prefix or glob'
+    assert_includes script, 'is not in the approved repair set'
+    refute_includes script, '"$RUN_NAME" != "CI"',
+                    'the hard-coded CI-only admission must be gone'
+  end
+
+  def repair_ci_script
+    job = yaml(File.join(ROOT, '.github/workflows/continuum-opencode-repair.yml'))
+          .fetch('jobs').fetch('ci-repair')
+    step = job.fetch('steps').find do |entry|
+      entry['name'].to_s.include?('Dispatch one automatic OpenCode fix')
+    end
+    refute_nil step, 'the workflow_run repair step is missing'
+    step.fetch('run')
+  end
+
+  FAKE_GH = <<~'BASH'
+    #!/usr/bin/env bash
+    set -euo pipefail
+    printf '%s\n' "$*" >> "$FAKE_GH_LOG"
+    if [[ "${1:-}" != "api" ]]; then
+      exit 0
+    fi
+    args="$*"
+    if [[ "$args" == *"/commits/"*"/pulls"* ]]; then
+      printf '%s' "${FAKE_GH_PR:-}"
+      exit 0
+    fi
+    if [[ "$args" == *"/pulls/"* ]]; then
+      cat "$FAKE_GH_PR_JSON"
+      exit 0
+    fi
+    exit 0
+  BASH
+
+  # Run the real ci-repair shell body with a deterministic fake `gh`, so the
+  # admission, exact-HEAD, fork, PR-association and one-attempt-per-head rules
+  # are exercised as a unit rather than asserted by string presence.
+  def run_repair_ci_job(run_name:, conclusion:, pr_number:, run_head_sha:,
+                        pr_json:, workflows:, run_id: '39777697375',
+                        repo: 'kodmial/nanodictate')
+    tmp_root = File.join(ROOT, '.opencode-tmp')
+    FileUtils.mkdir_p(tmp_root)
+    Dir.mktmpdir('repair-ci-', tmp_root) do |dir|
+      bin = File.join(dir, 'bin')
+      FileUtils.mkdir_p(bin)
+      gh = File.join(bin, 'gh')
+      File.write(gh, FAKE_GH)
+      FileUtils.chmod(0o755, gh)
+      script = File.join(dir, 'ci-repair.sh')
+      File.write(script, repair_ci_script)
+      pr_file = File.join(dir, 'pr.json')
+      File.write(pr_file, JSON.generate(pr_json))
+      log = File.join(dir, 'gh.log')
+      File.write(log, '')
+
+      env = {
+        'PATH' => "#{bin}:#{ENV.fetch('PATH', '')}",
+        'GH_TOKEN' => 'test-token',
+        'GITHUB_REPOSITORY' => repo,
+        'RUN_ID' => run_id,
+        'RUN_NAME' => run_name,
+        'RUN_HEAD_SHA' => run_head_sha,
+        'CONCLUSION' => conclusion,
+        'CI_REPAIR_LABEL' => 'opencode-ci-repair',
+        'AUTO_MERGE_WORKFLOW' => 'continuum-auto-merge.yml',
+        'OPENCODE_WORKFLOW' => 'continuum-opencode.yml',
+        'CI_REPAIR_WORKFLOWS' => workflows,
+        'FAKE_GH_LOG' => log,
+        'FAKE_GH_PR' => pr_number.to_s,
+        'FAKE_GH_PR_JSON' => pr_file
+      }
+      output, status = Open3.capture2e(env, 'bash', script)
+      assert status.success?, "ci-repair exited #{status.exitstatus}:\n#{output}"
+      lines = File.readlines(log, chomp: true)
+      {
+        output: output,
+        log: lines,
+        dispatches: lines.select { |line| line.include?('/dispatches') && line.include?('inputs[mode]=ci-fix') }
+      }
+    end
+  end
+
+  def repair_pr_json(repo: 'kodmial/nanodictate', head_sha: 'a' * 40,
+                     head_ref: 'opencode/issue237-1', labels: [], state: 'open',
+                     body: '')
+    {
+      'state' => state,
+      'body' => body,
+      'head' => {
+        'ref' => head_ref,
+        'sha' => head_sha,
+        'repo' => { 'full_name' => repo }
+      },
+      'labels' => labels.map { |name| { 'name' => name } }
+    }
+  end
+
+  # Regression for kodmial/continuum#351: NanoDictate PR #238 had a green CI
+  # and a failed Windows host run on the same current head. The green result
+  # must not suppress the approved non-CI repair, and it must still consume
+  # the one-attempt-per-head lock exactly once.
+  def test_opencode_repair_repairs_an_approved_non_ci_failure_on_the_current_head
+    head = 'b' * 40
+    pr = repair_pr_json(head_sha: head)
+
+    green = run_repair_ci_job(run_name: 'CI', conclusion: 'success', pr_number: 238,
+                              run_head_sha: head, pr_json: pr,
+                              workflows: "CI\nWindows host")
+    assert_empty green.fetch(:dispatches), 'a green CI result must not dispatch a repair'
+
+    failed = run_repair_ci_job(run_name: 'Windows host', conclusion: 'failure', pr_number: 238,
+                               run_head_sha: head, pr_json: pr,
+                               workflows: "CI\nWindows host")
+    assert_equal 1, failed.fetch(:dispatches).size,
+                 'the approved Windows host failure must trigger exactly one ci-fix'
+    dispatch = failed.fetch(:dispatches).first
+    assert_includes dispatch, 'inputs[run_id]=39777697375'
+    assert failed.fetch(:log).any? { |line| line.include?('labels[]=opencode-ci-repair') },
+           'the one-attempt-per-head lock must be taken through the configured label'
+  end
+
+  def test_opencode_repair_ignores_unapproved_stale_unrelated_and_non_pr_runs
+    head = 'c' * 40
+    approved = "CI\nWindows host"
+
+    stale = run_repair_ci_job(run_name: 'Windows host', conclusion: 'failure', pr_number: 238,
+                              run_head_sha: head,
+                              pr_json: repair_pr_json(head_sha: 'd' * 40),
+                              workflows: approved)
+    assert_empty stale.fetch(:dispatches), 'a stale-head result must not dispatch'
+
+    unapproved = run_repair_ci_job(run_name: 'Windows host', conclusion: 'failure', pr_number: 238,
+                                   run_head_sha: head, pr_json: repair_pr_json(head_sha: head),
+                                   workflows: 'CI')
+    assert_empty unapproved.fetch(:dispatches), 'an unapproved workflow must not dispatch'
+
+    unrelated = run_repair_ci_job(run_name: 'Release', conclusion: 'failure', pr_number: 238,
+                                  run_head_sha: head, pr_json: repair_pr_json(head_sha: head),
+                                  workflows: approved)
+    assert_empty unrelated.fetch(:dispatches), 'an unrelated workflow must not dispatch'
+
+    non_pr = run_repair_ci_job(run_name: 'Windows host', conclusion: 'failure', pr_number: '',
+                               run_head_sha: head, pr_json: repair_pr_json(head_sha: head),
+                               workflows: approved)
+    assert_empty non_pr.fetch(:dispatches), 'a non-PR run must not dispatch'
+
+    fork = run_repair_ci_job(run_name: 'Windows host', conclusion: 'failure', pr_number: 238,
+                             run_head_sha: head,
+                             pr_json: repair_pr_json(repo: 'someone/nanodictate', head_sha: head),
+                             workflows: approved)
+    assert_empty fork.fetch(:dispatches), 'a fork-originated PR must not dispatch'
+
+    repeated = run_repair_ci_job(run_name: 'Windows host', conclusion: 'failure', pr_number: 238,
+                                 run_head_sha: head,
+                                 pr_json: repair_pr_json(head_sha: head, labels: ['opencode-ci-repair']),
+                                 workflows: approved)
+    assert_empty repeated.fetch(:dispatches), 'a repeated event for the same head must not dispatch'
+  end
+
+  def test_opencode_repair_still_repairs_a_ci_failure_by_default
+    head = 'e' * 40
+    default = run_repair_ci_job(run_name: 'CI', conclusion: 'failure', pr_number: 7,
+                                run_head_sha: head, pr_json: repair_pr_json(head_sha: head),
+                                workflows: 'CI')
+    assert_equal 1, default.fetch(:dispatches).size,
+                 'the pre-existing CI failure repair must remain unchanged'
   end
 
   # ------------------------------------------------- render execution controller
@@ -3932,7 +4149,7 @@ class ContinuumTest < Minitest::Test
     ],
     'continuum-opencode-repair.yml' => %w[
       continuum_ref pr_number head_sha conclusion run_id ci_repair_label
-      head_ref_pattern auto_merge_workflow opencode_workflow
+      head_ref_pattern auto_merge_workflow opencode_workflow ci_repair_workflows
     ],
     'continuum-coderabbit-unresolved.yml' => %w[continuum_ref review_provider],
     'continuum-pr-agent-recovery.yml' => %w[continuum_ref target_child_id max_executions],
