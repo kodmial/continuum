@@ -51,13 +51,17 @@ jobs:
 
   watchdog:
     if: >-
-      github.event_name == 'workflow_run' &&
-      github.event.workflow_run.path == '.github/workflows/opencode.yml'
+      (github.event_name == 'workflow_run' &&
+       github.event.workflow_run.path == '.github/workflows/opencode.yml') ||
+      (github.event_name == 'schedule' &&
+       github.event.schedule == '*/15 * * * *') ||
+      github.event_name == 'workflow_dispatch'
     uses: ./.github/workflows/continuum-opencode-watchdog.yml
     secrets: inherit
     with:
       continuum_ref: main
       watched_workflow: 'OpenCode agent'
+      opencode_workflow: 'opencode.yml'
 
   repair:
     if: >-

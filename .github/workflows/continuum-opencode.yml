@@ -253,6 +253,8 @@ jobs:
           REVIEW_BODY: ${{ github.event.review.body }}
           REVIEWED_SHA: ${{ github.event.review.commit_id }}
           COMMENT_PAT: ${{ secrets.TAP_PAT }}
+          OPENCODE_WORKFLOW: ${{ vars.CONTINUUM_OPENCODE_WORKFLOW }}
+          OPENCODE_CALLER_WORKFLOW: ${{ github.workflow_ref }}
         with:
           github-token: ${{ github.token }}
           script: |
@@ -361,11 +363,86 @@ jobs:
               return;
             }
 
+            // Resolve the repository-local caller that actually declares
+            // `workflow_dispatch`. Continuum's own checkout names that caller
+            // `opencode.yml`; an installed consumer names it
+            // `continuum-opencode.yml`. The reusable engine this job runs in
+            // is `workflow_call`-only and must never be dispatched directly.
+            const normalizeCaller = value => {
+              let text = String(value || '').trim().replace(/\\/g, '/');
+              if (!text) return '';
+              if (text.startsWith('./')) text = text.slice(2);
+              if (!text.startsWith('.github/workflows/')) {
+                if (text.includes('/')) return '';
+                text = '.github/workflows/' + text;
+              }
+              if (text.includes('..') || !/\.ya?ml$/i.test(text)) return '';
+              return text;
+            };
+            // `github.workflow_ref` is the caller, not this reusable engine,
+            // so self-dogfood resolves `opencode.yml` from the run itself
+            // instead of carrying an unprefixed name that a consumer's
+            // unrelated workflow could match after installation.
+            const callerFromRef = value => {
+              const text = String(value || '').trim().replace(/\\/g, '/');
+              const marker = '.github/workflows/';
+              const start = text.indexOf(marker);
+              if (start === -1) return '';
+              return normalizeCaller(text.slice(start).split('@')[0]);
+            };
+            const callerCandidates = [...new Set([
+              normalizeCaller(process.env.OPENCODE_WORKFLOW),
+              callerFromRef(process.env.OPENCODE_CALLER_WORKFLOW),
+              '.github/workflows/continuum-opencode.yml',
+            ].filter(Boolean))];
+            async function resolveDispatchCaller() {
+              const defaultBranch = (await github.rest.repos.get({
+                owner, repo,
+              })).data.default_branch;
+              for (const candidate of callerCandidates) {
+                let source;
+                try {
+                  const response = await github.rest.repos.getContent({
+                    owner, repo, path: candidate, ref: defaultBranch,
+                  });
+                  if (Array.isArray(response.data) || response.data.type !== 'file') {
+                    continue;
+                  }
+                  source = Buffer.from(
+                    String(response.data.content || '').replace(/\n/g, ''),
+                    'base64'
+                  ).toString('utf8');
+                } catch (err) {
+                  if (err.status === 404) continue;
+                  throw err;
+                }
+                const lines = source.split(/\r?\n/);
+                const onIndex = lines.findIndex(line => /^on:\s*(?:#.*)?$/.test(line));
+                if (onIndex === -1) continue;
+                const onBlock = [];
+                for (let index = onIndex + 1; index < lines.length; index += 1) {
+                  if (/^\S/.test(lines[index]) && !lines[index].startsWith('#')) break;
+                  onBlock.push(lines[index]);
+                }
+                if (/^\s{2}workflow_dispatch:\s*(?:#.*)?$/m.test(onBlock.join('\n'))) {
+                  return {
+                    path: candidate,
+                    workflowId: candidate.slice(candidate.lastIndexOf('/') + 1),
+                    ref: defaultBranch,
+                  };
+                }
+              }
+              throw new Error(
+                'No repository-local OpenCode caller declares workflow_dispatch; ' +
+                'refusing to dispatch the reusable workflow-call engine.'
+              );
+            }
+            const dispatchTarget = await resolveDispatchCaller();
             await github.rest.actions.createWorkflowDispatch({
               owner,
               repo,
-              workflow_id: 'continuum-opencode.yml',
-              ref: 'main',
+              workflow_id: dispatchTarget.workflowId,
+              ref: dispatchTarget.ref,
               inputs: {
                 mode: 'coderabbit-fix',
                 pr_number: String(pullNumber),
@@ -374,7 +451,8 @@ jobs:
               },
             });
             core.notice(
-              `Dispatched OpenCode for CodeRabbit review ${reviewId} on PR #${pullNumber} with ${findings.length} inline finding(s).`
+              `Dispatched OpenCode for CodeRabbit review ${reviewId} on PR #${pullNumber} ` +
+              `with ${findings.length} inline finding(s) through ${dispatchTarget.path}.`
             );
 
   admit:
@@ -502,6 +580,7 @@ jobs:
           RECOVERY_CHECKPOINT_SHA: ${{ inputs.recovery_checkpoint_sha }}
           RECOVERY_STAGE: ${{ inputs.recovery_stage }}
           RECOVERY_GENERATION: ${{ inputs.recovery_generation }}
+          RECOVERY_MODE: ${{ inputs.mode }}
         run: |
           set -euo pipefail
           [[ -n "$RECOVERY_OPERATION_ID" ]] || { echo "::error::429 recovery without operation identity."; exit 1; }
@@ -525,6 +604,61 @@ jobs:
             }
           fi
           CHECKPOINT_SHA="$(git rev-parse FETCH_HEAD)"
+          # The dispatcher validates metadata before publishing a pointer,
+          # but the fresh runner must not trust dispatch inputs or the
+          # checked-out head_ref working tree. Read the identity file from
+          # the exact checkpoint commit and fail closed if it disagrees with
+          # the operation/stage/generation/ref or references a code commit
+          # outside this checkpoint history.
+          RECOVERY_METADATA_FILE="${RUNNER_TEMP:-/tmp}/continuum-429-recovery-checkpoint.json"
+          git show "FETCH_HEAD:.continuum-429-recovery.json" > "$RECOVERY_METADATA_FILE" 2>/dev/null || {
+            echo "::error::429 recovery checkpoint has no recovery metadata"; exit 1;
+          }
+          RECOVERY_METADATA_FILE="$RECOVERY_METADATA_FILE" python3 - <<'PY'
+          import json, os, re, subprocess, sys
+          path = os.environ["RECOVERY_METADATA_FILE"]
+          try:
+              with open(path, encoding="utf-8") as handle:
+                  data = json.load(handle)
+          except Exception as exc:
+              raise SystemExit("::error::429 recovery metadata is not readable JSON: {}".format(exc))
+          def required(name):
+              value = str(data.get(name) or "").strip()
+              if not value:
+                  raise SystemExit("::error::429 recovery metadata is missing {}".format(name))
+              return value
+          if int(data.get("schema_version") or 0) != 1:
+              raise SystemExit("::error::429 recovery metadata schema version is unsupported")
+          operation = required("operation_id")
+          if operation != os.environ.get("RECOVERY_OPERATION_ID", "").strip():
+              raise SystemExit("::error::429 recovery metadata operation mismatch")
+          try:
+              generation = int(data.get("generation"))
+          except (TypeError, ValueError):
+              raise SystemExit("::error::429 recovery metadata generation is malformed")
+          if generation != int(os.environ.get("RECOVERY_GENERATION", "0") or 0):
+              raise SystemExit("::error::429 recovery metadata generation mismatch")
+          stage = required("stage")
+          if stage != os.environ.get("RECOVERY_STAGE", "implementation-incomplete").strip():
+              raise SystemExit("::error::429 recovery metadata stage mismatch")
+          if required("checkpoint_ref") != os.environ.get("RECOVERY_CHECKPOINT_REF", "").strip():
+              raise SystemExit("::error::429 recovery metadata checkpoint ref mismatch")
+          mode = os.environ.get("RECOVERY_MODE", "").strip()
+          if mode and required("mode") != mode:
+              raise SystemExit("::error::429 recovery metadata mode mismatch")
+          head_sha = required("head_sha").lower()
+          if not re.fullmatch(r"[0-9a-f]{40}", head_sha):
+              raise SystemExit("::error::429 recovery metadata head SHA is malformed")
+          if not required("head_ref"):
+              raise SystemExit("::error::429 recovery metadata head ref is empty")
+          ancestor = subprocess.run(
+              ["git", "merge-base", "--is-ancestor", head_sha, "FETCH_HEAD"],
+              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+          )
+          if ancestor.returncode != 0:
+              raise SystemExit("::error::429 recovery metadata head SHA is outside the checkpoint history")
+          print("Validated 429 recovery metadata for {} generation {} stage {}".format(operation, generation, stage))
+          PY
           git switch --detach FETCH_HEAD
           # kodmial/continuum#290: drop any stage-progress file carried by
           # the checkpoint. The dispatch recovery_stage above is
@@ -1903,6 +2037,52 @@ jobs:
             if [[ -z "$default_branch" ]]; then echo "::error::Continuum branch safety: repository default branch is undiscoverable for '$repo'; refusing code push to '$dest'." >&2; return 1; fi
             if [[ "$dest" == "$default_branch" ]]; then echo "::error::Continuum branch safety: refusing code push to the default branch '$dest'. Recovery resumes the same PR branch; only the PR merge operation may update the default branch." >&2; return 1; fi
           }
+          continuum_validate_recovery_metadata() {
+            local path="$1" operation="$2" gen="$3" stage="$4" mode="$5" issue="$6" pr="$7" base="$8" head="$9" branch="${10}" checkpoint_ref="${11:-}"
+            python3 - "$path" "$operation" "$gen" "$stage" "$mode" "$issue" "$pr" "$base" "$head" "$branch" "$checkpoint_ref" <<'PY'
+          import json, re, sys
+          (path, operation, gen, stage, mode, issue, pr, base, head, branch, checkpoint_ref) = sys.argv[1:12]
+          try:
+              with open(path, encoding="utf-8") as handle:
+                  data = json.load(handle)
+          except Exception as exc:
+              raise SystemExit("metadata is not readable JSON: {}".format(exc))
+          required = (
+              "schema_version", "operation_id", "failure_kind", "generation", "stage",
+              "mode", "issue_number", "pr_number", "head_ref", "base_sha", "head_sha",
+              "branch", "checkpoint_ref",
+          )
+          missing = [field for field in required if field not in data]
+          if missing:
+              raise SystemExit("metadata is missing {}".format(", ".join(missing)))
+          if int(data.get("schema_version") or 0) != 1:
+              raise SystemExit("metadata schema version is unsupported")
+          if str(data.get("operation_id")) != operation:
+              raise SystemExit("metadata operation mismatch")
+          if int(data.get("generation")) != int(gen):
+              raise SystemExit("metadata generation mismatch")
+          if str(data.get("stage")) != stage:
+              raise SystemExit("metadata stage mismatch")
+          if str(data.get("mode")) != mode:
+              raise SystemExit("metadata mode mismatch")
+          if str(data.get("issue_number") or "") != str(issue or ""):
+              raise SystemExit("metadata issue mismatch")
+          if str(data.get("pr_number") or "") != str(pr or ""):
+              raise SystemExit("metadata PR mismatch")
+          if str(data.get("head_sha")) != head:
+              raise SystemExit("metadata head SHA mismatch")
+          if str(data.get("base_sha") or "") != str(base or ""):
+              raise SystemExit("metadata base SHA mismatch")
+          if str(data.get("branch")) != branch:
+              raise SystemExit("metadata branch mismatch")
+          if checkpoint_ref and str(data.get("checkpoint_ref")) != checkpoint_ref:
+              raise SystemExit("metadata checkpoint ref mismatch")
+          if not re.fullmatch(r"[0-9a-f]{40}", head):
+              raise SystemExit("metadata head SHA is malformed")
+          if not str(data.get("head_ref") or "").strip():
+              raise SystemExit("metadata head ref is empty")
+          PY
+          }
           continuum_infra_evacuate() {
             local operation="$1" stage="$2" mode="$3" issue_number="$4" pr_number="$5" base_sha="$6"
             local failure_kind="${7:-quota_429}"
@@ -1945,15 +2125,25 @@ jobs:
                 -m "Continuum-Component: opencode" || true
             fi
             head_sha="$(git rev-parse HEAD 2>/dev/null || true)"
+            local code_head_sha="$head_sha"
             local metadata=".continuum-429-recovery.json"
-            CONTINUUM_INFRA_FAILURE_KIND="$failure_kind" python3 - "$metadata" "$operation" "$next_gen" "$stage" "$mode" "$issue_number" "$pr_number" "$base_sha" "$head_sha" "$current_branch" <<'PY' || true
+            local metadata_ok=true
+            local metadata_error=""
+            # kodmial/continuum#290/#350: fail closed on metadata generation.
+            # The previous production helper passed ten positional arguments
+            # but sliced only nine and masked the resulting ValueError with
+            # `|| true`, so the checkpoint ref was pushed without the
+            # identity file. Never mask this failure again.
+            if ! metadata_error="$(CONTINUUM_INFRA_FAILURE_KIND="$failure_kind" CONTINUUM_429_CHECKPOINT_REF="$checkpoint_ref" python3 - "$metadata" "$operation" "$next_gen" "$stage" "$mode" "$issue_number" "$pr_number" "$base_sha" "$code_head_sha" "$current_branch" <<'PY' 2>&1
           import json, os, sys
-          path, operation, gen, stage, mode, issue, pr, base, head, branch = sys.argv[1:10]
+          path, operation, gen, stage, mode, issue, pr, base, head, branch = sys.argv[1:11]
           with open(path, "w", encoding="utf-8") as handle:
               json.dump({
+                  "schema_version": 1,
                   "operation_id": operation,
                   "failure_kind": os.environ.get("CONTINUUM_INFRA_FAILURE_KIND", "quota_429"),
                   "generation": int(gen),
+                  "checkpoint_ref": os.environ.get("CONTINUUM_429_CHECKPOINT_REF", ""),
                   "stage": stage,
                   "mode": mode,
                   "issue_number": issue,
@@ -1973,41 +2163,90 @@ jobs:
                   "branch": branch,
               }, handle, indent=2, sort_keys=True)
           PY
-            if [[ -f "$metadata" ]]; then
+            )"; then
+              metadata_ok=false
+            fi
+            if [[ "$metadata_ok" == "true" ]] && ! continuum_validate_recovery_metadata "$metadata" "$operation" "$next_gen" "$stage" "$mode" "$issue_number" "$pr_number" "$base_sha" "$code_head_sha" "$current_branch" "$checkpoint_ref"; then
+              metadata_ok=false
+              metadata_error="generated metadata did not validate"
+            fi
+            local checkpoint_sha=""
+            if [[ "$metadata_ok" == "true" ]]; then
               git add "$metadata"
-              git commit -m "chore: record 429 recovery identity ${operation} gen ${next_gen}" \
+              if ! git commit -m "chore: record 429 recovery identity ${operation} gen ${next_gen}" \
                 -m "Continuum-Checkpoint-429-Operation: ${operation}" \
-                -m "Continuum-Component: opencode" || true
-              head_sha="$(git rev-parse HEAD 2>/dev/null || true)"
+                -m "Continuum-Component: opencode"; then
+                metadata_ok=false
+                metadata_error="metadata commit failed"
+              fi
+            fi
+            if [[ "$metadata_ok" == "true" ]]; then
+              checkpoint_sha="$(git rev-parse HEAD 2>/dev/null || true)"
+              local verify_file="${RUNNER_TEMP:-/tmp}/continuum-429-metadata-verify.json"
+              if ! git show "HEAD:$metadata" > "$verify_file" 2>/dev/null || \
+                 ! continuum_validate_recovery_metadata "$verify_file" "$operation" "$next_gen" "$stage" "$mode" "$issue_number" "$pr_number" "$base_sha" "$code_head_sha" "$current_branch" "$checkpoint_ref"; then
+                metadata_ok=false
+                metadata_error="committed metadata did not validate"
+              fi
             fi
             local evacuated_ok=false
-            if [[ -n "$head_sha" ]]; then
+            if [[ "$metadata_ok" != "true" ]]; then
+              # Preserve the raw code even when metadata cannot be proven.
+              # This is deliberately NOT a recoverable checkpoint pointer: the
+              # watchdog must never dispatch from it.
+              local salvage_ref="opencode/429-salvage-${operation}-gen-${next_gen}"
+              if [[ -n "$code_head_sha" ]]; then
+                if continuum_assert_safe_push "$salvage_ref"; then
+                  git push --force origin "${code_head_sha}:refs/heads/${salvage_ref}" || true
+                  echo "::warning::Preserved raw 429-interrupted work at salvage ref ${salvage_ref} (operation ${operation}, generation ${next_gen}); metadata is not recoverable."
+                else
+                  echo "::error::Continuum branch safety: refusing salvage push to '${salvage_ref}'; raw work remains local to the burned runner." >&2
+                fi
+              fi
+              metadata_error="$(printf '%s' "${metadata_error:-unknown metadata failure}" | tr '\n' ' ' | tr -s ' ' | cut -c1-300)"
+              echo "::error::CONTINUUM_OPENCODE_429_RECOVERY_METADATA_FAILED operation=${operation} generation=${next_gen} stage=${stage} mode=${mode} issue=${issue_number:-} pr=${pr_number:-} salvage_ref=${salvage_ref:-} reason=${metadata_error}"
+              echo "CONTINUUM_429_CHECKPOINT_REF=" >> "${GITHUB_ENV:-/dev/null}"
+              echo "CONTINUUM_429_SALVAGE_REF=${salvage_ref:-}" >> "${GITHUB_ENV:-/dev/null}"
+              echo "CONTINUUM_429_OPERATION=${operation}" >> "${GITHUB_ENV:-/dev/null}"
+            else
               # kodmial/continuum#302: checkpoint refs are permitted only as
               # proven non-default refs; fail closed before any mutation
               # when the destination is empty, ambiguous, or the discovered
               # default branch.
               continuum_assert_safe_push "$checkpoint_ref" || exit 1
               if git push --force origin "HEAD:refs/heads/${checkpoint_ref}"; then
-                evacuated_ok=true
-                echo "::warning::Evacuated ${checkpoint_class/infra/infrastructure} checkpoint ${checkpoint_ref} at exact SHA ${head_sha} (operation ${operation}, stage ${stage}, generation ${next_gen}, mode ${mode}, issue ${issue_number}, pr ${pr_number}, branch ${current_branch})."
-                # Optional legacy-branch mirror so scheduler-native resume
-                # keeps working after infrastructure cooldown even without a
-                # recovery dispatch (best effort; never fails the evacuation).
-                # kodmial/continuum#302: the mirror must still never alias
-                # the default branch; a refused mirror is cleared and
-                # skipped while the primary checkpoint still evacuates.
-                continuum_assert_safe_push "${CONTINUUM_429_LEGACY_REF}" || {
-                  echo "::error::Continuum branch safety: refusing legacy checkpoint mirror to '${CONTINUUM_429_LEGACY_REF}'." >&2
-                  CONTINUUM_429_LEGACY_REF=""
-                }
-                if [[ -n "${CONTINUUM_429_LEGACY_REF:-}" ]]; then
-                  git push --force origin "HEAD:refs/heads/${CONTINUUM_429_LEGACY_REF}" || true
+                local remote_tip=""
+                local remote_metadata="${RUNNER_TEMP:-/tmp}/continuum-429-metadata-remote.json"
+                if git fetch --no-tags origin "refs/heads/${checkpoint_ref}" --quiet 2>/dev/null; then
+                  remote_tip="$(git rev-parse FETCH_HEAD 2>/dev/null || true)"
+                fi
+                if [[ "${remote_tip,,}" != "${checkpoint_sha,,}" ]] || \
+                   ! git show "FETCH_HEAD:$metadata" > "$remote_metadata" 2>/dev/null || \
+                   ! continuum_validate_recovery_metadata "$remote_metadata" "$operation" "$next_gen" "$stage" "$mode" "$issue_number" "$pr_number" "$base_sha" "$code_head_sha" "$current_branch" "$checkpoint_ref"; then
+                  echo "::error::CONTINUUM_OPENCODE_429_RECOVERY_METADATA_FAILED operation=${operation} generation=${next_gen} stage=${stage} mode=${mode} issue=${issue_number:-} pr=${pr_number:-} salvage_ref=${checkpoint_ref} reason=pushed-checkpoint-metadata-could-not-be-verified"
+                  echo "CONTINUUM_429_CHECKPOINT_REF=" >> "${GITHUB_ENV:-/dev/null}"
+                  echo "CONTINUUM_429_OPERATION=${operation}" >> "${GITHUB_ENV:-/dev/null}"
+                  evacuated_ok=false
+                else
+                  evacuated_ok=true
+                  echo "::warning::Evacuated ${checkpoint_class/infra/infrastructure} checkpoint ${checkpoint_ref} at exact SHA ${checkpoint_sha} (operation ${operation}, stage ${stage}, generation ${next_gen}, mode ${mode}, issue ${issue_number}, pr ${pr_number}, branch ${current_branch})."
+                  # Optional legacy-branch mirror so scheduler-native resume
+                  # keeps working after infrastructure cooldown even without a
+                  # recovery dispatch (best effort; never fails the evacuation).
+                  # kodmial/continuum#302: the mirror must still never alias
+                  # the default branch; a refused mirror is cleared and
+                  # skipped while the primary checkpoint still evacuates.
+                  continuum_assert_safe_push "${CONTINUUM_429_LEGACY_REF}" || {
+                    echo "::error::Continuum branch safety: refusing legacy checkpoint mirror to '${CONTINUUM_429_LEGACY_REF}'." >&2
+                    CONTINUUM_429_LEGACY_REF=""
+                  }
+                  if [[ -n "${CONTINUUM_429_LEGACY_REF:-}" ]]; then
+                    git push --force origin "HEAD:refs/heads/${CONTINUUM_429_LEGACY_REF}" || true
+                  fi
                 fi
               else
-                echo "::warning::429 evacuation push failed for ${checkpoint_ref} at local SHA ${head_sha} (operation ${operation}, stage ${stage}, generation ${next_gen}); no durable checkpoint was published."
+                echo "::warning::429 evacuation push failed for ${checkpoint_ref} at local SHA ${checkpoint_sha} (operation ${operation}, stage ${stage}, generation ${next_gen}); no durable checkpoint was published."
               fi
-            else
-              echo "::warning::429 evacuation had no committable state; recording the marker without a checkpoint ref."
             fi
             if [[ "$failure_kind" == "quota_429" ]]; then
               : > "${RUNNER_TEMP:-/tmp}/continuum-opencode-429"
