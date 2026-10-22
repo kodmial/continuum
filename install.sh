@@ -8,25 +8,38 @@ set -euo pipefail
 # Continuum callers without the interactive confirmation. The variable is
 # honoured only for an exact `1`, `true` or `yes`; any other value, including
 # empty, `0` and `false`, leaves the confirmation in place.
+# An optional `--dry-run` prints the exact proposed add/update/keep/
+# ownership-conflict/prune plan and changes nothing. A remote-ref preview needs
+# network access but never credentials.
 # Installing into Continuum's own checkout is refused outright.
 # ref defaults to main. `core` is the task-domain layer every project needs;
 # `tech` is the opt-in consumer-neutral technology library (`continuum-tech-<tech>-`);
 # `parent` adds only child-execution callers.
 # Continuum never triggers its own technology library: consumers opt into it.
+#
+# The install is transactional for controlled errors: every template is fetched
+# and validated before the target is touched, uploads go through a temporary
+# file plus rename, and any overwritten or pruned file is backed up. If a
+# controlled apply/prune step then fails, the pre-install bytes are restored.
+# Atomic replacement of the whole multi-file directory across a process kill or
+# host crash is not promised; re-running the installer converges safely.
 DEST="${1:-.}"
 REF="${2:-main}"
 SET="${3:-core}"
-# `--yes` is accepted in any position and removed before positional parsing, so
-# the documented argument shape stays `[path] [ref] [set]` and an existing
-# invocation is unaffected. It is the only way to skip the prune confirmation.
+# `--yes` and `--dry-run` are accepted in any position and removed before
+# positional parsing, so the documented argument shape stays
+# `[path] [ref] [set]` and an existing invocation is unaffected. `--yes` is the
+# only way to skip the prune confirmation.
 # POSITIONAL counts the non-flag arguments, because the local-vs-remote
-# template choice below must ignore the flag.
+# template choice below must ignore the flags.
 POSITIONAL=0
 ASSUME_YES=no
+DRY_RUN=no
 ARGV=()
 for arg in "$@"; do
   case "$arg" in
     --yes) ASSUME_YES=yes ;;
+    --dry-run) DRY_RUN=yes ;;
     *) ARGV+=("$arg"); POSITIONAL=$((POSITIONAL + 1)) ;;
   esac
 done
@@ -40,8 +53,19 @@ case "$SET" in
   *) echo "invalid set: $SET (the old 'swift' set is now 'tech')" >&2; exit 1 ;;
 esac
 [[ "$REF" =~ ^[A-Za-z0-9._/-]+$ ]] || { echo "invalid ref: $REF" >&2; exit 1; }
-if [[ ! -d "$DEST/.github/workflows" ]]; then
-  mkdir -p "$DEST/.github/workflows"
+# Reject an unusable target shape before creating anything. A preview must not
+# even make the directory, so the write-side mkdirs happen only after preflight.
+if [[ -e "$DEST" && ! -d "$DEST" ]]; then
+  echo "invalid target: $DEST is not a directory" >&2
+  exit 1
+fi
+if [[ -e "$DEST/.github" && ! -d "$DEST/.github" ]]; then
+  echo "invalid target: $DEST/.github is not a directory" >&2
+  exit 1
+fi
+if [[ -e "$DEST/.github/workflows" && ! -d "$DEST/.github/workflows" ]]; then
+  echo "invalid target: $DEST/.github/workflows is not a directory" >&2
+  exit 1
 fi
 # The three layers, each stored under the exact name it installs as. There is
 # one naming rule in Continuum and no exception list: a caller is stored as
@@ -114,7 +138,14 @@ else
   LOCAL_STUBS_DIR=""
   SELF_DIR=""
 fi
-TARGET_DIR="$(cd "$DEST/.github/workflows" && pwd)"
+DEST_ABS=""
+if [[ -d "$DEST" ]]; then
+  DEST_ABS="$(cd "$DEST" && pwd)"
+fi
+TARGET_DIR=""
+if [[ -n "$DEST_ABS" ]]; then
+  TARGET_DIR="$DEST_ABS/.github/workflows"
+fi
 # Installing into Continuum's own checkout is never a consumer install, and it
 # is not a harmless one. This repository's `.github/workflows/` holds the real
 # core workflows; the files this script writes are thin caller stubs that
@@ -123,12 +154,12 @@ TARGET_DIR="$(cd "$DEST/.github/workflows" && pwd)"
 # insertions, 6413 deletions, i.e. the loss of every core workflow body in the
 # repository.
 #
-# Skipping the prune (below) is not enough, because the WRITE is the
-# destructive half and it happens first. So this refuses outright, before a
-# single byte is written, and says why. Refusing loudly is the only safe
-# answer: silently installing nothing would look like a success and leave the
-# operator no signal that their repository was skipped.
-if [[ -n "$SELF_DIR" && "$TARGET_DIR" == "$SELF_DIR/.github/workflows" ]]; then
+# This refuses outright, before a single byte is written, and says why.
+# Refusing loudly is the only safe answer: silently installing nothing would
+# look like a success and leave the operator no signal that their repository
+# was skipped.
+if [[ -n "$SELF_DIR" && -n "$DEST_ABS" &&
+      ( "$DEST_ABS" == "$SELF_DIR" || "$TARGET_DIR" == "$SELF_DIR/.github/workflows" ) ]]; then
   cat >&2 <<EOF
 refusing to install: the target is Continuum's own checkout ($TARGET_DIR).
 
@@ -144,54 +175,160 @@ installer at a consumer repository instead:
 EOF
   exit 1
 fi
-# The stored stub name is the installed name, verbatim: the loop variable is
-# written straight to the destination, so a repository file name and the
-# consumer file name are always the same string and cannot drift apart.
+# A Continuum-owned caller is one this project wrote. The marker is the
+# repository reference on a real `uses:` line, not the file name: every caller
+# this installer writes carries that call, while a hand-written file that
+# merely borrows the `continuum-` prefix or cites the path in a comment does
+# not. The pinned revision is deliberately irrelevant, so a caller installed at
+# an older ref is still recognised and remains upgradable.
+is_continuum_artifact() {
+  local file="$1" base="${1##*/}"
+  [[ "$base" == continuum-* ]] || return 1
+  grep -qE '^[[:space:]]*-?[[:space:]]*uses:[[:space:]]*["'"'"']?kodmial/continuum/\.github/workflows/' \
+    "$file" 2>/dev/null || return 1
+  return 0
+}
+# Stage templates and backups outside the live target files. The directory is
+# private to this run and is removed on exit, including after a failed apply.
+STAGE_DIR="$(mktemp -d "${TMPDIR:-/tmp}/continuum-install.XXXXXX")" ||
+  { echo "unable to create a staging directory" >&2; exit 1; }
+cleanup_stage() {
+  if [[ -n "$STAGE_DIR" && -d "$STAGE_DIR" ]]; then
+    rm -rf "$STAGE_DIR"
+  fi
+}
+trap cleanup_stage EXIT
+mkdir -p "$STAGE_DIR/raw" "$STAGE_DIR/prepared" "$STAGE_DIR/backup"
+# Preflight: fetch and prepare every requested template before the target is
+# touched. A failed download, an empty/corrupt body, or a template that does not
+# look like a Continuum caller stops the install with no partial write.
+validate_template() {
+  local file="$1" name="$2"
+  if ! grep -qE '[^[:space:]]' "$file"; then
+    echo "invalid template: $name is empty" >&2
+    return 1
+  fi
+  if ! grep -qE '^[[:space:]]*jobs:[[:space:]]*(#.*)?$' "$file"; then
+    echo "invalid template: $name has no jobs block" >&2
+    return 1
+  fi
+  if ! grep -qE '^[[:space:]]*-?[[:space:]]*uses:[[:space:]]*["'"'"']?kodmial/continuum/\.github/workflows/' "$file"; then
+    echo "invalid template: $name does not call a Continuum workflow" >&2
+    return 1
+  fi
+  return 0
+}
+REMOTE_USED=no
 for f in "${STUBS[@]}"; do
+  raw="$STAGE_DIR/raw/$f"
+  prepared="$STAGE_DIR/prepared/$f"
   # Canonical main installs are byte copies. Do not pass them through command
   # substitution: POSIX shells strip trailing newlines from $(...), which would
   # manufacture a diff even when the source and destination are the same
   # canonical caller.
   if [[ "$REF" == "main" ]]; then
     if [[ $POSITIONAL -lt 2 && -f "$LOCAL_STUBS_DIR/$f" ]]; then
-      cat "$LOCAL_STUBS_DIR/$f" > "$DEST/.github/workflows/$f"
+      if ! cat "$LOCAL_STUBS_DIR/$f" > "$raw"; then
+        echo "failed to read local template: $f" >&2
+        exit 1
+      fi
     else
-      curl -fsSL "$BASE/$f" > "$DEST/.github/workflows/$f"
+      REMOTE_USED=yes
+      if ! curl -fsSL "$BASE/$f" > "$raw"; then
+        echo "failed to fetch template: $f ($BASE/$f)" >&2
+        exit 1
+      fi
     fi
-    continue
-  fi
-
-  if [[ $POSITIONAL -lt 2 && -f "$LOCAL_STUBS_DIR/$f" ]]; then
-    template="$(cat "$LOCAL_STUBS_DIR/$f")"
+    if ! cp "$raw" "$prepared"; then
+      echo "failed to prepare template: $f" >&2
+      exit 1
+    fi
   else
-    template="$(curl -fsSL "$BASE/$f")"
+    if [[ $POSITIONAL -lt 2 && -f "$LOCAL_STUBS_DIR/$f" ]]; then
+      if ! cat "$LOCAL_STUBS_DIR/$f" > "$raw"; then
+        echo "failed to read local template: $f" >&2
+        exit 1
+      fi
+    else
+      REMOTE_USED=yes
+      if ! curl -fsSL "$BASE/$f" > "$raw"; then
+        echo "failed to fetch template: $f ($BASE/$f)" >&2
+        exit 1
+      fi
+    fi
+    template="$(cat "$raw")"
+    # Use the same revision for the workflow and its fallback scripts.
+    #
+    # A `uses:` line is legal at two levels: job-level (`  call:` then
+    # `    uses: ...`) and step-level (`      - uses: ...`). The optional `-`
+    # is what makes the step form match; without it the ref silently stays
+    # `main` on any caller that composes another workflow as a step, which is
+    # exactly the guarantee the ref parameter exists to provide.
+    #
+    # Each pattern is anchored so an unrelated `main` elsewhere in the template
+    # is never rewritten, and the anchor tolerates the things a real line can
+    # carry after the ref without treating any of them as part of it:
+    #   - a trailing YAML comment (`@main # pinned`), re-emitted verbatim;
+    #   - surrounding quotes, which are part of the YAML scalar and not of the
+    #     ref, re-emitted verbatim;
+    #   - trailing whitespace, including the CR of a CRLF checkout, re-emitted
+    #     verbatim.
+    # Each of those ends the match, so a line that merely *contains* `main` — a
+    # third-party action, an `@branch-main` tag, a `run:` body — never matches.
+    # `@main` with no space before a `#` is deliberately NOT rewritten: YAML
+    # requires whitespace to open a comment, so `#` there is part of the ref.
+    # Non-main refs are test/development overrides. The ref is written as a
+    # double-quoted YAML scalar rather than a bare or single-quoted one.
+    if ! printf '%s\n' "$template" | sed -E \
+      -e "s|^([[:space:]]*-?[[:space:]]*uses:[[:space:]]*[\"']?kodmial/continuum/\.github/workflows/[^@[:space:]\"']*)@main([\"']?)([[:space:]]+#.*)?([[:space:]]*)$|\1@$REF\2\3\4|" \
+      -e "s|^([[:space:]]*-?[[:space:]]*(continuum_ref\|engine_ref):[[:space:]]*)main([[:space:]]+#.*)?([[:space:]]*)$|\1\"$REF\"\3\4|" \
+      > "$prepared"; then
+      echo "failed to rewrite template: $f" >&2
+      exit 1
+    fi
   fi
-  # Use the same revision for the workflow and its fallback scripts.
-  #
-  # A `uses:` line is legal at two levels: job-level (`  call:` then
-  # `    uses: ...`) and step-level (`      - uses: ...`). The optional `-`
-  # is what makes the step form match; without it the ref silently stays
-  # `main` on any caller that composes another workflow as a step, which is
-  # exactly the guarantee the ref parameter exists to provide.
-  #
-  # Each pattern is anchored so an unrelated `main` elsewhere in the template
-  # is never rewritten, and the anchor tolerates the things a real line can
-  # carry after the ref without treating any of them as part of it:
-  #   - a trailing YAML comment (`@main # pinned`), re-emitted verbatim;
-  #   - surrounding quotes, which are part of the YAML scalar and not of the
-  #     ref, re-emitted verbatim;
-  #   - trailing whitespace, including the CR of a CRLF checkout, re-emitted
-  #     verbatim.
-  # Each of those ends the match, so a line that merely *contains* `main` — a
-  # third-party action, an `@branch-main` tag, a `run:` body — never matches.
-  # `@main` with no space before a `#` is deliberately NOT rewritten: YAML
-  # requires whitespace to open a comment, so `#` there is part of the ref.
-  # Non-main refs are test/development overrides. The ref is written as a
-  # double-quoted YAML scalar rather than a bare or single-quoted one.
-  printf '%s\n' "$template" | sed -E \
-    -e "s|^([[:space:]]*-?[[:space:]]*uses:[[:space:]]*[\"']?kodmial/continuum/\.github/workflows/[^@[:space:]\"']*)@main([\"']?)([[:space:]]+#.*)?([[:space:]]*)$|\1@$REF\2\3\4|" \
-    -e "s|^([[:space:]]*-?[[:space:]]*(continuum_ref\|engine_ref):[[:space:]]*)main([[:space:]]+#.*)?([[:space:]]*)$|\1\"$REF\"\3\4|" \
-    > "$DEST/.github/workflows/$f"
+  validate_template "$prepared" "$f" || exit 1
+done
+if [[ "$DRY_RUN" == yes && "$REMOTE_USED" == yes ]]; then
+  echo "preview: templates fetched from $BASE (network access required; no credentials are used)"
+fi
+# Classify each target before any mutation. A target this installer did not
+# write is an ownership conflict, never an implicit overwrite: fail closed and
+# tell the operator how to resolve it. `cmp` prevents a same-version reinstall
+# from touching bytes at all.
+TARGET_WORKFLOWS="$DEST/.github/workflows"
+ADD_FILES=()
+UPDATE_FILES=()
+KEEP_FILES=()
+CONFLICT_FILES=()
+CONFLICT_DETAILS=()
+PLAN_ACTIONS=()
+for f in "${STUBS[@]}"; do
+  target="$TARGET_WORKFLOWS/$f"
+  if [[ -L "$target" ]]; then
+    PLAN_ACTIONS+=("ownership-conflict")
+    CONFLICT_FILES+=("$f")
+    CONFLICT_DETAILS+=("$f is a symlink, not a regular installer-owned file")
+  elif [[ -e "$target" ]]; then
+    if [[ ! -f "$target" ]]; then
+      PLAN_ACTIONS+=("ownership-conflict")
+      CONFLICT_FILES+=("$f")
+      CONFLICT_DETAILS+=("$f exists but is not a regular file")
+    elif cmp -s "$STAGE_DIR/prepared/$f" "$target"; then
+      PLAN_ACTIONS+=("keep")
+      KEEP_FILES+=("$f")
+    elif is_continuum_artifact "$target"; then
+      PLAN_ACTIONS+=("update")
+      UPDATE_FILES+=("$f")
+    else
+      PLAN_ACTIONS+=("ownership-conflict")
+      CONFLICT_FILES+=("$f")
+      CONFLICT_DETAILS+=("$f is not recognised as a Continuum-owned caller (no Continuum uses: line)")
+    fi
+  else
+    PLAN_ACTIONS+=("add")
+    ADD_FILES+=("$f")
+  fi
 done
 # Supersession: a renamed or dropped stub must not leave a stale caller behind
 # in the consumer, or the old file keeps running next to its replacement.
@@ -201,47 +338,21 @@ done
 #
 # 1. Ownership. A file is a Continuum artifact only if its name carries the
 #    uniform `continuum-` prefix *and* it really calls one of this
-#    repository's workflows on a `uses:` line. Every caller this installer
-#    writes carries that call, so the test never rejects a real artifact; a
-#    hand-written `continuum-experiment.yml` that merely borrows the prefix —
-#    or that only mentions the repository path in a comment — fails it and is
-#    left alone. Neither the prefix nor the mention alone is ownership
-#    evidence.
+#    repository's workflows on a `uses:` line. Neither the prefix nor a
+#    comment mention alone is ownership evidence.
 # 2. Intent. The exact list is printed and must be confirmed at a terminal.
-#    Non-interactive runs delete nothing and say so, so a CI install can never
-#    silently drop a file. `--yes` or CONTINUUM_INSTALL_ASSUME_YES=1 is the
-#    explicit opt-out for an unattended install that does want the prune.
-# 3. Self-install. Installing into Continuum's own checkout is never a consumer
-#    install, so pruning is skipped entirely and the repository's own
-#    workflows stay untouched.
+#    Non-interactive runs delete nothing and say so. `--yes` or
+#    CONTINUUM_INSTALL_ASSUME_YES=1 is the explicit opt-out for an unattended
+#    install that does want the prune. A preview only lists the candidates.
+# 3. Self-install. Installing into Continuum's own checkout is refused before
+#    this point, so its own workflows are never candidates.
 #
-# The other two layers' callers are never candidates: ALL_STUBS spans all three
+# The other layers' callers are never candidates: ALL_STUBS spans all three
 # layers, so installing one set cannot delete another set's files.
-# The self-install case never reaches this point: it is refused before the
-# write loop above, because writing caller stubs over this repository's own
-# core workflows is the destructive half. The branch below remains as a
-# second, independent fence on the DELETE half only.
 ALL_STUBS=("${CORE_STUBS[@]}" "${TECH_STUBS[@]}" "${PARENT_STUBS[@]}")
-# A Continuum-owned caller is one this project wrote. The marker is the
-# repository reference inside it, not the file name.
-is_continuum_artifact() {
-  local file="$1" base="${1##*/}"
-  [[ "$base" == continuum-* ]] || return 1
-  # The marker must be a real `uses:` call, not merely the string somewhere in
-  # the body. A bare `grep` for the repository path also matches a hand-written
-  # file that only cites Continuum in a comment, and such a file is still
-  # project-owned work the installer never wrote. Anchoring on a `uses:` line
-  # is what makes this ownership evidence: every caller this installer writes
-  # calls one of this repository's workflows, and nothing else does.
-  grep -qE '^[[:space:]]*-?[[:space:]]*uses:[[:space:]]*["'"'"']?kodmial/continuum/\.github/workflows/' \
-    "$file" 2>/dev/null || return 1
-  return 0
-}
-if [[ -n "$SELF_DIR" && "$TARGET_DIR" == "$SELF_DIR/.github/workflows" ]]; then
-  echo "target is Continuum's own checkout: skipping superseded-caller prune"
-else
-  superseded=()
-  for installed in "$DEST"/.github/workflows/continuum-*.yml; do
+SUPERSEDED=()
+if [[ -d "$TARGET_WORKFLOWS" ]]; then
+  for installed in "$TARGET_WORKFLOWS"/continuum-*.yml; do
     [[ -f "$installed" ]] || continue
     stale="${installed##*/}"
     known=no
@@ -250,31 +361,148 @@ else
     done
     [[ "$known" == yes ]] && continue
     is_continuum_artifact "$installed" || continue
-    superseded+=("$stale")
+    SUPERSEDED+=("$stale")
   done
-  if [[ ${#superseded[@]} -eq 0 ]]; then
-    :
+fi
+# Print the exact plan. It is the whole user-visible contract of `--dry-run`,
+# and it is equally truthful during a real install.
+for i in "${!STUBS[@]}"; do
+  echo "${PLAN_ACTIONS[$i]}: ${STUBS[$i]}"
+done
+for stale in ${SUPERSEDED[@]+"${SUPERSEDED[@]}"}; do
+  echo "prune: $stale"
+done
+if [[ ${#CONFLICT_FILES[@]} -gt 0 ]]; then
+  for i in "${!CONFLICT_FILES[@]}"; do
+    echo "ownership-conflict: ${CONFLICT_FILES[$i]}: ${CONFLICT_DETAILS[$i]}" >&2
+  done
+  cat >&2 <<EOF
+refusing to install: ${#CONFLICT_FILES[@]} target file(s) are not Continuum-owned.
+
+The installer never overwrites a file it cannot prove it wrote. Move or rename
+the conflicting file(s) above, then re-run the installer. There is no implicit
+force flag: a consumer-owned workflow stays untouched.
+EOF
+  exit 1
+fi
+# Prune intent is decided before the transactional apply so a declined prompt
+# cannot leave a half-finished run.
+PRUNE=no
+if [[ ${#SUPERSEDED[@]} -gt 0 ]]; then
+  if [[ "$DRY_RUN" == yes ]]; then
+    if [[ "$ASSUME_YES" != yes ]]; then
+      echo "preview: these prune entries need --yes or terminal confirmation when applying"
+    fi
   elif [[ "$ASSUME_YES" == yes ]]; then
-    for stale in "${superseded[@]}"; do
-      rm -f "$DEST/.github/workflows/$stale"
-      echo "removed superseded Continuum caller: $stale"
-    done
+    PRUNE=yes
   elif [[ -t 0 && -t 1 ]]; then
     echo "Continuum no longer ships these callers; they are superseded and can be removed:"
-    printf '  %s\n' "${superseded[@]}"
-    read -r -p "Remove these ${#superseded[@]} file(s)? [y/N] " reply
+    printf '  %s\n' "${SUPERSEDED[@]}"
+    read -r -p "Remove these ${#SUPERSEDED[@]} file(s)? [y/N] " reply
     if [[ "$reply" =~ ^[Yy]$ ]]; then
-      for stale in "${superseded[@]}"; do
-        rm -f "$DEST/.github/workflows/$stale"
-        echo "removed superseded Continuum caller: $stale"
-      done
+      PRUNE=yes
     else
       echo "left in place (re-run with --yes to prune non-interactively)"
     fi
   else
     echo "non-interactive install: not removing superseded Continuum callers."
-    printf '  would remove: %s\n' "${superseded[@]}"
+    printf '  would remove: %s\n' "${SUPERSEDED[@]}"
     echo "re-run with --yes (or CONTINUUM_INSTALL_ASSUME_YES=1) to prune"
   fi
+fi
+if [[ "$DRY_RUN" == yes ]]; then
+  echo "dry-run: no files were changed"
+  exit 0
+fi
+# Transactional apply. Every overwritten/pruned file is backed up first; each
+# write lands in a temporary file next to the target and is then renamed, so a
+# controlled failure cannot leave a half-written caller. If any step fails, the
+# original bytes (including pruned files) are restored.
+CREATED_DIRS=()
+ADDED_FILES=()
+TEMP_FILES=()
+RESTORE_FILES=("${UPDATE_FILES[@]}")
+if [[ "$PRUNE" == yes ]]; then
+  RESTORE_FILES+=("${SUPERSEDED[@]}")
+fi
+ensure_dir() {
+  local dir="$1"
+  [[ -d "$dir" ]] && return 0
+  mkdir -p "$dir" || return 1
+  CREATED_DIRS+=("$dir")
+  return 0
+}
+rollback() {
+  local f i rollback_failed=no
+  for f in ${ADDED_FILES[@]+"${ADDED_FILES[@]}"}; do
+    rm -f "$TARGET_WORKFLOWS/$f" 2>/dev/null || rollback_failed=yes
+  done
+  for f in ${TEMP_FILES[@]+"${TEMP_FILES[@]}"}; do
+    rm -f "$TARGET_WORKFLOWS/$f" 2>/dev/null || rollback_failed=yes
+  done
+  for f in ${RESTORE_FILES[@]+"${RESTORE_FILES[@]}"}; do
+    if [[ -f "$STAGE_DIR/backup/$f" ]]; then
+      cp -p "$STAGE_DIR/backup/$f" "$TARGET_WORKFLOWS/$f" 2>/dev/null || rollback_failed=yes
+    fi
+  done
+  for ((i = ${#CREATED_DIRS[@]} - 1; i >= 0; i--)); do
+    rmdir "${CREATED_DIRS[$i]}" 2>/dev/null || true
+  done
+  [[ "$rollback_failed" == no ]] || echo "warning: rollback could not fully restore the target" >&2
+}
+apply_ok=yes
+if ! ensure_dir "$DEST" || ! ensure_dir "$DEST/.github" || ! ensure_dir "$TARGET_WORKFLOWS"; then
+  apply_ok=no
+fi
+if [[ "$apply_ok" == yes ]]; then
+  for f in ${RESTORE_FILES[@]+"${RESTORE_FILES[@]}"}; do
+    if ! cp -p "$TARGET_WORKFLOWS/$f" "$STAGE_DIR/backup/$f"; then
+      echo "failed to back up: $f" >&2
+      apply_ok=no
+      break
+    fi
+  done
+fi
+write_target() {
+  local f="$1" tmp
+  tmp="$TARGET_WORKFLOWS/.continuum-install-${f}.$$"
+  TEMP_FILES+=("$(basename "$tmp")")
+  cp "$STAGE_DIR/prepared/$f" "$tmp" || return 1
+  mv -f "$tmp" "$TARGET_WORKFLOWS/$f" || return 1
+  return 0
+}
+if [[ "$apply_ok" == yes ]]; then
+  for f in ${ADD_FILES[@]+"${ADD_FILES[@]}"}; do
+    ADDED_FILES+=("$f")
+    if ! write_target "$f"; then
+      echo "failed to install: $f" >&2
+      apply_ok=no
+      break
+    fi
+  done
+fi
+if [[ "$apply_ok" == yes ]]; then
+  for f in ${UPDATE_FILES[@]+"${UPDATE_FILES[@]}"}; do
+    if ! write_target "$f"; then
+      echo "failed to update: $f" >&2
+      apply_ok=no
+      break
+    fi
+  done
+fi
+if [[ "$apply_ok" == yes && "$PRUNE" == yes ]]; then
+  for stale in "${SUPERSEDED[@]}"; do
+    if ! rm -f "$TARGET_WORKFLOWS/$stale"; then
+      echo "failed to prune: $stale" >&2
+      apply_ok=no
+      break
+    fi
+    echo "removed superseded Continuum caller: $stale"
+  done
+fi
+if [[ "$apply_ok" != yes ]]; then
+  rollback
+  echo "installation failed; restored the pre-install target files" >&2
+  exit 1
 fi
 echo "Continuum callers installed to $DEST/.github/workflows/ (set: $SET, ref: $REF)"
