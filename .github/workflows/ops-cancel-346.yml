@@ -51,6 +51,23 @@ jobs:
               if (err.status !== 409 && err.status !== 422) throw err;
               core.notice('Cancellation raced terminal state: ' + err.status);
             }
+            // The ordinary cancel was accepted but the worker is still running.
+            // Force-cancel only this exact verified run if it has not terminated.
+            await new Promise(resolve => setTimeout(resolve, 10000));
+            const { data: afterCancel } = await github.rest.actions.getWorkflowRun({
+              owner, repo, run_id,
+            });
+            if (afterCancel.status !== 'completed') {
+              try {
+                await github.request('POST /repos/{owner}/{repo}/actions/runs/{run_id}/force-cancel', {
+                  owner, repo, run_id,
+                });
+                core.notice('Sent force-cancel for verified issue #346 run #' + run_id);
+              } catch (err) {
+                if (err.status !== 409 && err.status !== 422) throw err;
+                core.notice('Force cancel raced terminal state: ' + err.status);
+              }
+            }
             for (let i = 0; i < 18; i++) {
               await new Promise(resolve => setTimeout(resolve, 5000));
               const { data: updated } = await github.rest.actions.getWorkflowRun({
