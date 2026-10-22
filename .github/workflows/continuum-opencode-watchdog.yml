@@ -417,49 +417,86 @@ jobs:
             async function readCheckpointMetadata({
               operation, generation, checkpointRef, checkpointSha,
             }) {
-              let exactSha = String(checkpointSha || '').trim().toLowerCase();
-              let lastError = null;
+              const pointerSha = String(checkpointSha || '').trim().toLowerCase();
+              let refSha = '';
+              let refError = null;
+              // Resolve the durable ref first. The ref tip, not a possibly
+              // stale event pointer, is what a fresh runner can actually
+              // fetch. A transient 404 is retried (eventual visibility), but
+              // a ref that never appears is a provably missing checkpoint.
               for (let attempt = 0; attempt < 7; attempt += 1) {
                 try {
-                  if (!exactSha) {
-                    const refResponse = await readGithub.rest.git.getRef({
-                      owner, repo, ref: 'heads/' + checkpointRef,
-                    });
-                    exactSha = String(refResponse.data.object.sha || '').toLowerCase();
-                  }
-                  const content = await readGithub.rest.repos.getContent({
-                    owner, repo, path: '.continuum-429-recovery.json', ref: exactSha,
+                  const refResponse = await readGithub.rest.git.getRef({
+                    owner, repo, ref: 'heads/' + checkpointRef,
                   });
-                  if (Array.isArray(content.data) || content.data.type !== 'file') {
-                    return { ok: false, kind: 'invalid', reason: 'recovery metadata is not a file', exactSha };
-                  }
-                  const identity = JSON.parse(
-                    Buffer.from(content.data.content, 'base64').toString('utf8')
-                  );
-                  return { ok: true, identity, exactSha };
+                  refSha = String(refResponse.data.object.sha || '').toLowerCase();
+                  refError = null;
+                  break;
                 } catch (err) {
-                  lastError = err;
+                  refError = err;
                   const status = Number(err && err.status || 0);
-                  if (status === 404 && attempt < 6) {
-                    await new Promise(resolve => setTimeout(resolve, 1000 * Math.pow(2, attempt)));
-                    continue;
+                  if (status !== 404) {
+                    return {
+                      ok: false,
+                      kind: status === 401 || status === 403 ? 'auth' : 'transient',
+                      status,
+                      reason: String(err && err.message || err),
+                      exactSha: pointerSha,
+                      stalePointer: false,
+                    };
                   }
-                  return {
-                    ok: false,
-                    kind: status === 404 ? 'missing' : (status === 401 || status === 403 ? 'auth' : 'transient'),
-                    status,
-                    reason: String(err && err.message || err),
-                    exactSha,
-                  };
+                  if (attempt < 6) {
+                    await new Promise(resolve => setTimeout(resolve, 1000 * Math.pow(2, attempt)));
+                  }
                 }
               }
-              return {
-                ok: false,
-                kind: 'transient',
-                status: Number(lastError && lastError.status || 0),
-                reason: String(lastError && lastError.message || lastError || 'metadata unreadable'),
-                exactSha,
-              };
+              if (!refSha) {
+                return {
+                  ok: false,
+                  kind: 'missing',
+                  status: Number(refError && refError.status || 0),
+                  reason: 'checkpoint ref ' + checkpointRef + ' is not visible',
+                  exactSha: pointerSha,
+                  stalePointer: false,
+                };
+              }
+              // The event pointer can be stale after a duplicate evacuation
+              // force-updated the same generation. The ref tip is newer and
+              // reviewable, so prefer it; record the mismatch for operators.
+              const exactSha = refSha;
+              const stalePointer = Boolean(pointerSha) && pointerSha !== refSha;
+              try {
+                const content = await readGithub.rest.repos.getContent({
+                  owner, repo, path: '.continuum-429-recovery.json', ref: exactSha,
+                });
+                if (Array.isArray(content.data) || content.data.type !== 'file') {
+                  return {
+                    ok: false, kind: 'invalid',
+                    reason: 'recovery metadata is not a file',
+                    exactSha, stalePointer,
+                  };
+                }
+                const identity = JSON.parse(
+                  Buffer.from(content.data.content, 'base64').toString('utf8')
+                );
+                return { ok: true, identity, exactSha, stalePointer };
+              } catch (err) {
+                const status = Number(err && err.status || 0);
+                // The commit is known (the ref resolved), so a 404 here
+                // proves the metadata file is absent rather than merely
+                // still becoming visible.
+                let kind = 'transient';
+                if (status === 404 || status === 422) kind = 'missing';
+                else if (status === 401 || status === 403) kind = 'auth';
+                return {
+                  ok: false,
+                  kind,
+                  status,
+                  reason: String(err && err.message || err),
+                  exactSha,
+                  stalePointer,
+                };
+              }
             }
 
             async function resolveDispatchTarget(runPath) {
@@ -663,7 +700,17 @@ jobs:
                 );
                 return;
               }
-              const checkpointSha = pointerSha || metadata.exactSha;
+              // The ref tip is authoritative for a fetchable checkpoint; a
+              // stale event pointer must not dispatch an older SHA than the
+              // ref now exposes.
+              const checkpointSha = metadata.exactSha || pointerSha;
+              if (metadata.stalePointer) {
+                core.warning(
+                  'OpenCode infrastructure checkpoint ' + checkpointRef +
+                  ' advanced from stale event pointer ' + pointerSha +
+                  ' to current ref tip ' + checkpointSha + '; using the tip.'
+                );
+              }
 
               const comments = await listThreadComments(threadNumber);
               const previous = latestRecoveryState(comments, operation, generation);

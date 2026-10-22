@@ -106,6 +106,17 @@ DEFAULT_MAX_429_RUNNER_RESTARTS = 3
 #: Prefix for workflow-owned durable checkpoint refs.
 CHECKPOINT_REF_PREFIX = "opencode/429-checkpoint-"
 
+#: Infrastructure-unavailable (non-429) checkpoints use a sibling namespace
+#: so a provider outage is still recoverable with the same exact-SHA
+#: contract. Both namespaces validate and restore identically.
+INFRA_CHECKPOINT_REF_PREFIX = "opencode/infra-checkpoint-"
+
+#: Every accepted workflow-owned checkpoint namespace.
+CHECKPOINT_REF_PREFIXES = (
+    CHECKPOINT_REF_PREFIX,
+    INFRA_CHECKPOINT_REF_PREFIX,
+)
+
 #: Workflow-owned progress file an agent maintains while it works. The agent
 #: writes a single lifecycle stage name (see :data:`STAGES`) as it completes
 #: each phase; the workflow-owned 429 evacuator reads it back (no LLM call)
@@ -150,6 +161,7 @@ _REQUIRED_METADATA_FIELDS = (
     "base_sha",
     "head_sha",
     "branch",
+    "checkpoint_ref",
 )
 
 #: Modes whose fresh-run path can continue without the agent, so an honest
@@ -356,15 +368,17 @@ def parse_checkpoint_ref(ref: Any) -> Optional[Dict[str, Any]]:
     """Parse a checkpoint ref back into operation+generation, or None."""
 
     text = str(ref or "").strip()
-    if not text.startswith(CHECKPOINT_REF_PREFIX):
-        return None
-    rest = text[len(CHECKPOINT_REF_PREFIX):]
-    if "-gen-" not in rest:
-        return None
-    operation, _, generation = rest.rpartition("-gen-")
-    if not operation or not generation.isdigit():
-        return None
-    return {"operation_id": operation, "generation": int(generation)}
+    for prefix in CHECKPOINT_REF_PREFIXES:
+        if not text.startswith(prefix):
+            continue
+        rest = text[len(prefix):]
+        if "-gen-" not in rest:
+            return None
+        operation, _, generation = rest.rpartition("-gen-")
+        if not operation or not generation.isdigit():
+            return None
+        return {"operation_id": operation, "generation": int(generation)}
+    return None
 
 
 def next_generation(generation: Any) -> int:
@@ -586,6 +600,7 @@ def validate_recovery_metadata(
     stage: Any = None,
     head_sha: Any = None,
     branch: Any = None,
+    checkpoint_ref: Any = None,
 ) -> Tuple[bool, str]:
     """Validate complete checkpoint recovery metadata. Returns (ok, reason).
 
@@ -652,6 +667,18 @@ def validate_recovery_metadata(
         return False, "recovery metadata branch is empty"
     if not str(metadata.get("head_ref") or "").strip():
         return False, "recovery metadata head ref is empty"
+    metadata_checkpoint = str(metadata.get("checkpoint_ref") or "").strip()
+    if not metadata_checkpoint.startswith(CHECKPOINT_REF_PREFIX) and not (
+        metadata_checkpoint.startswith("opencode/infra-checkpoint-")
+    ):
+        return False, "recovery metadata checkpoint ref is malformed"
+    parsed_checkpoint = parse_checkpoint_ref(metadata_checkpoint)
+    if parsed_checkpoint is None:
+        return False, "recovery metadata checkpoint ref is malformed"
+    if parsed_checkpoint["operation_id"] != operation:
+        return False, "recovery metadata checkpoint ref does not match the operation"
+    if parsed_checkpoint["generation"] != gen:
+        return False, "recovery metadata checkpoint ref does not match the generation"
 
     if operation_id not in (None, "") and _safe_token(operation_id) != operation:
         return False, "recovery metadata operation does not match the pointer"
@@ -671,6 +698,8 @@ def validate_recovery_metadata(
         metadata.get("branch") or ""
     ).strip():
         return False, "recovery metadata branch does not match the pointer"
+    if checkpoint_ref not in (None, "") and str(checkpoint_ref).strip() != metadata_checkpoint:
+        return False, "recovery metadata checkpoint ref does not match the pointer"
     return True, "recovery metadata is valid"
 
 
@@ -897,6 +926,8 @@ __all__ = [
     "DEFAULT_MAX_429_RUNNER_RESTARTS",
     "FAIL_CLOSED_STATUSES",
     "INFRA_BACKOFF_SCHEDULE",
+    "INFRA_CHECKPOINT_REF_PREFIX",
+    "CHECKPOINT_REF_PREFIXES",
     "MODES_HONORING_STAGE_FILE",
     "PUBLISH_RACE_MARKER",
     "RECOVERY_METADATA_FAILED_MARKER",

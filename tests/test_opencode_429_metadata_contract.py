@@ -77,12 +77,45 @@ class RecoveryMetadataTest(unittest.TestCase):
             "base_sha",
             "head_sha",
             "branch",
+            "checkpoint_ref",
         ):
             data = metadata()
             data.pop(field)
             ok, reason = validate_recovery_metadata(data)
             self.assertFalse(ok, field)
             self.assertIn(field, reason)
+
+    def test_checkpoint_ref_must_match_operation_and_generation(self):
+        for overrides, reason in (
+            ({"checkpoint_ref": "opencode/429-checkpoint-other-gen-1"}, "operation"),
+            ({"checkpoint_ref": "opencode/429-checkpoint-opencode-429-issue-issue350-gen-2"}, "generation"),
+            ({"checkpoint_ref": "not-a-checkpoint"}, "malformed"),
+        ):
+            ok, message = validate_recovery_metadata(metadata(**overrides))
+            self.assertFalse(ok, overrides)
+            self.assertIn(reason, message)
+
+    def test_pointer_identity_can_be_cross_checked(self):
+        ok, reason = validate_recovery_metadata(
+            metadata(),
+            checkpoint_ref="opencode/429-checkpoint-opencode-429-issue-issue350-gen-1",
+        )
+        self.assertTrue(ok, reason)
+        ok, reason = validate_recovery_metadata(
+            metadata(),
+            checkpoint_ref="opencode/429-checkpoint-opencode-429-issue-issue350-gen-9",
+        )
+        self.assertFalse(ok)
+        self.assertIn("checkpoint ref", reason)
+
+    def test_infrastructure_checkpoint_namespace_is_accepted(self):
+        ok, reason = validate_recovery_metadata(
+            metadata(
+                failure_kind="unavailable",
+                checkpoint_ref="opencode/infra-checkpoint-opencode-429-issue-issue350-gen-1",
+            ),
+        )
+        self.assertTrue(ok, reason)
 
     def test_unknown_mode_stage_and_failure_kind_are_rejected(self):
         for field, value in (

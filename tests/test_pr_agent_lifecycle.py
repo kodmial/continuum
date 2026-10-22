@@ -71,7 +71,7 @@ APPROVED_347_OPENCODE_SHA256 = (
 # forwards packed recovery identity. Both files are pinned byte-for-byte so
 # any unrelated drift still fails closed.
 APPROVED_350_OPENCODE_SHA256 = (
-    "7445354c05e4a9ca8597b545789d9bec7ad2a4bc263adde015070205a25e29ec"
+    "f9368c6939f4343a27f28d3bdc0653d1b1822de56c1b963454543cbed60fb03b"
 )
 APPROVED_350_CALLER_SHA256 = (
     "5ae873799a580154158d89a4b45aeb2427fa82e72060d786cb00a24c6551c751"

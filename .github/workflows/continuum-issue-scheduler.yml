@@ -3354,16 +3354,43 @@ jobs:
                 const body = comment.body || '';
                 return /<!--\s*continuum-429-(?:recovery|resumption|backoff)\b/.test(body);
               });
-              const newestRecoveryAt = recoveryComments.reduce(
-                (newest, comment) => Math.max(
-                  newest,
-                  new Date(comment.updated_at || comment.created_at || 0).getTime()
-                ),
-                0
-              );
-              const hasFresh429Recovery =
-                newestRecoveryAt > 0 &&
-                (Date.now() - newestRecoveryAt) < 2 * 60 * 60 * 1000;
+              const parse429RecoveryState = body => {
+                const states = [...String(body || '').matchAll(
+                  /<!--\s*continuum-429-recovery\s+op=\S+\s+gen=\d+\s+state=(\S+)\s+attempt=\d+\s+next_due=(\d+)/g
+                )];
+                if (!states.length) return { state: '', nextDue: 0 };
+                const latest = states[states.length - 1];
+                return {
+                  state: latest[1],
+                  nextDue: Math.max(0, Number(latest[2]) || 0),
+                };
+              };
+              const newestRecovery = recoveryComments
+                .map(comment => ({
+                  at: new Date(comment.updated_at || comment.created_at || 0).getTime(),
+                  ...parse429RecoveryState(comment.body || ''),
+                }))
+                .sort((a, b) => a.at - b.at)
+                .at(-1);
+              // A durable 429 recovery state holds the reservation only while
+              // it still has a real owner and an unexpired bounded next step.
+              // `metadata-failed` cannot be resumed from an unproven
+              // checkpoint, so after its bounded due time the scheduler must
+              // be free to retry the task (the raw salvage ref is retained)
+              // instead of stranding the reservation forever.
+              const hasFresh429Recovery = (() => {
+                if (!newestRecovery) return false;
+                const now = Date.now();
+                if (newestRecovery.state === 'metadata-failed') {
+                  return newestRecovery.nextDue > 0 &&
+                    newestRecovery.nextDue * 1000 > now;
+                }
+                if (newestRecovery.nextDue > 0) {
+                  return newestRecovery.nextDue * 1000 > now;
+                }
+                return Number.isFinite(newestRecovery.at) &&
+                  (now - newestRecovery.at) < 2 * 60 * 60 * 1000;
+              })();
               const latestDispatch = dispatches.at(-1);
               const latestPr = latestPrByIssue.get(issueNumber);
 

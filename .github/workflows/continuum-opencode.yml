@@ -253,6 +253,8 @@ jobs:
           REVIEW_BODY: ${{ github.event.review.body }}
           REVIEWED_SHA: ${{ github.event.review.commit_id }}
           COMMENT_PAT: ${{ secrets.TAP_PAT }}
+          OPENCODE_WORKFLOW: ${{ vars.CONTINUUM_OPENCODE_WORKFLOW }}
+          OPENCODE_CALLER_WORKFLOW: ${{ github.workflow_ref }}
         with:
           github-token: ${{ github.token }}
           script: |
@@ -361,11 +363,86 @@ jobs:
               return;
             }
 
+            // Resolve the repository-local caller that actually declares
+            // `workflow_dispatch`. Continuum's own checkout names that caller
+            // `opencode.yml`; an installed consumer names it
+            // `continuum-opencode.yml`. The reusable engine this job runs in
+            // is `workflow_call`-only and must never be dispatched directly.
+            const normalizeCaller = value => {
+              let text = String(value || '').trim().replace(/\\/g, '/');
+              if (!text) return '';
+              if (text.startsWith('./')) text = text.slice(2);
+              if (!text.startsWith('.github/workflows/')) {
+                if (text.includes('/')) return '';
+                text = '.github/workflows/' + text;
+              }
+              if (text.includes('..') || !/\.ya?ml$/i.test(text)) return '';
+              return text;
+            };
+            // `github.workflow_ref` is the caller, not this reusable engine,
+            // so self-dogfood resolves `opencode.yml` from the run itself
+            // instead of carrying an unprefixed name that a consumer's
+            // unrelated workflow could match after installation.
+            const callerFromRef = value => {
+              const text = String(value || '').trim().replace(/\\/g, '/');
+              const marker = '.github/workflows/';
+              const start = text.indexOf(marker);
+              if (start === -1) return '';
+              return normalizeCaller(text.slice(start).split('@')[0]);
+            };
+            const callerCandidates = [...new Set([
+              normalizeCaller(process.env.OPENCODE_WORKFLOW),
+              callerFromRef(process.env.OPENCODE_CALLER_WORKFLOW),
+              '.github/workflows/continuum-opencode.yml',
+            ].filter(Boolean))];
+            async function resolveDispatchCaller() {
+              const defaultBranch = (await github.rest.repos.get({
+                owner, repo,
+              })).data.default_branch;
+              for (const candidate of callerCandidates) {
+                let source;
+                try {
+                  const response = await github.rest.repos.getContent({
+                    owner, repo, path: candidate, ref: defaultBranch,
+                  });
+                  if (Array.isArray(response.data) || response.data.type !== 'file') {
+                    continue;
+                  }
+                  source = Buffer.from(
+                    String(response.data.content || '').replace(/\n/g, ''),
+                    'base64'
+                  ).toString('utf8');
+                } catch (err) {
+                  if (err.status === 404) continue;
+                  throw err;
+                }
+                const lines = source.split(/\r?\n/);
+                const onIndex = lines.findIndex(line => /^on:\s*(?:#.*)?$/.test(line));
+                if (onIndex === -1) continue;
+                const onBlock = [];
+                for (let index = onIndex + 1; index < lines.length; index += 1) {
+                  if (/^\S/.test(lines[index]) && !lines[index].startsWith('#')) break;
+                  onBlock.push(lines[index]);
+                }
+                if (/^\s{2}workflow_dispatch:\s*(?:#.*)?$/m.test(onBlock.join('\n'))) {
+                  return {
+                    path: candidate,
+                    workflowId: candidate.slice(candidate.lastIndexOf('/') + 1),
+                    ref: defaultBranch,
+                  };
+                }
+              }
+              throw new Error(
+                'No repository-local OpenCode caller declares workflow_dispatch; ' +
+                'refusing to dispatch the reusable workflow-call engine.'
+              );
+            }
+            const dispatchTarget = await resolveDispatchCaller();
             await github.rest.actions.createWorkflowDispatch({
               owner,
               repo,
-              workflow_id: 'continuum-opencode.yml',
-              ref: 'main',
+              workflow_id: dispatchTarget.workflowId,
+              ref: dispatchTarget.ref,
               inputs: {
                 mode: 'coderabbit-fix',
                 pr_number: String(pullNumber),
@@ -374,7 +451,8 @@ jobs:
               },
             });
             core.notice(
-              `Dispatched OpenCode for CodeRabbit review ${reviewId} on PR #${pullNumber} with ${findings.length} inline finding(s).`
+              `Dispatched OpenCode for CodeRabbit review ${reviewId} on PR #${pullNumber} ` +
+              `with ${findings.length} inline finding(s) through ${dispatchTarget.path}.`
             );
 
   admit:
