@@ -230,19 +230,28 @@ jobs:
     timeout-minutes: 5
 
     steps:
-      - name: Checkout shared CI repair state classifier
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-        with:
-          repository: kodmial/continuum
-          ref: ${{ inputs.continuum_ref || 'main' }}
-          path: .continuum-repair-engine
-          fetch-depth: 1
-          persist-credentials: false
-          token: ''
-          sparse-checkout-cone-mode: false
-          sparse-checkout: |
-            .github/scripts/opencode_repair_state.py
-            src/continuum
+      - name: Fetch public CI repair classifier without credentials
+        shell: bash
+        env:
+          CONTINUUM_REF: ${{ inputs.continuum_ref || 'main' }}
+        run: |
+          set -euo pipefail
+          # The shared controller has permissions: {} by design. Its helper
+          # resides in a public repository, so no GITHUB_TOKEN or PAT is needed.
+          # actions/checkout with token: '' fails before any repair runs.
+          if [[ "$CONTINUUM_REF" == -* ]] || ! git check-ref-format --allow-onelevel "$CONTINUUM_REF" >/dev/null; then
+            echo '::error::Invalid Continuum ref for CI repair helper' >&2
+            exit 1
+          fi
+          repo=.continuum-repair-engine
+          git init -q "$repo"
+          git -C "$repo" remote add origin https://github.com/kodmial/continuum.git
+          git -C "$repo" sparse-checkout init --no-cone
+          git -C "$repo" sparse-checkout set --no-cone .github/scripts/opencode_repair_state.py src/continuum
+          GIT_TERMINAL_PROMPT=0 git -C "$repo" -c credential.helper= fetch --no-tags --depth=1 origin "$CONTINUUM_REF"
+          git -C "$repo" checkout --detach --force -q FETCH_HEAD
+          test -f "$repo/.github/scripts/opencode_repair_state.py"
+          test -f "$repo/src/continuum/opencode_repair_state.py"
 
       - name: Reconcile one CI result reported by the consumer's own CI
         env:
@@ -462,19 +471,28 @@ jobs:
     timeout-minutes: 5
 
     steps:
-      - name: Checkout shared CI repair state classifier
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-        with:
-          repository: kodmial/continuum
-          ref: ${{ inputs.continuum_ref || 'main' }}
-          path: .continuum-repair-engine
-          fetch-depth: 1
-          persist-credentials: false
-          token: ''
-          sparse-checkout-cone-mode: false
-          sparse-checkout: |
-            .github/scripts/opencode_repair_state.py
-            src/continuum
+      - name: Fetch public CI repair classifier without credentials
+        shell: bash
+        env:
+          CONTINUUM_REF: ${{ inputs.continuum_ref || 'main' }}
+        run: |
+          set -euo pipefail
+          # The shared controller has permissions: {} by design. Its helper
+          # resides in a public repository, so no GITHUB_TOKEN or PAT is needed.
+          # actions/checkout with token: '' fails before any repair runs.
+          if [[ "$CONTINUUM_REF" == -* ]] || ! git check-ref-format --allow-onelevel "$CONTINUUM_REF" >/dev/null; then
+            echo '::error::Invalid Continuum ref for CI repair helper' >&2
+            exit 1
+          fi
+          repo=.continuum-repair-engine
+          git init -q "$repo"
+          git -C "$repo" remote add origin https://github.com/kodmial/continuum.git
+          git -C "$repo" sparse-checkout init --no-cone
+          git -C "$repo" sparse-checkout set --no-cone .github/scripts/opencode_repair_state.py src/continuum
+          GIT_TERMINAL_PROMPT=0 git -C "$repo" -c credential.helper= fetch --no-tags --depth=1 origin "$CONTINUUM_REF"
+          git -C "$repo" checkout --detach --force -q FETCH_HEAD
+          test -f "$repo/.github/scripts/opencode_repair_state.py"
+          test -f "$repo/src/continuum/opencode_repair_state.py"
 
       - name: Dispatch one automatic OpenCode fix for failed blocking workflow
         env:
