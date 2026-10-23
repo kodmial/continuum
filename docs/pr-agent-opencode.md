@@ -113,10 +113,45 @@ CI -> review -> clean? merge gate : improve
 ```
 
 The merge gate requires the native persistent state to be a complete full review
-for the same HEAD and accepts only `safe_to_merge` with no current findings or
-qualifying suggestions. Generic auto-merge is disabled in PR-Agent mode. The
+for the same HEAD and accepts `safe_to_merge` or a narrowly proven
+non-actionable `merge_with_caution` with no current findings or qualifying
+suggestions. Generic auto-merge is disabled in PR-Agent mode. The
 bridge is resolved from the selected Continuum revision; consumers do not copy
 Continuum-internal bridge code into their repositories.
+
+### Review disposition and non-code holds
+
+One canonical policy (`.github/scripts/pr_agent_policy.js`:
+`unwrapReview` + `reviewDisposition`) is consumed by both the review router and
+the independently revalidated merge gate:
+
+| Native review evidence | Disposition |
+| --- | --- |
+| Non-empty `key_issues_to_review` | One bounded exact-HEAD repair batch; optional qualifying `/improve` only augments that repair. |
+| No code findings, positive `not_compliant_requirements` (any recommendation) | Non-code task-compliance **HOLD**. No code repair, no merge, no same-HEAD automatic re-review. |
+| No code findings, `changes_required`, no ticket gap | Non-code unresolved-review **HOLD** until eligible evidence changes or a human triages it. |
+| No code findings, clean/absent ticket context, clean security/tool/coverage, `safe_to_merge` | Merge-eligible under all existing exact-HEAD gates. |
+| Same, `merge_with_caution`, no independent blocking signal | Merge-eligible through the existing `nonActionableCautionIsMergeable` policy. |
+| Blocking security, tool error, incomplete coverage, malformed/contradictory output | Existing fail-closed gate (never converted into a deterministic non-code hold). |
+
+`ticket_compliance_check` is evaluated in every entry, including multiple
+tickets and split-envelope/chunk unions. The native
+`not_compliant_requirements` and `requires_further_human_verification` fields
+are free-form strings: only definitively empty/negative prose is empty.
+A positive non-compliance string always blocks merge. A positive
+`requires_further_human_verification` string is an advisory note, not a
+non-compliance finding and not a new automatic approval gate.
+
+A non-code hold is published for the exact HEAD as a
+`continuum/pr-agent-review` **failure** status with a distinct hold description
+(not the `blocking; recovery eligible` token) plus one durable controller-state
+comment carrying the exact native ticket URL or ID and sanitized reason. The
+comment is scoped to the target repository, PR, exact HEAD, and ticket
+fingerprint. The scheduled reconciler therefore does not reopen the unchanged
+same-state review. A legitimate new HEAD starts fresh. Editing PR metadata does
+not automatically wake the controller: a fresh review (for example an explicit
+`/review` after the evidence or task metadata changes) is required to clear a
+hold. The hold comment never includes raw PR/issue body text or secrets.
 
 ## Failure modes (all explicit, never silent green)
 

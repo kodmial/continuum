@@ -4744,7 +4744,7 @@ class ImproveSkipWorkflowTests(unittest.TestCase):
         # The window must cover the whole gate step. Delegated target-aware
         # live-head revalidation uses longer owner/repo lines than a
         # same-repository lookup, so allow margin beyond the gate body.
-        window = body[gate:gate + 7000]
+        window = body[gate:gate + 10000]
         self.assertIn("REVIEWED_SHA", window)
         self.assertIn("HEAD_SHA", window)
         self.assertIn("headSha !== reviewedSha", window)
@@ -4764,7 +4764,7 @@ class ImproveSkipWorkflowTests(unittest.TestCase):
         # discards each carry their own flag before the live-head decision.
         # Delegated target-aware revalidation is longer than a same-repository
         # lookup, so allow margin beyond the gate body.
-        window = body[gate:gate + 7000]
+        window = body[gate:gate + 10000]
         self.assertIn("pulls.get", window)
         self.assertIn("liveSha", window)
         self.assertIn("reviewedHeadSha", window)
@@ -5529,17 +5529,15 @@ class ReviewDispositionIntegrationTests(unittest.TestCase):
                 ],
             },
         )
-        self.assertEqual(
-            run_policy("disposition", {"review": caution_with_gap}).get("action"),
-            "rereview",
+        caution_result = run_policy("disposition", {"review": caution_with_gap})
+        self.assertEqual(caution_result.get("action"), "hold")
+        self.assertEqual(caution_result.get("hold", {}).get("kind"), "ticket_compliance")
+        changes_result = run_policy(
+            "disposition",
+            {"review": make_review([], recommendation="changes_required")},
         )
-        self.assertEqual(
-            run_policy(
-                "disposition",
-                {"review": make_review([], recommendation="changes_required")},
-            ).get("action"),
-            "rereview",
-        )
+        self.assertEqual(changes_result.get("action"), "hold")
+        self.assertEqual(changes_result.get("hold", {}).get("kind"), "unresolved_review")
         self.assertEqual(
             run_policy(
                 "disposition",
@@ -5590,6 +5588,131 @@ class ReviewDispositionIntegrationTests(unittest.TestCase):
         self.assertNotIn(
             "needs.pr_agent.outputs.needs_repair == 'false'",
             review,
+        )
+
+    def test_non_code_hold_is_durable_and_distinct_from_rereview(self):
+        review = read_repo(".github/workflows/continuum-pr-agent.yml")
+        merge = read_repo(".github/workflows/continuum-pr-agent-auto-merge.yml")
+        recovery = read_repo(".github/workflows/continuum-pr-agent-recovery.yml")
+        # Routing exposes the third non-repair/non-merge state.
+        self.assertIn("needs_hold", review)
+        self.assertIn("core.setOutput('needs_hold'", review)
+        self.assertIn("disposition.action === 'hold'", review)
+        self.assertIn("hold_file", review)
+        self.assertIn("{ mode: 0o600 }", review)
+        # The hold is persisted as a deterministic failure-state status (no
+        # recovery token), never as the rereview/actionable success status.
+        self.assertIn(
+            "state: disposition === 'hold' ? 'failure' : 'success'",
+            review,
+        )
+        self.assertIn("PR-Agent review held: non-code task compliance", review)
+        self.assertIn("PR-Agent review held: non-code unresolved", review)
+        self.assertIn("continuum-pr-agent-hold head=", review)
+        self.assertIn("No code repair was dispatched", review)
+        self.assertIn(
+            "editing PR metadata alone does not automatically wake this controller",
+            review,
+        )
+        # The hold path must not reach repair or merge, and must skip the
+        # second provider pass because there is no actionable code finding.
+        self.assertIn("earlyDisposition.action === 'hold'", review)
+        self.assertIn("needs.pr_agent.outputs.needs_repair == 'true'", review)
+        self.assertIn("needs.pr_agent.outputs.ready_to_merge == 'true'", review)
+        self.assertNotIn("needs.pr_agent.outputs.needs_hold == 'true'", review)
+        # Merge eligibility still independently revalidates the same policy.
+        self.assertIn("policy.reviewDisposition(", merge)
+        # Target-aware delegated path: the hold comment is written through
+        # the resolved target with the existing token split, no new inputs.
+        self.assertIn("CONTINUUM_PR_AGENT_TARGET_OWNER", review)
+        self.assertIn("CONTINUUM_PR_AGENT_TARGET_REPO", review)
+        self.assertIn(
+            "secrets.TAP_PAT || (env.CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED != 'true' && github.token",
+            review,
+        )
+        # The reconciler keeps the existing recovery token for genuine
+        # blocking reviews but never adds it to the non-code hold string.
+        self.assertIn("blocking; recovery eligible", recovery)
+        self.assertNotIn("non-code task compliance; recovery eligible", review)
+        self.assertNotIn("non-code unresolved; recovery eligible", review)
+
+    def test_recovery_classifies_non_code_hold_as_deterministic_hold(self):
+        import sys
+
+        sys.path.insert(0, SRC)
+        try:
+            from continuum import pr_agent_recovery as recovery
+        finally:
+            sys.path.remove(SRC)
+        for description in (
+            "PR-Agent review held: non-code task compliance",
+            "PR-Agent review held: non-code unresolved",
+        ):
+            with self.subTest(description=description):
+                decision = recovery.decide_recovery(
+                    ci_green=True,
+                    operation_state="failure",
+                    operation_description=description,
+                    operation_context="continuum/pr-agent-review",
+                )
+                self.assertEqual(decision.action, "hold")
+                self.assertIsNone(decision.attempt)
+
+    def test_issue_392_safe_merge_with_ticket_gap_is_not_merge_eligible(self):
+        review = make_review(
+            [],
+            recommendation="safe_to_merge",
+            extra={
+                "ticket_compliance_check": [{
+                    "ticket_url": "https://github.com/o/r/issues/392",
+                    "not_compliant_requirements": (
+                        "Measured before-POST count requirement not demonstrated"
+                    ),
+                }],
+            },
+        )
+        result = run_policy("disposition", {"review": review})
+        self.assertEqual(result["action"], "hold")
+        self.assertEqual(result["hold"]["kind"], "ticket_compliance")
+        clean = make_review([], recommendation="safe_to_merge")
+        self.assertEqual(
+            run_policy("disposition", {"review": clean})["action"], "merge"
+        )
+
+    def test_issue_158_caution_with_pr_body_evidence_gap_holds_once(self):
+        review = make_review(
+            [],
+            recommendation="merge_with_caution",
+            extra={
+                "security_concerns": "No security concerns identified",
+                "ticket_compliance_check": [{
+                    "ticket_url": "https://github.com/kodmial/kodmai/issues/157",
+                    "not_compliant_requirements": (
+                        "before/after examples missing in PR description"
+                    ),
+                }],
+            },
+        )
+        first = run_policy("disposition", {"review": review})
+        second = run_policy("disposition", {"review": review})
+        self.assertEqual(first["action"], "hold")
+        self.assertEqual(second["action"], "hold")
+        self.assertEqual(first["hold"]["fingerprint"], second["hold"]["fingerprint"])
+        self.assertNotEqual(first["action"], "repair")
+        # A fresh review after externally corrected metadata may clear the
+        # hold; the policy never rewrites or infers PR-body evidence itself.
+        corrected = make_review(
+            [],
+            recommendation="safe_to_merge",
+            extra={
+                "ticket_compliance_check": [{
+                    "ticket_url": "https://github.com/kodmial/kodmai/issues/157",
+                    "not_compliant_requirements": "None",
+                }],
+            },
+        )
+        self.assertEqual(
+            run_policy("disposition", {"review": corrected})["action"], "merge"
         )
 
     def test_runtime_fallback_is_loaded_from_continuum_ref(self):

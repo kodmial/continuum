@@ -4,6 +4,7 @@ const crypto = require('crypto');
 
 const IMPROVE_REPAIR_THRESHOLD = 7;
 const CONTROLLER_STATE_MARKER = '<!-- continuum-pr-agent-controller-state:v1 -->';
+const TICKET_COMPLIANCE_KEY = 'ticket_compliance_check';
 
 // Continuum comment attribution (kodmial/continuum#258). Every
 // human-visible comment created or updated by Continuum must make machine
@@ -706,6 +707,7 @@ function unwrapReview(reviewPayload) {
   const outerHasSignal =
     'key_issues_to_review' in reviewPayload ||
     'merge_recommendation' in reviewPayload ||
+    TICKET_COMPLIANCE_KEY in reviewPayload ||
     BLOCKING_SECURITY_SIGNAL_KEYS.some((key) => key in reviewPayload) ||
     TOOL_ERROR_SIGNAL_KEYS.some((key) => key in reviewPayload) ||
     GENERIC_TOOL_ERROR_KEYS.some((key) => key in reviewPayload) ||
@@ -762,6 +764,21 @@ function unwrapReview(reviewPayload) {
         if (mergeRecommendationSeverity(outerText) > mergeRecommendationSeverity(currentText)) {
           merged[key] = value;
         }
+      }
+      continue;
+    }
+    if (key === TICKET_COMPLIANCE_KEY) {
+      // Large-PR chunking and split envelopes can carry ticket evidence on
+      // both sides. Every ticket must be evaluated, so union both lists
+      // instead of letting one side discard the other. Any non-list side is
+      // surfaced so strict ticket validation fails closed.
+      if (Array.isArray(current) && Array.isArray(value)) {
+        merged[key] = [...value, ...current];
+      } else if (!Array.isArray(current)) {
+        // Keep the malformed nested side so strict validation fails closed.
+      } else {
+        // The outer side is malformed; surface it instead of the clean list.
+        merged[key] = value;
       }
       continue;
     }
@@ -1012,6 +1029,274 @@ function isSkippedCleanImprovePayload(raw) {
   return sawLine && foundMarker;
 }
 
+// Upstream v0.46.0 documents ticket_compliance_check as a list of
+// TicketCompliance objects whose not_compliant_requirements and
+// requires_further_human_verification fields are free-form bullet prose
+// (strings), not typed actions. Only definitively empty/negated prose is
+// empty. Everything else is a positive compliance signal that no rerun of
+// the same review can repair because it depends on PR/issue metadata.
+const EMPTY_COMPLIANCE_TEXTS = new Set([
+  '',
+  '-',
+  '--',
+  '0',
+  'false',
+  'n/a',
+  'na',
+  'nil',
+  'no',
+  'none',
+  'none.',
+  '[]',
+  '{}',
+  'nothing',
+  'not applicable',
+  'nope',
+  'null',
+  'no gaps',
+  'no gap',
+  'no issues',
+  'no issue',
+  'no findings',
+  'no finding',
+  'no compliance issues',
+  'no compliance issue',
+  'no compliance concerns',
+  'no compliance concern',
+  'no unmet requirements',
+  'no unmet requirement',
+  'no outstanding requirements',
+  'no outstanding requirement',
+  'no outstanding issues',
+  'no outstanding issue',
+  'no missing requirements',
+  'no non-compliance',
+  'no noncompliance',
+  'no non-compliant requirements',
+  'no noncompliant requirements',
+  'no compliance gaps',
+  'no compliance gap',
+  'no requirements missing',
+  'no acceptance criteria gaps',
+  'no acceptance criteria missing',
+  'nothing to report',
+  'nothing missing',
+  'all requirements met',
+  'all requirements are met',
+  'all requirements were met',
+  'all requirements have been met',
+  'all requirements satisfied',
+  'all requirements are satisfied',
+  'all requirements were satisfied',
+  'all requirements compliant',
+  'all requirements are compliant',
+  'all requirements addressed',
+  'all requirements are addressed',
+  'all acceptance criteria met',
+  'all acceptance criteria are met',
+  'all acceptance criteria satisfied',
+  'all acceptance criteria were satisfied',
+  'all acceptance criteria are satisfied',
+  'acceptance criteria met',
+  'acceptance criteria are met',
+  'acceptance criteria satisfied',
+  'acceptance criteria are satisfied',
+  'every requirement met',
+  'every requirement is met',
+  'every requirement satisfied',
+  'every requirement is satisfied',
+  'fully compliant',
+  'fully satisfied',
+  'completely compliant',
+  'completely satisfied',
+  'requirements met',
+  'requirements are met',
+  'requirements were met',
+  'requirements satisfied',
+  'requirements are satisfied',
+  'requirements compliant',
+]);
+
+function normalizeComplianceLine(value) {
+  let line = String(value || '').trim().toLowerCase();
+  line = line.replace(/^(?:[-*+•·–—]+|\d+[.)])\s*/, '');
+  line = line.replace(/^[`"'“”‘’]+|[`"'“”‘’]+$/g, '');
+  line = line.replace(/\s+/g, ' ').trim();
+  line = line.replace(/[.;:,!]+$/g, '').trim();
+  return line;
+}
+
+function isDefinitivelyEmptyComplianceText(value) {
+  // Only string fields are valid per the upstream schema; non-strings are
+  // malformed and are rejected by ticketComplianceSummary before this
+  // helper is called.
+  if (typeof value !== 'string') return false;
+  const lines = value
+    .replace(/\r\n?/g, '\n')
+    .split('\n')
+    .map(normalizeComplianceLine)
+    .filter(Boolean);
+  if (lines.length === 0) return true;
+  const suffixes = [
+    ' found',
+    ' was found',
+    ' were found',
+    ' identified',
+    ' was identified',
+    ' were identified',
+    ' detected',
+    ' was detected',
+    ' were detected',
+    ' observed',
+    ' was observed',
+    ' were observed',
+    ' reported',
+    ' was reported',
+    ' were reported',
+    ' remain',
+    ' remains',
+    ' remaining',
+  ];
+  return lines.every((line) => {
+    if (EMPTY_COMPLIANCE_TEXTS.has(line)) return true;
+    return suffixes.some((suffix) => {
+      return line.endsWith(suffix) &&
+        EMPTY_COMPLIANCE_TEXTS.has(line.slice(0, -suffix.length).trim());
+    });
+  });
+}
+
+function sanitizeComplianceText(value, limit = 320) {
+  // Sanitized hold evidence: single-line, control characters removed,
+  // URLs and obvious credential shapes redacted, then truncated. The exact
+  // native ticket URL is carried separately in ticket_url.
+  return String(value || '')
+    .replace(/\r\n?/g, ' ')
+    .replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]+/g, ' ')
+    .replace(/https?:\/\/\S+/gi, '[url]')
+    .replace(/\b(?:gh[pousr]_[A-Za-z0-9]{8,}|github_pat_[A-Za-z0-9_]+|rnd_[A-Za-z0-9]+)\b/g, '[redacted]')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, limit);
+}
+
+function safeTicketReference(value) {
+  if (value === undefined || value === null || value === '') return '';
+  if (typeof value !== 'string') {
+    throw new Error('PR-Agent ticket_compliance_check ticket_url must be a string.');
+  }
+  const text = value.trim();
+  if (!text) return '';
+  // Upstream v0.46.0 documents ticket_url as "Ticket URL or ID". Accept both
+  // the exact http(s) URL and common compact IDs, but keep the value safe to
+  // embed in a controller comment (no markdown/control/whitespace injection).
+  const isUrl = /^https?:\/\/[A-Za-z0-9._~:/?#@$&'*+,;=%-]+$/i.test(text);
+  const isId =
+    /^(?:#?\d+|[A-Za-z0-9][A-Za-z0-9_.-]*\/[A-Za-z0-9_.-]+#\d+|[A-Za-z][A-Za-z0-9_.-]*#\d+|[A-Za-z][A-Za-z0-9_.-]*-\d+)$/.test(text);
+  if (!isUrl && !isId) {
+    throw new Error(
+      'PR-Agent ticket_compliance_check ticket_url must be an http(s) URL or ticket ID.'
+    );
+  }
+  return text;
+}
+
+function complianceStringField(entry, key) {
+  const value = entry[key];
+  if (value === undefined) {
+    throw new Error('PR-Agent ticket_compliance_check entry has no ' + key + ' string.');
+  }
+  if (typeof value !== 'string') {
+    throw new Error('PR-Agent ticket_compliance_check ' + key + ' must be a string.');
+  }
+  return value;
+}
+
+function optionalComplianceStringField(entry, key) {
+  const value = entry[key];
+  if (value === undefined || value === null) return '';
+  if (typeof value !== 'string') {
+    throw new Error('PR-Agent ticket_compliance_check ' + key + ' must be a string.');
+  }
+  return value;
+}
+
+function ticketComplianceSummary(reviewPayload) {
+  // Canonical strict parser for the documented v0.46.0 structure. It
+  // evaluates every entry (multiple tickets and split-envelope/chunk
+  // unions) instead of inspecting only the first ticket. Missing ticket
+  // context is legitimate for an issue-less PR; a present malformed
+  // structure fails closed.
+  const review = unwrapReview(reviewPayload);
+  const raw = review[TICKET_COMPLIANCE_KEY];
+  if (raw === undefined || raw === null) {
+    return {
+      present: false,
+      ticketCount: 0,
+      nonCompliant: [],
+      requiresHumanVerification: [],
+      fingerprint: crypto.createHash('sha256').update('absent').digest('hex'),
+    };
+  }
+  if (!Array.isArray(raw)) {
+    throw new Error('PR-Agent review ticket_compliance_check must be a list.');
+  }
+  const nonCompliant = [];
+  const requiresHumanVerification = [];
+  const canonical = [];
+  for (const entry of raw) {
+    if (!entry || typeof entry !== 'object' || Array.isArray(entry)) {
+      throw new Error('PR-Agent review ticket_compliance_check entries must be objects.');
+    }
+    const notCompliantText = complianceStringField(entry, 'not_compliant_requirements');
+    const furtherVerificationText = optionalComplianceStringField(
+      entry,
+      'requires_further_human_verification'
+    );
+    const ticketUrl = safeTicketReference(entry.ticket_url);
+    // Validate the remaining documented string fields when present so a
+    // contradictory non-string shape never reaches a merge decision.
+    optionalComplianceStringField(entry, 'ticket_requirements');
+    optionalComplianceStringField(entry, 'fully_compliant_requirements');
+    const notCompliantEmpty = isDefinitivelyEmptyComplianceText(notCompliantText);
+    const furtherVerificationEmpty =
+      !furtherVerificationText ||
+      isDefinitivelyEmptyComplianceText(furtherVerificationText);
+    if (!notCompliantEmpty) {
+      nonCompliant.push({
+        ticket_url: ticketUrl,
+        reason: sanitizeComplianceText(notCompliantText),
+      });
+    }
+    if (!furtherVerificationEmpty) {
+      requiresHumanVerification.push({
+        ticket_url: ticketUrl,
+        note: sanitizeComplianceText(furtherVerificationText),
+      });
+    }
+    canonical.push({
+      ticket_url: ticketUrl,
+      not_compliant_requirements: notCompliantEmpty
+        ? ''
+        : sanitizeComplianceText(notCompliantText),
+      requires_further_human_verification: furtherVerificationEmpty
+        ? ''
+        : sanitizeComplianceText(furtherVerificationText),
+    });
+  }
+  const fingerprint = crypto
+    .createHash('sha256')
+    .update(JSON.stringify(stable(canonical)))
+    .digest('hex');
+  return {
+    present: true,
+    ticketCount: raw.length,
+    nonCompliant,
+    requiresHumanVerification,
+    fingerprint,
+  };
+}
+
 function nonActionableCautionIsMergeable(review) {
   // Upstream can legitimately choose merge_with_caution for risk/advisory
   // prose even when its exact-HEAD review found no actionable issues.
@@ -1026,21 +1311,21 @@ function nonActionableCautionIsMergeable(review) {
       hasToolErrorSignal(review) ||
       hasIncompleteCoverageSignal(review)) return false;
 
-  // An issue-less PR legitimately has no ticket_compliance_check entry.
-  // Missing/empty ticket checks are not positive non-compliance. But an
-  // explicitly supplied ticket result must prove no non-compliant requirements;
-  // malformed or nonempty non-compliance keeps the merge gate closed.
-  const ticket = review && review.ticket_compliance_check;
-  if (ticket === undefined || ticket === null) return true;
-  if (!Array.isArray(ticket)) return false;
-  const empty = new Set(['', '-', 'none', 'n/a', 'na', 'no']);
-  for (const entry of ticket) {
-    if (!entry || typeof entry !== 'object' || Array.isArray(entry)) return false;
-    if (!Object.prototype.hasOwnProperty.call(entry, 'not_compliant_requirements')) return false;
-    const value = String(entry.not_compliant_requirements ?? '').trim().toLowerCase();
-    if (!empty.has(value)) return false;
+  // Missing/empty ticket context is not positive non-compliance. A present
+  // malformed structure or any positive not_compliant_requirements string
+  // keeps the merge gate closed; requires_further_human_verification alone
+  // is advisory and is deliberately not equated with non-compliance.
+  let ticket;
+  try {
+    ticket = ticketComplianceSummary(review);
+  } catch (err) {
+    return false;
   }
-  return true;
+  return ticket.nonCompliant.length === 0;
+}
+
+function holdFingerprint(parts) {
+  return crypto.createHash('sha256').update(JSON.stringify(stable(parts))).digest('hex');
 }
 
 function reviewDisposition(reviewPayload, improveJsonl, threshold = IMPROVE_REPAIR_THRESHOLD) {
@@ -1059,12 +1344,18 @@ function reviewDisposition(reviewPayload, improveJsonl, threshold = IMPROVE_REPA
       'PR-Agent review has invalid merge_recommendation: ' + (recommendation || '<empty>')
     );
   }
+  // Strict ticket parsing happens before any routing so a malformed or
+  // contradictory native structure always fails closed, even when code
+  // findings exist. This is the same helper the merge gate consumes via the
+  // canonical disposition below.
+  const ticket = ticketComplianceSummary(review);
   const qualifying = qualifyingImproveSuggestions(improveJsonl, threshold);
   const reviewCount = review.key_issues_to_review.length;
   const common = {
     recommendation,
     reviewCount,
     qualifyingSuggestionCount: qualifying.length,
+    ticketCount: ticket.ticketCount,
   };
   // The authoritative review is the merge/repair gate. /improve is an
   // auxiliary repair input only after that review has already found an
@@ -1079,17 +1370,91 @@ function reviewDisposition(reviewPayload, improveJsonl, threshold = IMPROVE_REPA
         qualifying.length + ' auxiliary improve suggestion(s)',
     };
   }
+  // Independent blocking signals keep their existing fail-closed gate. They
+  // must never be relabeled as a deterministic non-code hold, because the
+  // existing tool/security/coverage machinery owns that classification.
+  const independentBlocking =
+    hasBlockingSecuritySignal(review) ||
+    hasToolErrorSignal(review) ||
+    hasIncompleteCoverageSignal(review);
+
+  if (!independentBlocking) {
+    if (ticket.nonCompliant.length > 0) {
+      // A positive not_compliant_requirements STRING always prevents merge,
+      // regardless of the model's merge_recommendation. Rerunning the same
+      // reviewer on unchanged HEAD/issue/PR metadata cannot add the missing
+      // external evidence, so this is a non-code hold, never repair or an
+      // unchanged same-state re-review.
+      const ticketUrls = ticket.nonCompliant
+        .map((entry) => entry.ticket_url)
+        .filter(Boolean);
+      return {
+        ...common,
+        action: 'hold',
+        hold: {
+          kind: 'ticket_compliance',
+          recommendation,
+          ticket_urls: Array.from(new Set(ticketUrls)),
+          reasons: ticket.nonCompliant.map((entry) => ({
+            ticket_url: entry.ticket_url,
+            reason: entry.reason,
+          })),
+          requires_human_verification: ticket.requiresHumanVerification,
+          fingerprint: holdFingerprint({
+            action: 'hold',
+            kind: 'ticket_compliance',
+            recommendation,
+            tickets: ticket.nonCompliant,
+          }),
+        },
+        reason:
+          'non-code task-compliance hold: ' + ticket.nonCompliant.length +
+          ' ticket requirement gap(s); no code repair dispatched',
+      };
+    }
+    if (recommendation === 'changes_required') {
+      // changes_required with no actionable native key issues and no ticket
+      // compliance gap cannot be fixed by repeating the same-HEAD review. Hold
+      // it explicitly and require changed eligible evidence/manual triage.
+      return {
+        ...common,
+        action: 'hold',
+        hold: {
+          kind: 'unresolved_review',
+          recommendation,
+          ticket_urls: [],
+          reasons: [],
+          requires_human_verification: ticket.requiresHumanVerification,
+          fingerprint: holdFingerprint({
+            action: 'hold',
+            kind: 'unresolved_review',
+            recommendation,
+            ticket: ticket.fingerprint,
+          }),
+        },
+        reason:
+          'non-code unresolved hold: changes_required with zero actionable code findings; ' +
+          'fresh review requires changed eligible evidence or manual triage',
+      };
+    }
+  }
+
   if (
     recommendation === 'safe_to_merge' ||
     (recommendation === 'merge_with_caution' && nonActionableCautionIsMergeable(review))
   ) {
+    const advisory =
+      ticket.requiresHumanVerification.length > 0
+        ? '; advisory human-verification note(s) recorded without a new approval gate'
+        : '';
     return {
       ...common,
       action: 'merge',
       reason:
-        recommendation === 'safe_to_merge'
+        (recommendation === 'safe_to_merge'
           ? 'safe_to_merge with no actionable review/improve items'
-          : 'non-actionable caution with explicit no-security/no-noncompliance evidence',
+          : 'non-actionable caution with explicit no-security/no-noncompliance evidence') +
+        advisory,
     };
   }
   return {
@@ -1146,5 +1511,7 @@ module.exports = {
   reviewDisposition,
   nonActionableCautionIsMergeable,
   sameLogicalDefect,
+  ticketComplianceSummary,
+  isDefinitivelyEmptyComplianceText,
   unwrapReview,
 };

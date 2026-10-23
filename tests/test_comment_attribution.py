@@ -83,7 +83,7 @@ MUTATION_COUNTS = {
     "continuum-pr-agent-canary.yml": 4,
     "continuum-pr-agent-recovery.yml": 4,
     "continuum-pr-agent-repair.yml": 6,
-    "continuum-pr-agent.yml": 3,
+    "continuum-pr-agent.yml": 5,  # durable non-code hold comment path
     "continuum-render-executor.yml": 17,
 }
 
@@ -224,6 +224,7 @@ FUNCTIONAL_ANCHORS = {
     "continuum-pr-agent.yml": (
         "policy.controllerStateBody",
         "continuum-pr-agent-repair-batch:v1",
+        "continuum-pr-agent-hold",
     ),
     "continuum-render-executor.yml": (
         '"$QUALIFICATION_MARKER" "$BODY"',

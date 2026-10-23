@@ -18,6 +18,9 @@ on:
       ready_to_merge:
         description: Whether review policy is safe-to-merge with no actionable items.
         value: ${{ jobs.pr_agent.outputs.ready_to_merge }}
+      needs_hold:
+        description: Whether a non-code task-compliance or unresolved review condition holds the exact HEAD.
+        value: ${{ jobs.pr_agent.outputs.needs_hold }}
       needs_rereview:
         description: Whether a blocking recommendation has no actionable payload and needs bounded re-review.
         value: ${{ jobs.pr_agent.outputs.needs_rereview }}
@@ -175,6 +178,7 @@ jobs:
       needs_repair: ${{ steps.route.outputs.needs_repair }}
       ready_to_merge: ${{ steps.route.outputs.ready_to_merge }}
       merge_gate_verified: ${{ steps.merge_evidence.outputs.green }}
+      needs_hold: ${{ steps.route.outputs.needs_hold }}
       needs_rereview: ${{ steps.route.outputs.needs_rereview }}
       retry_attempt: ${{ steps.stack.outputs.retry_attempt }}
       retry_workflow: ${{ steps.stack.outputs.retry_workflow }}
@@ -1963,6 +1967,30 @@ jobs:
               core.setFailed(`Invalid PR-Agent review coverage signal: ${err.message}`);
               return;
             }
+            // A non-code hold (ticket non-compliance or changes_required
+            // with zero actionable code findings) has no repair value for
+            // the automatic improve pass. Skip that second provider call and
+            // let the route step publish the deterministic hold; malformed
+            // structured output still fails closed here.
+            let earlyDisposition;
+            try {
+              earlyDisposition = policy.reviewDisposition(review, '');
+            } catch (err) {
+              // Malformed/contradictory structured output keeps the existing
+              // fail-closed path: improve still runs for repair value and the
+              // route/merge gate rejects the invalid review. Never convert it
+              // into a deterministic non-code hold.
+              core.notice('Improve gate could not classify a non-code hold: ' + err.message);
+              earlyDisposition = null;
+            }
+            if (earlyDisposition && earlyDisposition.action === 'hold') {
+              core.setOutput('skip_improve', 'true');
+              core.setOutput('reason', earlyDisposition.reason);
+              core.notice(
+                `Non-code hold at ${reviewedSha}; skipping automatic improve: ${earlyDisposition.reason}`
+              );
+              return;
+            }
             let decision;
             try {
               decision = policy.isCleanReviewForImproveSkip(
@@ -2326,6 +2354,8 @@ jobs:
           REVIEW_FILE: ${{ steps.pragent.outputs.review_file }}
           IMPROVE_FILE: ${{ steps.improve_output.outputs.improve_file }}
           IMPROVE_SKIPPED: ${{ steps.improve_skipped.outcome == 'success' }}
+          HEAD_SHA: ${{ steps.result.outputs.head_sha }}
+          PR_NUMBER: ${{ steps.stack.outputs.pr_number }}
           POLICY_SCRIPT: ${{ steps.runtime.outputs.policy_script }}
         with:
           github-token: ${{ github.token }}
@@ -2373,13 +2403,29 @@ jobs:
             );
             const needsRepair = disposition.action === 'repair';
             const readyToMerge = disposition.action === 'merge';
+            const needsHold = disposition.action === 'hold';
             const needsRereview = disposition.action === 'rereview';
             core.setOutput('needs_repair', needsRepair ? 'true' : 'false');
             core.setOutput('ready_to_merge', readyToMerge ? 'true' : 'false');
+            core.setOutput('needs_hold', needsHold ? 'true' : 'false');
             core.setOutput('needs_rereview', needsRereview ? 'true' : 'false');
             core.setOutput('review_disposition', disposition.action);
             core.setOutput('review_findings', String(disposition.reviewCount));
             core.setOutput('improve_suggestions', String(disposition.qualifyingSuggestionCount));
+            if (needsHold) {
+              // The exact ticket URL and sanitized non-compliance reason stay
+              // in a mode-0600 runner-local file for the target-repository
+              // comment. Only the generic disposition reaches parent logs.
+              const holdFile = String(process.env.RUNNER_TEMP || '') + '/continuum-pr-agent-hold.json';
+              const holdPayload = {
+                ...(disposition.hold || {}),
+                head_sha: String(process.env.HEAD_SHA || '').trim().toLowerCase(),
+                pr_number: String(process.env.PR_NUMBER || '').trim(),
+              };
+              fs.writeFileSync(holdFile, JSON.stringify(holdPayload), { mode: 0o600 });
+              core.setOutput('hold_file', holdFile);
+              core.setOutput('hold_kind', String((disposition.hold && disposition.hold.kind) || ''));
+            }
             core.notice(
               'PR-Agent disposition=' + disposition.action + ': ' + disposition.reason
             );
@@ -2884,31 +2930,182 @@ jobs:
         uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
         env:
           HEAD_SHA: ${{ steps.result.outputs.head_sha }}
+          PR_NUMBER: ${{ steps.stack.outputs.pr_number }}
           REVIEW_DISPOSITION: ${{ steps.route.outputs.review_disposition }}
+          REVIEW_HOLD_KIND: ${{ steps.route.outputs.hold_kind }}
+          HOLD_FILE: ${{ steps.route.outputs.hold_file }}
+          POLICY_SCRIPT: ${{ steps.runtime.outputs.policy_script }}
         with:
           github-token: ${{ env.CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED == 'true' && secrets.TAP_PAT || (env.CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED != 'true' && github.token || '') }}
           script: |
+            const fs = require('fs');
+            const policy = require(process.env.POLICY_SCRIPT);
             const disposition = String(process.env.REVIEW_DISPOSITION || '').trim();
+            const holdKind = String(process.env.REVIEW_HOLD_KIND || '').trim();
+            const head = String(process.env.HEAD_SHA || '').trim().toLowerCase();
+            const prNumber = Number(process.env.PR_NUMBER);
             const descriptions = {
               repair: 'PR-Agent review complete: actionable',
               merge: 'PR-Agent review complete: clean',
+              hold: holdKind === 'ticket_compliance'
+                ? 'PR-Agent review held: non-code task compliance'
+                : 'PR-Agent review held: non-code unresolved',
               rereview: 'PR-Agent review complete: blocking; recovery eligible',
             };
             if (!descriptions[disposition]) {
               core.setFailed('Unknown PR-Agent review disposition: ' + (disposition || '<empty>'));
               return;
             }
+            // A non-code hold is a durable failure-state marker, not a
+            // transient provider failure and not the "blocking; recovery
+            // eligible" rereview state. Recovery treats a failure status
+            // without that token as a deterministic hold, so the scheduled
+            // reconciler never reopens the unchanged same-state review.
             await github.rest.repos.createCommitStatus({
               owner: process.env.CONTINUUM_PR_AGENT_TARGET_OWNER,
               repo: process.env.CONTINUUM_PR_AGENT_TARGET_REPO,
               sha: process.env.HEAD_SHA,
-              state: 'success',
+              state: disposition === 'hold' ? 'failure' : 'success',
               context: 'continuum/pr-agent-review',
               description: descriptions[disposition],
               target_url:
                 context.serverUrl + '/' + context.repo.owner + '/' +
                 context.repo.repo + '/actions/runs/' + context.runId,
             });
+            if (!prNumber || !head) {
+              core.setFailed('PR-Agent durable review state requires an exact HEAD and PR number.');
+              return;
+            }
+            // Bounded controller-state scan; hold markers are distinct from
+            // retry/no-progress markers so both can coexist.
+            const comments = [];
+            const total = (await github.rest.issues.get({
+              owner: process.env.CONTINUUM_PR_AGENT_TARGET_OWNER,
+              repo: process.env.CONTINUUM_PR_AGENT_TARGET_REPO,
+              issue_number: prNumber,
+            })).data.comments || 0;
+            const lastPage = Math.max(1, Math.ceil(total / 100));
+            for (let page = 1; page <= 5; page += 1) {
+              const targetPage = lastPage - (page - 1);
+              if (targetPage < 1) break;
+              const { data } = await github.rest.issues.listComments({
+                owner: process.env.CONTINUUM_PR_AGENT_TARGET_OWNER,
+                repo: process.env.CONTINUUM_PR_AGENT_TARGET_REPO,
+                issue_number: prNumber,
+                per_page: 100,
+                page: targetPage,
+              });
+              if (Array.isArray(data) && data.length > 0) comments.push(...data);
+            }
+            const holds = comments
+              .filter((comment) => {
+                const body = String(comment.body || '');
+                return body.includes(policy.CONTROLLER_STATE_MARKER) &&
+                  body.includes('continuum-pr-agent-hold');
+              })
+              .sort((a, b) => Number(a.id) - Number(b.id));
+            if (disposition !== 'hold') {
+              // A fresh non-hold disposition supersedes any older hold on
+              // this PR (repair/re-review/new HEAD). The merge path also
+              // clears all controller state immediately before merge.
+              for (const stale of holds) {
+                await github.rest.issues.deleteComment({
+                  owner: process.env.CONTINUUM_PR_AGENT_TARGET_OWNER,
+                  repo: process.env.CONTINUUM_PR_AGENT_TARGET_REPO,
+                  comment_id: stale.id,
+                });
+              }
+              return;
+            }
+            const holdFile = String(process.env.HOLD_FILE || '').trim();
+            if (!holdFile || !fs.existsSync(holdFile)) {
+              core.setFailed('A non-code hold requires runner-local hold evidence.');
+              return;
+            }
+            let hold;
+            try {
+              hold = JSON.parse(fs.readFileSync(holdFile, 'utf8'));
+            } catch (err) {
+              core.setFailed('Invalid runner-local non-code hold evidence: ' + err.message);
+              return;
+            }
+            if (!hold || typeof hold !== 'object' || Array.isArray(hold)) {
+              core.setFailed('Non-code hold evidence must be an object.');
+              return;
+            }
+            const holdHead = String(hold.head_sha || '').trim().toLowerCase();
+            if (holdHead !== head) {
+              core.setFailed('Non-code hold evidence is not for the reviewed exact HEAD.');
+              return;
+            }
+            const fingerprint = String(hold.fingerprint || '').trim();
+            const stateMarker =
+              '<!-- continuum-pr-agent-hold head=' + head +
+              ' kind=review hold=' + String(hold.kind || 'unknown') +
+              (fingerprint ? ' fingerprint=' + fingerprint : '') + ' -->';
+            const summary = [];
+            summary.push(hold.kind === 'ticket_compliance'
+              ? 'Non-code task-compliance **HOLD** for exact HEAD `' + head + '`.'
+              : 'Non-code unresolved-review **HOLD** for exact HEAD `' + head + '`.');
+            summary.push('');
+            summary.push('Recommendation: `' + String(hold.recommendation || holdKind || 'unknown') + '`');
+            const reasons = Array.isArray(hold.reasons) ? hold.reasons : [];
+            if (reasons.length > 0) {
+              summary.push('');
+              summary.push('Native ticket evidence:');
+              for (const item of reasons) {
+                const url = String((item && item.ticket_url) || '').trim();
+                const reason = String((item && item.reason) || '').trim();
+                if (url || reason) {
+                  summary.push('- ' + (url ? url + ' — ' : '') + reason);
+                }
+              }
+            }
+            const tickets = Array.isArray(hold.ticket_urls) ? hold.ticket_urls : [];
+            const missingTicketUrls = tickets.filter((url) => {
+              return !reasons.some((item) => String((item && item.ticket_url) || '') === String(url));
+            });
+            for (const url of missingTicketUrls) {
+              summary.push('- ' + String(url));
+            }
+            const humanNotes = Array.isArray(hold.requires_human_verification)
+              ? hold.requires_human_verification
+              : [];
+            if (humanNotes.length > 0) {
+              summary.push('');
+              summary.push('Advisory human-verification note(s), not automatic approval gates:');
+              for (const item of humanNotes) {
+                const url = String((item && item.ticket_url) || '').trim();
+                const note = String((item && item.note) || '').trim();
+                if (url || note) summary.push('- ' + (url ? url + ' — ' : '') + note);
+              }
+            }
+            summary.push('');
+            summary.push('No code repair was dispatched. This hold is scoped to the repository, PR, exact HEAD, and frozen ticket context. A fresh upstream review after eligible evidence or metadata changes is required; editing PR metadata alone does not automatically wake this controller.');
+            const body = policy.controllerStateBody(stateMarker, summary.join('\n'));
+            const latest = holds.at(-1);
+            if (latest) {
+              await github.rest.issues.updateComment({
+                owner: process.env.CONTINUUM_PR_AGENT_TARGET_OWNER,
+                repo: process.env.CONTINUUM_PR_AGENT_TARGET_REPO,
+                comment_id: latest.id,
+                body,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: process.env.CONTINUUM_PR_AGENT_TARGET_OWNER,
+                repo: process.env.CONTINUUM_PR_AGENT_TARGET_REPO,
+                issue_number: prNumber,
+                body,
+              });
+            }
+            for (const stale of holds.slice(0, -1)) {
+              await github.rest.issues.deleteComment({
+                owner: process.env.CONTINUUM_PR_AGENT_TARGET_OWNER,
+                repo: process.env.CONTINUUM_PR_AGENT_TARGET_REPO,
+                comment_id: stale.id,
+              });
+            }
 
       - name: Publish failed PR-Agent review state
         if: >-

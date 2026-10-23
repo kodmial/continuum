@@ -219,10 +219,6 @@ class CleanSkipTests(unittest.TestCase):
         cases = [
             {},
             {"security_concerns": "Secret disclosure"},
-            {**base, "ticket_compliance_check": [
-                {"not_compliant_requirements": "Required live E2E evidence missing"}]},
-            {**base, "ticket_compliance_check": [{"unknown": "not checked"}]},
-            {**base, "ticket_compliance_check": "unknown"},
             {**base, "tool_errors": "review API call failed"},
             {**base, "coverage_complete": False},
         ]
@@ -234,10 +230,36 @@ class CleanSkipTests(unittest.TestCase):
                     raw="",
                 )
                 self.assertEqual(result["action"], "rereview")
+        # A positive ticket-compliance gap is now an explicit non-code hold,
+        # never a same-HEAD rereview.
+        gap = run_js(
+            "disposition",
+            review=make_review(
+                [], recommendation="merge_with_caution",
+                extra={**base, "ticket_compliance_check": [
+                    {"not_compliant_requirements": "Required live E2E evidence missing"}]},
+            ),
+            raw="",
+        )
+        self.assertEqual(gap["action"], "hold")
+        # Malformed structured output keeps the fail-closed gate.
+        for malformed in (
+            {**base, "ticket_compliance_check": [{"unknown": "not checked"}]},
+            {**base, "ticket_compliance_check": "unknown"},
+        ):
+            with self.subTest(malformed=malformed):
+                with self.assertRaises(AssertionError):
+                    run_js(
+                        "disposition",
+                        review=make_review(
+                            [], recommendation="merge_with_caution", extra=malformed
+                        ),
+                        raw="",
+                    )
         never_safe = make_review(
             [], recommendation="changes_required", extra=base,
         )
-        self.assertEqual(run_js("disposition", review=never_safe, raw="")["action"], "rereview")
+        self.assertEqual(run_js("disposition", review=never_safe, raw="")["action"], "hold")
         actionable = make_review(
             [issue_entry()], recommendation="merge_with_caution", extra=base,
         )
@@ -282,6 +304,268 @@ class CleanSkipTests(unittest.TestCase):
         )
         self.assertEqual(result["action"], "merge")
         self.assertEqual(result["qualifyingSuggestionCount"], 0)
+
+
+class TicketComplianceDispositionTests(unittest.TestCase):
+    """Finite v0.46.0 ticket-compliance disposition (#403).
+
+    The native fields are free-form strings. Only definitively empty or
+    negative prose is empty; any positive not_compliant_requirements string
+    always prevents merge and produces a non-code hold, regardless of the
+    model's merge recommendation.
+    """
+
+    def _hold(self, review):
+        result = run_js("disposition", review=review, raw="")
+        self.assertEqual(result["action"], "hold", result)
+        self.assertEqual(result["hold"]["kind"], "ticket_compliance", result)
+        return result
+
+    def test_absent_and_empty_ticket_context_reaches_merge(self):
+        empty_markers = [
+            "",
+            "   ",
+            "-",
+            "- ",
+            "None",
+            "none.",
+            "[]",
+            "{}",
+            "N/A",
+            "n/a",
+            "No non-compliant requirements",
+            "No noncompliant requirements identified",
+            "No issues were found.",
+            "No gaps were identified.",
+            "No compliance concerns detected.",
+            "All requirements met.",
+            "All requirements are satisfied",
+            "All requirements have been met",
+            "All acceptance criteria were satisfied",
+            "Nothing to report.",
+            "Fully compliant",
+            "- None\n- N/A\n* all requirements met",
+        ]
+        for marker in empty_markers:
+            with self.subTest(marker=marker):
+                review = make_review(
+                    [], extra={"ticket_compliance_check": [
+                        {"ticket_url": "https://github.com/o/r/issues/1",
+                         "not_compliant_requirements": marker}
+                    ]}
+                )
+                self.assertEqual(
+                    run_js("disposition", review=review, raw="")["action"], "merge"
+                )
+        for absent in (None, []):
+            with self.subTest(absent=absent):
+                extra = {} if absent is None else {"ticket_compliance_check": absent}
+                self.assertEqual(
+                    run_js("disposition", review=make_review([], extra=extra), raw="")["action"],
+                    "merge",
+                )
+
+    def test_positive_noncompliance_holds_regardless_of_recommendation(self):
+        for recommendation in ("safe_to_merge", "merge_with_caution", "changes_required"):
+            with self.subTest(recommendation=recommendation):
+                review = make_review(
+                    [],
+                    recommendation=recommendation,
+                    extra={
+                        "security_concerns": "No security concerns identified",
+                        "ticket_compliance_check": [{
+                            "ticket_url": "https://github.com/o/r/issues/1",
+                            "ticket_requirements": "Evidence before/after in PR body",
+                            "fully_compliant_requirements": "Tests pass",
+                            "not_compliant_requirements": "- before/after examples missing in PR description",
+                            "requires_further_human_verification": "",
+                        }],
+                    },
+                )
+                result = self._hold(review)
+                self.assertEqual(result["hold"]["recommendation"], recommendation)
+                self.assertEqual(
+                    result["hold"]["ticket_urls"],
+                    ["https://github.com/o/r/issues/1"],
+                )
+                self.assertIn(
+                    "before/after examples missing",
+                    result["hold"]["reasons"][0]["reason"],
+                )
+
+    def test_multiple_tickets_and_split_envelope_union_are_all_evaluated(self):
+        clean = {
+            "ticket_url": "https://github.com/o/r/issues/1",
+            "not_compliant_requirements": "None",
+        }
+        dirty = {
+            "ticket_url": "https://github.com/o/r/issues/2",
+            "not_compliant_requirements": "Measured before-POST count not demonstrated",
+        }
+        review = make_review([], extra={"ticket_compliance_check": [clean, dirty]})
+        result = self._hold(review)
+        self.assertEqual(len(result["hold"]["reasons"]), 1)
+        self.assertEqual(
+            result["hold"]["reasons"][0]["ticket_url"],
+            "https://github.com/o/r/issues/2",
+        )
+
+        split = {
+            "ticket_compliance_check": [clean],
+            "merge_recommendation": "safe_to_merge",
+            "key_issues_to_review": [],
+            "review": make_review(
+                [], extra={"ticket_compliance_check": [dirty]}
+            ),
+        }
+        merged = run_js("unwrap", review=split)
+        self.assertEqual(len(merged["ticket_compliance_check"]), 2)
+        self.assertEqual(run_js("disposition", review=split, raw="")["action"], "hold")
+
+        # A malformed list on either side of a split envelope must survive the
+        # merge so the strict parser fails closed instead of reading the clean
+        # side.
+        for outer, nested in (
+            ([clean], "malformed"),
+            ("malformed", [clean]),
+        ):
+            with self.subTest(outer=outer, nested=nested):
+                malformed = {
+                    "ticket_compliance_check": outer,
+                    "merge_recommendation": "safe_to_merge",
+                    "key_issues_to_review": [],
+                    "review": make_review(
+                        [], extra={"ticket_compliance_check": nested}
+                    ),
+                }
+                with self.assertRaises(AssertionError):
+                    run_js("disposition", review=malformed, raw="")
+
+    def test_requires_further_human_verification_alone_is_advisory(self):
+        review = make_review(
+            [],
+            extra={
+                "ticket_compliance_check": [{
+                    "ticket_url": "https://github.com/o/r/issues/1",
+                    "not_compliant_requirements": "None",
+                    "requires_further_human_verification": "Manually confirm rollout window",
+                }]
+            },
+        )
+        result = run_js("disposition", review=review, raw="")
+        self.assertEqual(result["action"], "merge")
+        self.assertIn("advisory human-verification", result["reason"])
+
+        caution = make_review(
+            [],
+            recommendation="merge_with_caution",
+            extra={
+                "security_concerns": "No security concerns identified",
+                "ticket_compliance_check": [{
+                    "ticket_url": "https://github.com/o/r/issues/1",
+                    "not_compliant_requirements": "None",
+                    "requires_further_human_verification": "Manually confirm rollout window",
+                }],
+            },
+        )
+        self.assertEqual(run_js("disposition", review=caution, raw="")["action"], "merge")
+
+    def test_changes_required_without_findings_is_a_non_code_hold(self):
+        result = run_js(
+            "disposition",
+            review=make_review([], recommendation="changes_required"),
+            raw="",
+        )
+        self.assertEqual(result["action"], "hold")
+        self.assertEqual(result["hold"]["kind"], "unresolved_review")
+        self.assertEqual(result["hold"]["ticket_urls"], [])
+        self.assertIn("zero actionable code findings", result["reason"])
+
+    def test_independent_blocking_signals_keep_the_existing_fail_closed_gate(self):
+        ticket = [{
+            "ticket_url": "https://github.com/o/r/issues/1",
+            "not_compliant_requirements": "Evidence missing",
+        }]
+        safe_with_security = make_review(
+            [], extra={"ticket_compliance_check": ticket,
+                      "security_concerns": "Hardcoded credential"}
+        )
+        self.assertEqual(
+            run_js("disposition", review=safe_with_security, raw="")["action"], "merge"
+        )
+        caution_tool = make_review(
+            [], recommendation="merge_with_caution",
+            extra={"ticket_compliance_check": ticket,
+                   "security_concerns": "No security concerns identified",
+                   "tool_errors": "review API call failed"}
+        )
+        self.assertEqual(
+            run_js("disposition", review=caution_tool, raw="")["action"], "rereview"
+        )
+        changes_partial = make_review(
+            [], recommendation="changes_required",
+            extra={"ticket_compliance_check": ticket, "coverage_complete": False}
+        )
+        self.assertEqual(
+            run_js("disposition", review=changes_partial, raw="")["action"], "rereview"
+        )
+
+    def test_malformed_ticket_structure_fails_closed(self):
+        malformed = [
+            {"ticket_compliance_check": "unknown"},
+            {"ticket_compliance_check": {"not_compliant_requirements": "None"}},
+            {"ticket_compliance_check": ["not-an-object"]},
+            {"ticket_compliance_check": [{"ticket_url": "https://github.com/o/r/issues/1"}]},
+            {"ticket_compliance_check": [{
+                "ticket_url": "https://github.com/o/r/issues/1",
+                "not_compliant_requirements": ["typed", "list"],
+            }]},
+            {"ticket_compliance_check": [{
+                "ticket_url": "https://github.com/o/r/issues/1",
+                "not_compliant_requirements": "None",
+                "requires_further_human_verification": True,
+            }]},
+            {"ticket_compliance_check": [{
+                "ticket_url": 7,
+                "not_compliant_requirements": "None",
+            }]},
+        ]
+        for extra in malformed:
+            with self.subTest(extra=extra):
+                with self.assertRaises(AssertionError):
+                    run_js("disposition", review=make_review([], extra=extra), raw="")
+
+    def test_documented_ticket_ids_are_valid_native_ticket_context(self):
+        for ticket_ref in ("#123", "ABC-123", "owner/repo#123", "123"):
+            with self.subTest(ticket_ref=ticket_ref):
+                review = make_review(
+                    [], extra={"ticket_compliance_check": [{
+                        "ticket_url": ticket_ref,
+                        "not_compliant_requirements": "Evidence missing",
+                    }]}
+                )
+                result = self._hold(review)
+                self.assertEqual(result["hold"]["ticket_urls"], [ticket_ref])
+
+    def test_hold_evidence_is_sanitized_and_keeps_the_exact_native_ticket_url(self):
+        secret = "ghp_" + "A" * 24
+        review = make_review(
+            [],
+            extra={"ticket_compliance_check": [{
+                "ticket_url": "https://github.com/o/r/issues/7",
+                "not_compliant_requirements": (
+                    "Missing evidence\n" + secret +
+                    " at https://example.test/private\n" + "x" * 900
+                ),
+            }]},
+        )
+        result = self._hold(review)
+        self.assertEqual(result["hold"]["ticket_urls"], ["https://github.com/o/r/issues/7"])
+        reason = result["hold"]["reasons"][0]["reason"]
+        self.assertNotIn("\n", reason)
+        self.assertNotIn(secret, reason)
+        self.assertNotIn("https://example.test/private", reason)
+        self.assertLessEqual(len(reason), 320)
 
 
 class SignalMatrixTests(unittest.TestCase):
