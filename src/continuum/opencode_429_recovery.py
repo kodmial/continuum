@@ -221,6 +221,7 @@ _FAIL_CLOSED_RE = re.compile(
     r"|missing scope",
     re.IGNORECASE,
 )
+_FAIL_CLOSED_STATUS_RE = re.compile(r"\b(?:400|401|403|404|422)\b", re.IGNORECASE)
 _QUOTA_STATUSES = frozenset({429})
 _UPSTREAM_STATUSES = frozenset({500, 502, 504})
 _UNAVAILABLE_STATUSES = frozenset({503})
@@ -517,7 +518,7 @@ def classify_agent_error(log_text: Any, exit_code: Any = 1) -> str:
     if classification == "fail_closed":
         return "fail-closed"
     text = log_text if isinstance(log_text, str) else ""
-    if _FAIL_CLOSED_RE.search(text):
+    if _FAIL_CLOSED_STATUS_RE.search(text):
         return "fail-closed"
     return "task-failure"
 

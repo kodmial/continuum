@@ -115,6 +115,45 @@ class Classify429Test(unittest.TestCase):
                 self.assertEqual(classify_agent_error(log, 0), "runner-death-429")
                 self.assertEqual(classify_agent_error(log, 1), "runner-death-429")
 
+    def test_pinned_cli_production_error_event_shape_is_classified(self):
+        # Captured from OpenCode 1.19.3 ``run --format json`` against a fake
+        # OpenAI-compatible endpoint returning HTTP 429 (see the pinned CLI's
+        # session.error emitter). This locks the real event envelope rather
+        # than only the minimal synthetic fixture.
+        log = json.dumps(
+            {
+                "type": "error",
+                "timestamp": 1792765550447,
+                "sessionID": "ses_e96d9ba3bffe7tnMMH8RFy32DJ",
+                "error": {
+                    "name": "APIError",
+                    "data": {
+                        "message": "Free usage limit reached",
+                        "statusCode": 429,
+                        "isRetryable": True,
+                        "responseHeaders": {
+                            "content-length": "109",
+                            "content-type": "application/json",
+                            "date": "Fri, 23 Oct 2026 14:25:50 GMT",
+                            "server": "BaseHTTP/0.6 Python/3.12.3",
+                        },
+                        "responseBody": (
+                            '{"error": {"message": "Free usage limit reached", '
+                            '"type": "FreeUsageLimitError", "code": '
+                            '"free_usage_limit"}}'
+                        ),
+                        "metadata": {
+                            "url": "http://127.0.0.1:18765/v1/chat/completions"
+                        },
+                    },
+                },
+            }
+        )
+        self.assertEqual(parse_opencode_error_events(log)[0]["type"], "error")
+        self.assertEqual(classify_opencode_events(log, 1), "quota_429")
+        self.assertTrue(is_opencode_429(log, 1))
+        self.assertEqual(classify_agent_error(log, 1), "runner-death-429")
+
     def test_arbitrary_transcript_text_never_classifies(self):
         for log in (
             "FreeUsageLimitError: quota exceeded",
@@ -180,6 +219,19 @@ class Classify429Test(unittest.TestCase):
             with self.subTest(log=log):
                 self.assertFalse(is_opencode_429(log, 1), log)
                 self.assertEqual(classify_agent_error(log, 1), "fail-closed", log)
+
+    def test_transcript_words_without_status_are_not_fail_closed(self):
+        # Only authenticated provider error objects may use the word tokens;
+        # ordinary task prose that merely mentions auth vocabulary stays a
+        # task failure and never changes recovery routing.
+        for log in (
+            "the agent discussed an unauthorized API request",
+            "bad credentials were mentioned in the review",
+            "this path is forbidden by the repository policy",
+            "the token is missing scope documentation",
+        ):
+            with self.subTest(log=log):
+                self.assertEqual(classify_agent_error(log, 1), "task-failure")
 
     def test_event_quoting_429_without_authenticated_status_is_not_quota(self):
         log = error_event("AssertionError", 'expected "429" in the report')
