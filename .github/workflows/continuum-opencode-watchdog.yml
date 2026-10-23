@@ -228,6 +228,13 @@ jobs:
               'CONTINUUM_OPENCODE_PUBLISH_RACE_RETRY_REQUIRED';
             const metadataFailedMarker =
               'CONTINUUM_OPENCODE_429_RECOVERY_METADATA_FAILED';
+            // kodmial/continuum#374: a fresh-VM checkpoint recovery that
+            // failed before the restore step (for example a checkout/transport
+            // error) never reached OpenCode. The workflow records the original
+            // checkpoint identity so this pass can retry it through the same
+            // bounded recovery path instead of charging a task attempt.
+            const bootstrapRetryMarker =
+              'CONTINUUM_OPENCODE_429_BOOTSTRAP_RETRY_REQUIRED';
             // Legacy claim/backoff markers remain readable so an older
             // in-flight watchdog pass cannot duplicate a resumption.
             const legacyResumptionPrefix = '<!-- continuum-429-resumption';
@@ -240,6 +247,28 @@ jobs:
               /Evacuated (?:429|infrastructure) checkpoint (\S+) at exact SHA ([0-9a-f]{40}) \(operation (\S+), stage (\S+), generation (\d+), mode (\S+), issue ([^,]*), pr ([^,]*), branch ([^)]*)\)/;
             const metadataFailedRe =
               /CONTINUUM_OPENCODE_429_RECOVERY_METADATA_FAILED operation=(\S+) generation=(\d+) stage=(\S*) mode=(\S*) issue=(\S*) pr=(\S*) salvage_ref=(\S*) reason=(.*)$/;
+            const bootstrapRetryRe =
+              /Recoverable (?:429|infrastructure) checkpoint (\S+) at exact SHA ([0-9a-f]{40}|-) \(operation (\S+), stage (\S*), generation (\d+), mode (\S*), issue ([^,]*), pr ([^,]*), branch ([^)]*)\)/;
+            function parseBootstrapRetry(logText) {
+              for (const line of String(logText || '').split('\n')) {
+                const match = line.match(bootstrapRetryRe);
+                if (!match) continue;
+                const clean = (value) => (value === '-' ? '' : value);
+                return {
+                  checkpointRef: match[1],
+                  checkpointSha: clean(match[2]),
+                  operationId: match[3],
+                  stage: clean(match[4]),
+                  generation: Number.parseInt(match[5], 10),
+                  mode: clean(match[6]),
+                  issueNumber: clean(match[7]).trim(),
+                  prNumber: clean(match[8]).trim(),
+                  branch: clean(match[9]).trim(),
+                  bootstrap: true,
+                };
+              }
+              return null;
+            }
             function parseMetadataFailure(logText) {
               for (const line of String(logText || '').split('\n')) {
                 const match = line.match(metadataFailedRe);
@@ -729,6 +758,21 @@ jobs:
               const now = Math.floor(Date.now() / 1000);
               const comments = await listThreadComments(threadNumber);
               const previous = latestRecoveryState(comments, operation, generation);
+              const bootstrapRetry = Boolean(evacuated429 && evacuated429.bootstrap);
+
+              // kodmial/continuum#374: once the bounded pre-checkpoint retry
+              // budget is exhausted, keep the durable state but never dispatch
+              // another run or slide the window on every catch-up pass.
+              if (bootstrapRetry && previous &&
+                  previous.detail === 'bootstrap-attempts-exhausted') {
+                core.notice(
+                  'OpenCode infrastructure operation ' + operation + ' generation ' +
+                  generation + ' exhausted its bounded pre-checkpoint retry budget; ' +
+                  'checkpoint ' + checkpointRef + ' is preserved and no task budget ' +
+                  'was consumed.'
+                );
+                return;
+              }
 
               if (generation > max429Restarts) {
                 // Honor the durable window instead of recording a fresh
@@ -897,12 +941,29 @@ jobs:
 
               if (previous) {
                 if (previous.state === 'observed') {
-                  core.notice(
+                  // A completed fresh-VM run that never reached the restore
+                  // step (bootstrap/checkout failure) may open one bounded
+                  // retry of the SAME checkpoint generation. It must never
+                  // race a run that is still in flight or reuse an unrelated
+                  // observed run id.
+                  const sameFailedRun = Boolean(run) &&
+                    String(previous.runId || '') === String(run.id || '') &&
+                    run.status === 'completed' &&
+                    run.conclusion !== 'success';
+                  if (!(bootstrapRetry && sameFailedRun)) {
+                    core.notice(
+                      'OpenCode infrastructure operation ' + operation + ' generation ' +
+                      generation + ' was already resumed by observed run ' + previous.runId + '; ' +
+                      'watchdog will not create a competing resumption.'
+                    );
+                    return;
+                  }
+                  core.warning(
                     'OpenCode infrastructure operation ' + operation + ' generation ' +
-                    generation + ' was already resumed by observed run ' + previous.runId + '; ' +
-                    'watchdog will not create a competing resumption.'
+                    generation + ' observed run ' + previous.runId + ' ended with ' +
+                    run.conclusion + ' before restoring the checkpoint; scheduling ' +
+                    'a bounded pre-checkpoint retry.'
                   );
-                  return;
                 }
                 if (previous.state === 'accepted' && previous.nextDue > now) {
                   core.notice(
@@ -935,7 +996,7 @@ jobs:
                   previous.state === 'backoff' && previous.nextDue <= now;
                 if (
                   previous.attempt >= Math.max(1, max429Restarts + 1) &&
-                  !backoffExpired
+                  (!backoffExpired || bootstrapRetry)
                 ) {
                   await recordRecoveryState({
                     ...baseState,
@@ -943,8 +1004,12 @@ jobs:
                     state: 'backoff',
                     attempt: previous.attempt,
                     nextDue: now + 3600,
-                    detail: 'attempts-exhausted',
-                    summary: 'Bounded recovery attempts are exhausted for this generation. Checkpoint `' + checkpointRef + '` is preserved; no pause was applied.',
+                    detail: bootstrapRetry
+                      ? 'bootstrap-attempts-exhausted'
+                      : 'attempts-exhausted',
+                    summary: bootstrapRetry
+                      ? 'Bounded pre-checkpoint bootstrap retries are exhausted for this generation. Checkpoint `' + checkpointRef + '` is preserved; no task budget was consumed and no further run was dispatched.'
+                      : 'Bounded recovery attempts are exhausted for this generation. Checkpoint `' + checkpointRef + '` is preserved; no pause was applied.',
                   });
                   return;
                 }
@@ -1208,7 +1273,8 @@ jobs:
                   const emitted = logText.split('\n').some(line =>
                     line.includes('##[error]') &&
                     (line.includes(rateLimitMarker) ||
-                     line.includes(upstreamUnavailableMarker))
+                     line.includes(upstreamUnavailableMarker) ||
+                     line.includes(bootstrapRetryMarker))
                   );
                   if (!emitted) continue;
                   candidateRestart = true;
@@ -1225,6 +1291,8 @@ jobs:
                       prNumber: (evacuated[8] || '').trim(),
                       branch: (evacuated[9] || '').trim(),
                     };
+                  } else if (logText.includes(bootstrapRetryMarker)) {
+                    candidateEvacuated = parseBootstrapRetry(logText);
                   }
                   if (logText.includes(metadataFailedMarker)) {
                     candidateMetadataFailed = parseMetadataFailure(logText);
@@ -1309,7 +1377,8 @@ jobs:
               const emittedRestartMarker = logText.split('\n').some(line =>
                 line.includes('##[error]') &&
                 (line.includes(rateLimitMarker) ||
-                 line.includes(upstreamUnavailableMarker))
+                 line.includes(upstreamUnavailableMarker) ||
+                 line.includes(bootstrapRetryMarker))
               );
               if (emittedRestartMarker) {
                 runnerRestartRequired = true;
@@ -1326,6 +1395,8 @@ jobs:
                     prNumber: (evacuated[8] || '').trim(),
                     branch: (evacuated[9] || '').trim(),
                   };
+                } else if (logText.includes(bootstrapRetryMarker)) {
+                  evacuated429 = parseBootstrapRetry(logText);
                 }
               }
               if (logText.includes(metadataFailedMarker)) {
