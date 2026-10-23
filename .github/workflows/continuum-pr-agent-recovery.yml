@@ -308,7 +308,25 @@ jobs:
             ]);
             const REVIEW_CONTEXT = 'continuum/pr-agent-review';
             const REPAIR_CONTEXT = 'continuum/pr-agent-repair';
+            const DESCRIPTION_CONTEXT = 'continuum/pr-agent-description';
             const CONTROLLER_STATE_MARKER = '<!-- continuum-pr-agent-controller-state:v1 -->';
+            function descriptionBodyRevision(body) {
+              const withoutMarker = String(body || '').replace(
+                /<!--\s*continuum-child-pr-description:v1\s+sha256=[0-9a-f]{64}\s*-->/g,
+                ''
+              );
+              return require('crypto')
+                .createHash('sha256')
+                .update(
+                  withoutMarker
+                    .replace(/\r\n?/g, '\n')
+                    .split('\n')
+                    .map(line => line.replace(/[ \t]+$/g, ''))
+                    .join('\n')
+                    .trim() + '\n'
+                )
+                .digest('hex');
+            }
 
             // Keep the action client PAT-authenticated for mutations/dispatch.
             // A distinct Octokit instance handles read-only same-repository calls
@@ -2220,6 +2238,19 @@ jobs:
               );
 
               const reviewStatus = latestContext(statuses, REVIEW_CONTEXT);
+              // A clean status is scoped to the exact PR description the
+              // reviewer saw. A metadata-only body edit with unchanged HEAD
+              // makes that status stale and must be re-evaluated through the
+              // normal bounded review lifecycle (#399).
+              const descriptionStatus = latestContext(statuses, DESCRIPTION_CONTEXT);
+              const descriptionRevisionMatch = descriptionStatus
+                ? /^revision=([0-9a-f]{64})$/.exec(
+                    String(descriptionStatus.description || '').trim()
+                  )
+                : null;
+              const descriptionRevisionStale = Boolean(descriptionStatus) &&
+                String(descriptionRevisionMatch ? descriptionRevisionMatch[1] : '') !==
+                  descriptionBodyRevision(pr.body);
               // A clean review operation is not the same as a completed merge
               // lifecycle. Even when the orchestration run that published the
               // status succeeded, the open PR can still be waiting for an
@@ -2233,7 +2264,9 @@ jobs:
               let cleanLifecycleIncomplete = false;
               if (reviewStatus?.state === 'success') {
                 const cleanDescription = String(reviewStatus.description || '');
-                if (!/actionable/i.test(cleanDescription) && !/blocking; recovery eligible/i.test(cleanDescription)) {
+                if (!descriptionRevisionStale &&
+                    !/actionable/i.test(cleanDescription) &&
+                    !/blocking; recovery eligible/i.test(cleanDescription)) {
                   cleanReviewRun = await statusRunMetadata(reviewStatus);
                   const cleanRunConclusion =
                     String(cleanReviewRun.conclusion || '').toLowerCase();
@@ -2346,6 +2379,18 @@ jobs:
                     description: 'PR-Agent blocking review: recovery eligible',
                   };
                   operationRun = reviewRun;
+                } else if (descriptionRevisionStale) {
+                  kind = 'review';
+                  operationStatus = {
+                    ...reviewStatus,
+                    state: 'failure',
+                    description: 'PR-Agent review description changed: recovery eligible',
+                  };
+                  operationRun = reviewRun;
+                  core.info(
+                    'PR #' + pr.number + ' HEAD ' + head +
+                    ': PR description changed after the clean review; bounded re-review required.'
+                  );
                 } else if (
                   retryableConclusions.has(
                     String(reviewRun.conclusion || '').toLowerCase()

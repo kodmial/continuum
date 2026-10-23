@@ -289,6 +289,97 @@ jobs:
               );
               return;
             }
+            // A clean review is only valid for the exact description it
+            // reviewed. If a metadata-only edit changed the PR body without
+            // moving HEAD, fail closed and let the bounded lifecycle request
+            // fresh review instead of merging a stale attestation (#399).
+            const descriptionStatuses = (data.statuses || [])
+              .filter(status => status.context === 'continuum/pr-agent-description')
+              .sort((a, b) => {
+                const at = new Date(a.updated_at || a.created_at || 0).getTime();
+                const bt = new Date(b.updated_at || b.created_at || 0).getTime();
+                if (bt !== at) return bt - at;
+                return Number(b.id || 0) - Number(a.id || 0);
+              });
+            function descriptionContentRevision(body) {
+              const withoutMarker = String(body || '').replace(
+                /<!--\s*continuum-child-pr-description:v1\s+sha256=[0-9a-f]{64}\s*-->/g,
+                ''
+              );
+              return require('crypto')
+                .createHash('sha256')
+                .update(
+                  withoutMarker
+                    .replace(/\r\n?/g, '\n')
+                    .split('\n')
+                    .map(line => line.replace(/[ \t]+$/g, ''))
+                    .join('\n')
+                    .trim() + '\n'
+                )
+                .digest('hex');
+            }
+            const latestDescription = descriptionStatuses[0];
+            if (latestDescription) {
+              const match = /^revision=([0-9a-f]{64})$/.exec(
+                String(latestDescription.description || '').trim()
+              );
+              let liveDescriptionRevision = '';
+              try {
+                const { data: livePr } = await github.rest.pulls.get({
+                  owner,
+                  repo,
+                  pull_number: prNumber,
+                });
+                liveDescriptionRevision = descriptionContentRevision(livePr.body || '');
+              } catch (err) {
+                core.setFailed(
+                  'Could not verify the reviewed PR description before merge: ' + err.message
+                );
+                return;
+              }
+              if (!match || match[1] !== liveDescriptionRevision) {
+                const marker =
+                  '<!-- continuum-pr-agent-description-stale:' + headSha + ' -->';
+                try {
+                  const comments = [];
+                  for (let page = 1; page <= 2; page += 1) {
+                    const { data: batch } = await github.rest.issues.listComments({
+                      owner,
+                      repo,
+                      issue_number: prNumber,
+                      per_page: 100,
+                      page,
+                    });
+                    comments.push(...(batch || []));
+                    if (!batch || batch.length < 100) break;
+                  }
+                  if (!comments.some((comment) =>
+                    String(comment.body || '').includes(marker)
+                  )) {
+                    await github.rest.issues.createComment({
+                      owner,
+                      repo,
+                      issue_number: prNumber,
+                      body: marker + '\n' +
+                        '⚡ **Continuum · pr-agent-auto-merge**\n' +
+                        '<!-- continuum-origin role=continuum component=pr-agent-auto-merge -->\n' +
+                        'PR-Agent refused to merge because the PR description changed ' +
+                        'after the clean review at `' + headSha + '`. A fresh review of ' +
+                        'the current description is required; this comment is posted once ' +
+                        'per exact HEAD.',
+                    });
+                  }
+                } catch (err) {
+                  core.warning(
+                    'Could not post the stale-description refusal comment: ' + err.message
+                  );
+                }
+                core.setFailed(
+                  'PR description changed after the clean review; refusing to merge a stale attestation.'
+                );
+                return;
+              }
+            }
             core.setOutput('green', 'true');
             core.setOutput('head_sha', headSha);
             core.notice(

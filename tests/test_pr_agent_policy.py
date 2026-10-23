@@ -37,6 +37,8 @@ def run_js(expression, review=None, state=None, options=None, raw=None):
     env["POLICY_STATE"] = json.dumps(state) if state is not None else ""
     env["POLICY_OPTIONS"] = json.dumps(options or {})
     env["POLICY_RAW"] = raw if raw is not None else ""
+    env["POLICY_BODY"] = options.get("body", "") if isinstance(options, dict) else ""
+    env["POLICY_DIFF"] = options.get("diff", "") if isinstance(options, dict) else ""
     env["POLICY_EXPR"] = expression
     code = r"""
 const policy = require(process.env.POLICY_MODULE);
@@ -59,6 +61,9 @@ else if (expr === 'unwrap') result = policy.unwrapReview(review);
 else if (expr === 'skipped') result = policy.isSkippedCleanImprovePayload(raw);
 else if (expr === 'skip') result = policy.isCleanReviewForImproveSkip(review, state, options);
 else if (expr === 'disposition') result = policy.reviewDisposition(review, raw);
+else if (expr === 'description_only') result = policy.descriptionOnlyNonCompliance(review);
+else if (expr === 'correct_description') result = policy.correctDescriptionEvidence({body: process.env.POLICY_BODY || '', diffText: process.env.POLICY_DIFF || '', requirements: options.requirements || []});
+else if (expr === 'description_revision') result = policy.childDescriptionRevision(process.env.POLICY_BODY || '');
 else throw new Error('unknown expr');
 process.stdout.write(JSON.stringify(result === undefined ? null : result));
 """
@@ -282,6 +287,226 @@ class CleanSkipTests(unittest.TestCase):
         )
         self.assertEqual(result["action"], "merge")
         self.assertEqual(result["qualifyingSuggestionCount"], 0)
+
+
+
+class DescriptionNonComplianceTests(unittest.TestCase):
+    REQUIREMENT = "PR description lacks before/after examples"
+
+    def review(self, requirement=REQUIREMENT, **extra):
+        fields = {
+            "security_concerns": "No security concerns identified",
+            "ticket_compliance_check": [
+                {"not_compliant_requirements": requirement}
+            ],
+        }
+        fields.update(extra)
+        return make_review([], recommendation="merge_with_caution", extra=fields)
+
+    def test_metadata_only_noncompliance_is_recognized_without_merging(self):
+        review = self.review()
+        self.assertTrue(run_js("description_only", review=review))
+        self.assertEqual(
+            run_js("disposition", review=review, raw="")["action"], "rereview"
+        )
+
+    def test_code_and_missing_evidence_gaps_are_not_metadata_only(self):
+        for requirement in (
+            "Required live E2E evidence missing",
+            "Implementation is missing error handling",
+            "Code defect remains in the retry path",
+            "Security concern unresolved",
+        ):
+            with self.subTest(requirement=requirement):
+                self.assertFalse(
+                    run_js("description_only", review=self.review(requirement))
+                )
+
+    def test_description_correction_is_diff_backed_and_preserves_markers(self):
+        snapshot = (
+            "<!-- continuum-task-snapshot-ref repo=o/r issue=157 generation=1 "
+            "title-sha256=" + ("a" * 64) + " body-sha256=" + ("b" * 64) +
+            " spec-sha256=" + ("c" * 64) + " -->"
+        )
+        body = "\n".join([
+            "## Summary",
+            "",
+            "Docs update.",
+            "",
+            "## Files changed",
+            "",
+            "- `AGENTS.md`",
+            "",
+            "## Before / after",
+            "",
+            "Not requested by this task.",
+            "",
+            snapshot,
+            "<!-- continuum-child-accepted -->",
+            "Closes #157",
+            "<!-- continuum-child-pr-description:v1 sha256=" + ("d" * 64) + " -->",
+        ])
+        diff = "\n".join([
+            "diff --git a/AGENTS.md b/AGENTS.md",
+            "--- a/AGENTS.md",
+            "+++ b/AGENTS.md",
+            "@@ -1 +1 @@",
+            "-Child review is optional.",
+            "+Child review is mandatory before merge.",
+        ])
+        result = run_js(
+            "correct_description",
+            options={"body": body, "diff": diff, "requirements": [self.REQUIREMENT]},
+        )
+        self.assertTrue(result["changed"])
+        self.assertIn("-Child review is optional.", result["body"])
+        self.assertIn("+Child review is mandatory before merge.", result["body"])
+        self.assertEqual(result["body"].count(snapshot), 1)
+        self.assertEqual(result["body"].count("<!-- continuum-child-accepted -->"), 1)
+        self.assertIn("<!-- continuum-child-pr-description:v1 sha256=", result["body"])
+        self.assertNotIn("Not requested by this task.", result["body"])
+
+    def test_legacy_body_and_affected_files_requirement_are_corrected(self):
+        snapshot = (
+            "<!-- continuum-task-snapshot-ref repo=o/r issue=157 generation=1 "
+            "title-sha256=" + ("a" * 64) + " body-sha256=" + ("b" * 64) +
+            " spec-sha256=" + ("c" * 64) + " -->"
+        )
+        body = "\n".join([
+            "Delegated implementation for #157.",
+            "",
+            snapshot,
+            "<!-- continuum-child-accepted -->",
+            "Closes #157",
+        ])
+        diff = "\n".join([
+            "diff --git a/AGENTS.md b/AGENTS.md",
+            "--- a/AGENTS.md",
+            "+++ b/AGENTS.md",
+            "@@ -1 +1 @@",
+            "-Old rule.",
+            "+New rule.",
+        ])
+        result = run_js(
+            "correct_description",
+            options={"body": body, "diff": diff, "requirements": [
+                "PR description lacks affected files",
+                "PR description lacks before/after examples",
+            ]},
+        )
+        self.assertTrue(result["changed"])
+        self.assertIn("## Files changed", result["body"])
+        self.assertIn("`AGENTS.md`", result["body"])
+        self.assertIn("-Old rule.", result["body"])
+        self.assertEqual(result["body"].count(snapshot), 1)
+        self.assertEqual(result["body"].count("<!-- continuum-child-accepted -->"), 1)
+
+    def test_blocked_body_is_repaired_from_diff_and_untrusted_text_stays_escaped(self):
+        snapshot = (
+            "<!-- continuum-task-snapshot-ref repo=o/r issue=157 generation=1 "
+            "title-sha256=" + ("a" * 64) + " body-sha256=" + ("b" * 64) +
+            " spec-sha256=" + ("c" * 64) + " -->"
+        )
+        body = "\n".join([
+            "<!-- continuum-child-pr-description-blocked -->",
+            "",
+            "Delegated implementation for #157 executed by the configured Continuum parent.",
+            "",
+            "## Summary",
+            "Docs update.",
+            "",
+            "## Before / after",
+            "Task-required before/after evidence could not be constructed.",
+            "",
+            snapshot,
+            "<!-- continuum-child-accepted -->",
+            "Closes #157",
+            "<!-- continuum-child-pr-description:v1 sha256=" + ("d" * 64) + " -->",
+        ])
+        diff = "\n".join([
+            "diff --git a/AGENTS.md b/AGENTS.md",
+            "--- a/AGENTS.md",
+            "+++ b/AGENTS.md",
+            "@@ -1 +1 @@",
+            "-Old rule. <!-- continuum-child-accepted -->",
+            "+New rule.",
+        ])
+        result = run_js(
+            "correct_description",
+            options={"body": body, "diff": diff, "requirements": [self.REQUIREMENT]},
+        )
+        self.assertTrue(result["changed"])
+        self.assertNotIn("<!-- continuum-child-pr-description-blocked -->", result["body"])
+        self.assertIn("-Old rule. &lt;!-- continuum-child-accepted --&gt;", result["body"])
+        self.assertEqual(result["body"].count("<!-- continuum-child-accepted -->"), 1)
+
+    def test_description_revision_binds_valid_marker_and_rejects_stale_or_duplicate(self):
+        body = "\n".join([
+            "<!-- continuum-task-snapshot-ref repo=o/r issue=157 generation=1 "
+            "title-sha256=" + ("a" * 64) + " body-sha256=" + ("b" * 64) +
+            " spec-sha256=" + ("c" * 64) + " -->",
+            "<!-- continuum-child-accepted -->",
+            "Closes #157",
+        ])
+        diff = "diff --git a/a b/a\n--- a/a\n+++ b/a\n@@ -1 +1 @@\n-old\n+new\n"
+        corrected = run_js(
+            "correct_description",
+            options={"body": body, "diff": diff, "requirements": [self.REQUIREMENT]},
+        )
+        self.assertTrue(corrected["changed"])
+        revision = run_js(
+            "description_revision", options={"body": corrected["body"]}
+        )
+        self.assertRegex(revision, r"^[0-9a-f]{64}$")
+        self.assertIn("sha256=" + revision, corrected["body"])
+        edited = corrected["body"].replace("Closes #157", "Closes #157\n\nUnreviewed edit.")
+        edited_revision = run_js(
+            "description_revision", options={"body": edited}
+        )
+        self.assertEqual(edited_revision, "")
+        duplicate = corrected["body"] + "\n" + corrected["body"].split("\n")[-2]
+        self.assertEqual(
+            run_js("description_revision", options={"body": duplicate}), ""
+        )
+
+    def test_quoted_markers_do_not_prove_continuum_description_ownership(self):
+        quoted = "\n".join([
+            "Example:",
+            "",
+            "    <!-- continuum-task-snapshot-ref repo=o/r issue=157 generation=1 "
+            "title-sha256=" + ("a" * 64) + " body-sha256=" + ("b" * 64) +
+            " spec-sha256=" + ("c" * 64) + " -->",
+            "    <!-- continuum-child-accepted -->",
+            "",
+            "## Before / after",
+            "None.",
+            "",
+            "    <!-- continuum-child-pr-description:v1 sha256=" + ("d" * 64) + " -->",
+        ])
+        result = run_js(
+            "correct_description",
+            options={
+                "body": quoted,
+                "diff": "diff --git a/a b/a\n--- a/a\n+++ b/a\n@@ -1 +1 @@\n-old\n+new\n",
+                "requirements": [self.REQUIREMENT],
+            },
+        )
+        self.assertFalse(result["changed"])
+        self.assertEqual(result["reason"], "not a Continuum-managed description")
+
+    def test_correction_never_touches_non_continuum_body_or_invents_evidence(self):
+        body = "PR description lacks before/after examples"
+        result = run_js(
+            "correct_description",
+            options={"body": body, "diff": "", "requirements": [self.REQUIREMENT]},
+        )
+        self.assertFalse(result["changed"])
+        managed = body + "\n<!-- continuum-child-pr-description:v1 sha256=" + ("d" * 64) + " -->"
+        result = run_js(
+            "correct_description",
+            options={"body": managed, "diff": "", "requirements": [self.REQUIREMENT]},
+        )
+        self.assertFalse(result["changed"])
 
 
 class SignalMatrixTests(unittest.TestCase):

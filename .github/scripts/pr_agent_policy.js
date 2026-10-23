@@ -1043,6 +1043,266 @@ function nonActionableCautionIsMergeable(review) {
   return true;
 }
 
+
+const DESCRIPTION_ONLY_NONCOMPLIANCE_RE = new RegExp(
+  '\\b(?:pr|pull[ -]?request)\\s+(?:description|body)\\b|' +
+  '\\bdescription\\s+examples?\\b|\\bbefore\\s*(?:/|and|&|vs\\.?|versus)\\s*after\\b|' +
+  '\\bbefore-after\\b',
+  'i'
+);
+const CODE_NONCOMPLIANCE_RE = new RegExp(
+  '\\b(?:code|implementation|logic|bug|tests?|testing|coverage|security|secret|' +
+  'credential|ci|build|lint|typecheck|runtime|performance|race|error|failure)\\b',
+  'i'
+);
+const CHILD_DESCRIPTION_MARKER_RE =
+  /<!--\s*continuum-child-pr-description:v1\s+sha256=[0-9a-f]{64}\s*-->/g;
+const CHILD_BLOCKED_MARKER = '<!-- continuum-child-pr-description-blocked -->';
+
+function nonCompliantRequirements(review) {
+  // Canonical PR-Agent ticket shape only. Empty/none entries prove
+  // compliance; malformed entries are deliberately ignored here because the
+  // merge gate itself stays closed on them via nonActionableCautionIsMergeable.
+  const inner = unwrapReview(review);
+  const ticket = inner && inner.ticket_compliance_check;
+  if (!Array.isArray(ticket)) return [];
+  const empty = new Set(['', '-', 'none', 'n/a', 'na', 'no']);
+  const requirements = [];
+  for (const entry of ticket) {
+    if (!entry || typeof entry !== 'object' || Array.isArray(entry)) continue;
+    if (!Object.prototype.hasOwnProperty.call(entry, 'not_compliant_requirements')) continue;
+    const text = String(entry.not_compliant_requirements ?? '').trim();
+    if (empty.has(text.toLowerCase())) continue;
+    requirements.push(text);
+  }
+  return requirements;
+}
+
+function descriptionOnlyNonCompliance(review) {
+  // A zero-code-finding review whose only ticket gap is required PR metadata
+  // must not be re-reviewed unchanged. Genuine code, security, coverage or
+  // tool gaps are intentionally excluded and stay on the existing
+  // repair/blocked paths.
+  const inner = unwrapReview(review);
+  if (!inner || !Array.isArray(inner.key_issues_to_review)) return false;
+  if (inner.key_issues_to_review.length > 0) return false;
+  if (hasBlockingSecuritySignal(inner) ||
+      hasToolErrorSignal(inner) ||
+      hasIncompleteCoverageSignal(inner)) return false;
+  const requirements = nonCompliantRequirements(inner);
+  if (requirements.length === 0) return false;
+  return requirements.every((text) =>
+    DESCRIPTION_ONLY_NONCOMPLIANCE_RE.test(text) &&
+    !CODE_NONCOMPLIANCE_RE.test(text)
+  );
+}
+
+function escapeUntrustedDescriptionText(value) {
+  return String(value || '')
+    .replace(/\r\n?/g, '\n')
+    .split('\n')
+    .map((line) => line.replace(/[ \t]+$/g, ''))
+    .join('\n')
+    .trim()
+    .replace(/<!--/g, '&lt;!--')
+    .replace(/-->/g, '--&gt;');
+}
+
+function normalizeDescriptionRevisionText(value) {
+  return String(value || '')
+    .replace(/\r\n?/g, '\n')
+    .split('\n')
+    .map((line) => line.replace(/[ \t]+$/g, ''))
+    .join('\n')
+    .trim() + '\n';
+}
+
+function descriptionContentRevision(value) {
+  const withoutMarker = String(value || '').replace(CHILD_DESCRIPTION_MARKER_RE, '');
+  return crypto
+    .createHash('sha256')
+    .update(normalizeDescriptionRevisionText(withoutMarker))
+    .digest('hex');
+}
+
+function childDescriptionRevision(value) {
+  const text = String(value || '');
+  CHILD_DESCRIPTION_MARKER_RE.lastIndex = 0;
+  const matches = text.match(CHILD_DESCRIPTION_MARKER_RE) || [];
+  CHILD_DESCRIPTION_MARKER_RE.lastIndex = 0;
+  const contentRevision = descriptionContentRevision(text);
+  if (matches.length === 0) return contentRevision;
+  if (matches.length === 1) {
+    const embedded = /^<!--\s*continuum-child-pr-description:v1\s+sha256=([0-9a-f]{64})\s*-->$/
+      .exec(matches[0].trim());
+    if (embedded && embedded[1] === contentRevision) return embedded[1];
+  }
+  return '';
+}
+
+function extractDiffChangedFiles(diffText) {
+  const files = [];
+  const seen = new Set();
+  for (const line of String(diffText || '').split('\n')) {
+    let candidate = '';
+    const git = /^diff --git a\/(.+?) b\/(.+)$/.exec(line);
+    if (git) candidate = git[2];
+    if (!candidate) continue;
+    if (!seen.has(candidate)) {
+      seen.add(candidate);
+      files.push(candidate);
+    }
+  }
+  return files;
+}
+
+function beforeAfterExcerptFromDiff(diffText, maxLines = 80) {
+  const lines = String(diffText || '').replace(/\r\n?/g, '\n').split('\n');
+  const blocks = [];
+  let path = '';
+  let picked = [];
+  let spent = 0;
+  const flush = () => {
+    if (!path || picked.length === 0) return;
+    const content = escapeUntrustedDescriptionText(picked.join('\n'));
+    blocks.push('### ' + escapeUntrustedDescriptionText(path) + '\n\n```diff\n' + content + '\n```');
+  };
+  for (const line of lines) {
+    const git = /^diff --git a\/(.+?) b\/(.+)$/.exec(line);
+    if (git) {
+      flush();
+      path = git[2];
+      picked = [];
+      continue;
+    }
+    if (!path) continue;
+    if (spent >= maxLines) break;
+    if (line.startsWith('---') || line.startsWith('+++')) continue;
+    if (line.startsWith('+') || line.startsWith('-')) {
+      picked.push(line);
+      spent += 1;
+    }
+  }
+  flush();
+  return blocks.slice(0, 8).join('\n\n');
+}
+
+function replaceDescriptionSection(body, heading, content) {
+  const lines = String(body || '').replace(/\r\n?/g, '\n').split('\n');
+  const headingRe = new RegExp('^##\\s+' + heading.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '\\s*$', 'i');
+  let start = lines.findIndex((line) => headingRe.test(line));
+  const insert = content.trim().split('\n');
+  if (start === -1) {
+    let at = lines.findIndex((line) =>
+      /^<!--\s*continuum-task-snapshot-ref\b/.test(line) ||
+      line.trim() === '<!-- continuum-child-accepted -->'
+    );
+    if (at === -1) at = lines.length;
+    while (at > 0 && lines[at - 1].trim() === '') at -= 1;
+    lines.splice(at, 0, '', '## ' + heading, '', ...insert);
+    return lines.join('\n');
+  }
+  let end = lines.length;
+  for (let index = start + 1; index < lines.length; index += 1) {
+    if (/^##\s+/.test(lines[index]) ||
+        /^<!--\s*continuum-task-snapshot-ref\b/.test(lines[index]) ||
+        lines[index].trim() === '<!-- continuum-child-accepted -->') {
+      end = index;
+      break;
+    }
+  }
+  lines.splice(start, end - start, '## ' + heading, '', ...insert, '');
+  return lines.join('\n');
+}
+
+function hasContinuumDescriptionMarker(body) {
+  const value = String(body || '');
+  // Markers must occupy their own line. A quoted or indented copy inside
+  // untrusted prose is not ownership evidence.
+  const managedByRevision =
+    /^<!--\s*continuum-child-pr-description:v1\s+sha256=[0-9a-f]{64}\s*-->\s*$/m
+      .test(value);
+  if (managedByRevision) return true;
+  // Legacy delegated Child bodies predate the revision marker. Recognize
+  // only the exact trusted snapshot/acceptance pair the worker used to
+  // publish, never an arbitrary PR body that merely mentions a description.
+  return /^<!--\s*continuum-task-snapshot-ref\b[^>\n]*-->\s*$/m.test(value) &&
+    /^<!-- continuum-child-accepted -->\s*$/m.test(value);
+}
+
+function correctDescriptionEvidence({ body, diffText, requirements }) {
+  // Metadata-only correction for a Continuum-managed Child PR body. The
+  // correction is derived exclusively from the verified diff; it never claims
+  // a test result, never touches a non-Continuum body, and preserves the
+  // snapshot/acceptance markers byte-for-byte.
+  const original = String(body || '');
+  if (!hasContinuumDescriptionMarker(original)) {
+    return { changed: false, reason: 'not a Continuum-managed description' };
+  }
+  const required = Array.isArray(requirements)
+    ? requirements.join(' ')
+    : String(requirements || '');
+  const diffTextValue = String(diffText || '');
+  const needsBeforeAfter = DESCRIPTION_ONLY_NONCOMPLIANCE_RE.test(required) ||
+    original.includes(CHILD_BLOCKED_MARKER);
+  const needsFiles = /\b(?:affected|changed)\s+files?\b|\bfiles?\s+changed\b/i.test(required);
+  const existingBeforeAfter = /^##\s+Before\s*\/\s*after\s*$/im.test(original);
+  const existingBeforeAfterContent = existingBeforeAfter
+    ? (original.split(/^##\s+Before\s*\/\s*after\s*$/im)[1] || '').split(/^##\s+|^<!--\s*continuum-/m)[0]
+    : '';
+  const missingBeforeAfter = needsBeforeAfter && (
+    !existingBeforeAfter ||
+    /^\s*none\.?\s*$|not requested by this task|could not be constructed|must not merge/i.test(
+      existingBeforeAfterContent.trim()
+    )
+  );
+  const existingFiles = /^##\s+Files changed\s*$/im.test(original);
+  const existingFilesContent = existingFiles
+    ? (original.split(/^##\s+Files changed\s*$/im)[1] || '').split(/^##\s+|^<!--\s*continuum-/m)[0]
+    : '';
+  const missingFiles = needsFiles && (
+    !existingFiles ||
+    /^\s*none\.?\s*$|no tracked file changes/i.test(existingFilesContent.trim())
+  );
+  if (!missingBeforeAfter && !missingFiles) {
+    return { changed: false, reason: 'description evidence is already present' };
+  }
+  const files = extractDiffChangedFiles(diffTextValue);
+  const excerpt = missingBeforeAfter ? beforeAfterExcerptFromDiff(diffTextValue) : '';
+  if (missingBeforeAfter && !excerpt) {
+    return { changed: false, reason: 'no source-backed diff evidence available' };
+  }
+  let corrected = original.replace(
+    new RegExp('^' + CHILD_BLOCKED_MARKER.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '\\s*\\n?\\n?', 'm'),
+    ''
+  );
+  if (excerpt) {
+    corrected = replaceDescriptionSection(
+      corrected,
+      'Before / after',
+      excerpt + '\n\n_Before/after excerpts are verbatim removed/added diff lines from the verified branch, not a claim about runtime behavior._'
+    );
+  }
+  if (missingFiles && files.length > 0) {
+    corrected = replaceDescriptionSection(
+      corrected,
+      'Files changed',
+      files.map((path) => '- `' + escapeUntrustedDescriptionText(path) + '`').join('\n')
+    );
+  }
+  corrected = corrected.replace(CHILD_DESCRIPTION_MARKER_RE, '');
+  const normalized = normalizeDescriptionRevisionText(corrected);
+  const digest = childDescriptionRevision(normalized);
+  corrected = normalized.replace(/\n+$/, '') +
+    '\n<!-- continuum-child-pr-description:v1 sha256=' + digest + ' -->\n';
+  return {
+    changed: corrected !== original,
+    body: corrected,
+    digest,
+    reason: corrected !== original ? 'added source-backed description evidence' : 'no change required',
+  };
+}
+
 function reviewDisposition(reviewPayload, improveJsonl, threshold = IMPROVE_REPAIR_THRESHOLD) {
   // Split envelopes carry signals on both sides: merge fail-closed via the
   // centralized unwrapReview so no finding is lost from the disposition.
@@ -1145,6 +1405,10 @@ module.exports = {
   qualifyingImproveSuggestions,
   reviewDisposition,
   nonActionableCautionIsMergeable,
+  nonCompliantRequirements,
+  descriptionOnlyNonCompliance,
+  correctDescriptionEvidence,
+  childDescriptionRevision,
   sameLogicalDefect,
   unwrapReview,
 };

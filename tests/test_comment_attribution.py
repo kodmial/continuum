@@ -79,7 +79,7 @@ MUTATION_COUNTS = {
     "continuum-opencode-repair.yml": 2,
     "continuum-opencode-watchdog.yml": 4,
     "continuum-opencode.yml": 12,  # additional functional batch-verification reply
-    "continuum-pr-agent-auto-merge.yml": 1,
+    "continuum-pr-agent-auto-merge.yml": 2,  # stale-description refusal
     "continuum-pr-agent-canary.yml": 4,
     "continuum-pr-agent-recovery.yml": 4,
     "continuum-pr-agent-repair.yml": 6,
@@ -207,6 +207,7 @@ FUNCTIONAL_ANCHORS = {
     ),
     "continuum-pr-agent-auto-merge.yml": (
         "Automatic OpenCode conflict repair, attempt 1/1",
+        "PR-Agent refused to merge because the PR description changed",
     ),
     "continuum-pr-agent-canary.yml": (
         "'/review',",

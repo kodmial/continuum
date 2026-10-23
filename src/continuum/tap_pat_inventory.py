@@ -811,6 +811,7 @@ PR_AGENT_FAMILY = {
         "Publish private exact-head repair handoff",
         "Clear settled PR-Agent controller state",
         "Publish durable PR-Agent review state",
+        "Route the current PR-Agent result",
         "Publish failed PR-Agent review state",
         "Fail closed on a moved head",
         "Update persistent PR-Agent retry controller state",

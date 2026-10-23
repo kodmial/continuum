@@ -2327,8 +2327,17 @@ jobs:
           IMPROVE_FILE: ${{ steps.improve_output.outputs.improve_file }}
           IMPROVE_SKIPPED: ${{ steps.improve_skipped.outcome == 'success' }}
           POLICY_SCRIPT: ${{ steps.runtime.outputs.policy_script }}
+          # A metadata-only correction writes the exact PR body. Delegated
+          # runs must use the same TAP_PAT identity as every other mutation;
+          # a github.token fallback is explicitly rejected below.
+          PR_NUMBER: ${{ steps.stack.outputs.pr_number }}
+          REVIEWED_SHA: ${{ steps.result.outputs.head_sha }}
+          TAP_PAT: ${{ secrets.TAP_PAT }}
+          RETRY_WORKFLOW: ${{ steps.stack.outputs.retry_workflow }}
+          CONTINUUM_REF_INPUT: ${{ inputs.continuum_ref }}
+          TARGET_CHILD_ID: ${{ inputs.target_child_id }}
         with:
-          github-token: ${{ github.token }}
+          github-token: ${{ env.CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED == 'true' && secrets.TAP_PAT || (env.CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED != 'true' && github.token || '') }}
           script: |
             const fs = require('fs');
             const policy = require(process.env.POLICY_SCRIPT);
@@ -2373,15 +2382,136 @@ jobs:
             );
             const needsRepair = disposition.action === 'repair';
             const readyToMerge = disposition.action === 'merge';
-            const needsRereview = disposition.action === 'rereview';
+            let needsRereview = disposition.action === 'rereview';
+            let descriptionCorrected = false;
+            // kodmial/continuum#399: a metadata-only noncompliance is not a
+            // code defect. Correct a Continuum-managed Child PR description
+            // from the verified diff and then request exactly one fresh review
+            // on the unchanged HEAD. A body that already carries evidence is
+            // left alone, so this cannot create an edit/review loop.
+            if (needsRereview && policy.descriptionOnlyNonCompliance(review)) {
+              const targetOwner = process.env.CONTINUUM_PR_AGENT_TARGET_OWNER;
+              const targetRepo = process.env.CONTINUUM_PR_AGENT_TARGET_REPO;
+              const prNumber = Number(process.env.PR_NUMBER);
+              const head = String(process.env.REVIEWED_SHA || '').toLowerCase();
+              if (process.env.CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED === 'true' &&
+                  !String(process.env.TAP_PAT || '').trim()) {
+                core.setFailed(
+                  'Delegated description correction requires TAP_PAT; refusing to fall back to github.token.'
+                );
+                return;
+              }
+              try {
+                const { data: livePr } = await github.rest.pulls.get({
+                  owner: targetOwner,
+                  repo: targetRepo,
+                  pull_number: prNumber,
+                });
+                const liveHead = String(livePr.head?.sha || '').toLowerCase();
+                if (!head || liveHead !== head) {
+                  core.notice('Description correction skipped: PR head moved during review.');
+                } else {
+                  const files = await github.paginate(
+                    github.rest.pulls.listFiles,
+                    { owner: targetOwner, repo: targetRepo, pull_number: prNumber, per_page: 100 }
+                  );
+                  const diffText = files
+                    .filter((file) => file && typeof file.patch === 'string' && file.patch)
+                    .map((file) =>
+                      'diff --git a/' + file.filename + ' b/' + file.filename +
+                      '\n' + file.patch
+                    )
+                    .join('\n');
+                  const corrected = policy.correctDescriptionEvidence({
+                    body: String(livePr.body || ''),
+                    diffText,
+                    requirements: policy.nonCompliantRequirements(review),
+                  });
+                  if (corrected.changed && corrected.body) {
+                    await github.rest.pulls.update({
+                      owner: targetOwner,
+                      repo: targetRepo,
+                      pull_number: prNumber,
+                      body: corrected.body,
+                    });
+                    descriptionCorrected = true;
+                    core.notice(
+                      'Corrected the Child PR description from source-backed diff evidence at ' +
+                      head + '; requesting a fresh review on the unchanged HEAD.'
+                    );
+                  } else {
+                    core.notice(
+                      'Description correction made no change: ' + corrected.reason
+                    );
+                  }
+                }
+              } catch (err) {
+                // A correction is best-effort metadata. Never merge on this
+                // path; leave the bounded re-review/recovery gate intact.
+                core.warning(`Description correction failed closed: ${err.message}`);
+              }
+            }
             core.setOutput('needs_repair', needsRepair ? 'true' : 'false');
             core.setOutput('ready_to_merge', readyToMerge ? 'true' : 'false');
             core.setOutput('needs_rereview', needsRereview ? 'true' : 'false');
+            core.setOutput('description_corrected', descriptionCorrected ? 'true' : 'false');
             core.setOutput('review_disposition', disposition.action);
             core.setOutput('review_findings', String(disposition.reviewCount));
             core.setOutput('improve_suggestions', String(disposition.qualifyingSuggestionCount));
             core.notice(
               'PR-Agent disposition=' + disposition.action + ': ' + disposition.reason
+            );
+
+      - name: Re-review a corrected description on the unchanged exact HEAD
+        if: >-
+          steps.route.outcome == 'success' &&
+          steps.route.outputs.description_corrected == 'true'
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
+        env:
+          RETRY_WORKFLOW: ${{ steps.stack.outputs.retry_workflow }}
+          CONTINUUM_REF_INPUT: ${{ inputs.continuum_ref }}
+          TARGET_CHILD_ID: ${{ inputs.target_child_id }}
+          PR_NUMBER: ${{ steps.stack.outputs.pr_number }}
+          HEAD_SHA: ${{ steps.result.outputs.head_sha }}
+        with:
+          github-token: ${{ github.token }}
+          script: |
+            const workflow = String(process.env.RETRY_WORKFLOW || 'continuum-pr-agent.yml').trim();
+            if (!['continuum-pr-agent.yml', 'pr-agent.yml'].includes(workflow)) {
+              core.setFailed(
+                'Description re-review requires continuum-pr-agent.yml or pr-agent.yml, got: ' + workflow
+              );
+              return;
+            }
+            const { data: repo } = await github.rest.repos.get({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+            });
+            const inputs = {
+              pr_number: String(process.env.PR_NUMBER || ''),
+              expected_head_sha: String(process.env.HEAD_SHA || ''),
+              retry_attempt: '0',
+              retry_workflow: workflow,
+              recovery_kind: 'review',
+            };
+            if (String(process.env.TARGET_CHILD_ID || '').trim()) {
+              inputs.target_child_id = String(process.env.TARGET_CHILD_ID).trim();
+              inputs.continuum_ref = String(process.env.CONTINUUM_REF_INPUT || '').trim();
+              if (!inputs.continuum_ref) {
+                core.setFailed('Delegated description re-review requires continuum_ref.');
+                return;
+              }
+            }
+            await github.rest.actions.createWorkflowDispatch({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              workflow_id: workflow,
+              ref: String(repo.default_branch || 'main'),
+              inputs,
+            });
+            core.notice(
+              'Requested a fresh PR-Agent review for the corrected description on exact HEAD ' +
+              inputs.expected_head_sha + '.'
             );
 
       - name: Cool down failed real provider route before the bounded retry
@@ -2883,7 +3013,9 @@ jobs:
         uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
         env:
           HEAD_SHA: ${{ steps.result.outputs.head_sha }}
+          PR_NUMBER: ${{ steps.stack.outputs.pr_number }}
           REVIEW_DISPOSITION: ${{ steps.route.outputs.review_disposition }}
+          POLICY_SCRIPT: ${{ steps.runtime.outputs.policy_script }}
         with:
           github-token: ${{ env.CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED == 'true' && secrets.TAP_PAT || (env.CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED != 'true' && github.token || '') }}
           script: |
@@ -2897,6 +3029,35 @@ jobs:
               core.setFailed('Unknown PR-Agent review disposition: ' + (disposition || '<empty>'));
               return;
             }
+            // Bind the review to the exact PR description the reviewer saw.
+            // A later metadata-only edit with an unchanged HEAD must not be
+            // accepted by a stale clean status (kodmial/continuum#399).
+            const policy = require(process.env.POLICY_SCRIPT);
+            let descriptionRevision = '';
+            try {
+              const { data: livePr } = await github.rest.pulls.get({
+                owner: process.env.CONTINUUM_PR_AGENT_TARGET_OWNER,
+                repo: process.env.CONTINUUM_PR_AGENT_TARGET_REPO,
+                pull_number: Number(process.env.PR_NUMBER),
+              });
+              descriptionRevision = policy.childDescriptionRevision(livePr.body || '');
+            } catch (err) {
+              core.setFailed(
+                'Could not bind the review to the current PR description: ' + err.message
+              );
+              return;
+            }
+            await github.rest.repos.createCommitStatus({
+              owner: process.env.CONTINUUM_PR_AGENT_TARGET_OWNER,
+              repo: process.env.CONTINUUM_PR_AGENT_TARGET_REPO,
+              sha: process.env.HEAD_SHA,
+              state: 'success',
+              context: 'continuum/pr-agent-description',
+              description: 'revision=' + descriptionRevision,
+              target_url:
+                context.serverUrl + '/' + context.repo.owner + '/' +
+                context.repo.repo + '/actions/runs/' + context.runId,
+            });
             await github.rest.repos.createCommitStatus({
               owner: process.env.CONTINUUM_PR_AGENT_TARGET_OWNER,
               repo: process.env.CONTINUUM_PR_AGENT_TARGET_REPO,
