@@ -73,7 +73,7 @@ data = json.loads(Path(os.environ["FIXTURE"]).read_text())
 query = parse_qs(urlparse(url).query)
 status = (query.get("status") or [""])[0]
 page = int((query.get("page") or ["1"])[0])
-per_page = int((query.get("per_page") or ["100"])[0])
+per_page = min(int((query.get("per_page") or ["100"])[0]), 100)
 
 if data.get("fail_all") or status == data.get("fail_status"):
     print(data.get("failure_message", "gh: HTTP 500"), file=sys.stderr)
@@ -250,6 +250,26 @@ print(json.dumps({"total_count": len(runs), "workflow_runs": batch}))
                 )
                 self.assertNotIn("owner/parent", result.stderr)
                 self.assertNotIn("child", result.stderr.lower())
+
+    def test_configured_page_size_above_api_cap_does_not_truncate(self):
+        runs = [run("in_progress", f"SubTask #{i + 1}") for i in range(150)]
+        self.write_fixture(runs={"in_progress": runs})
+        result, output = self.snapshot(
+            env_extra={"CONTINUUM_ACTIVE_RUNS_PER_PAGE": "1000"}
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        lines = output.read_text().splitlines()
+        self.assertEqual(len(lines), 150, lines)
+        self.assertIn("in_progress\tSubTask #150", lines)
+        in_progress_calls = [
+            call for call in self.calls.read_text().splitlines()
+            if "status=in_progress" in call
+        ]
+        self.assertEqual(len(in_progress_calls), 2, in_progress_calls)
+        self.assertTrue(
+            all("per_page=100" in call for call in in_progress_calls),
+            in_progress_calls,
+        )
 
     def test_page_cap_truncation_fails_closed(self):
         self.write_fixture(runs={}, truncate_status="in_progress")

@@ -22,6 +22,14 @@ PER_PAGE="${CONTINUUM_ACTIVE_RUNS_PER_PAGE:-100}"
 MAX_PAGES="${CONTINUUM_ACTIVE_RUNS_MAX_PAGES:-5}"
 UNAVAILABLE=4
 
+# The Actions REST endpoint caps per_page at 100; a larger value makes a
+# full served page indistinguishable from a partial one, so the
+# "count < PER_PAGE" loop exit would silently drop older active runs.
+case "$PER_PAGE" in ''|*[!0-9]*) PER_PAGE=100 ;; esac
+if (( PER_PAGE < 1 )) || (( PER_PAGE > 100 )); then
+  PER_PAGE=100
+fi
+
 # Raw API output can embed private request URLs, so it is always discarded.
 # The diagnostic names only the public capability and the recovery action.
 unavailable() {
@@ -149,12 +157,15 @@ check() {
   local tmp
   tmp="$(mktemp "${RUNNER_TEMP:-.}/continuum-active-check.XXXXXX")" || unavailable
   # Reuse the exact same bounded, status-filtered discovery for a fresh
-  # pre-dispatch recheck. A failure here is likewise fail-closed.
-  snapshot --output "$tmp" || {
-    local rc=$?
+  # pre-dispatch recheck. A failure here is likewise fail-closed. `snapshot`
+  # exits the whole script on outage, so invoke it in a subshell to keep this
+  # temporary file's cleanup reachable instead of leaking it in RUNNER_TEMP.
+  local rc=0
+  ( snapshot --output "$tmp" ) || rc=$?
+  if (( rc != 0 )); then
     rm -f "$tmp"
     exit "$rc"
-  }
+  fi
 
   if task_active --file "$tmp" --child-id "$child_id" --kind task --task "$task"; then
     rm -f "$tmp"
