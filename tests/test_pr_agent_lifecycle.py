@@ -99,6 +99,13 @@ APPROVED_400_OPENCODE_SHA256 = (
 APPROVED_415_OPENCODE_SHA256 = (
     "7c3424ff29acb06917a0f72808297587e97c0cc3cc60798e54adda1b46dbc42c"
 )
+# kodmial/continuum#413: the reviewed change installs and uses one
+# deterministic checkpoint/publish staging boundary, so workflow-owned
+# cancellation-engine checkouts and recovery metadata can never enter a PR
+# tree. Historical digests above remain for audit.
+APPROVED_413_OPENCODE_SHA256 = (
+    "566da1b1ccb719f0016a68a54542e6917155bdbd7918711e0051d8f30dc119be"
+)
 
 APPROVED_350_SELF_CALLER_SHA256 = (
     "f06cdcb9affc06f976aed97945ff9d31496e5954ca225971164f87ec4e1ca22c"
@@ -2519,8 +2526,8 @@ class ProtectedBaselineTests(unittest.TestCase):
                     # #350/#374/#400 metadata, routing, and checkout artifacts.
                     self.assertEqual(
                         protected_file_digest(path),
-                        APPROVED_415_OPENCODE_SHA256,
-                        f"{path}: unexpected drift outside reviewed #415 provider-event classification",
+                        APPROVED_413_OPENCODE_SHA256,
+                        f"{path}: unexpected drift outside reviewed #413 publish isolation",
                     )
                 else:
                     # The self-dogfood caller is the dispatchable surface
@@ -3377,7 +3384,7 @@ class IsolationTests(unittest.TestCase):
         self.assertIn('refs/heads/$HEAD_REF', repair)
         self.assertIn("Resolve the writable PR source branch", repair)
         self.assertIn("Restore verified cached OpenCode for PR-Agent repair", repair)
-        self.assertIn("git add -A", repair)
+        self.assertIn("continuum_stage_publishable", repair)
 
     def test_merge_gate_uses_native_v046_persistent_state_schema(self):
         merge = read_repo(".github/workflows/continuum-pr-agent-auto-merge.yml")
