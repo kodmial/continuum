@@ -63,6 +63,15 @@ jobs:
       MAX_AGENT_PASSES: ${{ inputs.max_agent_passes }}
       OPENCODE_CONFIG_CONTENT: '{"permission":{"bash":{"*":"allow","git *":"allow","git push *":"deny"}}}'
     steps:
+      # The job's immutable 45-minute timeout starts here, before checkout and
+      # toolchain setup. Capture that anchor so the inner agent deadline is
+      # derived from real remaining time instead of a fixed per-pass budget.
+      - name: Record delegated job deadline anchor
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "CONTINUUM_JOB_STARTED_EPOCH=$(date +%s)" >> "$GITHUB_ENV"
+
       - name: Checkout parent control plane
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
@@ -381,55 +390,126 @@ jobs:
           $issue_body
           EOF
 
-          accepted=false
-          for pass in $(seq 1 "$MAX_AGENT_PASSES"); do
-            pass_prompt="$RUNNER_TEMP/continuum-child-pass-$pass.txt"
-            cp "$prompt" "$pass_prompt"
-            if [[ "$pass" -gt 1 ]]; then
-              cat >>"$pass_prompt" <<EOF
-          
-          Continuation pass $pass:
-          - Continue from the existing working tree and prior transcript at $transcript.
-          - Resolve the concrete remaining blocker, rerun verification, and update $result_file.
-          EOF
-            fi
-            # The point-of-use gate sits outside the failure-tolerant block on
-            # purpose. A missing or altered global instructions file is a
-            # Continuum defect, not an agent failure to retry, so it stops the
-            # pass instead of burning the remaining ones under no policy.
-            python3 "$CONTINUUM_ENGINE_ROOT/.github/scripts/opencode_instructions.py" verify \
-              --source "$CONTINUUM_ENGINE_ROOT/.github/agents/AGENTS.md"
-            set +e
-            opencode run --auto --model "$OPENCODE_MODEL" "$(cat "$pass_prompt")" >"$transcript" 2>&1
-            rc=$?
-            set -e
-            if [[ -f "$result_file" ]] && grep -qx 'Acceptance: PASS' "$result_file"; then
-              accepted=true
-              break
-            fi
-            echo "Child task #$TASK_NUMBER pass $pass incomplete (agent rc=$rc); continuing."
-          done
+          # BEGIN continuum-delegated-deadline-config
+          job_timeout_seconds=2700
+          checkpoint_reserve_seconds=300
+          min_agent_pass_seconds=480
+          max_subpass_seconds=900
+          subpass_grace_seconds=30
+          job_started_epoch="${CONTINUUM_JOB_STARTED_EPOCH:-$(date +%s)}"
+          deadline_epoch=$(( job_started_epoch + job_timeout_seconds - checkpoint_reserve_seconds ))
+          # END continuum-delegated-deadline-config
 
-          if [[ "$accepted" != true ]]; then
-            checkpoint_state="no-code-delta"
+          # BEGIN continuum-delegated-deadline-functions
+          continuum_seconds_remaining() {
+            printf '%s' "$(( deadline_epoch - $(date +%s) ))"
+          }
+
+          continuum_pass_timeout() {
+            local remaining="$1" bounded="$max_subpass_seconds"
+            if (( remaining < bounded )); then
+              bounded="$remaining"
+            fi
+            printf '%s' "$bounded"
+          }
+
+          continuum_persist_incomplete_work() {
             if [[ -n "$(git status --porcelain)" ]]; then
               # Save partial code only to the private child repository and
               # only after the same token and branch-safety guards as PR push.
               # Never claim acceptance or open a PR for a checkpoint.
-              continuum_checkpoint_save "$checkpoint_ref" "$checkpoint_spec" "$child_repo" "$TASK_NUMBER" || exit $?
+              continuum_checkpoint_save "$checkpoint_ref" "$checkpoint_spec" "$child_repo" "$TASK_NUMBER" || return $?
               checkpoint_state="saved"
             elif [[ "$CONTINUUM_CHECKPOINT_RESTORED" == true ]]; then
               checkpoint_state="resumed-no-new-delta"
             fi
+            return 0
+          }
+
+          continuum_run_delegated_passes() {
+            accepted=false
+            pass_count=0
+            rc=0
+            budget_exhausted=false
+            checkpoint_state="no-code-delta"
+            for pass in $(seq 1 "$MAX_AGENT_PASSES"); do
+              local remaining pass_timeout
+              remaining="$(continuum_seconds_remaining)"
+              # Do not start work that cannot finish plus persist inside the
+              # remaining inner budget. Finishing normally here preserves the
+              # supported retry marker instead of racing the hard job timeout.
+              if (( remaining < min_agent_pass_seconds )); then
+                echo "::notice::Child task #$TASK_NUMBER deadline budget exhausted before pass $pass (${remaining}s remaining, ${min_agent_pass_seconds}s minimum); persisting work for a fresh run."
+                budget_exhausted=true
+                break
+              fi
+              pass_timeout="$(continuum_pass_timeout "$remaining")"
+              pass_prompt="$RUNNER_TEMP/continuum-child-pass-$pass.txt"
+              cp "$prompt" "$pass_prompt"
+              if [[ "$pass" -gt 1 ]]; then
+                cat >>"$pass_prompt" <<EOF
+
+          Continuation pass $pass:
+          - Continue from the existing working tree and prior transcript at $transcript.
+          - Resolve the concrete remaining blocker, rerun verification, and update $result_file.
+          EOF
+              fi
+              # The point-of-use gate sits outside the failure-tolerant block on
+              # purpose. A missing or altered global instructions file is a
+              # Continuum defect, not an agent failure to retry, so it stops the
+              # pass instead of burning the remaining ones under no policy.
+              python3 "$CONTINUUM_ENGINE_ROOT/.github/scripts/opencode_instructions.py" verify \
+                --source "$CONTINUUM_ENGINE_ROOT/.github/agents/AGENTS.md"
+              # Each pass must produce fresh evidence; a prior pass's PASS line
+              # can never satisfy a later, timed-out invocation.
+              rm -f "$result_file"
+              set +e
+              timeout --signal=TERM --kill-after="${subpass_grace_seconds}s" "${pass_timeout}s" \
+                opencode run --auto --model "$OPENCODE_MODEL" "$(cat "$pass_prompt")" >"$transcript" 2>&1
+              rc=$?
+              set -e
+              pass_count="$pass"
+              # A timed-out or failed process is never trustworthy evidence,
+              # even if it wrote a PASS line before the deadline fired.
+              if [[ "$rc" -eq 0 && -f "$result_file" ]] && grep -qx 'Acceptance: PASS' "$result_file"; then
+                accepted=true
+                break
+              fi
+              # Persist every incomplete pass before spending more budget on
+              # another agent call. A failed checkpoint push is fatal and never
+              # falls through to a blind retry that could lose this delta.
+              continuum_persist_incomplete_work || return $?
+              echo "Child task #$TASK_NUMBER pass $pass incomplete (agent rc=$rc; timeout=${pass_timeout}s); checkpoint=$checkpoint_state."
+            done
+
+            if [[ "$accepted" == true ]]; then
+              return 0
+            fi
+            # The loop already persisted after the last incomplete pass. This
+            # final idempotent save covers a zero-pass invocation without
+            # inventing a checkpoint when the worktree is unchanged.
+            continuum_persist_incomplete_work || return $?
             result_state="missing"
             [[ -f "$result_file" ]] && result_state="present-without-PASS"
+            budget_state="passes-exhausted"
+            [[ "$budget_exhausted" == true ]] && budget_state="exhausted"
             # Only bounded structural telemetry is exposed. The private source,
             # the agent transcript and the issue snapshot remain off the public
             # parent logs and out of this machine-readable child issue comment.
             gh issue comment "$TASK_NUMBER" --repo "$child_repo" \
-              --body "$(printf '%s\n%s\n%s\n%s' '<!-- continuum-child-needs-retry -->' '⚡ **Continuum · delegation-worker**' '<!-- continuum-origin role=continuum component=delegation-worker -->' "Child task #$TASK_NUMBER: acceptance not verified after $MAX_AGENT_PASSES passes; last agent exit=$rc; result=$result_state; checkpoint=$checkpoint_state; run=$GITHUB_RUN_ID. Next run must resume the same frozen generation if a checkpoint was saved.")" \
+              --body "$(printf '%s\n%s\n%s\n%s' '<!-- continuum-child-needs-retry -->' '⚡ **Continuum · delegation-worker**' '<!-- continuum-origin role=continuum component=delegation-worker -->' "Child task #$TASK_NUMBER: acceptance not verified after $pass_count/$MAX_AGENT_PASSES passes; budget=$budget_state; last agent exit=$rc; result=$result_state; checkpoint=$checkpoint_state; run=$GITHUB_RUN_ID. Next run must resume the same frozen generation if a checkpoint was saved.")" \
               >/dev/null 2>&1 || true
+            return 30
+          }
+          # END continuum-delegated-deadline-functions
+
+          run_rc=0
+          continuum_run_delegated_passes || run_rc=$?
+          if [[ "$run_rc" -eq 30 ]]; then
             exit 30
+          fi
+          if [[ "$run_rc" -ne 0 ]]; then
+            exit "$run_rc"
           fi
 
           if git diff --no-ext-diff -- . | grep -Eiq '(github_pat_[A-Za-z0-9_]+|ghp_[A-Za-z0-9]+|rnd_[A-Za-z0-9]+|-----BEGIN [A-Z ]*PRIVATE KEY-----)' || git diff --no-ext-diff "origin/main"...HEAD -- . | grep -Eiq '(github_pat_[A-Za-z0-9_]+|ghp_[A-Za-z0-9]+|rnd_[A-Za-z0-9]+|-----BEGIN [A-Z ]*PRIVATE KEY-----)'; then
@@ -474,7 +554,7 @@ jobs:
           pr_url="$(
             gh pr create --repo "$child_repo" --base main --head "$branch"               --title "$issue_title" --body "$pr_body" 2>/dev/null
           )"
-          if [[ "$CONTINUUM_CHECKPOINT_RESTORED" == true ]]; then
+          if [[ "$CONTINUUM_CHECKPOINT_RESTORED" == true || "$checkpoint_state" == "saved" ]]; then
             continuum_checkpoint_cleanup "$checkpoint_ref" "$child_repo" || true
           fi
           gh issue comment "$TASK_NUMBER" --repo "$child_repo"             --body "$(printf '%s\n%s\n%s\n%s' '<!-- continuum-child-pr -->' '🦾 **Agent Coder · delegation-worker**' '<!-- continuum-origin role=agent-coder component=delegation-worker -->' "Child task #$TASK_NUMBER produced an accepted implementation PR: $pr_url")"             >/dev/null 2>&1 || true

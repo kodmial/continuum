@@ -9131,6 +9131,29 @@ class ContinuumTest < Minitest::Test
                      'the exact-HEAD merge contract must stay intact'
   end
 
+  # kodmial/continuum#406: a delegated child pass must never outlive the
+  # GitHub job cap and must persist unaccepted work before spending budget on
+  # another agent call. The hard 45-minute ceiling stays immutable; the inner
+  # deadline is derived from the actual job anchor minus an orderly reserve.
+  def test_delegated_child_worker_bounds_passes_before_the_job_deadline
+    worker = workflow_body('continuum-consumer-child-worker.yml')
+
+    assert_includes worker, 'timeout-minutes: 45',
+                    'the hard GitHub job timeout must stay in place'
+    assert_includes worker, 'Record delegated job deadline anchor'
+    assert_includes worker, 'CONTINUUM_JOB_STARTED_EPOCH=$(date +%s)'
+    assert_includes worker, 'job_timeout_seconds=2700'
+    assert_includes worker, 'checkpoint_reserve_seconds=300'
+    assert_includes worker, 'deadline_epoch=$(( job_started_epoch + job_timeout_seconds - checkpoint_reserve_seconds ))'
+    assert_includes worker, 'timeout --signal=TERM --kill-after="${subpass_grace_seconds}s"'
+    assert_includes worker, 'continuum_persist_incomplete_work || return $?'
+    assert_includes worker, 'budget=$budget_state'
+    assert_includes worker, '[[ "$rc" -eq 0 && -f "$result_file" ]]',
+                    'a timed-out or failed agent run must never satisfy acceptance'
+    assert File.exist?(File.join(ROOT, 'tests/test_delegated_subpass_deadline.py')),
+           'the delegated deadline behavior needs executable workflow-path tests'
+  end
+
   def test_delegated_child_paths_pin_with_the_canonical_engine
     worker = workflow_body('continuum-consumer-child-worker.yml')
     assert_includes worker, 'task_snapshot_admission.py',
