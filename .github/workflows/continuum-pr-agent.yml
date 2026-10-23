@@ -2414,6 +2414,7 @@ jobs:
           timeout: ${{ vars.OPENCODE_PROBE_TIMEOUT || '90' }}
 
       - name: Attest successful independent OpenCode review
+        id: review_attestation
         if: >-
           steps.model_route.outcome == 'success' &&
           steps.pragent.outcome == 'success' &&
@@ -2919,7 +2920,7 @@ jobs:
         env:
           HEAD_SHA: ${{ steps.admit.outputs.head_sha }}
           PR_NUMBER: ${{ steps.stack.outputs.pr_number }}
-          RETRYABLE_FAILURE: ${{ (steps.model_route.outcome == 'failure' || steps.install_pragent.outcome == 'failure' || steps.install_opencode.outcome == 'failure' || steps.start_opencode.outcome == 'failure' || steps.runtime.outcome == 'failure' || steps.start_bridge.outcome == 'failure' || steps.pragent.outcome == 'failure' || steps.before.outputs.transient == 'true' || steps.result.outcome == 'failure' || steps.persistent.outcome == 'failure' || steps.improve_gate.outcome == 'failure' || steps.improve.outcome == 'failure' || steps.improve_skipped.outcome == 'failure' || steps.post_improve.outcome == 'failure' || steps.improve_output.outcome == 'failure') && steps.result.outputs.stale_head != 'true' && steps.persistent.outputs.stale_head != 'true' && steps.improve_gate.outputs.stale_head != 'true' && steps.improve.outputs.stale_head != 'true' && steps.improve_skipped.outputs.stale_head != 'true' && steps.post_improve.outputs.stale_head != 'true' && 'true' || 'false' }}
+          RETRYABLE_FAILURE: ${{ (steps.model_route.outcome == 'failure' || steps.install_pragent.outcome == 'failure' || steps.install_opencode.outcome == 'failure' || steps.start_opencode.outcome == 'failure' || steps.runtime.outcome == 'failure' || steps.start_bridge.outcome == 'failure' || steps.pragent.outcome == 'failure' || steps.before.outputs.transient == 'true' || steps.result.outcome == 'failure' || steps.persistent.outcome == 'failure' || steps.improve_gate.outcome == 'failure' || steps.improve.outcome == 'failure' || steps.improve_skipped.outcome == 'failure' || steps.post_improve.outcome == 'failure' || steps.improve_output.outcome == 'failure' || (steps.review_attestation.outcome == 'failure' && env.CONTINUUM_MODEL_STATE_TRANSIENT != '')) && steps.result.outputs.stale_head != 'true' && steps.persistent.outputs.stale_head != 'true' && steps.improve_gate.outputs.stale_head != 'true' && steps.improve.outputs.stale_head != 'true' && steps.improve_skipped.outputs.stale_head != 'true' && steps.post_improve.outputs.stale_head != 'true' && 'true' || 'false' }}
         with:
           github-token: ${{ env.CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED == 'true' && secrets.TAP_PAT || (env.CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED != 'true' && github.token || '') }}
           script: |
@@ -3038,7 +3039,9 @@ jobs:
            steps.improve.outcome == 'failure' ||
            steps.improve_skipped.outcome == 'failure' ||
            steps.post_improve.outcome == 'failure' ||
-           steps.improve_output.outcome == 'failure') &&
+           steps.improve_output.outcome == 'failure' ||
+           (steps.review_attestation.outcome == 'failure' &&
+            env.CONTINUUM_MODEL_STATE_TRANSIENT != '')) &&
            steps.result.outputs.stale_head != 'true' &&
            steps.persistent.outputs.stale_head != 'true' &&
            steps.improve_gate.outputs.stale_head != 'true' &&
@@ -3052,8 +3055,8 @@ jobs:
           RETRY_ATTEMPT: ${{ steps.stack.outputs.retry_attempt }}
           RECOVERY_KIND: ${{ steps.stack.outputs.recovery_kind }}
           POLICY_SCRIPT: ${{ steps.runtime.outputs.policy_script }}
-          ROUTE_NOT_BEFORE: ${{ env.CONTINUUM_MODEL_NOT_BEFORE_EPOCH }}
-          ROUTE_UNAVAILABLE: ${{ (steps.model_route.outcome == 'failure' || steps.model_cooldown.outcome == 'success') && 'true' || 'false' }}
+          ROUTE_NOT_BEFORE: ${{ env.CONTINUUM_MODEL_STATE_NOT_BEFORE_EPOCH || env.CONTINUUM_MODEL_NOT_BEFORE_EPOCH }}
+          ROUTE_UNAVAILABLE: ${{ (steps.model_route.outcome == 'failure' || steps.model_cooldown.outcome == 'success' || (steps.review_attestation.outcome == 'failure' && env.CONTINUUM_MODEL_STATE_TRANSIENT != '')) && 'true' || 'false' }}
         with:
           github-token: ${{ env.CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED == 'true' && secrets.TAP_PAT || (env.CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED != 'true' && github.token || '') }}
           script: |
@@ -3163,6 +3166,7 @@ jobs:
           steps.admit.outputs.admitted == 'true' &&
           failure() &&
           env.CONTINUUM_MODEL_NOT_BEFORE_EPOCH == '' &&
+          env.CONTINUUM_MODEL_STATE_NOT_BEFORE_EPOCH == '' &&
           (steps.install_pragent.outcome == 'failure' ||
            steps.install_opencode.outcome == 'failure' ||
            steps.start_opencode.outcome == 'failure' ||
@@ -3176,7 +3180,9 @@ jobs:
            steps.improve.outcome == 'failure' ||
            steps.improve_skipped.outcome == 'failure' ||
            steps.post_improve.outcome == 'failure' ||
-           steps.improve_output.outcome == 'failure') &&
+           steps.improve_output.outcome == 'failure' ||
+           (steps.review_attestation.outcome == 'failure' &&
+            env.CONTINUUM_MODEL_STATE_TRANSIENT != '')) &&
            steps.result.outputs.stale_head != 'true' &&
            steps.persistent.outputs.stale_head != 'true' &&
            steps.improve_gate.outputs.stale_head != 'true' &&
@@ -3213,6 +3219,10 @@ jobs:
           fi
           if [[ -n "${CONTINUUM_MODEL_NOT_BEFORE_EPOCH:-}" ]]; then
             echo "All trusted models are in durable cooldown; recovery controller owns the deferred retry."
+            exit 0
+          fi
+          if [[ -n "${CONTINUUM_MODEL_STATE_NOT_BEFORE_EPOCH:-}" ]]; then
+            echo "GitHub model state is rate limited; recovery controller owns the deferred retry."
             exit 0
           fi
           attempt="${RETRY_ATTEMPT:-0}"
