@@ -91,6 +91,14 @@ APPROVED_374_OPENCODE_SHA256 = (
 APPROVED_400_OPENCODE_SHA256 = (
     "2f39f012a266009316efd2e418c27940d1b1554ef13e7cd2adec217daf4dfe5f"
 )
+# kodmial/continuum#415: replace whole-transcript quota greps with the
+# authenticated provider-event classifier. The reviewed change installs the
+# shared wrapper/classifier scripts, checks that the pinned CLI supports
+# `run --format json`, and routes the five agent call sites through the
+# wrapper's exit-code contract. Historical digests above remain for audit.
+APPROVED_415_OPENCODE_SHA256 = (
+    "7c3424ff29acb06917a0f72808297587e97c0cc3cc60798e54adda1b46dbc42c"
+)
 
 APPROVED_350_SELF_CALLER_SHA256 = (
     "f06cdcb9affc06f976aed97945ff9d31496e5954ca225971164f87ec4e1ca22c"
@@ -2506,13 +2514,13 @@ class ProtectedBaselineTests(unittest.TestCase):
                     self.assertIn("CONTINUUM_OPENCODE_PUBLISH_RACE_RETRY_REQUIRED", original)
                     self.assertIn("steps.model_route.outputs.model", original)
                 if path == ".github/workflows/continuum-opencode.yml":
-                    # #400 adds owner cancellation control and #412 resolves
-                    # its role/binding from trusted vars atop the exact
-                    # #350/#374 metadata, routing, and checkout artifacts.
+                    # #415 replaces whole-transcript quota greps with the
+                    # authenticated provider-event classifier atop the exact
+                    # #350/#374/#400 metadata, routing, and checkout artifacts.
                     self.assertEqual(
                         protected_file_digest(path),
-                        APPROVED_400_OPENCODE_SHA256,
-                        f"{path}: unexpected drift outside reviewed #400 operator-cancel change",
+                        APPROVED_415_OPENCODE_SHA256,
+                        f"{path}: unexpected drift outside reviewed #415 provider-event classification",
                     )
                 else:
                     # The self-dogfood caller is the dispatchable surface

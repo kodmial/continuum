@@ -173,57 +173,349 @@ _REQUIRED_METADATA_FIELDS = (
 #: repair stage.
 MODES_HONORING_STAGE_FILE = frozenset({"issue", "qualification"})
 
-_FREE_USAGE_RE = re.compile(r"FreeUsageLimitError", re.IGNORECASE)
-_429_SIGNAL_RE = re.compile(
-    r"APIError.*429"
-    r"|HTTP[^0-9]*429([^0-9]|$)"
-    r"|429[ \t]+Too[ \t]+Many[ \t]+Requests"
-    r"|statusCode[^0-9]*429([^0-9]|$)",
+#: Only top-level ``type=error`` events are provider evidence. Agent text,
+#: tool output, source files, and test fixtures are never scanned for a token.
+_QUOTA_IDENTIFIER_RE = re.compile(
+    r"freeusagelimiterror"
+    r"|gousagelimiterror"
+    r"|ratelimiterror"
+    r"|insufficient_quota"
+    r"|rate_limit_exceeded"
+    r"|usage_limit_exceeded"
+    r"|quota_exceeded"
+    r"|too_many_requests",
+    re.IGNORECASE,
+)
+_UNAVAILABLE_RE = re.compile(
+    r"endpoint is unavailable"
+    r"|upstream request failed"
+    r"|modelunavailableerror"
+    r"|model is unavailable"
+    r"|model unavailable"
+    r"|apiconnectionerror",
+    re.IGNORECASE,
+)
+_UPSTREAM_RE = re.compile(
+    r"service unavailable"
+    r"|bad gateway"
+    r"|internal server error"
+    r"|internalservererror"
+    r"|provider is overloaded"
+    r"|server is overloaded",
+    re.IGNORECASE,
+)
+_TIMEOUT_RE = re.compile(
+    r"apitimeouterror"
+    r"|timeouterror"
+    r"|providerheadertimeouterror"
+    r"|timed out"
+    r"|request timed out"
+    r"|timeout value",
     re.IGNORECASE,
 )
 _FAIL_CLOSED_RE = re.compile(
-    r"\b(400|401|403|404|422)\b",
+    r"\b(400|401|403|404|422)\b"
+    r"|unauthorized"
+    r"|forbidden"
+    r"|bad credentials"
+    r"|missing scope",
     re.IGNORECASE,
 )
+_QUOTA_STATUSES = frozenset({429})
+_UPSTREAM_STATUSES = frozenset({500, 502, 504})
+_UNAVAILABLE_STATUSES = frozenset({503})
+_TIMEOUT_STATUSES = frozenset({408})
 _CHILD_REPO_RE = re.compile(
     r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+",
 )
 _SHA_RE = re.compile(r"\b[0-9a-f]{40}\b", re.IGNORECASE)
 
+#: ``opencode run --format json`` emits one JSON object per line. The
+#: terminal provider failure is a top-level ``type=error`` event carrying the
+#: provider error object. Tool results are ``type=tool_use`` and prose is
+#: ``type=text``; neither is provider evidence.
+_OPENCODE_EVENT_ERROR = "error"
 
-def is_opencode_429(log_text: Any, exit_code: Any = 1) -> bool:
-    """Whether an OpenCode invocation failed with model 429 runner death.
+#: ``opencode github run`` has no JSON mode (verified against the pinned
+#: 1.19.3 CLI). It writes the provider error object to stderr immediately
+#: before throwing, prefixed with one of these runtime-owned markers. The
+#: agent's own final response goes to stdout instead, so only diagnostics on
+#: stderr are ever inspected.
+_GITHUB_ERROR_PREFIXES = ("Agent error:", "Summary agent error:")
+_GITHUB_NAME_RE = re.compile(
+    r"['\"]?name['\"]?\s*:\s*['\"]?([A-Za-z0-9_.-]+)"
+)
+_GITHUB_STATUS_RE = re.compile(
+    r"['\"]?(?:statusCode|status)['\"]?\s*:\s*['\"]?([0-9]{3})\b"
+)
 
-    ``FreeUsageLimitError`` always classifies (even on exit 0, because the
-    provider refused usage). Any other 429 signal classifies only when the
-    invocation actually failed (non-zero exit), so a passing run whose log
-    merely mentions 429 in prose is never burned. Deterministic
-    ``400/401/403/404/422`` failures without a 429 signal never classify.
+
+def _as_int(value: Any) -> Optional[int]:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str) and value.strip().isdigit():
+        return int(value.strip())
+    return None
+
+
+def _event_status(error: Mapping[str, Any]) -> Optional[int]:
+    stack = [error]
+    while stack:
+        item = stack.pop()
+        if isinstance(item, Mapping):
+            for key in ("statusCode", "status"):
+                status = _as_int(item.get(key))
+                if status is not None:
+                    return status
+            stack.extend(item.values())
+        elif isinstance(item, list):
+            stack.extend(item)
+    return None
+
+
+def _event_name(error: Mapping[str, Any]) -> str:
+    name = error.get("name")
+    if isinstance(name, str):
+        return name.strip()
+    data = error.get("data")
+    if isinstance(data, Mapping) and isinstance(data.get("name"), str):
+        return str(data["name"]).strip()
+    return ""
+
+
+def _classify_provider_error(name: Any, status: Any, blob: Any) -> str:
+    """Classify one authenticated provider error object.
+
+    ``status`` is the authoritative HTTP status from the provider error
+    payload. ``blob`` is only that same provider error object; it is never
+    the agent transcript. A bare quoted ``429`` in prose therefore cannot
+    classify, while an explicit provider 429 status always does.
     """
 
-    text = log_text if isinstance(log_text, str) else ""
+    name_text = str(name or "")
+    blob_text = blob if isinstance(blob, str) else ""
+    status_int = _as_int(status)
+
+    if status_int in _QUOTA_STATUSES:
+        return "quota_429"
+    if status_int in FAIL_CLOSED_STATUSES:
+        return "fail_closed"
+    if status_int in _UNAVAILABLE_STATUSES:
+        return "unavailable"
+    if status_int in _UPSTREAM_STATUSES:
+        return "upstream"
+    if status_int in _TIMEOUT_STATUSES:
+        return "timeout"
+    if _QUOTA_IDENTIFIER_RE.search(name_text):
+        return "quota_429"
+    if _UNAVAILABLE_RE.search(name_text):
+        return "unavailable"
+    if _TIMEOUT_RE.search(name_text):
+        return "timeout"
+    if _FAIL_CLOSED_RE.search(name_text):
+        return "fail_closed"
+    if _QUOTA_IDENTIFIER_RE.search(blob_text):
+        return "quota_429"
+    if _UNAVAILABLE_RE.search(blob_text):
+        return "unavailable"
+    if _TIMEOUT_RE.search(blob_text):
+        return "timeout"
+    if _UPSTREAM_RE.search(blob_text):
+        return "upstream"
+    if _FAIL_CLOSED_RE.search(blob_text):
+        return "fail_closed"
+    if status_int is not None and 400 <= status_int < 500:
+        return "fail_closed"
+    return "provider_error"
+
+
+def parse_opencode_error_events(log_text: Any) -> list:
+    """Return authoritative top-level ``type=error`` JSON events.
+
+    OpenCode's ``run --format json`` emits one JSON object per line. Only a
+    fully parsed object with ``type=error`` and an object ``error`` payload is
+    considered. Malformed/truncated lines, tool results, text parts, and
+    prompts are ignored, so a source file or test fixture containing
+    ``FreeUsageLimitError`` can never be mistaken for provider evidence.
+    """
+
+    if not isinstance(log_text, str):
+        return []
+    events = []
+    for raw_line in log_text.splitlines():
+        line = raw_line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            event = json.loads(line)
+        except (TypeError, ValueError):
+            continue
+        if (
+            isinstance(event, dict)
+            and event.get("type") == _OPENCODE_EVENT_ERROR
+            and isinstance(event.get("error"), dict)
+        ):
+            events.append(event)
+    return events
+
+
+def _classify_error_event(event: Mapping[str, Any]) -> str:
+    error = event.get("error")
+    if not isinstance(error, Mapping):
+        return ""
+    return _classify_provider_error(
+        _event_name(error),
+        _event_status(error),
+        json.dumps(error, sort_keys=True, default=str),
+    )
+
+
+def _select_event_classification(classes: list, exit_code: Any) -> str:
+    if "quota_429" in classes:
+        return "quota_429"
+    if "fail_closed" in classes:
+        return "fail_closed"
+    if "unavailable" in classes:
+        return "unavailable"
+    if "upstream" in classes:
+        return "upstream"
+    if "timeout" in classes:
+        return "timeout"
+    if classes:
+        return "provider_error"
     try:
         code = int(exit_code)
     except (TypeError, ValueError):
         code = 1
-    if _FREE_USAGE_RE.search(text):
-        return True
-    if code == 0:
-        return False
-    return bool(_429_SIGNAL_RE.search(text))
+    return "ok" if code == 0 else "inconclusive"
+
+
+def classify_opencode_events(log_text: Any, exit_code: Any = 1) -> str:
+    """Classify one ``run --format json`` invocation from structured events.
+
+    Returns ``quota_429``, ``unavailable``, ``upstream``, ``timeout``,
+    ``fail_closed``, ``provider_error``, ``ok``, or ``inconclusive``.
+
+    An authoritative error event wins even when the CLI exited 0 (the known
+    legitimate case where the provider refused usage but the process still
+    reported success). A non-zero exit without a structured provider event is
+    ``inconclusive`` and must never burn a healthy runner.
+    """
+
+    events = parse_opencode_error_events(log_text)
+    return _select_event_classification(
+        [_classify_error_event(event) for event in events], exit_code
+    )
+
+
+def _github_error_blocks(log_text: Any) -> list:
+    """Extract runtime-owned provider-error blocks from ``github run`` stderr.
+
+    The pinned CLI (1.19.3) has no ``--format json`` for ``github run``. It
+    does print the full provider error object to stderr with ``console.error``
+    before throwing. Only those prefixed blocks are inspected; stdout (the
+    agent's final response) and arbitrary transcript text are never evidence.
+    """
+
+    if not isinstance(log_text, str):
+        return []
+    blocks = []
+    current = None
+    for line in log_text.splitlines():
+        if any(line.startswith(prefix) for prefix in _GITHUB_ERROR_PREFIXES):
+            current = [line]
+            blocks.append(current)
+            continue
+        if current is None:
+            continue
+        if line in ("}", "]"):
+            current.append(line)
+            current = None
+            continue
+        if not line.strip() or line[:1].isspace():
+            current.append(line)
+        else:
+            current = None
+    return ["\n".join(block) for block in blocks]
+
+
+def _classify_github_error_block(block: str) -> str:
+    name_match = _GITHUB_NAME_RE.search(block)
+    status_match = _GITHUB_STATUS_RE.search(block)
+    return _classify_provider_error(
+        name_match.group(1) if name_match else "",
+        int(status_match.group(1)) if status_match else None,
+        block,
+    )
+
+
+def classify_opencode_github_events(log_text: Any, exit_code: Any = 1) -> str:
+    """Classify ``opencode github run`` from its stderr diagnostic channel.
+
+    The CLI has no machine-readable event mode on the pinned version, so a
+    real provider failure is only provable from the runtime-emitted
+    ``Agent error:``/``Summary agent error:`` block. Anything else is
+    ``inconclusive`` rather than a synthetic 429; the process exit code is
+    always preserved by the runner wrapper.
+    """
+
+    blocks = _github_error_blocks(log_text)
+    return _select_event_classification(
+        [_classify_github_error_block(block) for block in blocks], exit_code
+    )
+
+
+def _combined_classification(log_text: Any, exit_code: Any) -> str:
+    """Return the strongest classification across both entrypoint channels.
+
+    Structured ``run`` events take precedence. When those are absent or
+    inconclusive, runtime-owned ``github run`` diagnostics are considered.
+    Plain prose never contributes because both parsers require a structured
+    event or an exact runtime prefix.
+    """
+
+    classification = classify_opencode_events(log_text, exit_code)
+    if classification not in ("ok", "inconclusive"):
+        return classification
+    github = classify_opencode_github_events(log_text, exit_code)
+    if github not in ("ok", "inconclusive"):
+        return github
+    return classification
+
+
+def is_opencode_429(log_text: Any, exit_code: Any = 1) -> bool:
+    """Whether an OpenCode invocation produced provider quota runner death.
+
+    Only an authoritative provider error object (a structured ``type=error``
+    event for ``run --format json``, or the runtime diagnostic block for
+    ``github run``) with an explicit 429/quota signature classifies. Arbitrary
+    transcript text, source/test literals, tool output, and prose are never
+    evidence. Deterministic ``400/401/403/404/422`` failures never classify,
+    and a non-zero exit with no provider error is inconclusive, not quota.
+    """
+
+    return _combined_classification(log_text, exit_code) == "quota_429"
 
 
 def classify_agent_error(log_text: Any, exit_code: Any = 1) -> str:
     """Classify a finished agent invocation.
 
-    Returns ``"runner-death-429"`` for model 429, ``"fail-closed"`` for
-    deterministic configuration/auth errors, and ``"task-failure"`` for
-    every normal non-429 agent failure (which must never be misclassified
-    as runner replacement).
+    Returns ``"runner-death-429"`` for a provider 429,
+    ``"infrastructure-unavailable"`` for a provider/transport failure,
+    ``"fail-closed"`` for deterministic configuration/auth errors, and
+    ``"task-failure"`` for every normal non-429 agent failure (which must
+    never be misclassified as runner replacement).
     """
 
-    if is_opencode_429(log_text, exit_code):
+    classification = _combined_classification(log_text, exit_code)
+    if classification == "quota_429":
         return "runner-death-429"
+    if classification in ("unavailable", "upstream", "timeout"):
+        return "infrastructure-unavailable"
+    if classification == "fail_closed":
+        return "fail-closed"
     text = log_text if isinstance(log_text, str) else ""
     if _FAIL_CLOSED_RE.search(text):
         return "fail-closed"
@@ -943,6 +1235,8 @@ __all__ = [
     "already_resumed",
     "checkpoint_ref",
     "classify_agent_error",
+    "classify_opencode_events",
+    "classify_opencode_github_events",
     "consumes_task_budget",
     "cooldown_comment",
     "infra_backoff_seconds",
@@ -951,6 +1245,7 @@ __all__ = [
     "next_generation",
     "operation_id",
     "parse_checkpoint_ref",
+    "parse_opencode_error_events",
     "parse_stage_file",
     "parse_metadata_failure_line",
     "parse_recovery_state_markers",

@@ -2285,61 +2285,44 @@ jobs:
           components: opencode
           opencode-version: ${{ vars.CONTINUUM_OPENCODE_VERSION || '' }}
 
+      - name: Checkout Continuum 429 classifier
+        if: steps.issue_readiness.outputs.ready != 'false'
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: kodmial/continuum
+          ref: ${{ inputs.continuum_ref || 'main' }}
+          path: .continuum-429-engine
+          fetch-depth: 1
+          persist-credentials: false
+          sparse-checkout: |
+            src/continuum
+            .github/scripts
+
       - name: Install Continuum OpenCode rate-limit wrapper
         if: steps.issue_readiness.outputs.ready != 'false'
         shell: bash
         run: |
           set -euo pipefail
-          wrapper="${RUNNER_TEMP:-/tmp}/continuum-opencode"
-          cat > "$wrapper" <<'SH'
-          #!/usr/bin/env bash
-          set -uo pipefail
-          # kodmial/continuum#290: a 429 burns the current VM immediately. A
-          # burned runner must never invoke the model again, so any second
-          # invocation on this runner fails fast with the dedicated
-          # infrastructure outcome (exit 75) without touching the model.
-          if [[ -f "${RUNNER_TEMP:-/tmp}/continuum-opencode-429" ]]; then
-            echo "::error::CONTINUUM_OPENCODE_429_RESTART_REQUIRED (runner already burned; refusing a second model invocation on this VM)."
-            exit 75
+          engine="$GITHUB_WORKSPACE/.continuum-429-engine"
+          install_root="${RUNNER_TEMP:-/tmp}/continuum-429"
+          rm -rf "$install_root"
+          mkdir -p "$install_root/.github/scripts" "$install_root/src"
+          cp -R "$engine/src/continuum" "$install_root/src/"
+          cp "$engine/.github/scripts/opencode_429_classify.py" "$install_root/.github/scripts/"
+          cp "$engine/.github/scripts/opencode_429_wrapper.sh" "$install_root/continuum-opencode"
+          chmod +x "$install_root/continuum-opencode" "$install_root/.github/scripts/opencode_429_classify.py"
+          rm -rf "$engine"
+          echo "$install_root" >> "$GITHUB_PATH"
+          echo "CONTINUUM_429_CLASSIFIER=$install_root/.github/scripts/opencode_429_classify.py" >> "$GITHUB_ENV"
+          # kodmial/continuum#415: prove the pinned CLI accepts the
+          # authoritative structured event channel before any agent runs.
+          opencode_version="$(opencode --version)"
+          run_help="$(opencode run --help 2>&1 || true)"
+          if ! grep -q -- '--format' <<<"$run_help" || ! grep -q 'json' <<<"$run_help"; then
+            echo "::error::Installed OpenCode CLI $opencode_version does not support 'run --format json'; refusing unstructured provider-error classification."
+            exit 2
           fi
-          log="$(mktemp)"
-          set +e
-          opencode "$@" 2>&1 | tee "$log"
-          status=${PIPESTATUS[0]}
-          set -e
-          # kodmial/continuum#290: classification mirrors the
-          # is_opencode_429 engine contract exactly. FreeUsageLimitError
-          # always burns the runner (the provider refused usage even when
-          # the CLI exits 0); any other 429 signal burns only when the
-          # invocation actually failed, so a passing run whose log merely
-          # mentions 429 in prose (prompts and agent output routinely do)
-          # never retires a healthy runner.
-          burned=false
-          if grep -Eiq 'FreeUsageLimitError' "$log"; then
-            burned=true
-          elif [[ "$status" -ne 0 ]] && grep -Eiq 'APIError.*429|HTTP[^0-9]*429([^0-9]|$)|429[[:space:]]+Too[[:space:]]+Many[[:space:]]+Requests|statusCode[^0-9]*429([^0-9]|$)' "$log"; then
-            burned=true
-          fi
-          if [[ "$burned" == "true" ]]; then
-            : > "${RUNNER_TEMP:-/tmp}/continuum-opencode-429"
-            rm -f "$log"
-            echo "::error::OpenCode 429: retire this runner and recover on a fresh runner."
-            exit 75
-          fi
-          # An unavailable upstream is a provider/transport failure, not a
-          # code defect and not a quota-429. Preserve this distinction for
-          # routing feedback and durable fresh-runner recovery.
-          if [[ "$status" -ne 0 ]] && grep -Eiq 'Upstream request failed:[[:space:]]*Endpoint is unavailable\.?|\bEndpoint is unavailable\.' "$log"; then
-            : > "${RUNNER_TEMP:-/tmp}/continuum-opencode-upstream-unavailable"
-            rm -f "$log"
-            echo "::error::CONTINUUM_OPENCODE_UPSTREAM_UNAVAILABLE_RESTART_REQUIRED"
-            exit 76
-          fi
-          rm -f "$log"
-          exit "$status"
-          SH
-          chmod +x "$wrapper"
-          echo "${RUNNER_TEMP:-/tmp}" >> "$GITHUB_PATH"
+          echo "Verified OpenCode $opencode_version supports 'run --format json'."
 
       # kodmial/continuum#290: workflow-owned 429 evacuation. Shell/workflow
       # code — never the model — persists all recoverable state before the
@@ -3069,8 +3052,7 @@ jobs:
             checkpoint_issue_progress "$OPENCODE_RUN_RC"
           fi
           trap - TERM INT HUP
-          if [[ "$OPENCODE_RUN_RC" -eq 76 ]] || grep -Eiq 'FreeUsageLimitError' "$OPENCODE_RUN_LOG" || \
-             { [[ "$OPENCODE_RUN_RC" -ne 0 ]] && grep -Eiq 'APIError.*429|HTTP[^0-9]*429([^0-9]|$)|429[[:space:]]+Too[[:space:]]+Many[[:space:]]+Requests|statusCode[^0-9]*429([^0-9]|$)' "$OPENCODE_RUN_LOG"; }; then
+          if [[ "$OPENCODE_RUN_RC" -eq 75 || "$OPENCODE_RUN_RC" -eq 76 ]]; then
             # kodmial/continuum#290: 429 burns this VM. Workflow-owned
             # evacuation persists working-tree changes, commits, SHAs,
             # operation identity, stage, and evidence to the durable
@@ -3386,8 +3368,7 @@ jobs:
             OPENCODE_RUN_RC=${PIPESTATUS[0]}
             set -e
           fi
-          if [[ "$OPENCODE_RUN_RC" -eq 76 ]] || grep -Eiq 'FreeUsageLimitError' "$OPENCODE_RUN_LOG" || \
-             { [[ "$OPENCODE_RUN_RC" -ne 0 ]] && grep -Eiq 'APIError.*429|HTTP[^0-9]*429([^0-9]|$)|429[[:space:]]+Too[[:space:]]+Many[[:space:]]+Requests|statusCode[^0-9]*429([^0-9]|$)' "$OPENCODE_RUN_LOG"; }; then
+          if [[ "$OPENCODE_RUN_RC" -eq 75 || "$OPENCODE_RUN_RC" -eq 76 ]]; then
             # kodmial/continuum#290: 429 burns this VM. Workflow-owned
             # evacuation persists the exact required SHA, operation identity,
             # and qualification stage to the durable recovery ref, marks the
@@ -3802,8 +3783,7 @@ jobs:
           continuum-opencode run --auto --model "$OPENCODE_MODEL" "$PROMPT" 2>&1 | tee "$OPENCODE_RUN_LOG"
           OPENCODE_RUN_RC=${PIPESTATUS[0]}
           set -e
-          if [[ "$OPENCODE_RUN_RC" -eq 76 ]] || grep -Eiq 'FreeUsageLimitError' "$OPENCODE_RUN_LOG" || \
-             { [[ "$OPENCODE_RUN_RC" -ne 0 ]] && grep -Eiq 'APIError.*429|HTTP[^0-9]*429([^0-9]|$)|429[[:space:]]+Too[[:space:]]+Many[[:space:]]+Requests|statusCode[^0-9]*429([^0-9]|$)' "$OPENCODE_RUN_LOG"; }; then
+          if [[ "$OPENCODE_RUN_RC" -eq 75 || "$OPENCODE_RUN_RC" -eq 76 ]]; then
             # kodmial/continuum#290: 429 burns this VM. Workflow-owned
             # evacuation preserves the working tree, the exact PR HEAD
             # identity (REPAIR_BASE_SHA), and the review-repair stage to the
@@ -4284,8 +4264,7 @@ jobs:
           continuum-opencode run --auto --model "$OPENCODE_MODEL" "$PROMPT" 2>&1 | tee "$OPENCODE_RUN_LOG"
           OPENCODE_RUN_RC=${PIPESTATUS[0]}
           set -e
-          if [[ "$OPENCODE_RUN_RC" -eq 76 ]] || grep -Eiq 'FreeUsageLimitError' "$OPENCODE_RUN_LOG" || \
-             { [[ "$OPENCODE_RUN_RC" -ne 0 ]] && grep -Eiq 'APIError.*429|HTTP[^0-9]*429([^0-9]|$)|429[[:space:]]+Too[[:space:]]+Many[[:space:]]+Requests|statusCode[^0-9]*429([^0-9]|$)' "$OPENCODE_RUN_LOG"; }; then
+          if [[ "$OPENCODE_RUN_RC" -eq 75 || "$OPENCODE_RUN_RC" -eq 76 ]]; then
             # kodmial/continuum#290: 429 burns this VM. Workflow-owned
             # evacuation preserves the conflict-repair working tree, the exact
             # PR HEAD identity, and the review-repair stage to the durable
@@ -4491,8 +4470,7 @@ jobs:
           continuum-opencode run --auto --model "$OPENCODE_MODEL" "$PROMPT" 2>&1 | tee "$OPENCODE_RUN_LOG"
           OPENCODE_RUN_RC=${PIPESTATUS[0]}
           set -e
-          if [[ "$OPENCODE_RUN_RC" -eq 76 ]] || grep -Eiq 'FreeUsageLimitError' "$OPENCODE_RUN_LOG" || \
-             { [[ "$OPENCODE_RUN_RC" -ne 0 ]] && grep -Eiq 'APIError.*429|HTTP[^0-9]*429([^0-9]|$)|429[[:space:]]+Too[[:space:]]+Many[[:space:]]+Requests|statusCode[^0-9]*429([^0-9]|$)' "$OPENCODE_RUN_LOG"; }; then
+          if [[ "$OPENCODE_RUN_RC" -eq 75 || "$OPENCODE_RUN_RC" -eq 76 ]]; then
             # kodmial/continuum#290: 429 burns this VM. Workflow-owned
             # evacuation preserves the CI-repair working tree, the exact PR
             # HEAD identity, and the review-repair stage to the durable
