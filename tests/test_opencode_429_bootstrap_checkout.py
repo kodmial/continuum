@@ -415,7 +415,9 @@ class RestoreAgainstRealGitTest(unittest.TestCase):
         )
         return worktree
 
-    def run_restore(self, worktree, operation, ref, sha, stage, generation, mode):
+    def run_restore(
+        self, worktree, operation, ref, sha, stage, generation, mode, issue="373"
+    ):
         runner_temp = self.workdir / "runner-temp"
         runner_temp.mkdir(exist_ok=True)
         output_file = self.workdir / "github-output"
@@ -429,6 +431,7 @@ class RestoreAgainstRealGitTest(unittest.TestCase):
                 "RECOVERY_STAGE": stage,
                 "RECOVERY_GENERATION": str(generation),
                 "RECOVERY_MODE": mode,
+                "RECOVERY_ISSUE_NUMBER": issue,
                 "RUNNER_TEMP": str(runner_temp),
                 "GITHUB_OUTPUT": str(output_file),
             }
@@ -506,6 +509,21 @@ class RestoreAgainstRealGitTest(unittest.TestCase):
             "operation mismatch", wrong_operation.stdout + wrong_operation.stderr
         )
 
+        wrong_issue, _ = self.run_restore(
+            worktree,
+            "opencode-429-issue-issue373",
+            ref,
+            checkpoint_sha,
+            "tests-passed",
+            1,
+            "issue",
+            issue="357",
+        )
+        self.assertNotEqual(wrong_issue.returncode, 0)
+        self.assertIn(
+            "issue mismatch", wrong_issue.stdout + wrong_issue.stderr
+        )
+
         wrong_generation, _ = self.run_restore(
             worktree,
             "opencode-429-issue-issue373",
@@ -557,10 +575,55 @@ class RestoreAgainstRealGitTest(unittest.TestCase):
             "implementation-incomplete",
             1,
             "issue",
+            issue="357",
         )
         self.assertNotEqual(missing.returncode, 0)
         self.assertIn(
             "no recovery metadata", missing.stdout + missing.stderr
+        )
+
+    def test_stale_sha_and_absent_remote_ref_fail_closed(self):
+        stale_ref, stale_sha = self.make_checkpoint(
+            operation="opencode-429-issue-issue999",
+            issue="999",
+        )
+        # Advance the same durable ref after the pointer was captured.
+        self.make_checkpoint(
+            operation="opencode-429-issue-issue999",
+            issue="999",
+        )
+        worktree = self.bootstrap_worktree_from_expression(
+            "opencode/issue373-39863508457"
+        )
+        stale, _ = self.run_restore(
+            worktree,
+            "opencode-429-issue-issue999",
+            stale_ref,
+            stale_sha,
+            "tests-passed",
+            1,
+            "issue",
+            issue="999",
+        )
+        self.assertNotEqual(stale.returncode, 0)
+        self.assertIn(
+            "does not match recovery SHA", stale.stdout + stale.stderr
+        )
+
+        absent, _ = self.run_restore(
+            worktree,
+            "opencode-429-issue-issue999",
+            "opencode/429-checkpoint-opencode-429-issue-issue999-gen-9",
+            stale_sha,
+            "tests-passed",
+            1,
+            "issue",
+            issue="999",
+        )
+        self.assertNotEqual(absent.returncode, 0)
+        self.assertIn(
+            "couldn't find remote ref",
+            (absent.stdout + absent.stderr).lower(),
         )
 
 
@@ -575,6 +638,7 @@ class PreRestoreFailureClassificationTest(unittest.TestCase):
     def test_checkout_failure_is_marked_as_infrastructure(self):
         classifier = step(self.opencode, "Classify 429 recovery bootstrap failure")
         condition = classifier["if"]
+        self.assertIn("inputs.mode == 'issue'", condition)
         self.assertIn("inputs.recovery_checkpoint_ref != ''", condition)
         self.assertIn("steps.checkout.outcome != 'success'", condition)
         script = classifier["run"]

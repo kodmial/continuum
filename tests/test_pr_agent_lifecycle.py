@@ -82,7 +82,7 @@ APPROVED_350_OPENCODE_SHA256 = (
 # infrastructure recovery instead of a task attempt. This pins the entire
 # reviewed workflow content so unrelated drift still fails closed.
 APPROVED_374_OPENCODE_SHA256 = (
-    "5b457f1788da34e9c14a00919df94cf1481dcd45b0da6be2f67e736832b7ee45"
+    "6d95dabd11ca824935e89a5c379a086f7e9d26acef246cdb2bfa25c666832077"
 )
 APPROVED_350_SELF_CALLER_SHA256 = (
     "f06cdcb9affc06f976aed97945ff9d31496e5954ca225971164f87ec4e1ca22c"

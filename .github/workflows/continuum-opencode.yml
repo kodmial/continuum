@@ -573,6 +573,7 @@ jobs:
         id: recovery_bootstrap
         if: >-
           always() &&
+          inputs.mode == 'issue' &&
           inputs.recovery_checkpoint_ref != '' &&
           steps.checkout.outcome != 'success'
         env:
@@ -621,6 +622,7 @@ jobs:
           RECOVERY_STAGE: ${{ inputs.recovery_stage }}
           RECOVERY_GENERATION: ${{ inputs.recovery_generation }}
           RECOVERY_MODE: ${{ inputs.mode }}
+          RECOVERY_ISSUE_NUMBER: ${{ inputs.issue_number }}
         run: |
           set -euo pipefail
           [[ -n "$RECOVERY_OPERATION_ID" ]] || { echo "::error::429 recovery without operation identity."; exit 1; }
@@ -686,6 +688,12 @@ jobs:
           mode = os.environ.get("RECOVERY_MODE", "").strip()
           if mode and required("mode") != mode:
               raise SystemExit("::error::429 recovery metadata mode mismatch")
+          if mode == "issue":
+              issue_number = os.environ.get("RECOVERY_ISSUE_NUMBER", "").strip()
+              if not re.fullmatch(r"[0-9]+", issue_number):
+                  raise SystemExit("::error::429 recovery metadata issue number is missing")
+              if str(data.get("issue_number") or "").strip() != issue_number:
+                  raise SystemExit("::error::429 recovery metadata issue mismatch")
           head_sha = required("head_sha").lower()
           if not re.fullmatch(r"[0-9a-f]{40}", head_sha):
               raise SystemExit("::error::429 recovery metadata head SHA is malformed")

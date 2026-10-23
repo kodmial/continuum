@@ -267,6 +267,7 @@ class ProductionRestoreTest(unittest.TestCase):
                 "RECOVERY_STAGE": "implementation-incomplete",
                 "RECOVERY_GENERATION": "1",
                 "RECOVERY_MODE": "issue",
+                "RECOVERY_ISSUE_NUMBER": "350",
                 "GITHUB_OUTPUT": str(output),
             }
         )
