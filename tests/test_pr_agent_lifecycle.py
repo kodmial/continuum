@@ -74,6 +74,16 @@ APPROVED_347_OPENCODE_SHA256 = (
 APPROVED_350_OPENCODE_SHA256 = (
     "f9368c6939f4343a27f28d3bdc0653d1b1822de56c1b963454543cbed60fb03b"
 )
+
+# kodmial/continuum#374 exact protected-workflow artifact pin. A fresh-VM 429
+# issue recovery now bootstraps its initial checkout from a trusted existing
+# base/default ref and restores the exact pinned checkpoint afterwards; a
+# pre-restore checkout/transport failure is classified as bounded
+# infrastructure recovery instead of a task attempt. This pins the entire
+# reviewed workflow content so unrelated drift still fails closed.
+APPROVED_374_OPENCODE_SHA256 = (
+    "5b457f1788da34e9c14a00919df94cf1481dcd45b0da6be2f67e736832b7ee45"
+)
 APPROVED_350_SELF_CALLER_SHA256 = (
     "f06cdcb9affc06f976aed97945ff9d31496e5954ca225971164f87ec4e1ca22c"
 )
@@ -2488,12 +2498,12 @@ class ProtectedBaselineTests(unittest.TestCase):
                     self.assertIn("CONTINUUM_OPENCODE_PUBLISH_RACE_RETRY_REQUIRED", original)
                     self.assertIn("steps.model_route.outputs.model", original)
                 if path == ".github/workflows/continuum-opencode.yml":
-                    # #350 is reviewed as one exact artifact: metadata
-                    # validation, fail-closed salvage, and dispatch routing.
+                    # #350's recovery contract plus #374's trusted bootstrap
+                    # checkout are reviewed as one exact artifact.
                     self.assertEqual(
                         protected_file_digest(path),
-                        APPROVED_350_OPENCODE_SHA256,
-                        f"{path}: unexpected drift outside reviewed #350 recovery patch",
+                        APPROVED_374_OPENCODE_SHA256,
+                        f"{path}: unexpected drift outside reviewed #350/#374 recovery patch",
                     )
                 else:
                     # The self-dogfood caller is the dispatchable surface
