@@ -1060,6 +1060,68 @@ class ExactHeadCiProofRegressionTests(unittest.TestCase):
             ),
         ]
 
+    @classmethod
+    def _listing_scenarios(cls):
+        run = cls._ci_run
+        head = cls.HEAD
+        return [
+            (
+                "green-proof-unreadable-listing",
+                {
+                    "proofRun": run(),
+                    "runs": None,
+                    "workflowName": "CI",
+                    "headSha": head,
+                },
+                "unavailable",
+                None,
+            ),
+            (
+                "green-proof-empty-listing",
+                {
+                    "proofRun": run(),
+                    "runs": [],
+                    "workflowName": "CI",
+                    "headSha": head,
+                },
+                "green",
+                101,
+            ),
+            (
+                "red-proof-unreadable-listing",
+                {
+                    "proofRun": run(conclusion="failure"),
+                    "runs": None,
+                    "workflowName": "CI",
+                    "headSha": head,
+                },
+                "unavailable",
+                None,
+            ),
+            (
+                "pending-proof-unreadable-listing",
+                {
+                    "proofRun": run(status="in_progress", conclusion=None),
+                    "runs": None,
+                    "workflowName": "CI",
+                    "headSha": head,
+                },
+                "unavailable",
+                None,
+            ),
+            (
+                "missing-proof-unreadable-listing",
+                {
+                    "proofRun": None,
+                    "runs": None,
+                    "workflowName": "CI",
+                    "headSha": head,
+                },
+                "unavailable",
+                None,
+            ),
+        ]
+
     @staticmethod
     def _extract(source: str, name: str, start: int = 0) -> str:
         import re
@@ -1182,6 +1244,142 @@ console.log('CI_PROOF_OK');
         self.assertEqual(completed.returncode, 0, completed.stderr or completed.stdout)
         self.assertIn("CI_PROOF_OK", completed.stdout)
 
+    def test_unreadable_listing_fails_closed_for_review_and_merge(self):
+        import json
+        import os
+        import re
+        import shutil
+        import subprocess
+        import tempfile
+
+        review = read(".github/workflows/continuum-pr-agent.yml")
+        merge = read(".github/workflows/continuum-pr-agent-auto-merge.yml")
+
+        helpers = "\n".join(
+            self._extract(review, name)
+            for name in (
+                "ciRunCreatedAt",
+                "ciRunUpdatedAt",
+                "ciRunMatchesExactHead",
+                "ciRunProofState",
+            )
+        )
+        review_decision = self._extract(review, "decideExactHeadCi")
+        merge_decision = self._extract(merge, "decideExactHeadCi")
+        review_wrapper = self._extract(review, "decideWithCiListing")
+        merge_wrapper = self._extract(merge, "decideWithCiListing")
+        review_reader = self._extract(review, "readRuns")
+        merge_reader = self._extract(merge, "listCiRunsForHead")
+
+        def rename(source, decision_name, wrapper_name=None):
+            source = re.sub(r"\bdecideExactHeadCi\b", decision_name, source)
+            if wrapper_name:
+                source = re.sub(
+                    r"\bdecideWithCiListing\b", wrapper_name, source
+                )
+            return source
+
+        review_decision = rename(review_decision, "decideReviewCi")
+        merge_decision = rename(merge_decision, "decideMergeCi")
+        review_wrapper = rename(
+            review_wrapper, "decideReviewCi", "decideReviewWithListing"
+        )
+        merge_wrapper = rename(
+            merge_wrapper, "decideMergeCi", "decideMergeWithListing"
+        )
+
+        scenario_source = (
+            "const scenarios = "
+            + json.dumps(self._listing_scenarios())
+            + ";\n"
+            + """
+process.env.CONTINUUM_PR_AGENT_TARGET_OWNER = 'owner';
+process.env.CONTINUUM_PR_AGENT_TARGET_REPO = 'repo';
+const owner = 'owner';
+const repo = 'repo';
+const admittedSha = scenarios[0][1].headSha;
+const core = { info() {} };
+const github = {
+  rest: {
+    actions: {
+      listWorkflowRunsForRepo: async () => {
+        throw new Error('transient API failure');
+      },
+    },
+  },
+};
+const wrappers = [decideReviewWithListing, decideMergeWithListing];
+(async () => {
+  for (const wrapper of wrappers) {
+    for (const [name, payload, expectedState, expectedRunId] of scenarios) {
+      const decision = wrapper(payload);
+      assert.strictEqual(decision.state, expectedState, name + ' state');
+      assert.strictEqual(decision.runId, expectedRunId, name + ' run id');
+    }
+  }
+  const readers = [readRuns, listCiRunsForHead];
+  for (const reader of readers) {
+    const runs = await reader(null, admittedSha);
+    assert.strictEqual(runs, null, 'failed listing read must return null');
+    for (const wrapper of wrappers) {
+      const decision = wrapper({
+        proofRun: scenarios[0][1].proofRun,
+        runs,
+        workflowName: scenarios[0][1].workflowName,
+        headSha: admittedSha,
+      });
+      assert.strictEqual(
+        decision.state,
+        'unavailable',
+        'a failed API read must fail closed even with green proof'
+      );
+      assert.strictEqual(decision.runId, null);
+    }
+  }
+  console.log('CI_LISTING_FAIL_CLOSED_OK');
+})().catch((err) => {
+  console.error(err);
+  process.exit(1);
+});
+"""
+        )
+        harness = (
+            "const assert = require('assert');\n"
+            + helpers
+            + "\n"
+            + "const delegated = false;\n"
+            + review_decision
+            + "\n"
+            + merge_decision
+            + "\n"
+            + review_wrapper
+            + "\n"
+            + merge_wrapper
+            + "\n"
+            + review_reader
+            + "\n"
+            + merge_reader
+            + "\n"
+            + scenario_source
+        )
+        node = shutil.which("node")
+        self.assertIsNotNone(node, "node is required to execute the shipped CI proof")
+        temp_dir = ROOT / ".opencode-tmp"
+        temp_dir.mkdir(exist_ok=True)
+        with tempfile.NamedTemporaryFile(
+            "w", suffix=".js", dir=str(temp_dir), delete=False
+        ) as handle:
+            handle.write(harness)
+            script = handle.name
+        try:
+            completed = subprocess.run(
+                [node, script], capture_output=True, text=True, timeout=30
+            )
+        finally:
+            os.unlink(script)
+        self.assertEqual(completed.returncode, 0, completed.stderr or completed.stdout)
+        self.assertIn("CI_LISTING_FAIL_CLOSED_OK", completed.stdout)
+
     def test_retry_dispatch_python_decision_matches_canonical_scenarios(self):
         import json
         import shutil
@@ -1200,17 +1398,24 @@ console.log('CI_PROOF_OK');
             script_path.write_text(decision, encoding="utf-8")
             proof_path = Path(temp) / "proof.json"
             list_path = Path(temp) / "runs.json"
-            for name, payload, expected_state, _ in self._ci_scenarios():
+            scenarios = self._ci_scenarios() + self._listing_scenarios()
+            for name, payload, expected_state, _ in scenarios:
                 with self.subTest(scenario=name):
                     proof = payload.get("proofRun")
                     if proof is None:
                         proof_path.unlink(missing_ok=True)
                     else:
                         proof_path.write_text(json.dumps(proof), encoding="utf-8")
-                    list_path.write_text(
-                        json.dumps({"workflow_runs": payload.get("runs") or []}),
-                        encoding="utf-8",
-                    )
+                    runs = payload.get("runs")
+                    if runs is None:
+                        # A failed `gh api` listing read deletes $CI_JSON, so
+                        # the shipped decision must see a missing file.
+                        list_path.unlink(missing_ok=True)
+                    else:
+                        list_path.write_text(
+                            json.dumps({"workflow_runs": runs}),
+                            encoding="utf-8",
+                        )
                     delegated = (
                         "true" if payload.get("delegated") else "false"
                     )
