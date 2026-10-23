@@ -702,7 +702,7 @@ jobs:
             ]);
             const observedTerminalFailures = new Set([
               'failure', 'timed_out', 'startup_failure', 'action_required',
-              'stale',
+              'stale', 'cancelled', 'skipped', 'neutral',
             ]);
             function isValidCheckpointSha(value) {
               return /^[0-9a-f]{40}$/i.test(String(value || '').trim());
@@ -1166,6 +1166,35 @@ jobs:
                     return;
                   }
                   if (observed.action === 'retry-later') {
+                    // Every unverified retry consumes one bounded attempt. A
+                    // permanently unreadable run lookup must eventually enter
+                    // backoff instead of polling every wake forever.
+                    const retryAttempt = (Number(previous.attempt) || 0) + 1;
+                    const retryBudget = Math.max(1, max429Restarts + 1);
+                    if (retryAttempt >= retryBudget) {
+                      await recordRecoveryState({
+                        ...baseState,
+                        checkpointSha: previous.checkpointSha || pointerSha,
+                        state: 'backoff',
+                        attempt: retryAttempt,
+                        nextDue: now + 3600,
+                        runId: observed.runId || previous.runId,
+                        detail: 'attempts-exhausted',
+                        summary: 'OpenCode infrastructure resumption could not be ' +
+                          'verified from authoritative GitHub evidence (' +
+                          observed.detail + ') and the bounded retry budget is ' +
+                          'exhausted. The checkpoint is preserved; no duplicate ' +
+                          'dispatch was made.',
+                        fresh: previous.state === 'observed',
+                      });
+                      core.warning(
+                        'OpenCode infrastructure operation ' + operation + ' generation ' +
+                        generation + ' observed run evidence remains unavailable (' +
+                        observed.detail + '); entering bounded backoff after ' +
+                        'exhausting the retry budget without dispatching a duplicate.'
+                      );
+                      return;
+                    }
                     // Keep the earlier observed marker as history and publish a
                     // bounded retry state. A transient/unverifiable GitHub read
                     // must never become a permanent observed deadlock.
@@ -1173,7 +1202,7 @@ jobs:
                       ...baseState,
                       checkpointSha: previous.checkpointSha || pointerSha,
                       state: 'observed-unverified',
-                      attempt: previous.attempt,
+                      attempt: retryAttempt,
                       nextDue: now + 300,
                       runId: observed.runId || previous.runId,
                       detail: observed.detail,

@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import copy
 import json
+import re
 import shutil
 import subprocess
 import tempfile
@@ -50,6 +51,7 @@ const state = {
   dispatches: [],
   runs: new Map(),
   runErrors: new Map(Object.entries(scenario.runErrors || {})),
+  runLookups: [],
   workflowRuns: (scenario.workflowRuns || []).map(run => ({ ...run })),
   scriptErrors: [],
   notices: [],
@@ -127,6 +129,7 @@ function makeRest() {
         (scenario.jobs || []).map(job => ({ ...job })),
       getWorkflowRun: async ({ run_id }) => {
         const key = String(run_id);
+        state.runLookups.push(key);
         if (state.runErrors.has(key)) {
           throw apiError(state.runErrors.get(key), 'run lookup failed');
         }
@@ -272,6 +275,7 @@ async function runOnce() {
     dispatches: state.dispatches,
     comments: state.comments,
     notices: state.notices,
+    runLookups: state.runLookups,
     scriptErrors: state.scriptErrors,
   };
   fs.writeFileSync(resultPath, JSON.stringify(result, null, 2), 'utf8');
@@ -570,6 +574,9 @@ class WatchdogHarness(unittest.TestCase):
     def test_unverifiable_run_status_is_a_bounded_retry_not_a_deadlock(self):
         scenario = base_scenario()
         scenario["runErrors"] = {OLD_RUN_ID: 403}
+        # Both wakes share one mock state, so the second wake sees the durable
+        # observed-unverified marker recorded by the first.
+        scenario["passes"] = 2
         result = self.run_scenario(scenario)
         self.assert_no_dispatch(result)
         unverified = [
@@ -579,11 +586,49 @@ class WatchdogHarness(unittest.TestCase):
         self.assertEqual(len(unverified), 1, result["comments"])
         self.assertIn("detail=run-status-403", unverified[0])
         self.assertRegex(unverified[0], r"next_due=[1-9][0-9]*")
-        # A second wake inside the bounded window must not hammer the API or
-        # dispatch blindly.
-        scenario["passes"] = 1
+        self.assertIn("attempt=2", unverified[0])
+        # The second wake inside the bounded window must skip dispatch and must
+        # not re-read the unverifiable run: the guard alone suppresses it.
+        self.assertEqual(
+            result["runLookups"].count(OLD_RUN_ID), 1, result["runLookups"]
+        )
+
+        # Once the window elapses and the API recovers, the marker is
+        # re-verified and the newer checkpoint resumes dispatch instead of
+        # deadlocking forever.
+        replay = base_scenario()
+        replay["comments"] = copy.deepcopy(result["comments"])
+        for comment in replay["comments"]:
+            if "state=observed-unverified" in comment["body"]:
+                comment["body"] = re.sub(
+                    r"next_due=\d+", "next_due=0", comment["body"]
+                )
+        recovered = self.run_scenario(replay)
+        self.assert_one_current_dispatch(recovered, NEW_SHA)
+
+    def test_unverified_retry_budget_enters_bounded_backoff(self):
+        scenario = base_scenario()
+        scenario["comments"][0]["body"] = recovery_marker(
+            "observed-unverified", OLD_SHA, OLD_RUN_ID, attempt=4
+        )
+        scenario["runErrors"] = {OLD_RUN_ID: 403}
         result = self.run_scenario(scenario)
         self.assert_no_dispatch(result)
+        backoff = [
+            comment["body"] for comment in result["comments"]
+            if "state=backoff" in comment["body"]
+        ]
+        self.assertEqual(len(backoff), 1, result["comments"])
+        self.assertIn("detail=attempts-exhausted", backoff[0])
+        self.assertIn("attempt=5", backoff[0])
+
+    def test_terminal_non_owning_conclusions_allow_newer_checkpoint_resume(self):
+        for conclusion in ("cancelled", "skipped", "neutral"):
+            with self.subTest(conclusion=conclusion):
+                scenario = base_scenario()
+                scenario["runs"][0]["conclusion"] = conclusion
+                result = self.run_scenario(scenario)
+                self.assert_one_current_dispatch(result, NEW_SHA)
 
     def test_transient_run_lookup_404_is_retryable(self):
         scenario = base_scenario()
