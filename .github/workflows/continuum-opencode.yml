@@ -558,7 +558,10 @@ jobs:
           # TAP_PAT must be a classic PAT with repo + workflow scopes.
           token: ${{ secrets.TAP_PAT }}
           persist-credentials: true
-          ref: ${{ inputs.head_ref || github.ref }}
+          # Fresh-VM issue recovery: checkout a ref that exists before restoring the pinned 429 checkpoint.
+          # The burned runner's ephemeral head_ref was not necessarily pushed to origin.
+          # Other modes preserve their original checkout behavior.
+          ref: ${{ (inputs.mode == 'issue' && inputs.recovery_checkpoint_ref != '') && (inputs.base_ref || github.event.repository.default_branch || github.ref) || inputs.head_ref || github.ref }}
 
       - name: Configure Git identity
         run: |
