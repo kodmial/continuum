@@ -2970,70 +2970,186 @@ jobs:
               );
             }
 
-            const labelSpecs = [
-              {
-                name: 'priority:p0',
-                color: 'B60205',
-                description: 'P0 — critical work that should be handled immediately.',
-              },
-              {
-                name: 'priority:p1',
-                color: 'D93F0B',
-                description: 'P1 — high-priority planned work.',
-              },
-              {
-                name: 'priority:p2',
-                color: 'FBCA04',
-                description: 'P2 — normal planned work.',
-              },
-              {
-                name: inProgressLabel,
-                color: '5319E7',
-                description: 'Actively reserved or implemented by the automatic issue scheduler.',
-              },
-              {
-                name: pausedLabel,
-                color: 'BFDADC',
-                description: 'Automation is paused after a failed/stopped implementation; remove to retry.',
-              },
-              {
-                name: qualifyingLabel,
-                color: '0E8A16',
-                description: 'Implementation merged; mandatory live qualification is pending exact-SHA evidence.',
-              },
-              {
-                name: blockedLabel,
-                color: 'B60205',
-                description: 'Mandatory live qualification failed; repair is required before completion.',
-              },
-              // A configured route label is reserved before this run can see
-              // it, so create it here rather than letting a consumer's
-              // selection silently no-op on a missing label.
-              ...[...executionRouteLabels].map(name => ({
-                name,
-                color: '0E8A16',
-                description:
-                  'Routes this issue to a configured execution workflow instead of the OpenCode agent.',
-              })),
-              // The optional admission label is created here for the same
-              // reason: a consumer can apply it from the issue page without
-              // a missing-label selection silently no-op. Empty creates
-              // nothing and keeps current behavior unchanged.
-              ...(readyLabel ? [{
-                name: readyLabel,
-                color: '0E8A16',
-                description:
-                  'Admits this issue to automatic implementation by the issue scheduler.',
-              }] : []),
-            ];
+            // Label specs mirror the configured names the reconcile pass
+            // below uses. Keeping them in one builder preserves newly
+            // installed repositories, optional execution routes and the
+            // optional admission label without creating duplicates.
+            function buildSchedulerLabelSpecs(config) {
+              const settings = config || {};
+              const inProgressLabel =
+                settings.inProgressLabel || 'automation:in-progress';
+              const pausedLabel =
+                settings.pausedLabel || 'automation:paused';
+              const qualifyingLabel =
+                settings.qualifyingLabel || 'automation:qualifying';
+              const blockedLabel =
+                settings.blockedLabel || 'automation:blocked';
+              const executionRouteLabels = settings.executionRouteLabels || [];
+              const readyLabel = settings.readyLabel || '';
+              return [
+                {
+                  name: 'priority:p0',
+                  color: 'B60205',
+                  description: 'P0 — critical work that should be handled immediately.',
+                },
+                {
+                  name: 'priority:p1',
+                  color: 'D93F0B',
+                  description: 'P1 — high-priority planned work.',
+                },
+                {
+                  name: 'priority:p2',
+                  color: 'FBCA04',
+                  description: 'P2 — normal planned work.',
+                },
+                {
+                  name: inProgressLabel,
+                  color: '5319E7',
+                  description: 'Actively reserved or implemented by the automatic issue scheduler.',
+                },
+                {
+                  name: pausedLabel,
+                  color: 'BFDADC',
+                  description: 'Automation is paused after a failed/stopped implementation; remove to retry.',
+                },
+                {
+                  name: qualifyingLabel,
+                  color: '0E8A16',
+                  description: 'Implementation merged; mandatory live qualification is pending exact-SHA evidence.',
+                },
+                {
+                  name: blockedLabel,
+                  color: 'B60205',
+                  description: 'Mandatory live qualification failed; repair is required before completion.',
+                },
+                // A configured route label is reserved before this run can see
+                // it, so create it here rather than letting a consumer's
+                // selection silently no-op on a missing label.
+                ...[...executionRouteLabels].map(name => ({
+                  name,
+                  color: '0E8A16',
+                  description:
+                    'Routes this issue to a configured execution workflow instead of the OpenCode agent.',
+                })),
+                // The optional admission label is created here for the same
+                // reason: a consumer can apply it from the issue page without
+                // a missing-label selection silently no-op. Empty creates
+                // nothing and keeps current behavior unchanged.
+                ...(readyLabel ? [{
+                  name: readyLabel,
+                  color: '0E8A16',
+                  description:
+                    'Admits this issue to automatic implementation by the issue scheduler.',
+                }] : []),
+              ];
+            }
 
-            for (const spec of labelSpecs) {
+            // Provision labels from a complete repository inventory instead of
+            // sending one POST per spec on every pass (kodmial/continuum#388).
+            // The same-repository GITHUB_TOKEN reads the inventory, so a
+            // steady-state pass spends no shared-PAT write and no
+            // already-existing label is re-POSTed. Pagination is authoritative:
+            // a repository with more than 100 labels must never hide a
+            // required one.
+            //
+            // Any inventory failure aborts the pass before reconciliation.
+            // Treating a 403/429/5xx/timeout/permission failure as an empty
+            // repository would fan out creates on an exhausted budget and could
+            // authorize implementation from an uncertain label state.
+            async function provisionSchedulerLabels({
+              readClient,
+              writeClient,
+              repositoryOwner,
+              repositoryName,
+              specs,
+            }) {
+              let inventory;
               try {
-                await github.rest.issues.createLabel({ owner, repo, ...spec });
+                inventory = await readClient.paginate(
+                  readClient.rest.issues.listLabelsForRepo,
+                  {
+                    owner: repositoryOwner,
+                    repo: repositoryName,
+                    per_page: 100,
+                  }
+                );
               } catch (err) {
-                if (err.status !== 422) throw err; // already exists
+                const status =
+                  err && err.status ? ' (status=' + err.status + ')' : '';
+                throw new Error(
+                  'Label inventory read failed' + status +
+                    '; refusing to provision labels or reconcile this pass.'
+                );
+              }
+              if (!Array.isArray(inventory)) {
+                throw new Error(
+                  'Label inventory read returned an invalid page; refusing to provision labels or reconcile this pass.'
+                );
+              }
+              const existingNames = new Set();
+              for (const label of inventory) {
+                if (
+                  !label ||
+                  typeof label.name !== 'string' ||
+                  !label.name
+                ) {
+                  throw new Error(
+                    'Label inventory contained an invalid entry; refusing to provision labels or reconcile this pass.'
+                  );
+                }
+                existingNames.add(label.name);
+              }
+              const attempted = new Set();
+              for (const spec of specs) {
+                if (!spec || typeof spec.name !== 'string' || !spec.name) {
+                  throw new Error(
+                    'Label specification is invalid; refusing to provision labels or reconcile this pass.'
+                  );
+                }
+                if (attempted.has(spec.name)) continue;
+                attempted.add(spec.name);
+                if (existingNames.has(spec.name)) continue;
+                try {
+                  await writeClient.rest.issues.createLabel({
+                    owner: repositoryOwner,
+                    repo: repositoryName,
+                    ...spec,
+                  });
+                } catch (err) {
+                  // A concurrent actor can create the label between the
+                  // inventory read and this POST. 422 is the existing-label
+                  // race, so it stays idempotent; everything else aborts.
+                  if (err && err.status === 422) {
+                    existingNames.add(spec.name);
+                    continue;
+                  }
+                  const status =
+                    err && err.status ? ' (status=' + err.status + ')' : '';
+                  throw new Error(
+                    'Label provisioning failed' + status +
+                      '; refusing to reconcile this pass. Retry after the next event or cron wake.'
+                  );
+                }
+                existingNames.add(spec.name);
               }
             }
+
+            const labelSpecs = buildSchedulerLabelSpecs({
+              inProgressLabel,
+              pausedLabel,
+              qualifyingLabel,
+              blockedLabel,
+              executionRouteLabels,
+              readyLabel,
+            });
+
+            await provisionSchedulerLabels({
+              readClient: readGithub,
+              writeClient: github,
+              repositoryOwner: owner,
+              repositoryName: repo,
+              specs: labelSpecs,
+            });
 
             const labelsByIssue = new Map();
 
