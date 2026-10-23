@@ -436,7 +436,8 @@ class CiSnapshotTests(unittest.TestCase):
         dispatch = body[dispatch_at:dispatch_at + 9000]
         self.assertIn("if (!(await exactHeadCiGreen(head))) {", dispatch)
         self.assertIn("head_sha: head", body)
-        self.assertIn("run.head_sha === head", body)
+        self.assertIn("const decision = decideExactHeadCi({", body)
+        self.assertIn("headSha: head", body)
 
 
 class CleanReviewShortCircuitTests(unittest.TestCase):

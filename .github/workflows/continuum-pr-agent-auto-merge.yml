@@ -30,6 +30,20 @@ on:
         type: string
         default: ''
         required: false
+      ci_run_id:
+        description: >-
+          Immutable CI workflow run id verified on the exact HEAD at admission.
+          Empty falls back to a bounded exact-SHA listing.
+        type: string
+        default: ''
+        required: false
+      ci_workflow_name:
+        description: >-
+          Exact CI workflow name verified on the exact HEAD at admission. Empty
+          falls back to vars.CONTINUUM_CI_WORKFLOW_NAME, then to 'CI'.
+        type: string
+        default: ''
+        required: false
       gate_verified:
         description: >-
           Safe scalar attestation produced after the full runner-local
@@ -647,6 +661,8 @@ jobs:
         env:
           PR_NUMBER: ${{ inputs.pr_number }}
           REVIEWED_HEAD: ${{ inputs.head_sha }}
+          CI_RUN_ID: ${{ inputs.ci_run_id }}
+          CI_WORKFLOW_NAME: ${{ inputs.ci_workflow_name || vars.CONTINUUM_CI_WORKFLOW_NAME || 'CI' }}
           POST_MERGE_WAKEUPS: ${{ inputs.post_merge_wakeups || vars.CONTINUUM_POST_MERGE_WAKEUPS }}
           POST_MERGE_WAKEUP_REF: ${{ inputs.post_merge_wakeup_ref || vars.CONTINUUM_POST_MERGE_WAKEUP_REF || github.event.repository.default_branch || 'main' }}
           REQUIRED_WORKFLOW_GATE_LABEL: ${{ inputs.required_workflow_gate_label || vars.CONTINUUM_REQUIRED_WORKFLOW_GATE_LABEL || '' }}
@@ -691,6 +707,8 @@ jobs:
             const targetChildId = String(process.env.TARGET_CHILD_ID || '').trim();
             const prNumber = Number(process.env.PR_NUMBER);
             const reviewedHead = String(process.env.REVIEWED_HEAD || '').trim().toLowerCase();
+            const ciRunId = String(process.env.CI_RUN_ID || '').trim();
+            const ciWorkflowName = String(process.env.CI_WORKFLOW_NAME || 'CI').trim();
             const AUTO_MERGE_BLOCK_LABEL = 'no-auto-merge';
             const CONFLICT_LOCK_LABEL = 'opencode-conflict-repair';
             const requiredWorkflowGateLabel =
@@ -734,6 +752,182 @@ jobs:
               } catch (err) {
                 if (err.status !== 422) throw err;
               }
+            }
+
+            // Canonical exact-HEAD CI proof shared with admission and
+            // pre-review revalidation (issue #368). The run id verified at
+            // admission is re-fetched as immutable evidence; the filtered
+            // listing is a cross-check. An empty/stale listing can never
+            // erase a verified green run, while a newer red or pending run
+            // still blocks the merge. An unreadable listing fails closed
+            // because it cannot prove the verified run is still the newest.
+            function ciRunCreatedAt(run) {
+              const parsed = Date.parse(String((run && run.created_at) || ''));
+              return Number.isFinite(parsed) ? parsed : 0;
+            }
+            function ciRunUpdatedAt(run) {
+              const parsed = Date.parse(String((run && run.updated_at) || ''));
+              return Number.isFinite(parsed) ? parsed : 0;
+            }
+            function ciRunMatchesExactHead(run, workflowName, head) {
+              return Boolean(
+                run &&
+                String(run.name || '') === String(workflowName || '') &&
+                String(run.head_sha || '').trim().toLowerCase() ===
+                  String(head || '').trim().toLowerCase() &&
+                String(run.event || '') === 'pull_request'
+              );
+            }
+            function ciRunProofState(run, delegatedTarget) {
+              if (!run) return 'unavailable';
+              if (String(run.status || '') !== 'completed') return 'pending';
+              const conclusion = String(run.conclusion || '');
+              if (conclusion === 'success') return 'green';
+              if (delegatedTarget && conclusion === 'skipped') return 'green';
+              return 'red';
+            }
+            function decideExactHeadCi({ proofRun = null, runs = [], workflowName, headSha: head, delegated: delegatedTarget = false }) {
+              // Deduplicate by immutable run id while keeping the freshest
+              // observed state of that run: the proof run fetched by id and
+              // the filtered listing may describe the same run at different
+              // moments (pending -> completed), so the newer snapshot wins.
+              const byKey = new Map();
+              for (const run of [proofRun, ...(runs || [])]) {
+                if (!ciRunMatchesExactHead(run, workflowName, head)) continue;
+                const key = run.id !== undefined && run.id !== null
+                  ? 'id:' + String(run.id)
+                  : [
+                      String(run.name || ''),
+                      String(run.head_sha || '').toLowerCase(),
+                      String(run.created_at || ''),
+                      String(run.status || ''),
+                      String(run.conclusion || ''),
+                    ].join('|');
+                const previous = byKey.get(key);
+                if (!previous) {
+                  byKey.set(key, run);
+                  continue;
+                }
+                const previousUpdated = ciRunUpdatedAt(previous);
+                const currentUpdated = ciRunUpdatedAt(run);
+                if (
+                  currentUpdated > previousUpdated ||
+                  (
+                    currentUpdated === previousUpdated &&
+                    previous.status !== 'completed' &&
+                    run.status === 'completed'
+                  )
+                ) {
+                  byKey.set(key, run);
+                }
+              }
+              const candidates = [...byKey.values()];
+              const newest = candidates.sort((a, b) => {
+                const at = ciRunCreatedAt(a);
+                const bt = ciRunCreatedAt(b);
+                if (bt !== at) return bt - at;
+                return Number(b.id || 0) - Number(a.id || 0);
+              })[0] || null;
+              if (!newest) {
+                return {
+                  state: 'unavailable',
+                  run: null,
+                  runId: null,
+                  reason: 'no exact-HEAD pull_request CI run is visible',
+                };
+              }
+              return {
+                state: ciRunProofState(newest, delegatedTarget),
+                run: newest,
+                runId: Number(newest.id) || null,
+                reason: 'newest exact-HEAD pull_request CI run decides',
+              };
+            }
+            async function readCiProofRun() {
+              if (!/^[0-9]+$/.test(ciRunId)) return null;
+              try {
+                const { data } = await github.rest.actions.getWorkflowRun({
+                  owner,
+                  repo,
+                  run_id: Number(ciRunId),
+                });
+                return data;
+              } catch (err) {
+                core.info(
+                  `Could not re-read admitted CI run ${ciRunId}; falling back to the exact-HEAD listing: ${err.message}`
+                );
+                return null;
+              }
+            }
+            async function listCiRunsForHead(pr, headSha) {
+              try {
+                const runs = [];
+                for (let page = 1; page <= 2; page += 1) {
+                  const { data } = await github.rest.actions.listWorkflowRunsForRepo(
+                    {
+                      owner,
+                      repo,
+                      event: 'pull_request',
+                      head_sha: headSha,
+                      per_page: 100,
+                      page,
+                    }
+                  );
+                  const batch = data.workflow_runs || [];
+                  if (batch.length === 0) break;
+                  runs.push(...batch);
+                  if (batch.length < 100) break;
+                }
+                return runs;
+              } catch (err) {
+                core.info(
+                  `Could not read the exact-HEAD CI listing; refusing to treat verified run evidence as newest: ${err.message}`
+                );
+                return null;
+              }
+            }
+            function decideWithCiListing({ proofRun, runs, workflowName, headSha }) {
+              // A failed listing read is not evidence that the verified run
+              // is the newest exact-HEAD run: fail closed instead of letting
+              // a transient API failure hide a superseding red/pending run.
+              if (runs === null) {
+                return {
+                  state: 'unavailable',
+                  run: null,
+                  runId: null,
+                  reason: 'exact-HEAD CI listing could not be read',
+                };
+              }
+              return decideExactHeadCi({
+                proofRun,
+                runs,
+                workflowName,
+                headSha,
+                delegated,
+              });
+            }
+            async function resolveExactHeadCi(pr, headSha, workflowName) {
+              let proofRun = await readCiProofRun();
+              let decision = decideWithCiListing({
+                proofRun,
+                runs: await listCiRunsForHead(pr, headSha),
+                workflowName,
+                headSha,
+              });
+              // Pending or unreadable evidence is not a deterministic red
+              // verdict: re-evaluate from latest state with short bounded
+              // backoff before any merge decision.
+              for (let attempt = 1; attempt <= 2 && ['pending', 'unavailable'].includes(decision.state); attempt += 1) {
+                await new Promise(resolve => setTimeout(resolve, attempt * 5000));
+                proofRun = await readCiProofRun();
+                decision = decideWithCiListing({
+                  proofRun,
+                  runs: await listCiRunsForHead(pr, headSha),
+                  workflowName,
+                  headSha,
+                });
+              }
+              return decision;
             }
 
             // Single-pass gate memo (#254): CI/packaging/required checks
@@ -786,18 +980,15 @@ jobs:
               // Per-evaluation memo only: each gate check starts fresh so
               // initial/final/pre-merge evaluations never reuse a stale entry.
               gateCache.clear();
-              const ci = await latestWorkflowForHead(pr, pr.head.sha, 'CI');
-              const delegatedSkippedCi =
-                delegated &&
-                ci &&
-                ci.status === 'completed' &&
-                ci.conclusion === 'skipped';
-              if (
-                !ci ||
-                ci.status !== 'completed' ||
-                (ci.conclusion !== 'success' && !delegatedSkippedCi)
-              ) {
-                return { ok: false, reason: 'Current-head CI is not acceptable' };
+              const ciDecision = await resolveExactHeadCi(pr, pr.head.sha, ciWorkflowName);
+              if (ciDecision.state !== 'green') {
+                return {
+                  ok: false,
+                  reason:
+                    'Current-head CI is not acceptable (' +
+                    ciDecision.state +
+                    ': ' + ciDecision.reason + ')',
+                };
               }
 
               if (repoFullName === 'kodmial/continuum') {

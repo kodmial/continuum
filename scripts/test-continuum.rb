@@ -2003,8 +2003,11 @@ class ContinuumTest < Minitest::Test
     assert_includes admit, 'CONTINUUM_PR_AGENT_TARGET_OWNER'
     refute_includes admit, 'owner: context.repo.owner'
 
-    # 2. Immediately-before-review revalidation: gh pr view plus exact-HEAD
-    # CI evidence against the resolved target (conditional token as above).
+    # 2. Immediately-before-review revalidation: pulls.get plus the exact-HEAD
+    # CI proof against the resolved target (conditional token as above). The
+    # immutable run id from admission is re-fetched and the filtered listing
+    # is only a cross-check, so a transient empty listing cannot erase green
+    # CI for an unchanged HEAD.
     assert_includes before, 'github.token'
     assert_includes before, 'secrets.TAP_PAT'
     assert_includes before, 'CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED'
@@ -2018,9 +2021,11 @@ class ContinuumTest < Minitest::Test
                     'pre-review revalidation must fail closed for delegated reads without TAP_PAT'
     refute_includes before, 'GH_TOKEN: ${{ github.token }}',
                     'pre-review revalidation must not set an unconditional github.token credential'
-    assert_includes before, 'gh pr view'
-    assert_includes before, 'actions/runs?event=pull_request&head_sha='
-    assert_includes before, 'CONTINUUM_PR_AGENT_TARGET_REPOSITORY'
+    assert_includes before, 'github.rest.pulls.get'
+    assert_includes before, 'CI_RUN_ID'
+    assert_includes before, 'github.rest.actions.getWorkflowRun'
+    assert_includes before, 'github.rest.actions.listWorkflowRunsForRepo'
+    assert_includes before, 'CONTINUUM_PR_AGENT_TARGET_OWNER'
 
     # 3. Immediately-after-review revalidation: pulls.get for current PR/head
     # only against the resolved target.
@@ -2065,7 +2070,8 @@ class ContinuumTest < Minitest::Test
 
     # Exact-HEAD admission, CI name matching, stale-HEAD rejection and
     # fail-closed behavior are unchanged.
-    assert_includes admit, 'run.head_sha === headSha'
+    assert_includes admit, 'const ciDecision = decideExactHeadCi({'
+    assert_includes admit, 'headSha,'
     assert_includes admit, 'Stale admission ignored:'
     assert_includes before, 'refusing to review an unqualified HEAD'
     assert_includes after, 'PR head moved during review'
@@ -4747,7 +4753,7 @@ class ContinuumTest < Minitest::Test
       retry_attempt retry_workflow
     ],
     'continuum-pr-agent-auto-merge.yml' => %w[
-      continuum_ref pr_number target_child_id head_sha gate_verified review_json improve_jsonl persistent_state_json
+      continuum_ref pr_number target_child_id head_sha ci_run_id ci_workflow_name gate_verified review_json improve_jsonl persistent_state_json
       post_merge_wakeups post_merge_wakeup_ref
       required_workflow_gate_label required_workflow_gate_name
     ],
@@ -8502,7 +8508,9 @@ class ContinuumTest < Minitest::Test
                       "#{base}: exact-HEAD CI evidence must go through the guarded read client"
     assert_includes reconcile, 'head_sha: head',
                       "#{base}: CI evidence must be for the exact HEAD only"
-    assert_includes reconcile, 'run.head_sha === head',
+    assert_includes reconcile, 'const decision = decideExactHeadCi({',
+                      "#{base}: CI match must use the canonical exact-HEAD decision"
+    assert_includes reconcile, 'headSha: head',
                       "#{base}: CI match must be for the exact HEAD only"
     assert_includes reconcile, 'pr.head.repo.full_name !== repoFullName',
                       "#{base}: fork/same-repo filter must compare against the resolved target"
