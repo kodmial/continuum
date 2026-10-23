@@ -138,6 +138,44 @@ class CheckpointIntegrationTest(unittest.TestCase):
             "continuum-child/task-42-run3", self.run_cmd(work, "git", "branch").stdout
         )
 
+    def test_moved_default_branch_rejects_a_stale_checkpoint(self):
+        first = self.clone("stale-first")
+        self.shell(first, """
+            ref="$(continuum_checkpoint_ref 42 1 "$SPEC")"
+            continuum_checkpoint_restore "$ref" continuum-child/task-42-run5 "$SPEC"
+            printf 'stale work\n' > stale.txt
+            continuum_checkpoint_save "$ref" "$SPEC" child/example 42
+        """)
+        advance = self.clone("advance-main")
+        (advance / "later.txt").write_text("new main\n", encoding="utf-8")
+        self.run_cmd(advance, "git", "add", "later.txt")
+        self.run_cmd(advance, "git", "commit", "-m", "advance main")
+        self.run_cmd(advance, "git", "push", "origin", "main")
+        second = self.clone("stale-restore")
+        result = self.shell(second, """
+            ref="$(continuum_checkpoint_ref 42 1 "$SPEC")"
+            continuum_checkpoint_restore "$ref" continuum-child/task-42-run6 "$SPEC"
+        """, check=False)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertNotIn(
+            "continuum-child/task-42-run6", self.run_cmd(second, "git", "branch").stdout
+        )
+        self.assertFalse((second / "stale.txt").exists())
+
+    def test_failed_checkpoint_push_fails_closed(self):
+        work = self.clone("reject-push")
+        hook = self.origin / "hooks" / "pre-receive"
+        hook.write_text("#!/usr/bin/env bash\necho rejected >&2\nexit 1\n", encoding="utf-8")
+        hook.chmod(0o755)
+        result = self.shell(work, """
+            ref="$(continuum_checkpoint_ref 42 1 "$SPEC")"
+            continuum_checkpoint_restore "$ref" continuum-child/task-42-run7 "$SPEC"
+            printf 'unpublishable work\n' > local.txt
+            continuum_checkpoint_save "$ref" "$SPEC" child/example 42
+        """, check=False)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertNotIn(self.ref(), self.run_cmd(work, "git", "ls-remote", "--heads", "origin").stdout)
+
     def test_untrusted_checkpoint_without_matching_spec_rejected(self):
         work = self.clone("wrong")
         self.shell(work, """

@@ -1,4 +1,5 @@
 .opencode-tmp/
+.continuum-cancel-engine/
 __pycache__/
 *.pyc
 
