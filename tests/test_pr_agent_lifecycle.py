@@ -81,12 +81,13 @@ APPROVED_350_OPENCODE_SHA256 = (
 APPROVED_374_OPENCODE_SHA256 = (
     "6a17495b366e55b6dcbf034bfddf2e03957bfe89b7ad3524302ae2a793952b36"
 )
-# kodmial/continuum#400: exact owner /oc-cancel now persists an independent
-# operator stop and physically cancels only provenance-verified active runs.
-# This deliberate change extends the reviewed #374 artifact; the historical
-# #347/#350/#374 digests above remain for audit.
-APPROVED_400_OPENCODE_SHA256 = (
-    "de8e6631c23910d536697c4480f5c60272e413128eaeda77d27c81646bc7ae67"
+# kodmial/continuum#411: provider failures are classified only from
+# structured `run --format json` type=error events, so agent prose and tool
+# output can never fabricate a 429. This deliberate change extends the
+# reviewed #400 artifact; the historical #347/#350/#374/#400 digests above
+# remain for audit.
+APPROVED_411_OPENCODE_SHA256 = (
+    "b346cb4107620c82264beb2940bfb1c61e27f7479d646d26f8fcd4f191071db9"
 )
 
 APPROVED_350_SELF_CALLER_SHA256 = (
@@ -2503,12 +2504,13 @@ class ProtectedBaselineTests(unittest.TestCase):
                     self.assertIn("CONTINUUM_OPENCODE_PUBLISH_RACE_RETRY_REQUIRED", original)
                     self.assertIn("steps.model_route.outputs.model", original)
                 if path == ".github/workflows/continuum-opencode.yml":
-                    # #400 adds owner cancellation control atop the exact
-                    # #350/#374 metadata, routing, and checkout artifacts.
+                    # #411 adds structured provider-error classification atop
+                    # the exact #400/#374 metadata, routing, and checkout
+                    # artifacts.
                     self.assertEqual(
                         protected_file_digest(path),
-                        APPROVED_400_OPENCODE_SHA256,
-                        f"{path}: unexpected drift outside reviewed #400 operator-cancel change",
+                        APPROVED_411_OPENCODE_SHA256,
+                        f"{path}: unexpected drift outside reviewed #411 structured-error change",
                     )
                 else:
                     # The self-dogfood caller is the dispatchable surface

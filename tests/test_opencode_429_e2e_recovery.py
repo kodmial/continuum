@@ -82,8 +82,28 @@ class FakeModel:
             return 75, "CONTINUUM_OPENCODE_429_RESTART_REQUIRED (burned)"
         self.invocations += 1
         if self.fail_with_429:
-            return 1, "ERROR FreeUsageLimitError: free usage limit reached"
-        return 0, "done"
+            return 1, json.dumps(
+                {
+                    "type": "error",
+                    "timestamp": 1,
+                    "sessionID": "ses_e2e",
+                    "error": {
+                        "name": "FreeUsageLimitError",
+                        "data": {
+                            "message": "free usage limit reached",
+                            "statusCode": 429,
+                        },
+                    },
+                }
+            )
+        return 0, json.dumps(
+            {
+                "type": "text",
+                "timestamp": 1,
+                "sessionID": "ses_e2e",
+                "part": {"type": "text", "text": "done"},
+            }
+        )
 
 
 def evacuate(repo, operation, generation, stage, mode, issue, pr, base_sha):

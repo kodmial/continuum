@@ -173,57 +173,207 @@ _REQUIRED_METADATA_FIELDS = (
 #: repair stage.
 MODES_HONORING_STAGE_FILE = frozenset({"issue", "qualification"})
 
-_FREE_USAGE_RE = re.compile(r"FreeUsageLimitError", re.IGNORECASE)
-_429_SIGNAL_RE = re.compile(
-    r"APIError.*429"
-    r"|HTTP[^0-9]*429([^0-9]|$)"
-    r"|429[ \t]+Too[ \t]+Many[ \t]+Requests"
-    r"|statusCode[^0-9]*429([^0-9]|$)",
+#: Errors are only trusted from OpenCode's structured ``type=error`` events.
+#: The prose, tool output, test fixtures, and source text an agent prints are
+#: never provider evidence, even when they contain a quota token verbatim.
+_QUOTA_RE = re.compile(
+    r"freeusagelimiterror"
+    r"|ratelimiterror"
+    r"|quotaexceeded"
+    r"|quota exceeded"
+    r"|free usage limit"
+    r"|usage limit"
+    r"|too many requests"
+    r"|\b429\b",
+    re.IGNORECASE,
+)
+_UNAVAILABLE_RE = re.compile(
+    r"endpoint is unavailable"
+    r"|upstream request failed"
+    r"|modelunavailableerror"
+    r"|model is unavailable"
+    r"|model unavailable"
+    r"|apiconnectionerror",
+    re.IGNORECASE,
+)
+_UPSTREAM_RE = re.compile(
+    r"\b50[0-9]\b"
+    r"|service unavailable"
+    r"|bad gateway"
+    r"|internal server error"
+    r"|internalservererror",
+    re.IGNORECASE,
+)
+_TIMEOUT_RE = re.compile(
+    r"apitimeouterror"
+    r"|timeouterror"
+    r"|timed out"
+    r"|request timed out"
+    r"|timeout value",
     re.IGNORECASE,
 )
 _FAIL_CLOSED_RE = re.compile(
-    r"\b(400|401|403|404|422)\b",
+    r"\b(400|401|403|404|422)\b"
+    r"|unauthorized"
+    r"|forbidden"
+    r"|bad credentials"
+    r"|missing scope",
     re.IGNORECASE,
 )
+_UPSTREAM_STATUSES = frozenset({500, 502, 503, 504})
+_QUOTA_STATUSES = frozenset({429})
 _CHILD_REPO_RE = re.compile(
     r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+",
 )
 _SHA_RE = re.compile(r"\b[0-9a-f]{40}\b", re.IGNORECASE)
 
 
-def is_opencode_429(log_text: Any, exit_code: Any = 1) -> bool:
-    """Whether an OpenCode invocation failed with model 429 runner death.
+def _as_int(value: Any) -> Optional[int]:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str) and value.strip().isdigit():
+        return int(value.strip())
+    return None
 
-    ``FreeUsageLimitError`` always classifies (even on exit 0, because the
-    provider refused usage). Any other 429 signal classifies only when the
-    invocation actually failed (non-zero exit), so a passing run whose log
-    merely mentions 429 in prose is never burned. Deterministic
-    ``400/401/403/404/422`` failures without a 429 signal never classify.
+
+def _event_status(error: Mapping[str, Any]) -> Optional[int]:
+    stack = [error]
+    while stack:
+        item = stack.pop()
+        if isinstance(item, Mapping):
+            for key in ("statusCode", "status", "code"):
+                status = _as_int(item.get(key))
+                if status is not None:
+                    return status
+            stack.extend(item.values())
+        elif isinstance(item, list):
+            stack.extend(item)
+    return None
+
+
+def parse_opencode_error_events(log_text: Any) -> list:
+    """Return authoritative ``type=error`` events from a JSON event stream.
+
+    OpenCode's ``run --format json`` emits one JSON object per line. Only
+    top-level terminal events are considered. Lines that are not valid JSON,
+    tool results, text parts, and prompts are ignored, so a test fixture or a
+    source file containing ``FreeUsageLimitError`` can never be mistaken for
+    provider evidence.
     """
 
-    text = log_text if isinstance(log_text, str) else ""
+    if not isinstance(log_text, str):
+        return []
+    events = []
+    for raw_line in log_text.splitlines():
+        line = raw_line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            event = json.loads(line)
+        except (TypeError, ValueError):
+            continue
+        if not isinstance(event, dict) or event.get("type") != "error":
+            continue
+        error = event.get("error")
+        if not isinstance(error, dict):
+            continue
+        events.append(event)
+    return events
+
+
+def _classify_error_event(event: Mapping[str, Any]) -> str:
+    error = event.get("error")
+    if not isinstance(error, Mapping):
+        return ""
+    name = str(error.get("name") or "").strip().lower()
+    status = _event_status(error)
+    blob = json.dumps(error, sort_keys=True, default=str)
+
+    if status in _QUOTA_STATUSES or _QUOTA_RE.search(name):
+        return "quota_429"
+    if status in FAIL_CLOSED_STATUSES:
+        return "fail_closed"
+    if status in _UPSTREAM_STATUSES:
+        return "upstream"
+    if _QUOTA_RE.search(blob):
+        return "quota_429"
+    if _UNAVAILABLE_RE.search(blob):
+        return "unavailable"
+    if _TIMEOUT_RE.search(blob):
+        return "timeout"
+    if _UPSTREAM_RE.search(blob):
+        return "upstream"
+    if _FAIL_CLOSED_RE.search(blob):
+        return "fail_closed"
+    return "provider_error"
+
+
+def classify_opencode_events(log_text: Any, exit_code: Any = 1) -> str:
+    """Classify one finished OpenCode invocation from structured events only.
+
+    Returns ``quota_429``, ``unavailable``, ``upstream``, ``timeout``,
+    ``fail_closed``, ``provider_error``, ``ok``, or ``inconclusive``.
+
+    An authoritative error event wins even when the CLI exited 0 (the known
+    legitimate case where the provider refused usage but the process still
+    reported success). A non-zero exit without a structured provider event is
+    ``inconclusive`` and must never burn a healthy runner.
+    """
+
     try:
         code = int(exit_code)
     except (TypeError, ValueError):
         code = 1
-    if _FREE_USAGE_RE.search(text):
-        return True
-    if code == 0:
-        return False
-    return bool(_429_SIGNAL_RE.search(text))
+    events = parse_opencode_error_events(log_text)
+    for event in events:
+        classification = _classify_error_event(event)
+        if classification == "quota_429":
+            return "quota_429"
+    for event in events:
+        classification = _classify_error_event(event)
+        if classification in ("unavailable", "upstream"):
+            return classification
+    for event in events:
+        classification = _classify_error_event(event)
+        if classification in ("timeout", "fail_closed"):
+            return classification
+    if events:
+        return "provider_error"
+    return "ok" if code == 0 else "inconclusive"
+
+
+def is_opencode_429(log_text: Any, exit_code: Any = 1) -> bool:
+    """Whether an OpenCode invocation produced provider quota runner death.
+
+    Only an authoritative structured ``type=error`` event with a 429/quota
+    signature classifies. Arbitrary transcript text, source/test literals,
+    tool output, and prose are never evidence. Deterministic
+    ``400/401/403/404/422`` failures never classify, and a non-zero exit with
+    no structured event is inconclusive rather than quota.
+    """
+
+    return classify_opencode_events(log_text, exit_code) == "quota_429"
 
 
 def classify_agent_error(log_text: Any, exit_code: Any = 1) -> str:
     """Classify a finished agent invocation.
 
-    Returns ``"runner-death-429"`` for model 429, ``"fail-closed"`` for
-    deterministic configuration/auth errors, and ``"task-failure"`` for
-    every normal non-429 agent failure (which must never be misclassified
-    as runner replacement).
+    Returns ``"runner-death-429"`` for a structured model 429,
+    ``"infrastructure-unavailable"`` for a structured upstream/transport
+    event, ``"fail-closed"`` for deterministic configuration/auth errors, and
+    ``"task-failure"`` for every normal non-429 agent failure (which must
+    never be misclassified as runner replacement).
     """
 
-    if is_opencode_429(log_text, exit_code):
+    classification = classify_opencode_events(log_text, exit_code)
+    if classification == "quota_429":
         return "runner-death-429"
+    if classification in ("unavailable", "upstream"):
+        return "infrastructure-unavailable"
+    if classification == "fail_closed":
+        return "fail-closed"
     text = log_text if isinstance(log_text, str) else ""
     if _FAIL_CLOSED_RE.search(text):
         return "fail-closed"
@@ -943,6 +1093,7 @@ __all__ = [
     "already_resumed",
     "checkpoint_ref",
     "classify_agent_error",
+    "classify_opencode_events",
     "consumes_task_budget",
     "cooldown_comment",
     "infra_backoff_seconds",
@@ -951,6 +1102,7 @@ __all__ = [
     "next_generation",
     "operation_id",
     "parse_checkpoint_ref",
+    "parse_opencode_error_events",
     "parse_stage_file",
     "parse_metadata_failure_line",
     "parse_recovery_state_markers",

@@ -2289,42 +2289,224 @@ jobs:
             exit 75
           fi
           log="$(mktemp)"
+          args=("$@")
+          structured=false
+          # kodmial/continuum#411: provider failures are only trusted from
+          # OpenCode's structured `run --format json` type=error events.
+          # Agent prose, tool output, source files, and test fixtures can all
+          # contain the literal quota token, so the transcript is never
+          # scanned for it. `github run` has no structured event mode and is
+          # therefore never classified as quota from text.
+          if [[ "${1:-}" == "run" ]]; then
+            explicit_format=""
+            for ((i=1; i<=$#; i++)); do
+              if [[ "${!i}" == "--format" ]]; then
+                next=$((i+1))
+                explicit_format="${!next:-}"
+              elif [[ "${!i}" == --format=* ]]; then
+                explicit_format="${!i#--format=}"
+              fi
+            done
+            if [[ -n "$explicit_format" && "$explicit_format" != "json" ]]; then
+              echo "::error::OpenCode was invoked without structured JSON events; refusing unstructured provider-error classification." >&2
+              rm -f "$log"
+              exit 2
+            fi
+            if [[ -z "$explicit_format" ]]; then
+              args=(run --format json "${@:2}")
+            fi
+            structured=true
+          fi
+          renderer=""
           set +e
-          opencode "$@" 2>&1 | tee "$log"
-          status=${PIPESTATUS[0]}
+          if [[ "$structured" == "true" ]]; then
+            renderer="$(mktemp)"
+            # The renderer is a separate file, not a stdin heredoc: its stdin
+            # must remain the live OpenCode event stream. Consuming that stream
+            # as the Python program would leave the producer with no reader
+            # (SIGPIPE/141) and silently discard every event.
+            cat > "$renderer" <<'PY'
+          import json
+          import sys
+
+          log_path = sys.argv[1]
+          with open(log_path, "w", encoding="utf-8") as raw_log:
+              for raw in sys.stdin:
+                  raw_log.write(raw)
+                  raw_log.flush()
+                  stripped = raw.strip()
+                  try:
+                      event = json.loads(stripped)
+                  except (TypeError, ValueError):
+                      if not stripped.startswith("{"):
+                          sys.stdout.write(raw)
+                          sys.stdout.flush()
+                      continue
+                  if not isinstance(event, dict):
+                      sys.stdout.write(raw)
+                      sys.stdout.flush()
+                      continue
+                  part = event.get("part") if isinstance(event.get("part"), dict) else {}
+                  kind = event.get("type")
+                  if kind == "text" and isinstance(part.get("text"), str):
+                      text = part["text"]
+                      sys.stdout.write(text + ("" if text.endswith("\n") else "\n"))
+                      sys.stdout.flush()
+                  elif kind == "tool_use":
+                      state = part.get("state") if isinstance(part.get("state"), dict) else {}
+                      title = state.get("title")
+                      if isinstance(title, str) and title:
+                          sys.stderr.write("[tool] " + title + "\n")
+                          sys.stderr.flush()
+                  elif kind == "error":
+                      error = event.get("error") if isinstance(event.get("error"), dict) else {}
+                      data = error.get("data") if isinstance(error.get("data"), dict) else {}
+                      name = error.get("name") or "Error"
+                      message = data.get("message") or ""
+                      sys.stderr.write("OpenCode error: {} {}\n".format(name, message).rstrip() + "\n")
+                      sys.stderr.flush()
+          PY
+            opencode "${args[@]}" 2>&1 | python3 "$renderer" "$log"
+            status=${PIPESTATUS[0]}
+            rm -f "$renderer"
+          else
+            opencode "${args[@]}" 2>&1 | tee "$log"
+            status=${PIPESTATUS[0]}
+          fi
           set -e
-          # kodmial/continuum#290: classification mirrors the
-          # is_opencode_429 engine contract exactly. FreeUsageLimitError
-          # always burns the runner (the provider refused usage even when
-          # the CLI exits 0); any other 429 signal burns only when the
-          # invocation actually failed, so a passing run whose log merely
-          # mentions 429 in prose (prompts and agent output routinely do)
-          # never retires a healthy runner.
-          burned=false
-          if grep -Eiq 'FreeUsageLimitError' "$log"; then
-            burned=true
-          elif [[ "$status" -ne 0 ]] && grep -Eiq 'APIError.*429|HTTP[^0-9]*429([^0-9]|$)|429[[:space:]]+Too[[:space:]]+Many[[:space:]]+Requests|statusCode[^0-9]*429([^0-9]|$)' "$log"; then
-            burned=true
+          classification=inconclusive
+          if [[ "$structured" == "true" ]]; then
+            classification="$(python3 - "$log" "$status" <<'PY_CLASSIFY'
+          import json
+          import re
+          import sys
+
+          def _int(value):
+              if isinstance(value, bool):
+                  return None
+              if isinstance(value, int):
+                  return value
+              if isinstance(value, str) and value.strip().isdigit():
+                  return int(value.strip())
+              return None
+
+          def _status(error):
+              stack = [error]
+              while stack:
+                  item = stack.pop()
+                  if isinstance(item, dict):
+                      for key in ("statusCode", "status", "code"):
+                          found = _int(item.get(key))
+                          if found is not None:
+                              return found
+                      stack.extend(item.values())
+                  elif isinstance(item, list):
+                      stack.extend(item)
+              return None
+
+          QUOTA = re.compile(
+              r"freeusagelimiterror|ratelimiterror|quotaexceeded|quota exceeded|"
+              r"free usage limit|usage limit|too many requests|\b429\b",
+              re.IGNORECASE,
+          )
+          UNAVAILABLE = re.compile(
+              r"endpoint is unavailable|upstream request failed|modelunavailableerror|"
+              r"model is unavailable|model unavailable|apiconnectionerror",
+              re.IGNORECASE,
+          )
+          UPSTREAM = re.compile(
+              r"\b50[0-9]\b|service unavailable|bad gateway|internal server error|"
+              r"internalservererror",
+              re.IGNORECASE,
+          )
+          TIMEOUT = re.compile(
+              r"apitimeouterror|timeouterror|timed out|request timed out|timeout value",
+              re.IGNORECASE,
+          )
+          FAIL_CLOSED = re.compile(
+              r"\b(400|401|403|404|422)\b|unauthorized|forbidden|bad credentials|"
+              r"missing scope",
+              re.IGNORECASE,
+          )
+
+          def classify(error):
+              name = str(error.get("name") or "").lower()
+              status = _status(error)
+              blob = json.dumps(error, sort_keys=True, default=str)
+              if status == 429 or QUOTA.search(name):
+                  return "quota_429"
+              if status in (400, 401, 403, 404, 422):
+                  return "fail_closed"
+              if status in (500, 502, 503, 504):
+                  return "upstream"
+              if QUOTA.search(blob):
+                  return "quota_429"
+              if UNAVAILABLE.search(blob):
+                  return "unavailable"
+              if TIMEOUT.search(blob):
+                  return "timeout"
+              if UPSTREAM.search(blob):
+                  return "upstream"
+              if FAIL_CLOSED.search(blob):
+                  return "fail_closed"
+              return "provider_error"
+
+          events = []
+          for line in open(sys.argv[1], encoding="utf-8", errors="replace"):
+              line = line.strip()
+              if not line.startswith("{"):
+                  continue
+              try:
+                  event = json.loads(line)
+              except (TypeError, ValueError):
+                  continue
+              if isinstance(event, dict) and event.get("type") == "error" and isinstance(event.get("error"), dict):
+                  events.append(event)
+
+          classes = [classify(event["error"]) for event in events]
+          if "quota_429" in classes:
+              print("quota_429")
+          elif "unavailable" in classes or "upstream" in classes:
+              print("unavailable" if "unavailable" in classes else "upstream")
+          elif "timeout" in classes or "fail_closed" in classes:
+              print("timeout" if "timeout" in classes else "fail_closed")
+          elif classes:
+              print("provider_error")
+          else:
+              print("ok" if _int(sys.argv[2]) == 0 else "inconclusive")
+          PY_CLASSIFY
+          )"
           fi
-          if [[ "$burned" == "true" ]]; then
-            : > "${RUNNER_TEMP:-/tmp}/continuum-opencode-429"
-            rm -f "$log"
-            echo "::error::OpenCode 429: retire this runner and recover on a fresh runner."
-            exit 75
-          fi
-          # An unavailable upstream is a provider/transport failure, not a
-          # code defect and not a quota-429. Preserve this distinction for
-          # routing feedback and durable fresh-runner recovery.
-          if [[ "$status" -ne 0 ]] && grep -Eiq 'Upstream request failed:[[:space:]]*Endpoint is unavailable\.?|\bEndpoint is unavailable\.' "$log"; then
-            : > "${RUNNER_TEMP:-/tmp}/continuum-opencode-upstream-unavailable"
-            rm -f "$log"
-            echo "::error::CONTINUUM_OPENCODE_UPSTREAM_UNAVAILABLE_RESTART_REQUIRED"
-            exit 76
-          fi
+          case "$classification" in
+            quota_429)
+              : > "${RUNNER_TEMP:-/tmp}/continuum-opencode-429"
+              rm -f "$log"
+              echo "::error::OpenCode 429: retire this runner and recover on a fresh runner."
+              exit 75
+              ;;
+            unavailable|upstream)
+              : > "${RUNNER_TEMP:-/tmp}/continuum-opencode-upstream-unavailable"
+              rm -f "$log"
+              echo "::error::CONTINUUM_OPENCODE_UPSTREAM_UNAVAILABLE_RESTART_REQUIRED"
+              exit 76
+              ;;
+            inconclusive|provider_error)
+              if [[ "$status" -ne 0 ]]; then
+                : > "${RUNNER_TEMP:-/tmp}/continuum-opencode-inconclusive"
+                echo "::warning::OpenCode failed without an authoritative provider error event; leaving the failure classified as a task failure."
+              fi
+              ;;
+          esac
           rm -f "$log"
           exit "$status"
           SH
           chmod +x "$wrapper"
+          # kodmial/continuum#411: validate the pinned CLI supports the
+          # authoritative structured event channel before any agent runs.
+          if ! opencode run --help 2>/dev/null | grep -q -- '--format'; then
+            echo "::error::Installed OpenCode CLI does not support 'run --format json'; refusing unstructured provider-error classification. Pin a supported version."
+            exit 2
+          fi
           echo "${RUNNER_TEMP:-/tmp}" >> "$GITHUB_PATH"
 
       # kodmial/continuum#290: workflow-owned 429 evacuation. Shell/workflow
@@ -3055,8 +3237,7 @@ jobs:
             checkpoint_issue_progress "$OPENCODE_RUN_RC"
           fi
           trap - TERM INT HUP
-          if [[ "$OPENCODE_RUN_RC" -eq 76 ]] || grep -Eiq 'FreeUsageLimitError' "$OPENCODE_RUN_LOG" || \
-             { [[ "$OPENCODE_RUN_RC" -ne 0 ]] && grep -Eiq 'APIError.*429|HTTP[^0-9]*429([^0-9]|$)|429[[:space:]]+Too[[:space:]]+Many[[:space:]]+Requests|statusCode[^0-9]*429([^0-9]|$)' "$OPENCODE_RUN_LOG"; }; then
+          if [[ "$OPENCODE_RUN_RC" -eq 75 || "$OPENCODE_RUN_RC" -eq 76 ]]; then
             # kodmial/continuum#290: 429 burns this VM. Workflow-owned
             # evacuation persists working-tree changes, commits, SHAs,
             # operation identity, stage, and evidence to the durable
@@ -3372,8 +3553,7 @@ jobs:
             OPENCODE_RUN_RC=${PIPESTATUS[0]}
             set -e
           fi
-          if [[ "$OPENCODE_RUN_RC" -eq 76 ]] || grep -Eiq 'FreeUsageLimitError' "$OPENCODE_RUN_LOG" || \
-             { [[ "$OPENCODE_RUN_RC" -ne 0 ]] && grep -Eiq 'APIError.*429|HTTP[^0-9]*429([^0-9]|$)|429[[:space:]]+Too[[:space:]]+Many[[:space:]]+Requests|statusCode[^0-9]*429([^0-9]|$)' "$OPENCODE_RUN_LOG"; }; then
+          if [[ "$OPENCODE_RUN_RC" -eq 75 || "$OPENCODE_RUN_RC" -eq 76 ]]; then
             # kodmial/continuum#290: 429 burns this VM. Workflow-owned
             # evacuation persists the exact required SHA, operation identity,
             # and qualification stage to the durable recovery ref, marks the
@@ -3788,8 +3968,7 @@ jobs:
           continuum-opencode run --auto --model "$OPENCODE_MODEL" "$PROMPT" 2>&1 | tee "$OPENCODE_RUN_LOG"
           OPENCODE_RUN_RC=${PIPESTATUS[0]}
           set -e
-          if [[ "$OPENCODE_RUN_RC" -eq 76 ]] || grep -Eiq 'FreeUsageLimitError' "$OPENCODE_RUN_LOG" || \
-             { [[ "$OPENCODE_RUN_RC" -ne 0 ]] && grep -Eiq 'APIError.*429|HTTP[^0-9]*429([^0-9]|$)|429[[:space:]]+Too[[:space:]]+Many[[:space:]]+Requests|statusCode[^0-9]*429([^0-9]|$)' "$OPENCODE_RUN_LOG"; }; then
+          if [[ "$OPENCODE_RUN_RC" -eq 75 || "$OPENCODE_RUN_RC" -eq 76 ]]; then
             # kodmial/continuum#290: 429 burns this VM. Workflow-owned
             # evacuation preserves the working tree, the exact PR HEAD
             # identity (REPAIR_BASE_SHA), and the review-repair stage to the
@@ -4270,8 +4449,7 @@ jobs:
           continuum-opencode run --auto --model "$OPENCODE_MODEL" "$PROMPT" 2>&1 | tee "$OPENCODE_RUN_LOG"
           OPENCODE_RUN_RC=${PIPESTATUS[0]}
           set -e
-          if [[ "$OPENCODE_RUN_RC" -eq 76 ]] || grep -Eiq 'FreeUsageLimitError' "$OPENCODE_RUN_LOG" || \
-             { [[ "$OPENCODE_RUN_RC" -ne 0 ]] && grep -Eiq 'APIError.*429|HTTP[^0-9]*429([^0-9]|$)|429[[:space:]]+Too[[:space:]]+Many[[:space:]]+Requests|statusCode[^0-9]*429([^0-9]|$)' "$OPENCODE_RUN_LOG"; }; then
+          if [[ "$OPENCODE_RUN_RC" -eq 75 || "$OPENCODE_RUN_RC" -eq 76 ]]; then
             # kodmial/continuum#290: 429 burns this VM. Workflow-owned
             # evacuation preserves the conflict-repair working tree, the exact
             # PR HEAD identity, and the review-repair stage to the durable
@@ -4477,8 +4655,7 @@ jobs:
           continuum-opencode run --auto --model "$OPENCODE_MODEL" "$PROMPT" 2>&1 | tee "$OPENCODE_RUN_LOG"
           OPENCODE_RUN_RC=${PIPESTATUS[0]}
           set -e
-          if [[ "$OPENCODE_RUN_RC" -eq 76 ]] || grep -Eiq 'FreeUsageLimitError' "$OPENCODE_RUN_LOG" || \
-             { [[ "$OPENCODE_RUN_RC" -ne 0 ]] && grep -Eiq 'APIError.*429|HTTP[^0-9]*429([^0-9]|$)|429[[:space:]]+Too[[:space:]]+Many[[:space:]]+Requests|statusCode[^0-9]*429([^0-9]|$)' "$OPENCODE_RUN_LOG"; }; then
+          if [[ "$OPENCODE_RUN_RC" -eq 75 || "$OPENCODE_RUN_RC" -eq 76 ]]; then
             # kodmial/continuum#290: 429 burns this VM. Workflow-owned
             # evacuation preserves the CI-repair working tree, the exact PR
             # HEAD identity, and the review-repair stage to the durable

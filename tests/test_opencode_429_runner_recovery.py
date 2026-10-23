@@ -43,7 +43,6 @@ class OpenCode429RunnerRecoveryContractTest(unittest.TestCase):
     def test_429_burns_current_vm_immediately(self):
         # The wrapper refuses any second model invocation on a burned runner.
         for marker in (
-            "FreeUsageLimitError",
             "continuum-opencode-429",
             "runner already burned",
             "refusing a second model invocation",
@@ -57,14 +56,16 @@ class OpenCode429RunnerRecoveryContractTest(unittest.TestCase):
         self.assertIn("CONTINUUM_OPENCODE_429_RESTART_REQUIRED", self.body)
 
     def test_wrapper_classification_mirrors_engine_contract(self):
-        # FreeUsageLimitError always burns; any other 429 signal burns only
-        # when the invocation actually failed, so a passing run whose log
-        # merely mentions 429 in prose never retires a healthy runner.
-        self.assertIn("is_opencode_429", self.body)
-        self.assertIn('grep -Eiq \'FreeUsageLimitError\' "$log"', self.body)
-        self.assertIn('[ "$status" -ne 0 ]', self.body)
-        self.assertIn("burned=true", self.body)
-        self.assertIn("burned=false", self.body)
+        # Only structured `run --format json` type=error events are provider
+        # evidence. The wrapper must never scan the transcript for a token,
+        # and a non-zero exit without an event is inconclusive, not quota.
+        self.assertIn("--format json", self.body)
+        self.assertIn("PY_CLASSIFY", self.body)
+        self.assertIn('event.get("type") == "error"', self.body)
+        self.assertNotIn("grep -Eiq 'FreeUsageLimitError'", self.body)
+        self.assertNotIn("APIError.*429|HTTP", self.body)
+        self.assertIn("inconclusive", self.body)
+        self.assertIn("run --format json", self.body)
 
     def test_agent_progress_file_drives_honest_checkpoint_stage(self):
         # The issue agent tracks lifecycle progress in .continuum-429-stage;

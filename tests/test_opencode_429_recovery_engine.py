@@ -41,22 +41,77 @@ from continuum.opencode_429_recovery import (
 )
 
 
-class Classify429Test(unittest.TestCase):
-    def test_free_usage_limit_always_classifies(self):
-        self.assertTrue(is_opencode_429("FreeUsageLimitError: quota exceeded", 0))
-        self.assertTrue(is_opencode_429("x FreeUsageLimitError y", 1))
+def error_event(name=None, message=None, status=None):
+    import json
 
-    def test_429_signals_classify_only_on_failure(self):
+    data = {}
+    if message is not None:
+        data["message"] = message
+    if status is not None:
+        data["statusCode"] = status
+    return json.dumps(
+        {
+            "type": "error",
+            "timestamp": 1,
+            "sessionID": "ses_test",
+            "error": {"name": name or "APIError", "data": data},
+        }
+    )
+
+
+def text_event(text):
+    import json
+
+    return json.dumps(
+        {
+            "type": "text",
+            "timestamp": 1,
+            "sessionID": "ses_test",
+            "part": {"type": "text", "text": text},
+        }
+    )
+
+
+class Classify429Test(unittest.TestCase):
+    def test_free_usage_limit_event_classifies_even_on_exit_zero(self):
+        log = error_event("FreeUsageLimitError", "quota exceeded", 429)
+        self.assertTrue(is_opencode_429(log, 0))
+        self.assertTrue(is_opencode_429(log, 1))
+
+    def test_structured_429_classifies_regardless_of_exit(self):
         for log in (
-            "APIError 429 too many requests",
-            "HTTP 429 Too Many Requests",
-            "statusCode: 429",
-            "429 Too Many Requests",
+            error_event("APIError", "too many requests", 429),
+            error_event("APIError", "429 Too Many Requests"),
+            error_event("RateLimitError", "rate limited"),
         ):
             self.assertTrue(is_opencode_429(log, 1), log)
-            self.assertFalse(is_opencode_429(log, 0), log)
+            self.assertTrue(is_opencode_429(log, 0), log)
 
-    def test_fail_closed_errors_never_classify(self):
+    def test_arbitrary_transcript_text_never_classifies(self):
+        for log in (
+            "FreeUsageLimitError: quota exceeded",
+            "self.assertTrue(is_opencode_429(\"FreeUsageLimitError: quota exceeded\", 0))",
+            "APIError 429 too many requests",
+            "HTTP 429 Too Many Requests",
+            "429 Too Many Requests",
+            text_event('return 1, "ERROR FreeUsageLimitError: free usage limit reached"'),
+        ):
+            self.assertFalse(is_opencode_429(log, 0), log)
+            self.assertFalse(is_opencode_429(log, 1), log)
+
+    def test_structured_fail_closed_errors_never_classify(self):
+        for status, name in (
+            (400, "BadRequestError"),
+            (401, "AuthenticationError"),
+            (403, "PermissionDeniedError"),
+            (404, "NotFoundError"),
+            (422, "UnprocessableEntityError"),
+        ):
+            log = error_event(name, "provider rejected the request", status)
+            self.assertFalse(is_opencode_429(log, 1), log)
+            self.assertEqual(classify_agent_error(log, 1), "fail-closed", log)
+
+    def test_plain_text_fail_closed_remains_fail_closed(self):
         for log in (
             "request failed with status 400",
             "401 unauthorized: bad credentials",
@@ -67,12 +122,37 @@ class Classify429Test(unittest.TestCase):
             self.assertFalse(is_opencode_429(log, 1), log)
             self.assertEqual(classify_agent_error(log, 1), "fail-closed", log)
 
+    def test_structured_upstream_503_is_infrastructure_not_quota(self):
+        log = error_event("APIError", "service unavailable", 503)
+        self.assertFalse(is_opencode_429(log, 1))
+        self.assertEqual(
+            classify_agent_error(log, 1), "infrastructure-unavailable"
+        )
+
     def test_normal_failure_is_not_runner_death(self):
         self.assertFalse(is_opencode_429("tests failed: 3 assertions", 1))
         self.assertEqual(
             classify_agent_error("tests failed: 3 assertions", 1), "task-failure"
         )
         self.assertEqual(classify_agent_error("", 0), "task-failure")
+
+    def test_malformed_json_and_multiline_tool_output_are_inconclusive(self):
+        multiline_tool = (
+            '{"type":"tool_use","sessionID":"ses_test","part":{"type":"tool",'
+            '"state":{"status":"completed","output":"FreeUsageLimitError\\n'
+            'quota exceeded\\n","title":"pytest"}}}'
+        )
+        for log in (
+            '{"type":"error", not-json',
+            "[1, 2, 3]",
+            multiline_tool,
+            '{"type":"tool_use","part":{"type":"tool","state":{"output":'
+            '"APIError 429 Too Many Requests"}}}',
+        ):
+            self.assertFalse(is_opencode_429(log, 1), log)
+            self.assertEqual(
+                classify_agent_error(log, 1), "task-failure", log
+            )
 
     def test_runner_death_exit_code_is_75(self):
         self.assertEqual(RUNNER_DEATH_EXIT_CODE, 75)

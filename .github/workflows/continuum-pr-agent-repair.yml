@@ -850,16 +850,167 @@ jobs:
           # Attribute only explicit external provider failures to the
           # selected OpenCode route. Code/tool failures must not burn models.
           repair_log="$RUNNER_TEMP/pr-agent-opencode-repair.log"
-          if ! opencode run --auto --model "$OPENCODE_MODEL" "$PROMPT" 2>&1 | tee "$repair_log"; then
-            if grep -Eiq 'Upstream request failed: Endpoint is unavailable|Endpoint is unavailable|model unavailable|ModelUnavailableError' "$repair_log"; then
-              echo "provider_failure=unavailable" >> "$GITHUB_OUTPUT"
-            elif grep -Eiq 'APITimeoutError|TimeoutError|Request timed out|timed out' "$repair_log"; then
-              echo "provider_failure=timeout" >> "$GITHUB_OUTPUT"
-            elif grep -Eiq 'HTTP 503|503 Service Unavailable|502 Bad Gateway|upstream request failed' "$repair_log"; then
-              echo "provider_failure=upstream" >> "$GITHUB_OUTPUT"
-            elif grep -Eiq 'FreeUsageLimitError|RateLimitError|429 Too Many Requests' "$repair_log"; then
-              echo "provider_failure=quota_429" >> "$GITHUB_OUTPUT"
-            fi
+          # kodmial/continuum#411: provider failures are only trusted from
+          # structured `run --format json` type=error events. Repair prompts
+          # and agent output include review text, source files, and test
+          # fixtures, so the transcript is never scanned for a quota token.
+          set +e
+          opencode run --format json --auto --model "$OPENCODE_MODEL" "$PROMPT" >"$repair_log" 2>&1
+          repair_status=$?
+          set -e
+          python3 - "$repair_log" <<'PY_RENDER'
+          import json
+          import sys
+
+          with open(sys.argv[1], encoding="utf-8", errors="replace") as stream:
+              for raw in stream:
+                  stripped = raw.strip()
+                  try:
+                      event = json.loads(stripped)
+                  except (TypeError, ValueError):
+                      if not stripped.startswith("{"):
+                          sys.stdout.write(raw)
+                          sys.stdout.flush()
+                      continue
+                  if not isinstance(event, dict):
+                      sys.stdout.write(raw)
+                      sys.stdout.flush()
+                      continue
+                  part = event.get("part") if isinstance(event.get("part"), dict) else {}
+                  kind = event.get("type")
+                  if kind == "text" and isinstance(part.get("text"), str):
+                      text = part["text"]
+                      sys.stdout.write(text + ("" if text.endswith("\n") else "\n"))
+                      sys.stdout.flush()
+                  elif kind == "tool_use":
+                      state = part.get("state") if isinstance(part.get("state"), dict) else {}
+                      title = state.get("title")
+                      if isinstance(title, str) and title:
+                          sys.stderr.write("[tool] " + title + "\n")
+                          sys.stderr.flush()
+                  elif kind == "error":
+                      error = event.get("error") if isinstance(event.get("error"), dict) else {}
+                      data = error.get("data") if isinstance(error.get("data"), dict) else {}
+                      name = error.get("name") or "Error"
+                      message = data.get("message") or ""
+                      sys.stderr.write("OpenCode error: {} {}\n".format(name, message).rstrip() + "\n")
+                      sys.stderr.flush()
+          PY_RENDER
+          repair_classification="$(python3 - "$repair_log" "$repair_status" <<'PY_CLASSIFY'
+          import json
+          import re
+          import sys
+
+          def _int(value):
+              if isinstance(value, bool):
+                  return None
+              if isinstance(value, int):
+                  return value
+              if isinstance(value, str) and value.strip().isdigit():
+                  return int(value.strip())
+              return None
+
+          def _status(error):
+              stack = [error]
+              while stack:
+                  item = stack.pop()
+                  if isinstance(item, dict):
+                      for key in ("statusCode", "status", "code"):
+                          found = _int(item.get(key))
+                          if found is not None:
+                              return found
+                      stack.extend(item.values())
+                  elif isinstance(item, list):
+                      stack.extend(item)
+              return None
+
+          QUOTA = re.compile(
+              r"freeusagelimiterror|ratelimiterror|quotaexceeded|quota exceeded|"
+              r"free usage limit|usage limit|too many requests|\b429\b",
+              re.IGNORECASE,
+          )
+          UNAVAILABLE = re.compile(
+              r"endpoint is unavailable|upstream request failed|modelunavailableerror|"
+              r"model is unavailable|model unavailable|apiconnectionerror",
+              re.IGNORECASE,
+          )
+          UPSTREAM = re.compile(
+              r"\b50[0-9]\b|service unavailable|bad gateway|internal server error|"
+              r"internalservererror",
+              re.IGNORECASE,
+          )
+          TIMEOUT = re.compile(
+              r"apitimeouterror|timeouterror|timed out|request timed out|timeout value",
+              re.IGNORECASE,
+          )
+          FAIL_CLOSED = re.compile(
+              r"\b(400|401|403|404|422)\b|unauthorized|forbidden|bad credentials|"
+              r"missing scope",
+              re.IGNORECASE,
+          )
+
+          def classify(error):
+              name = str(error.get("name") or "").lower()
+              status = _status(error)
+              blob = json.dumps(error, sort_keys=True, default=str)
+              if status == 429 or QUOTA.search(name):
+                  return "quota_429"
+              if status in (400, 401, 403, 404, 422):
+                  return "fail_closed"
+              if status in (500, 502, 503, 504):
+                  return "upstream"
+              if QUOTA.search(blob):
+                  return "quota_429"
+              if UNAVAILABLE.search(blob):
+                  return "unavailable"
+              if TIMEOUT.search(blob):
+                  return "timeout"
+              if UPSTREAM.search(blob):
+                  return "upstream"
+              if FAIL_CLOSED.search(blob):
+                  return "fail_closed"
+              return "provider_error"
+
+          events = []
+          for line in open(sys.argv[1], encoding="utf-8", errors="replace"):
+              line = line.strip()
+              if not line.startswith("{"):
+                  continue
+              try:
+                  event = json.loads(line)
+              except (TypeError, ValueError):
+                  continue
+              if isinstance(event, dict) and event.get("type") == "error" and isinstance(event.get("error"), dict):
+                  events.append(event)
+
+          classes = [classify(event["error"]) for event in events]
+          if "quota_429" in classes:
+              print("quota_429")
+          elif "unavailable" in classes or "upstream" in classes:
+              print("unavailable" if "unavailable" in classes else "upstream")
+          elif "timeout" in classes or "fail_closed" in classes:
+              print("timeout" if "timeout" in classes else "fail_closed")
+          elif classes:
+              print("provider_error")
+          else:
+              print("ok" if _int(sys.argv[2]) == 0 else "inconclusive")
+          PY_CLASSIFY
+          )"
+          repair_provider_failure=""
+          case "$repair_classification" in
+            quota_429) repair_provider_failure=quota_429 ;;
+            unavailable) repair_provider_failure=unavailable ;;
+            upstream) repair_provider_failure=upstream ;;
+            timeout) repair_provider_failure=timeout ;;
+          esac
+          if [[ -n "$repair_provider_failure" ]]; then
+            echo "provider_failure=$repair_provider_failure" >> "$GITHUB_OUTPUT"
+          fi
+          # A structured provider error wins even when the CLI itself exited 0:
+          # the provider refused the work and the route must be retired. A
+          # non-zero exit with no authoritative event remains an ordinary
+          # repair runtime failure.
+          if [[ "$repair_status" -ne 0 || -n "$repair_provider_failure" ]]; then
             echo "classification=transient" >> "$GITHUB_OUTPUT"
             echo "::error::OpenCode repair runtime failed; recovery may retry this exact operation."
             exit 1
