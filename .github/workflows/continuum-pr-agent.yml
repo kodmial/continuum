@@ -21,6 +21,15 @@ on:
       needs_rereview:
         description: Whether a blocking recommendation has no actionable payload and needs bounded re-review.
         value: ${{ jobs.pr_agent.outputs.needs_rereview }}
+      needs_metadata:
+        description: Whether the review requires a PR description/metadata correction on the same HEAD.
+        value: ${{ jobs.pr_agent.outputs.needs_metadata }}
+      needs_hold:
+        description: Whether the review requires a durable non-code/policy hold.
+        value: ${{ jobs.pr_agent.outputs.needs_hold }}
+      review_target:
+        description: Canonical remediation target selected by the review disposition.
+        value: ${{ jobs.pr_agent.outputs.review_target }}
     inputs:
       continuum_ref:
         description: Continuum revision supplying fallback scripts
@@ -176,6 +185,9 @@ jobs:
       ready_to_merge: ${{ steps.route.outputs.ready_to_merge }}
       merge_gate_verified: ${{ steps.merge_evidence.outputs.green }}
       needs_rereview: ${{ steps.route.outputs.needs_rereview }}
+      needs_metadata: ${{ steps.route.outputs.needs_metadata }}
+      needs_hold: ${{ steps.route.outputs.needs_hold }}
+      review_target: ${{ steps.route.outputs.review_target }}
       retry_attempt: ${{ steps.stack.outputs.retry_attempt }}
       retry_workflow: ${{ steps.stack.outputs.retry_workflow }}
       recovery_kind: ${{ steps.stack.outputs.recovery_kind }}
@@ -2374,14 +2386,182 @@ jobs:
             const needsRepair = disposition.action === 'repair';
             const readyToMerge = disposition.action === 'merge';
             const needsRereview = disposition.action === 'rereview';
+            const needsMetadata = disposition.action === 'metadata';
+            const needsHold = disposition.action === 'hold';
             core.setOutput('needs_repair', needsRepair ? 'true' : 'false');
             core.setOutput('ready_to_merge', readyToMerge ? 'true' : 'false');
             core.setOutput('needs_rereview', needsRereview ? 'true' : 'false');
+            core.setOutput('needs_metadata', needsMetadata ? 'true' : 'false');
+            core.setOutput('needs_hold', needsHold ? 'true' : 'false');
             core.setOutput('review_disposition', disposition.action);
+            core.setOutput('review_target', String(disposition.target || ''));
             core.setOutput('review_findings', String(disposition.reviewCount));
             core.setOutput('improve_suggestions', String(disposition.qualifyingSuggestionCount));
             core.notice(
-              'PR-Agent disposition=' + disposition.action + ': ' + disposition.reason
+              'PR-Agent disposition=' + disposition.action +
+              (disposition.target ? ' target=' + disposition.target : '') +
+              ': ' + disposition.reason
+            );
+
+      - name: Correct required PR description evidence on the same HEAD
+        if: >-
+          steps.route.outcome == 'success' &&
+          steps.route.outputs.needs_metadata == 'true' &&
+          steps.admit.outputs.admitted == 'true'
+        id: metadata_correction
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
+        env:
+          PR_NUMBER: ${{ steps.stack.outputs.pr_number }}
+          HEAD_SHA: ${{ steps.result.outputs.head_sha }}
+          REVIEW_FILE: ${{ steps.pragent.outputs.review_file }}
+          POLICY_SCRIPT: ${{ steps.runtime.outputs.policy_script }}
+          TAP_PAT: ${{ secrets.TAP_PAT }}
+          GITHUB_WORKFLOW_REF: ${{ github.workflow_ref }}
+          TARGET_CHILD_ID: ${{ inputs.target_child_id }}
+          CONTINUUM_REF_INPUT: ${{ inputs.continuum_ref }}
+        with:
+          github-token: ${{ env.CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED == 'true' && env.TAP_PAT || (env.CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED != 'true' && github.token || '') }}
+          script: |
+            // Metadata-only obligations are corrected in place on the same
+            // HEAD. The correction is source-grounded (actual compare diff)
+            // and never invents before/after evidence. Exactly one
+            // correction per HEAD is attempted: if the machine-owned block
+            // for this HEAD already exists and the body would not change, the
+            // disposition becomes a durable non-code hold instead of an
+            // endless review loop.
+            const fs = require('fs');
+            if (
+              process.env.CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED === 'true' &&
+              !String(process.env.TAP_PAT || '').trim()
+            ) {
+              core.setFailed('Delegated PR-Agent metadata correction requires TAP_PAT.');
+              return;
+            }
+            const prNumber = Number(process.env.PR_NUMBER);
+            const headSha = String(process.env.HEAD_SHA || '').trim().toLowerCase();
+            const reviewFile = String(process.env.REVIEW_FILE || '').trim();
+            if (!Number.isInteger(prNumber) || prNumber < 1 || !/^[0-9a-f]{40,64}$/.test(headSha)) {
+              core.setFailed('Metadata correction requires pr_number and exact full HEAD.');
+              return;
+            }
+            if (!reviewFile || !fs.existsSync(reviewFile)) {
+              core.setFailed('Metadata correction requires the runner-local review JSON.');
+              return;
+            }
+            const owner = process.env.CONTINUUM_PR_AGENT_TARGET_OWNER;
+            const repo = process.env.CONTINUUM_PR_AGENT_TARGET_REPO;
+            const policy = require(process.env.POLICY_SCRIPT);
+            const review = JSON.parse(fs.readFileSync(reviewFile, 'utf8'));
+            const disposition = policy.reviewDisposition(review, '');
+            const requirements = [];
+            const ticket = policy.ticketComplianceState(review);
+            for (const issue of ticket.issues || []) {
+              if (issue.target === policy.TARGET_PR_DESCRIPTION) requirements.push(issue.text);
+            }
+            for (const item of disposition.items || []) {
+              if (item.target === policy.TARGET_PR_DESCRIPTION) requirements.push(item.text);
+            }
+            if (requirements.length === 0) {
+              core.notice('Metadata disposition carries no PR-description requirement; nothing to correct.');
+              return;
+            }
+            const { data: pr } = await github.rest.pulls.get({ owner, repo, pull_number: prNumber });
+            if (String(pr.head.sha || '').trim().toLowerCase() !== headSha) {
+              core.notice('PR head moved before metadata correction; discarding stale correction.');
+              return;
+            }
+            const existingBody = String(pr.body || '');
+            if (
+              existingBody.includes('<!-- continuum-pr-body-evidence:v1 head=' + headSha) ||
+              existingBody.includes('<!-- continuum-pr-body-evidence:v1 head=' + headSha.toLowerCase())
+            ) {
+              core.setOutput('held', 'true');
+              core.notice(
+                'PR #' + prNumber + ' already carries the metadata evidence for HEAD ' + headSha +
+                '; recording a durable non-code hold instead of another review.'
+              );
+              return;
+            }
+            let files = [];
+            try {
+              const compare = await github.rest.repos.compareCommits({
+                owner,
+                repo,
+                base: String(pr.base.sha || '').trim(),
+                head: headSha,
+              });
+              files = Array.isArray(compare.data.files) ? compare.data.files : [];
+            } catch (err) {
+              core.warning('Could not read the PR diff for metadata evidence: ' + err.message);
+            }
+            const evidence = policy.buildMetadataEvidence(requirements, files, { head: headSha });
+            const body = policy.replaceMetadataEvidence(existingBody, evidence);
+            if (String(body).trim() === existingBody.trim()) {
+              core.setOutput('held', 'true');
+              core.notice('Metadata correction produced no description change; holding.');
+              return;
+            }
+            await github.rest.pulls.update({
+              owner,
+              repo,
+              pull_number: prNumber,
+              body,
+            });
+            core.setOutput('changed', 'true');
+            core.setOutput('head_sha', headSha);
+            core.notice(
+              'PR #' + prNumber + ' description corrected for HEAD ' + headSha +
+              '; a fresh independent review is required.'
+            );
+
+      - name: Trigger fresh review after PR description correction
+        if: >-
+          steps.metadata_correction.outcome == 'success' &&
+          steps.metadata_correction.outputs.changed == 'true'
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
+        env:
+          PR_NUMBER: ${{ steps.stack.outputs.pr_number }}
+          HEAD_SHA: ${{ steps.result.outputs.head_sha }}
+          RETRY_WORKFLOW: ${{ steps.stack.outputs.retry_workflow }}
+          TARGET_CHILD_ID: ${{ inputs.target_child_id }}
+          CONTINUUM_REF_INPUT: ${{ inputs.continuum_ref }}
+        with:
+          github-token: ${{ github.token }}
+          script: |
+            const prNumber = Number(process.env.PR_NUMBER);
+            const headSha = String(process.env.HEAD_SHA || '').trim().toLowerCase();
+            const workflowFile = String(process.env.RETRY_WORKFLOW || '').trim();
+            if (!workflowFile) {
+              core.warning('Cannot determine the caller review workflow for the metadata refresh dispatch.');
+              return;
+            }
+            const { data: repoData } = await github.rest.repos.get({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+            });
+            const inputs = {
+              pr_number: String(prNumber),
+              expected_head_sha: headSha,
+              retry_attempt: '0',
+              retry_workflow: workflowFile,
+              recovery_kind: 'review',
+            };
+            if (String(process.env.TARGET_CHILD_ID || '').trim()) {
+              inputs.target_child_id = String(process.env.TARGET_CHILD_ID).trim();
+            }
+            if (String(process.env.CONTINUUM_REF_INPUT || '').trim()) {
+              inputs.continuum_ref = String(process.env.CONTINUUM_REF_INPUT).trim();
+            }
+            await github.rest.actions.createWorkflowDispatch({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              workflow_id: workflowFile,
+              ref: repoData.default_branch,
+              inputs,
+            });
+            core.notice(
+              'Dispatched a fresh PR-Agent review for PR #' + prNumber +
+              ' after the description-only correction on HEAD ' + headSha + '.'
             );
 
       - name: Cool down failed real provider route before the bounded retry
@@ -2883,7 +3063,9 @@ jobs:
         uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
         env:
           HEAD_SHA: ${{ steps.result.outputs.head_sha }}
+          PR_NUMBER: ${{ steps.stack.outputs.pr_number }}
           REVIEW_DISPOSITION: ${{ steps.route.outputs.review_disposition }}
+          POLICY_SCRIPT: ${{ steps.runtime.outputs.policy_script }}
         with:
           github-token: ${{ env.CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED == 'true' && secrets.TAP_PAT || (env.CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED != 'true' && github.token || '') }}
           script: |
@@ -2892,21 +3074,49 @@ jobs:
               repair: 'PR-Agent review complete: actionable',
               merge: 'PR-Agent review complete: clean',
               rereview: 'PR-Agent review complete: blocking; recovery eligible',
+              metadata: 'PR-Agent review complete: description evidence required',
+              hold: 'PR-Agent review complete: policy hold',
             };
             if (!descriptions[disposition]) {
               core.setFailed('Unknown PR-Agent review disposition: ' + (disposition || '<empty>'));
               return;
             }
+            const targetUrl =
+              context.serverUrl + '/' + context.repo.owner + '/' +
+              context.repo.repo + '/actions/runs/' + context.runId;
+            const owner = process.env.CONTINUUM_PR_AGENT_TARGET_OWNER;
+            const repo = process.env.CONTINUUM_PR_AGENT_TARGET_REPO;
+            // Review-input identity: HEAD + relevant PR-body digest. A later
+            // description-only correction changes this value, so an earlier
+            // clean attestation can never authorize a merge of a different
+            // review input (same HEAD, new body).
+            const policy = require(process.env.POLICY_SCRIPT);
+            const { data: pr } = await github.rest.pulls.get({
+              owner,
+              repo,
+              pull_number: Number(process.env.PR_NUMBER),
+            });
+            const inputVersion = policy.reviewInputVersion(
+              String(process.env.HEAD_SHA || ''),
+              pr.body || ''
+            );
             await github.rest.repos.createCommitStatus({
-              owner: process.env.CONTINUUM_PR_AGENT_TARGET_OWNER,
-              repo: process.env.CONTINUUM_PR_AGENT_TARGET_REPO,
+              owner,
+              repo,
               sha: process.env.HEAD_SHA,
               state: 'success',
               context: 'continuum/pr-agent-review',
               description: descriptions[disposition],
-              target_url:
-                context.serverUrl + '/' + context.repo.owner + '/' +
-                context.repo.repo + '/actions/runs/' + context.runId,
+              target_url: targetUrl,
+            });
+            await github.rest.repos.createCommitStatus({
+              owner,
+              repo,
+              sha: process.env.HEAD_SHA,
+              state: 'success',
+              context: 'continuum/pr-agent-review-input',
+              description: inputVersion,
+              target_url: targetUrl,
             });
 
       - name: Publish failed PR-Agent review state

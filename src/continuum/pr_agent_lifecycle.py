@@ -1347,6 +1347,474 @@ def ticket_compliance_ok(pr_body: str, review: Mapping[str, Any]) -> bool:
     return review_has_ticket_compliance(review)
 
 
+TARGET_CODE = "code"
+TARGET_PR_DESCRIPTION = "pr_description"
+TARGET_CI = "ci"
+TARGET_POLICY = "policy"
+TARGET_INFRASTRUCTURE = "infrastructure"
+
+_PR_DESCRIPTION_PATTERNS = (
+    re.compile(r"\bpr\s+(?:description|body)\b"),
+    re.compile(r"\bpull\s+request\s+(?:description|body)\b"),
+    re.compile(r"\bpr[- ]description\b"),
+    re.compile(r"\bdescription\s+(?:of|for)\s+(?:the\s+)?(?:pr|pull\s+request)\b"),
+    re.compile(
+        r"\bbefore\s*(?:/|and|&)\s*after\s+"
+        r"(?:evidence|example|examples|screenshot|screenshots|behavior|behaviour|comparison)\b"
+    ),
+    re.compile(r"\bpr\s+summary\b"),
+)
+
+_CI_PATTERNS = (
+    re.compile(r"\bci\b"),
+    re.compile(r"\bcontract\s+gate\b"),
+    re.compile(r"\bqualification\b"),
+    re.compile(r"\bworkflow\s+run\b"),
+    re.compile(r"\bcheck\s+run\b"),
+    re.compile(r"\bpipeline\b"),
+    re.compile(r"\bvalidation\s+(?:evidence|proof|result)\b"),
+    re.compile(r"\btest\s+(?:run|evidence|proof)\b"),
+)
+
+_POLICY_PATTERNS = (
+    re.compile(r"\bowner[- ]only\b"),
+    re.compile(r"\bhuman\s+(?:review|verification|approval|decision)\b"),
+    re.compile(r"\bmanually?\s+(?:verify|verified|approve|approved)\b"),
+    re.compile(r"\bmaintainer\b"),
+    re.compile(r"\bsign[- ]?off\b"),
+    re.compile(r"\bpolicy\b"),
+    re.compile(r"\bowner\s+decision\b"),
+    re.compile(r"\brequires?\s+(?:a\s+)?(?:human|owner|maintainer)\b"),
+    re.compile(r"\bnon[- ]automatable\b"),
+)
+
+_INFRASTRUCTURE_PATTERNS = (
+    re.compile(r"\btool\s+(?:error|failure|timeout)\b"),
+    re.compile(r"\bapi\s+(?:error|timeout|rate\s+limit)\b"),
+    re.compile(r"\bprovider\b"),
+    re.compile(r"\bmodel\s+(?:error|unavailable|timeout)\b"),
+    re.compile(r"\btransient\b"),
+    re.compile(r"\brate\s+limit\b"),
+    re.compile(r"\b(?:403|429)\b"),
+)
+
+_TICKET_ISSUE_KEYS = (
+    "not_compliant_requirements",
+    "non_compliant_requirements",
+    "missing_requirements",
+    "unmet_requirements",
+    "not_compliant",
+    "missing",
+)
+
+_TICKET_CLEAN_TEXTS = frozenset(
+    {
+        "",
+        "-",
+        "--",
+        "none",
+        "n/a",
+        "na",
+        "no",
+        "null",
+        "nil",
+        "ok",
+        "pass",
+        "passed",
+        "compliant",
+        "all requirements met",
+        "no non-compliant requirements",
+        "no missing requirements",
+    }
+)
+
+_TICKET_CLEAN_PREFIXES = (
+    "no non-compliant",
+    "no noncompliant",
+    "no missing",
+    "no unmet",
+    "none ",
+    "n/a ",
+)
+
+_TARGET_RANK = (
+    TARGET_CODE,
+    TARGET_PR_DESCRIPTION,
+    TARGET_CI,
+    TARGET_POLICY,
+    TARGET_INFRASTRUCTURE,
+)
+
+
+def _matches(patterns: Sequence[re.Pattern[str]], text: str) -> bool:
+    lowered = str(text or "").lower()
+    return any(pattern.search(lowered) for pattern in patterns)
+
+
+def classify_remediation_target(text: str, *, path: str = "") -> str:
+    value = str(text or "").strip()
+    if _matches(_PR_DESCRIPTION_PATTERNS, value):
+        return TARGET_PR_DESCRIPTION
+    if _matches(_POLICY_PATTERNS, value):
+        return TARGET_POLICY
+    if _matches(_INFRASTRUCTURE_PATTERNS, value):
+        return TARGET_INFRASTRUCTURE
+    if _matches(_CI_PATTERNS, value):
+        return TARGET_CI
+    if str(path or "").strip():
+        return TARGET_CODE
+    return TARGET_CODE
+
+
+def classify_ticket_target(text: str) -> str:
+    target = classify_remediation_target(text)
+    if target == TARGET_CODE and not re.search(
+        r"\b(?:code|implementation|implement|fix|change|test|tests|docs?|documentation|document)\b",
+        str(text or ""),
+        re.IGNORECASE,
+    ):
+        return TARGET_CI
+    return target
+
+
+def _clean_ticket_text(value: object) -> bool:
+    text = str("" if value is None else value).strip().lower()
+    text = re.sub(r"^[-*>\s]+", "", text)
+    text = re.sub(r"[.!]+$", "", text).strip()
+    if text in _TICKET_CLEAN_TEXTS:
+        return True
+    return any(text.startswith(prefix) for prefix in _TICKET_CLEAN_PREFIXES)
+
+
+def _parse_ticket_issue_value(value: object) -> List[str]:
+    issues: List[str] = []
+    if isinstance(value, list):
+        for entry in value:
+            issues.extend(_parse_ticket_issue_value(entry))
+        return issues
+    if isinstance(value, Mapping):
+        for key in value:
+            issues.extend(_parse_ticket_issue_value(value[key]))
+        return issues
+    text = str("" if value is None else value).strip()
+    if not text or _clean_ticket_text(text):
+        return issues
+    return [text]
+
+
+def ticket_compliance_state(review: Mapping[str, Any]) -> Dict[str, Any]:
+    """Normalize native ticket compliance without trusting the recommendation.
+
+    ``safe_to_merge`` never cancels an explicit non-compliant requirement.
+    Missing ticket data is not positive non-compliance (issue-less PRs), but
+    malformed or contradictory data fails closed.
+    """
+
+    ticket = review.get("ticket_compliance_check")
+    if ticket is None:
+        return {"present": False, "malformed": False, "issues": [], "verified": False}
+    if isinstance(ticket, str):
+        text = ticket.strip()
+        if not text or _clean_ticket_text(text):
+            return {"present": True, "malformed": False, "issues": [], "verified": True}
+        if not (
+            _matches(_PR_DESCRIPTION_PATTERNS, text)
+            or _matches(_POLICY_PATTERNS, text)
+            or _matches(_INFRASTRUCTURE_PATTERNS, text)
+            or _matches(_CI_PATTERNS, text)
+            or re.search(
+                r"\b(?:code|implementation|implement|fix|change|test|tests|docs?|documentation|document|evidence)\b",
+                text,
+                re.IGNORECASE,
+            )
+        ):
+            return {"present": True, "malformed": True, "issues": [], "verified": False}
+        return {
+            "present": True,
+            "malformed": False,
+            "issues": [
+                {
+                    "text": text,
+                    "target": classify_ticket_target(text),
+                    "blocking": True,
+                }
+            ],
+            "verified": False,
+        }
+    entries = ticket if isinstance(ticket, list) else [ticket]
+    if not entries:
+        return {"present": True, "malformed": False, "issues": [], "verified": True}
+    issues: List[Dict[str, Any]] = []
+    malformed = False
+    for entry in entries:
+        if not isinstance(entry, Mapping):
+            malformed = True
+            continue
+        present = [key for key in _TICKET_ISSUE_KEYS if key in entry]
+        if not present:
+            malformed = True
+            continue
+        for key in present:
+            for text in _parse_ticket_issue_value(entry[key]):
+                issues.append(
+                    {
+                        "text": text,
+                        "target": classify_ticket_target(text),
+                        "blocking": True,
+                    }
+                )
+    return {
+        "present": True,
+        "malformed": malformed,
+        "issues": issues,
+        "verified": not malformed and not issues,
+    }
+
+
+def _first_target(entries: Sequence[Mapping[str, Any]]) -> str:
+    for target in _TARGET_RANK:
+        if any(entry.get("target") == target for entry in entries):
+            return target
+    return TARGET_CODE
+
+
+def _stable_suggestion_id(source: str, index: int, payload: Mapping[str, Any]) -> str:
+    # Deterministic locator, not a content hash: callers use it to
+    # name one item in a batch. The pinned upstream state remains the only
+    # owner of finding identity and ACTIVE/RESOLVED history.
+    path = _normalize_path(payload) or "unknown"
+    problem = _normalize_problem(payload, source) or "unspecified"
+    start, end = _line_range(payload)
+    return f"{source}:{index}:{path}:{start}-{end}:{problem}"
+
+
+def normalize_actionable_items(
+    review: Mapping[str, Any],
+    suggestions: Sequence[Mapping[str, Any]] = (),
+) -> List[Dict[str, Any]]:
+    """Normalize findings into identity, target, blocking/advisory, completion."""
+
+    if not isinstance(review, Mapping):
+        raise LifecycleError("PR-Agent review payload must be an object")
+    raw = review.get("key_issues_to_review")
+    if not isinstance(raw, list):
+        raise LifecycleError("PR-Agent review JSON has no key_issues_to_review list")
+    items: List[Dict[str, Any]] = []
+    for index, finding in enumerate(raw):
+        payload = finding if isinstance(finding, Mapping) else {}
+        text = " ".join(
+            str(payload.get(key) or "")
+            for key in ("issue_header", "issue_content", "title", "body")
+            if isinstance(payload.get(key), str)
+        ).strip()
+        items.append(
+            {
+                "id": _stable_suggestion_id("review", index, payload),
+                "source": "review",
+                "index": index,
+                "target": classify_remediation_target(text, path=_normalize_path(payload)),
+                "blocking": True,
+                "advisory": False,
+                "text": text,
+                "completion": "The original finding is absent from an independent review of the new HEAD.",
+                "finding": dict(payload),
+            }
+        )
+    for index, suggestion in enumerate(qualifying_suggestions(suggestions)):
+        payload = suggestion if isinstance(suggestion, Mapping) else {}
+        text = " ".join(
+            str(payload.get(key) or "")
+            for key in (
+                "one_sentence_summary",
+                "suggestion_content",
+                "title",
+                "body",
+            )
+            if isinstance(payload.get(key), str)
+        ).strip()
+        items.append(
+            {
+                "id": _stable_suggestion_id("improve", index, payload),
+                "source": "improve",
+                "index": index,
+                "target": classify_remediation_target(text, path=_normalize_path(payload)),
+                "blocking": False,
+                "advisory": True,
+                "text": text,
+                "completion": "Advisory suggestion applied or explicitly declined without blocking merge.",
+                "suggestion": dict(payload),
+            }
+        )
+    return items
+
+
+def _non_actionable_caution_is_mergeable(review: Mapping[str, Any]) -> bool:
+    security = review.get("security_concerns")
+    if security is None or security == "":
+        return False
+    if (
+        has_blocking_security_signal(review)
+        or has_tool_error_signal(review)
+        or has_incomplete_coverage_signal(review)
+    ):
+        return False
+    ticket = ticket_compliance_state(review)
+    return not ticket["malformed"] and not ticket["issues"]
+
+
+def review_disposition(
+    review: Mapping[str, Any],
+    suggestions: Sequence[Mapping[str, Any]] = (),
+) -> Dict[str, Any]:
+    """Canonical target-aware PR-Agent disposition.
+
+    The recommendation string is one input, never the decision. A genuine
+    ticket obligation blocks merge even under ``safe_to_merge``; concrete
+    code findings repair; metadata obligations correct the PR description;
+    owner/policy obligations persist a durable hold.
+    """
+
+    merged = _unwrap_review(review)
+    if not isinstance(merged, Mapping):
+        raise LifecycleError("PR-Agent review payload must be an object")
+    recommendation = str(merged.get("merge_recommendation") or "").strip()
+    if recommendation not in (
+        REVIEW_MERGE_SAFE,
+        REVIEW_MERGE_CAUTION,
+        REVIEW_MERGE_CHANGES,
+    ):
+        raise LifecycleError(
+            f"PR-Agent review has invalid merge_recommendation: {recommendation or '<empty>'}"
+        )
+    items = normalize_actionable_items(merged, suggestions)
+    review_items = [item for item in items if item["source"] == "review"]
+    improve_items = [item for item in items if item["source"] == "improve"]
+    ticket = ticket_compliance_state(merged)
+    structural = (
+        has_tool_error_signal(merged)
+        or has_incomplete_coverage_signal(merged)
+        or has_blocking_security_signal(merged)
+        or len(review_items) == NUM_MAX_FINDINGS
+    )
+    common: Dict[str, Any] = {
+        "recommendation": recommendation,
+        "reviewCount": len(review_items),
+        "qualifyingSuggestionCount": len(improve_items),
+        "ticketCompliance": ticket,
+        "items": [
+            {key: item[key] for key in ("id", "source", "target", "blocking", "advisory", "text", "completion")}
+            for item in items
+        ],
+    }
+
+    if ticket["malformed"]:
+        return {
+            **common,
+            "action": "rereview",
+            "target": TARGET_INFRASTRUCTURE,
+            "blocking": True,
+            "reason": "ticket compliance data is malformed or contradictory: failing closed",
+        }
+    if review_items:
+        target = _first_target(review_items)
+        if target == TARGET_CODE:
+            return {
+                **common,
+                "action": "repair",
+                "target": target,
+                "blocking": True,
+                "reason": (
+                    f"{len(review_items)} authoritative review finding(s), "
+                    f"{len(improve_items)} auxiliary improve suggestion(s)"
+                ),
+            }
+        if target == TARGET_PR_DESCRIPTION:
+            return {
+                **common,
+                "action": "metadata",
+                "target": target,
+                "blocking": True,
+                "reason": "authoritative review requires PR description/metadata evidence; no code change is implied",
+            }
+        if target == TARGET_POLICY:
+            return {
+                **common,
+                "action": "hold",
+                "target": target,
+                "blocking": True,
+                "reason": "authoritative review requires a non-automatable policy/owner decision",
+            }
+        return {
+            **common,
+            "action": "rereview",
+            "target": target,
+            "blocking": True,
+            "reason": "authoritative review finding targets an external/CI condition: failing closed",
+        }
+    if ticket["issues"]:
+        target = _first_target(ticket["issues"])
+        if target == TARGET_PR_DESCRIPTION:
+            return {
+                **common,
+                "action": "metadata",
+                "target": target,
+                "blocking": True,
+                "reason": "required ticket evidence belongs in the PR description/metadata",
+            }
+        if target == TARGET_CODE:
+            return {
+                **common,
+                "action": "repair",
+                "target": target,
+                "blocking": True,
+                "reason": "required ticket obligation names a concrete code/test change",
+            }
+        if target == TARGET_POLICY:
+            return {
+                **common,
+                "action": "hold",
+                "target": target,
+                "blocking": True,
+                "reason": "required ticket obligation needs an owner/policy decision",
+            }
+        return {
+            **common,
+            "action": "rereview",
+            "target": target,
+            "blocking": True,
+            "reason": "required ticket obligation depends on an existing CI/qualification path",
+        }
+    if structural:
+        return {
+            **common,
+            "action": "rereview",
+            "target": TARGET_INFRASTRUCTURE,
+            "blocking": True,
+            "reason": "structured security/tool-error/incomplete review: failing closed",
+        }
+    if recommendation == REVIEW_MERGE_SAFE or (
+        recommendation == REVIEW_MERGE_CAUTION and _non_actionable_caution_is_mergeable(merged)
+    ):
+        return {
+            **common,
+            "action": "merge",
+            "target": None,
+            "blocking": False,
+            "reason": (
+                "safe_to_merge with empty/verified compliance and no actionable review items"
+                if recommendation == REVIEW_MERGE_SAFE
+                else "non-actionable caution with explicit no-security/no-noncompliance evidence"
+            ),
+        }
+    return {
+        **common,
+        "action": "rereview",
+        "target": TARGET_INFRASTRUCTURE,
+        "blocking": True,
+        "reason": f"blocking merge recommendation without actionable payload: {recommendation}",
+    }
+
+
 @dataclass
 class GateInputs:
     review: Dict[str, Any]
@@ -1844,6 +2312,15 @@ __all__ = [
     "upstream_state_has_active",
     "review_has_ticket_compliance",
     "ticket_compliance_ok",
+    "classify_remediation_target",
+    "ticket_compliance_state",
+    "normalize_actionable_items",
+    "review_disposition",
+    "TARGET_CODE",
+    "TARGET_PR_DESCRIPTION",
+    "TARGET_CI",
+    "TARGET_POLICY",
+    "TARGET_INFRASTRUCTURE",
     "evaluate_gate",
     "should_dispatch_repair",
     "is_conflict_lock_stranded",

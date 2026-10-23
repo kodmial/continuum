@@ -289,10 +289,47 @@ jobs:
               );
               return;
             }
+            // Review-input freshness: a clean status for this HEAD is only
+            // valid for the exact PR description that was reviewed. A
+            // description-only correction keeps HEAD but produces a new
+            // review-input version, so the old attestation must not merge.
+            const crypto = require('crypto');
+            const { data: livePr } = await github.rest.pulls.get({
+              owner,
+              repo,
+              pull_number: prNumber,
+            });
+            const bodyDigest = crypto
+              .createHash('sha256')
+              .update(String(livePr.body || '').replace(/\r\n/g, '\n'))
+              .digest('hex');
+            const expectedInputVersion = headSha + ':' + bodyDigest;
+            const inputStatuses = (data.statuses || [])
+              .filter(status => status.context === 'continuum/pr-agent-review-input')
+              .sort((a, b) => {
+                const at = new Date(a.updated_at || a.created_at || 0).getTime();
+                const bt = new Date(b.updated_at || b.created_at || 0).getTime();
+                if (bt !== at) return bt - at;
+                return Number(b.id || 0) - Number(a.id || 0);
+              });
+            const latestInput = inputStatuses[0];
+            if (
+              !latestInput ||
+              latestInput.state !== 'success' ||
+              String(latestInput.description || '') !== expectedInputVersion ||
+              !String(latestInput.target_url || '').startsWith(expectedTargetPrefix)
+            ) {
+              core.setFailed(
+                'PR-Agent merge blocked: the clean attestation does not cover the current ' +
+                'HEAD + PR-description revision. A description change requires a fresh review.'
+              );
+              return;
+            }
             core.setOutput('green', 'true');
             core.setOutput('head_sha', headSha);
             core.notice(
-              'PR #' + prNumber + ' durable clean review attestation verified at ' + headSha + '.'
+              'PR #' + prNumber + ' durable clean review attestation verified at ' + headSha +
+              ' for review input ' + expectedInputVersion.slice(0, 16) + '...'
             );
 
       - name: Resolve PR-Agent signal policy
@@ -649,6 +686,52 @@ jobs:
             // Exact-HEAD plus CI plus draft/conflict revalidation happens in
             // the next step immediately before merge; this step records that
             // the review portion of the gate is satisfied for this HEAD.
+            // Review-input freshness: the reviewed description is part of
+            // the review input. Same HEAD with a different PR body is a new
+            // input and requires a fresh independent review.
+            const crypto = require('crypto');
+            const targetOwner = process.env.CONTINUUM_PR_AGENT_TARGET_OWNER;
+            const targetRepo = process.env.CONTINUUM_PR_AGENT_TARGET_REPO;
+            const { data: livePr } = await github.rest.pulls.get({
+              owner: targetOwner,
+              repo: targetRepo,
+              pull_number: prNumber,
+            });
+            const { data: statusData } = await github.rest.repos.getCombinedStatusForRef({
+              owner: targetOwner,
+              repo: targetRepo,
+              ref: headSha,
+              per_page: 100,
+              page: 1,
+            });
+            const bodyDigest = crypto
+              .createHash('sha256')
+              .update(String(livePr.body || '').replace(/\r\n/g, '\n'))
+              .digest('hex');
+            const expectedInputVersion = headSha + ':' + bodyDigest;
+            const expectedPrefix =
+              context.serverUrl + '/' + context.repo.owner + '/' +
+              context.repo.repo + '/actions/runs/';
+            const inputStatuses = (statusData.statuses || [])
+              .filter(status => status.context === 'continuum/pr-agent-review-input')
+              .sort((a, b) => {
+                const at = new Date(a.updated_at || a.created_at || 0).getTime();
+                const bt = new Date(b.updated_at || b.created_at || 0).getTime();
+                if (bt !== at) return bt - at;
+                return Number(b.id || 0) - Number(a.id || 0);
+              });
+            const latestInput = inputStatuses[0];
+            if (
+              !latestInput ||
+              latestInput.state !== 'success' ||
+              String(latestInput.description || '') !== expectedInputVersion ||
+              !String(latestInput.target_url || '').startsWith(expectedPrefix)
+            ) {
+              fail(
+                'review attestation does not cover the current HEAD + PR-description revision'
+              );
+              return;
+            }
             core.setOutput('green', 'true');
             core.setOutput('reason', 'review portion satisfied');
             core.setOutput('head_sha', headSha);

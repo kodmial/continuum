@@ -1012,7 +1012,296 @@ function isSkippedCleanImprovePayload(raw) {
   return sawLine && foundMarker;
 }
 
-function nonActionableCautionIsMergeable(review) {
+const TICKET_ISSUE_KEYS = [
+  'not_compliant_requirements',
+  'non_compliant_requirements',
+  'missing_requirements',
+  'unmet_requirements',
+  'not_compliant',
+  'missing',
+];
+
+const TICKET_CLEAN_TEXTS = new Set([
+  '',
+  '-',
+  '--',
+  'none',
+  'n/a',
+  'na',
+  'no',
+  'null',
+  'nil',
+  'ok',
+  'pass',
+  'passed',
+  'compliant',
+  'all requirements met',
+  'no non-compliant requirements',
+  'no missing requirements',
+]);
+
+const TICKET_CLEAN_PREFIXES = [
+  'no non-compliant',
+  'no noncompliant',
+  'no missing',
+  'no unmet',
+  'none ',
+  'n/a ',
+];
+
+function cleanTicketText(value) {
+  const text = String(value === undefined || value === null ? '' : value)
+    .trim()
+    .toLowerCase()
+    .replace(/^[-*>\s]+/, '')
+    .replace(/[.!]+$/, '')
+    .trim();
+  if (TICKET_CLEAN_TEXTS.has(text)) return true;
+  return TICKET_CLEAN_PREFIXES.some((prefix) => text.startsWith(prefix));
+}
+
+// Remediation target vocabulary shared by the review/repair/metadata/merge
+// handoffs. The target answers "who can actually fix this?", which is the
+// only safe basis for choosing a next action. Recommendation strings alone
+// never decide dispatch.
+const TARGET_CODE = 'code';
+const TARGET_PR_DESCRIPTION = 'pr_description';
+const TARGET_CI = 'ci';
+const TARGET_POLICY = 'policy';
+const TARGET_INFRASTRUCTURE = 'infrastructure';
+
+const PR_DESCRIPTION_PATTERNS = [
+  /\bpr\s+(?:description|body)\b/,
+  /\bpull\s+request\s+(?:description|body)\b/,
+  /\bpr[- ]description\b/,
+  /\bdescription\s+(?:of|for)\s+(?:the\s+)?(?:pr|pull\s+request)\b/,
+  /\bbefore\s*(?:\/|and|&)\s*after\s+(?:evidence|example|examples|screenshot|screenshots|behavior|behaviour|comparison)\b/,
+  /\bpr\s+summary\b/,
+];
+
+const CI_PATTERNS = [
+  /\bci\b/,
+  /\bcontract\s+gate\b/,
+  /\bqualification\b/,
+  /\bworkflow\s+run\b/,
+  /\bcheck\s+run\b/,
+  /\bpipeline\b/,
+  /\bvalidation\s+(?:evidence|proof|result)\b/,
+  /\btest\s+(?:run|evidence|proof)\b/,
+];
+
+const POLICY_PATTERNS = [
+  /\bowner[- ]only\b/,
+  /\bhuman\s+(?:review|verification|approval|decision)\b/,
+  /\bmanually?\s+(?:verify|verified|approve|approved)\b/,
+  /\bmaintainer\b/,
+  /\bsign[- ]?off\b/,
+  /\bpolicy\b/,
+  /\bowner\s+decision\b/,
+  /\brequires?\s+(?:a\s+)?(?:human|owner|maintainer)\b/,
+  /\bnon[- ]automatable\b/,
+];
+
+const INFRASTRUCTURE_PATTERNS = [
+  /\btool\s+(?:error|failure|timeout)\b/,
+  /\bapi\s+(?:error|timeout|rate\s+limit)\b/,
+  /\bprovider\b/,
+  /\bmodel\s+(?:error|unavailable|timeout)\b/,
+  /\btransient\b/,
+  /\brate\s+limit\b/,
+  /\b(?:403|429)\b/,
+];
+
+function textMatches(patterns, text) {
+  const lowered = String(text || '').toLowerCase();
+  return patterns.some((pattern) => pattern.test(lowered));
+}
+
+function classifyRemediationTarget(text, options = {}) {
+  const opts = options && typeof options === 'object' ? options : {};
+  const value = String(text || '').trim();
+  const hasPath = Boolean(String(opts.path || '').trim());
+  if (textMatches(PR_DESCRIPTION_PATTERNS, value)) return TARGET_PR_DESCRIPTION;
+  if (textMatches(POLICY_PATTERNS, value)) return TARGET_POLICY;
+  if (textMatches(INFRASTRUCTURE_PATTERNS, value)) return TARGET_INFRASTRUCTURE;
+  if (textMatches(CI_PATTERNS, value)) return TARGET_CI;
+  // A concrete file/line finding is a code change even when its prose also
+  // mentions tests or documentation: the reviewer pointed at the patch.
+  if (hasPath) return TARGET_CODE;
+  return TARGET_CODE;
+}
+
+function classifyTicketTarget(text) {
+  const target = classifyRemediationTarget(text);
+  if (target === TARGET_CODE &&
+      !/\b(?:code|implementation|implement|fix|change|test|tests|docs?|documentation|document)\b/i.test(String(text || ''))) {
+    // A ticket obligation that names no concrete code/test/doc change is
+    // not a safe automatic code-repair target: wait on the canonical CI /
+    // qualification path or persist a policy hold instead.
+    return TARGET_CI;
+  }
+  return target;
+}
+
+function findingText(finding) {
+  return [finding.issue_header, finding.issue_content, finding.title, finding.body]
+    .map((value) => (typeof value === 'string' ? value : ''))
+    .filter(Boolean)
+    .join(' ')
+    .trim();
+}
+
+function stableFindingId(item) {
+  const source = item && item.source === 'review' ? 'review' : 'improve';
+  const payload = source === 'review' ? item.finding : item.suggestion;
+  const canonical = JSON.stringify(stable(logicalDescriptor({ source, ...(source === 'review' ? { finding: payload || {} } : { suggestion: payload || {} }) })));
+  return crypto.createHash('sha256').update(canonical).digest('hex');
+}
+
+function normalizeActionableItems(reviewPayload, improveJsonl = '', threshold = IMPROVE_REPAIR_THRESHOLD) {
+  const review = unwrapReview(reviewPayload);
+  if (!review || typeof review !== 'object' || Array.isArray(review)) {
+    throw new Error('PR-Agent review payload must be an object.');
+  }
+  if (!Array.isArray(review.key_issues_to_review)) {
+    throw new Error('PR-Agent review JSON has no key_issues_to_review list.');
+  }
+
+  const items = [];
+  review.key_issues_to_review.forEach((finding, index) => {
+    const text = findingText(finding || {});
+    const target = classifyRemediationTarget(text, { path: normalizePath(finding || {}) });
+    items.push({
+      id: stableFindingId({ source: 'review', index, finding: finding || {} }),
+      source: 'review',
+      index,
+      target,
+      blocking: true,
+      advisory: false,
+      text,
+      completion: 'The original finding is absent from an independent review of the new HEAD.',
+      finding,
+    });
+  });
+
+  // /improve is advisory by default. Only high-signal suggestions that dedupe
+  // against an authoritative code finding may enrich an already-required
+  // repair; they never create an independent mandatory loop.
+  const qualifying = qualifyingImproveSuggestions(improveJsonl, threshold);
+  qualifying.forEach((suggestion, index) => {
+    const text = [suggestion.one_sentence_summary, suggestion.suggestion_content, suggestion.title, suggestion.body]
+      .map((value) => (typeof value === 'string' ? value : ''))
+      .filter(Boolean)
+      .join(' ')
+      .trim();
+    const target = classifyRemediationTarget(text, { path: normalizePath(suggestion || {}) });
+    items.push({
+      id: stableFindingId({ source: 'improve', index, suggestion: suggestion || {} }),
+      source: 'improve',
+      index,
+      target,
+      blocking: false,
+      advisory: true,
+      text,
+      completion: 'Advisory suggestion applied or explicitly declined without blocking merge.',
+      suggestion,
+    });
+  });
+  return { review, items };
+}
+
+function parseTicketIssueValue(value) {
+  const issues = [];
+  if (Array.isArray(value)) {
+    value.forEach((entry) => {
+      const nested = parseTicketIssueValue(entry);
+      nested.forEach((text) => issues.push(text));
+    });
+    return issues;
+  }
+  if (value && typeof value === 'object') {
+    Object.keys(value).forEach((key) => {
+      const nested = parseTicketIssueValue(value[key]);
+      nested.forEach((text) => issues.push(text));
+    });
+    return issues;
+  }
+  const text = String(value === undefined || value === null ? '' : value).trim();
+  if (!text || cleanTicketText(text)) return issues;
+  return [text];
+}
+
+function ticketComplianceState(reviewPayload) {
+  const review = unwrapReview(reviewPayload);
+  const ticket = review ? review.ticket_compliance_check : undefined;
+  if (ticket === undefined || ticket === null) {
+    return { present: false, malformed: false, issues: [], verified: false };
+  }
+  if (typeof ticket === 'string') {
+    const text = ticket.trim();
+    if (!text) return { present: true, malformed: false, issues: [], verified: true };
+    if (cleanTicketText(text)) {
+      return { present: true, malformed: false, issues: [], verified: true };
+    }
+    // Free-form prose is only accepted as explicit non-compliance when it
+    // names a recognizable remediation target; ambiguous prose fails closed
+    // as malformed instead of guessing a code repair.
+    if (
+      !textMatches(PR_DESCRIPTION_PATTERNS, text) &&
+      !textMatches(POLICY_PATTERNS, text) &&
+      !textMatches(INFRASTRUCTURE_PATTERNS, text) &&
+      !textMatches(CI_PATTERNS, text) &&
+      !/\b(?:code|implementation|implement|fix|change|test|tests|docs?|documentation|document|evidence)\b/i.test(text)
+    ) {
+      return { present: true, malformed: true, issues: [], verified: false };
+    }
+    return {
+      present: true,
+      malformed: false,
+      issues: [{ text, target: classifyTicketTarget(text), blocking: true }],
+      verified: false,
+    };
+  }
+  const entries = Array.isArray(ticket) ? ticket : [ticket];
+  if (entries.length === 0) {
+    return { present: true, malformed: false, issues: [], verified: true };
+  }
+  const issues = [];
+  let malformed = false;
+  for (const entry of entries) {
+    if (!entry || typeof entry !== 'object' || Array.isArray(entry)) {
+      malformed = true;
+      continue;
+    }
+    const presentKeys = TICKET_ISSUE_KEYS.filter((key) =>
+      Object.prototype.hasOwnProperty.call(entry, key)
+    );
+    if (presentKeys.length === 0) {
+      // An entry that carries no recognizable compliance field is not
+      // positive evidence of compliance: fail closed instead of guessing.
+      malformed = true;
+      continue;
+    }
+    for (const key of presentKeys) {
+      const texts = parseTicketIssueValue(entry[key]);
+      for (const text of texts) {
+        issues.push({
+          text,
+          target: classifyTicketTarget(text),
+          blocking: true,
+        });
+      }
+    }
+  }
+  return {
+    present: true,
+    malformed,
+    issues,
+    verified: !malformed && issues.length === 0,
+  };
+}
+
+function nonActionableCautionIsMergeable(reviewPayload) {
   // Upstream can legitimately choose merge_with_caution for risk/advisory
   // prose even when its exact-HEAD review found no actionable issues.
   // Re-reviewing an unchanged clean HEAD cannot fix that recommendation.
@@ -1020,6 +1309,7 @@ function nonActionableCautionIsMergeable(review) {
   // structural failure signals before treating such caution as non-actionable.
   // Reuse the canonical clean-security parser: upstream writes natural-language
   // negations ("No security concerns identified"), not just "no"/"none".
+  const review = unwrapReview(reviewPayload);
   const security = review && review.security_concerns;
   if (security === undefined || security === null || security === '') return false;
   if (hasBlockingSecuritySignal(review) ||
@@ -1028,57 +1318,182 @@ function nonActionableCautionIsMergeable(review) {
 
   // An issue-less PR legitimately has no ticket_compliance_check entry.
   // Missing/empty ticket checks are not positive non-compliance. But an
-  // explicitly supplied ticket result must prove no non-compliant requirements;
-  // malformed or nonempty non-compliance keeps the merge gate closed.
-  const ticket = review && review.ticket_compliance_check;
-  if (ticket === undefined || ticket === null) return true;
-  if (!Array.isArray(ticket)) return false;
-  const empty = new Set(['', '-', 'none', 'n/a', 'na', 'no']);
-  for (const entry of ticket) {
-    if (!entry || typeof entry !== 'object' || Array.isArray(entry)) return false;
-    if (!Object.prototype.hasOwnProperty.call(entry, 'not_compliant_requirements')) return false;
-    const value = String(entry.not_compliant_requirements ?? '').trim().toLowerCase();
-    if (!empty.has(value)) return false;
+  // explicitly supplied ticket result must prove no non-compliant
+  // requirements; malformed or nonempty non-compliance keeps the merge gate
+  // closed. `safe_to_merge` follows the same rule in reviewDisposition: the
+  // recommendation string never overrides a genuine ticket obligation.
+  const ticket = ticketComplianceState(review);
+  return !ticket.malformed && ticket.issues.length === 0;
+}
+
+function reviewInputDigest(prBody) {
+  return crypto
+    .createHash('sha256')
+    .update(String(prBody === undefined || prBody === null ? '' : prBody).replace(/\r\n/g, '\n'))
+    .digest('hex');
+}
+
+function reviewInputVersion(headSha, prBody) {
+  const head = String(headSha || '').trim().toLowerCase();
+  if (!isPlausibleHeadSha(head)) {
+    throw new Error('review input version requires a plausible HEAD SHA');
   }
-  return true;
+  return head + ':' + reviewInputDigest(prBody);
 }
 
 function reviewDisposition(reviewPayload, improveJsonl, threshold = IMPROVE_REPAIR_THRESHOLD) {
   // Split envelopes carry signals on both sides: merge fail-closed via the
   // centralized unwrapReview so no finding is lost from the disposition.
-  const review = unwrapReview(reviewPayload);
-  if (!review || typeof review !== 'object' || Array.isArray(review)) {
-    throw new Error('PR-Agent review payload must be an object.');
-  }
-  if (!Array.isArray(review.key_issues_to_review)) {
-    throw new Error('PR-Agent review JSON has no key_issues_to_review list.');
-  }
+  const { review, items } = normalizeActionableItems(reviewPayload, improveJsonl, threshold);
   const recommendation = String(review.merge_recommendation || '').trim();
   if (!['safe_to_merge', 'merge_with_caution', 'changes_required'].includes(recommendation)) {
     throw new Error(
       'PR-Agent review has invalid merge_recommendation: ' + (recommendation || '<empty>')
     );
   }
-  const qualifying = qualifyingImproveSuggestions(improveJsonl, threshold);
-  const reviewCount = review.key_issues_to_review.length;
+  const qualifying = items.filter((item) => item.source === 'improve');
+  const reviewItems = items.filter((item) => item.source === 'review');
+  const reviewCount = reviewItems.length;
+  const ticket = ticketComplianceState(review);
+  const structural =
+    hasToolErrorSignal(review) ||
+    hasIncompleteCoverageSignal(review) ||
+    hasBlockingSecuritySignal(review) ||
+    (reviewCount === REVIEW_MAX_FINDINGS);
   const common = {
     recommendation,
     reviewCount,
     qualifyingSuggestionCount: qualifying.length,
+    ticketCompliance: {
+      present: ticket.present,
+      malformed: ticket.malformed,
+      verified: ticket.verified,
+      issues: ticket.issues.map((issue) => ({ text: issue.text, target: issue.target })),
+    },
+    items: items.map((item) => ({
+      id: item.id,
+      source: item.source,
+      target: item.target,
+      blocking: item.blocking,
+      advisory: item.advisory,
+      text: item.text,
+      completion: item.completion,
+    })),
   };
-  // The authoritative review is the merge/repair gate. /improve is an
-  // auxiliary repair input only after that review has already found an
-  // actionable defect. A clean reviewed HEAD must never be held in an endless
-  // polish loop by a fresh suggestion discovered by the optional second pass.
-  if (reviewCount > 0) {
+
+  const firstTarget = (list) => {
+    const ranks = [TARGET_CODE, TARGET_PR_DESCRIPTION, TARGET_CI, TARGET_POLICY, TARGET_INFRASTRUCTURE];
+    for (const target of ranks) {
+      if (list.some((entry) => entry.target === target)) return target;
+    }
+    return TARGET_CODE;
+  };
+
+  if (ticket.malformed) {
     return {
       ...common,
-      action: 'repair',
-      reason:
-        reviewCount + ' authoritative review finding(s), ' +
-        qualifying.length + ' auxiliary improve suggestion(s)',
+      action: 'rereview',
+      target: TARGET_INFRASTRUCTURE,
+      blocking: true,
+      reason: 'ticket compliance data is malformed or contradictory: failing closed',
     };
   }
+
+  if (reviewCount > 0) {
+    // Actionable code/test/doc findings own the repair batch. Metadata-only
+    // findings get a PR-body correction; owner/policy findings become a
+    // durable hold. A mixed batch still repairs code first because the same
+    // code commit produces the evidence a later metadata review needs.
+    const target = firstTarget(reviewItems);
+    if (target === TARGET_CODE) {
+      return {
+        ...common,
+        action: 'repair',
+        target,
+        blocking: true,
+        reason:
+          reviewCount + ' authoritative review finding(s), ' +
+          qualifying.length + ' auxiliary improve suggestion(s)',
+      };
+    }
+    if (target === TARGET_PR_DESCRIPTION) {
+      return {
+        ...common,
+        action: 'metadata',
+        target,
+        blocking: true,
+        reason: 'authoritative review requires PR description/metadata evidence; no code change is implied',
+      };
+    }
+    if (target === TARGET_POLICY) {
+      return {
+        ...common,
+        action: 'hold',
+        target,
+        blocking: true,
+        reason: 'authoritative review requires a non-automatable policy/owner decision',
+      };
+    }
+    return {
+      ...common,
+      action: 'rereview',
+      target,
+      blocking: true,
+      reason: 'authoritative review finding targets an external/CI condition: failing closed',
+    };
+  }
+
+  if (ticket.issues.length > 0) {
+    // A genuine unresolved ticket obligation blocks merge even when upstream
+    // says safe_to_merge (Continuum PR #392 regression). Dispatch by the
+    // requirement's remediation target, never by the recommendation string.
+    const target = firstTarget(ticket.issues);
+    if (target === TARGET_PR_DESCRIPTION) {
+      return {
+        ...common,
+        action: 'metadata',
+        target,
+        blocking: true,
+        reason: 'required ticket evidence belongs in the PR description/metadata',
+      };
+    }
+    if (target === TARGET_CODE) {
+      return {
+        ...common,
+        action: 'repair',
+        target,
+        blocking: true,
+        reason: 'required ticket obligation names a concrete code/test change',
+      };
+    }
+    if (target === TARGET_POLICY) {
+      return {
+        ...common,
+        action: 'hold',
+        target,
+        blocking: true,
+        reason: 'required ticket obligation needs an owner/policy decision',
+      };
+    }
+    return {
+      ...common,
+      action: 'rereview',
+      target,
+      blocking: true,
+      reason: 'required ticket obligation depends on an existing CI/qualification path',
+    };
+  }
+
+  if (structural) {
+    return {
+      ...common,
+      action: 'rereview',
+      target: TARGET_INFRASTRUCTURE,
+      blocking: true,
+      reason: 'structured security/tool-error/incomplete review: failing closed',
+    };
+  }
+
   if (
     recommendation === 'safe_to_merge' ||
     (recommendation === 'merge_with_caution' && nonActionableCautionIsMergeable(review))
@@ -1086,17 +1501,101 @@ function reviewDisposition(reviewPayload, improveJsonl, threshold = IMPROVE_REPA
     return {
       ...common,
       action: 'merge',
+      target: null,
+      blocking: false,
       reason:
         recommendation === 'safe_to_merge'
-          ? 'safe_to_merge with no actionable review/improve items'
+          ? 'safe_to_merge with empty/verified compliance and no actionable review items'
           : 'non-actionable caution with explicit no-security/no-noncompliance evidence',
     };
   }
   return {
     ...common,
     action: 'rereview',
+    target: TARGET_INFRASTRUCTURE,
+    blocking: true,
     reason: 'blocking merge recommendation without actionable payload: ' + recommendation,
   };
+}
+
+function buildMetadataEvidence(requirements, files, options = {}) {
+  // Deterministic, source-grounded PR-description evidence for a
+  // metadata-only review obligation. It never invents before/after examples:
+  // examples are extracted from the actual patch, and when the diff carries
+  // no usable pair the section is omitted.
+  const opts = options && typeof options === 'object' ? options : {};
+  const requirementTexts = (Array.isArray(requirements) ? requirements : [])
+    .map((entry) => (typeof entry === 'string' ? entry : entry && entry.text))
+    .map((text) => String(text || '').trim())
+    .filter(Boolean);
+  const requireBeforeAfter = requirementTexts.some((text) =>
+    /\bbefore\s*(?:\/|and)\s*after\b/i.test(text)
+  );
+  const lines = [];
+  lines.push('## Review evidence');
+  lines.push('');
+  if (requirementTexts.length > 0) {
+    lines.push('Reviewer-required evidence:');
+    for (const text of [...new Set(requirementTexts)]) {
+      lines.push('- ' + text.replace(/\s+/g, ' ').slice(0, 500));
+    }
+    lines.push('');
+  }
+  if (requireBeforeAfter) {
+    const examples = [];
+    for (const file of Array.isArray(files) ? files : []) {
+      if (examples.length >= 3) break;
+      const patch = String((file && file.patch) || '');
+      if (!patch) continue;
+      const removed = [];
+      const added = [];
+      for (const rawLine of patch.split('\n')) {
+        if (rawLine.startsWith('---') || rawLine.startsWith('+++')) continue;
+        if (rawLine.startsWith('-') && rawLine.slice(1).trim()) removed.push(rawLine.slice(1).trim());
+        if (rawLine.startsWith('+') && rawLine.slice(1).trim()) added.push(rawLine.slice(1).trim());
+      }
+      if (!removed.length || !added.length) continue;
+      const before = removed[0].slice(0, 240);
+      const after = added[0].slice(0, 240);
+      examples.push(
+        '- `' + String(file.filename || 'file') + '`: Before: `' + before +
+        '`; After: `' + after + '`'
+      );
+    }
+    if (examples.length > 0) {
+      lines.push('### Before / After');
+      lines.push('');
+      lines.push(...examples);
+      lines.push('');
+    }
+  }
+  if (opts.head) {
+    lines.push(
+      'Validated on exact HEAD `' + String(opts.head).trim() + '`; this description ' +
+      'update is reviewed afresh before merge.'
+    );
+    lines.push('');
+  }
+  const headMarker = opts.head ? ' head=' + String(opts.head).trim().toLowerCase() : '';
+  return [
+    '<!-- continuum-pr-body-evidence:v1' + headMarker + ' -->',
+    ...lines,
+    '<!-- /continuum-pr-body-evidence -->',
+  ].join('\n').trim();
+}
+
+function replaceMetadataEvidence(prBody, evidence) {
+  // Replace only the machine-owned evidence block; every other byte of the
+  // existing PR description (task context, snapshot reference, accepted
+  // markers, Closes keywords, qualification semantics) is preserved.
+  const body = String(prBody === undefined || prBody === null ? '' : prBody);
+  const pattern =
+    /<!--\s*continuum-pr-body-evidence:v1[^>]*-->[\s\S]*?<!--\s*\/continuum-pr-body-evidence\s*-->/m;
+  const section = String(evidence || '').trim();
+  if (pattern.test(body)) {
+    return body.replace(pattern, section);
+  }
+  return body.trimEnd() + '\n\n' + section + '\n';
 }
 
 function controllerStateBody(stateMarker, summary) {
@@ -1128,7 +1627,9 @@ module.exports = {
   REVIEW_MAX_FINDINGS,
   REVIEW_MERGE_SAFE,
   attributionHeader,
+  buildMetadataEvidence,
   buildRepairBatch,
+  classifyRemediationTarget,
   controllerAttributionComponent,
   controllerStateBody,
   hasBlockingSecuritySignal,
@@ -1137,14 +1638,24 @@ module.exports = {
   isCleanReviewForImproveSkip,
   isSkippedCleanImprovePayload,
   logicalFingerprint,
+  normalizeActionableItems,
   normalizeProblem,
   originMarker,
   overlappingLocation,
   parseImproveJsonl,
   persistentHasActive,
   qualifyingImproveSuggestions,
+  replaceMetadataEvidence,
   reviewDisposition,
+  reviewInputDigest,
+  reviewInputVersion,
   nonActionableCautionIsMergeable,
   sameLogicalDefect,
+  ticketComplianceState,
   unwrapReview,
+  TARGET_CI,
+  TARGET_CODE,
+  TARGET_INFRASTRUCTURE,
+  TARGET_POLICY,
+  TARGET_PR_DESCRIPTION,
 };

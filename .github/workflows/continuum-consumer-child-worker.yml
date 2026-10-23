@@ -461,7 +461,28 @@ jobs:
             echo "::error::Task snapshot reference is missing for child task #$TASK_NUMBER; refusing to open an unprotected PR." >&2
             exit 1
           fi
-          pr_body="$(cat <<EOF
+          child_diff_file="$RUNNER_TEMP/continuum-child-pr.diff"
+          git diff --no-ext-diff "$base_sha..HEAD" > "$child_diff_file" 2>/dev/null || : > "$child_diff_file"
+          child_task_body_file="$RUNNER_TEMP/continuum-child-task-body.txt"
+          printf '%s' "$issue_body" > "$child_task_body_file"
+          child_pr_body_helper="$CONTINUUM_ENGINE_ROOT/src/continuum/pr_body.py"
+          if [[ -f "$child_pr_body_helper" ]]; then
+            child_qualification=""
+            if grep -Eqi '<!--[[:space:]]*automation-qualification:' <<<"$issue_body"; then
+              child_qualification="--qualification"
+            fi
+            child_recovery_note="$(printf 'Delegated implementation for #%s executed by the configured Continuum parent.\n\nChild source, issue text, test logs, and agent transcript were not uploaded to the parent repository.' "$TASK_NUMBER")"
+            pr_body="$(python3 "$child_pr_body_helper" compose \
+              --snapshot-ref "$child_snapshot_ref" \
+              --issue-number "$TASK_NUMBER" \
+              --task-body-file "$child_task_body_file" \
+              --diff-file "$child_diff_file" \
+              --head "$(git rev-parse HEAD)" \
+              --child-accepted \
+              --recovery-note "$child_recovery_note" \
+              $child_qualification)"
+          else
+            pr_body="$(cat <<EOF
           Delegated implementation for #$TASK_NUMBER executed by the configured Continuum parent.
 
           Child source, issue text, test logs, and agent transcript were not uploaded to the parent repository.
@@ -471,6 +492,7 @@ jobs:
           Closes #$TASK_NUMBER
           EOF
           )"
+          fi
           pr_url="$(
             gh pr create --repo "$child_repo" --base main --head "$branch"               --title "$issue_title" --body "$pr_body" 2>/dev/null
           )"

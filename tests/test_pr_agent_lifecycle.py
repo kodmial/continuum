@@ -5524,7 +5524,7 @@ class ReviewDispositionIntegrationTests(unittest.TestCase):
         )
         self.assertEqual(
             run_policy("disposition", {"review": caution_with_gap}).get("action"),
-            "rereview",
+            "repair",
         )
         self.assertEqual(
             run_policy(
