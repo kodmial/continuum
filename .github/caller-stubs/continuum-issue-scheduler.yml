@@ -151,7 +151,12 @@ jobs:
     # Parent filtering is unchanged: unrelated issue comments stay cheap
     # caller skips. A manual owner `/oc` is in-flight work the scheduler must
     # reserve, and trusted qualification result comments wake the scheduler
-    # immediately; cron remains the missed-event backstop. This stub is only
+    # immediately; cron remains the missed-event backstop. Continuum's own
+    # scheduler dispatch and watchdog recovery comments are machine-origin
+    # exceptions: they already represent work the scheduler started, so they
+    # must not wake it again. These are exact markers, not a generic origin
+    # check; an owner who manually copies one into a command is intentionally
+    # suppressed with them, so a manual wake must omit the marker. This stub is only
     # a cheap prefilter: the reusable scheduler applies the canonical exact
     # parser before it reserves or dispatches anything.
     if: >-
@@ -159,7 +164,9 @@ jobs:
       (github.event_name != 'issue_comment' ||
        (github.actor == github.repository_owner &&
         (startsWith(github.event.comment.body, '/oc') ||
-         startsWith(github.event.comment.body, '/opencode'))) ||
+         startsWith(github.event.comment.body, '/opencode')) &&
+        !contains(github.event.comment.body, '<!-- issue-scheduler-dispatch -->') &&
+        !contains(github.event.comment.body, '<!-- continuum-origin role=continuum component=opencode-watchdog -->')) ||
        ((github.actor == github.repository_owner ||
          github.actor == 'github-actions[bot]' ||
          github.event.comment.author_association == 'OWNER' ||
