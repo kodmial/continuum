@@ -9,11 +9,7 @@ require 'open3'
 
 class ContinuumTest < Minitest::Test
   ROOT = File.expand_path('..', __dir__)
-  # The historical direct OpenCode event dispatcher is a compatibility
-  # fixture for consumers not yet migrated to CodeRabbit-owned batching.
-  CORE_STUBS = Dir[File.join(ROOT, '.github/caller-stubs/*.yml')].sort.reject do |path|
-    File.basename(path) == 'continuum-opencode-unresolved.yml'
-  end
+  CORE_STUBS = Dir[File.join(ROOT, '.github/caller-stubs/*.yml')].sort
   TECH_STUBS = Dir[File.join(ROOT, '.github/caller-stubs/tech/*.yml')].sort
   PARENT_STUBS = Dir[File.join(ROOT, '.github/caller-stubs/parent/*.yml')].sort
   WORKFLOWS = Dir[File.join(ROOT, '.github/workflows/*.yml')].sort
@@ -8222,6 +8218,37 @@ class ContinuumTest < Minitest::Test
     assert_includes executor, 'Continuum-Component: opencode'
     assert_includes executor, 'CONTINUUM_OPENCODE_PUBLISH_RACE_RETRY_REQUIRED'
     assert_includes executor, 'Qualify current CodeRabbit unresolved batch'
+  end
+
+  # The historical direct OpenCode UNRESOLVED caller template is retired from
+  # fresh installs. The canonical CodeRabbit caller owns the same event, while
+  # the legacy reusable engine stays dispatchable for consumers that still have
+  # the old caller installed.
+  def test_retired_opencode_unresolved_caller_template_keeps_one_canonical_owner
+    retired = '.github/caller-stubs/continuum-opencode-unresolved.yml'
+    refute File.exist?(File.join(ROOT, retired)),
+           'the retired caller template must not be shipped by fresh installs'
+    refute_includes CORE_STUBS.map { |path| File.basename(path) }, 'continuum-opencode-unresolved.yml'
+    installer = File.read(File.join(ROOT, 'install.sh'))
+    core = installer[/^CORE_STUBS=\((.*?)^\)/m, 1]
+    refute_nil core, 'install.sh must keep an explicit CORE_STUBS array'
+    refute_includes core, 'continuum-opencode-unresolved.yml',
+                    'CORE_STUBS must not recreate the retired caller'
+
+    assert File.exist?(File.join(ROOT, '.github/workflows/continuum-opencode-unresolved.yml')),
+           'the legacy reusable engine must remain for already-installed old callers'
+    canonical_stub = yaml(File.join(ROOT, '.github/caller-stubs/continuum-coderabbit-unresolved.yml'))
+    canonical_events = events(canonical_stub)
+    assert_equal ['pull_request_review_comment'], canonical_events.keys,
+                 'the canonical CodeRabbit caller must own the UNRESOLVED event path'
+    assert_equal ['created'], canonical_events.fetch('pull_request_review_comment').fetch('types')
+    canonical_engine = workflow_body('continuum-coderabbit-unresolved.yml')
+    assert_includes canonical_engine, "github.event.comment.user.login == 'coderabbitai[bot]'"
+    legacy_engine = workflow_body('continuum-opencode-unresolved.yml')
+    assert_includes legacy_engine, 'CANONICAL_CALLER'
+    assert_includes legacy_engine,
+                    "grep -qE '^[[:space:]]*uses:[[:space:]]*kodmial/continuum/.github/workflows/continuum-coderabbit-unresolved.yml@'"
+    assert_includes legacy_engine, 'dispatch=false'
   end
 
   def test_coderabbit_unresolved_reverification_uses_unwrapped_git_ref_data

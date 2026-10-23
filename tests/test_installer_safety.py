@@ -12,10 +12,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 INSTALL = ROOT / "install.sh"
 STUB_ROOT = ROOT / ".github" / "caller-stubs"
-CORE_STUBS = sorted(
-    path for path in STUB_ROOT.glob("*.yml")
-    if path.name != "continuum-opencode-unresolved.yml"
-)
+CORE_STUBS = sorted(STUB_ROOT.glob("*.yml"))
 CORE_NAMES = [path.name for path in CORE_STUBS]
 
 
