@@ -44,6 +44,10 @@ continuum_remove_workflow_path() {
   local path="$1"
   git rm -r -f --ignore-unmatch -- "$path" >/dev/null 2>&1 || true
   git update-index --force-remove -- "$path" >/dev/null 2>&1 || true
+  if [[ -n "$(git ls-files -- "$path")" ]]; then
+    continuum_staging_error "failed to remove workflow-owned path '$path' from the index; refusing to stage."
+    return 1
+  fi
   rm -rf -- "$path"
 }
 
@@ -93,7 +97,7 @@ continuum_stage_checkpoint() {
   git add -A
   local path
   for path in "${CONTINUUM_CHECKPOINT_EXCLUDED_PATHS[@]}"; do
-    continuum_remove_workflow_path "$path"
+    continuum_remove_workflow_path "$path" || return 1
   done
   continuum_assert_configured_gitlinks
 }
@@ -102,7 +106,7 @@ continuum_stage_publishable() {
   git add -A
   local path
   for path in "${CONTINUUM_PUBLISH_EXCLUDED_PATHS[@]}"; do
-    continuum_remove_workflow_path "$path"
+    continuum_remove_workflow_path "$path" || return 1
   done
   continuum_assert_configured_gitlinks
 }

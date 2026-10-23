@@ -317,6 +317,29 @@ class PublishIsolationTest(unittest.TestCase):
         )
         self.assertTrue((self.repo / "mystery").exists())
 
+    def test_removal_failure_refuses_to_leave_workflow_paths_staged(self):
+        self.embed_cancel_engine()
+        script = (
+            'source "{}"; git add -A; : > .git/index.lock; '
+            'continuum_remove_workflow_path .continuum-cancel-engine'
+        ).format(STAGING_LIBRARY)
+        env = dict(os.environ)
+        env.update(GIT_ENV)
+        completed = subprocess.run(
+            ["bash", "-c", script],
+            cwd=str(self.repo),
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=120,
+        )
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertIn("failed to remove workflow-owned path", completed.stderr)
+        self.assertIn(
+            ".continuum-cancel-engine",
+            run_git(self.repo, "ls-files", "--stage"),
+        )
+
     def test_concurrent_publish_staging_keeps_both_trees_clean(self):
         work_a = self.workdir / "work-a"
         work_b = self.workdir / "work-b"

@@ -104,7 +104,7 @@ APPROVED_415_OPENCODE_SHA256 = (
 # cancellation-engine checkouts and recovery metadata can never enter a PR
 # tree. Historical digests above remain for audit.
 APPROVED_413_OPENCODE_SHA256 = (
-    "f4ff009be918df3c43722e448c9a31a4558bdad602f9c600cadcbd8bc0007b29"
+    "566da1b1ccb719f0016a68a54542e6917155bdbd7918711e0051d8f30dc119be"
 )
 
 APPROVED_350_SELF_CALLER_SHA256 = (

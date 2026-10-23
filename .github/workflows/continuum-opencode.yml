@@ -2467,7 +2467,21 @@ jobs:
             find . -type d -name '__pycache__' -prune -exec rm -rf {} + 2>/dev/null || true
             find . -type f \( -name '*.pyc' -o -name '*.pyo' \) -delete 2>/dev/null || true
             if [[ -n "$(git status --porcelain 2>/dev/null)" ]]; then
-              continuum_stage_checkpoint
+              if ! continuum_stage_checkpoint; then
+                echo "::error::Continuum staging: refusing checkpoint of 429-interrupted ${mode} work after staging failure; declining to publish recovery state." >&2
+                if [[ "$failure_kind" == "quota_429" ]]; then
+                  : > "${RUNNER_TEMP:-/tmp}/continuum-opencode-429"
+                  echo "CONTINUUM_429_CHECKPOINT_REF=" >> "${GITHUB_ENV:-/dev/null}"
+                  echo "CONTINUUM_429_OPERATION=${operation}" >> "${GITHUB_ENV:-/dev/null}"
+                  echo "::error::CONTINUUM_OPENCODE_429_RESTART_REQUIRED"
+                  exit 75
+                fi
+                : > "${RUNNER_TEMP:-/tmp}/continuum-opencode-upstream-unavailable"
+                echo "CONTINUUM_429_CHECKPOINT_REF=" >> "${GITHUB_ENV:-/dev/null}"
+                echo "CONTINUUM_429_OPERATION=${operation}" >> "${GITHUB_ENV:-/dev/null}"
+                echo "::error::CONTINUUM_OPENCODE_UPSTREAM_UNAVAILABLE_RESTART_REQUIRED"
+                exit 76
+              fi
               if ! git diff --cached --quiet; then
                 git commit -m "chore: checkpoint 429-interrupted ${mode} work" \
                   -m "Continuum-Checkpoint-429-Operation: ${operation}" \
