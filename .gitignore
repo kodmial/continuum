@@ -1,5 +1,9 @@
 .opencode-tmp/
+.continuum-admission-engine/
 .continuum-cancel-engine/
+.continuum-engine/
+.continuum-repair-engine/
+.continuum-watchdog-engine/
 __pycache__/
 *.pyc
 

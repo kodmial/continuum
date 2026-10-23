@@ -171,6 +171,47 @@ class FreshRunner429CheckoutTests(unittest.TestCase):
             names.index("Implement issue"),
         )
 
+    def test_engine_checkout_directories_can_never_be_checkpointed_as_gitlinks(self):
+        # A 429 evacuation stages the whole working tree. If an engine
+        # checkout such as .continuum-cancel-engine is not ignored, Git records
+        # it as a submodule gitlink; with no .gitmodules entry every later
+        # checkout then fails with "No url found for submodule path".
+        workflows = ROOT / ".github" / "workflows"
+        checkout_paths = set()
+        for path in sorted(workflows.glob("*.yml")):
+            body = path.read_text(encoding="utf-8")
+            data = yaml.safe_load(body) or {}
+            for job in (data.get("jobs") or {}).values():
+                for step in job.get("steps") or []:
+                    if not isinstance(step, dict):
+                        continue
+                    checkout_path = str(
+                        (step.get("with") or {}).get("path") or ""
+                    ).strip()
+                    if checkout_path.startswith(".continuum-"):
+                        checkout_paths.add(checkout_path.strip("/"))
+            for match in re.finditer(
+                r"repo=(\.continuum-[A-Za-z0-9-]+)", body
+            ):
+                checkout_paths.add(match.group(1).strip("/"))
+        self.assertIn(".continuum-cancel-engine", checkout_paths)
+        ignored = {
+            line.strip().rstrip("/")
+            for line in (ROOT / ".gitignore").read_text(
+                encoding="utf-8"
+            ).splitlines()
+            if line.strip() and not line.lstrip().startswith("#")
+        }
+        for checkout_path in sorted(checkout_paths):
+            with self.subTest(path=checkout_path):
+                self.assertIn(
+                    checkout_path,
+                    ignored,
+                    checkout_path + " is a workflow engine checkout; a missing "
+                    ".gitignore entry lets the 429 checkpoint publish it as a "
+                    "gitlink and breaks every later checkout",
+                )
+
 
 if __name__ == "__main__":
     unittest.main()
