@@ -905,6 +905,115 @@ jobs:
               ) || null;
             }
 
+            function hasNoAutoMergeHold(candidate) {
+              return (candidate?.labels || []).some(label =>
+                String(label?.name || label || '') === 'no-auto-merge'
+              );
+            }
+
+            // Mirrors the merge gate's REST/GraphQL-compatible conflict check.
+            // A successful review only proves the review operation; it never
+            // proves the merge lifecycle. A conflicted mergeability state is
+            // therefore a deterministic hold, not fresh work to replay.
+            function isConflictedMergeability(mergeable, mergeableState) {
+              const state = String(mergeableState || '').trim().toLowerCase();
+              if (state === 'dirty') return true;
+              if (typeof mergeable === 'boolean') return !mergeable;
+              if (mergeable === null || mergeable === undefined) {
+                return state === '' || state === 'unknown' ? null : false;
+              }
+              const text = String(mergeable).trim().toLowerCase();
+              if (
+                text === 'false' ||
+                text === 'conflicting' ||
+                text === 'conflicted' ||
+                text === 'dirty'
+              ) {
+                return true;
+              }
+              if (
+                text === 'true' ||
+                text === 'mergeable' ||
+                text === 'clean' ||
+                text === 'stable' ||
+                text === 'blocked' ||
+                text === 'behind'
+              ) {
+                return false;
+              }
+              return null;
+            }
+
+            // Admission for the clean-review -> merge-lifecycle transition.
+            // A successful review status is not proof that the open PR has
+            // finished its merge lifecycle: an explicit no-auto-merge hold or
+            // an earlier skipped merge leaves the PR open with clean evidence.
+            // Only a still-open, non-draft, same-repository PR with no current
+            // hold, no retryable/incomplete review run and no deterministic
+            // merge blocker may resume through the full PR-Agent
+            // review/merge orchestration. Reviewer-policy decisions are
+            // handled before this function and are never treated as approval.
+            function assessCleanReviewLifecycle({
+              reviewStatus,
+              runConclusionRetryable = false,
+              pr,
+              freshPr,
+              head,
+              repoFullName,
+            }) {
+              const state = String(reviewStatus?.state || '').toLowerCase();
+              const description = String(reviewStatus?.description || '');
+              if (state !== 'success') {
+                return { decision: 'not-clean-review', reason: 'review operation has not succeeded' };
+              }
+              if (/actionable/i.test(description) || /blocking; recovery eligible/i.test(description)) {
+                return { decision: 'not-clean-review', reason: 'reviewer policy requires repair or re-review' };
+              }
+              // Cheap NOOP while the owner holds automatic merge: no merge
+              // and no repeated reviewer/model execution.
+              if (hasNoAutoMergeHold(pr)) {
+                return { decision: 'hold', reason: 'review is clean under explicit no-auto-merge hold' };
+              }
+              if (!freshPr) {
+                return { decision: 'defer', reason: 'current PR state is unavailable' };
+              }
+              const freshHead = String(freshPr.head?.sha || '').toLowerCase();
+              if (freshHead !== String(head || '').toLowerCase()) {
+                return {
+                  decision: 'hold',
+                  reason: 'PR moved from ' + head + ' to ' + (freshHead || '<missing>'),
+                };
+              }
+              if (String(freshPr.state || '').toLowerCase() !== 'open' || freshPr.merged) {
+                return { decision: 'settled', reason: 'PR is already merged or closed' };
+              }
+              if (freshPr.draft) {
+                return { decision: 'hold', reason: 'PR is a draft' };
+              }
+              if (!freshPr.head?.repo || freshPr.head.repo.full_name !== repoFullName) {
+                return { decision: 'hold', reason: 'PR is not same-repository' };
+              }
+              if (hasNoAutoMergeHold(freshPr)) {
+                return { decision: 'hold', reason: 'review is clean under explicit no-auto-merge hold' };
+              }
+              if (runConclusionRetryable) {
+                return {
+                  decision: 'replay',
+                  reason: 'clean review belongs to an incomplete orchestration run',
+                };
+              }
+              if (isConflictedMergeability(freshPr.mergeable, freshPr.mergeable_state) === true) {
+                return {
+                  decision: 'hold',
+                  reason: 'merge conflict/stale base blocks the merge lifecycle',
+                };
+              }
+              return {
+                decision: 'resume',
+                reason: 'clean exact-HEAD review completed but the merge lifecycle is unfinished',
+              };
+            }
+
             async function operationIsActive(prNumber, head, kind) {
               // Re-read immediately before dispatch-grace coalescing. A fresh
               // controller marker is only proof of a live dispatch while the
@@ -1504,6 +1613,23 @@ jobs:
                 );
                 return false;
               }
+              // Re-read the current hold immediately before dispatch so a
+              // re-added no-auto-merge label never pays for another reviewer/
+              // model execution. The merge gate re-checks the hold as well.
+              if (hasNoAutoMergeHold(fresh)) {
+                core.info(
+                  'PR #' + pr.number + ' HEAD ' + head +
+                  ': explicit no-auto-merge hold is present; recovery dispatch cancelled.'
+                );
+                return false;
+              }
+              if (isConflictedMergeability(fresh.mergeable, fresh.mergeable_state) === true) {
+                core.info(
+                  'PR #' + pr.number + ' HEAD ' + head +
+                  ': merge conflict/stale base blocks the merge lifecycle; recovery dispatch cancelled.'
+                );
+                return false;
+              }
               if (!(await exactHeadCiGreen(head))) {
                 core.info(
                   'PR #' + pr.number + ' HEAD ' + head +
@@ -2094,68 +2220,76 @@ jobs:
               );
 
               const reviewStatus = latestContext(statuses, REVIEW_CONTEXT);
-              // A clean review status is terminal only when the orchestration
-              // run that published it also completed successfully. GitHub can
-              // preserve the clean exact-HEAD status even when a downstream
-              // merge job fails (for example because a cross-job output was
-              // suppressed). In that case the PR is still open and the
-              // lifecycle is incomplete: replay the bounded review
-              // orchestration so the current merge path gets fresh,
-              // runner-local evidence instead of stranding a clean PR.
+              // A clean review operation is not the same as a completed merge
+              // lifecycle. Even when the orchestration run that published the
+              // status succeeded, the open PR can still be waiting for an
+              // explicit no-auto-merge hold to be lifted, for mergeability to
+              // finish, or for a skipped merge to be retried. Only a
+              // merged/closed PR, a currently held/draft/conflicted PR, or a
+              // genuinely settled lifecycle is a NOOP; otherwise resume the
+              // bounded full orchestration so the current merge path gets
+              // fresh, runner-local evidence instead of stranding a clean PR.
               let cleanReviewRun = null;
-              let cleanMergeabilityPending = false;
+              let cleanLifecycleIncomplete = false;
               if (reviewStatus?.state === 'success') {
                 const cleanDescription = String(reviewStatus.description || '');
                 if (!/actionable/i.test(cleanDescription) && !/blocking; recovery eligible/i.test(cleanDescription)) {
                   cleanReviewRun = await statusRunMetadata(reviewStatus);
                   const cleanRunConclusion =
                     String(cleanReviewRun.conclusion || '').toLowerCase();
-                  if (!retryableConclusions.has(cleanRunConclusion)) {
-                    const explicitMergeHold = (pr.labels || []).some(label =>
-                      String(label?.name || label || '') === 'no-auto-merge'
-                    );
-                    if (explicitMergeHold) {
-                      core.info(
-                        'PR #' + pr.number + ' HEAD ' + head +
-                        ': review is settled clean under explicit no-auto-merge hold.'
-                      );
-                      continue;
-                    }
-                    const freshPr = await withReadFallback(async client => (
+                  const cleanRunRetryable =
+                    retryableConclusions.has(cleanRunConclusion);
+                  // Re-read the live PR before deciding: the owner may have
+                  // re-added the hold, moved the HEAD, merged/closed the PR,
+                  // or made it a draft since the open-PR snapshot.
+                  let freshPr = null;
+                  if (!hasNoAutoMergeHold(pr)) {
+                    freshPr = await withReadFallback(async client => (
                       await client.rest.pulls.get({
                         owner,
                         repo,
                         pull_number: pr.number,
                       })
                     ).data);
-                    const freshHead = String(freshPr.head?.sha || '').toLowerCase();
-                    if (freshHead !== head) {
-                      core.info(
-                        'PR #' + pr.number + ' moved from ' + head + ' to ' +
-                        (freshHead || '<missing>') +
-                        ' while checking mergeability; stale recovery wakeup ignored.'
-                      );
-                      continue;
-                    }
-                    cleanMergeabilityPending = freshPr.mergeable === null;
-                    if (!cleanMergeabilityPending) {
-                      core.info(
-                        'PR #' + pr.number + ' HEAD ' + head +
-                        ': review is settled clean; recovery has nothing to do.'
-                      );
-                      continue;
-                    }
+                  }
+                  const assessment = assessCleanReviewLifecycle({
+                    reviewStatus,
+                    runConclusionRetryable: cleanRunRetryable,
+                    pr,
+                    freshPr,
+                    head,
+                    repoFullName,
+                  });
+                  if (assessment.decision === 'not-clean-review') {
                     core.info(
                       'PR #' + pr.number + ' HEAD ' + head +
-                      ': mergeability is still computing; recovery eligible.'
+                      ': ' + assessment.reason + '; reviewer policy remains authoritative.'
+                    );
+                  } else if (assessment.decision !== 'resume' && assessment.decision !== 'replay') {
+                    core.info(
+                      'PR #' + pr.number + ' HEAD ' + head +
+                      ': ' + assessment.reason + '; recovery has nothing to do.'
+                    );
+                    continue;
+                  } else if (assessment.decision === 'resume') {
+                    // The review operation is clean for this exact HEAD, but
+                    // the open PR proves the enclosing merge lifecycle did not
+                    // finish (for example an explicit hold skipped the merge).
+                    // Resume through the same bounded full orchestration.
+                    cleanLifecycleIncomplete = true;
+                    core.info(
+                      'PR #' + pr.number + ' HEAD ' + head +
+                      ': ' + assessment.reason +
+                      '; bounded recovery will resume the full PR-Agent review/merge lifecycle.'
+                    );
+                  } else {
+                    core.warning(
+                      'PR #' + pr.number + ' HEAD ' + head +
+                      ': ' + assessment.reason + ' (' +
+                      (cleanRunConclusion || 'unknown') +
+                      '); bounded recovery will replay the review/merge lifecycle.'
                     );
                   }
-                  core.warning(
-                    'PR #' + pr.number + ' HEAD ' + head +
-                    ': clean review belongs to an incomplete orchestration run (' +
-                    (cleanRunConclusion || 'unknown') +
-                    '); bounded recovery will replay the review/merge lifecycle.'
-                  );
                 }
               }
               const comments = await withReadFallback(async (client) => {
@@ -2225,6 +2359,19 @@ jobs:
                       'PR-Agent clean review lifecycle incomplete: recovery eligible',
                   };
                   operationRun = reviewRun;
+                } else if (cleanLifecycleIncomplete) {
+                  // The review run succeeded, but the PR is still open and
+                  // eligible for the merge lifecycle to resume. Keep the
+                  // success state and let decide() treat the lifecycle as
+                  // incomplete instead of silently settling the PR.
+                  kind = 'review';
+                  operationStatus = {
+                    ...reviewStatus,
+                    state: 'success',
+                    description:
+                      'PR-Agent clean review lifecycle incomplete: merge not completed',
+                  };
+                  operationRun = reviewRun;
                 } else {
                   core.info(
                     'PR #' + pr.number + ' HEAD ' + head +
@@ -2259,7 +2406,7 @@ jobs:
                 runConclusion: operationRun.conclusion,
                 evidence,
                 operationContext: String(operationStatus?.context || ''),
-                lifecycleComplete: !cleanMergeabilityPending,
+                lifecycleComplete: !cleanLifecycleIncomplete,
               });
 
               core.info(
