@@ -493,6 +493,8 @@ def evaluate_predecessor_completion(
 ) -> Tuple[bool, str, Optional[int], str]:
     """Evaluate the complete trusted completion chain for a predecessor."""
 
+    if predecessor_issue.get("pull_request"):
+        return False, "predecessor is a pull request, not an issue", None, ""
     number = _number(predecessor_issue.get("number"))
     if not number:
         return False, "predecessor issue identity is invalid", None, ""
@@ -632,6 +634,12 @@ def decide_owner_resume(
 
     if predecessor_issue is None:
         return ResumeDecision(NOOP, "predecessor state is unavailable")
+    if predecessor_issue.get("pull_request"):
+        return ResumeDecision(NOOP, "predecessor is a pull request")
+    if _number(predecessor_issue.get("number")) != instruction.predecessor:
+        return ResumeDecision(
+            NOOP, "predecessor identity does not match the owner marker"
+        )
     if str(predecessor_issue.get("state") or "").lower() == "open":
         return ResumeDecision(
             WAIT,

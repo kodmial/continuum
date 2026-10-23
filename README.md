@@ -96,8 +96,10 @@ actually merged to the default branch with exact-HEAD `CI`, Contract Gate, and
 independent clean-review evidence. Continuum then removes only that target's
 `automation:paused` label and lets the existing checkpoint/watchdog recovery
 path continue; it does not edit the task snapshot, start a new generation, or
-resume any other paused issue. A post-marker recovery attempt is a bounded
-fence, so a failed automatic recovery stays paused instead of looping.
+resume any other paused issue. While the predecessor is incomplete the marker
+is a `WAIT`: the pause label stays in place even when an old scheduler lease
+expires. A post-marker recovery attempt is a bounded fence, so a failed
+automatic recovery stays paused instead of looping.
 
 ## What this adds beyond plain GitHub Actions
 

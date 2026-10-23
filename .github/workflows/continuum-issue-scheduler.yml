@@ -3959,10 +3959,21 @@ jobs:
               // fresh infrastructure retry budget. Dispatches before the
               // marker are history and cannot immediately re-pause the
               // target; post-marker dispatches stay bounded and a failed
-              // recovery remains paused instead of looping.
-              const ownerResumeBaselineMs = ownerResumeBaselineNumber(
+              // recovery remains paused instead of looping. The fresh budget
+              // applies only after the owner-resume decision admitted the
+              // target (the pause label is gone). A still-paused target has
+              // not proven its predecessor complete, so its original budget
+              // keeps applying and lease expiry must not release it.
+              const ownerResumeMarkerBaselineMs = ownerResumeBaselineNumber(
                 comments, issueNumber
               );
+              const ownerResumeMarkerPending =
+                ownerResumeMarkerBaselineMs !== null &&
+                labels.has(pausedLabel);
+              const ownerResumeBaselineMs =
+                ownerResumeMarkerPending
+                  ? null
+                  : ownerResumeMarkerBaselineMs;
               const countedSchedulerDispatches =
                 ownerResumeBaselineMs === null
                   ? schedulerDispatches
@@ -4153,6 +4164,13 @@ jobs:
                   'Issue #' + issueNumber + ' produced no OpenCode PR after ' +
                   countedSchedulerDispatches.length +
                   ' scheduler dispatch attempt(s); automation paused.'
+                );
+              } else if (ownerResumeMarkerPending) {
+                core.notice(
+                  'Owner-armed resume for #' + issueNumber +
+                  ' is waiting for predecessor completion; keeping the ' +
+                  'automation pause and not restarting a model generation ' +
+                  'from an expired lease.'
                 );
               } else {
                 await removeLabel(issueNumber, pausedLabel);

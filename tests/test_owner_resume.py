@@ -1,14 +1,18 @@
 """Owner-armed predecessor-completion-gated resume (kodmial/continuum#382).
 
-The tests exercise the production decision module and the existing scheduler
-reconciliation model.  Workflow string assertions pin the embedded JavaScript
-to the same contract so the shipped scheduler cannot drift into a fake helper.
+The tests exercise the production decision module, the existing scheduler
+reconciliation model, and the JavaScript embedded in the shipped scheduler
+(through a Node harness). Workflow string assertions pin the surrounding
+production contract so the scheduler cannot drift into a fake helper.
 """
 
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+import json
+import os
 from pathlib import Path
+import subprocess
 import unittest
 
 from continuum.owner_resume import (
@@ -39,6 +43,154 @@ MERGE_B = "d" * 40
 
 PAUSE = "automation:paused"
 READY = "automation:ready"
+
+# Executes the real owner-resume JavaScript embedded in the production
+# scheduler. The Python decision model below documents the contract; this
+# harness proves the shipped workflow implements the same decisions instead
+# of a parallel mock.
+WORKFLOW_HARNESS = r"""
+const fs = require('fs');
+const scenario = JSON.parse(process.env.SCENARIO_JSON || '{}');
+const body = fs.readFileSync(process.env.SCHEDULER, 'utf8');
+const start = body.indexOf('const ownerResumeMarkerRe =');
+const end = body.indexOf('async function openDeclaredBlockers(', start);
+if (start < 0 || end < 0) throw new Error('owner-resume block missing');
+const segment = body.slice(start, end);
+const logs = [];
+const core = {
+  notice(m) { logs.push({ level: 'notice', msg: String(m) }); },
+  warning(m) { logs.push({ level: 'warning', msg: String(m) }); },
+};
+const owner = scenario.owner || 'kodmial';
+const repo = scenario.repo || 'continuum';
+const repoFullName = owner + '/' + repo;
+const context = {
+  payload: { repository: { default_branch: scenario.defaultBranch || 'main' } },
+};
+const pausedLabel = 'automation:paused';
+const readyLabel = 'automation:ready';
+const blockedLabel = 'automation:blocked';
+const dispatchMarker = '<!-- issue-scheduler-dispatch -->';
+const generationStopMarkerRe = /<!--\s*continuum-task-generation-stop\s+repo=([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)\s+issue=(\d+)\s+generation=(\d+)\s+pinned-spec=([0-9a-fA-F]{64})\s+live-spec=([0-9a-fA-F]{64})\s+reason=(drift|tampered)\s*-->/;
+const generationRecoverMarkerRe = /<!--\s*continuum-task-generation-recover\s+repo=([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)\s+issue=(\d+)\s+generation=(\d+)\s*-->/;
+function stopOrderKey(entry) {
+  return (entry.created_at || '') + '#' + String(entry.id || 0).padStart(12, '0');
+}
+const target = Number(scenario.target || 373);
+const labels = scenario.labels || ['automation:paused', 'automation:ready'];
+const labelsByIssue = new Map([[target, new Set(labels)]]);
+const openPrIssues = new Set(scenario.openPrIssueNumbers || []);
+const activeRunIssues = new Set(scenario.activeRunIssueNumbers || []);
+const pulls = scenario.pulls || [];
+const commentsByIssue = scenario.commentsByIssue || {};
+const predecessorIssues = scenario.predecessorIssues || {};
+const fullPrs = scenario.fullPrs || {};
+const failures = scenario.failures || {};
+function maybeFail(kind) {
+  if (!failures[kind]) return;
+  const error = new Error(kind + ' failure');
+  error.status = failures[kind];
+  throw error;
+}
+const readGithub = {
+  rest: {
+    issues: {
+      listComments: async (params) => {
+        maybeFail('comments');
+        return { data: commentsByIssue[String(params.issue_number)] || [] };
+      },
+      get: async (params) => {
+        maybeFail('predecessor');
+        const value = predecessorIssues[String(params.issue_number)];
+        if (!value) {
+          const error = new Error('not found');
+          error.status = 404;
+          throw error;
+        }
+        return { data: value };
+      },
+    },
+    pulls: {
+      get: async (params) => {
+        maybeFail('pull');
+        return { data: fullPrs[String(params.pull_number)] };
+      },
+      listReviews: async () => {
+        maybeFail('reviews');
+        return { data: scenario.reviews || [] };
+      },
+    },
+    actions: {
+      listWorkflowRunsForRepo: async () => {
+        maybeFail('runs');
+        return { data: scenario.runs || [] };
+      },
+    },
+    repos: {
+      getCombinedStatusForRef: async () => {
+        maybeFail('statuses');
+        return { data: { statuses: scenario.statuses || [] } };
+      },
+    },
+  },
+  paginate: async (fn, params) => {
+    const result = await fn(params);
+    if (Array.isArray(result)) return result;
+    if (result && Array.isArray(result.data)) return result.data;
+    if (result && result.data && Array.isArray(result.data.workflow_runs)) {
+      return result.data.workflow_runs;
+    }
+    return [];
+  },
+};
+const factory = new Function(
+  'owner', 'repo', 'repoFullName', 'context', 'core', 'readGithub',
+  'labelsByIssue', 'pausedLabel', 'readyLabel', 'blockedLabel',
+  'openPrIssues', 'activeRunIssues', 'pulls', 'dispatchMarker',
+  'generationStopMarkerRe', 'generationRecoverMarkerRe', 'stopOrderKey',
+  segment + `
+  return {
+    ownerResumeScan, ownerResumeDecision, ownerResumeIssueComments,
+    ownerResumeBaselineNumber, ownerResumeActivityAfter,
+    ownerResumeGenerationStopped
+  };`
+);
+const api = factory(
+  owner, repo, repoFullName, context, core, readGithub, labelsByIssue,
+  pausedLabel, readyLabel, blockedLabel, openPrIssues, activeRunIssues,
+  pulls, dispatchMarker, generationStopMarkerRe, generationRecoverMarkerRe,
+  stopOrderKey
+);
+(async () => {
+  const issue = {
+    number: target,
+    state: 'open',
+    labels: labels.map(name => ({ name })),
+  };
+  const comments = await api.ownerResumeIssueComments(target).catch(error => ({
+    error: String(error && error.message || error),
+  }));
+  let output;
+  if (!Array.isArray(comments)) {
+    output = { state: 'NOOP', reason: comments.error };
+  } else if (scenario.op === 'scan') {
+    output = api.ownerResumeScan(target, comments);
+  } else if (scenario.op === 'baseline') {
+    output = { baseline: api.ownerResumeBaselineNumber(comments, target) };
+  } else {
+    const scan = api.ownerResumeScan(target, comments);
+    output = scan.instruction
+      ? await api.ownerResumeDecision(issue, scan.instruction, comments)
+      : { state: 'NOOP', reason: scan.reason };
+  }
+  process.stdout.write(JSON.stringify({ output, logs }));
+})().catch(error => {
+  process.stdout.write(JSON.stringify({
+    fatal: String(error && error.message || error),
+    stack: String(error && error.stack || ''),
+  }));
+});
+"""
 
 
 def marker(predecessor: int, *, author: str = OWNER, cid: int = 1,
@@ -532,7 +684,52 @@ class NegativeEvidenceTests(unittest.TestCase):
         )
 
     def test_api_failure_fails_closed(self):
-        self.assertEqual(self.complete(api_error="403").state, NOOP)
+        for error in ("403", "429", "500", "502", "503", "timeout", "crash"):
+            with self.subTest(error=error):
+                self.assertEqual(self.complete(api_error=error).state, NOOP)
+
+    def test_predecessor_must_be_the_marker_issue_not_a_pr_or_other_number(self):
+        marker_pr = issue(374)
+        marker_pr["pull_request"] = {"url": "https://example.invalid/pr/374"}
+        self.assertEqual(
+            self.complete(predecessor_issue=marker_pr).state, NOOP
+        )
+        self.assertEqual(
+            self.complete(predecessor_issue=issue(999)).state, NOOP
+        )
+
+    def test_canceled_or_closed_unmerged_predecessor_pr_fails(self):
+        for candidate in (
+            pr(900, 374, merged=False, state="closed"),
+            pr(900, 374, merged=False, state="open"),
+        ):
+            with self.subTest(state=candidate["state"]):
+                self.assertEqual(
+                    self.complete(pull_requests=[candidate]).state, NOOP
+                )
+        canceled_run = green_runs()
+        canceled_run[0]["conclusion"] = "cancelled"
+        self.assertEqual(self.complete(runs=canceled_run).state, NOOP)
+
+    def test_reordered_comments_are_evaluated_by_timestamp_not_list_order(self):
+        recovery_before = comment(
+            "<!-- continuum-429-recovery op=x gen=1 state=observed "
+            "attempt=1 next_due=0 checkpoint=- sha=- run=- -->",
+            cid=2,
+            at=NOW - timedelta(hours=2),
+        )
+        marker_after = marker(374, cid=1, at=NOW - timedelta(hours=1))
+        decision = self.complete(comments=[marker_after, recovery_before])
+        self.assertEqual(decision.state, RESUME)
+
+    def test_crash_before_any_post_marker_attempt_is_safely_idempotent(self):
+        # A crash before dispatch leaves no post-marker evidence. Re-running
+        # the decision is the same bounded admission, not a second model
+        # generation; the next successful pass removes the pause exactly once.
+        decision = self.complete()
+        self.assertEqual(decision.state, RESUME)
+        retry = self.complete()
+        self.assertEqual(retry.state, RESUME)
 
     def test_closed_or_unadmitted_target_is_noop(self):
         result = decide_owner_resume(
@@ -632,14 +829,17 @@ class SchedulerResumeBudgetTests(unittest.TestCase):
             NOW - timedelta(hours=1),
         )
 
-    def test_spent_pre_marker_attempts_do_not_repause_target(self):
+    def test_spent_pre_marker_attempts_do_not_repause_after_admission(self):
+        # The production owner-resume decision admits the target first (it
+        # removes the pause label only after predecessor completion). The
+        # lease reconcile then sees an admitted target and resets the budget.
         comments = self.records(
             ("<!-- issue-scheduler-dispatch -->", True, NOW - timedelta(hours=4)),
             ("<!-- issue-scheduler-dispatch -->", True, NOW - timedelta(hours=3)),
             (marker(374)["body"], True, NOW - timedelta(hours=2)),
         )
         issues = self.scheduler_issue(
-            {READY, PAUSE, "automation:in-progress"}
+            {READY, "automation:in-progress"}
         )
         result = reconcile(
             NOW,
@@ -656,6 +856,42 @@ class SchedulerResumeBudgetTests(unittest.TestCase):
         self.assertNotIn(PAUSE, issues[373].labels)
         self.assertNotIn(373, result.paused)
 
+    def test_marker_without_admission_keeps_pause_even_below_budget(self):
+        # A predecessor that is still open produces WAIT. The marker alone
+        # must never let an expired lease release the pause, even when fewer
+        # than max_dispatch_attempts history entries exist.
+        for dispatches in (1, 2, 3):
+            with self.subTest(dispatches=dispatches):
+                comments = self.records(
+                    *[
+                        (
+                            "<!-- issue-scheduler-dispatch -->",
+                            True,
+                            NOW - timedelta(hours=6 - index),
+                        )
+                        for index in range(dispatches)
+                    ],
+                    (marker(374)["body"], True, NOW - timedelta(hours=1)),
+                )
+                issues = self.scheduler_issue(
+                    {READY, PAUSE, "automation:in-progress"}
+                )
+                result = reconcile(
+                    NOW,
+                    issues,
+                    set(),
+                    set(),
+                    {373: comments},
+                    {},
+                    {},
+                    set(),
+                    self.config(),
+                    repository_owner=OWNER,
+                )
+                self.assertIn(PAUSE, issues[373].labels)
+                self.assertIn(373, result.reservations_removed)
+                self.assertNotIn(373, result.dispatched)
+
     def test_post_marker_attempts_remain_bounded(self):
         comments = self.records(
             ("<!-- issue-scheduler-dispatch -->", True, NOW - timedelta(hours=5)),
@@ -664,7 +900,7 @@ class SchedulerResumeBudgetTests(unittest.TestCase):
             ("<!-- issue-scheduler-dispatch -->", True, NOW - timedelta(hours=2)),
         )
         issues = self.scheduler_issue(
-            {PAUSE, READY, "automation:in-progress"}
+            {READY, "automation:in-progress"}
         )
         first = reconcile(
             NOW,
@@ -688,7 +924,7 @@ class SchedulerResumeBudgetTests(unittest.TestCase):
             ("<!-- issue-scheduler-dispatch -->", True, NOW - timedelta(hours=1)),
         )
         issues = self.scheduler_issue(
-            {READY, "automation:in-progress"}
+            {READY, PAUSE, "automation:in-progress"}
         )
         second = reconcile(
             NOW,
@@ -728,6 +964,115 @@ class SchedulerResumeBudgetTests(unittest.TestCase):
         self.assertEqual(result.paused, [373])
 
 
+class ExecutableProductionWorkflowTests(unittest.TestCase):
+    def run_workflow(self, scenario):
+        env = os.environ.copy()
+        env["SCHEDULER"] = str(SCHEDULER)
+        env["SCENARIO_JSON"] = json.dumps(scenario)
+        completed = subprocess.run(
+            ["node", "-e", WORKFLOW_HARNESS],
+            capture_output=True,
+            text=True,
+            env=env,
+            cwd=str(ROOT),
+            timeout=60,
+        )
+        self.assertEqual(
+            completed.returncode, 0,
+            "node harness failed: {}".format(completed.stderr),
+        )
+        payload = json.loads(completed.stdout)
+        self.assertNotIn("fatal", payload)
+        return payload["output"]
+
+    def decision_scenario(self, **overrides):
+        evidence = complete_predecessor()
+        scenario = {
+            "op": "decide",
+            "target": 373,
+            "commentsByIssue": {"373": [marker(374)]},
+            "predecessorIssues": {"374": evidence["issue"]},
+            "pulls": evidence["pull_requests"],
+            "fullPrs": {"900": evidence["pull_requests"][0]},
+            "runs": evidence["runs"],
+            "statuses": evidence["statuses"],
+            "reviews": evidence["reviews"],
+        }
+        scenario.update(overrides)
+        return scenario
+
+    def test_production_js_resumes_only_on_the_complete_chain(self):
+        outcome = self.run_workflow(self.decision_scenario())
+        self.assertEqual(outcome["state"], "RESUME")
+        self.assertEqual(outcome["pullRequest"], 900)
+        self.assertEqual(outcome["headSha"], HEAD_A)
+
+    def test_production_js_predecessor_open_is_wait(self):
+        scenario = self.decision_scenario(
+            predecessorIssues={"374": issue(374, state="open")},
+        )
+        self.assertEqual(self.run_workflow(scenario)["state"], "WAIT")
+
+    def test_production_js_unmerged_or_unreviewed_chain_is_noop(self):
+        unmerged = self.decision_scenario()
+        unmerged["pulls"] = [pr(900, 374, merged=False, state="open")]
+        unmerged["fullPrs"] = {"900": pr(900, 374, merged=False, state="open")}
+        self.assertEqual(self.run_workflow(unmerged)["state"], "NOOP")
+
+        unreviewed = self.decision_scenario(statuses=[])
+        self.assertEqual(self.run_workflow(unreviewed)["state"], "NOOP")
+
+        wrong_base = self.decision_scenario()
+        wrong_base["pulls"] = [pr(900, 374, base="release")]
+        wrong_base["fullPrs"] = {"900": pr(900, 374, base="release")}
+        self.assertEqual(self.run_workflow(wrong_base)["state"], "NOOP")
+
+    def test_production_js_target_stops_block_resume(self):
+        for scenario in (
+            self.decision_scenario(openPrIssueNumbers=[373]),
+            self.decision_scenario(activeRunIssueNumbers=[373]),
+            self.decision_scenario(
+                labels=[PAUSE, READY, "no-auto-merge"]
+            ),
+            self.decision_scenario(labels=[PAUSE, READY, "automation:blocked"]),
+        ):
+            with self.subTest(scenario=scenario):
+                self.assertEqual(self.run_workflow(scenario)["state"], "NOOP")
+
+    def test_production_js_api_failures_and_bad_markers_fail_closed(self):
+        for failure in (
+            {"comments": 500},
+            {"predecessor": 403},
+            {"runs": 429},
+            {"statuses": 500},
+        ):
+            with self.subTest(failure=failure):
+                self.assertEqual(
+                    self.run_workflow(
+                        self.decision_scenario(failures=failure)
+                    )["state"],
+                    "NOOP",
+                )
+        for comments in (
+            [marker(374, author="github-actions[bot]")],
+            [marker(374, cid=1), marker(375, cid=2)],
+            [comment("<!-- continuum-resume-after predecessor=374 -->")],
+        ):
+            with self.subTest(comments=comments):
+                outcome = self.run_workflow(
+                    self.decision_scenario(commentsByIssue={"373": comments})
+                )
+                self.assertEqual(outcome["state"], "NOOP")
+
+    def test_production_js_marker_scan_and_baseline_are_exact(self):
+        scenario = self.decision_scenario(op="scan")
+        self.assertEqual(
+            self.run_workflow(scenario)["instruction"]["predecessor"], 374
+        )
+        baseline = self.run_workflow(self.decision_scenario(op="baseline"))
+        self.assertTrue(baseline["baseline"])
+
+
 class ProductionWorkflowContractTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -750,6 +1095,7 @@ class ProductionWorkflowContractTests(unittest.TestCase):
             "ownerResumeGenerationStopped",
             "ownerResumeActivityAfter",
             "ownerResumeBaselineNumber",
+            "ownerResumeMarkerPending",
             "countedSchedulerDispatches",
         ):
             with self.subTest(marker=marker):
@@ -799,6 +1145,13 @@ class ProductionWorkflowContractTests(unittest.TestCase):
         self.assertNotIn("dispatchWorkflow", block)
         self.assertNotIn("/oc", block)
         self.assertIn("checkpoint/snapshot state was not modified", block.lower())
+
+    def test_simultaneous_cron_is_serialized_and_pause_is_not_prematurely_released(self):
+        self.assertIn("concurrency:", self.body)
+        self.assertIn("group: issue-scheduler", self.body)
+        self.assertIn("cancel-in-progress: false", self.body)
+        self.assertIn("ownerResumeMarkerPending", self.body)
+        self.assertIn("waiting for predecessor completion", self.body)
 
 
 if __name__ == "__main__":

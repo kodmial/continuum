@@ -271,10 +271,18 @@ def reconcile(
         # fresh infrastructure retry budget. Attempts spent before the marker
         # cannot immediately re-pause the target; attempts after it stay
         # bounded and a failed recovery therefore remains diagnostically
-        # paused instead of looping forever.
-        baseline = owner_resume.resume_baseline(
+        # paused instead of looping forever. The fresh budget applies only
+        # after the owner-resume decision actually admitted the target (the
+        # pause label is gone). A target that is still paused has not proven
+        # its predecessor complete, so its original budget continues to
+        # apply and lease expiry must not release it.
+        marker_baseline = owner_resume.resume_baseline(
             issue_comments, target=number, repository_owner=repository_owner
         )
+        marker_waiting = (
+            marker_baseline is not None and config.pause_label in labels
+        )
+        baseline = None if marker_waiting else marker_baseline
         counted_dispatches = scheduler_dispatches
         if baseline is not None:
             counted_dispatches = [
@@ -303,6 +311,13 @@ def reconcile(
             result.skip_reasons[number] = (
                 "paused after %d scheduler dispatch attempt(s) with no "
                 "OpenCode PR" % len(counted_dispatches)
+            )
+        elif marker_waiting:
+            # The target is armed but its predecessor is not yet provably
+            # complete. Keep the operator-visible pause and do not restart a
+            # model generation from an expired lease.
+            result.skip_reasons[number] = (
+                "owner-armed resume is waiting for predecessor completion"
             )
         else:
             labels.discard(config.pause_label)
