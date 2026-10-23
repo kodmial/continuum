@@ -78,6 +78,27 @@ scenario. Parent/child delegated execution is an advanced, optional layer.
    repository and no valuable open issues, especially while tuning labels and
    runner settings.
 
+### Owner-armed recovery after a prerequisite
+
+An issue that was paused by an infrastructure failure can be released by one
+owner-authored marker line on that issue:
+
+```html
+<!-- continuum-resume-after:v1 predecessor=374 -->
+```
+
+The line must be the first line of a comment from the repository owner as
+reported by the GitHub API; a bot, member, model, or prose-only mention cannot
+arm it. The marker is metadata, never an OpenCode command. It authorizes only
+its own paused+ready target, and only after the named predecessor issue is
+closed as completed through a bound `opencode/issue<N>-` pull request that was
+actually merged to the default branch with exact-HEAD `CI`, Contract Gate, and
+independent clean-review evidence. Continuum then removes only that target's
+`automation:paused` label and lets the existing checkpoint/watchdog recovery
+path continue; it does not edit the task snapshot, start a new generation, or
+resume any other paused issue. A post-marker recovery attempt is a bounded
+fence, so a failed automatic recovery stays paused instead of looping.
+
 ## What this adds beyond plain GitHub Actions
 
 Plain workflow YAML gives you runners and triggers. You still have to assemble

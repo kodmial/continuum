@@ -206,6 +206,7 @@ def _comment_records(raw_comments: Sequence[Any]) -> List[CommentRecord]:
                 body=str(raw.get("body") or ""),
                 author_is_owner=author_is_owner,
                 created_at=when,
+                author_login=str(user.get("login") or ""),
             )
         )
     return records
@@ -326,6 +327,7 @@ def plan_issue_admissions(
     qualification_trackers: Sequence[int] = (),
     terminal_stopped: Sequence[Any] = (),
     generations: Optional[Mapping[int, int]] = None,
+    repository_owner: str = "",
 ) -> List[ReconciliationDecision]:
     """Derive all issue admission decisions from trusted repository state.
 
@@ -358,6 +360,7 @@ def plan_issue_admissions(
         dispatch_hook=None,
         terminal_stopped=set(terminal_stopped),
         generations=generations,
+        repository_owner=repository_owner,
     )
     decisions: List[ReconciliationDecision] = []
     for number in sorted(records):
