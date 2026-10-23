@@ -1846,6 +1846,12 @@ jobs:
               /<!--\s*continuum-429-(?:recovery|resumption|backoff)\b/;
             const ownerResumeCommandRe =
               /^[ ]{0,3}\/(?:opencode|oc)(?=\s|$)/m;
+            const ownerResumeTaskContextRe =
+              /<!--\s*continuum-task-context\s+repo=([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)\s+issue=(\d+)\s*-->/g;
+            const ownerResumeSnapshotRefRe =
+              /<!--\s*continuum-task-snapshot-ref\s+repo=([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)\s+issue=(\d+)\s+generation=(\d+)\s+title-sha256=([0-9a-fA-F]{64})\s+body-sha256=([0-9a-fA-F]{64})\s+spec-sha256=([0-9a-fA-F]{64})\s*-->/g;
+            const ownerResumeSnapshotMarkerRe =
+              /<!--\s*continuum-task-snapshot\s+repo=([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)\s+issue=(\d+)\s+generation=(\d+)\s+title-sha256=([0-9a-fA-F]{64})\s+body-sha256=([0-9a-fA-F]{64})\s+spec-sha256=([0-9a-fA-F]{64})\s*-->/g;
             const ownerResumeCommentPageLimit = 5;
             const ownerResumeCiWorkflow =
               (process.env.OWNER_RESUME_CI_WORKFLOW || 'CI').trim();
@@ -1922,6 +1928,78 @@ jobs:
               if (!scan.instruction) return null;
               const at = ownerResumeCreatedAt(scan.instruction.comment);
               return Number.isFinite(at) && at > 0 ? at : null;
+            }
+            function ownerResumePrSnapshotBinding(pr, predecessorNumber) {
+              const body = String(pr?.body || '');
+              const contexts = [...body.matchAll(ownerResumeTaskContextRe)];
+              const refs = [...body.matchAll(ownerResumeSnapshotRefRe)];
+              if (contexts.length === 0 && refs.length === 0) return null;
+              if (contexts.length > 1 || refs.length > 1) return false;
+              if (contexts.length === 1) {
+                const context = contexts[0];
+                if (String(context[1]).toLowerCase() !== repoFullName.toLowerCase()) {
+                  return false;
+                }
+                if (Number(context[2]) !== predecessorNumber) return false;
+              }
+              if (refs.length === 0) return null;
+              const ref = refs[0];
+              if (String(ref[1]).toLowerCase() !== repoFullName.toLowerCase()) {
+                return false;
+              }
+              if (Number(ref[2]) !== predecessorNumber) return false;
+              if (String(ref[3]) !== '1') return false;
+              return {
+                title: String(ref[4]).toLowerCase(),
+                body: String(ref[5]).toLowerCase(),
+                spec: String(ref[6]).toLowerCase(),
+              };
+            }
+            function ownerResumeBoundPr(pr, predecessorNumber) {
+              const branchBound = String(pr?.head?.ref || '').startsWith(
+                'opencode/issue' + predecessorNumber + '-'
+              );
+              const binding = ownerResumePrSnapshotBinding(pr, predecessorNumber);
+              if (binding === false) return null;
+              if (!branchBound && binding === null) return null;
+              return { branchBound, binding };
+            }
+            function ownerResumeSnapshotBindingMatches(
+              comments, predecessorNumber, binding
+            ) {
+              for (const comment of comments || []) {
+                const association = String(
+                  comment.author_association || ''
+                ).toUpperCase();
+                const login = ownerResumeLogin(comment);
+                if (
+                  login !== owner.toLowerCase() &&
+                  login !== 'github-actions[bot]' &&
+                  !['OWNER', 'MEMBER', 'COLLABORATOR'].includes(association)
+                ) {
+                  continue;
+                }
+                const markers = [
+                  ...String(comment.body || '').matchAll(ownerResumeSnapshotMarkerRe)
+                ];
+                for (const marker of markers) {
+                  if (
+                    String(marker[1]).toLowerCase() !== repoFullName.toLowerCase() ||
+                    Number(marker[2]) !== predecessorNumber ||
+                    String(Number(marker[3])) !== '1'
+                  ) {
+                    continue;
+                  }
+                  if (
+                    String(marker[4]).toLowerCase() === binding.title &&
+                    String(marker[5]).toLowerCase() === binding.body &&
+                    String(marker[6]).toLowerCase() === binding.spec
+                  ) {
+                    return true;
+                  }
+                }
+              }
+              return false;
             }
             function ownerResumeActivityAfter(comments, instruction) {
               const baseline = ownerResumeCreatedAt(instruction.comment);
@@ -2093,19 +2171,25 @@ jobs:
                 };
               }
 
-              const prefix = 'opencode/issue' + predecessorNumber + '-';
-              const bound = pulls.filter(pr =>
-                pr.head?.repo?.full_name === repoFullName &&
-                String(pr.head?.ref || '').startsWith(prefix)
-              );
+              const bound = [];
+              for (const candidatePr of pulls) {
+                if (candidatePr.head?.repo?.full_name !== repoFullName) continue;
+                const bindingInfo = ownerResumeBoundPr(
+                  candidatePr, predecessorNumber
+                );
+                if (!bindingInfo) continue;
+                bound.push({ pr: candidatePr, ...bindingInfo });
+              }
               if (bound.length === 0) {
                 return {
                   state: 'NOOP',
                   reason: 'predecessor has no trusted implementation PR binding',
                 };
               }
-              bound.sort((a, b) => Number(a.number || 0) - Number(b.number || 0));
-              const latest = bound[bound.length - 1];
+              bound.sort(
+                (a, b) => Number(a.pr.number || 0) - Number(b.pr.number || 0)
+              );
+              const latest = bound[bound.length - 1].pr;
               if (!latest.merged_at || String(latest.state || '').toLowerCase() !== 'closed') {
                 return {
                   state: 'NOOP',
@@ -2127,6 +2211,15 @@ jobs:
                 );
                 return { state: 'NOOP', reason: 'predecessor PR state is unavailable' };
               }
+              const fullBindingInfo = ownerResumeBoundPr(
+                fullPr, predecessorNumber
+              );
+              if (!fullBindingInfo) {
+                return {
+                  state: 'NOOP',
+                  reason: 'predecessor PR binding is not trusted',
+                };
+              }
               if (
                 !fullPr.merged ||
                 !fullPr.merged_at ||
@@ -2136,6 +2229,35 @@ jobs:
                   state: 'NOOP',
                   reason: 'predecessor implementation PR is not truly merged',
                 };
+              }
+              if (fullBindingInfo.binding) {
+                let predecessorComments;
+                try {
+                  predecessorComments = await ownerResumeIssueComments(
+                    predecessorNumber
+                  );
+                } catch (err) {
+                  core.warning(
+                    'Owner-armed resume predecessor snapshot read failed for #' +
+                      predecessorNumber + '; failing closed: ' + err.message
+                  );
+                  return {
+                    state: 'NOOP',
+                    reason: 'predecessor snapshot evidence is unavailable',
+                  };
+                }
+                if (
+                  !ownerResumeSnapshotBindingMatches(
+                    predecessorComments,
+                    predecessorNumber,
+                    fullBindingInfo.binding
+                  )
+                ) {
+                  return {
+                    state: 'NOOP',
+                    reason: 'predecessor PR snapshot binding is not trusted',
+                  };
+                }
               }
               if (String(fullPr.base?.ref || '') !== ownerResumeDefaultBranch) {
                 return {
@@ -2147,12 +2269,6 @@ jobs:
                 return {
                   state: 'NOOP',
                   reason: 'predecessor PR head repository is not trusted',
-                };
-              }
-              if (!String(fullPr.head?.ref || '').startsWith(prefix)) {
-                return {
-                  state: 'NOOP',
-                  reason: 'predecessor PR is not bound to the issue',
                 };
               }
               const headSha = String(fullPr.head?.sha || '').toLowerCase();

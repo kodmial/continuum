@@ -15,6 +15,7 @@ from pathlib import Path
 import subprocess
 import unittest
 
+from continuum import task_snapshot
 from continuum.owner_resume import (
     NOOP,
     RESUME,
@@ -227,7 +228,8 @@ def issue(number: int, *, state: str = "open", reason: str = "",
 def pr(number: int, predecessor: int, *, merged: bool = True,
        state: str = "closed", base: str = "main", head_sha: str = HEAD_A,
        merge_sha: str = MERGE_A, head_repo: str = REPOSITORY,
-       branch_prefix: str | None = None, author: str = "continuum-bot") -> dict:
+       branch_prefix: str | None = None, author: str = "continuum-bot",
+       body: str = "") -> dict:
     prefix = branch_prefix or ("opencode/issue%d-" % predecessor)
     return {
         "number": number,
@@ -242,6 +244,7 @@ def pr(number: int, predecessor: int, *, merged: bool = True,
         },
         "base": {"ref": base},
         "user": {"login": author},
+        "body": body,
     }
 
 
@@ -278,6 +281,42 @@ def clean_statuses() -> list:
         "state": "success",
         "description": "PR-Agent review complete: clean",
     }]
+
+
+TASK_TITLE = "P0: Fix 429 fresh-run checkout before checkpoint restoration"
+TASK_BODY = "## Definition of Done\n- [ ] Restore the exact checkpoint.\n"
+
+
+def snapshot_record(number: int = 374, *, title: str = TASK_TITLE,
+                    body: str = TASK_BODY) -> dict:
+    return task_snapshot.build_snapshot(REPOSITORY, number, title, body)
+
+
+def snapshot_comment(number: int = 374, *, title: str = TASK_TITLE,
+                     body: str = TASK_BODY, author: str = OWNER,
+                     cid: int = 500, at: datetime = NOW,
+                     association: str = "OWNER") -> dict:
+    return {
+        "id": cid,
+        "body": task_snapshot.render_snapshot_comment(
+            snapshot_record(number, title=title, body=body)
+        ),
+        "user": {"login": author},
+        "author_association": association,
+        "created_at": at.isoformat().replace("+00:00", "Z"),
+    }
+
+
+def task_snapshot_pr_body(number: int = 374, *, title: str = TASK_TITLE,
+                          body: str = TASK_BODY, repo: str = REPOSITORY) -> str:
+    snapshot = snapshot_record(number, title=title, body=body)
+    context = "<!-- continuum-task-context repo={} issue={} -->".format(
+        repo, number
+    )
+    reference = task_snapshot.render_pr_snapshot_ref(
+        dict(snapshot, repo=repo)
+    )
+    return context + "\n" + reference
 
 
 def complete_predecessor(number: int = 374, *, head_sha: str = HEAD_A,
@@ -467,6 +506,106 @@ class CompletionStateMachineTests(unittest.TestCase):
             statuses=evidence["statuses"],
         )
         self.assertEqual(repeat.state, NOOP)
+
+    def test_actual_374_style_fix_branch_binds_through_task_snapshot(self):
+        # kodmial/continuum#374 merged as PR #397 on the normal owner fix
+        # branch `fix/...`, not `opencode/issue374-`. Its task-context and
+        # snapshot-reference markers must bind the predecessor to the
+        # durable snapshot comment, never to a matching title.
+        body = task_snapshot_pr_body(374)
+        candidate = pr(
+            397, 374, branch_prefix="fix/429-bootstrap-checkout-374-395-",
+            body=body,
+        )
+        decision = decide(
+            predecessor_issue=issue(374, state="closed", reason="completed"),
+            predecessor_comments=[snapshot_comment(374)],
+            pull_requests=[candidate],
+            runs=green_runs(),
+            statuses=clean_statuses(),
+        )
+        self.assertEqual(decision.state, RESUME)
+        self.assertEqual(decision.predecessor_pr, 397)
+
+    def test_legacy_canonical_branch_context_binding_still_resumes(self):
+        # Pre-snapshot OpenCode PRs carry only a task-context marker. The
+        # canonical opencode/issue<N>- branch remains a trusted binding, while
+        # a conflicting context marker must still fail closed.
+        candidate = pr(
+            900, 374,
+            body="<!-- continuum-task-context repo={} issue=374 -->".format(
+                REPOSITORY
+            ),
+        )
+        decision = decide(
+            predecessor_issue=issue(374, state="closed", reason="completed"),
+            predecessor_comments=[],
+            pull_requests=[candidate],
+            runs=green_runs(),
+            statuses=clean_statuses(),
+        )
+        self.assertEqual(decision.state, RESUME)
+
+        conflicting = pr(
+            900, 374,
+            body="<!-- continuum-task-context repo={} issue=375 -->".format(
+                REPOSITORY
+            ),
+        )
+        rejected = decide(
+            predecessor_issue=issue(374, state="closed", reason="completed"),
+            predecessor_comments=[],
+            pull_requests=[conflicting],
+            runs=green_runs(),
+            statuses=clean_statuses(),
+        )
+        self.assertEqual(rejected.state, NOOP)
+
+    def test_snapshot_binding_requires_the_durable_predecessor_snapshot(self):
+        candidate = pr(
+            397, 374, branch_prefix="fix/429-bootstrap-checkout-374-395-",
+            body=task_snapshot_pr_body(374),
+        )
+        no_durable = decide(
+            predecessor_issue=issue(374, state="closed", reason="completed"),
+            predecessor_comments=[],
+            pull_requests=[candidate],
+            runs=green_runs(),
+            statuses=clean_statuses(),
+        )
+        self.assertEqual(no_durable.state, NOOP)
+
+        wrong_pin = decide(
+            predecessor_issue=issue(374, state="closed", reason="completed"),
+            predecessor_comments=[snapshot_comment(374, body="edited contract")],
+            pull_requests=[candidate],
+            runs=green_runs(),
+            statuses=clean_statuses(),
+        )
+        self.assertEqual(wrong_pin.state, NOOP)
+
+    def test_snapshot_binding_rejects_other_issue_and_ambiguous_markers(self):
+        for body in (
+            task_snapshot_pr_body(375),
+            task_snapshot_pr_body(374) + "\n" + task_snapshot_pr_body(374),
+            "<!-- continuum-task-context repo=kodmial/continuum issue=374 -->\n"
+            "No snapshot reference here.",
+        ):
+            with self.subTest(body=body[:60]):
+                candidate = pr(
+                    397, 374,
+                    branch_prefix="fix/429-bootstrap-checkout-374-395-",
+                    body=body,
+                )
+                decision = decide(
+                    predecessor_issue=issue(374, state="closed",
+                                            reason="completed"),
+                    predecessor_comments=[snapshot_comment(374)],
+                    pull_requests=[candidate],
+                    runs=green_runs(),
+                    statuses=clean_statuses(),
+                )
+                self.assertEqual(decision.state, NOOP)
 
     def test_357_waits_for_373_and_then_resumes_its_own_chain(self):
         waiting = decide(
@@ -1007,11 +1146,77 @@ class ExecutableProductionWorkflowTests(unittest.TestCase):
         self.assertEqual(outcome["pullRequest"], 900)
         self.assertEqual(outcome["headSha"], HEAD_A)
 
+    def test_production_js_legacy_canonical_branch_context_resumes(self):
+        candidate = pr(
+            900, 374,
+            body="<!-- continuum-task-context repo={} issue=374 -->".format(
+                REPOSITORY
+            ),
+        )
+        scenario = self.decision_scenario(
+            pulls=[candidate],
+            fullPrs={"900": candidate},
+        )
+        self.assertEqual(self.run_workflow(scenario)["state"], "RESUME")
+
+        conflicting = pr(
+            900, 374,
+            body="<!-- continuum-task-context repo={} issue=375 -->".format(
+                REPOSITORY
+            ),
+        )
+        rejected = self.decision_scenario(
+            pulls=[conflicting],
+            fullPrs={"900": conflicting},
+        )
+        self.assertEqual(
+            self.run_workflow(rejected)["state"], "NOOP"
+        )
+
     def test_production_js_predecessor_open_is_wait(self):
         scenario = self.decision_scenario(
             predecessorIssues={"374": issue(374, state="open")},
         )
         self.assertEqual(self.run_workflow(scenario)["state"], "WAIT")
+
+    def test_production_js_snapshot_bound_non_opencode_pr_resumes(self):
+        candidate = pr(
+            397, 374, branch_prefix="fix/429-bootstrap-checkout-374-395-",
+            body=task_snapshot_pr_body(374),
+        )
+        scenario = self.decision_scenario(
+            commentsByIssue={
+                "373": [marker(374)],
+                "374": [snapshot_comment(374)],
+            },
+            pulls=[candidate],
+            fullPrs={"397": candidate},
+        )
+        outcome = self.run_workflow(scenario)
+        self.assertEqual(outcome["state"], "RESUME")
+        self.assertEqual(outcome["pullRequest"], 397)
+
+    def test_production_js_snapshot_binding_must_match_durable_comment(self):
+        candidate = pr(
+            397, 374, branch_prefix="fix/429-bootstrap-checkout-374-395-",
+            body=task_snapshot_pr_body(374),
+        )
+        for predecessor_comments in (
+            [],
+            [snapshot_comment(374, body="edited contract")],
+        ):
+            with self.subTest(count=len(predecessor_comments)):
+                scenario = self.decision_scenario(
+                    commentsByIssue={
+                        "373": [marker(374)],
+                        "374": predecessor_comments,
+                    },
+                    pulls=[candidate],
+                    fullPrs={"397": candidate},
+                )
+                self.assertEqual(
+                    self.run_workflow(scenario)["state"], "NOOP"
+                )
 
     def test_production_js_unmerged_or_unreviewed_chain_is_noop(self):
         unmerged = self.decision_scenario()
@@ -1097,6 +1302,12 @@ class ProductionWorkflowContractTests(unittest.TestCase):
             "ownerResumeBaselineNumber",
             "ownerResumeMarkerPending",
             "countedSchedulerDispatches",
+            "ownerResumeTaskContextRe",
+            "ownerResumeSnapshotRefRe",
+            "ownerResumeSnapshotMarkerRe",
+            "ownerResumePrSnapshotBinding",
+            "ownerResumeBoundPr",
+            "ownerResumeSnapshotBindingMatches",
         ):
             with self.subTest(marker=marker):
                 self.assertIn(marker, self.body)
@@ -1116,6 +1327,10 @@ class ProductionWorkflowContractTests(unittest.TestCase):
     def test_completion_is_bound_to_pr_branch_merge_exact_head_gates(self):
         for marker in (
             "opencode/issue' + predecessorNumber + '-'",
+            "ownerResumeTaskContextRe",
+            "ownerResumeSnapshotRefRe",
+            "ownerResumeSnapshotMarkerRe",
+            "ownerResumeSnapshotBindingMatches",
             "readGithub.rest.pulls.get",
             "fullPr.merged",
             "fullPr.base?.ref",

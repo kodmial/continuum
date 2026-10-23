@@ -18,7 +18,11 @@ Predecessor completion requires all of the following trusted evidence:
 
 * the predecessor issue is *closed as completed*;
 * its latest implementation PR is bound by the existing
-  ``opencode/issue<number>-`` branch identity (never by matching titles);
+  ``opencode/issue<number>-`` branch identity or, for an owner-authored
+  normal fix branch, by the exact ``continuum-task-context`` plus
+  ``continuum-task-snapshot-ref`` markers in the PR body verified against
+  the durable task-snapshot comment on the predecessor issue (never by
+  matching titles);
 * that PR is merged into the expected default branch with a real merge
   commit and exact HEAD;
 * the exact PR HEAD has completed/successful project CI and Contract Gate
@@ -38,6 +42,8 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 import re
 from typing import Any, Iterable, Mapping, Optional, Sequence, Set, Tuple
+
+from . import task_snapshot
 
 
 WAIT = "WAIT"
@@ -76,6 +82,18 @@ GENERATION_RECOVER_RE = re.compile(
 )
 FULL_SHA_RE = re.compile(r"\A[0-9a-f]{40}(?:[0-9a-f]{24})?\Z")
 CLEAN_PR_AGENT_REVIEW = "PR-Agent review complete: clean"
+TASK_CONTEXT_RE = re.compile(
+    r"<!--\s*continuum-task-context\s+"
+    r"repo=([A-Za-z0-9_.\-]+/[A-Za-z0-9_.\-]+)\s+issue=(\d+)\s*-->"
+)
+PR_SNAPSHOT_REF_RE = re.compile(
+    r"<!--\s*continuum-task-snapshot-ref\s+"
+    r"repo=([A-Za-z0-9_.\-]+/[A-Za-z0-9_.\-]+)\s+"
+    r"issue=(\d+)\s+generation=(\d+)\s+"
+    r"title-sha256=([0-9a-fA-F]{64})\s+"
+    r"body-sha256=([0-9a-fA-F]{64})\s+"
+    r"spec-sha256=([0-9a-fA-F]{64})\s*-->"
+)
 
 
 @dataclass(frozen=True)
@@ -373,13 +391,107 @@ def _pr_author(pr: Mapping[str, Any]) -> str:
     return str(pr.get("author_login") or "").lower()
 
 
+def _pr_body(pr: Mapping[str, Any]) -> str:
+    return str(pr.get("body") or "")
+
+
+def _pr_snapshot_binding(
+    pr: Mapping[str, Any],
+    *,
+    predecessor: int,
+    repository: str,
+) -> Any:
+    """Return the PR's task-snapshot digests, or None/False for no/conflict.
+
+    ``None`` means the PR body carries no usable marker binding: either no
+    task-context/snapshot-reference markers at all, or only a matching legacy
+    task-context marker that canonical ``opencode/issue<N>-`` branch binding
+    can trust. ``False`` means marker-shaped content is present but malformed,
+    duplicated, or targets another issue. Otherwise the tuple is the exact
+    ``(title, body, spec)`` digest binding from the PR body.
+    """
+
+    body = _pr_body(pr)
+    contexts = TASK_CONTEXT_RE.findall(body)
+    refs = PR_SNAPSHOT_REF_RE.findall(body)
+    if not contexts and not refs:
+        return None
+    if len(contexts) > 1 or len(refs) > 1:
+        return False
+    if contexts:
+        context_repo, context_issue = contexts[0]
+        if str(context_repo).lower() != str(repository or "").lower():
+            return False
+        if _number(context_issue) != int(predecessor):
+            return False
+    if not refs:
+        return None
+    ref_repo, ref_issue, generation, title, body_digest, spec = refs[0]
+    if str(ref_repo).lower() != str(repository or "").lower():
+        return False
+    if _number(ref_issue) != int(predecessor):
+        return False
+    if _number(generation) != 1:
+        return False
+    return (title.lower(), body_digest.lower(), spec.lower())
+
+
+def _durable_snapshot_digests(
+    comments: Sequence[Any],
+    *,
+    predecessor: int,
+    repository: str,
+    owner_login: str,
+) -> Optional[Tuple[str, str, str]]:
+    selection = task_snapshot.select_snapshot(
+        [
+            comment if isinstance(comment, Mapping) else _comment_mapping(comment)
+            for comment in comments or ()
+        ],
+        repo=repository,
+        issue=predecessor,
+        generation=1,
+        owner_login=owner_login,
+    )
+    if selection.status != "found" or selection.snapshot is None:
+        return None
+    pinned = selection.snapshot
+    return (
+        str(pinned.title_sha256).lower(),
+        str(pinned.body_sha256).lower(),
+        str(pinned.spec_sha256).lower(),
+    )
+
+
+def _comment_mapping(comment: Any) -> Mapping[str, Any]:
+    return {
+        "body": _body(comment),
+        "user": {"login": _login(comment)},
+        "author_association": str(
+            getattr(comment, "author_association", "") or ""
+        ),
+        "created_at": _created_at(comment),
+        "id": _comment_id(comment),
+    }
+
+
 def bound_implementation_prs(
     pull_requests: Sequence[Mapping[str, Any]],
     *,
     predecessor: int,
     repository: str,
+    predecessor_comments: Optional[Sequence[Any]] = None,
+    owner_login: str = "",
 ) -> list:
-    """Return implementation PRs bound by the canonical branch identity."""
+    """Return implementation PRs bound to the predecessor.
+
+    A trusted binding is either the canonical ``opencode/issue<N>-`` branch
+    identity or an exact task-context plus task-snapshot reference in the PR
+    body. A canonical branch PR may also carry only a matching legacy
+    task-context marker. Any explicit snapshot reference is accepted only when
+    it matches the durable task-snapshot comment on the predecessor issue, so
+    a mutable PR body alone can never retarget the authorization.
+    """
 
     prefix = "opencode/issue{}-".format(int(predecessor))
     bound = []
@@ -388,8 +500,24 @@ def bound_implementation_prs(
             continue
         if repository and _pr_head_repo(pr).lower() != str(repository).lower():
             continue
-        if not _pr_head_ref(pr).startswith(prefix):
+        branch_bound = _pr_head_ref(pr).startswith(prefix)
+        snapshot_binding = _pr_snapshot_binding(
+            pr, predecessor=predecessor, repository=repository
+        )
+        if snapshot_binding is False:
             continue
+        snapshot_bound = snapshot_binding is not None
+        if not branch_bound and not snapshot_bound:
+            continue
+        if snapshot_bound:
+            durable = _durable_snapshot_digests(
+                predecessor_comments or (),
+                predecessor=predecessor,
+                repository=repository,
+                owner_login=owner_login,
+            )
+            if durable is None or durable != snapshot_binding:
+                continue
         if _number(pr.get("number") or pr.get("pull_number")):
             bound.append(pr)
     bound.sort(key=lambda pr: _number(pr.get("number") or pr.get("pull_number")))
@@ -490,6 +618,8 @@ def evaluate_predecessor_completion(
     contract_gate_paths: Sequence[str] = (
         ".github/workflows/contract-gate.yml",
     ),
+    predecessor_comments: Optional[Sequence[Any]] = None,
+    owner_login: str = "",
 ) -> Tuple[bool, str, Optional[int], str]:
     """Evaluate the complete trusted completion chain for a predecessor."""
 
@@ -512,7 +642,11 @@ def evaluate_predecessor_completion(
         return False, "predecessor issue is not closed as completed", None, ""
 
     bound = bound_implementation_prs(
-        pull_requests, predecessor=number, repository=repository
+        pull_requests,
+        predecessor=number,
+        repository=repository,
+        predecessor_comments=predecessor_comments,
+        owner_login=owner_login,
     )
     if not bound:
         return False, "predecessor has no trusted implementation PR binding", None, ""
@@ -523,9 +657,6 @@ def evaluate_predecessor_completion(
         return False, "predecessor PR base is not the expected default branch", None, ""
     if _pr_head_repo(latest).lower() != str(repository or "").lower():
         return False, "predecessor PR head repository is not trusted", None, ""
-    prefix = "opencode/issue{}-".format(number)
-    if not _pr_head_ref(latest).startswith(prefix):
-        return False, "predecessor PR is not bound to the issue", None, ""
     head_sha = _pr_head_sha(latest)
     if not FULL_SHA_RE.match(head_sha):
         return False, "predecessor PR HEAD is missing or not a full SHA", None, ""
@@ -574,6 +705,7 @@ def decide_owner_resume(
     open_pr_issue_numbers: Sequence[int] = (),
     active_run_issue_numbers: Sequence[int] = (),
     predecessor_issue: Optional[Mapping[str, Any]] = None,
+    predecessor_comments: Optional[Sequence[Any]] = None,
     pull_requests: Sequence[Mapping[str, Any]] = (),
     exact_head_runs: Sequence[Mapping[str, Any]] = (),
     statuses: Sequence[Mapping[str, Any]] = (),
@@ -655,6 +787,8 @@ def decide_owner_resume(
         reviews=reviews,
         repository=repository,
         default_branch=default_branch,
+        predecessor_comments=predecessor_comments,
+        owner_login=repository_owner,
     )
     if not complete:
         return ResumeDecision(NOOP, reason, instruction)
