@@ -791,6 +791,9 @@ jobs:
           cp -R "$engine/src/continuum" "$install_root/src/"
           cp "$engine/.github/scripts/opencode_429_classify.py" "$install_root/.github/scripts/"
           cp "$engine/.github/scripts/opencode_429_wrapper.sh" "$install_root/continuum-opencode"
+          # kodmial/continuum#413: one deterministic staging boundary shared
+          # with the OpenCode executor; installed outside the task worktree.
+          cp "$engine/.github/scripts/continuum_pr_staging.sh" "${RUNNER_TEMP:-/tmp}/continuum-pr-staging.sh"
           chmod +x "$install_root/continuum-opencode" "$install_root/.github/scripts/opencode_429_classify.py"
           rm -rf "$engine"
           echo "$install_root" >> "$GITHUB_PATH"
@@ -926,6 +929,13 @@ jobs:
             git restore --source="$START_HEAD" --worktree --staged -- "${TRACKED_IGNORED[@]}"
           fi
 
+          # shellcheck disable=SC1090
+          source "${RUNNER_TEMP:-/tmp}/continuum-pr-staging.sh"
+          # kodmial/continuum#413: stage the real repair diff, then remove
+          # exactly workflow-owned artifacts (including a previously tracked
+          # cancellation Gitlink or recovery metadata). An unconfigured
+          # Gitlink fails closed before any publication.
+          continuum_stage_publishable || exit 1
           if [[ -z "$(git status --porcelain)" ]]; then
             echo "classification=transient" >> "$GITHUB_OUTPUT"
             echo "no_progress=true" >> "$GITHUB_OUTPUT"
@@ -933,7 +943,6 @@ jobs:
             echo "::warning::No repair diff; requesting bounded exact-HEAD re-review/repair instead of settling the PR."
             exit 1
           fi
-          git add -A
           if git diff --cached --quiet; then
             echo "classification=transient" >> "$GITHUB_OUTPUT"
             echo "no_progress=true" >> "$GITHUB_OUTPUT"

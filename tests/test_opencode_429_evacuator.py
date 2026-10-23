@@ -18,6 +18,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 WORKFLOW = ROOT / ".github" / "workflows" / "continuum-opencode.yml"
+STAGING_LIBRARY = ROOT / ".github" / "scripts" / "continuum_pr_staging.sh"
 TMP_PARENT = ROOT / ".opencode-tmp"
 
 GIT_ENV = {
@@ -63,6 +64,7 @@ class ProductionEvacuatorTest(unittest.TestCase):
         self.bin.mkdir()
         self.runner = self.workdir / "runner"
         self.runner.mkdir()
+        shutil.copy(STAGING_LIBRARY, self.runner / "continuum-pr-staging.sh")
         self.github_env = self.workdir / "github-env"
         subprocess.run(
             ["git", "init", "--bare", str(self.origin)],

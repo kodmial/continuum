@@ -1209,7 +1209,7 @@ jobs:
           gh api --paginate --slurp \
             "repos/$TASK_REPO/issues/$TASK_NUMBER/comments?per_page=100" \
             | jq 'add // []' >"$work/comments.json"
-          kind="$(python3 "$GITHUB_WORKSPACE/.continuum-cancel-engine/.github/scripts/opencode_cancel.py" stop-kind \
+          kind="$(python3 "${CONTINUUM_CANCEL_HELPER:-$GITHUB_WORKSPACE/.continuum-cancel-engine/.github/scripts/opencode_cancel.py}" stop-kind \
             --comments-json "$work/comments.json" --repo "$TASK_REPO" \
             --issue "$TASK_NUMBER" --owner "${TASK_REPO%%/*}" --generation 1)"
           if [[ "$kind" != "active" ]]; then
@@ -2310,10 +2310,20 @@ jobs:
           cp -R "$engine/src/continuum" "$install_root/src/"
           cp "$engine/.github/scripts/opencode_429_classify.py" "$install_root/.github/scripts/"
           cp "$engine/.github/scripts/opencode_429_wrapper.sh" "$install_root/continuum-opencode"
-          chmod +x "$install_root/continuum-opencode" "$install_root/.github/scripts/opencode_429_classify.py"
+          # kodmial/continuum#413: one deterministic staging boundary for every
+          # checkpoint and publish path, independent of agent instructions and
+          # .gitignore. The library is installed outside the task worktree so
+          # it can never be published.
+          cp "$engine/.github/scripts/continuum_pr_staging.sh" "${RUNNER_TEMP:-/tmp}/continuum-pr-staging.sh"
+          # The publish boundary removes the in-worktree cancellation-engine
+          # checkout. Keep a trusted copy outside the worktree so Owner STOP
+          # checks still run after that cleanup.
+          cp "$engine/.github/scripts/opencode_cancel.py" "$install_root/.github/scripts/"
+          chmod +x "$install_root/continuum-opencode" "$install_root/.github/scripts/opencode_429_classify.py" "$install_root/.github/scripts/opencode_cancel.py"
           rm -rf "$engine"
           echo "$install_root" >> "$GITHUB_PATH"
           echo "CONTINUUM_429_CLASSIFIER=$install_root/.github/scripts/opencode_429_classify.py" >> "$GITHUB_ENV"
+          echo "CONTINUUM_CANCEL_HELPER=$install_root/.github/scripts/opencode_cancel.py" >> "$GITHUB_ENV"
           # kodmial/continuum#415: prove the pinned CLI accepts the
           # authoritative structured event channel before any agent runs.
           opencode_version="$(opencode --version)"
@@ -2349,6 +2359,10 @@ jobs:
           # Evacuates workflow-owned state to the durable 429 checkpoint ref,
           # marks this runner burned, and exits 75. Never invokes the model,
           # never sleeps, never asks the model to commit.
+          # kodmial/continuum#413: checkpoint staging keeps the verified
+          # recovery metadata but never the cancellation-engine checkout.
+          # shellcheck disable=SC1090
+          source "${RUNNER_TEMP:-/tmp}/continuum-pr-staging.sh"
           # kodmial/continuum#302: canonical fail-closed branch safety for
           # every code push in this helper. The destination must be a proven
           # non-default ref; the default branch is discovered from repository
@@ -2453,10 +2467,12 @@ jobs:
             find . -type d -name '__pycache__' -prune -exec rm -rf {} + 2>/dev/null || true
             find . -type f \( -name '*.pyc' -o -name '*.pyo' \) -delete 2>/dev/null || true
             if [[ -n "$(git status --porcelain 2>/dev/null)" ]]; then
-              git add -A
-              git commit -m "chore: checkpoint 429-interrupted ${mode} work" \
-                -m "Continuum-Checkpoint-429-Operation: ${operation}" \
-                -m "Continuum-Component: opencode" || true
+              continuum_stage_checkpoint
+              if ! git diff --cached --quiet; then
+                git commit -m "chore: checkpoint 429-interrupted ${mode} work" \
+                  -m "Continuum-Checkpoint-429-Operation: ${operation}" \
+                  -m "Continuum-Component: opencode" || true
+              fi
             fi
             head_sha="$(git rev-parse HEAD 2>/dev/null || true)"
             local code_head_sha="$head_sha"
@@ -2669,6 +2685,8 @@ jobs:
           SNAPSHOT_BODY_SHA: ${{ steps.task_snapshot.outputs.body_sha256 }}
         run: |
           set -euo pipefail
+          # shellcheck disable=SC1090
+          source "${RUNNER_TEMP:-/tmp}/continuum-pr-staging.sh"
 
           continuum_assert_no_stop() {
             local stop_repo="${1:?repo}" stop_issue="${2:?issue}" stop_file stop_kind
@@ -2679,7 +2697,7 @@ jobs:
                 echo "::error::Could not verify operator stop for $stop_repo#$stop_issue; refusing to publish." >&2
                 return 1
               }
-            stop_kind="$(python3 "$GITHUB_WORKSPACE/.continuum-cancel-engine/.github/scripts/opencode_cancel.py" stop-kind \
+            stop_kind="$(python3 "${CONTINUUM_CANCEL_HELPER:-$GITHUB_WORKSPACE/.continuum-cancel-engine/.github/scripts/opencode_cancel.py}" stop-kind \
               --comments-json "$stop_file" --repo "$stop_repo" --issue "$stop_issue" \
               --owner "${stop_repo%%/*}" --generation 1)" || return 1
             rm -f "$stop_file"
@@ -2727,8 +2745,11 @@ jobs:
 
           # If the agent switched branches before committing, preserve those
           # edits rather than letting the runner discard them.
-          if [[ -n "$(git status --porcelain)" ]]; then
-            git add -A
+          # kodmial/continuum#413: the publish boundary removes workflow-owned
+          # checkout directories and recovery metadata even when an older
+          # branch already tracked them.
+          continuum_stage_publishable || exit 1
+          if ! git diff --cached --quiet; then
             # kodmial/continuum#260: workflow-owned recovery commit uses the
             # bot identity (see Configure Git identity) plus a stable
             # component trailer so it is visibly machine-generated.
@@ -2813,7 +2834,7 @@ jobs:
                 echo "::error::Could not verify operator stop for $stop_repo#$stop_issue; refusing to publish." >&2
                 return 1
               }
-            stop_kind="$(python3 "$GITHUB_WORKSPACE/.continuum-cancel-engine/.github/scripts/opencode_cancel.py" stop-kind \
+            stop_kind="$(python3 "${CONTINUUM_CANCEL_HELPER:-$GITHUB_WORKSPACE/.continuum-cancel-engine/.github/scripts/opencode_cancel.py}" stop-kind \
               --comments-json "$stop_file" --repo "$stop_repo" --issue "$stop_issue" \
               --owner "${stop_repo%%/*}" --generation 1)" || return 1
             rm -f "$stop_file"
@@ -2825,6 +2846,8 @@ jobs:
 
           # shellcheck disable=SC1091
           source "${RUNNER_TEMP:-/tmp}/continuum-429-evacuate.sh" 2>/dev/null || true
+          # shellcheck disable=SC1090
+          source "${RUNNER_TEMP:-/tmp}/continuum-pr-staging.sh"
           # kodmial/continuum#302: the evacuator helper already defines
           # continuum_assert_safe_push; define it here as well so this step
           # stays fail-closed even when the helper failed to install.
@@ -2966,10 +2989,15 @@ jobs:
               find . -type d -name '__pycache__' -prune -exec rm -rf {} +
               find . -type f \( -name '*.pyc' -o -name '*.pyo' \) -delete
               if [[ -n "$(git status --porcelain)" ]]; then
-                git add -A
-                git commit -m "chore: checkpoint interrupted issue #${ISSUE_NUMBER}" \
-                  -m "Continuum-Checkpoint-Issue: #${ISSUE_NUMBER}" \
-                  -m "Continuum-Component: opencode" || true
+                if ! continuum_stage_checkpoint; then
+                  echo "::warning::Refusing interrupted checkpoint with an unconfigured Gitlink."
+                  exit "$exit_code"
+                fi
+                if ! git diff --cached --quiet; then
+                  git commit -m "chore: checkpoint interrupted issue #${ISSUE_NUMBER}" \
+                    -m "Continuum-Checkpoint-Issue: #${ISSUE_NUMBER}" \
+                    -m "Continuum-Component: opencode" || true
+                fi
               fi
               if [[ "$(git rev-parse HEAD)" != "$BASE_START_SHA" ]]; then
                 # kodmial/continuum#302: interruption checkpoints are
@@ -3085,8 +3113,20 @@ jobs:
             exit 1
           fi
 
+          # Keep generated Python bytecode out of task commits even when an
+          # agent or test run created it before staging. .gitignore prevents new
+          # cache files; this also removes any tracked leftovers.
+          find . -type d -name '__pycache__' -prune -exec rm -rf {} +
+          find . -type f \( -name '*.pyc' -o -name '*.pyo' \) -delete
+          # kodmial/continuum#290/#413: the 429 stage-progress file and the
+          # recovery identity are workflow-owned recovery metadata, never
+          # product code. The evacuator commits them into checkpoints when
+          # present; this publish boundary removes them (and the cancellation
+          # engine checkout) before the no-change decision and task commit.
+          continuum_stage_publishable || exit 1
+
           WORKTREE_DIRTY=false
-          if [[ -n "$(git status --porcelain)" ]]; then
+          if ! git diff --cached --quiet; then
             WORKTREE_DIRTY=true
           fi
           COMMITS_FROM_START="$(git rev-list --count "$BASE_START_SHA..HEAD" 2>/dev/null || echo 0)"
@@ -3110,19 +3150,7 @@ jobs:
             exit 0
           fi
 
-          # Keep generated Python bytecode out of task commits even when an
-          # agent or test run created it before staging. .gitignore prevents new
-          # cache files; this also removes any tracked leftovers.
-          find . -type d -name '__pycache__' -prune -exec rm -rf {} +
-          find . -type f \( -name '*.pyc' -o -name '*.pyo' \) -delete
-          # kodmial/continuum#290: the 429 stage-progress file is
-          # workflow-owned recovery metadata, never product code. The
-          # evacuator commits it into checkpoints when present; the task
-          # commit below must not carry it into the PR.
-          rm -f .continuum-429-stage
-
-          if [[ -n "$(git status --porcelain)" ]]; then
-            git add -A
+          if [[ "$WORKTREE_DIRTY" == "true" ]]; then
             # kodmial/continuum#260: workflow-owned task commit sets the bot
             # identity (see Configure Git identity) and carries the component
             # trailer. The agent itself never commits (see prompt: the workflow
@@ -3288,6 +3316,8 @@ jobs:
           set -euo pipefail
           # shellcheck disable=SC1091
           source "${RUNNER_TEMP:-/tmp}/continuum-429-evacuate.sh" 2>/dev/null || true
+          # shellcheck disable=SC1090
+          source "${RUNNER_TEMP:-/tmp}/continuum-pr-staging.sh"
           [[ "$QUALIFICATION_NUMBER" =~ ^[0-9]+$ ]] || { echo "::error::Missing qualification issue number."; exit 2; }
           [[ "$REQUIRED_SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::Missing exact required SHA for qualification."; exit 2; }
           [[ "$CAPABILITY_NUMBER" =~ ^[0-9]+$ ]] || { echo "::error::Missing capability number for qualification run identity."; exit 2; }
@@ -3694,6 +3724,8 @@ jobs:
           fi
           # shellcheck disable=SC1091
           source "${RUNNER_TEMP:-/tmp}/continuum-429-evacuate.sh" 2>/dev/null || true
+          # shellcheck disable=SC1090
+          source "${RUNNER_TEMP:-/tmp}/continuum-pr-staging.sh"
           # kodmial/continuum#302: repair updates only the exact current PR
           # head. HEAD_REF must be a proven non-default ref before the agent
           # runs; the push below re-asserts it after the exact-head race
@@ -3802,8 +3834,11 @@ jobs:
           # kodmial/continuum#260: deterministic ownership — the workflow owns
           # the final commit with the bot identity (see Configure Git
           # identity) plus the component trailer. The agent never commits.
-          if [[ -n "$(git status --porcelain)" ]]; then
-            git add -A
+          # kodmial/continuum#413: publish only task edits; a previously
+          # tracked cancellation Gitlink or recovery artifact is removed at
+          # this exact boundary, and an unknown Gitlink fails closed.
+          continuum_stage_publishable || exit 1
+          if ! git diff --cached --quiet; then
             git commit -m "fix: address CodeRabbit review findings for PR #${PR_NUMBER}" -m "Continuum-Component: opencode"
           fi
 
@@ -4179,6 +4214,8 @@ jobs:
           fi
           # shellcheck disable=SC1091
           source "${RUNNER_TEMP:-/tmp}/continuum-429-evacuate.sh" 2>/dev/null || true
+          # shellcheck disable=SC1090
+          source "${RUNNER_TEMP:-/tmp}/continuum-pr-staging.sh"
           # kodmial/continuum#302: conflict repair updates only the exact
           # current PR head. HEAD_REF must be a proven non-default ref
           # before the agent runs and again before the push below.
@@ -4283,8 +4320,11 @@ jobs:
           # kodmial/continuum#260: deterministic ownership — the workflow owns
           # the final conflict-repair commit with the bot identity plus the
           # component trailer. Never rebase or reset away either side.
-          if [[ -n "$(git status --porcelain)" ]]; then
-            git add -A
+          # kodmial/continuum#413: exclude only workflow-owned artifacts at
+          # the publish boundary; legitimate merge edits and declared
+          # submodules stay intact, and an unknown Gitlink fails closed.
+          continuum_stage_publishable || exit 1
+          if ! git diff --cached --quiet; then
             git commit -m "fix: resolve merge conflict with main for PR #${PR_NUMBER}" -m "Continuum-Component: opencode"
           fi
           if [[ "$(git rev-list --count "origin/${HEAD_REF}"..HEAD)" -gt 0 ]]; then
@@ -4317,6 +4357,8 @@ jobs:
           set -euo pipefail
           # shellcheck disable=SC1091
           source "${RUNNER_TEMP:-/tmp}/continuum-429-evacuate.sh" 2>/dev/null || true
+          # shellcheck disable=SC1090
+          source "${RUNNER_TEMP:-/tmp}/continuum-pr-staging.sh"
           # kodmial/continuum#302: CI repair updates only the exact current
           # PR head. HEAD_REF must be a proven non-default ref before the
           # agent runs and again before the push below.
@@ -4490,8 +4532,11 @@ jobs:
           # the final repair commit with the bot identity plus the component
           # trailer. The agent never commits.
           BEFORE_SHA=$(git rev-parse HEAD)
-          if [[ -n "$(git status --porcelain)" ]]; then
-            git add -A
+          # kodmial/continuum#413: the CI repair publishes through the same
+          # deterministic boundary as issue mode; workflow-only files never
+          # enter the PR, and an unknown Gitlink fails closed before push.
+          continuum_stage_publishable || exit 1
+          if ! git diff --cached --quiet; then
             git commit -m "fix: repair blocking workflow for PR #${PR_NUMBER}" -m "Continuum-Component: opencode"
             # kodmial/continuum#302: CI repair publishes only to the proven
             # non-default PR head asserted on entry.
