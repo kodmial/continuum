@@ -75,14 +75,15 @@ APPROVED_350_OPENCODE_SHA256 = (
     "f9368c6939f4343a27f28d3bdc0653d1b1822de56c1b963454543cbed60fb03b"
 )
 
-# kodmial/continuum#374 exact protected-workflow artifact pin. A fresh-VM 429
-# issue recovery now bootstraps its initial checkout from a trusted existing
-# base/default ref and restores the exact pinned checkpoint afterwards; a
-# pre-restore checkout/transport failure is classified as bounded
-# infrastructure recovery instead of a task attempt. This pins the entire
+# kodmial/continuum#374/#395 exact protected-workflow artifact pin. A fresh-VM
+# 429 issue recovery now bootstraps its initial checkout from a trusted
+# existing base/default ref and restores the exact pinned checkpoint
+# afterwards; a pre-restore checkout/transport failure is classified as bounded
+# infrastructure recovery instead of a task attempt, and workflow-owned
+# recovery metadata is stripped before the task commit. This pins the entire
 # reviewed workflow content so unrelated drift still fails closed.
 APPROVED_374_OPENCODE_SHA256 = (
-    "6d95dabd11ca824935e89a5c379a086f7e9d26acef246cdb2bfa25c666832077"
+    "fa86b8c47e187bf617a48bdb5e110cd3adf8c4447ee472cdbe03911e9b2b4bdf"
 )
 APPROVED_350_SELF_CALLER_SHA256 = (
     "f06cdcb9affc06f976aed97945ff9d31496e5954ca225971164f87ec4e1ca22c"

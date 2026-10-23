@@ -244,6 +244,30 @@ class BootstrapCheckoutExpressionTest(unittest.TestCase):
         self.assertTrue(model_indexes)
         self.assertGreater(min(model_indexes), restore_index)
 
+    def test_task_publication_excludes_workflow_recovery_metadata(self):
+        # The recovered checkpoint carries workflow-owned runtime files. They
+        # must be removed before the task commit, never shipped in the PR.
+        for name, commit_marker in (
+            ("Implement issue", 'git commit -m "${COMMIT_PREFIX}'),
+            (
+                "Recover agent-managed issue branch",
+                'git commit -m "chore: recover OpenCode issue changes"',
+            ),
+        ):
+            with self.subTest(step=name):
+                script = step(self.opencode, name)["run"]
+                for runtime_file in (
+                    ".continuum-429-stage",
+                    ".continuum-429-recovery.json",
+                ):
+                    self.assertIn("rm -f", script)
+                    self.assertIn(runtime_file, script)
+                self.assertLess(
+                    script.index(".continuum-429-recovery.json"),
+                    script.index(commit_marker),
+                    "runtime recovery metadata must be removed before committing",
+                )
+
     def test_watchdog_and_callers_keep_the_recovery_identity_mapping(self):
         watchdog = WATCHDOG.read_text(encoding="utf-8")
         self.assertIn(

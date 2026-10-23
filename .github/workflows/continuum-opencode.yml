@@ -2421,7 +2421,10 @@ jobs:
           fi
 
           # If the agent switched branches before committing, preserve those
-          # edits rather than letting the runner discard them.
+          # edits rather than letting the runner discard them. Workflow-owned
+          # 429 recovery metadata is never product code and must not reach the
+          # recovered pull request.
+          rm -f .continuum-429-stage .continuum-429-recovery.json
           if [[ -n "$(git status --porcelain)" ]]; then
             git add -A
             # kodmial/continuum#260: workflow-owned recovery commit uses the
@@ -2790,11 +2793,11 @@ jobs:
           # cache files; this also removes any tracked leftovers.
           find . -type d -name '__pycache__' -prune -exec rm -rf {} +
           find . -type f \( -name '*.pyc' -o -name '*.pyo' \) -delete
-          # kodmial/continuum#290: the 429 stage-progress file is
-          # workflow-owned recovery metadata, never product code. The
-          # evacuator commits it into checkpoints when present; the task
-          # commit below must not carry it into the PR.
-          rm -f .continuum-429-stage
+          # kodmial/continuum#290/#374: the 429 stage-progress file and the
+          # recovery identity file are workflow-owned recovery metadata, never
+          # product code. The evacuator commits them into checkpoints when
+          # present; the task commit below must not carry either into the PR.
+          rm -f .continuum-429-stage .continuum-429-recovery.json
 
           if [[ -n "$(git status --porcelain)" ]]; then
             git add -A
