@@ -196,6 +196,7 @@ jobs:
               typeof readGithub.rest?.actions?.listWorkflowRunsForRepo !== 'function' ||
               typeof readGithub.rest?.actions?.listWorkflowRuns !== 'function' ||
               typeof readGithub.rest?.actions?.listJobsForWorkflowRun !== 'function' ||
+              typeof readGithub.rest?.actions?.getWorkflowRun !== 'function' ||
               typeof readGithub.rest?.actions?.reRunWorkflow !== 'function' ||
               typeof readGithub.rest?.git?.getRef !== 'function' ||
               typeof readGithub.rest?.repos?.get !== 'function' ||
@@ -338,19 +339,10 @@ jobs:
               return all.length ? all[all.length - 1] : null;
             }
 
-            function recoveryCommentBody(marker, summary) {
-              return [
-                marker,
-                '⚡ **Continuum · opencode-watchdog**',
-                '<!-- continuum-origin role=continuum component=opencode-watchdog -->',
-                summary,
-              ].join('\n');
-            }
-
             async function recordRecoveryState({
               threadNumber, operation, generation, state, checkpointRef,
               checkpointSha, runId, attempt, nextDue, detail, summary,
-              fresh = false,
+              fresh = false, commentId = 0,
             }) {
               if (!Number.isInteger(threadNumber) || threadNumber <= 0) return null;
               const marker = recoveryStateMarker({
@@ -365,11 +357,19 @@ jobs:
               // Match the machine-readable marker exactly (same operation and
               // arithmetic generation), never an unanchored substring: a
               // `gen=1` lookup must not update a `gen=10` comment.
-              const existing = comments
+              let existing = comments
                 .filter(comment => parseRecoveryStates(
                   comment.body || '', operation, generation
                 ).length > 0)
                 .sort((a, b) => Number(a.id || 0) - Number(b.id || 0));
+              // Post-dispatch updates target the winning claim, never a
+              // concurrent loser's soon-to-be-deleted claim.
+              if (Number(commentId) > 0) {
+                const own = comments.filter(
+                  comment => Number(comment.id) === Number(commentId)
+                );
+                if (own.length) existing = own;
+              }
               if (existing.length) {
                 const latest = existing[existing.length - 1];
                 await github.rest.issues.updateComment({
@@ -381,6 +381,15 @@ jobs:
                 owner, repo, issue_number: threadNumber, body,
               });
               return created.data;
+            }
+
+            function recoveryCommentBody(marker, summary) {
+              return [
+                marker,
+                '⚡ **Continuum · opencode-watchdog**',
+                '<!-- continuum-origin role=continuum component=opencode-watchdog -->',
+                summary,
+              ].join('\n');
             }
 
             // kodmial/continuum#350: the pre-dispatch claim must be a fresh
@@ -683,6 +692,224 @@ jobs:
               return null;
             }
 
+            // A recorded `observed` marker is an ownership fence only while
+            // authoritative GitHub evidence says the recorded run still owns
+            // the work. The marker alone is never enough: an old resumption can
+            // fail or be cancelled, and a later workflow-owned checkpoint can
+            // contain saved work that the old run never saw.
+            const observedFenceStates = new Set([
+              'observed', 'observed-unverified',
+            ]);
+            const observedTerminalFailures = new Set([
+              'failure', 'timed_out', 'startup_failure', 'action_required',
+              'stale', 'cancelled', 'skipped', 'neutral',
+            ]);
+            function isValidCheckpointSha(value) {
+              return /^[0-9a-f]{40}$/i.test(String(value || '').trim());
+            }
+            function trustedOperatorStopComment(comment, trustedOwner) {
+              const association = String(
+                comment.author_association || ''
+              ).toUpperCase();
+              if (['OWNER', 'MEMBER', 'COLLABORATOR'].includes(association)) {
+                return true;
+              }
+              const login = String(comment.user?.login || '').toLowerCase();
+              if (login === 'github-actions[bot]') return true;
+              return login === String(trustedOwner || '').toLowerCase();
+            }
+            function operatorCommentOrder(comment) {
+              return String(comment.created_at || '') + '#' +
+                String(comment.id || 0).padStart(12, '0');
+            }
+            // An owner STOP is authoritative for the 429 path too. It is read
+            // from the same durable comment history as the normal recovery
+            // path; no label or prose is guessed at.
+            function hasEffectiveOperatorStop(comments, threadNumber, generation) {
+              if (!Number.isInteger(threadNumber) || threadNumber <= 0) {
+                return false;
+              }
+              const stopRe =
+                /<!--\s*continuum-task-operator-stop\s+repo=([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)\s+issue=(\d+)\s+generation=(\d+)\s*-->/;
+              const resumeRe =
+                /<!--\s*continuum-task-operator-resume\s+repo=([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)\s+issue=(\d+)\s+generation=(\d+)\s*-->/;
+              const wantedRepo = (owner + '/' + repo).toLowerCase();
+              let lastStop = null;
+              let lastResume = null;
+              for (const comment of comments) {
+                if (!trustedOperatorStopComment(comment, owner)) continue;
+                const body = String(comment.body || '');
+                const stop = body.match(stopRe);
+                if (
+                  stop &&
+                  stop[1].toLowerCase() === wantedRepo &&
+                  Number(stop[2]) === threadNumber &&
+                  Number(stop[3]) === Number(generation)
+                ) {
+                  if (
+                    !lastStop ||
+                    operatorCommentOrder(comment) > operatorCommentOrder(lastStop)
+                  ) {
+                    lastStop = comment;
+                  }
+                  continue;
+                }
+                const resume = body.match(resumeRe);
+                if (
+                  resume &&
+                  resume[1].toLowerCase() === wantedRepo &&
+                  Number(resume[2]) === threadNumber &&
+                  Number(resume[3]) === Number(generation)
+                ) {
+                  if (
+                    !lastResume ||
+                    operatorCommentOrder(comment) > operatorCommentOrder(lastResume)
+                  ) {
+                    lastResume = comment;
+                  }
+                }
+              }
+              return Boolean(
+                lastStop &&
+                (!lastResume ||
+                  operatorCommentOrder(lastResume) <=
+                    operatorCommentOrder(lastStop))
+              );
+            }
+
+            // Publication evidence is checked through the API, never by
+            // reading arbitrary comment prose. Any PR on the issue branch (open,
+            // closed, or merged) proves the run already published.
+            async function hasPublishedResumptionPullRequest({
+              mode, issueNumber, prNumber, identity,
+            }) {
+              if (mode === 'issue' && /^[0-9]+$/.test(String(issueNumber || ''))) {
+                const branch = String(
+                  identity.head_ref || identity.branch || ''
+                ).trim();
+                const prefix = 'opencode/issue' + issueNumber + '-';
+                const pulls = await readGithub.paginate(
+                  readGithub.rest.pulls.list,
+                  { owner, repo, state: 'all', per_page: 100 }
+                );
+                return pulls.some(pull => {
+                  const headRepo = String(pull.head?.repo?.full_name || '');
+                  const headRef = String(pull.head?.ref || '');
+                  if (headRepo !== owner + '/' + repo) return false;
+                  return branch ? headRef === branch : headRef.startsWith(prefix);
+                });
+              }
+              if (/^[0-9]+$/.test(String(prNumber || ''))) {
+                try {
+                  const response = await readGithub.rest.pulls.get({
+                    owner, repo, pull_number: Number(prNumber),
+                  });
+                  return Boolean(response && response.data);
+                } catch (err) {
+                  if (Number(err && err.status || 0) === 404) return false;
+                  throw err;
+                }
+              }
+              return false;
+            }
+
+            // Resolve an observed recovery marker against authoritative run
+            // status and the current metadata-verified checkpoint. `retry-later`
+            // is a fail-closed, bounded retry; it never dispatches blind.
+            async function inspectObservedRecovery({
+              previous, checkpointSha, mode, issueNumber, prNumber, identity,
+            }) {
+              const runId = String(previous.runId || '').trim();
+              if (!/^[0-9]+$/.test(runId)) {
+                return { action: 'retry-later', detail: 'run-id-missing' };
+              }
+              let observedRun;
+              try {
+                const response = await readGithub.rest.actions.getWorkflowRun({
+                  owner, repo, run_id: Number(runId),
+                });
+                observedRun = response && response.data;
+              } catch (err) {
+                const status = Number(err && err.status || 0);
+                return {
+                  action: 'retry-later',
+                  runId,
+                  detail: 'run-status-' + (status || 'unavailable'),
+                };
+              }
+              if (!observedRun || typeof observedRun !== 'object') {
+                return {
+                  action: 'retry-later', runId, detail: 'run-status-malformed',
+                };
+              }
+              const status = String(observedRun.status || '');
+              const conclusion = observedRun.conclusion == null
+                ? ''
+                : String(observedRun.conclusion);
+              const evidence = { runId, status, conclusion };
+              if (status !== 'completed') {
+                return { ...evidence, action: 'stand-down', reason: 'active' };
+              }
+              if (conclusion === 'success') {
+                return {
+                  ...evidence, action: 'stand-down', reason: 'completed-success',
+                };
+              }
+              if (!observedTerminalFailures.has(conclusion)) {
+                return {
+                  ...evidence,
+                  action: 'stand-down',
+                  reason: 'terminal-' + (conclusion || 'unknown'),
+                };
+              }
+              let published = false;
+              try {
+                published = await hasPublishedResumptionPullRequest({
+                  mode, issueNumber, prNumber, identity,
+                });
+              } catch (err) {
+                const apiStatus = Number(err && err.status || 0);
+                return {
+                  ...evidence,
+                  action: 'retry-later',
+                  detail: 'publication-status-' + (apiStatus || 'unavailable'),
+                };
+              }
+              if (published) {
+                return {
+                  ...evidence, action: 'stand-down', reason: 'published',
+                };
+              }
+              const previousSha = String(previous.checkpointSha || '')
+                .trim().toLowerCase();
+              const currentSha = String(checkpointSha || '')
+                .trim().toLowerCase();
+              if (
+                !isValidCheckpointSha(previousSha) ||
+                !isValidCheckpointSha(currentSha)
+              ) {
+                return {
+                  ...evidence,
+                  action: 'retry-later',
+                  detail: 'checkpoint-sha-unverifiable',
+                };
+              }
+              if (previousSha === currentSha) {
+                return {
+                  ...evidence,
+                  action: 'stand-down',
+                  reason: 'checkpoint-unchanged',
+                };
+              }
+              return {
+                ...evidence,
+                action: 'resume',
+                reason: 'newer-checkpoint',
+                previousSha,
+                currentSha,
+              };
+            }
+
             async function recoverFrom429OnFreshVm({
               owner, repo, run, evacuated429,
               max429Restarts,
@@ -835,6 +1062,21 @@ jobs:
                 );
               }
 
+              // An owner STOP is authoritative for this operation. It is
+              // evaluated before any retry/claim so a stopped generation can
+              // never be redispatched by infrastructure recovery.
+              if (
+                mode === 'issue' &&
+                hasEffectiveOperatorStop(comments, threadNumber, generation)
+              ) {
+                core.notice(
+                  'OpenCode infrastructure operation ' + operation +
+                  ' generation ' + generation + ' has an effective owner STOP; ' +
+                  'watchdog will not dispatch a resumption.'
+                );
+                return;
+              }
+
               const displayTitle = mode === 'issue'
                 ? 'OpenCode issue #' + issueText
                 : (prText ? 'OpenCode repair PR #' + prText : '');
@@ -896,13 +1138,97 @@ jobs:
               }
 
               if (previous) {
-                if (previous.state === 'observed') {
+                if (observedFenceStates.has(previous.state)) {
+                  if (previous.nextDue > now) {
+                    core.notice(
+                      'OpenCode infrastructure operation ' + operation + ' generation ' +
+                      generation + ' is awaiting authoritative run evidence until ' +
+                      previous.nextDue + '; no duplicate dispatch.'
+                    );
+                    return;
+                  }
+                  const observed = await inspectObservedRecovery({
+                    previous,
+                    checkpointSha,
+                    mode,
+                    issueNumber: issueText,
+                    prNumber: prText,
+                    identity,
+                  });
+                  if (observed.action === 'stand-down') {
+                    core.notice(
+                      'OpenCode infrastructure operation ' + operation + ' generation ' +
+                      generation + ' was already resumed by observed run ' +
+                      previous.runId + ' (' + observed.status + '/' +
+                      observed.conclusion + ', ' + observed.reason + '); ' +
+                      'watchdog will not create a competing resumption.'
+                    );
+                    return;
+                  }
+                  if (observed.action === 'retry-later') {
+                    // Every unverified retry consumes one bounded attempt. A
+                    // permanently unreadable run lookup must eventually enter
+                    // backoff instead of polling every wake forever.
+                    const retryAttempt = (Number(previous.attempt) || 0) + 1;
+                    const retryBudget = Math.max(1, max429Restarts + 1);
+                    if (retryAttempt >= retryBudget) {
+                      await recordRecoveryState({
+                        ...baseState,
+                        checkpointSha: previous.checkpointSha || pointerSha,
+                        state: 'backoff',
+                        attempt: retryAttempt,
+                        nextDue: now + 3600,
+                        runId: observed.runId || previous.runId,
+                        detail: 'attempts-exhausted',
+                        summary: 'OpenCode infrastructure resumption could not be ' +
+                          'verified from authoritative GitHub evidence (' +
+                          observed.detail + ') and the bounded retry budget is ' +
+                          'exhausted. The checkpoint is preserved; no duplicate ' +
+                          'dispatch was made.',
+                        fresh: previous.state === 'observed',
+                      });
+                      core.warning(
+                        'OpenCode infrastructure operation ' + operation + ' generation ' +
+                        generation + ' observed run evidence remains unavailable (' +
+                        observed.detail + '); entering bounded backoff after ' +
+                        'exhausting the retry budget without dispatching a duplicate.'
+                      );
+                      return;
+                    }
+                    // Keep the earlier observed marker as history and publish a
+                    // bounded retry state. A transient/unverifiable GitHub read
+                    // must never become a permanent observed deadlock.
+                    await recordRecoveryState({
+                      ...baseState,
+                      checkpointSha: previous.checkpointSha || pointerSha,
+                      state: 'observed-unverified',
+                      attempt: retryAttempt,
+                      nextDue: now + 300,
+                      runId: observed.runId || previous.runId,
+                      detail: observed.detail,
+                      summary: 'OpenCode infrastructure resumption could not be ' +
+                        'verified from authoritative GitHub evidence (' +
+                        observed.detail + '). The checkpoint is preserved and a ' +
+                        'bounded watchdog catch-up will retry; no duplicate dispatch ' +
+                        'was made.',
+                      fresh: previous.state === 'observed',
+                    });
+                    core.warning(
+                      'OpenCode infrastructure operation ' + operation + ' generation ' +
+                      generation + ' observed run evidence is unavailable (' +
+                      observed.detail + '); retrying on a bounded catch-up without ' +
+                      'dispatching a duplicate.'
+                    );
+                    return;
+                  }
                   core.notice(
                     'OpenCode infrastructure operation ' + operation + ' generation ' +
-                    generation + ' was already resumed by observed run ' + previous.runId + '; ' +
-                    'watchdog will not create a competing resumption.'
+                    generation + ' observed run ' + previous.runId +
+                    ' ended ' + observed.conclusion + ' at checkpoint ' +
+                    observed.previousSha + ', but the metadata-verified checkpoint ' +
+                    'advanced to ' + observed.currentSha + '; that old run never saw ' +
+                    'the newer saved work, so a bounded fresh-VM resumption is allowed.'
                   );
-                  return;
                 }
                 if (previous.state === 'accepted' && previous.nextDue > now) {
                   core.notice(
@@ -1106,6 +1432,7 @@ jobs:
                   detail: 'dispatch-not-observed',
                   summary: 'GitHub accepted the fresh-VM dispatch through `' + target.path +
                     '`, but no new run was observed yet. A scheduled watchdog catch-up will verify it; a claim alone is not treated as proof that a runner started.',
+                  commentId: claim && claim.id,
                 });
                 core.warning(
                   'OpenCode 429 dispatch through ' + target.path + ' for operation ' +
@@ -1126,6 +1453,7 @@ jobs:
                   checkpointRef + '` at exact SHA `' + checkpointSha + '` (stage `' +
                   stage + '`, generation ' + generation + '). Completed stages are not ' +
                   'repeated and no task/review/qualification budget was consumed.',
+                commentId: claim && claim.id,
               });
               core.notice(
                 'OpenCode 429: observed fresh-VM run ' + observed.id +
