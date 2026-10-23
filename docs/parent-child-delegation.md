@@ -133,6 +133,14 @@ does not start a delegated worker for the same issue while it observes an active
 local OpenCode run, an open `opencode/issue<NUMBER>-...` pull request, or a
 recent owner command inside the configured command-grace window.
 
+The exact owner `/oc-cancel` command cancels the child's local runs and, when
+the child role is verified, the matching delegated worker in the Parent Actions
+repository. Cancellation requires the child's `TAP_PAT` to have Actions read/write
+access to the parent. The durable operator stop remains on the child issue, so
+the parent scheduler and worker do not relaunch that generation; the opaque
+Child id is masked in logs. A parent worker already using the legacy
+`SubTask #N` title cannot be attributed safely and is never guessed at.
+
 ## Child PR-Agent routing through the parent
 
 When `CONTINUUM_REVIEW_PROVIDER=pr-agent`, the parent is the only automatic

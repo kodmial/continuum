@@ -9166,6 +9166,66 @@ class ContinuumTest < Minitest::Test
                      'true drift must publish the deterministic terminal stop state'
   end
 
+  # kodmial/continuum#400: /oc-cancel is a physical, durable cancellation,
+  # not a launch guard. Admission must route it away from the coder, and the
+  # control plane must persist the operator stop before cancelling only exact
+  # provenance-verified run ids.
+  def test_operator_cancel_is_physical_and_durable
+    admission = File.read(File.join(ROOT, 'src/continuum/opencode_admission.py'))
+    assert_includes admission, '"route": "cancel"',
+                     'the exact owner /oc-cancel must route to cancellation control'
+    cancel_engine = File.read(File.join(ROOT, 'src/continuum/opencode_cancel.py'))
+    %w[
+      OPERATOR_STOP_MARKER OPERATOR_RESUME_MARKER
+      is_operator_stopped is_execution_stopped plan_cancellation
+      classify_cancel_response needs_force_cancel
+    ].each do |symbol|
+      assert_includes cancel_engine, symbol, "opencode_cancel.py must define #{symbol}"
+    end
+    workflow = workflow_body('continuum-opencode.yml')
+    job = YAML.safe_load(workflow).fetch('jobs').fetch('cancel')
+    permissions = job.fetch('permissions')
+    assert_equal 'write', permissions.fetch('actions'),
+                 'physical cancellation requires actions: write'
+    assert_equal 'write', permissions.fetch('issues'),
+                 'the durable operator stop requires issues: write'
+    cancel_step = step_body(workflow, 'Persist stop and cancel exact active runs')
+    refute_nil cancel_step, 'the physical cancellation step is missing'
+    stop_index = cancel_step.index('operator-stop')
+    cancel_index = cancel_step.index('/actions/runs/')
+    refute_nil stop_index, 'the durable operator stop must be persisted'
+    refute_nil cancel_index, 'the run cancellation API call is missing'
+    assert_operator stop_index, :<, cancel_index,
+                    'the durable stop must be persisted before any cancel request'
+    assert_includes cancel_step, 'force-cancel',
+                     'a bounded force-cancel fallback is required'
+    assert_includes cancel_step, 'GITHUB_RUN_ID',
+                     'the control-plane run must be excluded from cancellation'
+    assert_includes cancel_step, 'classify',
+                     'HTTP acceptance must be classified without claiming a stopped job'
+    %w[
+      CONTINUUM_ROLE CONTINUUM_PARENT CONTINUUM_CHILD_ID
+      continuum-child-worker.yml --child-id
+    ].each do |needle|
+      assert_includes cancel_step, needle,
+                      "delegated Child cancellation must resolve #{needle}"
+    end
+    assert_includes cancel_step, '::add-mask::',
+                     'the opaque Child id must not be exposed in public logs'
+    assert_includes cancel_step, 'TAP_PAT',
+                     'the Parent Actions repository requires the lifecycle token'
+    scheduler = workflow_body('continuum-issue-scheduler.yml')
+    assert_includes scheduler, 'continuum-task-operator-stop',
+                     'the scheduler must recognize the operator stop'
+    assert_includes scheduler, 'continuum-task-operator-resume',
+                     'only an explicit operator resume may re-arm an operator stop'
+    watchdog = workflow_body('continuum-opencode-watchdog.yml')
+    assert_includes watchdog, 'continuum-task-operator-stop',
+                     'the watchdog must not retry an operator-cancelled generation'
+    assert File.exist?(File.join(ROOT, 'tests/test_opencode_cancel.py')),
+                 'physical cancellation needs hermetic stop/provenance tests'
+  end
+
   def test_terminal_generation_stop_gates_every_scheduler_path
     engine = File.read(File.join(ROOT, 'src/continuum/task_snapshot.py'))
     %w[

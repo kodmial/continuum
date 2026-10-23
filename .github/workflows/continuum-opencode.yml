@@ -515,6 +515,298 @@ jobs:
           fi
           python3 "$parser" admit "${args[@]}" >> "$GITHUB_OUTPUT"
 
+  cancel:
+    # Exact owner /oc-cancel on an ordinary issue. Admission never starts the
+    # coder for this route. Persist the durable operator stop first, then
+    # cancel only provenance-verified active runs and report observed outcomes
+    # truthfully: HTTP 202 is acceptance, never proof that a job stopped.
+    name: Cancel OpenCode generation
+    needs: admit
+    if: needs.admit.outputs.run == 'false' && needs.admit.outputs.route == 'cancel'
+    runs-on: ubuntu-latest
+    timeout-minutes: ${{ fromJSON(vars.AUTOMATION_DISPATCH_TIMEOUT_MINUTES || '10') }}
+    permissions:
+      actions: write
+      contents: read
+      issues: write
+    concurrency:
+      group: opencode-cancel-${{ github.event.issue.number || github.run_id }}
+      cancel-in-progress: false
+    steps:
+      - name: Checkout cancellation engine
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: kodmial/continuum
+          ref: ${{ inputs.continuum_ref || 'main' }}
+          path: .continuum-cancel-engine
+          fetch-depth: 1
+          persist-credentials: false
+          sparse-checkout: |
+            src/continuum
+            .github/scripts
+
+      - name: Persist stop and cancel exact active runs
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GITHUB_TOKEN: ${{ github.token }}
+          GITHUB_API_URL: ${{ github.api_url }}
+          PARENT_TOKEN: ${{ secrets.TAP_PAT }}
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+          REPOSITORY_OWNER: ${{ github.repository_owner }}
+          WORKFLOW_PATH_A: .github/workflows/continuum-opencode.yml
+          WORKFLOW_NAME: OpenCode agent
+          WORKFLOW_REF: ${{ github.workflow_ref }}
+        run: |
+          set -euo pipefail
+          helper="$GITHUB_WORKSPACE/.continuum-cancel-engine/.github/scripts/opencode_cancel.py"
+          [[ "$ISSUE_NUMBER" =~ ^[1-9][0-9]*$ ]] || { echo "::error::Cancellation has no valid issue number."; exit 1; }
+          work="$RUNNER_TEMP/continuum-cancel"
+          mkdir -p "$work"
+          comments="$work/comments.json"
+          fetch_comments() {
+            gh api --paginate --slurp \
+              "repos/$GITHUB_REPOSITORY/issues/$ISSUE_NUMBER/comments?per_page=100" \
+              | jq 'add // []' >"$comments"
+          }
+          stop_state() {
+            python3 "$helper" has-operator-stop --comments-json "$comments" \
+              --repo "$GITHUB_REPOSITORY" --issue "$ISSUE_NUMBER" \
+              --owner "$REPOSITORY_OWNER" --generation 1
+          }
+          fetch_comments
+          if [[ "$(stop_state)" != "stopped" ]]; then
+            python3 "$helper" render-stop --repo "$GITHUB_REPOSITORY" \
+              --issue "$ISSUE_NUMBER" --generation 1 >"$work/operator-stop.md"
+            gh api --method POST \
+              "repos/$GITHUB_REPOSITORY/issues/$ISSUE_NUMBER/comments" \
+              --raw-field "body=$(cat "$work/operator-stop.md")" >/dev/null
+            fetch_comments
+            [[ "$(stop_state)" == "stopped" ]] || {
+              echo "::error::Operator stop comment was not persisted; refusing to cancel without a durable stop."
+              exit 1
+            }
+            echo "::notice::Persisted durable operator stop for $GITHUB_REPOSITORY#$ISSUE_NUMBER generation 1."
+          else
+            echo "::notice::Durable operator stop for $GITHUB_REPOSITORY#$ISSUE_NUMBER generation 1 already exists."
+          fi
+
+          # Bounded active inventory: explicit server-side status filters, at
+          # most five full pages per status. Truncation or any malformed page
+          # fails closed instead of being read as "no active run".
+          inventory_runs() {
+            local repo="$1" token="$2" runs_file="$3"
+            local raw_runs="${runs_file}.raw" status page count payload
+            : >"$raw_runs"
+            for status in queued requested pending waiting in_progress action_required; do
+              page=1
+              while :; do
+                if ! payload="$(GH_TOKEN="$token" gh api \
+                  "repos/$repo/actions/runs?status=$status&per_page=100&page=$page" \
+                  2>/dev/null)"; then
+                  echo "::error::Active run inventory is unavailable (status $status page $page); cancel nothing and retry."
+                  return 1
+                fi
+                if ! count="$(jq -er \
+                  'if (.workflow_runs | type) == "array" then (.workflow_runs | length) else error("bad workflow_runs") end' \
+                  <<<"$payload" 2>/dev/null)"; then
+                  echo "::error::Active run inventory is malformed (status $status page $page); cancel nothing."
+                  return 1
+                fi
+                jq -c --arg status "$status" \
+                  '.workflow_runs[] | select((.status // "") == $status)' \
+                  <<<"$payload" >>"$raw_runs"
+                if (( count < 100 )); then
+                  break
+                fi
+                if (( page >= 5 )); then
+                  echo "::error::Active run inventory is truncated at the bounded page cap; cancel nothing and retry."
+                  return 1
+                fi
+                page=$((page + 1))
+              done
+            done
+            jq -s 'unique_by(.id)' "$raw_runs" >"$runs_file"
+          }
+
+          post_action() {
+            local repo="$1" token="$2" run_id="$3" action="$4"
+            local response="$work/${run_id}-${action}.json"
+            curl -sS -o "$response" -w '%{http_code}' \
+              -X POST \
+              -H "Authorization: Bearer $token" \
+              -H "Accept: application/vnd.github+json" \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              "$GITHUB_API_URL/repos/$repo/actions/runs/$run_id/$action"
+          }
+
+          run_state() {
+            local repo="$1" token="$2" run_id="$3"
+            GH_TOKEN="$token" gh api "repos/$repo/actions/runs/$run_id" \
+              --jq '[(.status // ""), (.conclusion // "")] | @tsv' 2>/dev/null
+          }
+
+          tab=$'\t'
+          wait_for_terminal() {
+            local repo="$1" token="$2" run_id="$3" attempts="$4" state="unknown"
+            for ((attempt = 1; attempt <= attempts; attempt++)); do
+              state="$(run_state "$repo" "$token" "$run_id" || true)"
+              if [[ "${state%%"$tab"*}" == "completed" ]]; then
+                printf '%s\n' "$state"
+                return 0
+              fi
+              sleep 5
+            done
+            [[ "$state" == *"$tab"* ]] || state="unknown${tab}unknown"
+            printf '%s\n' "$state"
+            return 1
+          }
+
+          cancel_runs() {
+            local repo="$1" token="$2" label="$3"
+            shift 3
+            local run_id http_status classification state status conclusion
+            local force_status force_classification
+            for run_id in "$@"; do
+              echo "::notice::Cancelling $label active run $run_id for issue #$ISSUE_NUMBER."
+              if ! http_status="$(post_action "$repo" "$token" "$run_id" cancel)"; then
+                http_status=000
+              fi
+              classification="$(python3 "$helper" classify --status "$http_status")"
+              echo "::notice::Cancel request for run $run_id returned HTTP $http_status ($classification)."
+              case "$classification" in
+                accepted|conflict) ;;
+                forbidden)
+                  echo "::error::Cancel request for run $run_id was forbidden; actions: write/token scope is insufficient."
+                  failed=1
+                  continue
+                  ;;
+                *)
+                  echo "::error::Cancel request for run $run_id failed with HTTP $http_status ($classification)."
+                  failed=1
+                  continue
+                  ;;
+              esac
+
+              state="$(wait_for_terminal "$repo" "$token" "$run_id" 6 || true)"
+              status="${state%%"$tab"*}"
+              conclusion="${state#*"$tab"}"
+              [[ "$conclusion" == "$state" ]] && conclusion=""
+              if [[ "$status" != "completed" ]]; then
+                echo "::warning::Run $run_id is still $status after the cancel observation window; trying one force-cancel for the same validated run id."
+                if ! force_status="$(post_action "$repo" "$token" "$run_id" force-cancel)"; then
+                  force_status=000
+                fi
+                force_classification="$(python3 "$helper" classify --status "$force_status")"
+                echo "::notice::Force-cancel request for run $run_id returned HTTP $force_status ($force_classification)."
+                state="$(wait_for_terminal "$repo" "$token" "$run_id" 12 || true)"
+                status="${state%%"$tab"*}"
+                conclusion="${state#*"$tab"}"
+                [[ "$conclusion" == "$state" ]] && conclusion=""
+              fi
+
+              if [[ "$status" == "completed" && "$conclusion" == "cancelled" ]]; then
+                echo "::notice::Observed terminal cancellation of run $run_id."
+              elif [[ "$status" == "completed" ]]; then
+                echo "::warning::Run $run_id stopped with conclusion '$conclusion' instead of 'cancelled'; the durable operator stop still blocks publication and retries."
+              else
+                echo "::error::Run $run_id is still '$status' after bounded cancel and force-cancel; no proof of cancellation."
+                failed=1
+              fi
+            done
+          }
+
+          cancel_plan() {
+            local repo="$1" token="$2" label="$3"
+            shift 3
+            local runs_file="$work/runs-${label}.json" plan
+            inventory_runs "$repo" "$token" "$runs_file" || return 1
+            if ! plan="$(python3 "$helper" plan --runs-json "$runs_file" \
+              --repo "$repo" --issue "$ISSUE_NUMBER" --generation 1 \
+              "$@" --exclude-run-id "$GITHUB_RUN_ID")"; then
+              echo "::error::Cancellation planner failed for the $label target; no run was cancelled."
+              return 1
+            fi
+            echo "$plan" | jq .
+            if [[ "$(echo "$plan" | jq -r '.inventory')" != "ok" ]]; then
+              echo "::error::Cancellation planner rejected the $label inventory; no run was cancelled."
+              return 1
+            fi
+            mapfile -t target_ids < <(echo "$plan" | jq -r '.targets[].run_id')
+            if (( ${#target_ids[@]} == 0 )); then
+              echo "::notice::No active, provenance-verified $label run for issue #$ISSUE_NUMBER generation 1."
+              return 0
+            fi
+            cancel_runs "$repo" "$token" "$label" "${target_ids[@]}"
+          }
+
+          failed=0
+
+          # The caller path is trusted GitHub context, not user input. It
+          # covers both the installed continuum-opencode caller and the
+          # self-dogfood caller without hardcoding a consumer-specific name.
+          current_path="${WORKFLOW_REF%%@*}"
+          current_path="${current_path#"$GITHUB_REPOSITORY/"}"
+          local_args=(--workflow-path "$WORKFLOW_PATH_A")
+          if [[ "$current_path" == .github/workflows/*.yml ]]; then
+            local_args+=(--workflow-path "$current_path")
+          fi
+          cancel_plan "$GITHUB_REPOSITORY" "$GITHUB_TOKEN" local \
+            "${local_args[@]}" --workflow-name "$WORKFLOW_NAME" || failed=1
+
+          # A verified Child runs delegated work in its Parent Actions
+          # repository. Cancel only the exact Child task title there; the
+          # opaque Child id is masked and the Parent repository name is not
+          # derived from task text. The durable stop comment is on the Child
+          # issue and is what the Parent scheduler and worker already honour.
+          read_repo_variable() {
+            local name="$1" value
+            if value="$(gh api "repos/$GITHUB_REPOSITORY/actions/variables/$name" \
+              --jq '.value' 2>"$work/variable.err")"; then
+              printf '%s' "$value"
+              return 0
+            fi
+            if grep -q 'HTTP 404' "$work/variable.err"; then
+              return 2
+            fi
+            return 1
+          }
+
+          role=""
+          role_status=0
+          role="$(read_repo_variable CONTINUUM_ROLE)" || role_status=$?
+          if (( role_status == 1 )); then
+            echo "::error::Repository role is unavailable; refusing to guess whether delegated Parent runs need cancellation."
+            failed=1
+          elif (( role_status == 2 )); then
+            role=""
+          fi
+          if [[ "$role" == "child" ]]; then
+            parent=""
+            child_id=""
+            if ! parent="$(read_repo_variable CONTINUUM_PARENT)"; then
+              parent=""
+            fi
+            if ! child_id="$(read_repo_variable CONTINUUM_CHILD_ID)"; then
+              child_id=""
+            fi
+            if [[ ! "$parent" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ || ! "$child_id" =~ ^[A-Za-z0-9][A-Za-z0-9._:-]*$ ]]; then
+              echo "::error::Verified Child role has no valid CONTINUUM_PARENT/CONTINUUM_CHILD_ID binding; delegated parent runs were not cancelled."
+              failed=1
+            elif [[ -z "${PARENT_TOKEN:-}" ]]; then
+              echo "::error::Delegated Child cancellation needs TAP_PAT access to the Parent Actions repository; no delegated run was cancelled."
+              failed=1
+            else
+              echo "::add-mask::$child_id"
+              cancel_plan "$parent" "$PARENT_TOKEN" delegated \
+                --workflow-path .github/workflows/continuum-child-worker.yml \
+                --child-id "$child_id" || failed=1
+            fi
+          fi
+
+          if (( failed != 0 )); then
+            exit 1
+          fi
+
   opencode:
     # Manual invocations remain owner-only. Automated repair modes arrive via
     # internal workflow_dispatch events from trusted workflows on main.
@@ -567,6 +859,21 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Checkout Continuum cancellation engine
+        if: >-
+          needs.admit.outputs.route == 'issue' ||
+          (github.event_name == 'workflow_dispatch' && inputs.mode == 'issue')
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: kodmial/continuum
+          ref: ${{ inputs.continuum_ref || 'main' }}
+          path: .continuum-cancel-engine
+          fetch-depth: 1
+          persist-credentials: false
+          sparse-checkout: |
+            src/continuum
+            .github/scripts
 
       # kodmial/continuum#290: a fresh-VM 429 resumption restores the exact
       # checkpoint before doing any work. Shell/workflow code — never the
@@ -869,6 +1176,33 @@ jobs:
             core.setOutput('task_body', String(issue.body || ''));
             core.setOutput('task_url', String(issue.html_url || ''));
             core.notice(`Resolved authoritative task ${taskRepository}#${taskNumber} via ${source}.`);
+
+      - name: Refuse an operator-cancelled generation
+        id: operator_stop
+        if: >-
+          steps.task_context.outputs.present == 'true' &&
+          ((github.event_name == 'workflow_dispatch' && inputs.mode == 'issue') ||
+           needs.admit.outputs.route == 'issue')
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TASK_REPO: ${{ steps.task_context.outputs.task_repo }}
+          TASK_NUMBER: ${{ steps.task_context.outputs.task_number }}
+        run: |
+          set -euo pipefail
+          [[ -n "$TASK_REPO" && "$TASK_NUMBER" =~ ^[1-9][0-9]*$ ]] || { echo "::error::Operator-stop gate has no authoritative task identity."; exit 1; }
+          work="$RUNNER_TEMP/continuum-operator-stop"
+          mkdir -p "$work"
+          gh api --paginate --slurp \
+            "repos/$TASK_REPO/issues/$TASK_NUMBER/comments?per_page=100" \
+            | jq 'add // []' >"$work/comments.json"
+          kind="$(python3 "$GITHUB_WORKSPACE/.continuum-cancel-engine/.github/scripts/opencode_cancel.py" stop-kind \
+            --comments-json "$work/comments.json" --repo "$TASK_REPO" \
+            --issue "$TASK_NUMBER" --owner "${TASK_REPO%%/*}" --generation 1)"
+          if [[ "$kind" != "active" ]]; then
+            echo "::error::$TASK_REPO#$TASK_NUMBER generation 1 has an effective $kind stop; refusing to implement or publish. An explicit operator resume or a new generation is required."
+            exit 1
+          fi
+          echo "::notice::No effective generation or operator stop for $TASK_REPO#$TASK_NUMBER generation 1."
 
       # kodmial/continuum#295: freeze the issue requirements at admission.
       # The issue title/body are immutable for one implementation
@@ -2339,6 +2673,25 @@ jobs:
         run: |
           set -euo pipefail
 
+          continuum_assert_no_stop() {
+            local stop_repo="${1:?repo}" stop_issue="${2:?issue}" stop_file stop_kind
+            stop_file="$(mktemp "${RUNNER_TEMP:-/tmp}/continuum-operator-stop.XXXXXX")"
+            gh api --paginate --slurp \
+              "repos/$stop_repo/issues/$stop_issue/comments?per_page=100" \
+              | jq 'add // []' >"$stop_file" || {
+                echo "::error::Could not verify operator stop for $stop_repo#$stop_issue; refusing to publish." >&2
+                return 1
+              }
+            stop_kind="$(python3 "$GITHUB_WORKSPACE/.continuum-cancel-engine/.github/scripts/opencode_cancel.py" stop-kind \
+              --comments-json "$stop_file" --repo "$stop_repo" --issue "$stop_issue" \
+              --owner "${stop_repo%%/*}" --generation 1)" || return 1
+            rm -f "$stop_file"
+            if [[ "$stop_kind" != "active" ]]; then
+              echo "::error::$stop_repo#$stop_issue has an effective $stop_kind stop; refusing branch push and PR publication. An explicit operator resume or a new generation is required." >&2
+              return 1
+            fi
+          }
+
           # kodmial/continuum#302: canonical fail-closed branch safety (see
           # the 429 evacuator helper for the full contract). The recovered
           # branch must be a proven non-default ref; only the PR merge
@@ -2395,6 +2748,7 @@ jobs:
           # kodmial/continuum#302: fail closed before mutation when the
           # recovered branch is empty, ambiguous, or the default branch.
           continuum_assert_safe_push "$CURRENT_BRANCH" || exit 1
+          continuum_assert_no_stop "$GITHUB_REPOSITORY" "$ISSUE_NUMBER" || exit 1
           git push -u origin "HEAD:$CURRENT_BRANCH"
 
           TITLE="$(git log -1 --format=%s)"
@@ -2415,6 +2769,7 @@ jobs:
           else
             BODY="$(printf '%s\n%s\n\nRecovered automatically after the OpenCode agent changed branches during issue #%s execution.\n\nCloses #%s' "$TASK_MARKER" "$RECOVER_SNAPSHOT_REF" "$ISSUE_NUMBER" "$ISSUE_NUMBER")"
           fi
+          continuum_assert_no_stop "$GITHUB_REPOSITORY" "$ISSUE_NUMBER" || exit 1
           gh pr create --repo "$GITHUB_REPOSITORY" --base main --head "$CURRENT_BRANCH" --title "$TITLE" --body "$BODY"
 
       - name: Implement issue
@@ -2452,6 +2807,25 @@ jobs:
           RECOVERY_GENERATION_IN: ${{ inputs.recovery_generation }}
         run: |
           set -euo pipefail
+          continuum_assert_no_stop() {
+            local stop_repo="${1:?repo}" stop_issue="${2:?issue}" stop_file stop_kind
+            stop_file="$(mktemp "${RUNNER_TEMP:-/tmp}/continuum-operator-stop.XXXXXX")"
+            gh api --paginate --slurp \
+              "repos/$stop_repo/issues/$stop_issue/comments?per_page=100" \
+              | jq 'add // []' >"$stop_file" || {
+                echo "::error::Could not verify operator stop for $stop_repo#$stop_issue; refusing to publish." >&2
+                return 1
+              }
+            stop_kind="$(python3 "$GITHUB_WORKSPACE/.continuum-cancel-engine/.github/scripts/opencode_cancel.py" stop-kind \
+              --comments-json "$stop_file" --repo "$stop_repo" --issue "$stop_issue" \
+              --owner "${stop_repo%%/*}" --generation 1)" || return 1
+            rm -f "$stop_file"
+            if [[ "$stop_kind" != "active" ]]; then
+              echo "::error::$stop_repo#$stop_issue has an effective $stop_kind stop; refusing branch push and PR publication. An explicit operator resume or a new generation is required." >&2
+              return 1
+            fi
+          }
+
           # shellcheck disable=SC1091
           source "${RUNNER_TEMP:-/tmp}/continuum-429-evacuate.sh" 2>/dev/null || true
           # kodmial/continuum#302: the evacuator helper already defines
@@ -2778,11 +3152,13 @@ jobs:
           # before any ref creation or push; recovery resumes this same
           # branch and never falls back to the default branch.
           continuum_assert_safe_push "$BRANCH" || exit 1
+          continuum_assert_no_stop "$TASK_REPO" "$TASK_NUMBER" || exit 1
 
           gh api --method POST "repos/$GITHUB_REPOSITORY/git/refs" \
             -f ref="refs/heads/$BRANCH" \
             -f sha="$BASE_SHA" >/dev/null
 
+          continuum_assert_no_stop "$TASK_REPO" "$TASK_NUMBER" || exit 1
           git push --force-with-lease="refs/heads/$BRANCH:$BASE_SHA" -u origin "HEAD:$BRANCH"
 
           PR_NUMBER="$(gh pr list --repo "$GITHUB_REPOSITORY" --head "$BRANCH" --state all \
@@ -2803,6 +3179,7 @@ jobs:
             else
               PR_BODY="$(printf '%s\n%s\n\nAutomated implementation for #%s.\n\nCloses #%s' "$TASK_MARKER" "$SNAPSHOT_REF" "$ISSUE_NUMBER" "$ISSUE_NUMBER")"
             fi
+            continuum_assert_no_stop "$TASK_REPO" "$TASK_NUMBER" || exit 1
             PR_URL="$(gh pr create --repo "$GITHUB_REPOSITORY" \
               --base "$BASE_REF" \
               --head "$BRANCH" \

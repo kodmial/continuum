@@ -88,7 +88,7 @@ class EventAdmissionTests(unittest.TestCase):
         )
         self.assertFalse(result["run"])
 
-    def test_cancel_is_ignored(self):
+    def test_cancel_routes_to_cancellation_not_the_coder(self):
         result = admission.admit_event(
             event="issue_comment",
             body="/oc-cancel",
@@ -97,7 +97,43 @@ class EventAdmissionTests(unittest.TestCase):
             owner=OWNER,
         )
         self.assertFalse(result["run"])
+        self.assertEqual(result["route"], "cancel")
         self.assertEqual(result["command"], commands.CANCEL)
+
+    def test_only_exact_owner_issue_cancel_triggers_cancellation(self):
+        for body, author, actor in (
+            ("/oc-cancel", OTHER, OTHER),
+            ("/oc-cancel", OWNER, OTHER),
+            ("Please /oc-cancel this", OWNER, OWNER),
+            ("`/oc-cancel`", OWNER, OWNER),
+            ("> /oc-cancel", OWNER, OWNER),
+            ("    /oc-cancel", OWNER, OWNER),
+            ("/oc-cancel please", OWNER, OWNER),
+            ("/oc-cancelled", OWNER, OWNER),
+        ):
+            with self.subTest(body=body, author=author, actor=actor):
+                result = admission.admit_event(
+                    event="issue_comment",
+                    body=body,
+                    author=author,
+                    actor=actor,
+                    owner=OWNER,
+                )
+                self.assertFalse(result["run"])
+                self.assertNotEqual(result["route"], "cancel")
+
+    def test_pull_request_cancel_never_triggers_issue_cancellation(self):
+        result = admission.admit_event(
+            event="issue_comment",
+            body="/oc-cancel",
+            author=OWNER,
+            actor=OWNER,
+            owner=OWNER,
+            is_pull_request=True,
+            issue_state="open",
+        )
+        self.assertFalse(result["run"])
+        self.assertNotEqual(result["route"], "cancel")
 
     def test_scheduler_and_watchdog_commands_are_admitted(self):
         for marker in (commands.DEFAULT_DISPATCH_MARKER, commands.DEFAULT_RETRY_MARKER):

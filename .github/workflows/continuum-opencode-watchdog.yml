@@ -1470,6 +1470,68 @@ jobs:
               return;
             }
 
+            // A durable operator /oc-cancel is independent of drift/tamper
+            // recovery. Watchdog retries, 429 recovery, label changes, and a
+            // later generation-recover marker never re-arm it; only a strictly
+            // later explicit operator resume (or a new generation) may.
+            const operatorStopRe =
+              /<!--\s*continuum-task-operator-stop\s+repo=([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)\s+issue=(\d+)\s+generation=(\d+)\s*-->/;
+            const operatorResumeRe =
+              /<!--\s*continuum-task-operator-resume\s+repo=([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)\s+issue=(\d+)\s+generation=(\d+)\s*-->/;
+            const trustedOperatorComment = comment => {
+              const association = String(comment.author_association || '').toUpperCase();
+              if (['OWNER', 'MEMBER', 'COLLABORATOR'].includes(association)) return true;
+              const login = String(comment.user?.login || '').toLowerCase();
+              return login === 'github-actions[bot]' || login === String(owner).toLowerCase();
+            };
+            const operatorOrder = comment =>
+              String(comment.created_at || '') + '#' +
+              String(comment.id || 0).padStart(12, '0');
+            const operatorComments = await readGithub.paginate(
+              readGithub.rest.issues.listComments,
+              { owner, repo, issue_number: issueNumber, per_page: 100 }
+            );
+            let lastOperatorStop = null;
+            let lastOperatorResume = null;
+            for (const comment of operatorComments) {
+              if (!trustedOperatorComment(comment)) continue;
+              const body = String(comment.body || '');
+              const stop = body.match(operatorStopRe);
+              if (
+                stop &&
+                stop[1].toLowerCase() === `${owner}/${repo}`.toLowerCase() &&
+                Number(stop[2]) === issueNumber &&
+                Number(stop[3]) === 1
+              ) {
+                if (!lastOperatorStop || operatorOrder(comment) > operatorOrder(lastOperatorStop)) {
+                  lastOperatorStop = comment;
+                }
+                continue;
+              }
+              const resume = body.match(operatorResumeRe);
+              if (
+                resume &&
+                resume[1].toLowerCase() === `${owner}/${repo}`.toLowerCase() &&
+                Number(resume[2]) === issueNumber &&
+                Number(resume[3]) === 1
+              ) {
+                if (!lastOperatorResume || operatorOrder(comment) > operatorOrder(lastOperatorResume)) {
+                  lastOperatorResume = comment;
+                }
+              }
+            }
+            if (
+              lastOperatorStop &&
+              (!lastOperatorResume ||
+                operatorOrder(lastOperatorResume) <= operatorOrder(lastOperatorStop))
+            ) {
+              core.notice(
+                'Issue #' + issueNumber +
+                ' has an effective operator cancellation stop; watchdog will not retry it.'
+              );
+              return;
+            }
+
             const issueLabels = new Set(
               (issue.labels || []).map(label =>
                 typeof label === 'string' ? label : label.name

@@ -74,7 +74,14 @@ scenario. Parent/child delegated execution is an advanced, optional layer.
 5. **Credentials stay named and scoped.** `TAP_PAT` is the lifecycle credential;
    `RENDER_API_KEY` is a separate Render-only credential. Never add a paid
    provider key to core.
-6. **Use an isolated test repository first.** Start with a disposable
+6. **Owner cancellation is durable.** The repository owner can post the exact
+   `/oc-cancel` command as the first significant line of an ordinary issue to
+   stop that issue's active implementation generation. Continuum records a
+   durable operator stop before cancelling provenance-verified runs, including
+   a verified Child's delegated worker in its Parent Actions repository. A
+   label change or automatic retry never re-arms it; a later trusted operator
+   resume or a newly authorized generation does.
+7. **Use an isolated test repository first.** Start with a disposable
    repository and no valuable open issues, especially while tuning labels and
    runner settings.
 

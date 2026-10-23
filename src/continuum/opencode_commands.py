@@ -45,8 +45,10 @@ What this module does not decide
   (``startsWith`` in the workflow expression, not ``contains``), so
   agent-generated prose that mentions ``/oc`` later can never chain a
   self-triggered run. Review comments keep their existing owner gate.
-* Cancellation of running work. ``/oc-cancel`` is a launch guard only:
-  Continuum has no mechanism that cancels an already-running run.
+* Physical cancellation. ``/oc-cancel`` is routed to the cheap trusted
+  cancellation-control path by admission; it is never a coder launch. That
+  path persists a durable operator stop and cancels only provenance-verified
+  active runs (see :mod:`continuum.opencode_cancel`).
 
 Standard library only.
 """
@@ -56,7 +58,7 @@ from __future__ import annotations
 #: Tokens that launch an implementation run from an issue comment.
 IMPLEMENT_COMMANDS = ("/oc", "/opencode")
 
-#: Token that suppresses an agent launch. It is a launch guard only.
+#: Token that cancels the active implementation generation.
 CANCEL_COMMAND = "/oc-cancel"
 
 #: Classification results of :func:`classify_issue_comment`.
