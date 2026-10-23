@@ -42,6 +42,17 @@ verified selection all fail closed. Concurrent runs retain separate receipts.
 State separates \`last_successful_probe\` from
 \`last_successful_real_execution\`, with per-route negative cooldowns.
 
+GitHub state-store failures keep permission/auth 403, CAS conflicts and
+malformed state deterministic. A 403 with exhausted
+`X-RateLimit-Remaining` or a corroborating secondary-limit `Retry-After`, a
+429, a transient 5xx, or a transport failure instead publishes only
+`CONTINUUM_MODEL_STATE_TRANSIENT` (the sanitized classifier) and a
+reset-aware `CONTINUUM_MODEL_STATE_NOT_BEFORE_EPOCH` through `GITHUB_ENV`.
+No token, state repository URL, response header or Git object content is
+emitted. PR-Agent's post-review attestation consumes that classified signal so
+the existing reconciler defers to the reset epoch instead of marking the review
+deterministically failed, dispatching early, or cooling down a healthy model.
+
 The existing 429 runner-burn file \`$RUNNER_TEMP/continuum-opencode-429\` is
 respected: on a live 429 the probe marks the VM burned and exits 75 without
 testing another route there; orchestration must use the existing durable

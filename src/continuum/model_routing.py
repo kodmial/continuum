@@ -9,6 +9,8 @@ from __future__ import annotations
 import argparse
 import base64
 from dataclasses import dataclass
+from datetime import timezone
+import email.utils
 import hashlib
 import json
 import os
@@ -48,6 +50,100 @@ class Conflict(RouteError):
 
 class SelectionNotVisible(RouteError):
     """The same-run selection receipt may lag a recent Git state ref write."""
+
+
+class GitHubStateUnavailable(RouteError):
+    """Sanitized GitHub model-state transport/rate-limit failure.
+
+    Only the classifier and the reset epoch may cross the process boundary.
+    The message never contains the token, the state repository URL, response
+    headers, or Git object contents.
+    """
+
+    def __init__(self, classification: str, not_before: int | None = None):
+        self.classification = classification
+        self.not_before = int(not_before) if not_before else None
+        super().__init__("GitHub model state " + classification)
+
+
+STATE_RATE_LIMIT_FALLBACK_SECONDS = 60
+
+
+def _header(headers, name: str) -> str | None:
+    if headers is None:
+        return None
+    try:
+        value = headers.get(name)
+    except AttributeError:
+        return None
+    return None if value is None else str(value).strip()
+
+
+def _positive_epoch(value: str | None) -> int | None:
+    try:
+        epoch = int(value) if value is not None else 0
+    except (TypeError, ValueError):
+        return None
+    return epoch if epoch > 0 else None
+
+
+def _retry_after_epoch(value: str | None, now: int) -> int | None:
+    if value is None or value == "":
+        return None
+    if value.isdecimal():
+        return now + int(value)
+    try:
+        moment = email.utils.parsedate_to_datetime(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if moment is None:
+        return None
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=timezone.utc)
+    return int(moment.timestamp())
+
+
+def classify_github_state_failure(err: urllib.error.HTTPError,
+                                  now: int | None = None) -> GitHubStateUnavailable | None:
+    """Classify only corroborated GitHub state transport/rate-limit failures.
+
+    A permission/auth 403 (remaining budget, no limit signals) stays a
+    deterministic failure. A 409/422 CAS conflict is handled by the caller.
+    """
+    code = int(getattr(err, "code", 0) or 0)
+    headers = getattr(err, "headers", None)
+    current = int(time.time()) if now is None else int(now)
+    remaining = _header(headers, "X-RateLimit-Remaining")
+    reset = _positive_epoch(_header(headers, "X-RateLimit-Reset"))
+    retry_after = _retry_after_epoch(_header(headers, "Retry-After"), current)
+    not_before = max((value for value in (reset, retry_after)
+                      if value is not None), default=0) or None
+    if code == 429:
+        return GitHubStateUnavailable(
+            "rate_limit", not_before or current + STATE_RATE_LIMIT_FALLBACK_SECONDS)
+    if code == 403:
+        # Primary limit: the shared budget is exhausted. Secondary/abuse
+        # limits corroborate with Retry-After even when a token-level
+        # remaining count is not zero. Everything else is permission/auth.
+        if remaining == "0" or retry_after is not None:
+            return GitHubStateUnavailable(
+                "rate_limit", not_before or current + STATE_RATE_LIMIT_FALLBACK_SECONDS)
+        return None
+    if 500 <= code <= 599:
+        return GitHubStateUnavailable("transient", not_before)
+    return None
+
+
+def publish_state_failure(error: GitHubStateUnavailable, env=None) -> None:
+    """Expose only a sanitized classifier and reset epoch to later steps."""
+    target = (env if env is not None else os.environ).get("GITHUB_ENV", "")
+    if not target:
+        return
+    with open(target, "a", encoding="utf-8") as output:
+        output.write("CONTINUUM_MODEL_STATE_TRANSIENT=%s\n" % error.classification)
+        if error.not_before:
+            output.write(
+                "CONTINUUM_MODEL_STATE_NOT_BEFORE_EPOCH=%d\n" % error.not_before)
 
 
 def bounded(name: str, value: str, default: int, minimum: int, maximum: int) -> int:
@@ -276,9 +372,14 @@ class GitRefStore:
                 return None
             if method in ("PATCH", "POST") and err.code in (409, 422):
                 raise Conflict("Git ref changed concurrently") from None
+            failure = classify_github_state_failure(err)
+            if failure is not None:
+                raise failure from None
             raise RouteError(f"GitHub model state {method} failed ({err.code})") from None
-        except (OSError, ValueError):
-            raise RouteError("GitHub model state backend unavailable") from None
+        except ValueError:
+            raise RouteError("GitHub model state response malformed") from None
+        except OSError:
+            raise GitHubStateUnavailable("transient") from None
 
     def read(self, key: str) -> tuple[dict, str | None, str | None]:
         ref = self.api("GET", "git/ref/heads/" + STATE_REF, missing=True)
@@ -621,6 +722,12 @@ def run() -> int:
             write_outputs(env, {"model": model})
             print(model)
             return 0
+        except GitHubStateUnavailable:
+            # A GitHub state-store rate limit/transport failure is never a
+            # model-provider failure: do not cool down an otherwise working
+            # route. The sanitized not-before epoch is published at the CLI
+            # boundary instead.
+            raise
         except BurnedRunner:
             def pause(current):
                 if current.get("fingerprint") != fingerprint:
@@ -646,12 +753,22 @@ def run() -> int:
     raise RouteError("No route qualified: " + "; ".join(errors.values()))
 
 
-if __name__ == "__main__":
+def main() -> int:
     try:
-        raise SystemExit(run())
+        return run()
     except BurnedRunner:
         print("::error::OpenCode 429: retire this runner without another LLM request", file=sys.stderr)
-        raise SystemExit(75)
+        return 75
+    except GitHubStateUnavailable as error:
+        publish_state_failure(error)
+        print("::error::Continuum model routing: GitHub model state " +
+              error.classification + "; durable recovery owns the retry",
+              file=sys.stderr)
+        return 2
     except RouteError as error:
         print("::error::Continuum model routing: " + str(error), file=sys.stderr)
-        raise SystemExit(2)
+        return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

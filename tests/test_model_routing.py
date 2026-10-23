@@ -582,5 +582,251 @@ class CooldownRecoveryContractTests(unittest.TestCase):
                 self.assertIn('CONTINUUM_MODEL_NOT_BEFORE_EPOCH:-', body)
                 self.assertIn("steps.model_cooldown.outcome == 'success'", text)
 
+class GitHubStateFailureClassificationTests(unittest.TestCase):
+    """Issue #398: GitHub state 403 rate limits are not permission failures."""
+
+    def _store(self):
+        return route.GitRefStore("example/private-target", "secret-state-token")
+
+    def _error(self, code, headers=None):
+        import email.message
+        message = email.message.Message()
+        for name, value in (headers or {}).items():
+            message[name] = value
+        return route.urllib.error.HTTPError(
+            "https://api.github.invalid/repos/example/private-target/state",
+            code, "sanitized", message, None)
+
+    def _raise(self, error):
+        def urlopen(request, timeout):
+            raise error
+        return patch.object(route.urllib.request, "urlopen", urlopen)
+
+    def _failure(self, error):
+        with self._raise(error):
+            with self.assertRaises(route.GitHubStateUnavailable) as caught:
+                self._store().api("POST", "git/trees", {"tree": []})
+        return caught.exception
+
+    def test_primary_403_rate_limit_exposes_reset_not_permission(self):
+        import time
+        reset = int(time.time()) + 120
+        failure = self._failure(self._error(403, {
+            "X-RateLimit-Remaining": "0",
+            "X-RateLimit-Reset": str(reset),
+        }))
+        self.assertEqual(failure.classification, "rate_limit")
+        self.assertGreaterEqual(failure.not_before, reset)
+        self.assertNotIn("secret-state-token", str(failure))
+        self.assertNotIn("private-target", str(failure))
+
+    def test_secondary_403_retry_after_is_rate_limit_even_with_budget(self):
+        import time
+        now = int(time.time())
+        failure = self._failure(self._error(403, {
+            "X-RateLimit-Remaining": "4999",
+            "Retry-After": "30",
+        }))
+        self.assertEqual(failure.classification, "rate_limit")
+        self.assertGreaterEqual(failure.not_before, now + 30)
+
+    def test_permission_403_with_budget_stays_deterministic(self):
+        with self._raise(self._error(403, {
+            "X-RateLimit-Remaining": "4999",
+            "X-RateLimit-Reset": "9999999999",
+        })):
+            with self.assertRaises(route.RouteError) as caught:
+                self._store().api("POST", "git/trees", {"tree": []})
+        self.assertNotIsInstance(caught.exception, route.GitHubStateUnavailable)
+        self.assertIn("403", str(caught.exception))
+
+    def test_429_and_retry_after_are_rate_limited(self):
+        import time
+        now = int(time.time())
+        failure = self._failure(self._error(429, {"Retry-After": "45"}))
+        self.assertEqual(failure.classification, "rate_limit")
+        self.assertGreaterEqual(failure.not_before, now + 45)
+
+    def test_5xx_and_transport_timeout_are_transient(self):
+        failure = self._failure(self._error(503, {"Retry-After": "10"}))
+        self.assertEqual(failure.classification, "transient")
+        self.assertIsNotNone(failure.not_before)
+
+        class TimeoutReply:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+            def read(self, *args):
+                raise TimeoutError("timed out")
+
+        def timed_out(request, timeout):
+            return TimeoutReply()
+
+        with patch.object(route.urllib.request, "urlopen", timed_out):
+            with self.assertRaises(route.GitHubStateUnavailable) as caught:
+                self._store().api("GET", "git/ref/heads/continuum-model-state")
+        self.assertEqual(caught.exception.classification, "transient")
+        self.assertNotIn("private-target", str(caught.exception))
+
+    def test_malformed_json_and_cas_conflict_remain_deterministic(self):
+        class MalformedReply:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+            def read(self, *args):
+                return b"not-json"
+
+        def malformed(request, timeout):
+            return MalformedReply()
+
+        with patch.object(route.urllib.request, "urlopen", malformed):
+            with self.assertRaises(route.RouteError) as caught:
+                self._store().api("GET", "git/ref/heads/continuum-model-state")
+        self.assertNotIsInstance(caught.exception, route.GitHubStateUnavailable)
+
+        with self._raise(self._error(409)):
+            with self.assertRaises(route.Conflict):
+                self._store().api("PATCH", "git/refs/heads/continuum-model-state",
+                                  {"sha": "x", "force": False})
+
+    def test_cli_record_failure_publishes_sanitized_reset_without_cooldown(self):
+        import contextlib
+        import io
+        import os
+        import tempfile
+        state = type("Store", (), {})()
+        state.update = lambda key, mutator: (_ for _ in ()).throw(
+            route.GitHubStateUnavailable("rate_limit", 1234567890))
+        with tempfile.TemporaryDirectory() as tmp:
+            target = pathlib.Path(tmp) / "github-env"
+            stderr = io.StringIO()
+            env = {
+                "OPENCODE_MODELS": A,
+                "CONTINUUM_SELECTED_MODEL": A,
+                "CONTINUUM_MODEL_STATE_TOKEN": "secret-state-token",
+                "GITHUB_REPOSITORY": "owner/private-target",
+                "GITHUB_RUN_ID": "703",
+                "GITHUB_RUN_ATTEMPT": "1",
+                "GITHUB_ENV": str(target),
+            }
+            with patch.object(route, "binary_provenance", lambda: ("1.2.3", "d")), \
+                 patch.object(route, "GitRefStore", lambda owner, token: state), \
+                 patch.object(route.sys, "argv",
+                              ["model_routing.py", "record"]), \
+                 patch.dict(os.environ, env, clear=True), \
+                 contextlib.redirect_stderr(stderr):
+                self.assertEqual(route.main(), 2)
+            self.assertEqual(
+                target.read_text(),
+                "CONTINUUM_MODEL_STATE_TRANSIENT=rate_limit\n"
+                "CONTINUUM_MODEL_STATE_NOT_BEFORE_EPOCH=1234567890\n")
+            self.assertNotIn("secret-state-token", stderr.getvalue())
+            self.assertNotIn("private-target", stderr.getvalue())
+
+    def test_published_environment_contains_only_classifier_and_reset(self):
+        import tempfile
+        failure = route.GitHubStateUnavailable("rate_limit", 1234567890)
+        with tempfile.TemporaryDirectory() as tmp:
+            target = pathlib.Path(tmp) / "github-env"
+            route.publish_state_failure(failure, env={"GITHUB_ENV": str(target)})
+            self.assertEqual(
+                target.read_text(),
+                "CONTINUUM_MODEL_STATE_TRANSIENT=rate_limit\n"
+                "CONTINUUM_MODEL_STATE_NOT_BEFORE_EPOCH=1234567890\n")
+        transient = route.GitHubStateUnavailable("transient")
+        with tempfile.TemporaryDirectory() as tmp:
+            target = pathlib.Path(tmp) / "github-env"
+            route.publish_state_failure(transient, env={"GITHUB_ENV": str(target)})
+            self.assertEqual(
+                target.read_text(), "CONTINUUM_MODEL_STATE_TRANSIENT=transient\n")
+
+
+class AttestationRecoveryContractTests(unittest.TestCase):
+    """Issue #398: thread only classified attestation failures into recovery."""
+
+    def setUp(self):
+        self.workflow = (PATH.parents[2] /
+                         ".github/workflows/continuum-pr-agent.yml").read_text()
+
+    def _block(self, start, stop):
+        return self.workflow.split(start, 1)[1].split(stop, 1)[0]
+
+    def test_attestation_step_has_stable_id_and_no_provider_cooldown(self):
+        attestation = self._block(
+            "      - name: Attest successful independent OpenCode review",
+            "      - name: Publish private exact-head repair handoff")
+        self.assertIn("id: review_attestation", attestation)
+        cooldown = self._block(
+            "      - name: Cool down failed real provider route before the bounded retry",
+            "      - name: Attest successful independent OpenCode review")
+        self.assertNotIn("review_attestation", cooldown)
+        self.assertIn("provider_failure", cooldown)
+
+    def test_failed_status_guard_requires_classified_transient_attestation(self):
+        status = self._block(
+            "      - name: Publish failed PR-Agent review state",
+            "      - name: Fail closed on a moved head")
+        self.assertIn(
+            "(steps.review_attestation.outcome == 'failure' && "
+            "env.CONTINUUM_MODEL_STATE_TRANSIENT != '')", status)
+        self.assertIn("PR-Agent review failed: transient; recovery eligible", status)
+        self.assertIn("PR-Agent review failed: deterministic; recovery held", status)
+
+    def test_durable_controller_guard_requires_classified_attestation(self):
+        controller = self._block(
+            "      - name: Update persistent PR-Agent retry controller state",
+            "      - name: Schedule bounded retry for retryable PR-Agent review failure")
+        self.assertIn(
+            "(steps.review_attestation.outcome == 'failure' &&\n"
+            "            env.CONTINUUM_MODEL_STATE_TRANSIENT != '')", controller)
+        self.assertIn("CONTINUUM_MODEL_STATE_NOT_BEFORE_EPOCH", controller)
+        self.assertIn("ROUTE_NOT_BEFORE:", controller)
+        self.assertIn("ROUTE_UNAVAILABLE:", controller)
+        self.assertIn("continuum-lifecycle-retry head=", controller)
+        self.assertIn("not-before=", controller)
+
+    def test_bounded_retry_guard_requires_classified_attestation_and_not_before(self):
+        schedule = self.workflow.split(
+            "      - name: Schedule bounded retry for retryable PR-Agent review failure",
+            1)[1]
+        self.assertIn(
+            "(steps.review_attestation.outcome == 'failure' &&\n"
+            "            env.CONTINUUM_MODEL_STATE_TRANSIENT != '')", schedule)
+        self.assertIn("env.CONTINUUM_MODEL_STATE_NOT_BEFORE_EPOCH == ''", schedule)
+        self.assertIn('CONTINUUM_MODEL_STATE_NOT_BEFORE_EPOCH:-', schedule)
+        self.assertNotIn("operation: fail", schedule)
+
+    def test_success_status_and_merge_require_completed_attestation(self):
+        attestation_at = self.workflow.index(
+            "      - name: Attest successful independent OpenCode review")
+        durable_at = self.workflow.index(
+            "      - name: Publish durable PR-Agent review state")
+        self.assertLess(attestation_at, durable_at)
+        durable = self._block(
+            "      - name: Publish durable PR-Agent review state",
+            "      - name: Publish failed PR-Agent review state")
+        self.assertNotIn("always()", durable)
+        self.assertNotIn("failure()", durable)
+        merge = self.workflow.split("\n  merge:\n", 1)[1].split("uses:", 1)[0]
+        self.assertIn("needs.pr_agent.outputs.ready_to_merge == 'true'", merge)
+        self.assertIn("needs.pr_agent.outputs.merge_gate_verified == 'true'", merge)
+        self.assertNotIn("always()", merge)
+
+    def test_target_aware_attestation_state_token_is_preserved(self):
+        attestation = self._block(
+            "      - name: Attest successful independent OpenCode review",
+            "      - name: Publish private exact-head repair handoff")
+        self.assertIn("state-repository: ${{ env.CONTINUUM_PR_AGENT_TARGET_REPOSITORY }}", attestation)
+        self.assertIn(
+            "state-token: ${{ env.CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED == 'true' "
+            "&& secrets.TAP_PAT", attestation)
+
+
 if __name__ == "__main__":
     unittest.main()
