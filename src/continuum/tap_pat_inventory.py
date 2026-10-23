@@ -382,6 +382,14 @@ ENTRIES = (
         "reason": "Reservation release must emit an issue event that wakes the scheduler; GITHUB_TOKEN mutations would not chain.",
         "evidence": ("github-token: ${{ secrets.TAP_PAT }}",),
     },
+    {
+        "workflow": "continuum-opencode.yml",
+        "step": "Persist stop and cancel exact active runs",
+        "capability": CROSS_REPO,
+        "same_repo": False,
+        "reason": "Verified Child cancellation must reach the Parent Actions repository that owns the delegated worker run; the child-scoped GITHUB_TOKEN cannot read or cancel those runs. Local issue runs stay on GITHUB_TOKEN.",
+        "evidence": ("PARENT_TOKEN: ${{ secrets.TAP_PAT }}", "--child-id"),
+    },
     # -- merge / watchdog / recovery / repair ----------------------------
     {
         "workflow": "continuum-auto-merge.yml",

@@ -99,8 +99,8 @@ class ReconcileResult:
 # whitespace or end of input. Trailing prose on the same line (``/oc please``)
 # still counts as owner intent for the scheduler race guard, but substrings
 # such as ``/ocean`` or ``/ock``, mid-line prose mentions, quoted/inline-code
-# examples, and ``/oc-cancel`` (a launch guard, not a run) must not stall an
-# otherwise eligible issue.
+# examples, and ``/oc-cancel`` (physical cancellation, not a launch) must not
+# stall an otherwise eligible issue.
 _OWNER_COMMAND_RE = re.compile(r"^[ ]{0,3}/(?:opencode|oc)(?=\s|$)", re.MULTILINE)
 
 

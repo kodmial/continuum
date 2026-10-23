@@ -12,7 +12,8 @@ The rule, briefly: a comment qualifies only when its first significant line
 is exactly ``/oc`` or ``/opencode`` (surrounding whitespace allowed).
 Prose, inline code, quotes, and Markdown blocks that merely mention the token
 never qualify. ``/oc-cancel`` as the first significant line classifies as
-``cancel`` and must suppress any launch; it is a launch guard only.
+``cancel`` and must never start the coder; it routes the owner to the cheap
+physical-cancellation control path instead.
 
 Usage (body via argument, file, or stdin)::
 

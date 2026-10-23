@@ -1855,6 +1855,10 @@ jobs:
               /<!--\s*continuum-task-generation-stop\s+repo=([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)\s+issue=(\d+)\s+generation=(\d+)\s+pinned-spec=([0-9a-fA-F]{64})\s+live-spec=([0-9a-fA-F]{64})\s+reason=(drift|tampered)\s*-->/;
             const generationRecoverMarkerRe =
               /<!--\s*continuum-task-generation-recover\s+repo=([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)\s+issue=(\d+)\s+generation=(\d+)\s*-->/;
+            const operatorStopMarkerRe =
+              /<!--\s*continuum-task-operator-stop\s+repo=([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)\s+issue=(\d+)\s+generation=(\d+)\s*-->/;
+            const operatorResumeMarkerRe =
+              /<!--\s*continuum-task-operator-resume\s+repo=([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)\s+issue=(\d+)\s+generation=(\d+)\s*-->/;
             function isTrustedStopComment(comment, trustedOwner = owner) {
               const association = String(
                 comment.author_association || ''
@@ -1893,9 +1897,38 @@ jobs:
               const scan = (list) => {
                 const stops = [];
                 const recovers = [];
+                const operatorStops = [];
+                const operatorResumes = [];
                 for (const comment of list || []) {
                   if (!isTrustedStopComment(comment, targetOwner)) continue;
-                  const stopMatch = String(comment.body || '').match(generationStopMarkerRe);
+                  const body = String(comment.body || '');
+                  const operatorStopMatch = body.match(operatorStopMarkerRe);
+                  if (
+                    operatorStopMatch &&
+                    operatorStopMatch[1].toLowerCase() === wantedRepo &&
+                    Number(operatorStopMatch[2]) === issueNumber &&
+                    Number(operatorStopMatch[3]) === wantedGeneration
+                  ) {
+                    operatorStops.push({
+                      created_at: comment.created_at || '',
+                      id: comment.id || 0,
+                    });
+                    continue;
+                  }
+                  const operatorResumeMatch = body.match(operatorResumeMarkerRe);
+                  if (
+                    operatorResumeMatch &&
+                    operatorResumeMatch[1].toLowerCase() === wantedRepo &&
+                    Number(operatorResumeMatch[2]) === issueNumber &&
+                    Number(operatorResumeMatch[3]) === wantedGeneration
+                  ) {
+                    operatorResumes.push({
+                      created_at: comment.created_at || '',
+                      id: comment.id || 0,
+                    });
+                    continue;
+                  }
+                  const stopMatch = body.match(generationStopMarkerRe);
                   if (
                     stopMatch &&
                     stopMatch[1].toLowerCase() === wantedRepo &&
@@ -1912,7 +1945,7 @@ jobs:
                     });
                     continue;
                   }
-                  const recoverMatch = String(comment.body || '').match(generationRecoverMarkerRe);
+                  const recoverMatch = body.match(generationRecoverMarkerRe);
                   if (
                     recoverMatch &&
                     recoverMatch[1].toLowerCase() === wantedRepo &&
@@ -1925,11 +1958,36 @@ jobs:
                     });
                   }
                 }
-                return { stops, recovers };
+                return { stops, recovers, operatorStops, operatorResumes };
               };
+              const sortByOrder = list =>
+                list.sort((a, b) => (stopOrderKey(a) < stopOrderKey(b) ? -1 : 1));
+              const effectiveOperatorStop = state => {
+                sortByOrder(state.operatorStops);
+                sortByOrder(state.operatorResumes);
+                if (state.operatorStops.length === 0) return null;
+                if (
+                  state.operatorResumes.length > 0 &&
+                  stopOrderKey(state.operatorResumes[state.operatorResumes.length - 1]) >
+                    stopOrderKey(state.operatorStops[state.operatorStops.length - 1])
+                ) {
+                  return null;
+                }
+                return state.operatorStops[0];
+              };
+              const operatorResult = () => ({
+                stopped: true,
+                generation: wantedGeneration,
+                kind: 'operator',
+                reason: 'operator',
+                pinnedSpec: '',
+                liveSpec: '',
+              });
               let found = scan(first);
-              found.stops.sort((a, b) => (stopOrderKey(a) < stopOrderKey(b) ? -1 : 1));
-              found.recovers.sort((a, b) => (stopOrderKey(a) < stopOrderKey(b) ? -1 : 1));
+              sortByOrder(found.stops);
+              sortByOrder(found.recovers);
+              sortByOrder(found.operatorStops);
+              sortByOrder(found.operatorResumes);
               // A stop beyond the first page must still gate: always
               // evaluate the full history below instead of returning
               // idle when the first page carries no stop.
@@ -1946,6 +2004,9 @@ jobs:
                 );
                 scanned = scan(all);
               } catch (err) {
+                if (effectiveOperatorStop(found)) {
+                  return operatorResult();
+                }
                 if (found.stops.length === 0) {
                   core.warning(
                     'Terminal-stop lookup failed for #' + issueNumber +
@@ -1961,13 +2022,19 @@ jobs:
                 return {
                   stopped: true,
                   generation: wantedGeneration,
+                  kind: 'generation',
                   pinnedSpec: earliest.pinnedSpec,
                   liveSpec: earliest.liveSpec,
                   reason: earliest.reason,
                 };
               }
-              scanned.stops.sort((a, b) => (stopOrderKey(a) < stopOrderKey(b) ? -1 : 1));
-              scanned.recovers.sort((a, b) => (stopOrderKey(a) < stopOrderKey(b) ? -1 : 1));
+              sortByOrder(scanned.stops);
+              sortByOrder(scanned.recovers);
+              sortByOrder(scanned.operatorStops);
+              sortByOrder(scanned.operatorResumes);
+              if (effectiveOperatorStop(scanned)) {
+                return operatorResult();
+              }
               if (scanned.stops.length === 0) return idle;
               if (
                 scanned.recovers.length > 0 &&
@@ -1979,6 +2046,7 @@ jobs:
               return {
                 stopped: true,
                 generation: wantedGeneration,
+                kind: 'generation',
                 pinnedSpec: earliest.pinnedSpec,
                 liveSpec: earliest.liveSpec,
                 reason: earliest.reason,
@@ -1986,6 +2054,14 @@ jobs:
             }
             function terminalStopSkipReason(issueNumber, stop) {
               const stopGeneration = Number(stop.generation) || 1;
+              if (stop.kind === 'operator' || stop.reason === 'operator') {
+                return 'operator generation stop: #' + issueNumber +
+                  ' generation ' + stopGeneration +
+                  ' was cancelled by the repository owner; scheduler, watchdog, ' +
+                  '429 recovery, label changes, and automated retries must not ' +
+                  'redispatch it. Resume only with an explicit operator resume ' +
+                  'or a new generation number.';
+              }
               return 'terminal generation stop: #' + issueNumber +
                 ' generation ' + stopGeneration + ' is stopped (' + (stop.reason || 'drift') +
                 ' pinned ' + String(stop.pinnedSpec || 'unknown').slice(0, 12) +

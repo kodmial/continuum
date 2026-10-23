@@ -21,6 +21,7 @@ Usage::
     task_snapshot_admission.py render-recover --repo o/n --issue 1
     task_snapshot_admission.py has-stop --comments-json comments.json
         --repo o/n --issue 1
+        (covers both drift/tamper generation stops and operator stops)
     task_snapshot_admission.py digests --title-file title.txt --body-file body.txt
 
 ``decide`` prints exactly one of ``pin``, ``proceed``,
@@ -53,13 +54,13 @@ SRC = os.path.join(ROOT, "src")
 if SRC not in sys.path:
     sys.path.insert(0, SRC)
 
+from continuum.opencode_cancel import is_execution_stopped  # noqa: E402
 from continuum.task_snapshot import (  # noqa: E402
     DEFAULT_GENERATION,
     TaskSnapshotError,
     body_digest,
     build_snapshot,
     decide_admission,
-    is_generation_terminally_stopped,
     render_generation_recover,
     render_generation_stop,
     render_pr_snapshot_ref,
@@ -279,7 +280,7 @@ def cmd_has_stop(args: argparse.Namespace) -> int:
     if not isinstance(comments, list):
         return _fail(f"comments file {args.comments_json!r} is not a JSON array")
     try:
-        stopped = is_generation_terminally_stopped(
+        stopped = is_execution_stopped(
             comments,
             repo=args.repo,
             issue=args.issue,

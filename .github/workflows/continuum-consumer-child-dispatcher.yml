@@ -479,7 +479,7 @@ jobs:
               fi
               rm -f "$legacy_stop_pages"
               if [[ "$legacy_stop_state" == "stopped" ]]; then
-                echo "Skipping child task #$task_number: terminal generation stop; open a successor issue with an explicit dependency or start an explicit new generation instead of redispatching."
+                echo "Skipping child task #$task_number: terminal generation stop or operator stop; an explicit operator resume, a successor issue with an explicit dependency, or an explicit new generation is required before redispatch."
                 continue
               fi
 
