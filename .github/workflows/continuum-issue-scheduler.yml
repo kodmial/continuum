@@ -724,42 +724,65 @@ jobs:
               >/dev/null 2>&1 || true
           done
 
-          active_titles="$(
-            gh run list --repo "$GITHUB_REPOSITORY" --limit 100 \
-              --json status,displayTitle \
-              --jq '.[] | select(.status == "queued" or .status == "in_progress" or .status == "waiting" or .status == "pending") | .displayTitle' \
-              2>/dev/null || true
-          )"
+          # Authoritative active-run discovery (kodmial/continuum#387). A
+          # global newest-100 all-status listing loses an older active SubTask
+          # behind completed PR-Agent/recovery churn, which admitted a second
+          # dispatch of the same task. Active states are queried with explicit
+          # server-side status filters, so old active work stays visible no
+          # matter how many unrelated completed runs arrived afterwards.
+          #
+          # A failed, malformed, rate-limited or truncated discovery is never
+          # read as "none active": delegated coding dispatch fails closed for
+          # this pass, while PR-Agent Child review (deduplicated downstream)
+          # and Parent-local scheduling continue. The next scheduler wake
+          # retries automatically.
+          active_script="$CONTINUUM_ENGINE_ROOT/.github/scripts/delegated_active_runs.sh"
+          active_runs_file="$RUNNER_TEMP/continuum-active-runs.tsv"
+          active_runs_state=ok
+          if ! bash "$active_script" snapshot --output "$active_runs_file"; then
+            active_runs_state=degraded
+            echo "::warning::Delegated active-run discovery is unavailable or truncated; new delegated coding dispatch is disabled for this pass. Child review and Parent-local scheduling continue, and the next scheduler wake retries automatically."
+          fi
+          echo "active_runs_state=$active_runs_state" >> "$GITHUB_OUTPUT"
 
           task_active() {
-            local child_id="$1" kind="$2" task="$3"
-            local neutral_title
-            if [[ "$kind" == "task" ]]; then
-              neutral_title="SubTask #$task"
-            else
-              neutral_title="SubTask review #$task"
+            local active_child_id="$1" kind="$2" task="$3"
+            # Uncertainty fails closed: an unavailable inventory never
+            # admits new delegated coding dispatch.
+            if [[ "$active_runs_state" != "ok" ]]; then
+              return 0
             fi
-            grep -Fxq "$neutral_title" <<<"$active_titles" ||
-              grep -Fxq "Child $kind [$child_id] #$task" <<<"$active_titles"
+            bash "$active_script" task-active --file "$active_runs_file" \
+              --child-id "$active_child_id" --kind "$kind" --task "$task"
           }
 
           manual_pr_active() {
-            local child_id="$1" pr="$2"
-            grep -Fxq "SubTask PR review #$pr" <<<"$active_titles" ||
-              grep -Fxq "Child PR review [$child_id] #$pr" <<<"$active_titles"
+            local child_id="$1" pr="$2" titles
+            if [[ "$active_runs_state" != "ok" ]]; then
+              return 0
+            fi
+            titles="$(awk -F '\t' 'NF >= 2 { print $2 }' "$active_runs_file")"
+            grep -Fxq "SubTask PR review #$pr" <<<"$titles" ||
+              grep -Fxq "Child PR review [$child_id] #$pr" <<<"$titles"
           }
 
           candidate_lines="$RUNNER_TEMP/continuum-child-candidates.jsonl"
           : > "$candidate_lines"
           declare -A active_wip_keys=()
 
-          while IFS= read -r title; do
-            if [[ "$title" =~ ^SubTask[[:space:]]#([0-9]+)$ ]]; then
-              active_wip_keys["subtask#${BASH_REMATCH[1]}"]=1
-            elif [[ "$title" =~ ^Child[[:space:]]task[[:space:]]\[([^]]+)\][[:space:]]#([0-9]+)$ ]]; then
-              active_wip_keys["${BASH_REMATCH[1]}#${BASH_REMATCH[2]}"]=1
-            fi
-          done <<<"$active_titles"
+          if [[ "$active_runs_state" == "ok" ]]; then
+            while IFS= read -r title; do
+              if [[ "$title" =~ ^SubTask[[:space:]]#([0-9]+)$ ]]; then
+                active_wip_keys["subtask#${BASH_REMATCH[1]}"]=1
+              elif [[ "$title" =~ ^Child[[:space:]]task[[:space:]]\[([^]]+)\][[:space:]]#([0-9]+)$ ]]; then
+                active_wip_keys["${BASH_REMATCH[1]}#${BASH_REMATCH[2]}"]=1
+              fi
+            done < <(awk -F '\t' 'NF >= 2 { print $2 }' "$active_runs_file")
+          fi
+          coding_admission_enabled=true
+          if [[ "$active_runs_state" != "ok" ]]; then
+            coding_admission_enabled=false
+          fi
 
           invalid=0
           review_dispatches=0
@@ -1065,28 +1088,35 @@ jobs:
             # authoritative (issue #244): under `pr-agent` the per-child
             # recovery dispatch above owns every child PR, so no legacy
             # review may race it. No double review, double repair, or
-            # competing merge paths.
+            # competing merge paths. Without a trustworthy active-run
+            # inventory the legacy path cannot deduplicate itself, so it is
+            # skipped for this pass while PR-Agent review keeps its own
+            # downstream identity.
             if [[ "$pr_agent_authoritative" != true ]]; then
-              manual_prs="$(
-                gh api --paginate "repos/$child_repo/pulls?state=open&per_page=100" \
-                  --jq '.[] |
-                    select(.draft == false) |
-                    select(.head.repo.full_name == .base.repo.full_name) |
-                    select(.user.login == .base.repo.owner.login) |
-                    select(
-                      ((.head.ref | startswith("continuum-child/task-")) or
-                       (.head.ref | startswith("runtime-worker/task-"))) | not
-                    ) |
-                    select(([.labels[]?.name] | index("no-auto-merge")) | not) |
-                    .number' 2>/dev/null || true
-              )"
-              while IFS= read -r manual_pr; do
-                [[ -n "$manual_pr" ]] || continue
-                manual_pr_active "$child_id" "$manual_pr" && continue
-                gh workflow run "$CHILD_PR_REVIEW_WORKFLOW" --repo "$GITHUB_REPOSITORY" \
-                  -f child_id="$child_id" -f pr_number="$manual_pr" >/dev/null
-                review_dispatches=$((review_dispatches + 1))
-              done <<<"$manual_prs"
+              if [[ "$active_runs_state" == "ok" ]]; then
+                manual_prs="$(
+                  gh api --paginate "repos/$child_repo/pulls?state=open&per_page=100" \
+                    --jq '.[] |
+                      select(.draft == false) |
+                      select(.head.repo.full_name == .base.repo.full_name) |
+                      select(.user.login == .base.repo.owner.login) |
+                      select(
+                        ((.head.ref | startswith("continuum-child/task-")) or
+                         (.head.ref | startswith("runtime-worker/task-"))) | not
+                      ) |
+                      select(([.labels[]?.name] | index("no-auto-merge")) | not) |
+                      .number' 2>/dev/null || true
+                )"
+                while IFS= read -r manual_pr; do
+                  [[ -n "$manual_pr" ]] || continue
+                  manual_pr_active "$child_id" "$manual_pr" && continue
+                  gh workflow run "$CHILD_PR_REVIEW_WORKFLOW" --repo "$GITHUB_REPOSITORY" \
+                    -f child_id="$child_id" -f pr_number="$manual_pr" >/dev/null
+                  review_dispatches=$((review_dispatches + 1))
+                done <<<"$manual_prs"
+              else
+                echo "::notice::Skipping legacy child PR review: active-run inventory is unavailable."
+              fi
             fi
 
             issues_json="$(gh api --paginate "repos/$child_repo/issues?state=open&per_page=100" 2>/dev/null)"
@@ -1154,6 +1184,12 @@ jobs:
                 gh api --method POST "repos/$child_repo/issues/$task_number/labels" \
                   -f "labels[]=$priority" >/dev/null 2>&1 || true
                 echo "Normalized delegated task #$task_number to $priority."
+              fi
+
+              # An unavailable active-run inventory disables new delegated
+              # coding admission for this pass; recovery is the next wake.
+              if [[ "$coding_admission_enabled" != "true" ]]; then
+                continue
               fi
 
               task_active "$child_id" task "$task_number" && continue
@@ -1304,6 +1340,9 @@ jobs:
         env:
           CHILD_ACTIVE_WIP: ${{ steps.child_queue.outputs.active_wip || '0' }}
           CHILD_CANDIDATES_FILE: ${{ runner.temp }}/continuum-child-candidates.json
+          CHILD_ACTIVE_RUNS_STATE: ${{ steps.child_queue.outputs.active_runs_state || 'ok' }}
+          CHILD_ACTIVE_RUNS_SCRIPT: ${{ github.workspace }}/.continuum-engine/.github/scripts/delegated_active_runs.sh
+          CHILD_ACTIVE_RUNS_FILE: ${{ runner.temp }}/continuum-active-runs-fresh.tsv
           DELEGATION_STATE: ${{ steps.child_queue.outputs.delegation_state }}
         with:
           # TAP_PAT is required because the existing OpenCode workflow accepts
@@ -1371,9 +1410,24 @@ jobs:
                 'Invalid CHILD_ACTIVE_WIP: ' + process.env.CHILD_ACTIVE_WIP
               );
             }
-            const childActiveWip = childActiveWipParsed;
             const childCandidatesFile = (
               process.env.CHILD_CANDIDATES_FILE || ''
+            ).trim();
+            // Active-run discovery is authoritative for duplicate dispatch
+            // (kodmial/continuum#387). `degraded` means the status-filtered
+            // Actions view failed or was truncated: never invent an empty
+            // active inventory. Delegated coding stops for this pass while
+            // Parent-local scheduling continues and the next wake retries.
+            const activeRunsState = (
+              process.env.CHILD_ACTIVE_RUNS_STATE || 'ok'
+            ).trim();
+            if (!['ok', 'degraded'].includes(activeRunsState)) {
+              throw new Error(
+                'Invalid CHILD_ACTIVE_RUNS_STATE: ' + activeRunsState
+              );
+            }
+            const activeRunsScript = (
+              process.env.CHILD_ACTIVE_RUNS_SCRIPT || ''
             ).trim();
             // Delegation state is the authoritative split between
             // Parent-local and delegated scheduling (kodmial/continuum#326).
@@ -1386,18 +1440,29 @@ jobs:
             if (!['ok', 'degraded', 'none'].includes(delegationState)) {
               throw new Error('Invalid DELEGATION_STATE: ' + delegationState);
             }
+            const childActiveWip =
+              activeRunsState === 'ok' ? childActiveWipParsed : 0;
             let childCandidates = [];
             if (delegationState === 'ok') {
-              if (!childCandidatesFile || !fs.existsSync(childCandidatesFile)) {
-                throw new Error(
-                  'Delegation state is "ok" but the delegated child candidate file is missing.'
+              if (activeRunsState === 'degraded') {
+                core.warning(
+                  'Delegated active-run discovery is unavailable or truncated; ' +
+                  'new delegated coding dispatch is disabled for this pass. ' +
+                  'Parent-local scheduling and PR-Agent Child review continue, ' +
+                  'and the next scheduler wake retries automatically.'
                 );
-              }
-              childCandidates = JSON.parse(
-                fs.readFileSync(childCandidatesFile, 'utf8')
-              );
-              if (!Array.isArray(childCandidates)) {
-                throw new Error('Delegated child candidate payload is not an array.');
+              } else {
+                if (!childCandidatesFile || !fs.existsSync(childCandidatesFile)) {
+                  throw new Error(
+                    'Delegation state is "ok" but the delegated child candidate file is missing.'
+                  );
+                }
+                childCandidates = JSON.parse(
+                  fs.readFileSync(childCandidatesFile, 'utf8')
+                );
+                if (!Array.isArray(childCandidates)) {
+                  throw new Error('Delegated child candidate payload is not an array.');
+                }
               }
             } else if (delegationState === 'degraded') {
               core.warning(
@@ -1405,6 +1470,111 @@ jobs:
                 'disabled for this pass while Parent-local scheduling continues.'
               );
             }
+
+            // Fresh pre-dispatch recheck against the same bounded,
+            // status-filtered discovery. The recheck snapshot is taken at
+            // most once per scheduler pass and reused for every delegated
+            // candidate, so REST cost is bounded by active-run volume rather
+            // than candidate count (no per-Child N+1). Exit 0 = an identical
+            // task/review run is still active, 1 = not active, anything else
+            // is an uncertain outage and must also suppress the duplicate.
+            const freshActiveRunsFile = (
+              process.env.CHILD_ACTIVE_RUNS_FILE ||
+              path.join(
+                process.env.RUNNER_TEMP || '.',
+                'continuum-active-runs-fresh.tsv'
+              )
+            ).trim();
+            let freshActiveRunsReady = false;
+            let freshActiveRunsUnavailable = false;
+            function ensureFreshDelegatedActiveRuns() {
+              if (freshActiveRunsReady || freshActiveRunsUnavailable) {
+                return freshActiveRunsReady;
+              }
+              if (!activeRunsScript) {
+                freshActiveRunsUnavailable = true;
+                core.warning(
+                  'Delegated active-run recheck is unavailable; skipping ' +
+                  'delegated dispatch for this pass.'
+                );
+                return false;
+              }
+              try {
+                execFileSync(
+                  'bash',
+                  [activeRunsScript, 'snapshot', '--output', freshActiveRunsFile],
+                  {
+                    encoding: 'utf8',
+                    stdio: ['ignore', 'pipe', 'pipe'],
+                    env: {
+                      ...process.env,
+                      GH_TOKEN: readToken,
+                      GITHUB_REPOSITORY: repoFullName,
+                    },
+                  }
+                );
+                freshActiveRunsReady = true;
+                return true;
+              } catch (error) {
+                freshActiveRunsUnavailable = true;
+                core.warning(
+                  'Delegated active-run recheck failed for this pass; ' +
+                  'skipping delegated dispatch because an unknown run ' +
+                  'state must not create a duplicate.'
+                );
+                return false;
+              }
+            }
+            function freshDelegatedTaskActive(childId, taskNumber) {
+              if (!ensureFreshDelegatedActiveRuns()) {
+                return true;
+              }
+              for (const kind of ['task', 'review']) {
+                try {
+                  execFileSync(
+                    'bash',
+                    [
+                      activeRunsScript,
+                      'task-active',
+                      '--file',
+                      freshActiveRunsFile,
+                      '--child-id',
+                      String(childId),
+                      '--kind',
+                      kind,
+                      '--task',
+                      String(taskNumber),
+                    ],
+                    {
+                      encoding: 'utf8',
+                      stdio: ['ignore', 'pipe', 'pipe'],
+                      env: {
+                        ...process.env,
+                        GH_TOKEN: readToken,
+                        GITHUB_REPOSITORY: repoFullName,
+                      },
+                    }
+                  );
+                  return true;
+                } catch (error) {
+                  if (error && error.status === 1) {
+                    continue;
+                  }
+                  core.warning(
+                    'Delegated active-run recheck failed for SubTask #' +
+                    taskNumber + '; skipping dispatch for this pass because ' +
+                    'an unknown run state must not create a duplicate.'
+                  );
+                  return true;
+                }
+              }
+              return false;
+            }
+
+            // Same-pass dispatch identity: a selected task that has just
+            // been dispatched must never be launched again even before its
+            // new run becomes visible in a fresh listing.
+            const dispatchedTaskKeys = new Set();
 
             function positiveInt(name, fallback) {
               const value = Number.parseInt(process.env[name] || String(fallback), 10);
@@ -4137,10 +4307,32 @@ jobs:
                   continue;
                 }
 
+                // Smallest authoritative recheck for the selection-to-
+                // dispatch race: a run that appeared after the pass snapshot
+                // (or a same-pass dispatch) must suppress the new job. An
+                // uncertain read also suppresses dispatch; the next wake
+                // retries when the inventory is trustworthy again.
+                const taskKey =
+                  child.child_id + '#' + child.task_number;
+                if (
+                  dispatchedTaskKeys.has(taskKey) ||
+                  freshDelegatedTaskActive(
+                    child.child_id, child.task_number
+                  )
+                ) {
+                  core.info(
+                    'Skipping SubTask #' + child.task_number +
+                    ': an identical active or just-dispatched run already ' +
+                    'owns this task.'
+                  );
+                  continue;
+                }
+
                 await dispatchWorkflow(childWorkerWorkflow, {
                   child_id: child.child_id,
                   task_number: String(child.task_number),
                 });
+                dispatchedTaskKeys.add(taskKey);
                 core.notice(
                   'Dispatched SubTask #' + child.task_number + ' (' +
                   (priority || 'no priority') + ').'
