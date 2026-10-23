@@ -478,9 +478,15 @@ class CleanReviewShortCircuitTests(unittest.TestCase):
         scan_at = body.index("const ciGreen = await scanCiGreen(head);")
         scan = body[scan_at:scan_at + 6000]
         statuses_at = scan.index("listCommitStatusesForRef")
+        admission_at = scan.index("assessCleanReviewLifecycle")
         comments_at = scan.index("rest.issues.listComments")
-        self.assertLess(statuses_at, comments_at)
-        self.assertIn("review is settled clean; recovery has nothing to do.", scan)
+        self.assertLess(statuses_at, admission_at)
+        self.assertLess(admission_at, comments_at)
+        # A clean review under an explicit hold still short-circuits before
+        # the durable evidence scan. A clean review whose merge lifecycle is
+        # unfinished must continue to the bounded recovery decision (#383).
+        self.assertIn("recovery has nothing to do.", scan)
+        self.assertIn("bounded recovery will resume the full PR-Agent review/merge lifecycle.", scan)
 
 
 class LeaseAndCredentialTests(unittest.TestCase):

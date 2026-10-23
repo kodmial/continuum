@@ -286,16 +286,27 @@ class RecoveryDecisionTests(unittest.TestCase):
         self.assertEqual(decision.action, "dispatch")
         self.assertEqual(decision.attempt, 0)
 
-    def test_clean_mergeability_wait_is_wired_to_recovery(self):
+    def test_clean_review_resume_is_wired_to_the_lifecycle(self):
         with open(
             os.path.join(ROOT, ".github/workflows/continuum-pr-agent-recovery.yml"),
             encoding="utf-8",
         ) as handle:
             body = handle.read()
 
-        self.assertIn("cleanMergeabilityPending", body)
-        self.assertIn("mergeability is still computing; recovery eligible", body)
-        self.assertIn("lifecycleComplete: !cleanMergeabilityPending", body)
+        self.assertIn("cleanLifecycleIncomplete", body)
+        self.assertIn("assessCleanReviewLifecycle({", body)
+        self.assertIn(
+            "clean exact-HEAD review completed but the merge lifecycle is unfinished",
+            body,
+        )
+        self.assertIn("lifecycleComplete: !cleanLifecycleIncomplete", body)
+        # Both early exits must use the shared admission result instead of
+        # settling merely because the review run succeeded.
+        self.assertNotIn("cleanMergeabilityPending", body)
+        self.assertEqual(
+            body.count("review is settled clean; recovery has nothing to do."),
+            1,
+        )
 
     def test_active_exact_run_coalesces_duplicate_wakeup(self):
         decision = recovery.decide_recovery(
@@ -629,6 +640,265 @@ class RecoveryDecisionTests(unittest.TestCase):
         self.assertEqual(recovery.resolve_max_executions("0"), 1)
         self.assertEqual(recovery.resolve_max_executions("99"), 10)
         self.assertEqual(recovery.resolve_max_executions("nope"), 10)
+
+
+class CleanReviewLifecycleResumeTests(unittest.TestCase):
+    """Issue #383: a clean review must still resume an unfinished merge."""
+
+    WORKFLOW = ".github/workflows/continuum-pr-agent-recovery.yml"
+
+    @classmethod
+    def setUpClass(cls):
+        with open(os.path.join(ROOT, cls.WORKFLOW), encoding="utf-8") as handle:
+            cls.body = handle.read()
+
+    @classmethod
+    def _extract_function(cls, name: str) -> str:
+        import re
+
+        match = re.search(r"function\s+" + re.escape(name) + r"\s*\(", cls.body)
+        if match is None:
+            raise AssertionError(f"workflow function {name} is missing")
+        start = match.start()
+        paren_start = cls.body.index("(", match.start())
+        depth = 0
+        paren_end = None
+        for pos in range(paren_start, len(cls.body)):
+            char = cls.body[pos]
+            if char == "(":
+                depth += 1
+            elif char == ")":
+                depth -= 1
+                if depth == 0:
+                    paren_end = pos
+                    break
+        if paren_end is None:
+            raise AssertionError(f"workflow function {name} has unbalanced parameters")
+        body_start = cls.body.index("{", paren_end)
+        depth = 0
+        body_end = None
+        for pos in range(body_start, len(cls.body)):
+            char = cls.body[pos]
+            if char == "{":
+                depth += 1
+            elif char == "}":
+                depth -= 1
+                if depth == 0:
+                    body_end = pos + 1
+                    break
+        if body_end is None:
+            raise AssertionError(f"workflow function {name} has unbalanced body")
+        return cls.body[start:body_end]
+
+    def test_hold_release_dispatches_exactly_one_full_lifecycle(self):
+        import shutil
+        import subprocess
+        import tempfile
+
+        node = shutil.which("node")
+        self.assertIsNotNone(
+            node,
+            "node is required to execute the shipped admission JS; failing closed instead of silently skipping",
+        )
+        harness = (
+            "const assert = require('assert');\n"
+            "const HEAD = 'a'.repeat(40);\n"
+            "const REPO = 'kodmial/continuum';\n"
+            "const retryableConclusions = new Set(['failure','cancelled','timed_out','stale','startup_failure']);\n"
+            "const staleMs = 70 * 60 * 1000;\n"
+            "const dispatchGraceMs = 90 * 1000;\n"
+            "const maxExecutions = 10;\n"
+            "const REVIEW_CONTEXT = 'continuum/pr-agent-review';\n"
+            "const REPAIR_CONTEXT = 'continuum/pr-agent-repair';\n"
+            "let clock = Date.parse('2026-10-23T00:00:00Z');\n"
+            "function nowMs() { return clock; }\n"
+            "function ageMs(value) { const parsed = Date.parse(String(value || '')); return Number.isFinite(parsed) ? Math.max(0, nowMs() - parsed) : Number.MAX_SAFE_INTEGER; }\n"
+            + self._extract_function("hasNoAutoMergeHold")
+            + "\n"
+            + self._extract_function("isConflictedMergeability")
+            + "\n"
+            + self._extract_function("assessCleanReviewLifecycle")
+            + "\n"
+            + self._extract_function("decide")
+            + "\n"
+            + r"""
+const cleanStatus = () => ({
+  state: 'success',
+  context: REVIEW_CONTEXT,
+  description: 'PR-Agent review complete: clean',
+  updated_at: new Date(clock - 20 * 60 * 1000).toISOString(),
+});
+const emptyEvidence = () => ({
+  latestAttempt: null,
+  latestMarkerAt: null,
+  exhausted: false,
+  notBeforeEpoch: null,
+});
+const basePr = (number, labels) => ({
+  number,
+  labels,
+  head: { sha: HEAD, repo: { full_name: REPO } },
+});
+const fresh = (labels, overrides = {}) => Object.assign({
+  number: 383,
+  state: 'open',
+  merged: false,
+  draft: false,
+  mergeable: true,
+  mergeable_state: 'clean',
+  labels,
+  head: { sha: HEAD, repo: { full_name: REPO } },
+}, overrides);
+const assess = (overrides = {}) => assessCleanReviewLifecycle(Object.assign({
+  reviewStatus: cleanStatus(),
+  runConclusionRetryable: false,
+  pr: basePr(383, []),
+  freshPr: fresh([]),
+  head: HEAD,
+  repoFullName: REPO,
+}, overrides));
+const decideResume = ({ activeRun = false, evidence = emptyEvidence() } = {}) => decide({
+  ciGreen: true,
+  operationStatus: cleanStatus(),
+  activeRun,
+  runConclusion: 'success',
+  evidence,
+  lifecycleComplete: false,
+});
+
+const hold = [{ name: 'no-auto-merge' }];
+const released = [];
+let dispatches = 0;
+
+// Repeated scheduled ticks while the owner hold is present: cheap NOOP.
+for (let tick = 0; tick < 3; tick += 1) {
+  const outcome = assess({ pr: basePr(383, hold), freshPr: fresh(hold) });
+  assert.strictEqual(outcome.decision, 'hold', JSON.stringify(outcome));
+}
+assert.strictEqual(dispatches, 0, 'held ticks must not dispatch');
+
+// Remove the hold: the clean exact-HEAD review is not a completed merge.
+const releasedAssessment = assess({ pr: basePr(383, released), freshPr: fresh(released) });
+assert.strictEqual(releasedAssessment.decision, 'resume', JSON.stringify(releasedAssessment));
+const first = decideResume();
+assert.strictEqual(first.action, 'dispatch');
+assert.strictEqual(first.attempt, 0);
+dispatches += 1;
+
+// The resumed exact PR/HEAD operation is now active: coalesce duplicates.
+const afterDispatch = {
+  latestAttempt: 0,
+  latestMarkerAt: clock,
+  exhausted: false,
+  notBeforeEpoch: null,
+};
+assert.strictEqual(decideResume({ activeRun: true, evidence: afterDispatch }).action, 'wait');
+// A delayed wakeup inside durable dispatch grace must coalesce as well.
+assert.strictEqual(decideResume({ evidence: afterDispatch }).action, 'wait');
+assert.strictEqual(dispatches, 1, 'exactly one full lifecycle dispatch is allowed');
+
+// An unrelated clean PR under its own hold is never woken by this release.
+const unrelated = assess({
+  pr: basePr(999, hold),
+  freshPr: fresh(hold, { number: 999 }),
+});
+assert.strictEqual(unrelated.decision, 'hold');
+
+// Once the resumed lifecycle actually merges/closes the PR: NOOP.
+assert.strictEqual(
+  assess({ pr: basePr(383, released), freshPr: fresh(released, { state: 'closed', merged: true }) }).decision,
+  'settled',
+);
+assert.strictEqual(dispatches, 1);
+assert.strictEqual(HEAD.length, 40, 'resume never invents a new HEAD');
+
+// Fail-closed admission table.
+const expectDecision = (overrides, expected) => {
+  const outcome = assess(overrides);
+  assert.strictEqual(outcome.decision, expected, JSON.stringify(outcome));
+};
+expectDecision({ pr: basePr(383, hold), freshPr: fresh(hold) }, 'hold');
+expectDecision({ freshPr: fresh([], { head: { sha: 'b'.repeat(40), repo: { full_name: REPO } } }) }, 'hold');
+expectDecision({ freshPr: fresh([], { draft: true }) }, 'hold');
+expectDecision({ freshPr: fresh([], { state: 'closed' }) }, 'settled');
+expectDecision({ freshPr: fresh([], { merged: true }) }, 'settled');
+expectDecision({ freshPr: fresh([], { mergeable: false, mergeable_state: 'dirty' }) }, 'hold');
+expectDecision({ freshPr: fresh([], { mergeable: 'CONFLICTING', mergeable_state: 'dirty' }) }, 'hold');
+expectDecision({ freshPr: fresh([], { head: { sha: HEAD, repo: { full_name: 'other/repo' } } }) }, 'hold');
+expectDecision({
+  reviewStatus: Object.assign(cleanStatus(), { description: 'PR-Agent review complete: actionable' }),
+}, 'not-clean-review');
+expectDecision({
+  reviewStatus: Object.assign(cleanStatus(), { description: 'PR-Agent review complete: blocking; recovery eligible' }),
+}, 'not-clean-review');
+expectDecision({ runConclusionRetryable: true, pr: basePr(383, hold), freshPr: fresh(hold) }, 'hold');
+expectDecision({ runConclusionRetryable: true }, 'replay');
+expectDecision({ freshPr: fresh([], { mergeable: null, mergeable_state: 'unknown' }) }, 'resume');
+expectDecision({ freshPr: null }, 'defer');
+console.log('HOLD_RELEASE_OK');
+"""
+        )
+        tmpdir = os.path.join(ROOT, ".opencode-tmp")
+        os.makedirs(tmpdir, exist_ok=True)
+        with tempfile.NamedTemporaryFile(
+            "w", suffix=".js", delete=False, dir=tmpdir
+        ) as handle:
+            handle.write(harness)
+            script = handle.name
+        try:
+            completed = subprocess.run(
+                [node, script],
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+        finally:
+            os.unlink(script)
+        self.assertEqual(completed.returncode, 0, completed.stderr or completed.stdout)
+        self.assertIn("HOLD_RELEASE_OK", completed.stdout)
+
+    def test_resume_rechecks_live_hold_and_merge_blockers_before_dispatch(self):
+        body = self.body
+        self.assertIn("if (!hasNoAutoMergeHold(pr))", body)
+        self.assertIn("hasNoAutoMergeHold(fresh)", body)
+        self.assertIn(
+            "isConflictedMergeability(fresh.mergeable, fresh.mergeable_state)",
+            body,
+        )
+        self.assertIn(
+            "explicit no-auto-merge hold is present; recovery dispatch cancelled.",
+            body,
+        )
+        # The dispatch remains the existing full orchestration on the exact
+        # HEAD: no isolated historical merge rerun and no synthesized status.
+        self.assertIn("expected_head_sha: head", body)
+        self.assertIn("recovery_kind: kind", body)
+        self.assertIn("createWorkflowDispatch", body)
+        self.assertNotIn("github.rest.pulls.merge(", body)
+        self.assertNotIn("createCommitStatus", body)
+
+    def test_parent_delegated_resume_keeps_opaque_routing(self):
+        body = self.body
+        # The Parent reads live PR/label/HEAD state from the resolved target,
+        # then dispatches the existing full orchestration in the execution
+        # repository with only the opaque child id.
+        self.assertIn("const owner = process.env.CONTINUUM_PR_AGENT_TARGET_OWNER;", body)
+        self.assertIn("const repo = process.env.CONTINUUM_PR_AGENT_TARGET_REPO;", body)
+        self.assertIn("owner: executionOwner", body)
+        self.assertIn("repo: executionRepo", body)
+        self.assertIn("recoveryInputs.target_child_id = recoveryChildId", body)
+        self.assertNotIn("recoveryInputs.target_repository", body)
+        self.assertNotIn("recoveryInputs.target_owner", body)
+        # Resume/hold log text carries PR number and exact HEAD only; no
+        # concrete target repository identity is emitted to public logs.
+        for needle in (
+            "bounded recovery will resume the full PR-Agent review/merge lifecycle.",
+            "explicit no-auto-merge hold is present; recovery dispatch cancelled.",
+            "merge conflict/stale base blocks the merge lifecycle; recovery dispatch cancelled.",
+        ):
+            with self.subTest(needle=needle):
+                self.assertIn(needle, body)
+                self.assertNotIn(needle + " ' + repoFullName", body)
 
 
 class RecoveryWiringTests(unittest.TestCase):
