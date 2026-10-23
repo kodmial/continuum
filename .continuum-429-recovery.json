@@ -1,0 +1,22 @@
+{
+  "base_ref": "",
+  "base_sha": "c5ca1aeae999cecd3dfab26542f6e509396e348e",
+  "branch": "fix/429-bootstrap-checkout-374-395",
+  "capability_number": "",
+  "checkpoint_ref": "opencode/429-checkpoint-opencode-429-ci-fix-pr397-run39901703550-gen-1",
+  "failure_kind": "quota_429",
+  "generation": 1,
+  "head_ref": "fix/429-bootstrap-checkout-374-395",
+  "head_sha": "00d0a92ea3845bee1d9dac995767a3401a2a933e",
+  "issue_number": "",
+  "mode": "ci-fix",
+  "operation_id": "opencode-429-ci-fix-pr397-run39901703550",
+  "pr_number": "397",
+  "qualification_number": "",
+  "required_sha": "",
+  "review_id": "",
+  "run_id": "39901703550",
+  "schema_version": 1,
+  "stage": "review-repair",
+  "unresolved_items_json": ""
+}
