@@ -545,9 +545,11 @@ jobs:
 
     outputs:
       restart_required: ${{ steps.runner_recovery.outputs.restart_required }}
+      recovery_bootstrap_failed: ${{ steps.recovery_bootstrap.outputs.failed }}
 
     steps:
       - name: Checkout repository
+        id: checkout
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           # Full history is required for conflict-repair merges against main.
@@ -562,6 +564,37 @@ jobs:
           # The burned runner's ephemeral head_ref was not necessarily pushed to origin.
           # Other modes preserve their original checkout behavior.
           ref: ${{ (inputs.mode == 'issue' && inputs.recovery_checkpoint_ref != '') && (inputs.base_ref || github.event.repository.default_branch || github.ref) || inputs.head_ref || github.ref }}
+
+      - name: Classify 429 recovery bootstrap failure
+        id: recovery_bootstrap
+        if: >-
+          always() &&
+          inputs.recovery_checkpoint_ref != '' &&
+          steps.checkout.outcome != 'success'
+        env:
+          RECOVERY_OPERATION_ID: ${{ inputs.recovery_operation_id }}
+          RECOVERY_CHECKPOINT_REF: ${{ inputs.recovery_checkpoint_ref }}
+          RECOVERY_CHECKPOINT_SHA: ${{ inputs.recovery_checkpoint_sha }}
+          RECOVERY_STAGE: ${{ inputs.recovery_stage }}
+          RECOVERY_GENERATION: ${{ inputs.recovery_generation }}
+          RECOVERY_MODE: ${{ inputs.mode }}
+          ISSUE_NUMBER: ${{ inputs.issue_number }}
+          PR_NUMBER: ${{ inputs.pr_number }}
+          HEAD_REF: ${{ inputs.head_ref }}
+        run: |
+          set -euo pipefail
+          echo "failed=true" >> "$GITHUB_OUTPUT"
+          # A pre-restore checkout/transport failure is infrastructure, not a
+          # task attempt. Mark it for the existing watchdog-owned bounded
+          # recovery path; the original checkpoint stays authoritative.
+          if [[ -z "$RECOVERY_OPERATION_ID" || -z "$RECOVERY_CHECKPOINT_REF" ]] || \
+             [[ ! "$RECOVERY_CHECKPOINT_SHA" =~ ^[0-9a-fA-F]{40}$ ]]; then
+            echo "::warning::429 checkpoint recovery could not bootstrap and has no pinned recovery identity; no task attempt was consumed."
+            exit 0
+          fi
+          touch "${RUNNER_TEMP:-/tmp}/continuum-opencode-429-bootstrap"
+          echo "::error::CONTINUUM_OPENCODE_429_BOOTSTRAP_RETRY_REQUIRED operation=${RECOVERY_OPERATION_ID}"
+          echo "Recoverable 429 checkpoint ${RECOVERY_CHECKPOINT_REF} at exact SHA ${RECOVERY_CHECKPOINT_SHA} (operation ${RECOVERY_OPERATION_ID}, stage ${RECOVERY_STAGE:-implementation-incomplete}, generation ${RECOVERY_GENERATION:-0}, mode ${RECOVERY_MODE}, issue ${ISSUE_NUMBER:-}, pr ${PR_NUMBER:-}, branch ${HEAD_REF:-})."
 
       - name: Configure Git identity
         run: |
@@ -584,6 +617,9 @@ jobs:
           RECOVERY_STAGE: ${{ inputs.recovery_stage }}
           RECOVERY_GENERATION: ${{ inputs.recovery_generation }}
           RECOVERY_MODE: ${{ inputs.mode }}
+          RECOVERY_ISSUE_NUMBER: ${{ inputs.issue_number }}
+          RECOVERY_PR_NUMBER: ${{ inputs.pr_number }}
+          RECOVERY_QUALIFICATION_NUMBER: ${{ inputs.qualification_number }}
         run: |
           set -euo pipefail
           [[ -n "$RECOVERY_OPERATION_ID" ]] || { echo "::error::429 recovery without operation identity."; exit 1; }
@@ -649,6 +685,18 @@ jobs:
           mode = os.environ.get("RECOVERY_MODE", "").strip()
           if mode and required("mode") != mode:
               raise SystemExit("::error::429 recovery metadata mode mismatch")
+          for field, variable in (
+              ("issue_number", "RECOVERY_ISSUE_NUMBER"),
+              ("pr_number", "RECOVERY_PR_NUMBER"),
+              ("qualification_number", "RECOVERY_QUALIFICATION_NUMBER"),
+          ):
+              expected = os.environ.get(variable, "").strip()
+              if expected and str(data.get(field) or "").strip() != expected:
+                  raise SystemExit(
+                      "::error::429 recovery metadata {} mismatch".format(
+                          field.replace("_number", "")
+                      )
+                  )
           head_sha = required("head_sha").lower()
           if not re.fullmatch(r"[0-9a-f]{40}", head_sha):
               raise SystemExit("::error::429 recovery metadata head SHA is malformed")
@@ -4164,9 +4212,9 @@ jobs:
         if: always()
         shell: bash
         run: |
-          if [[ -f "${RUNNER_TEMP:-/tmp}/continuum-opencode-429" || -f "${RUNNER_TEMP:-/tmp}/continuum-opencode-upstream-unavailable" ]]; then
+          if [[ -f "${RUNNER_TEMP:-/tmp}/continuum-opencode-429" || -f "${RUNNER_TEMP:-/tmp}/continuum-opencode-upstream-unavailable" || -f "${RUNNER_TEMP:-/tmp}/continuum-opencode-429-bootstrap" ]]; then
             echo "restart_required=true" >> "$GITHUB_OUTPUT"
-            echo "OpenCode provider/transport failure classified for fresh-runner recovery."
+            echo "OpenCode infrastructure failure classified for fresh-runner recovery."
           else
             echo "restart_required=false" >> "$GITHUB_OUTPUT"
           fi
@@ -4206,6 +4254,7 @@ jobs:
           path: |
             ${{ runner.temp }}/continuum-opencode-429
             ${{ runner.temp }}/continuum-opencode-upstream-unavailable
+            ${{ runner.temp }}/continuum-opencode-429-bootstrap
           if-no-files-found: error
           retention-days: 1
 
@@ -4290,6 +4339,7 @@ jobs:
       IN_PROGRESS_LABEL: ${{ inputs.in_progress_label || vars.AUTOMATION_IN_PROGRESS_LABEL || 'automation:in-progress' }}
       PAUSE_LABEL: ${{ inputs.pause_marker || vars.AUTOMATION_PAUSE_LABEL || 'automation:paused' }}
       PAUSE_ON_FAILURE: ${{ inputs.pause_on_failure || vars.AUTOMATION_PAUSE_ON_FAILURE || 'true' }}
+      RECOVERY_BOOTSTRAP_FAILED: ${{ needs.opencode.outputs.recovery_bootstrap_failed }}
 
     steps:
       - name: Brief backoff before retrying scheduler
@@ -4342,6 +4392,20 @@ jobs:
             if (!labels.has(inProgress)) {
               core.info(
                 `Issue #${issueNumber} no longer owns an automation reservation.`
+              );
+              return;
+            }
+
+            // kodmial/continuum#374: a 429 checkpoint recovery that failed
+            // before the restore step never reached OpenCode. That is an
+            // infrastructure bootstrap failure, not an implementation attempt,
+            // so it must not count historical scheduler dispatches or apply a
+            // terminal pause. Leave the reservation (and any explicit operator
+            // pause) untouched; watchdog bounded recovery owns the next step.
+            if ((process.env.RECOVERY_BOOTSTRAP_FAILED || '') === 'true') {
+              core.warning(
+                `Issue #${issueNumber} failed before restoring its 429 checkpoint; ` +
+                'no implementation attempt was consumed and bounded infrastructure recovery owns the next step.'
               );
               return;
             }

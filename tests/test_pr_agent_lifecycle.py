@@ -74,12 +74,14 @@ APPROVED_347_OPENCODE_SHA256 = (
 APPROVED_350_OPENCODE_SHA256 = (
     "f9368c6939f4343a27f28d3bdc0653d1b1822de56c1b963454543cbed60fb03b"
 )
-# kodmial/continuum#374: the authorized, narrowly scoped fix for fresh-runner
-# issue-mode 429 checkout bootstrapping extends the reviewed #350 artifact.
+# kodmial/continuum#374: a fresh-VM 429 issue recovery now bootstraps its
+# initial checkout from a trusted existing base/default ref and restores the
+# exact pinned checkpoint afterwards; a pre-restore checkout/transport failure
+# is classified as bounded infrastructure recovery instead of a task attempt.
 # Keep the historical #350 digest above for audit; re-pin the full current
 # protected workflow artifact to retain fail-closed detection of later drift.
 APPROVED_374_OPENCODE_SHA256 = (
-    "6a17495b366e55b6dcbf034bfddf2e03957bfe89b7ad3524302ae2a793952b36"
+    "e9f67a3ecd437e8431e1ffac8269130754c82041e667f9ba2485de4ee743b28b"
 )
 
 APPROVED_350_SELF_CALLER_SHA256 = (
@@ -2496,12 +2498,13 @@ class ProtectedBaselineTests(unittest.TestCase):
                     self.assertIn("CONTINUUM_OPENCODE_PUBLISH_RACE_RETRY_REQUIRED", original)
                     self.assertIn("steps.model_route.outputs.model", original)
                 if path == ".github/workflows/continuum-opencode.yml":
-                    # #374 adds one narrowly reviewed checkout bootstrap change
-                    # atop the exact #350 metadata and routing artifact.
+                    # #350's recovery contract plus #374's trusted bootstrap
+                    # checkout and pre-restore failure classification are
+                    # reviewed as one exact artifact.
                     self.assertEqual(
                         protected_file_digest(path),
                         APPROVED_374_OPENCODE_SHA256,
-                        f"{path}: unexpected drift outside reviewed #374 checkout bootstrap fix",
+                        f"{path}: unexpected drift outside reviewed #350/#374 recovery patch",
                     )
                 else:
                     # The self-dogfood caller is the dispatchable surface
