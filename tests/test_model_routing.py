@@ -647,6 +647,34 @@ class GitHubStateFailureClassificationTests(unittest.TestCase):
         self.assertEqual(failure.classification, "rate_limit")
         self.assertGreaterEqual(failure.not_before, now + 45)
 
+    def test_stale_reset_epochs_fall_back_to_the_backstop(self):
+        import email.utils
+        import time
+        now = int(time.time())
+        stale = str(now - 300)
+        stale_date = email.utils.formatdate(now - 300, usegmt=True)
+        cases = (
+            (429, {"X-RateLimit-Reset": stale}),
+            (403, {"X-RateLimit-Remaining": "0", "X-RateLimit-Reset": stale}),
+            (403, {"X-RateLimit-Remaining": "4999", "Retry-After": stale_date}),
+        )
+        for code, headers in cases:
+            with self.subTest(code=code, headers=headers):
+                failure = self._failure(self._error(code, headers))
+                self.assertEqual(failure.classification, "rate_limit")
+                self.assertGreaterEqual(
+                    failure.not_before,
+                    now + route.STATE_RATE_LIMIT_FALLBACK_SECONDS)
+
+    def test_retry_after_zero_is_still_retry_now(self):
+        import time
+        now = int(time.time())
+        failure = self._failure(self._error(429, {"Retry-After": "0"}))
+        self.assertEqual(failure.classification, "rate_limit")
+        self.assertLess(
+            failure.not_before,
+            now + route.STATE_RATE_LIMIT_FALLBACK_SECONDS)
+
     def test_5xx_and_transport_timeout_are_transient(self):
         failure = self._failure(self._error(503, {"Retry-After": "10"}))
         self.assertEqual(failure.classification, "transient")

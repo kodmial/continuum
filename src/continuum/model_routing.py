@@ -118,6 +118,8 @@ def classify_github_state_failure(err: urllib.error.HTTPError,
     retry_after = _retry_after_epoch(_header(headers, "Retry-After"), current)
     not_before = max((value for value in (reset, retry_after)
                       if value is not None), default=0) or None
+    if not_before is not None and not_before < current:
+        not_before = None
     if code == 429:
         return GitHubStateUnavailable(
             "rate_limit", not_before or current + STATE_RATE_LIMIT_FALLBACK_SECONDS)
