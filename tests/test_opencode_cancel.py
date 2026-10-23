@@ -145,6 +145,106 @@ class RunBindingTests(unittest.TestCase):
                 self.assertIsNone(cancel.bind_run_to_issue(run(1, title)))
 
 
+class DelegationResolutionTests(unittest.TestCase):
+    def resolve(self, role="", parent="", child_id="", *, credential=True):
+        return cancel.resolve_cancellation_delegation(
+            role,
+            parent,
+            child_id,
+            parent_credential_available=credential,
+        )
+
+    def test_standalone_and_parent_are_local_only(self):
+        standalone = self.resolve()
+        self.assertEqual(standalone.status, "standalone")
+        self.assertEqual(standalone.parent, "")
+        self.assertEqual(standalone.child_id, "")
+        self.assertEqual(self.resolve(None, None, None).status, "standalone")
+
+        parent = self.resolve("parent")
+        self.assertEqual(parent.status, "parent")
+        self.assertEqual(parent.parent, "")
+        self.assertEqual(parent.child_id, "")
+
+    def test_valid_child_requires_both_bindings_and_a_credential(self):
+        child = self.resolve("child", "owner/parent", "child-alpha")
+        self.assertEqual(child.status, "child")
+        self.assertEqual(child.parent, "owner/parent")
+        self.assertEqual(child.child_id, "child-alpha")
+
+        for child_id in ("a", "child-alpha", "child.alpha", "child:alpha", "child_alpha"):
+            with self.subTest(child_id=child_id):
+                self.assertEqual(
+                    self.resolve("child", "owner/parent", child_id).status,
+                    "child",
+                )
+
+    def test_missing_parent_credential_fails_closed(self):
+        result = self.resolve("child", "owner/parent", "child-alpha", credential=False)
+        self.assertEqual(result.status, "error")
+        self.assertIn("credential", result.reason)
+        self.assertEqual(result.parent, "")
+        self.assertEqual(result.child_id, "")
+
+    def test_missing_partial_or_invalid_child_binding_fails_closed(self):
+        for parent, child_id in (
+            ("", "child-alpha"),
+            ("owner/parent", ""),
+            ("", ""),
+            ("owner", "child-alpha"),
+            ("owner/parent/extra", "child-alpha"),
+            ("owner/parent", "-child-alpha"),
+            ("owner/parent", "child id"),
+            ("owner/parent\n", "child-alpha"),
+            ("owner/parent", "child-alpha\n"),
+        ):
+            with self.subTest(parent=parent, child_id=child_id):
+                result = self.resolve("child", parent, child_id)
+                self.assertEqual(result.status, "error")
+                self.assertEqual(result.parent, "")
+                self.assertEqual(result.child_id, "")
+
+    def test_unknown_role_and_contradictory_bindings_fail_closed(self):
+        for role, parent, child_id in (
+            ("standalone", "", ""),
+            ("owner", "", ""),
+            ("CHILD", "owner/parent", "child-alpha"),
+            ("", "owner/parent", ""),
+            ("", "", "child-alpha"),
+            ("", "owner/parent", "child-alpha"),
+            ("parent", "owner/parent", ""),
+            ("parent", "", "child-alpha"),
+            ("parent", "owner/parent", "child-alpha"),
+        ):
+            with self.subTest(role=role, parent=parent, child_id=child_id):
+                result = self.resolve(role, parent, child_id)
+                self.assertEqual(result.status, "error")
+                self.assertEqual(result.parent, "")
+                self.assertEqual(result.child_id, "")
+
+    def test_missing_role_after_observed_local_cancel_is_success_not_failure(self):
+        # Live regression: a validated local run reached completed/cancelled,
+        # then the controller failed while resolving a missing role through a
+        # redundant REST variable lookup. The local cancellation is complete
+        # and a repository with no role/binding is legitimately standalone.
+        target = run(39940719498, "OpenCode issue #410", status="in_progress")
+        plan_result = plan([target], issue=410)
+        self.assertEqual([item["run_id"] for item in plan_result["targets"]], [39940719498])
+
+        observed = run(
+            39940719498,
+            "OpenCode issue #410",
+            status="completed",
+            conclusion="cancelled",
+        )
+        self.assertEqual(cancel.observe_cancel_outcome(observed), "cancelled")
+        self.assertFalse(cancel.needs_force_cancel(observed))
+
+        resolution = self.resolve("", "", "", credential=False)
+        self.assertEqual(resolution.status, "standalone")
+        self.assertEqual(resolution.reason, "no role or Child binding")
+
+
 class CancellationPlanTests(unittest.TestCase):
     def test_cancels_exact_issue_and_queued_duplicate(self):
         runs = [
