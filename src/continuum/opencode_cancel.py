@@ -112,6 +112,21 @@ class RunBinding:
     recovery_generation: Optional[int] = None
 
 
+@dataclass(frozen=True)
+class DelegationResolution:
+    """One validated role/binding decision for delegated cancellation.
+
+    ``status`` is ``standalone`` (local result is authoritative), ``parent``
+    (local-only), ``child`` (verified delegation is required), or ``error``
+    (configuration is ambiguous or incomplete and nothing may be delegated).
+    """
+
+    status: str
+    parent: str = ""
+    child_id: str = ""
+    reason: str = ""
+
+
 def _parse_timestamp(value: Any) -> Optional[datetime]:
     if not isinstance(value, str) or not value.strip():
         return None
@@ -376,6 +391,8 @@ _DELEGATED_TASK_RE = re.compile(
 )
 _LEGACY_SUBTASK_RE = re.compile(r"^SubTask #(\d+)$")
 _RECOVERY_OPERATION_ISSUE_RE = re.compile(r"(?:^|-)issue(\d+)(?:-|$)")
+_DELEGATION_PARENT_RE = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")
+_DELEGATION_CHILD_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]*")
 
 
 def bind_run_to_issue(run: Mapping[str, Any]) -> Optional[RunBinding]:
@@ -403,6 +420,77 @@ def bind_run_to_issue(run: Mapping[str, Any]) -> Optional[RunBinding]:
     if match:
         return RunBinding(kind="legacy-delegated", issue=int(match.group(1)))
     return None
+
+
+def resolve_cancellation_delegation(
+    role: Any,
+    parent: Any,
+    child_id: Any,
+    *,
+    parent_credential_available: bool = False,
+) -> DelegationResolution:
+    """Validate the role and Child binding as one fail-closed unit.
+
+    The caller reads these values from trusted workflow ``vars`` context, never
+    from issue text. A missing role with no binding is a legitimate standalone
+    repository, so local cancellation stays authoritative. A partial or
+    contradictory declaration is a configuration failure: it must never fall
+    through to a wildcard Parent scan or another Child's runs.
+    """
+
+    role_text = "" if role is None else str(role)
+    parent_text = "" if parent is None else str(parent)
+    child_text = "" if child_id is None else str(child_id)
+    has_binding = bool(parent_text or child_text)
+
+    if role_text == "":
+        if has_binding:
+            return DelegationResolution(
+                status="error",
+                reason="empty CONTINUUM_ROLE with a Child binding",
+            )
+        return DelegationResolution(
+            status="standalone",
+            reason="no role or Child binding",
+        )
+    if role_text == "parent":
+        if has_binding:
+            return DelegationResolution(
+                status="error",
+                reason="parent role must not carry a Child binding",
+            )
+        return DelegationResolution(
+            status="parent",
+            reason="parent role without a Child binding",
+        )
+    if role_text == "child":
+        if not parent_text or not child_text:
+            return DelegationResolution(
+                status="error",
+                reason="child role requires both CONTINUUM_PARENT and CONTINUUM_CHILD_ID",
+            )
+        if not _DELEGATION_PARENT_RE.fullmatch(parent_text) or not _DELEGATION_CHILD_ID_RE.fullmatch(
+            child_text
+        ):
+            return DelegationResolution(
+                status="error",
+                reason="child role has a malformed Parent/Child binding",
+            )
+        if not parent_credential_available:
+            return DelegationResolution(
+                status="error",
+                reason="child role requires a usable Parent credential",
+            )
+        return DelegationResolution(
+            status="child",
+            parent=parent_text,
+            child_id=child_text,
+            reason="verified Child binding",
+        )
+    return DelegationResolution(
+        status="error",
+        reason="unknown CONTINUUM_ROLE value",
+    )
 
 
 def _normalize_workflow_path(value: Any) -> str:
@@ -659,6 +747,8 @@ __all__ = [
     "ParsedOperatorStop",
     "ParsedOperatorResume",
     "RunBinding",
+    "DelegationResolution",
+    "resolve_cancellation_delegation",
     "parse_operator_stop",
     "parse_operator_resume",
     "render_operator_stop",

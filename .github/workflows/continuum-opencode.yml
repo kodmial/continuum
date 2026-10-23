@@ -556,6 +556,9 @@ jobs:
           WORKFLOW_PATH_A: .github/workflows/continuum-opencode.yml
           WORKFLOW_NAME: OpenCode agent
           WORKFLOW_REF: ${{ github.workflow_ref }}
+          CONTINUUM_ROLE: ${{ vars.CONTINUUM_ROLE }}
+          CONTINUUM_PARENT: ${{ vars.CONTINUUM_PARENT }}
+          CONTINUUM_CHILD_ID: ${{ vars.CONTINUUM_CHILD_ID }}
         run: |
           set -euo pipefail
           helper="$GITHUB_WORKSPACE/.continuum-cancel-engine/.github/scripts/opencode_cancel.py"
@@ -752,58 +755,69 @@ jobs:
           fi
           cancel_plan "$GITHUB_REPOSITORY" "$GITHUB_TOKEN" local \
             "${local_args[@]}" --workflow-name "$WORKFLOW_NAME" || failed=1
+          local_failed=$failed
 
           # A verified Child runs delegated work in its Parent Actions
           # repository. Cancel only the exact Child task title there; the
           # opaque Child id is masked and the Parent repository name is not
           # derived from task text. The durable stop comment is on the Child
           # issue and is what the Parent scheduler and worker already honour.
-          read_repo_variable() {
-            local name="$1" value
-            if value="$(gh api "repos/$GITHUB_REPOSITORY/actions/variables/$name" \
-              --jq '.value' 2>"$work/variable.err")"; then
-              printf '%s' "$value"
-              return 0
-            fi
-            if grep -q 'HTTP 404' "$work/variable.err"; then
-              return 2
-            fi
-            return 1
-          }
-
-          role=""
-          role_status=0
-          role="$(read_repo_variable CONTINUUM_ROLE)" || role_status=$?
-          if (( role_status == 1 )); then
-            echo "::error::Repository role is unavailable; refusing to guess whether delegated Parent runs need cancellation."
+          #
+          # Repository configuration comes from the trusted workflow `vars`
+          # context through step env. Reading it back through the REST
+          # variables endpoint needs Variables:read (not a selectable job
+          # permission) and made an already-successful local cancellation
+          # fail on a lookup the cancellation never needed.
+          failed=0
+          delegation_args=(
+            --role "${CONTINUUM_ROLE:-}"
+            --parent "${CONTINUUM_PARENT:-}"
+            --child-id "${CONTINUUM_CHILD_ID:-}"
+          )
+          if [[ -n "${PARENT_TOKEN:-}" ]]; then
+            delegation_args+=(--parent-credential)
+          fi
+          if ! delegation="$(python3 "$helper" delegation "${delegation_args[@]}")"; then
+            echo "::error::Cancellation role/binding resolution failed; no delegated Parent run was cancelled."
             failed=1
-          elif (( role_status == 2 )); then
-            role=""
-          fi
-          if [[ "$role" == "child" ]]; then
-            parent=""
-            child_id=""
-            if ! parent="$(read_repo_variable CONTINUUM_PARENT)"; then
-              parent=""
-            fi
-            if ! child_id="$(read_repo_variable CONTINUUM_CHILD_ID)"; then
-              child_id=""
-            fi
-            if [[ ! "$parent" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ || ! "$child_id" =~ ^[A-Za-z0-9][A-Za-z0-9._:-]*$ ]]; then
-              echo "::error::Verified Child role has no valid CONTINUUM_PARENT/CONTINUUM_CHILD_ID binding; delegated parent runs were not cancelled."
-              failed=1
-            elif [[ -z "${PARENT_TOKEN:-}" ]]; then
-              echo "::error::Delegated Child cancellation needs TAP_PAT access to the Parent Actions repository; no delegated run was cancelled."
-              failed=1
-            else
+          else
+            delegation_status="$(jq -r '.status' <<<"$delegation")"
+            parent="$(jq -r '.parent' <<<"$delegation")"
+            child_id="$(jq -r '.child_id' <<<"$delegation")"
+            delegation_reason="$(jq -r '.reason' <<<"$delegation")"
+            if [[ -n "$child_id" ]]; then
               echo "::add-mask::$child_id"
-              cancel_plan "$parent" "$PARENT_TOKEN" delegated \
-                --workflow-path .github/workflows/continuum-child-worker.yml \
-                --child-id "$child_id" || failed=1
             fi
+            case "$delegation_status" in
+              standalone)
+                echo "::notice::No delegation configuration; the local cancellation result is authoritative."
+                ;;
+              parent)
+                echo "::notice::Parent role has no Child binding; the local cancellation result is authoritative."
+                ;;
+              child)
+                echo "::notice::Verified Child binding; checking delegated Parent runs for this exact Child task."
+                cancel_plan "$parent" "$PARENT_TOKEN" delegated \
+                  --workflow-path .github/workflows/continuum-child-worker.yml \
+                  --child-id "$child_id" || failed=1
+                ;;
+              *)
+                echo "::error::Cancellation role/binding configuration is invalid ($delegation_reason); no delegated Parent run was cancelled."
+                failed=1
+                ;;
+            esac
           fi
+          delegated_failed=$failed
 
-          if (( failed != 0 )); then
+          if (( local_failed != 0 )); then
+            echo "::error::Local cancellation did not verify every active run."
+          else
+            echo "::notice::Local cancellation completed; no other issue, Child task, PR-Agent or CI run was targeted."
+          fi
+          if (( delegated_failed != 0 )); then
+            echo "::error::Delegated Parent cancellation did not complete; the local cancellation outcome is unchanged."
+          fi
+          if (( local_failed != 0 || delegated_failed != 0 )); then
             exit 1
           fi
 

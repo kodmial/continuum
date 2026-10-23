@@ -9214,6 +9214,35 @@ class ContinuumTest < Minitest::Test
                  'the durable operator stop requires issues: write'
     cancel_step = step_body(workflow, 'Persist stop and cancel exact active runs')
     refute_nil cancel_step, 'the physical cancellation step is missing'
+    cancel_step_map = job.fetch('steps').find do |step|
+      step['name'] == 'Persist stop and cancel exact active runs'
+    end
+    refute_nil cancel_step_map, 'the physical cancellation step map is missing'
+    cancel_env = cancel_step_map.fetch('env')
+    assert_equal '${{ vars.CONTINUUM_ROLE }}', cancel_env.fetch('CONTINUUM_ROLE'),
+                 'the role must come from trusted workflow vars context'
+    assert_equal '${{ vars.CONTINUUM_PARENT }}', cancel_env.fetch('CONTINUUM_PARENT'),
+                 'the Parent binding must come from trusted workflow vars context'
+    assert_equal '${{ vars.CONTINUUM_CHILD_ID }}', cancel_env.fetch('CONTINUUM_CHILD_ID'),
+                 'the Child binding must come from trusted workflow vars context'
+    refute_includes cancel_step, '/actions/variables/',
+                    'cancellation must not read repository variables through the REST API'
+    refute_includes cancel_step, 'read_repo_variable',
+                    'the redundant REST variable helper must stay removed'
+    refute_includes cancel_step, 'github.event.comment.body',
+                    'untrusted comment text must never be interpolated into the cancellation shell'
+    assert_includes cancel_step, 'delegation',
+                    'role and binding must be validated together before delegation'
+    assert_includes cancel_step, '--parent-credential',
+                    'the Parent credential presence check must stay explicit'
+    %w[standalone parent child].each do |status|
+      assert_includes cancel_step, "#{status})",
+                      "the #{status} role decision must stay explicit"
+    end
+    assert_includes cancel_step, 'local_failed',
+                    'local cancellation outcome must be reported separately'
+    assert_includes cancel_step, 'delegated_failed',
+                    'delegated Parent outcome must be reported separately'
     stop_index = cancel_step.index('operator-stop')
     cancel_index = cancel_step.index('/actions/runs/')
     refute_nil stop_index, 'the durable operator stop must be persisted'
@@ -9237,6 +9266,15 @@ class ContinuumTest < Minitest::Test
                      'the opaque Child id must not be exposed in public logs'
     assert_includes cancel_step, 'TAP_PAT',
                      'the Parent Actions repository requires the lifecycle token'
+    stub = yaml(File.join(ROOT, '.github/caller-stubs/continuum-opencode.yml'))
+    call = stub.fetch('jobs').fetch('call')
+    assert_equal 'inherit', call.fetch('secrets'),
+                 'installed callers must keep forwarding the lifecycle credential'
+    with_inputs = call.fetch('with') || {}
+    %w[CONTINUUM_ROLE CONTINUUM_PARENT CONTINUUM_CHILD_ID].each do |name|
+      refute with_inputs.key?(name),
+             "#{name} must stay an optional repository variable, not a required caller input"
+    end
     scheduler = workflow_body('continuum-issue-scheduler.yml')
     assert_includes scheduler, 'continuum-task-operator-stop',
                      'the scheduler must recognize the operator stop'

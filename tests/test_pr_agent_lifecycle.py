@@ -83,10 +83,13 @@ APPROVED_374_OPENCODE_SHA256 = (
 )
 # kodmial/continuum#400: exact owner /oc-cancel now persists an independent
 # operator stop and physically cancels only provenance-verified active runs.
-# This deliberate change extends the reviewed #374 artifact; the historical
-# #347/#350/#374 digests above remain for audit.
+# kodmial/continuum#412 then resolves the optional role/Child binding from the
+# trusted workflow vars context and validates it as one fail-closed unit, so a
+# missing role can no longer turn an observed local cancellation into a false
+# failure. This deliberate change extends the reviewed #400 artifact; the
+# historical #347/#350/#374/#400 digests above remain for audit.
 APPROVED_400_OPENCODE_SHA256 = (
-    "de8e6631c23910d536697c4480f5c60272e413128eaeda77d27c81646bc7ae67"
+    "2f39f012a266009316efd2e418c27940d1b1554ef13e7cd2adec217daf4dfe5f"
 )
 
 APPROVED_350_SELF_CALLER_SHA256 = (
@@ -2503,7 +2506,8 @@ class ProtectedBaselineTests(unittest.TestCase):
                     self.assertIn("CONTINUUM_OPENCODE_PUBLISH_RACE_RETRY_REQUIRED", original)
                     self.assertIn("steps.model_route.outputs.model", original)
                 if path == ".github/workflows/continuum-opencode.yml":
-                    # #400 adds owner cancellation control atop the exact
+                    # #400 adds owner cancellation control and #412 resolves
+                    # its role/binding from trusted vars atop the exact
                     # #350/#374 metadata, routing, and checkout artifacts.
                     self.assertEqual(
                         protected_file_digest(path),

@@ -19,13 +19,17 @@ Usage::
     opencode_cancel.py plan --runs-json runs.json --repo o/n --issue 1 \
         [--generation 1] [--workflow-path PATH] [--workflow-name NAME] \
         [--child-id ID] [--associated-run-id ID] [--exclude-run-id ID]
+    opencode_cancel.py delegation [--role ROLE] [--parent OWNER/REPO] \
+        [--child-id ID] [--parent-credential]
     opencode_cancel.py classify --status 202
     opencode_cancel.py observe --run-json run.json
 
 ``has-stop`` prints ``stopped`` or ``active`` and covers both the operator
 stop and the existing drift/tamper generation stop. ``plan`` prints one JSON
 object and fails closed (``inventory: unavailable``) for malformed input.
-Any usage or I/O failure is reported as ``::error::`` with exit 2.
+``delegation`` prints one validated role/binding JSON object; ``error`` means
+the caller must fail closed without scanning any Parent repository. Any usage
+or I/O failure is reported as ``::error::`` with exit 2.
 
 Standard library only.
 """
@@ -52,6 +56,7 @@ from continuum.opencode_cancel import (  # noqa: E402
     plan_cancellation,
     render_operator_resume,
     render_operator_stop,
+    resolve_cancellation_delegation,
 )
 from continuum.task_snapshot import DEFAULT_GENERATION, TaskSnapshotError  # noqa: E402
 
@@ -144,6 +149,27 @@ def cmd_plan(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_delegation(args: argparse.Namespace) -> int:
+    result = resolve_cancellation_delegation(
+        args.role,
+        args.parent,
+        args.child_id,
+        parent_credential_available=args.parent_credential,
+    )
+    print(
+        json.dumps(
+            {
+                "status": result.status,
+                "parent": result.parent,
+                "child_id": result.child_id,
+                "reason": result.reason,
+            },
+            sort_keys=True,
+        )
+    )
+    return 0
+
+
 def cmd_classify(args: argparse.Namespace) -> int:
     print(classify_cancel_response(args.status))
     return 0
@@ -218,6 +244,15 @@ def build_parser() -> argparse.ArgumentParser:
     plan.add_argument("--associated-run-id", action="append", default=[])
     plan.add_argument("--exclude-run-id", default=None)
     plan.set_defaults(func=cmd_plan)
+
+    delegation = sub.add_parser(
+        "delegation", help="validate the role and Child binding as one unit"
+    )
+    delegation.add_argument("--role", default="")
+    delegation.add_argument("--parent", default="")
+    delegation.add_argument("--child-id", default="")
+    delegation.add_argument("--parent-credential", action="store_true")
+    delegation.set_defaults(func=cmd_delegation)
 
     classify = sub.add_parser("classify", help="classify a cancel HTTP status")
     classify.add_argument("--status", required=True)
