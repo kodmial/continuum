@@ -111,6 +111,14 @@ def admit_event(
                 return _admitted("pr", reason="owner command on an open pull request")
             return _ignored(command, "comment does not start with a manual command")
         if command == CANCEL:
+            # The destructive cancellation route re-checks owner identity in
+            # the branch itself so it can never depend on the order of the
+            # shared gate above.
+            if not _logins_equal(actor, owner) or not _logins_equal(author, owner):
+                return _ignored(
+                    command,
+                    "cancellation actor/author is not the repository owner",
+                )
             # The repository owner explicitly cancels this issue generation.
             # Admission still never starts the code runner: the reusable
             # workflow routes this to the cheap cancellation-control job.
