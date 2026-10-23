@@ -790,27 +790,6 @@
       "event_payload_dependent": true
     },
     {
-      "path": ".github/caller-stubs/continuum-opencode-unresolved.yml",
-      "name": "Retry OpenCode on CodeRabbit unresolved",
-      "layer": "core-caller",
-      "installer_set": "core",
-      "triggers": [
-        {
-          "event": "pull_request_review_comment",
-          "types": [
-            "created"
-          ]
-        }
-      ],
-      "jobs": [
-        "call"
-      ],
-      "owners": [
-        "coderabbit-unresolved"
-      ],
-      "event_payload_dependent": true
-    },
-    {
       "path": ".github/caller-stubs/continuum-opencode-watchdog.yml",
       "name": "OpenCode watchdog",
       "layer": "core-caller",

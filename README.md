@@ -175,7 +175,7 @@ Installing into Continuum's own checkout is refused.
 
 | Set | Installs |
 | --- | --- |
-| `core` (default) | The task-domain callers installed by the `CORE_STUBS` array in `install.sh`: scheduling, implementation/repair, optional review controllers, validation hand-off, and merge. One legacy compatibility stub in `.github/caller-stubs/` (`continuum-opencode-unresolved.yml`) is intentionally not installed. |
+| `core` (default) | The task-domain callers installed by the `CORE_STUBS` array in `install.sh`: scheduling, implementation/repair, optional review controllers, validation hand-off, and merge. The retired `continuum-opencode-unresolved.yml` caller is not shipped; `continuum-coderabbit-unresolved.yml` is the canonical CodeRabbit UNRESOLVED caller. |
 | `tech` | The caller under `.github/caller-stubs/tech/`. This is an opt-in technology library that Continuum never triggers itself; it currently contains a consumer-neutral Swift validation profile. |
 | `parent` | The callers under `.github/caller-stubs/parent/`. These are the delegated child worker/review/pr-review/cleanup wrappers. |
 
@@ -228,6 +228,34 @@ can remove callers Continuum no longer ships. Deletion is fenced:
 
 Do not hand-edit an installed `continuum-*.yml` caller. Put project-specific
 behavior in a project-owned workflow instead.
+
+### Migrating the CodeRabbit UNRESOLVED caller
+
+`core` installs `continuum-coderabbit-unresolved.yml`, the canonical caller for
+CodeRabbit UNRESOLVED findings. It batches findings and delegates the repair to
+the canonical OpenCode executor; it does not run a second model loop.
+
+The older `continuum-opencode-unresolved.yml` caller is no longer shipped. Its
+reusable engine remains in Continuum for consumers that still have the older
+caller installed, and that engine disables itself when the canonical caller is
+present. To migrate a repository, install or update the canonical
+`continuum-coderabbit-unresolved.yml` caller first, then re-run `core`:
+
+```sh
+bash install.sh /path/to/consumer <ref> core --dry-run
+bash install.sh /path/to/consumer <ref> core
+```
+
+The preview lists every superseded caller that would be pruned and changes
+nothing. A real non-interactive install also deletes nothing; confirm the exact
+list at a terminal, or use `--yes`/`CONTINUUM_INSTALL_ASSUME_YES=1` only for an
+owner-approved unattended prune. Keep the canonical caller installed before
+removing the old one. To roll back, restore the previous caller file from the
+consumer's Git history (or reinstall from the previous Continuum ref) and re-run
+the installer for the sets you use.
+
+The `tech` and `parent` sets remain optional. CodeRabbit, PR-Agent, Render, and
+delegation are enabled only when you install and configure them.
 
 ### Optional external periodic wake
 
@@ -317,7 +345,7 @@ No consumer repository was created or changed to produce this documentation.
 | --- | --- |
 | `.github/workflows/continuum-*.yml` | Continuum-owned reusable (`on: workflow_call`) engine workflows. The directory is the authoritative workflow inventory. |
 | `.github/workflows/{ci,opencode,automation}.yml` and other project-owned entries | Workflows used only to dogfood Continuum on this repository. They intentionally carry no `continuum-` prefix. |
-| `.github/caller-stubs/*.yml` | Thin caller templates for the default `core` set; the `CORE_STUBS` array in `install.sh` is authoritative, and one legacy compatibility stub is intentionally not installed. |
+| `.github/caller-stubs/*.yml` | Thin caller templates for the default `core` set; the `CORE_STUBS` array in `install.sh` is authoritative. |
 | `.github/caller-stubs/tech/*.yml` | Thin callers for the opt-in technology library. |
 | `.github/caller-stubs/parent/*.yml` | Thin callers installed by the `parent` set. |
 | `install.sh` | Installs one set into a consumer repository. |
