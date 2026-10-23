@@ -6,6 +6,7 @@ decisions, budget separation, bounded infrastructure backoff without pause,
 deduplication, Parent-log opacity, and recovery-input validation.
 """
 
+import json
 import unittest
 
 from continuum.opencode_429_recovery import (
@@ -15,6 +16,8 @@ from continuum.opencode_429_recovery import (
     already_resumed,
     checkpoint_ref,
     classify_agent_error,
+    classify_opencode_events,
+    classify_opencode_github_events,
     consumes_task_budget,
     cooldown_comment,
     infra_backoff_seconds,
@@ -24,6 +27,7 @@ from continuum.opencode_429_recovery import (
     operation_id,
     pack_recovery_identity,
     parse_checkpoint_ref,
+    parse_opencode_error_events,
     parse_stage_file,
     recovery_dispatch_inputs,
     redact_child_identity,
@@ -41,22 +45,170 @@ from continuum.opencode_429_recovery import (
 )
 
 
-class Classify429Test(unittest.TestCase):
-    def test_free_usage_limit_always_classifies(self):
-        self.assertTrue(is_opencode_429("FreeUsageLimitError: quota exceeded", 0))
-        self.assertTrue(is_opencode_429("x FreeUsageLimitError y", 1))
+def error_event(name=None, message=None, status=None, response_body=None):
+    data = {}
+    if message is not None:
+        data["message"] = message
+    if status is not None:
+        data["statusCode"] = status
+    if response_body is not None:
+        data["responseBody"] = response_body
+    return json.dumps(
+        {
+            "type": "error",
+            "timestamp": 1,
+            "sessionID": "ses_test",
+            "error": {"name": name or "APIError", "data": data},
+        }
+    )
 
-    def test_429_signals_classify_only_on_failure(self):
+
+def text_event(text):
+    return json.dumps(
+        {
+            "type": "text",
+            "timestamp": 1,
+            "sessionID": "ses_test",
+            "part": {"type": "text", "text": text},
+        }
+    )
+
+
+def tool_event(output):
+    return json.dumps(
+        {
+            "type": "tool_use",
+            "timestamp": 1,
+            "sessionID": "ses_test",
+            "part": {
+                "type": "tool",
+                "tool": "bash",
+                "state": {"status": "completed", "output": output, "title": "pytest"},
+            },
+        }
+    )
+
+
+def github_error_block(name="APIError", message="", status=None, prefix="Agent error:"):
+    lines = [prefix + " {", "  name: '{}',".format(name), "  data: {"]
+    if message:
+        lines.append("    message: '{}',".format(message))
+    if status is not None:
+        lines.append("    statusCode: {},".format(status))
+    lines += ["  }", "}"]
+    return "\n".join(lines)
+
+
+class Classify429Test(unittest.TestCase):
+    def test_structured_429_classifies_regardless_of_exit(self):
         for log in (
+            error_event("APIError", "too many requests", 429),
+            error_event("FreeUsageLimitError", "free usage limit reached"),
+            error_event(
+                "APIError",
+                response_body='{"type":"error","error":{"type":"FreeUsageLimitError"}}',
+            ),
+        ):
+            with self.subTest(log=log):
+                self.assertTrue(is_opencode_429(log, 0))
+                self.assertTrue(is_opencode_429(log, 1))
+                self.assertEqual(classify_agent_error(log, 0), "runner-death-429")
+                self.assertEqual(classify_agent_error(log, 1), "runner-death-429")
+
+    def test_pinned_cli_production_error_event_shape_is_classified(self):
+        # Captured from OpenCode 1.19.3 ``run --format json`` against a fake
+        # OpenAI-compatible endpoint returning HTTP 429 (see the pinned CLI's
+        # session.error emitter). This locks the real event envelope rather
+        # than only the minimal synthetic fixture.
+        log = json.dumps(
+            {
+                "type": "error",
+                "timestamp": 1792765550447,
+                "sessionID": "ses_e96d9ba3bffe7tnMMH8RFy32DJ",
+                "error": {
+                    "name": "APIError",
+                    "data": {
+                        "message": "Free usage limit reached",
+                        "statusCode": 429,
+                        "isRetryable": True,
+                        "responseHeaders": {
+                            "content-length": "109",
+                            "content-type": "application/json",
+                            "date": "Fri, 23 Oct 2026 14:25:50 GMT",
+                            "server": "BaseHTTP/0.6 Python/3.12.3",
+                        },
+                        "responseBody": (
+                            '{"error": {"message": "Free usage limit reached", '
+                            '"type": "FreeUsageLimitError", "code": '
+                            '"free_usage_limit"}}'
+                        ),
+                        "metadata": {
+                            "url": "http://127.0.0.1:18765/v1/chat/completions"
+                        },
+                    },
+                },
+            }
+        )
+        self.assertEqual(parse_opencode_error_events(log)[0]["type"], "error")
+        self.assertEqual(classify_opencode_events(log, 1), "quota_429")
+        self.assertTrue(is_opencode_429(log, 1))
+        self.assertEqual(classify_agent_error(log, 1), "runner-death-429")
+
+    def test_arbitrary_transcript_text_never_classifies(self):
+        for log in (
+            "FreeUsageLimitError: quota exceeded",
+            'self.assertTrue(is_opencode_429("FreeUsageLimitError: quota exceeded", 0))',
             "APIError 429 too many requests",
             "HTTP 429 Too Many Requests",
-            "statusCode: 429",
             "429 Too Many Requests",
+            text_event('return 1, "ERROR FreeUsageLimitError: free usage limit reached"'),
+            text_event("FAILED test_429: HTTP 429 Too Many Requests"),
+            tool_event('return 1, "ERROR FreeUsageLimitError: free usage limit reached"'),
+            tool_event("APIError 429 Too Many Requests"),
         ):
-            self.assertTrue(is_opencode_429(log, 1), log)
-            self.assertFalse(is_opencode_429(log, 0), log)
+            with self.subTest(log=log):
+                self.assertFalse(is_opencode_429(log, 0))
+                self.assertFalse(is_opencode_429(log, 1))
+                self.assertEqual(
+                    classify_agent_error(log, 1), "task-failure"
+                )
 
-    def test_fail_closed_errors_never_classify(self):
+    def test_structured_fail_closed_errors_never_classify(self):
+        for status, name in (
+            (400, "BadRequestError"),
+            (401, "AuthenticationError"),
+            (403, "PermissionDeniedError"),
+            (404, "NotFoundError"),
+            (422, "UnprocessableEntityError"),
+        ):
+            log = error_event(
+                name,
+                'provider rejected the request; transcript quoted "429" and '
+                "FreeUsageLimitError",
+                status,
+            )
+            with self.subTest(status=status):
+                self.assertFalse(is_opencode_429(log, 1), log)
+                self.assertEqual(classify_agent_error(log, 1), "fail-closed", log)
+
+    def test_structured_upstream_failures_are_not_quota(self):
+        cases = (
+            (error_event("APIError", 'quoted "429" in review text', 503), "unavailable"),
+            (error_event("APIError", "bad gateway", 502), "upstream"),
+            (error_event("APIError", "internal server error", 500), "upstream"),
+            (error_event("APIError", "gateway timeout", 504), "upstream"),
+            (error_event("APITimeoutError", "Request timed out"), "timeout"),
+            (error_event("APIError", "request timeout", 408), "timeout"),
+        )
+        for log, expected in cases:
+            with self.subTest(log=log):
+                self.assertFalse(is_opencode_429(log, 1))
+                self.assertEqual(
+                    classify_agent_error(log, 1), "infrastructure-unavailable"
+                )
+                self.assertEqual(classify_opencode_events(log, 1), expected)
+
+    def test_plain_text_fail_closed_remains_fail_closed(self):
         for log in (
             "request failed with status 400",
             "401 unauthorized: bad credentials",
@@ -64,15 +216,125 @@ class Classify429Test(unittest.TestCase):
             "404 not found",
             "422 unprocessable entity",
         ):
-            self.assertFalse(is_opencode_429(log, 1), log)
-            self.assertEqual(classify_agent_error(log, 1), "fail-closed", log)
+            with self.subTest(log=log):
+                self.assertFalse(is_opencode_429(log, 1), log)
+                self.assertEqual(classify_agent_error(log, 1), "fail-closed", log)
 
-    def test_normal_failure_is_not_runner_death(self):
-        self.assertFalse(is_opencode_429("tests failed: 3 assertions", 1))
-        self.assertEqual(
-            classify_agent_error("tests failed: 3 assertions", 1), "task-failure"
-        )
+    def test_transcript_words_without_status_are_not_fail_closed(self):
+        # Only authenticated provider error objects may use the word tokens;
+        # ordinary task prose that merely mentions auth vocabulary stays a
+        # task failure and never changes recovery routing.
+        for log in (
+            "the agent discussed an unauthorized API request",
+            "bad credentials were mentioned in the review",
+            "this path is forbidden by the repository policy",
+            "the token is missing scope documentation",
+        ):
+            with self.subTest(log=log):
+                self.assertEqual(classify_agent_error(log, 1), "task-failure")
+
+    def test_event_quoting_429_without_authenticated_status_is_not_quota(self):
+        log = error_event("AssertionError", 'expected "429" in the report')
+        self.assertFalse(is_opencode_429(log, 1))
+        self.assertEqual(classify_opencode_events(log, 1), "provider_error")
+        self.assertEqual(classify_agent_error(log, 1), "task-failure")
+
+    def test_malformed_and_truncated_events_are_inconclusive(self):
+        for log in (
+            '{"type":"error", not-json',
+            '{"type":"error","error":{"name":"APIError"',
+            "[1, 2, 3]",
+            '{"type":"error","error":"FreeUsageLimitError"}',
+            '{"type":"tool_use","part":{"state":{"output":"FreeUsageLimitError"}}}',
+        ):
+            with self.subTest(log=log):
+                self.assertFalse(is_opencode_429(log, 1), log)
+                self.assertEqual(
+                    classify_agent_error(log, 1), "task-failure", log
+                )
+                self.assertEqual(
+                    classify_opencode_events(log, 1), "inconclusive", log
+                )
+
+    def test_empty_log_preserves_success_and_failure(self):
+        self.assertEqual(classify_opencode_events("", 0), "ok")
+        self.assertEqual(classify_opencode_events("", 1), "inconclusive")
         self.assertEqual(classify_agent_error("", 0), "task-failure")
+        self.assertEqual(classify_agent_error("", 1), "task-failure")
+
+    def test_duplicate_quota_events_remain_quota(self):
+        log = error_event("APIError", "429 Too Many Requests", 429) + "\n" + error_event(
+            "APIError", "429 Too Many Requests", 429
+        )
+        self.assertTrue(is_opencode_429(log, 1))
+
+    def test_github_run_json_inspect_channel_is_classified(self):
+        block = (
+            'Agent error: {"name":"APIError","data":{"message":"quota",'
+            '"statusCode":429}}\n'
+        )
+        self.assertEqual(
+            classify_opencode_github_events(block, 1), "quota_429"
+        )
+        block = (
+            'Agent error: {"name":"AuthenticationError",'
+            '"data":{"statusCode":401}}\n'
+        )
+        self.assertEqual(
+            classify_opencode_github_events(block, 1), "fail_closed"
+        )
+
+    def test_github_run_channel_is_covered_by_generic_helpers(self):
+        quota = github_error_block(status=429)
+        self.assertTrue(is_opencode_429(quota, 1))
+        self.assertEqual(classify_agent_error(quota, 1), "runner-death-429")
+        auth = github_error_block("AuthenticationError", "unauthorized", 401)
+        self.assertFalse(is_opencode_429(auth, 1))
+        self.assertEqual(classify_agent_error(auth, 1), "fail-closed")
+
+    def test_github_run_stderr_error_block_is_classified(self):
+        self.assertEqual(
+            classify_opencode_github_events(github_error_block(status=429), 1),
+            "quota_429",
+        )
+        self.assertEqual(
+            classify_opencode_github_events(github_error_block(status=0), 0),
+            "provider_error",
+        )
+
+    def test_github_run_free_usage_and_auth_are_separated(self):
+        quota = github_error_block(
+            message="FreeUsageLimitError: free usage limit reached"
+        )
+        self.assertEqual(classify_opencode_github_events(quota, 1), "quota_429")
+        auth = github_error_block(
+            "AuthenticationError", 'status 401; transcript quoted "429"', 401
+        )
+        self.assertEqual(classify_opencode_github_events(auth, 1), "fail_closed")
+        upstream = github_error_block(
+            "APIError", 'status 503; transcript quoted "429"', 503
+        )
+        self.assertEqual(
+            classify_opencode_github_events(upstream, 1), "unavailable"
+        )
+
+    def test_github_run_summary_error_and_unprovable_output(self):
+        summary = github_error_block(
+            "APIError", "quota exceeded", 429, prefix="Summary agent error:"
+        )
+        self.assertEqual(
+            classify_opencode_github_events(summary, 1), "quota_429"
+        )
+        self.assertEqual(
+            classify_opencode_github_events("plain task failure\n", 1),
+            "inconclusive",
+        )
+        self.assertEqual(
+            classify_opencode_github_events(
+                "Response: Agent error: statusCode: 429\n", 0
+            ),
+            "ok",
+        )
 
     def test_runner_death_exit_code_is_75(self):
         self.assertEqual(RUNNER_DEATH_EXIT_CODE, 75)

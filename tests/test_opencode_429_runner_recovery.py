@@ -16,6 +16,8 @@ ROOT = Path(__file__).resolve().parents[1]
 WORKFLOW = ROOT / ".github" / "workflows" / "continuum-opencode.yml"
 WATCHDOG = ROOT / ".github" / "workflows" / "continuum-opencode-watchdog.yml"
 STUB = ROOT / ".github" / "caller-stubs" / "continuum-opencode.yml"
+WRAPPER = ROOT / ".github" / "scripts" / "opencode_429_wrapper.sh"
+CLASSIFIER = ROOT / ".github" / "scripts" / "opencode_429_classify.py"
 
 
 class OpenCode429RunnerRecoveryContractTest(unittest.TestCase):
@@ -24,6 +26,8 @@ class OpenCode429RunnerRecoveryContractTest(unittest.TestCase):
         cls.body = WORKFLOW.read_text(encoding="utf-8")
         cls.watchdog = WATCHDOG.read_text(encoding="utf-8")
         cls.stub = STUB.read_text(encoding="utf-8")
+        cls.wrapper = WRAPPER.read_text(encoding="utf-8")
+        cls.classifier = CLASSIFIER.read_text(encoding="utf-8")
 
     def test_all_agent_invocations_use_rate_limit_wrapper(self):
         self.assertIn("Install Continuum OpenCode rate-limit wrapper", self.body)
@@ -43,28 +47,31 @@ class OpenCode429RunnerRecoveryContractTest(unittest.TestCase):
     def test_429_burns_current_vm_immediately(self):
         # The wrapper refuses any second model invocation on a burned runner.
         for marker in (
-            "FreeUsageLimitError",
             "continuum-opencode-429",
             "runner already burned",
             "refusing a second model invocation",
             "exit 75",
         ):
-            self.assertIn(marker, self.body)
+            self.assertIn(marker, self.body + self.wrapper)
+        self.assertIn("classify_opencode_events", self.classifier)
+        self.assertIn("quota_429", self.classifier)
         self.assertIn("restart_required=true", self.body)
         self.assertIn("Publish OpenCode 429 recovery artifact", self.body)
         # No sleep/backoff retry of the model on the same VM: the burned
         # runner exits through the dedicated infrastructure outcome.
         self.assertIn("CONTINUUM_OPENCODE_429_RESTART_REQUIRED", self.body)
 
-    def test_wrapper_classification_mirrors_engine_contract(self):
-        # FreeUsageLimitError always burns; any other 429 signal burns only
-        # when the invocation actually failed, so a passing run whose log
-        # merely mentions 429 in prose never retires a healthy runner.
-        self.assertIn("is_opencode_429", self.body)
-        self.assertIn('grep -Eiq \'FreeUsageLimitError\' "$log"', self.body)
-        self.assertIn('[ "$status" -ne 0 ]', self.body)
-        self.assertIn("burned=true", self.body)
-        self.assertIn("burned=false", self.body)
+    def test_wrapper_uses_authenticated_provider_error_channels(self):
+        # Provider health is never inferred from a whole-transcript grep.
+        self.assertIn("--format json", self.wrapper)
+        self.assertIn("classify --mode run", self.wrapper)
+        self.assertIn("classify --mode github", self.wrapper)
+        self.assertIn("Agent error:", self.classifier)
+        self.assertIn("type=error", self.classifier)
+        self.assertNotIn("grep -Eiq 'FreeUsageLimitError'", self.body + self.wrapper)
+        self.assertNotIn("APIError.*429|HTTP", self.body + self.wrapper)
+        self.assertIn("inconclusive", self.wrapper)
+        self.assertIn("run --help", self.body)
 
     def test_agent_progress_file_drives_honest_checkpoint_stage(self):
         # The issue agent tracks lifecycle progress in .continuum-429-stage;

@@ -766,6 +766,43 @@ jobs:
           components: opencode
           opencode-version: ${{ vars.CONTINUUM_OPENCODE_VERSION || '' }}
 
+      - name: Checkout Continuum 429 classifier
+        if: steps.batch.outputs.empty != 'true' && steps.convergence.outcome == 'success' && steps.convergence.outputs.held != 'true'
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: kodmial/continuum
+          ref: ${{ inputs.continuum_ref || 'main' }}
+          path: .continuum-429-engine
+          fetch-depth: 1
+          persist-credentials: false
+          sparse-checkout: |
+            src/continuum
+            .github/scripts
+
+      - name: Install Continuum OpenCode rate-limit wrapper
+        if: steps.batch.outputs.empty != 'true' && steps.convergence.outcome == 'success' && steps.convergence.outputs.held != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          engine="$GITHUB_WORKSPACE/.continuum-429-engine"
+          install_root="${RUNNER_TEMP:-/tmp}/continuum-429"
+          rm -rf "$install_root"
+          mkdir -p "$install_root/.github/scripts" "$install_root/src"
+          cp -R "$engine/src/continuum" "$install_root/src/"
+          cp "$engine/.github/scripts/opencode_429_classify.py" "$install_root/.github/scripts/"
+          cp "$engine/.github/scripts/opencode_429_wrapper.sh" "$install_root/continuum-opencode"
+          chmod +x "$install_root/continuum-opencode" "$install_root/.github/scripts/opencode_429_classify.py"
+          rm -rf "$engine"
+          echo "$install_root" >> "$GITHUB_PATH"
+          echo "CONTINUUM_429_CLASSIFIER=$install_root/.github/scripts/opencode_429_classify.py" >> "$GITHUB_ENV"
+          opencode_version="$(opencode --version)"
+          run_help="$(opencode run --help 2>&1 || true)"
+          if ! grep -q -- '--format' <<<"$run_help" || ! grep -q 'json' <<<"$run_help"; then
+            echo "::error::Installed OpenCode CLI $opencode_version does not support 'run --format json'; refusing unstructured provider-error classification."
+            exit 2
+          fi
+          echo "Verified OpenCode $opencode_version supports 'run --format json'."
+
       - name: Qualify trusted repair-model route
         id: model_route
         if: steps.batch.outputs.empty != 'true' && steps.convergence.outcome == 'success' && steps.convergence.outputs.held != 'true'
@@ -850,16 +887,24 @@ jobs:
           # Attribute only explicit external provider failures to the
           # selected OpenCode route. Code/tool failures must not burn models.
           repair_log="$RUNNER_TEMP/pr-agent-opencode-repair.log"
-          if ! opencode run --auto --model "$OPENCODE_MODEL" "$PROMPT" 2>&1 | tee "$repair_log"; then
-            if grep -Eiq 'Upstream request failed: Endpoint is unavailable|Endpoint is unavailable|model unavailable|ModelUnavailableError' "$repair_log"; then
-              echo "provider_failure=unavailable" >> "$GITHUB_OUTPUT"
-            elif grep -Eiq 'APITimeoutError|TimeoutError|Request timed out|timed out' "$repair_log"; then
-              echo "provider_failure=timeout" >> "$GITHUB_OUTPUT"
-            elif grep -Eiq 'HTTP 503|503 Service Unavailable|502 Bad Gateway|upstream request failed' "$repair_log"; then
-              echo "provider_failure=upstream" >> "$GITHUB_OUTPUT"
-            elif grep -Eiq 'FreeUsageLimitError|RateLimitError|429 Too Many Requests' "$repair_log"; then
-              echo "provider_failure=quota_429" >> "$GITHUB_OUTPUT"
-            fi
+          repair_classification_file="${RUNNER_TEMP:-/tmp}/continuum-opencode-classification"
+          rm -f "$repair_classification_file"
+          # kodmial/continuum#415: shared wrapper classifies provider failures
+          # only from structured events (run) or the CLI stderr diagnostic
+          # block (github run). Review text, source files, and test fixtures
+          # in the prompt or transcript are never provider evidence.
+          set +e
+          continuum-opencode run --auto --model "$OPENCODE_MODEL" "$PROMPT" 2>&1 | tee "$repair_log"
+          repair_status=${PIPESTATUS[0]}
+          set -e
+          repair_classification="$(cat "$repair_classification_file" 2>/dev/null || true)"
+          case "$repair_classification" in
+            quota_429) echo "provider_failure=quota_429" >> "$GITHUB_OUTPUT" ;;
+            unavailable) echo "provider_failure=unavailable" >> "$GITHUB_OUTPUT" ;;
+            upstream) echo "provider_failure=upstream" >> "$GITHUB_OUTPUT" ;;
+            timeout) echo "provider_failure=timeout" >> "$GITHUB_OUTPUT" ;;
+          esac
+          if [[ "$repair_status" -ne 0 ]]; then
             echo "classification=transient" >> "$GITHUB_OUTPUT"
             echo "::error::OpenCode repair runtime failed; recovery may retry this exact operation."
             exit 1
