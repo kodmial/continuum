@@ -68,6 +68,27 @@ def extract_function(body: str, name: str) -> str:
     raise AssertionError("could not extract JS function: " + name)
 
 
+def extract_github_script(body: str, step_name: str) -> str:
+    step = body.index("- name: " + step_name)
+    marker = body.index("script: |", step)
+    lines = body[marker:].splitlines()
+    content = []
+    indent = None
+    for line in lines[1:]:
+        if not line.strip():
+            content.append("")
+            continue
+        current = len(line) - len(line.lstrip(" "))
+        if indent is None:
+            indent = current
+        if current < indent:
+            break
+        content.append(line[indent:])
+    if not content or not content[0].strip():
+        raise AssertionError("could not extract github-script body: " + step_name)
+    return "\n".join(content) + "\n"
+
+
 HARNESS = r"""
 const assert = require('assert');
 
@@ -494,6 +515,183 @@ const scenarios = {
 """
 
 
+BOOTSTRAP_RUNNER = r"""
+const fs = require('fs');
+const vm = require('vm');
+const path = require('path');
+
+const scriptPath = process.argv[2];
+const source = fs.readFileSync(scriptPath, 'utf8');
+const labels = JSON.parse(process.env.BOOTSTRAP_LABELS || '[]');
+const listError = process.env.BOOTSTRAP_LIST_ERROR || '';
+const createError = process.env.BOOTSTRAP_CREATE_ERROR || '';
+
+const calls = [];
+const clients = [];
+
+function apiError(status, message) {
+  const error = new Error(message);
+  error.status = status;
+  return error;
+}
+
+function response(group, method, params) {
+  if (group === 'issues' && method === 'listLabelsForRepo') {
+    if (listError) {
+      throw apiError(Number(listError), 'label inventory unavailable');
+    }
+    const perPage = params.per_page || 30;
+    const page = params.page || 1;
+    const start = (page - 1) * perPage;
+    return { data: labels.slice(start, start + perPage).map(name => ({ name })) };
+  }
+  if (group === 'issues' && method === 'createLabel') {
+    if (createError) {
+      throw apiError(Number(createError), 'label create unavailable');
+    }
+    if (labels.includes(params.name)) {
+      throw apiError(422, 'Validation Failed');
+    }
+    labels.push(params.name);
+    return { data: { name: params.name } };
+  }
+  if (group === 'issues' && method === 'deleteLabel') {
+    throw new Error('the scheduler must never delete labels');
+  }
+  if (group === 'issues' && (method === 'listForRepo' || method === 'listComments')) {
+    return { data: [] };
+  }
+  if (group === 'pulls' && method === 'list') {
+    return { data: [] };
+  }
+  if (group === 'actions' && (method === 'listWorkflowRunsForRepo' || method === 'listWorkflowRuns')) {
+    return { data: { workflow_runs: [] } };
+  }
+  if (group === 'actions' && method === 'listJobsForWorkflowRun') {
+    return { data: { jobs: [] } };
+  }
+  if (group === 'repos' && method === 'getBranch') {
+    return { data: { commit: { sha: 'a'.repeat(40) } } };
+  }
+  return { data: [] };
+}
+
+function makeRest(role) {
+  return new Proxy({}, {
+    get(_target, group) {
+      return new Proxy({}, {
+        get(_t, method) {
+          return async params => {
+            calls.push({ role, group, method, params });
+            return response(group, method, params);
+          };
+        },
+      });
+    },
+  });
+}
+
+class FakeOctokit {
+  constructor(options) {
+    this.options = options || {};
+    this.auth = this.options.auth;
+    this.baseUrl = this.options.baseUrl;
+    this.role = this.options.auth === process.env.READ_GITHUB_TOKEN
+      ? 'read'
+      : 'write';
+    this.rest = makeRest(this.role);
+    this.paginate = async (method, params) => {
+      if (typeof method === 'string') return [];
+      const all = [];
+      const perPage = params.per_page || 30;
+      let page = params.page || 1;
+      for (;;) {
+        const result = await method({ ...params, page });
+        const data = result && result.data;
+        if (!Array.isArray(data)) return data;
+        all.push(...data);
+        if (data.length < perPage) break;
+        page += 1;
+      }
+      return all;
+    };
+    this.request = async (...args) => {
+      calls.push({ role: this.role, method: 'request', args });
+      return { data: {} };
+    };
+    this.request.endpoint = {
+      DEFAULTS: { baseUrl: 'https://ghe.example.com/api/v3' },
+    };
+    this.graphql = async () => ({});
+    clients.push(this);
+  }
+}
+
+const github = new FakeOctokit({ auth: 'tap-pat-token' });
+github.constructor = FakeOctokit;
+const context = {
+  repo: { owner: 'parent-owner', repo: 'parent-repo' },
+  eventName: 'schedule',
+  payload: {},
+};
+const core = {
+  warning: () => {},
+  info: () => {},
+  notice: () => {},
+  debug: () => {},
+  setFailed: message => { throw new Error(String(message)); },
+};
+
+const vmContext = vm.createContext({
+  require,
+  process,
+  console,
+  context,
+  github,
+  core,
+  Buffer,
+  URL,
+  setTimeout,
+  clearTimeout,
+  setInterval,
+  clearInterval,
+  __filename: scriptPath,
+  __dirname: path.dirname(scriptPath),
+});
+
+function resultPayload(extra) {
+  const read = clients.find(client => client.role === 'read');
+  const write = clients.find(client => client.role === 'write');
+  return {
+    ...(extra || {}),
+    clients: clients.map(client => ({
+      role: client.role,
+      auth: client.auth,
+      baseUrl: client.baseUrl,
+    })),
+    readIsWrite: read === write,
+    calls,
+    labels,
+  };
+}
+
+(async () => {
+  await vm.runInContext(
+    '(async () => {\n' + source + '\n})()',
+    vmContext,
+    { filename: scriptPath }
+  );
+  console.log('RESULT ' + JSON.stringify(resultPayload()));
+})().catch(error => {
+  console.error(error && error.stack || error);
+  console.log('RESULT ' + JSON.stringify(resultPayload({
+    error: String(error && error.message || error),
+  })));
+  process.exit(1);
+});
+"""
+
+
 class SchedulerLabelProvisioningTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -505,6 +703,68 @@ class SchedulerLabelProvisioningTests(unittest.TestCase):
         body = scheduler_body()
         cls.build_source = extract_function(body, "buildSchedulerLabelSpecs")
         cls.provision_source = extract_function(body, "provisionSchedulerLabels")
+        cls.bootstrap_source = extract_github_script(
+            body, "Reconcile state and dispatch ready issues"
+        )
+
+    def run_bootstrap(
+        self,
+        labels: list[str],
+        *,
+        list_error: int | None = None,
+        create_error: int | None = None,
+        expect_failure: bool = False,
+    ) -> dict:
+        tmpdir = os.path.join(ROOT, ".opencode-tmp")
+        os.makedirs(tmpdir, exist_ok=True)
+        with tempfile.NamedTemporaryFile(
+            "w", suffix=".js", delete=False, dir=tmpdir
+        ) as handle:
+            handle.write(self.bootstrap_source)
+            source_path = handle.name
+        with tempfile.NamedTemporaryFile(
+            "w", suffix=".js", delete=False, dir=tmpdir
+        ) as handle:
+            handle.write(BOOTSTRAP_RUNNER)
+            runner_path = handle.name
+        try:
+            env = dict(
+                os.environ,
+                READ_GITHUB_TOKEN="read-token",
+                EXECUTION_LABEL_ROUTES="route:render|continuum-render-executor.yml",
+                READY_LABEL="automation:ready",
+                BOOTSTRAP_LABELS=json.dumps(labels),
+                BOOTSTRAP_LIST_ERROR=str(list_error or ""),
+                BOOTSTRAP_CREATE_ERROR=str(create_error or ""),
+            )
+            completed = subprocess.run(
+                [self.node, runner_path, source_path],
+                capture_output=True,
+                text=True,
+                env=env,
+                timeout=60,
+            )
+        finally:
+            os.unlink(source_path)
+            os.unlink(runner_path)
+        if expect_failure:
+            self.assertNotEqual(
+                completed.returncode,
+                0,
+                completed.stderr or completed.stdout,
+            )
+        else:
+            self.assertEqual(
+                completed.returncode,
+                0,
+                completed.stderr or completed.stdout,
+            )
+        lines = [
+            line for line in completed.stdout.splitlines()
+            if line.startswith("RESULT ")
+        ]
+        self.assertEqual(len(lines), 1, completed.stdout)
+        return json.loads(lines[0][len("RESULT "):])
 
     def run_scenario(self, name: str) -> dict:
         script = "\n\n".join(
@@ -607,28 +867,89 @@ class SchedulerLabelProvisioningTests(unittest.TestCase):
         self.assertEqual(result["creates"], 1)
         self.assertIn("status=403", result["diagnostic"])
 
-    def test_workflow_wires_inventory_first_provisioning(self):
-        body = scheduler_body()
-        self.assertIn("async function provisionSchedulerLabels({", body)
-        self.assertIn("readClient.paginate(", body)
-        self.assertIn("readClient.rest.issues.listLabelsForRepo", body)
-        self.assertIn("writeClient.rest.issues.createLabel({", body)
-        self.assertIn("if (existingNames.has(spec.name)) continue;", body)
-        self.assertIn("if (err && err.status === 422)", body)
-        self.assertIn("readClient: readGithub,", body)
-        self.assertIn("writeClient: github,", body)
-        self.assertIn("repositoryOwner: owner,", body)
-        self.assertIn("repositoryName: repo,", body)
-        self.assertIn(
-            "const labelSpecs = buildSchedulerLabelSpecs({",
-            body,
+    def test_real_bootstrap_reads_inventory_on_repository_token(self):
+        labels = CANONICAL_LABELS + ["route:render", "automation:ready"]
+        result = self.run_bootstrap(labels)
+        read = next(
+            client for client in result["clients"] if client["role"] == "read"
         )
-        # No unconditional per-pass create loop may survive the change.
-        self.assertNotIn(
-            "for (const spec of labelSpecs) {\n"
-            "              try {\n"
-            "                await github.rest.issues.createLabel({ owner, repo, ...spec });",
-            body,
+        write = next(
+            client for client in result["clients"] if client["role"] == "write"
+        )
+        self.assertFalse(result["readIsWrite"])
+        self.assertEqual(read["auth"], "read-token")
+        self.assertEqual(read["baseUrl"], "https://ghe.example.com/api/v3")
+        self.assertEqual(write["auth"], "tap-pat-token")
+        inventory = [
+            call for call in result["calls"]
+            if call["method"] == "listLabelsForRepo"
+        ]
+        self.assertTrue(inventory)
+        for call in inventory:
+            self.assertEqual(call["role"], "read")
+            self.assertEqual(call["params"]["owner"], "parent-owner")
+            self.assertEqual(call["params"]["repo"], "parent-repo")
+        self.assertEqual(
+            [call for call in result["calls"] if call["method"] == "createLabel"],
+            [],
+        )
+        self.assertEqual(
+            [call for call in result["calls"] if call["method"] == "deleteLabel"],
+            [],
+        )
+
+    def test_real_bootstrap_initialization_creates_only_missing_labels(self):
+        result = self.run_bootstrap(["priority:p0"])
+        creates = [
+            call for call in result["calls"]
+            if call["method"] == "createLabel"
+        ]
+        expected = set(CANONICAL_LABELS + ["route:render", "automation:ready"])
+        expected.discard("priority:p0")
+        self.assertEqual(len(creates), len(expected))
+        self.assertEqual(
+            {call["params"]["name"] for call in creates},
+            expected,
+        )
+        for call in creates:
+            self.assertEqual(call["role"], "write")
+            self.assertEqual(call["params"]["owner"], "parent-owner")
+            self.assertEqual(call["params"]["repo"], "parent-repo")
+        self.assertEqual(
+            [call for call in result["calls"] if call["method"] == "deleteLabel"],
+            [],
+        )
+        self.assertEqual(
+            set(result["labels"]),
+            expected | {"priority:p0"},
+        )
+        inventory = [
+            call for call in result["calls"]
+            if call["method"] == "listLabelsForRepo"
+        ]
+        self.assertTrue(inventory)
+        self.assertTrue(all(call["role"] == "read" for call in inventory))
+
+    def test_real_bootstrap_failures_do_not_fan_out_creates(self):
+        result = self.run_bootstrap(
+            CANONICAL_LABELS, list_error=403, expect_failure=True
+        )
+        self.assertIn("status=403", result["error"])
+        self.assertEqual(
+            [call for call in result["calls"] if call["method"] == "createLabel"],
+            [],
+        )
+
+        result = self.run_bootstrap(
+            CANONICAL_LABELS, create_error=403, expect_failure=True
+        )
+        self.assertIn("status=403", result["error"])
+        self.assertEqual(
+            len([
+                call for call in result["calls"]
+                if call["method"] == "createLabel"
+            ]),
+            1,
         )
 
 
