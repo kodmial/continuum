@@ -335,6 +335,27 @@ class SchedulerWorkflowWiringTests(unittest.TestCase):
         self.assertIn("return true;", helper)
         self.assertIn("skipping dispatch for this pass", helper)
 
+    def test_recheck_reuses_one_pass_snapshot_instead_of_per_candidate_checks(self):
+        body = SCHEDULER.read_text(encoding="utf-8")
+        helper = body[
+            body.index("function ensureFreshDelegatedActiveRuns"):
+            body.index("function positiveInt")
+        ]
+        normalized = " ".join(helper.split())
+        self.assertIn(
+            "[activeRunsScript, 'snapshot', '--output', freshActiveRunsFile]",
+            normalized,
+        )
+        self.assertIn("'task-active'", helper)
+        self.assertNotIn("'check'", helper)
+        self.assertIn("freshActiveRunsReady", helper)
+        self.assertIn("freshActiveRunsUnavailable", helper)
+        self.assertEqual(
+            helper.count("execFileSync("),
+            2,
+            "one snapshot and one local lookup call, never per-candidate discovery",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

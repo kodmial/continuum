@@ -1342,6 +1342,7 @@ jobs:
           CHILD_CANDIDATES_FILE: ${{ runner.temp }}/continuum-child-candidates.json
           CHILD_ACTIVE_RUNS_STATE: ${{ steps.child_queue.outputs.active_runs_state || 'ok' }}
           CHILD_ACTIVE_RUNS_SCRIPT: ${{ github.workspace }}/.continuum-engine/.github/scripts/delegated_active_runs.sh
+          CHILD_ACTIVE_RUNS_FILE: ${{ runner.temp }}/continuum-active-runs-fresh.tsv
           DELEGATION_STATE: ${{ steps.child_queue.outputs.delegation_state }}
         with:
           # TAP_PAT is required because the existing OpenCode workflow accepts
@@ -1471,28 +1472,37 @@ jobs:
             }
 
             // Fresh pre-dispatch recheck against the same bounded,
-            // status-filtered discovery. Exit 0 = an identical task/review
-            // run is still active, 1 = not active, anything else is an
-            // uncertain outage and must also suppress the duplicate.
-            function freshDelegatedTaskActive(childId, taskNumber) {
+            // status-filtered discovery. The recheck snapshot is taken at
+            // most once per scheduler pass and reused for every delegated
+            // candidate, so REST cost is bounded by active-run volume rather
+            // than candidate count (no per-Child N+1). Exit 0 = an identical
+            // task/review run is still active, 1 = not active, anything else
+            // is an uncertain outage and must also suppress the duplicate.
+            const freshActiveRunsFile = (
+              process.env.CHILD_ACTIVE_RUNS_FILE ||
+              path.join(
+                process.env.RUNNER_TEMP || '.',
+                'continuum-active-runs-fresh.tsv'
+              )
+            ).trim();
+            let freshActiveRunsReady = false;
+            let freshActiveRunsUnavailable = false;
+            function ensureFreshDelegatedActiveRuns() {
+              if (freshActiveRunsReady || freshActiveRunsUnavailable) {
+                return freshActiveRunsReady;
+              }
               if (!activeRunsScript) {
+                freshActiveRunsUnavailable = true;
                 core.warning(
                   'Delegated active-run recheck is unavailable; skipping ' +
-                  'SubTask #' + taskNumber + ' dispatch for this pass.'
+                  'delegated dispatch for this pass.'
                 );
-                return true;
+                return false;
               }
               try {
                 execFileSync(
                   'bash',
-                  [
-                    activeRunsScript,
-                    'check',
-                    '--child-id',
-                    String(childId),
-                    '--task',
-                    String(taskNumber),
-                  ],
+                  [activeRunsScript, 'snapshot', '--output', freshActiveRunsFile],
                   {
                     encoding: 'utf8',
                     stdio: ['ignore', 'pipe', 'pipe'],
@@ -1503,18 +1513,62 @@ jobs:
                     },
                   }
                 );
+                freshActiveRunsReady = true;
                 return true;
               } catch (error) {
-                if (error && error.status === 1) {
-                  return false;
-                }
+                freshActiveRunsUnavailable = true;
                 core.warning(
-                  'Delegated active-run recheck failed for SubTask #' +
-                  taskNumber + '; skipping dispatch for this pass because ' +
-                  'an unknown run state must not create a duplicate.'
+                  'Delegated active-run recheck failed for this pass; ' +
+                  'skipping delegated dispatch because an unknown run ' +
+                  'state must not create a duplicate.'
                 );
+                return false;
+              }
+            }
+            function freshDelegatedTaskActive(childId, taskNumber) {
+              if (!ensureFreshDelegatedActiveRuns()) {
                 return true;
               }
+              for (const kind of ['task', 'review']) {
+                try {
+                  execFileSync(
+                    'bash',
+                    [
+                      activeRunsScript,
+                      'task-active',
+                      '--file',
+                      freshActiveRunsFile,
+                      '--child-id',
+                      String(childId),
+                      '--kind',
+                      kind,
+                      '--task',
+                      String(taskNumber),
+                    ],
+                    {
+                      encoding: 'utf8',
+                      stdio: ['ignore', 'pipe', 'pipe'],
+                      env: {
+                        ...process.env,
+                        GH_TOKEN: readToken,
+                        GITHUB_REPOSITORY: repoFullName,
+                      },
+                    }
+                  );
+                  return true;
+                } catch (error) {
+                  if (error && error.status === 1) {
+                    continue;
+                  }
+                  core.warning(
+                    'Delegated active-run recheck failed for SubTask #' +
+                    taskNumber + '; skipping dispatch for this pass because ' +
+                    'an unknown run state must not create a duplicate.'
+                  );
+                  return true;
+                }
+              }
+              return false;
             }
 
             // Same-pass dispatch identity: a selected task that has just
