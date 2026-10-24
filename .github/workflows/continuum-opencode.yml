@@ -2837,6 +2837,12 @@ jobs:
           RECOVERY_SKIP_OPENCODE: ${{ steps.recovery_restore.outputs.skip_opencode }}
           RECOVERY_STAGE_IN: ${{ steps.recovery_restore.outputs.stage }}
           RECOVERY_GENERATION_IN: ${{ inputs.recovery_generation }}
+          CONTINUUM_PREPARE_COMMAND: ${{ vars.CONTINUUM_PREPARE_COMMAND }}
+          CONTINUUM_BUILD_COMMAND: ${{ vars.CONTINUUM_BUILD_COMMAND }}
+          CONTINUUM_TEST_COMMAND: ${{ vars.CONTINUUM_TEST_COMMAND }}
+          CONTINUUM_VALIDATION_COMMAND: ${{ vars.CONTINUUM_VALIDATION_COMMAND }}
+          VERIFICATION_ENGINE_ROOT: ${{ github.workspace }}/.continuum-cancel-engine
+          VERIFICATION_EVIDENCE_PATH: .continuum-verification.json
         run: |
           set -euo pipefail
           continuum_assert_no_stop() {
@@ -3028,6 +3034,40 @@ jobs:
           trap 'checkpoint_issue_progress 130' INT
           trap 'checkpoint_issue_progress 129' HUP
 
+          # kodmial/continuum#168: implementation is bracketed by the consumer's
+          # own authoritative verification contract. The baseline runs before
+          # any implementation mutation, the post-change run uses the exact
+          # command set recorded by the baseline, and an unresolved contract
+          # fails closed instead of inventing substitute checks.
+          VERIFICATION_ENGINE_ROOT="${VERIFICATION_ENGINE_ROOT:-$GITHUB_WORKSPACE/.continuum-cancel-engine}"
+          VERIFICATION_EVIDENCE_PATH="${VERIFICATION_EVIDENCE_PATH:-.continuum-verification.json}"
+          [[ -d "$VERIFICATION_ENGINE_ROOT/src/continuum" ]] || {
+            echo "::error::Continuum verification engine is unavailable at $VERIFICATION_ENGINE_ROOT/src/continuum."
+            exit 1
+          }
+          verification_python() {
+            PYTHONPATH="$VERIFICATION_ENGINE_ROOT/src${PYTHONPATH:+:$PYTHONPATH}" python3 -m continuum.verification "$@"
+          }
+          RECOVERY_STAGE_NOW="${RECOVERY_STAGE_IN:-implementation-incomplete}"
+          SKIP_PRIMARY_IMPLEMENTATION=false
+          case "$RECOVERY_STAGE_NOW" in
+            implementation-complete|tests-running|tests-passed|publish-pr)
+              SKIP_PRIMARY_IMPLEMENTATION=true
+              ;;
+          esac
+          if [[ "${RECOVERY_SKIP_OPENCODE:-}" == "true" ]]; then
+            SKIP_PRIMARY_IMPLEMENTATION=true
+          fi
+
+          verification_python baseline \
+            --repo "$GITHUB_WORKSPACE" \
+            --evidence "$VERIFICATION_EVIDENCE_PATH" \
+            --base-sha "$BASE_START_SHA" || {
+              echo "::error::The repository-authoritative verification baseline could not be established; refusing to implement without a known baseline."
+              exit 1
+            }
+          BASELINE_SUMMARY="$(verification_python summary --evidence "$VERIFICATION_EVIDENCE_PATH")"
+
           PROMPT="$(cat <<EOF
           Implement the authoritative task ${TASK_REPO}#${TASK_NUMBER} completely.
 
@@ -3054,6 +3094,7 @@ jobs:
           - You may use GitHub CLI/API and dispatch existing repository workflows when required by the issue. Treat specialized workflows as tools: inspect their outputs, wait for completion, and use their evidence to satisfy the Definition of Done; the scheduler will not reroute the issue for you.
           - If the Definition of Done is fully satisfied without repository changes, post the required evidence on the issue and close the issue yourself only after every Definition of Done item is verified. Never close an implementation task that still requires code changes.
           - Track lifecycle progress for crash recovery: keep a one-line progress file at .continuum-429-stage in the repository root containing exactly one of: implementation-incomplete, implementation-complete, tests-running, tests-passed, publish-pr. Update it as you complete each phase (write tests-passed only after the full validation actually passes on the current tree). It is workflow-owned recovery metadata, never product code: never commit it, never include secrets, and never let its absence block the task.
+          - The workflow also owns .continuum-verification.json (the baseline/verifier/final evidence). Never edit, delete, or commit it.
           - Do not perform git commits, pushes, branch switches, rebases, resets, merges, or PR creation; the workflow owns Git state.
           EOF
           )"
@@ -3075,15 +3116,15 @@ jobs:
           # kodmial/continuum#295: last live check before the agent starts
           # (bounds wasted work when the issue was edited after admission).
           verify_snapshot_live "agent start" || exit 1
-          # kodmial/continuum#290: a tests-passed/publish-pr checkpoint carries
-          # exact-SHA evidence, so the fresh run must NOT call OpenCode again
-          # merely to "finish". Skip the agent and proceed directly to
-          # workflow-owned commit/push/PR publication below.
-          if [[ "${RECOVERY_SKIP_OPENCODE:-}" == "true" ]]; then
-            echo "429 checkpoint stage '${RECOVERY_STAGE_IN:-}' already carries exact-SHA evidence; skipping OpenCode and publishing directly."
+          # kodmial/continuum#290/#168: a completed checkpoint must not repeat
+          # the primary coding session. The verification phases below still run
+          # unless their own exact evidence says they already passed.
+          if [[ "$SKIP_PRIMARY_IMPLEMENTATION" == "true" ]]; then
+            echo "429 checkpoint stage '$RECOVERY_STAGE_NOW' already completed primary implementation; skipping the primary OpenCode coding session."
             OPENCODE_RUN_RC=0
             rm -f "$OPENCODE_RUN_LOG"
           else
+            printf 'implementation-incomplete\n' > .continuum-429-stage
             set +e
             continuum-opencode run --auto --model "$OPENCODE_MODEL" "$PROMPT" 2>&1 | tee "$OPENCODE_RUN_LOG"
             OPENCODE_RUN_RC=${PIPESTATUS[0]}
@@ -3111,6 +3152,9 @@ jobs:
           if [[ "$OPENCODE_RUN_RC" -ne 0 ]]; then
             exit "$OPENCODE_RUN_RC"
           fi
+          if [[ "$SKIP_PRIMARY_IMPLEMENTATION" != "true" ]]; then
+            printf 'implementation-complete\n' > .continuum-429-stage
+          fi
 
           if [[ -n "$KNOWLEDGE_RECORDS_DIR" ]]; then
             RECORD_PATH="${KNOWLEDGE_RECORDS_DIR}/issue-${ISSUE_NUMBER}-run-${GITHUB_RUN_ID}.md"
@@ -3132,19 +3176,14 @@ jobs:
           # cache files; this also removes any tracked leftovers.
           find . -type d -name '__pycache__' -prune -exec rm -rf {} +
           find . -type f \( -name '*.pyc' -o -name '*.pyo' \) -delete
-          # kodmial/continuum#290/#413: the 429 stage-progress file and the
-          # recovery identity are workflow-owned recovery metadata, never
-          # product code. The evacuator commits them into checkpoints when
-          # present; this publish boundary removes them (and the cancellation
-          # engine checkout) before the no-change decision and task commit.
-          continuum_stage_publishable || exit 1
 
-          WORKTREE_DIRTY=false
-          if ! git diff --cached --quiet; then
-            WORKTREE_DIRTY=true
+          # Workflow-owned verification metadata must never make an
+          # operational (no-code) issue look like a task implementation.
+          if ! TASK_CHANGES_PRESENT="$(verification_python changes --repo "$GITHUB_WORKSPACE" --base-sha "$BASE_START_SHA")"; then
+            echo "::error::Could not determine whether the primary implementation changed the task worktree."
+            exit 1
           fi
-          COMMITS_FROM_START="$(git rev-list --count "$BASE_START_SHA..HEAD" 2>/dev/null || echo 0)"
-          if [[ "$WORKTREE_DIRTY" != "true" && "$COMMITS_FROM_START" -eq 0 ]]; then
+          if [[ "$TASK_CHANGES_PRESENT" != "true" ]]; then
             ISSUE_STATE="$(gh issue view "$ISSUE_NUMBER" --repo "$GITHUB_REPOSITORY" --json state --jq .state)"
             if [[ "$ISSUE_STATE" == "CLOSED" ]]; then
               gh issue edit "$ISSUE_NUMBER" --repo "$GITHUB_REPOSITORY" \
@@ -3162,6 +3201,136 @@ jobs:
             gh issue edit "$ISSUE_NUMBER" --repo "$GITHUB_REPOSITORY" \
               --add-label "$PAUSE_LABEL" --remove-label "$IN_PROGRESS_LABEL" >/dev/null 2>&1 || true
             exit 0
+          fi
+
+          # kodmial/continuum#168: a fresh, independent verifier/fix session
+          # inspects the actual checkout after the primary implementation. It is
+          # a separate OpenCode invocation (fresh context), not a second generic
+          # implementation attempt and not the later PR review provider.
+          if ! VERIFIER_NEEDED="$(verification_python needs-verifier --evidence "$VERIFICATION_EVIDENCE_PATH")"; then
+            echo "::error::Could not determine whether the implementation verifier is still required."
+            exit 1
+          fi
+          if [[ "$VERIFIER_NEEDED" == "true" ]]; then
+            printf 'implementation-complete\n' > .continuum-429-stage
+            IMPLEMENTATION_DIFF_STAT="$(git diff "$BASE_START_SHA" --stat 2>/dev/null | tail -n 80 || true)"
+            VERIFIER_PROMPT="$(cat <<EOF
+          Act as the independent implementation verifier for ${TASK_REPO}#${TASK_NUMBER}. This is a verification/fix role, not another generic implementation session.
+
+          Task URL:
+          ${ISSUE_URL}
+
+          Complete task title:
+          ${EFFECTIVE_TITLE}
+
+          Complete specification / Definition of Done:
+          ${EFFECTIVE_BODY}
+
+          Repository baseline evidence:
+          ${BASELINE_SUMMARY}
+          Spec snapshot: ${SNAPSHOT_SPEC}
+
+          Requirements:
+          - Do not assume the previous implementation is correct merely because it finished or claimed success.
+          - Read the complete task and every applicable Definition of Done / acceptance criterion above.
+          - Inspect the actual current checkout: use git status, git diff ${BASE_START_SHA}, and the surrounding affected code. The diff stat below is only a map; inspect the real files.
+          - Determine whether every requirement in the task is actually implemented, not merely mentioned or partially addressed.
+          - Check whether existing behavior outside the intended change was accidentally broken or degraded.
+          - Check compatibility with the repository's existing contracts, conventions, interfaces and tests.
+          - Look for missing edge cases, error handling, regressions, incomplete migrations, stale callers/configuration, and missing or insufficient automated tests where relevant.
+          - Reject unrelated refactoring or scope creep introduced by the implementation.
+          - If anything is incomplete or incorrect, fix it now in this same checkout, then re-inspect the resulting diff. Do not merely report findings and stop.
+          - Continue autonomously until the task is complete and internally consistent, or a genuine blocker prevents completion. If a blocker is genuine, leave the repository unchanged and explain it; do not fabricate a smaller scope.
+          - Do not treat the first agent's explanation or claimed test results as proof; verify against repository state and executable checks.
+          - The workflow will run the repository's authoritative verification command set after you finish.
+          - Keep all comments and commit-facing text in English.
+          - Do not perform git commits, pushes, branch switches, rebases, resets, merges, or PR creation; the workflow owns Git state.
+          - Keep lifecycle progress in .continuum-429-stage and leave it as implementation-complete; the workflow advances it after the final checks.
+          - Do not edit, delete, or commit .continuum-verification.json; it is workflow-owned baseline/verifier/final evidence.
+
+          Current implementation diff stat:
+          ${IMPLEMENTATION_DIFF_STAT}
+          EOF
+          )"
+            OPENCODE_VERIFIER_LOG="$(mktemp)"
+            set +e
+            continuum-opencode run --auto --model "$OPENCODE_MODEL" "$VERIFIER_PROMPT" 2>&1 | tee "$OPENCODE_VERIFIER_LOG"
+            OPENCODE_VERIFIER_RC=${PIPESTATUS[0]}
+            set -e
+            if [[ "$OPENCODE_VERIFIER_RC" -eq 143 || "$OPENCODE_VERIFIER_RC" -eq 130 || "$OPENCODE_VERIFIER_RC" -eq 129 ]]; then
+              rm -f "$OPENCODE_VERIFIER_LOG"
+              checkpoint_issue_progress "$OPENCODE_VERIFIER_RC"
+            fi
+            if [[ "$OPENCODE_VERIFIER_RC" -eq 75 || "$OPENCODE_VERIFIER_RC" -eq 76 ]]; then
+              rm -f "$OPENCODE_VERIFIER_LOG"
+              export CONTINUUM_429_LEGACY_REF="$CHECKPOINT_BRANCH"
+              CONTINUUM_INFRA_FAILURE_REASON=quota_429
+              [[ "$OPENCODE_VERIFIER_RC" -eq 76 ]] && CONTINUUM_INFRA_FAILURE_REASON=unavailable
+              continuum_infra_evacuate "opencode-429-issue-issue${ISSUE_NUMBER}" "implementation-complete" "issue" "$ISSUE_NUMBER" "" "$BASE_START_SHA" "$CONTINUUM_INFRA_FAILURE_REASON"
+            fi
+            rm -f "$OPENCODE_VERIFIER_LOG"
+            verification_python record-verifier \
+              --repo "$GITHUB_WORKSPACE" \
+              --evidence "$VERIFICATION_EVIDENCE_PATH" \
+              --exit-code "$OPENCODE_VERIFIER_RC" >/dev/null || exit 1
+            if [[ "$OPENCODE_VERIFIER_RC" -ne 0 ]]; then
+              echo "::error::The independent implementation verifier failed; refusing to publish an unverified implementation."
+              exit "$OPENCODE_VERIFIER_RC"
+            fi
+            echo "Independent implementation verifier completed successfully."
+          else
+            echo "429 checkpoint already carries a successful independent verifier/fix session; reusing that evidence."
+          fi
+          # Keep stop signals checkpointing until the publish boundary, including
+          # the resumed path where no fresh verifier session runs.
+          trap 'checkpoint_issue_progress 143' TERM
+          trap 'checkpoint_issue_progress 130' INT
+          trap 'checkpoint_issue_progress 129' HUP
+
+          # kodmial/continuum#168: the final run repeats the exact command set
+          # recorded by the baseline. A failed or unavailable required check
+          # never becomes a successful implementation result.
+          printf 'tests-running\n' > .continuum-429-stage
+          set +e
+          verification_python final \
+            --repo "$GITHUB_WORKSPACE" \
+            --evidence "$VERIFICATION_EVIDENCE_PATH" \
+            --base-sha "$BASE_START_SHA" \
+            --resume-stage "$RECOVERY_STAGE_NOW"
+          FINAL_VERIFICATION_RC=$?
+          set -e
+          if [[ "$FINAL_VERIFICATION_RC" -ne 0 ]]; then
+            echo "::error::Post-change verification did not pass; refusing to commit or publish a successful implementation."
+            exit "$FINAL_VERIFICATION_RC"
+          fi
+          printf 'tests-passed\n' > .continuum-429-stage
+
+          # Verification commands may create caches; remove them BEFORE the
+          # empty-change gate, exactly as for the earlier changes gate,
+          # otherwise fresh bytecode caches defeat the guard below.
+          find . -type d -name '__pycache__' -prune -exec rm -rf {} +
+          find . -type f \( -name '*.pyc' -o -name '*.pyo' \) -delete
+          # The verifier may have corrected an implementation by reverting it.
+          # Never turn an empty result into an implementation branch/PR.
+          if ! POST_VERIFICATION_CHANGES="$(verification_python changes --repo "$GITHUB_WORKSPACE" --base-sha "$BASE_START_SHA")"; then
+            echo "::error::Could not determine whether the verified checkout still contains task changes."
+            exit 1
+          fi
+          if [[ "$POST_VERIFICATION_CHANGES" != "true" ]]; then
+            echo "::error::The verified checkout no longer contains task changes; refusing an empty implementation commit."
+            exit 1
+          fi
+
+          # kodmial/continuum#290/#413: the 429 stage-progress file, verifier
+          # evidence and the recovery identity are workflow-owned recovery
+          # metadata, never product code. The evacuator commits them into
+          # checkpoints when present; this publish boundary removes them (and
+          # the cancellation engine checkout) before the task commit.
+          continuum_stage_publishable || exit 1
+
+          WORKTREE_DIRTY=false
+          if ! git diff --cached --quiet; then
+            WORKTREE_DIRTY=true
           fi
 
           if [[ "$WORKTREE_DIRTY" == "true" ]]; then
