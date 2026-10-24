@@ -3635,6 +3635,10 @@ jobs:
             }
 
             const activeIssueNumbers = new Set();
+            // Verified 429 checkpoints awaiting infrastructure recovery keep
+            // their reservation label for watchdog discovery but must never
+            // consume a coding WIP slot or be restarted from main.
+            const recoveryPendingIssueNumbers = new Set();
 
             // Active/pending OpenCode Actions are authoritative in-flight work.
             // Without this, lease expiry releases an issue while GitHub is still
@@ -3716,6 +3720,322 @@ jobs:
                 await addLabel(issueNumber, inProgressLabel);
                 await removeLabel(issueNumber, pausedLabel);
               }
+            }
+
+            // Durable 429 recovery state (kodmial/continuum#418). The recent
+            // Actions listing is a wake-up hint, never proof of ownership. An
+            // exact run GET plus the durable checkpoint metadata decides
+            // whether a marker still owns work, so a stale `observed` marker
+            // cannot hold a WIP slot for 48 hours and a verified checkpoint
+            // cannot be restarted from main just because its run aged out.
+            function parseSchedulerRecoveryMarkers(body) {
+              const re = /<!--\s*continuum-429-recovery\s+op=(\S+)\s+gen=(\d+)\s+state=(\S+)\s+attempt=(\d+)\s+next_due=(\d+)\s+checkpoint=(\S*)\s+sha=(\S*)\s+run=(\S*)\s+detail=(\S*)\s*-->/g;
+              const text = String(body || '');
+              const found = [];
+              let match;
+              while ((match = re.exec(text)) !== null) {
+                found.push({
+                  operation: match[1],
+                  generation: Number(match[2]),
+                  state: match[3],
+                  attempt: Number(match[4]),
+                  nextDue: Number(match[5]),
+                  checkpointRef: match[6] === '-' ? '' : match[6],
+                  checkpointSha: match[7] === '-' ? '' : match[7],
+                  runId: match[8] === '-' ? '' : match[8],
+                  detail: match[9] === '-' ? '' : match[9],
+                });
+              }
+              return found;
+            }
+
+            // Only the workflow actor may publish recovery state; a forged
+            // comment from any other account is ignored.
+            function trustedSchedulerRecoveryComment(comment) {
+              const login = String(comment.user?.login || '').toLowerCase();
+              if (login === 'github-actions[bot]') return true;
+              return login === String(owner || '').toLowerCase();
+            }
+
+            function latestSchedulerRecoveryState(comments) {
+              let latest = null;
+              const ordered = comments.slice().sort(
+                (a, b) => Number(a.id || 0) - Number(b.id || 0)
+              );
+              for (const comment of ordered) {
+                if (!trustedSchedulerRecoveryComment(comment)) continue;
+                const markers = parseSchedulerRecoveryMarkers(
+                  comment.body || ''
+                );
+                for (let index = 0; index < markers.length; index += 1) {
+                  const candidate = {
+                    ...markers[index],
+                    commentId: Number(comment.id || 0),
+                    markerIndex: index,
+                  };
+                  if (
+                    !latest ||
+                    candidate.commentId > latest.commentId ||
+                    (candidate.commentId === latest.commentId &&
+                      candidate.markerIndex >= latest.markerIndex)
+                  ) {
+                    latest = candidate;
+                  }
+                }
+              }
+              return latest;
+            }
+
+            function parseSchedulerCheckpointIdentity(checkpointRef) {
+              const match = /^opencode\/(?:429|infra)-checkpoint-(.+)-gen-(\d+)$/.exec(
+                String(checkpointRef || '')
+              );
+              if (!match) return null;
+              return {
+                operation: match[1],
+                generation: Number(match[2]),
+              };
+            }
+
+            async function fetchSchedulerRecoveryRun(runId) {
+              const text = String(runId || '').trim();
+              if (!/^\d+$/.test(text)) return { kind: 'none' };
+              const recent = workflowRuns.find(
+                run => String(run.id) === text
+              );
+              if (recent) {
+                return { kind: 'found', run: recent, source: 'recent' };
+              }
+              try {
+                const { data } =
+                  await readGithub.rest.actions.getWorkflowRun({
+                    owner, repo, run_id: Number(text),
+                  });
+                if (!data || typeof data !== 'object') {
+                  return { kind: 'unavailable', status: 0 };
+                }
+                return { kind: 'found', run: data, source: 'exact' };
+              } catch (err) {
+                const status = Number(err && err.status || 0);
+                if (status === 404) return { kind: 'missing', status };
+                return { kind: 'unavailable', status };
+              }
+            }
+
+            async function readSchedulerCheckpointEvidence({
+              operation, generation, checkpointRef, issueNumber,
+            }) {
+              let refSha = '';
+              try {
+                const { data } = await readGithub.rest.git.getRef({
+                  owner, repo, ref: 'heads/' + checkpointRef,
+                });
+                refSha = String(
+                  data && data.object && data.object.sha || ''
+                ).toLowerCase();
+              } catch (err) {
+                const status = Number(err && err.status || 0);
+                if (status === 404) return { kind: 'missing', status };
+                return { kind: 'unavailable', status };
+              }
+              if (!/^[0-9a-f]{40}$/.test(refSha)) {
+                return { kind: 'invalid', reason: 'ref-sha-malformed' };
+              }
+              let content;
+              try {
+                const response = await readGithub.rest.repos.getContent({
+                  owner,
+                  repo,
+                  path: '.continuum-429-recovery.json',
+                  ref: refSha,
+                });
+                content = response.data;
+              } catch (err) {
+                const status = Number(err && err.status || 0);
+                if (status === 404 || status === 422) {
+                  return { kind: 'invalid', reason: 'metadata-missing', status };
+                }
+                return { kind: 'unavailable', status };
+              }
+              if (!content || Array.isArray(content) || content.type !== 'file') {
+                return { kind: 'invalid', reason: 'metadata-not-file' };
+              }
+              let identity;
+              try {
+                identity = JSON.parse(
+                  Buffer.from(content.content || '', 'base64').toString('utf8')
+                );
+              } catch (err) {
+                return { kind: 'invalid', reason: 'metadata-not-json' };
+              }
+              if (
+                !identity ||
+                typeof identity !== 'object' ||
+                Array.isArray(identity)
+              ) {
+                return { kind: 'invalid', reason: 'metadata-not-object' };
+              }
+              if (Number(identity.schema_version) !== 1) {
+                return { kind: 'invalid', reason: 'schema-version' };
+              }
+              if (String(identity.operation_id) !== String(operation)) {
+                return { kind: 'invalid', reason: 'operation-mismatch' };
+              }
+              if (Number(identity.generation) !== Number(generation)) {
+                return { kind: 'invalid', reason: 'generation-mismatch' };
+              }
+              if (String(identity.checkpoint_ref) !== String(checkpointRef)) {
+                return { kind: 'invalid', reason: 'checkpoint-ref-mismatch' };
+              }
+              if (String(identity.mode) !== 'issue') {
+                return { kind: 'invalid', reason: 'mode-mismatch' };
+              }
+              if (String(identity.issue_number || '') !== String(issueNumber)) {
+                return { kind: 'invalid', reason: 'issue-mismatch' };
+              }
+              if (!/^[0-9a-f]{40}$/i.test(String(identity.head_sha || ''))) {
+                return { kind: 'invalid', reason: 'head-sha-malformed' };
+              }
+              if (!String(identity.stage || '').trim()) {
+                return { kind: 'invalid', reason: 'stage-missing' };
+              }
+              return { kind: 'valid', refSha, identity };
+            }
+
+            async function evaluateScheduler429Recovery({
+              recovery, issueNumber,
+            }) {
+              const now = Date.now();
+              const base = {
+                operation: recovery && recovery.operation || '',
+                generation: recovery && recovery.generation || 0,
+                checkpointRef: recovery && recovery.checkpointRef || '',
+                runId: recovery && recovery.runId || '',
+                state: recovery && recovery.state || '',
+                keepReservation: false,
+                countWip: false,
+                recoveryPending: false,
+                reason: 'no-recovery-state',
+              };
+              if (!recovery) return base;
+              const identity = parseSchedulerCheckpointIdentity(
+                recovery.checkpointRef
+              );
+              if (
+                !identity ||
+                identity.operation !== recovery.operation ||
+                identity.generation !== Number(recovery.generation) ||
+                !String(recovery.operation).split('-').includes(
+                  'issue' + issueNumber
+                )
+              ) {
+                return {
+                  ...base,
+                  keepReservation: true,
+                  recoveryPending: true,
+                  reason: 'malformed-marker',
+                };
+              }
+              const due = Math.max(0, Number(recovery.nextDue) || 0) * 1000;
+              const state = String(recovery.state || '');
+              if (state === 'metadata-failed') {
+                if (due > now) {
+                  return {
+                    ...base,
+                    keepReservation: true,
+                    recoveryPending: true,
+                    reason: 'metadata-failed-lease',
+                  };
+                }
+                return { ...base, reason: 'metadata-failed-expired' };
+              }
+              if (
+                due > now &&
+                [
+                  'claimed', 'accepted', 'backoff', 'metadata-pending',
+                  'dispatch-failed', 'observed-unverified',
+                  'reconcile-pending',
+                ].includes(state)
+              ) {
+                return {
+                  ...base,
+                  keepReservation: true,
+                  recoveryPending: true,
+                  reason: 'watchdog-lease',
+                };
+              }
+              const run = await fetchSchedulerRecoveryRun(recovery.runId);
+              if (run.kind === 'unavailable') {
+                return {
+                  ...base,
+                  keepReservation: true,
+                  recoveryPending: true,
+                  reason: 'run-unavailable',
+                };
+              }
+              if (
+                run.kind === 'found' &&
+                run.run &&
+                run.run.status !== 'completed'
+              ) {
+                return {
+                  ...base,
+                  keepReservation: true,
+                  countWip: true,
+                  reason: 'run-active',
+                };
+              }
+              const checkpoint = await readSchedulerCheckpointEvidence({
+                operation: recovery.operation,
+                generation: recovery.generation,
+                checkpointRef: recovery.checkpointRef,
+                issueNumber,
+              });
+              if (checkpoint.kind === 'unavailable') {
+                return {
+                  ...base,
+                  keepReservation: true,
+                  recoveryPending: true,
+                  reason: 'checkpoint-unavailable',
+                };
+              }
+              if (checkpoint.kind === 'valid') {
+                if (
+                  run.kind === 'found' &&
+                  run.run &&
+                  run.run.status === 'completed' &&
+                  run.run.conclusion === 'success'
+                ) {
+                  return { ...base, reason: 'run-completed-success' };
+                }
+                const markerSha = String(
+                  recovery.checkpointSha || ''
+                ).toLowerCase();
+                if (!/^[0-9a-f]{40}$/.test(markerSha)) {
+                  return {
+                    ...base,
+                    keepReservation: true,
+                    recoveryPending: true,
+                    reason: 'checkpoint-sha-invalid',
+                  };
+                }
+                const advanced = markerSha !== checkpoint.refSha;
+                if (advanced) {
+                  return {
+                    ...base,
+                    keepReservation: true,
+                    recoveryPending: true,
+                    reason: 'checkpoint-awaiting-recovery',
+                    checkpointSha: checkpoint.refSha,
+                  };
+                }
+                return {
+                  ...base,
+                  reason: 'checkpoint-unchanged',
+                  checkpointSha: checkpoint.refSha,
+                };
+              }
+              return { ...base, reason: 'checkpoint-' + checkpoint.kind };
             }
 
             // Reconcile reservations for the gap between posting /oc and the PR
@@ -3811,74 +4131,17 @@ jobs:
                 const body = comment.body || '';
                 return /<!--\s*continuum-429-(?:recovery|resumption|backoff)\b/.test(body);
               });
-              const parse429RecoveryState = body => {
-                const states = [...String(body || '').matchAll(
-                  /<!--\s*continuum-429-recovery\s+op=\S+\s+gen=\d+\s+state=(\S+)\s+attempt=\d+\s+next_due=(\d+)\s+checkpoint=(\S*)\s+sha=(\S*)\s+run=(\S*)/g
-                )];
-                if (!states.length) return { state: '', nextDue: 0, runId: '' };
-                const latest = states[states.length - 1];
-                return {
-                  state: latest[1],
-                  nextDue: Math.max(0, Number(latest[2]) || 0),
-                  runId: latest[5] === '-' ? '' : latest[5],
-                };
-              };
-              const newestRecovery = recoveryComments
-                .map(comment => ({
-                  at: new Date(comment.updated_at || comment.created_at || 0).getTime(),
-                  ...parse429RecoveryState(comment.body || ''),
-                }))
-                .sort((a, b) => a.at - b.at)
-                .at(-1);
-              // A durable 429 recovery state holds the reservation only while
-              // it still has a real owner and an unexpired bounded next step.
-              // `metadata-failed` cannot be resumed from an unproven
-              // checkpoint, so after its bounded due time the scheduler must
-              // be free to retry the task (the raw salvage ref is retained)
-              // instead of stranding the reservation forever.
-              const hasFresh429Recovery = (() => {
-                if (!newestRecovery) return false;
-                const now = Date.now();
-                if (newestRecovery.state === 'metadata-failed') {
-                  return newestRecovery.nextDue > 0 &&
-                    newestRecovery.nextDue * 1000 > now;
-                }
-                // A recorded resumption run is authoritative while it is not
-                // completed, however long it runs. The old fixed 2h window
-                // released (and re-dispatched) an issue whose recovery runner
-                // was still working after a slow start.
-                const recoveryRunId = Number(newestRecovery.runId);
-                let recordedRunCompleted = false;
-                if (Number.isInteger(recoveryRunId) && recoveryRunId > 0) {
-                  const recoveryRun = workflowRuns.find(
-                    run => Number(run.id) === recoveryRunId
-                  );
-                  if (recoveryRun) {
-                    if (recoveryRun.status !== 'completed') return true;
-                    recordedRunCompleted = true;
-                  }
-                }
-                if (newestRecovery.nextDue > 0 &&
-                    newestRecovery.nextDue * 1000 > now) {
-                  return true;
-                }
-                // `observed` records next_due=0 and `accepted` only covers the
-                // short dispatch-observation window. Both can precede a
-                // multi-hour run, so keep the reservation for the watchdog's
-                // bounded 48h catch-up horizon instead of 2h. A recorded run
-                // that has already completed still gets the old 2h grace for
-                // the watchdog to write the next durable state.
-                if (newestRecovery.state === 'observed' ||
-                    newestRecovery.state === 'accepted') {
-                  const horizon = recordedRunCompleted
-                    ? 2 * 60 * 60 * 1000
-                    : 48 * 60 * 60 * 1000;
-                  return Number.isFinite(newestRecovery.at) &&
-                    (now - newestRecovery.at) < horizon;
-                }
-                return Number.isFinite(newestRecovery.at) &&
-                  (now - newestRecovery.at) < 2 * 60 * 60 * 1000;
-              })();
+              const newestRecovery = recoveryComments.length
+                ? latestSchedulerRecoveryState(comments)
+                : null;
+              // The durable marker is only an ownership claim while the exact
+              // run and the metadata-verified checkpoint agree. `observed`
+              // with next_due=0 is not a 48h lease: the exact run GET decides.
+              const recoveryEvaluation = await evaluateScheduler429Recovery({
+                recovery: newestRecovery,
+                issueNumber,
+              });
+              const hasFresh429Recovery = recoveryEvaluation.keepReservation;
               const latestDispatch = dispatches.at(-1);
               const latestPr = latestPrByIssue.get(issueNumber);
 
@@ -3944,7 +4207,41 @@ jobs:
                 }
               }
 
+              const retainVerified429Recovery = () => {
+                if (recoveryEvaluation.countWip) {
+                  activeIssueNumbers.add(issueNumber);
+                } else {
+                  // Keep the reservation label so the bounded watchdog
+                  // discovery can find the durable marker, but release the
+                  // coding WIP slot: this is infrastructure recovery, not a
+                  // coding run. Candidate selection below skips this issue.
+                  recoveryPendingIssueNumbers.add(issueNumber);
+                }
+                core.notice(
+                  'Issue #' + issueNumber +
+                  ' has verified durable 429 infrastructure recovery state (' +
+                  recoveryEvaluation.reason + '; op=' +
+                  (recoveryEvaluation.operation || '-') + ' gen=' +
+                  (recoveryEvaluation.generation || 0) + ' checkpoint=' +
+                  (recoveryEvaluation.checkpointRef || '-') + ' run=' +
+                  (newestRecovery && newestRecovery.runId || '-') +
+                  '); ' +
+                  (recoveryEvaluation.countWip
+                    ? 'counting its active run as WIP.'
+                    : 'retaining the reservation for the watchdog without ' +
+                      'consuming a coding dispatch attempt or WIP slot.')
+                );
+              };
+
               if (!latestDispatch) {
+                // A durable recovery marker is itself evidence of ownership:
+                // the watchdog may have dispatched from a manual /oc or a
+                // workflow_run without a scheduler dispatch record. Releasing
+                // the label here would make that checkpoint undiscoverable.
+                if (hasFresh429Recovery) {
+                  retainVerified429Recovery();
+                  continue;
+                }
                 // A stale/manual reservation with no evidence of a dispatch is
                 // safe to release immediately.
                 await removeLabel(issueNumber, inProgressLabel);
@@ -3964,13 +4261,7 @@ jobs:
               }
 
               if (hasFresh429Recovery) {
-                activeIssueNumbers.add(issueNumber);
-                core.notice(
-                  'Issue #' + issueNumber +
-                  ' has fresh durable 429 infrastructure recovery state; ' +
-                  'leaving the reservation to the watchdog catch-up and not ' +
-                  'consuming a coding dispatch attempt.'
-                );
+                retainVerified429Recovery();
                 continue;
               }
 
@@ -4043,6 +4334,7 @@ jobs:
               for (const issue of issues) {
                 if (activeIssueNumbers.has(issue.number)) continue;
                 if (openPrIssues.has(issue.number)) continue;
+                if (recoveryPendingIssueNumbers.has(issue.number)) continue;
                 const admission = shouldAdmitToImplementation(
                   issue.number, qualificationTrackers
                 );
@@ -4090,6 +4382,16 @@ jobs:
                 core.info(
                   'Skipping #' + issue.number +
                   ': open implementation PR must not be duplicated.'
+                );
+                continue;
+              }
+              // Verified 429 checkpoints are recovered by the watchdog from
+              // their exact SHA. They must never be restarted from main just
+              // because they no longer consume a coding WIP slot.
+              if (recoveryPendingIssueNumbers.has(issue.number)) {
+                core.info(
+                  'Skipping #' + issue.number +
+                  ': verified 429 checkpoint is awaiting watchdog recovery.'
                 );
                 continue;
               }

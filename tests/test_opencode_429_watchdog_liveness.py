@@ -16,6 +16,7 @@ import shutil
 import subprocess
 import tempfile
 import unittest
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import yaml
@@ -53,6 +54,7 @@ const state = {
   runErrors: new Map(Object.entries(scenario.runErrors || {})),
   runLookups: [],
   workflowRuns: (scenario.workflowRuns || []).map(run => ({ ...run })),
+  issues: (scenario.issues || []).map(issue => ({ ...issue })),
   scriptErrors: [],
   notices: [],
 };
@@ -75,10 +77,35 @@ function nowIso() {
 function makeRest() {
   return {
     issues: {
-      get: async ({ issue_number }) => ({
-        data: { number: issue_number, state: 'open', labels: [], title: 'Issue ' + issue_number },
-      }),
-      listForRepo: async () => [],
+      get: async ({ issue_number }) => {
+        const issue = state.issues.find(
+          item => Number(item.number) === Number(issue_number)
+        );
+        if (issue) return { data: { ...issue } };
+        return {
+          data: {
+            number: issue_number,
+            state: 'open',
+            labels: [],
+            title: 'Issue ' + issue_number,
+          },
+        };
+      },
+      listForRepo: async (params = {}) => {
+        let items = state.issues.slice();
+        if (params.state) {
+          items = items.filter(issue => issue.state === params.state);
+        }
+        const label = String(params.labels || '').trim();
+        if (label) {
+          items = items.filter(issue =>
+            (issue.labels || []).some(item =>
+              (typeof item === 'string' ? item : item.name) === label
+            )
+          );
+        }
+        return items.map(issue => ({ ...issue }));
+      },
       listComments: async () => state.comments.map(comment => ({ ...comment })),
       createComment: async ({ issue_number, body }) => {
         const comment = {
@@ -122,9 +149,25 @@ function makeRest() {
     },
     actions: {
       listWorkflowRuns: async () => state.workflowRuns.map(run => ({ ...run })),
-      listWorkflowRunsForRepo: async () => ({
-        data: { workflow_runs: state.workflowRuns.map(run => ({ ...run })) },
-      }),
+      listWorkflowRunsForRepo: async (params = {}) => {
+        if (params.status && scenario.activeRunsError) {
+          throw apiError(scenario.activeRunsError, 'active run listing failed');
+        }
+        let items = state.workflowRuns.slice();
+        if (params.status) {
+          items = items.filter(run => run.status === params.status);
+        }
+        const perPage = Number(params.per_page || 30);
+        const page = Number(params.page || 1);
+        const start = (page - 1) * perPage;
+        return {
+          data: {
+            workflow_runs: items
+              .slice(start, start + perPage)
+              .map(run => ({ ...run })),
+          },
+        };
+      },
       listJobsForWorkflowRun: async () =>
         (scenario.jobs || []).map(job => ({ ...job })),
       getWorkflowRun: async ({ run_id }) => {
@@ -214,7 +257,16 @@ class MockGithub {
     this.request = {
       endpoint: { DEFAULTS: { baseUrl: 'https://api.github.com' } },
     };
-    this.paginate = async (method, params) => method(params);
+    this.paginate = async (method, params) => {
+      const result = await method(params);
+      if (
+        result && result.data &&
+        Array.isArray(result.data.workflow_runs)
+      ) {
+        return result.data.workflow_runs;
+      }
+      return result;
+    };
   }
 }
 
@@ -714,6 +766,218 @@ class WatchdogHarness(unittest.TestCase):
         self.assertIn("issueLabels.has(pausedLabel)", self.source)
         self.assertIn("' is ' + pausedLabel + '; watchdog will not retry it.'",
                       self.source)
+
+    def durable_scenario(self, newer_runs=320):
+        scenario = base_scenario()
+        scenario["triggerRun"] = None
+        scenario["jobs"] = []
+        scenario["jobLog"] = ""
+        now = datetime.now(timezone.utc)
+        old_run = dict(scenario["runs"][0])
+        old_run["created_at"] = (
+            now - timedelta(hours=30)
+        ).strftime("%Y-%m-%dT%H:%M:%SZ")
+        unrelated = []
+        for index in range(newer_runs):
+            unrelated.append(
+                {
+                    "id": 600000 + index,
+                    "status": "completed",
+                    "conclusion": "success",
+                    "event": "push",
+                    "path": ".github/workflows/other.yml",
+                    "name": "Other",
+                    "display_title": "Other run " + str(index),
+                    "created_at": (
+                        now - timedelta(minutes=index)
+                    ).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                }
+            )
+        # The historical run sits beyond the newest 200 repo-wide runs.
+        scenario["workflowRuns"] = unrelated + [old_run]
+        scenario["issues"] = [
+            {
+                "number": 382,
+                "state": "open",
+                "title": "P0: durable recovery",
+                "labels": [
+                    {"name": "automation:in-progress"},
+                    {"name": "automation:ready"},
+                ],
+            }
+        ]
+        scenario["dispatchedRunId"] = 5001
+        return scenario
+
+    def test_scheduled_wake_rediscovers_old_checkpoint_beyond_recent_200(self):
+        result = self.run_scenario(self.durable_scenario())
+        self.assert_one_current_dispatch(result, NEW_SHA)
+        self.assertIn(OLD_RUN_ID, result["runLookups"])
+        observed = [
+            comment["body"] for comment in result["comments"]
+            if "state=observed" in comment["body"] and
+            "run=5001" in comment["body"] and
+            "detail=run-started" in comment["body"]
+        ]
+        self.assertEqual(len(observed), 1, result["comments"])
+        self.assertTrue(
+            any(
+                "durable recovery inspected 1 trusted recovery marker" in
+                " ".join(line)
+                for line in result["notices"]
+            ),
+            result["notices"],
+        )
+
+    def test_scheduled_two_concurrent_wakes_dispatch_exactly_once(self):
+        scenario = self.durable_scenario(newer_runs=250)
+        scenario["passes"] = 2
+        scenario["concurrent"] = True
+        result = self.run_scenario(scenario)
+        self.assert_one_current_dispatch(result, NEW_SHA)
+        observed = [
+            comment["body"] for comment in result["comments"]
+            if "state=observed" in comment["body"]
+        ]
+        self.assertEqual(len(observed), 2, observed)
+
+    def test_scheduled_active_old_run_owns_the_work(self):
+        scenario = self.durable_scenario()
+        old_run = scenario["workflowRuns"][-1]
+        old_run["status"] = "in_progress"
+        old_run["conclusion"] = None
+        scenario["runs"][0]["status"] = "in_progress"
+        scenario["runs"][0]["conclusion"] = None
+        result = self.run_scenario(scenario)
+        self.assert_no_dispatch(result)
+
+    def test_scheduled_published_pr_is_not_redispatched(self):
+        scenario = self.durable_scenario()
+        scenario["pulls"] = [
+            {
+                "number": 500,
+                "state": "open",
+                "head": {
+                    "ref": BRANCH,
+                    "repo": {"full_name": OWNER + "/" + REPO},
+                },
+            }
+        ]
+        result = self.run_scenario(scenario)
+        self.assert_no_dispatch(result)
+
+    def test_scheduled_issue_guards_fail_closed(self):
+        for label in (
+            "automation:paused",
+            "automation:blocked",
+            "automation:qualifying",
+            "no-auto-merge",
+        ):
+            with self.subTest(label=label):
+                scenario = self.durable_scenario()
+                scenario["issues"][0]["labels"].append({"name": label})
+                result = self.run_scenario(scenario)
+                self.assert_no_dispatch(result)
+
+    def test_scheduled_closed_issue_is_not_resumed(self):
+        scenario = self.durable_scenario()
+        scenario["issues"][0]["state"] = "closed"
+        result = self.run_scenario(scenario)
+        self.assert_no_dispatch(result)
+
+    def test_scheduled_active_run_lookup_failure_fails_closed(self):
+        scenario = self.durable_scenario()
+        scenario["activeRunsError"] = 429
+        result = self.run_scenario(scenario)
+        self.assert_no_dispatch(result)
+        self.assertTrue(
+            any(
+                "cannot verify competing runs" in " ".join(line)
+                for line in result["notices"]
+            ),
+            result["notices"],
+        )
+
+    def test_scheduled_paused_unrelated_issues_are_not_scanned(self):
+        scenario = self.durable_scenario()
+        for number, label in ((373, "automation:paused"),
+                              (357, "automation:blocked"),
+                              (346, "no-auto-merge")):
+            scenario["issues"].append({
+                "number": number,
+                "state": "open",
+                "title": "unrelated",
+                "labels": [
+                    {"name": "automation:in-progress"},
+                    {"name": label},
+                ],
+            })
+        result = self.run_scenario(scenario)
+        dispatch = self.assert_one_current_dispatch(result, NEW_SHA)
+        self.assertEqual(
+            json.loads(dispatch["inputs"]["recovery_identity"])
+            ["recovery_operation_id"],
+            OPERATION,
+        )
+        self.assertFalse(
+            any(
+                "#" + str(number) in " ".join(line)
+                for number in (373, 357, 346)
+                for line in result["notices"]
+                if "durable recovery" in " ".join(line)
+            ),
+            result["notices"],
+        )
+
+    def test_scheduled_owner_stop_is_authoritative(self):
+        scenario = self.durable_scenario()
+        scenario["comments"].append(
+            {
+                "id": 20,
+                "body": (
+                    "<!-- continuum-task-operator-stop "
+                    "repo=kodmial/continuum issue=382 generation=1 -->"
+                ),
+                "user": {"login": "kodmial"},
+                "author_association": "OWNER",
+                "created_at": "2026-10-23T10:00:00Z",
+                "updated_at": "2026-10-23T10:00:00Z",
+            }
+        )
+        result = self.run_scenario(scenario)
+        self.assert_no_dispatch(result)
+
+    def test_scheduled_malformed_or_foreign_marker_fails_closed(self):
+        scenarios = {
+            "foreign": recovery_marker("observed", OLD_SHA, OLD_RUN_ID).replace(
+                OPERATION, "opencode-429-issue-issue373"
+            ),
+            "generation": recovery_marker(
+                "observed", OLD_SHA, OLD_RUN_ID
+            ).replace("gen=1", "gen=2"),
+            "checkpoint": recovery_marker(
+                "observed", OLD_SHA, OLD_RUN_ID
+            ).replace(CHECKPOINT_REF, CHECKPOINT_REF + "-other"),
+        }
+        for name, body in scenarios.items():
+            with self.subTest(name=name):
+                scenario = self.durable_scenario()
+                scenario["comments"][0]["body"] = body
+                result = self.run_scenario(scenario)
+                self.assert_no_dispatch(result)
+
+    def test_scheduled_forged_marker_is_ignored(self):
+        scenario = self.durable_scenario()
+        scenario["comments"][0]["user"] = {"login": "random-contributor"}
+        scenario["comments"][0]["author_association"] = "NONE"
+        result = self.run_scenario(scenario)
+        self.assert_no_dispatch(result)
+
+    def test_scheduled_unreserved_issue_is_not_scanned(self):
+        scenario = self.durable_scenario()
+        scenario["issues"][0]["labels"] = [{"name": "automation:ready"}]
+        result = self.run_scenario(scenario)
+        self.assert_no_dispatch(result)
 
     def test_production_source_verifies_authoritative_run_evidence(self):
         self.assertIn("getWorkflowRun", self.source)

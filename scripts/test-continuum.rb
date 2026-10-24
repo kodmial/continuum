@@ -2961,6 +2961,12 @@ class ContinuumTest < Minitest::Test
     assert_includes watchdog, 'resolveDispatchWorkflow'
     assert_includes File.read(File.join(ROOT, '.github/scripts/opencode_429_dispatch.js')), 'workflowSupportsDispatch'
     assert_includes watchdog, 'recoveryStateMarker'
+    assert_includes watchdog, 'discoverDurableRecoveryCandidates',
+                    'scheduled catch-up must rediscover checkpoints outside recent Actions history'
+    assert_includes watchdog, 'listActiveOpenCodeRuns',
+                    'durable rediscovery must fail closed on competing active runs'
+    assert_includes watchdog, 'trustedRecoveryMarkerComment',
+                    'durable markers must come from a trusted actor'
     refute_match(/readGithub\.rest\.actions\.reRunWorkflow\(/, watchdog[/async function recoverFrom429OnFreshVm.*?if \(publishRaceRestartRequired\)/m].to_s,
                  '429 recovery must dispatch a fresh run, never re-run the workflow_call engine')
 
@@ -2978,12 +2984,18 @@ class ContinuumTest < Minitest::Test
     assert_includes scheduler, 'hasFresh429Recovery'
     assert_includes scheduler, 'continuum-429-(?:recovery|resumption|backoff)',
                     'scheduler must recognise durable 429 recovery state'
-    assert_includes scheduler, 'newestRecovery.runId',
-                    'scheduler must follow the recorded resumption run, not a fixed 2h window'
-    assert_includes scheduler, "recoveryRun.status !== 'completed'",
+    assert_includes scheduler, 'getWorkflowRun',
+                    'scheduler must follow the recorded run by exact id, not a fixed recent window'
+    assert_includes scheduler, 'readSchedulerCheckpointEvidence',
+                    'scheduler must verify the checkpoint ref and metadata before releasing WIP'
+    assert_includes scheduler, "run.run.status !== 'completed'",
                     'a still-running recovery must hold the reservation for as long as it runs'
-    assert_includes scheduler, '48 * 60 * 60 * 1000',
-                    'observed/accepted state must use the bounded catch-up horizon'
+    assert_includes scheduler, 'checkpoint-awaiting-recovery',
+                    'an advanced verified checkpoint must stay pending instead of restarting from main'
+    assert_includes scheduler, 'recoveryPendingIssueNumbers',
+                    'recovery-pending issues must be skipped by candidate and waiter selection'
+    refute_includes scheduler, '48 * 60 * 60 * 1000',
+                    'observed state must not expire on a fixed 48h horizon'
   end
 
   # ---------------------------------------------------------------- watchdog
