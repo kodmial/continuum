@@ -207,6 +207,56 @@ class VerificationContractTest(unittest.TestCase):
                 self.repo, self.evidence, self.base, final_env
             )
 
+    def test_resumed_runner_environment_change_reestablishes_a_baseline(self):
+        baseline_env = dict(self.env)
+        baseline_env["RUNNER_OS"] = "Linux"
+        baseline_env["CONTINUUM_TEST_COMMAND"] = 'test "$RUNNER_OS" = "macOS"'
+        verification.ensure_baseline(
+            self.repo, self.evidence, self.base, baseline_env
+        )
+
+        final_env = dict(baseline_env)
+        final_env["RUNNER_OS"] = "macOS"
+        final_data, comparison = verification.run_final(
+            self.repo,
+            self.evidence,
+            self.base,
+            final_env,
+            resume_stage="tests-running",
+        )
+        self.assertTrue(comparison["accepted"])
+        self.assertTrue(final_data["baseline"]["environment_rebaselined"])
+        self.assertEqual("passed", final_data["baseline"]["state"])
+        self.assertEqual(
+            final_data["final"]["environment_fingerprint"],
+            final_data["baseline"]["environment_fingerprint"],
+        )
+
+    def test_resume_reuses_final_evidence_before_environment_comparison(self):
+        self.env["CONTINUUM_TEST_COMMAND"] = "true"
+        verification.ensure_baseline(
+            self.repo, self.evidence, self.base, self.env
+        )
+        verification.run_final(
+            self.repo, self.evidence, self.base, self.env
+        )
+        before = self.evidence.read_text(encoding="utf-8")
+        final_env = dict(self.env)
+        final_env["RUNNER_OS"] = "macOS"
+        data, comparison = verification.run_final(
+            self.repo,
+            self.evidence,
+            self.base,
+            final_env,
+            resume_stage="publish-pr",
+        )
+        self.assertTrue(comparison["accepted"])
+        self.assertEqual(
+            before,
+            self.evidence.read_text(encoding="utf-8"),
+            "a resumed runner must reuse the exact passed final evidence",
+        )
+
     def test_new_regression_is_distinguishable_from_baseline(self):
         self.env["CONTINUUM_TEST_COMMAND"] = "test ! -f broken.txt"
         verification.ensure_baseline(

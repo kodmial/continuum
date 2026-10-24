@@ -27,8 +27,10 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
+import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -710,6 +712,66 @@ def _comparison(
     }
 
 
+def _reestablish_baseline(
+    root: Path,
+    evidence_path: Path,
+    data: Dict[str, Any],
+    baseline: Mapping[str, Any],
+    contract: VerificationContract,
+    base: str,
+    env: Mapping[str, str],
+    timeout_seconds: Optional[float],
+    environment: str,
+) -> Dict[str, Any]:
+    """Re-run the baseline at the task base on a resumed, changed runner.
+
+    A 429 evacuation moves the task onto a replacement runner whose image or
+    ``PATH`` may differ. The restored baseline is then incomparable. Rebasing
+    only the environment fingerprint would keep stale results, so re-establish
+    a real baseline against the same task base before the final run.
+    """
+
+    if not _is_ancestor(root, base):
+        raise VerificationError(
+            "cannot re-establish the verification baseline: the task base is "
+            "not an ancestor of the current checkout"
+        )
+    previous = str(baseline.get("environment_fingerprint") or "")
+    temporary = tempfile.mkdtemp(prefix="continuum-verification-")
+    try:
+        added = _run_git(root, "worktree", "add", "--detach", temporary, base)
+        if added.returncode != 0:
+            raise VerificationError(
+                "could not re-establish the verification baseline on the current "
+                "runner: {}".format((added.stderr or "").strip()[-1000:])
+            )
+        result = run_command_set(contract, temporary, env, timeout_seconds)
+    finally:
+        _run_git(root, "worktree", "remove", "--force", temporary)
+        shutil.rmtree(temporary, ignore_errors=True)
+    result.update(
+        {
+            "phase": "baseline",
+            "base_sha": base,
+            "head_sha": base,
+            "contract": contract.as_dict(),
+            # The commands ran in the same environment as the final pass; only
+            # the temporary worktree path differs from the task checkout.
+            "environment_fingerprint": environment,
+            "environment_rebaselined": True,
+            "previous_environment_fingerprint": previous,
+        }
+    )
+    data["baseline"] = result
+    data["contract"] = contract.as_dict()
+    _save_evidence(evidence_path, data)
+    print(
+        "Verification environment changed on a resumed run; re-established the "
+        "baseline in the current environment."
+    )
+    return result
+
+
 def run_final(
     repo: Path | str,
     evidence_path: Path | str,
@@ -741,15 +803,12 @@ def run_final(
 
     baseline_environment = str(baseline.get("environment_fingerprint") or "")
     current_environment = environment_fingerprint(root, env)
-    if baseline_environment and current_environment != baseline_environment:
-        raise VerificationError(
-            "verification environment changed between baseline and final; the "
-            "results are not comparable"
-        )
 
     # A checkpoint after the final pass already carries exact evidence. Reuse
     # it only for an explicit tests-passed/publish-pr resume; never for a
-    # normal run that could have changed the tree.
+    # normal run that could have changed the tree. Reuse precedes the
+    # environment comparison because the resumed runner is expected to differ
+    # and the already-passed result does not need to be recomputed there.
     existing_final = data.get("final")
     if (
         resume_stage in ("tests-passed", "publish-pr")
@@ -762,6 +821,24 @@ def run_final(
         if isinstance(comparison, dict) and bool(comparison.get("accepted")):
             print("Reusing exact post-change verification evidence from the 429 checkpoint.")
             return data, comparison
+
+    if baseline_environment and current_environment != baseline_environment:
+        if not resume_stage:
+            raise VerificationError(
+                "verification environment changed between baseline and final; the "
+                "results are not comparable"
+            )
+        baseline = _reestablish_baseline(
+            root,
+            path,
+            data,
+            baseline,
+            contract,
+            base,
+            env,
+            timeout_seconds,
+            current_environment,
+        )
 
     result = run_command_set(contract, root, env, timeout_seconds)
     result["contract_fingerprint"] = contract.fingerprint

@@ -3301,6 +3301,11 @@ jobs:
           fi
           printf 'tests-passed\n' > .continuum-429-stage
 
+          # Verification commands may create caches; remove them BEFORE the
+          # empty-change gate, exactly as for the earlier changes gate,
+          # otherwise fresh bytecode caches defeat the guard below.
+          find . -type d -name '__pycache__' -prune -exec rm -rf {} +
+          find . -type f \( -name '*.pyc' -o -name '*.pyo' \) -delete
           # The verifier may have corrected an implementation by reverting it.
           # Never turn an empty result into an implementation branch/PR.
           if ! POST_VERIFICATION_CHANGES="$(verification_python changes --repo "$GITHUB_WORKSPACE" --base-sha "$BASE_START_SHA")"; then
@@ -3312,10 +3317,6 @@ jobs:
             exit 1
           fi
 
-          # Verification commands may create caches; remove them before staging
-          # exactly as for the primary and verifier sessions.
-          find . -type d -name '__pycache__' -prune -exec rm -rf {} +
-          find . -type f \( -name '*.pyc' -o -name '*.pyo' \) -delete
           # kodmial/continuum#290/#413: the 429 stage-progress file, verifier
           # evidence and the recovery identity are workflow-owned recovery
           # metadata, never product code. The evacuator commits them into

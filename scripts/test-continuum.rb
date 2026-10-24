@@ -5694,6 +5694,10 @@ class ContinuumTest < Minitest::Test
     assert_includes issue, 'Post-change verification did not pass; refusing to commit or publish a successful implementation.'
     assert_includes issue, 'POST_VERIFICATION_CHANGES="$(verification_python changes'
     assert_includes issue, 'refusing an empty implementation commit'
+    cache_cleanup = issue.index('Verification commands may create caches; remove them BEFORE the')
+    refute_nil cache_cleanup, 'bytecode cleanup must run before the empty-change gate'
+    assert_operator cache_cleanup, :<, issue.index('POST_VERIFICATION_CHANGES='),
+                    'untracked bytecode caches must not defeat the empty-change gate'
     assert_operator issue.index('POST_VERIFICATION_CHANGES='), :<, commit,
                     'the verified tree must still contain task changes before commit'
     assert_includes issue, '--resume-stage "$RECOVERY_STAGE_NOW"'

@@ -111,7 +111,7 @@ APPROVED_413_OPENCODE_SHA256 = (
 # post-change run before the workflow-owned commit. Historical digests above
 # remain for audit.
 APPROVED_168_OPENCODE_SHA256 = (
-    "04e8f58157d4eb5f6b348aa18dcdba0d213b12e2dd40893e81d027ca482c6bdb"
+    "af14142a56033870f8dd3bcd6eb7751008178205dd828aa91b2388ef3056c48f"
 )
 
 APPROVED_350_SELF_CALLER_SHA256 = (
