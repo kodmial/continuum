@@ -94,7 +94,35 @@ concurrency:
   # state for the head instead of acting only on their own event: whichever
   # event survives the queue still repairs a real failure or processes the
   # green lock decision.
-  group: opencode-repair-${{ github.event.workflow_run.head_sha || inputs.head_sha || github.event.pull_request.number || inputs.pr_number || github.sha }}
+  #
+  # Suppressed unapproved completions must not occupy the approved head group:
+  # otherwise a no-op completion could replace the one pending approved run
+  # even though its own job is skipped. They get a unique group instead, so
+  # every approved completion keeps the same-head serialization above while an
+  # unapproved completion can never displace it. `contains` is a conservative
+  # superset of the exact allow-list, exactly as in the caller admission.
+  #
+  # That isolation replaces the old backstop in which an unapproved completion
+  # could itself reconcile an approved failure after displacing its controller
+  # run: an unapproved completion can no longer enter (or be replaced within)
+  # the approved group, so the approved-group survivor is still present and
+  # re-reconciles the LATEST exact-head state. The burst replay tests model
+  # GitHub's one-running-plus-one-pending limit so no-missed-repair is checked
+  # rather than assumed from that queue behaviour.
+  group: >-
+    opencode-repair-${{
+      (github.event_name == 'workflow_run' &&
+       !contains(
+         inputs.ci_repair_workflows || vars.CONTINUUM_CI_REPAIR_WORKFLOWS || 'CI',
+         github.event.workflow_run.name
+       )) &&
+      format('unapproved-{0}', github.run_id)
+      || github.event.workflow_run.head_sha
+      || inputs.head_sha
+      || github.event.pull_request.number
+      || inputs.pr_number
+      || github.sha
+    }}
   cancel-in-progress: false
 
 jobs:
@@ -460,13 +488,29 @@ jobs:
           esac
 
   ci-repair:
+    # A `workflow_run` completion is admitted only for an exact member of the
+    # configured allow-list. GitHub cannot put `CONTINUUM_CI_REPAIR_WORKFLOWS`
+    # in the event trigger, but it can read `vars` here, so an unapproved
+    # completion skips this job before a runner is allocated or the helper is
+    # fetched. `contains` is deliberately a conservative superset: the exact
+    # allowed name is always a substring of the comma/newline-separated value,
+    # which preserves custom names and both delimiter styles without hardcoding
+    # any workflow. The runtime allow-list below remains authoritative, so a
+    # substring false positive can wake reconciliation but can never repair
+    # its own unapproved run. The direct workflow_dispatch and
+    # pull_request_target jobs are separate and unaffected.
     if: >-
       vars.CONTINUUM_ROLE != 'child' &&
       github.event_name == 'workflow_run' &&
+      github.event.workflow_run.name != 'OpenCode repair controller' &&
       github.event.workflow_run.event == 'pull_request' &&
       (github.event.workflow_run.conclusion == 'success' ||
        github.event.workflow_run.conclusion == 'failure' ||
-       github.event.workflow_run.conclusion == 'timed_out')
+       github.event.workflow_run.conclusion == 'timed_out') &&
+      contains(
+        inputs.ci_repair_workflows || vars.CONTINUUM_CI_REPAIR_WORKFLOWS || 'CI',
+        github.event.workflow_run.name
+      )
     runs-on: ubuntu-latest
     timeout-minutes: 5
 
@@ -526,12 +570,13 @@ jobs:
           # its previous behaviour. Matching is exact and case-sensitive; a
           # workflow can never authorize itself.
           #
-          # An unapproved completion is not discarded before reconciliation:
-          # GitHub may have replaced an approved failure's controller run in the
-          # single pending concurrency slot, so the surviving event must still
-          # be allowed to notice that approved failure. The allow-list below
-          # still decides which runs may be repaired, so this never authorizes
-          # the unapproved workflow's own run.
+          # The job-level admission above already skips a completion whose name
+          # is not a substring of the configured set, and the concurrency
+          # group keeps an unapproved completion out of the approved head
+          # group. This exact check remains the authoritative allow-list for
+          # the conservative substring case: a name that merely overlaps an
+          # approved name may still wake reconciliation of an approved failure,
+          # but it can never repair its own run.
           repairable=no
           while IFS= read -r candidate; do
             candidate="${candidate#"${candidate%%[![:space:]]*}"}"

@@ -461,6 +461,37 @@ class ContinuumTest < Minitest::Test
     end
   end
 
+  # The broad `workflow_run` glob still creates a controller run for every
+  # completion, but the installed caller and the reusable controller must skip
+  # the runner for a name the configured allow-list cannot admit. This keeps
+  # the exact runtime allow-list authoritative without hardcoding a workflow:
+  # `contains` is a conservative superset so no approved name is ever skipped.
+  def test_repair_wakeups_are_admitted_before_the_runner
+    caller = yaml(File.join(ROOT, '.github/caller-stubs/continuum-opencode-repair.yml'))
+    admission = caller.fetch('jobs').fetch('call').fetch('if')
+    assert_includes admission, "github.event_name != 'workflow_run'",
+                    'pull_request_target and workflow_dispatch must bypass the name admission'
+    assert_includes admission, 'vars.CONTINUUM_CI_REPAIR_WORKFLOWS'
+    assert_includes admission, 'github.event.workflow_run.name'
+    assert_includes admission, "'CI'",
+                    'an empty variable must keep the documented CI default'
+    refute_includes admission, 'Windows host',
+                    'the admission must not hardcode a consumer workflow name'
+
+    controller = yaml(File.join(ROOT, '.github/workflows/continuum-opencode-repair.yml'))
+    repair_if = controller.fetch('jobs').fetch('ci-repair').fetch('if')
+    assert_includes repair_if, 'vars.CONTINUUM_CI_REPAIR_WORKFLOWS'
+    assert_includes repair_if, 'github.event.workflow_run.name'
+    assert_includes repair_if, "github.event.workflow_run.name != 'OpenCode repair controller'",
+                    'a recursive self-completion must be skipped before the runner'
+    assert_includes controller.fetch('concurrency').fetch('group'), 'unapproved-',
+                    'a skipped completion must not displace an approved same-head run'
+    assert_includes controller.fetch('jobs').fetch('ci-repair-dispatch').fetch('if'),
+                    "github.event_name == 'workflow_dispatch'"
+    assert_includes controller.fetch('jobs').fetch('sync-current-pr').fetch('if'),
+                    "github.event_name == 'pull_request_target'"
+  end
+
   # `workflow_run.workflows` matches a workflow's `name:` VALUE. Reusable
   # engines and repository entry workflows are separate identity layers:
   # `ci.yml` deliberately has the same public name as its CI engine, and
@@ -3650,8 +3681,12 @@ class ContinuumTest < Minitest::Test
                     'reported-CI runs must key on the same reported head'
     assert_operator group.index('inputs.head_sha'), :<, group.index('inputs.pr_number'),
                     'the head must take precedence over the PR-only fallback'
-    refute_includes group, 'github.event_name',
-                    'event name must not split the shared per-head lock key'
+    # An unapproved completion is skipped by job admission. It must not enter
+    # the approved per-head group, because a pending no-op run would otherwise
+    # replace a pending approved repair. The event name is used only for that
+    # isolation; both real admission paths still land on the shared head/PR key.
+    assert_includes group, "github.event_name == 'workflow_run'"
+    assert_includes group, 'unapproved-'
     assert_equal false, concurrency.fetch('cancel-in-progress')
   end
 
