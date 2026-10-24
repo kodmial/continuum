@@ -162,6 +162,14 @@ on:
         required: false
         type: string
         default: ''
+      validation_command:
+        description: >-
+          Optional consumer-owned authoritative issue verification command.
+          Empty falls back to CONTINUUM_VALIDATION_COMMAND. The same resolved
+          command is required for pre-change baseline and post-change checks.
+        required: false
+        type: string
+        default: ''
       runner_os:
         description: >-
           Consumer-selected OpenCode execution runner (for example macos-15).
@@ -2840,7 +2848,7 @@ jobs:
           CONTINUUM_PREPARE_COMMAND: ${{ vars.CONTINUUM_PREPARE_COMMAND }}
           CONTINUUM_BUILD_COMMAND: ${{ vars.CONTINUUM_BUILD_COMMAND }}
           CONTINUUM_TEST_COMMAND: ${{ vars.CONTINUUM_TEST_COMMAND }}
-          CONTINUUM_VALIDATION_COMMAND: ${{ vars.CONTINUUM_VALIDATION_COMMAND }}
+          CONTINUUM_VALIDATION_COMMAND: ${{ inputs.validation_command || vars.CONTINUUM_VALIDATION_COMMAND }}
           VERIFICATION_ENGINE_ROOT: ${{ github.workspace }}/.continuum-cancel-engine
           VERIFICATION_EVIDENCE_PATH: .continuum-verification.json
         run: |

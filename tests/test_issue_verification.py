@@ -87,6 +87,23 @@ class VerificationContractTest(unittest.TestCase):
         workflows.mkdir(parents=True, exist_ok=True)
         (workflows / "ci.yml").write_text(text, encoding="utf-8")
 
+    def test_issue_workflow_explicit_validation_input_preserves_strict_contract(self):
+        workflow = (
+            ROOT / ".github" / "workflows" / "continuum-opencode.yml"
+        ).read_text(encoding="utf-8")
+        self.assertIn(
+            "      validation_command:\n"
+            "        description: >-",
+            workflow,
+        )
+        self.assertIn(
+            "CONTINUUM_VALIDATION_COMMAND: "
+            "${{ inputs.validation_command || vars.CONTINUUM_VALIDATION_COMMAND }}",
+            workflow,
+        )
+        self.assertIn("verification_python baseline", workflow)
+        self.assertIn("verification_python final", workflow)
+
     def test_unconfigured_contract_is_an_explicit_failure(self):
         contract = verification.resolve_contract(self.repo, self.env)
         self.assertEqual("unconfigured", contract.state)
