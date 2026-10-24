@@ -115,6 +115,16 @@ APPROVED_168_OPENCODE_SHA256 = (
     "2291ad53984296d8a88b177c7b137bb1396f97a7efea0c3800d281dc6a707491"
 )
 
+# kodmial/continuum#423: deliberately advance the exact protected workflow
+# artifact for the optional consumer-owned validation_command input only.
+# The reviewed change adds the input and wires it to the existing strict
+# CONTINUUM_VALIDATION_COMMAND resolver; it does not bypass baseline/final
+# verification or weaken the fail-closed contract. Preserve the #168 pin
+# above for historical audit; unrelated workflow drift still fails closed.
+APPROVED_423_OPENCODE_SHA256 = (
+    "198c789f38625fe23880e341d3b78ce8912244cb0e1556bd52c4d25272538730"
+)
+
 APPROVED_350_SELF_CALLER_SHA256 = (
     "f06cdcb9affc06f976aed97945ff9d31496e5954ca225971164f87ec4e1ca22c"
 )
@@ -2535,8 +2545,8 @@ class ProtectedBaselineTests(unittest.TestCase):
                     # isolation artifact.
                     self.assertEqual(
                         protected_file_digest(path),
-                        APPROVED_168_OPENCODE_SHA256,
-                        f"{path}: unexpected drift outside reviewed #168 issue verification",
+                        APPROVED_423_OPENCODE_SHA256,
+                        f"{path}: unexpected drift outside reviewed #423 validation input",
                     )
                 else:
                     # The self-dogfood caller is the dispatchable surface
