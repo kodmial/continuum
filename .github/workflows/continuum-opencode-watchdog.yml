@@ -301,7 +301,7 @@ jobs:
             }
 
             function parseRecoveryStates(body, operation, generation) {
-              const re = /<!--\s*continuum-429-recovery\s+op=(\S+)\s+gen=(\d+)\s+state=(\S+)\s+attempt=(\d+)\s+next_due=(\d+)\s+checkpoint=(\S*)\s+sha=(\S*)\s+run=(\S*)\s+detail=(\S*)\s*-->/g;
+              const re = /<!--\s*continuum-429-recovery\s+op=(\S+)\s+gen=(\d+)\s+state=(\S+)\s+attempt=(\d+)\s+next_due=(\d+)\s+checkpoint=(\S*)\s+sha=(\S*)\s+run=(\S*)(?:\s+detail=(\S*))?\s*-->/g;
               const text = String(body || '');
               const found = [];
               let match;
@@ -316,7 +316,7 @@ jobs:
                   checkpointRef: match[6] === '-' ? '' : match[6],
                   checkpointSha: match[7] === '-' ? '' : match[7],
                   runId: match[8] === '-' ? '' : match[8],
-                  detail: match[9] === '-' ? '' : match[9],
+                  detail: !match[9] || match[9] === '-' ? '' : match[9],
                 });
               }
               return found;
@@ -781,8 +781,10 @@ jobs:
             }
 
             // Publication evidence is checked through the API, never by
-            // reading arbitrary comment prose. Any PR on the issue branch (open,
-            // closed, or merged) proves the run already published.
+            // reading arbitrary comment prose. An open or merged PR on the
+            // issue branch proves the run already published; a PR closed
+            // without merge is not publication evidence and must not fence a
+            // verified newer checkpoint forever.
             async function hasPublishedResumptionPullRequest({
               mode, issueNumber, prNumber, identity,
             }) {
@@ -799,9 +801,14 @@ jobs:
                   const headRepo = String(pull.head?.repo?.full_name || '');
                   const headRef = String(pull.head?.ref || '');
                   if (headRepo !== owner + '/' + repo) return false;
-                  // Any PR on this issue's OpenCode branch family proves the
-                  // work already published, even when the current branch name
-                  // advanced or the PR was closed without merge.
+                  const published =
+                    pull.state === 'open' ||
+                    Boolean(pull.merged_at) ||
+                    pull.merged === true;
+                  if (!published) return false;
+                  // Any published PR on this issue's OpenCode branch family
+                  // proves the work already published, even when the current
+                  // branch name advanced.
                   return headRef.startsWith(prefix) ||
                     (Boolean(branch) && headRef === branch);
                 });
@@ -931,7 +938,7 @@ jobs:
               process.env.NO_AUTO_MERGE_LABEL || 'no-auto-merge';
 
             function parseAnyRecoveryStates(body) {
-              const re = /<!--\s*continuum-429-recovery\s+op=(\S+)\s+gen=(\d+)\s+state=(\S+)\s+attempt=(\d+)\s+next_due=(\d+)\s+checkpoint=(\S*)\s+sha=(\S*)\s+run=(\S*)\s+detail=(\S*)\s*-->/g;
+              const re = /<!--\s*continuum-429-recovery\s+op=(\S+)\s+gen=(\d+)\s+state=(\S+)\s+attempt=(\d+)\s+next_due=(\d+)\s+checkpoint=(\S*)\s+sha=(\S*)\s+run=(\S*)(?:\s+detail=(\S*))?\s*-->/g;
               const text = String(body || '');
               const found = [];
               let match;
@@ -945,7 +952,7 @@ jobs:
                   checkpointRef: match[6] === '-' ? '' : match[6],
                   checkpointSha: match[7] === '-' ? '' : match[7],
                   runId: match[8] === '-' ? '' : match[8],
-                  detail: match[9] === '-' ? '' : match[9],
+                  detail: !match[9] || match[9] === '-' ? '' : match[9],
                 });
               }
               return found;

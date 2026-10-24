@@ -866,6 +866,33 @@ class WatchdogHarness(unittest.TestCase):
         result = self.run_scenario(scenario)
         self.assert_no_dispatch(result)
 
+    def test_scheduled_closed_unmerged_pr_does_not_fence_newer_checkpoint(self):
+        scenario = self.durable_scenario()
+        scenario["comments"][0]["body"] = recovery_marker(
+            "claimed", OLD_SHA, OLD_RUN_ID
+        )
+        scenario["pulls"] = [
+            {
+                "number": 500,
+                "state": "closed",
+                "merged_at": None,
+                "head": {
+                    "ref": "opencode/issue382-earlier-attempt",
+                    "repo": {"full_name": OWNER + "/" + REPO},
+                },
+            }
+        ]
+        result = self.run_scenario(scenario)
+        self.assert_one_current_dispatch(result, NEW_SHA)
+
+    def test_scheduled_legacy_marker_without_detail_is_recognized(self):
+        scenario = self.durable_scenario()
+        scenario["comments"][0]["body"] = (
+            scenario["comments"][0]["body"].replace(" detail=test", "")
+        )
+        result = self.run_scenario(scenario)
+        self.assert_one_current_dispatch(result, NEW_SHA)
+
     def test_scheduled_issue_guards_fail_closed(self):
         for label in (
             "automation:paused",

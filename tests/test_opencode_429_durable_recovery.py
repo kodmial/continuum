@@ -13,6 +13,7 @@ import json
 import shutil
 import subprocess
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -384,6 +385,45 @@ class SchedulerDurableRecoveryTests(unittest.TestCase):
                 self.assertTrue(evaluation["keepReservation"])
                 self.assertTrue(evaluation["recoveryPending"])
                 self.assertEqual(evaluation["reason"], "malformed-marker")
+
+    def test_stale_fail_closed_marker_states_expire_by_age(self):
+        stale = int((time.time() - 2 * 24 * 60 * 60) * 1000)
+        cases = (
+            (
+                "malformed",
+                {"operation": "opencode-429-issue-issue373"},
+                {},
+                "malformed-marker-expired",
+            ),
+            (
+                "sha-invalid",
+                {"checkpointSha": "not-a-sha"},
+                {},
+                "checkpoint-sha-invalid-expired",
+            ),
+            (
+                "run-unavailable",
+                {},
+                {"runErrors": {OLD_RUN_ID: 403}},
+                "run-unavailable-expired",
+            ),
+            (
+                "checkpoint-unavailable",
+                {},
+                {"refError": 403},
+                "checkpoint-unavailable-expired",
+            ),
+        )
+        for name, recovery_update, scenario_update, reason in cases:
+            with self.subTest(name=name):
+                scenario = self.base_scenario()
+                scenario["recovery"].update(recovery_update)
+                scenario["recovery"]["commentAt"] = stale
+                scenario.update(scenario_update)
+                evaluation = self.run_scenario(scenario)["evaluation"]
+                self.assertFalse(evaluation["keepReservation"])
+                self.assertFalse(evaluation["recoveryPending"])
+                self.assertEqual(evaluation["reason"], reason)
 
     def test_48_hour_old_marker_has_no_cliff(self):
         # The evaluator never uses marker age: the exact run and checkpoint
