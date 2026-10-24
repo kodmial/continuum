@@ -31,8 +31,36 @@ repository variable shown below.
 | `CONTINUUM_PUBLISH_STATUS` | `true` | Publish pending/final status. |
 | `CONTINUUM_DISPATCH_REPAIR` | `true` | Dispatch repair after a PR validation result. |
 | `CONTINUUM_REPAIR_WORKFLOW` | `continuum-opencode-repair.yml` | Repair caller file. |
-| `CONTINUUM_CI_REPAIR_WORKFLOWS` | `CI` | Comma- or newline-separated exact workflow names whose completed pull-request runs may dispatch an OpenCode `ci-fix`. Only these exact names are admitted; the repair caller wakes broadly because a `workflow_run` filter cannot read repository variables. |
+| `CONTINUUM_CI_REPAIR_WORKFLOWS` | `CI` | Comma- or newline-separated exact workflow names whose completed pull-request runs may dispatch an OpenCode `ci-fix`. Only these exact names are admitted; the repair caller wakes broadly because a `workflow_run` filter cannot read repository variables, then skips the runner for an unapproved completed name. |
 | `CONTINUUM_SKIP_OPENCODE_PR` | `false` | Suppress duplicate pull_request validation for `opencode/*` branches. |
+
+### CI-repair wake-up admission
+
+GitHub does not allow a repository variable in a `workflow_run` event filter, so
+the installed repair caller still creates a controller run for every completed
+workflow. The caller and the reusable controller therefore read
+`CONTINUUM_CI_REPAIR_WORKFLOWS` in their job-level `if` and skip the runner
+before any checkout, git fetch, or GitHub API call when the completed name
+cannot be admitted. The check is a conservative substring superset of the
+controller's exact, comma/newline-aware allow-list, so it can never skip an
+approved name and the exact runtime admission remains authoritative.
+
+A suppressed completion gets a unique concurrency group, so it cannot replace a
+pending same-head run of an approved workflow. All approved workflow names,
+including custom names added to the variable later, still share the exact-head
+lock. The direct `workflow_dispatch` CI report and the `pull_request_target`
+branch-sync path do not use this name admission and are unaffected.
+
+This change does not remove the broad `workflow_run` trigger or introduce a
+timer; workflow-run creation itself remains a GitHub limitation, and durable
+all-event ingress/retirement stays with the paused #344/#345 successor work.
+
+Upgrade: reinstall the `core` set so the installed caller also skips before the
+reusable job is created. Existing installed callers already benefit from the
+reusable controller admission because it is referenced at `@main`. Rollback:
+restore the previous `continuum-opencode-repair.yml` caller and/or controller
+revision; the event trigger and both independent dispatch paths are unchanged,
+so no trigger migration is needed to roll back.
 
 The reusable engine is **not** installed as a `continuum-validation.yml`
 caller. Each consumer owns one primary `.github/workflows/ci.yml` whose
