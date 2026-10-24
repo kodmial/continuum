@@ -5740,7 +5740,7 @@ class ContinuumTest < Minitest::Test
     assert_includes issue, 'CONTINUUM_PREPARE_COMMAND: ${{ vars.CONTINUUM_PREPARE_COMMAND }}'
     assert_includes issue, 'CONTINUUM_BUILD_COMMAND: ${{ vars.CONTINUUM_BUILD_COMMAND }}'
     assert_includes issue, 'CONTINUUM_TEST_COMMAND: ${{ vars.CONTINUUM_TEST_COMMAND }}'
-    assert_includes issue, 'CONTINUUM_VALIDATION_COMMAND: ${{ vars.CONTINUUM_VALIDATION_COMMAND }}'
+    assert_includes issue, 'CONTINUUM_VALIDATION_COMMAND: ${{ inputs.validation_command || vars.CONTINUUM_VALIDATION_COMMAND }}'
     refute_includes issue, 'swift test',
                     'issue-mode verification must not hard-code a consumer language command'
   end
