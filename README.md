@@ -307,7 +307,7 @@ Repository variables:
 | --- | --- | --- |
 | `AUTOMATION_READY_LABEL` | empty | Optional admission label. When set, automatic implementation dispatches only issues carrying it. **When empty, any eligible open issue may be enqueued.** |
 | `CONTINUUM_REVIEW_PROVIDER` | `none` | Authoritative review selector: `none`, `coderabbit`, or `pr-agent`. |
-| `CONTINUUM_CI_REPAIR_WORKFLOWS` | `CI` | Comma- or newline-separated exact workflow names whose completed pull-request runs may dispatch an OpenCode `ci-fix`; the repair caller wakes broadly because a `workflow_run` filter cannot read repository variables. |
+| `CONTINUUM_CI_REPAIR_WORKFLOWS` | `CI` | Comma- or newline-separated exact workflow names whose completed pull-request runs may dispatch an OpenCode `ci-fix`; the repair caller wakes broadly because a `workflow_run` filter cannot read repository variables, then skips the runner for an unapproved completed name. |
 | `OPENCODE_MODEL` | free anonymous default | Optional model override for OpenCode. |
 | `MAINTAINERS` | empty | Optional maintainer allow-list for controllers. |
 | `AUTOMATION_WIP_LIMIT`, `AUTOMATION_LEASE_MINUTES`, `AUTOMATION_MAX_DISPATCH_ATTEMPTS` | scheduler defaults | Optional scheduler tuning. |
