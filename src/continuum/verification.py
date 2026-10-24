@@ -186,9 +186,257 @@ def _resolve_literal(
     return str(environ.get(match.group(1), "") or "").strip(), ""
 
 
-_HOOK_LINE = re.compile(
-    r"^\s*(?:-\s*)?(['\"]?)(prepare|build|test|validation)_command\1\s*:\s*(.*?)\s*$"
+_HOOK_KEYS = {hook + "_command": hook for hook, _ in HOOKS}
+_BLOCK_SCALAR_HEADER = re.compile(
+    r"\A[|>](?:[+-]?[1-9]?|[1-9][+-]?)\Z"
 )
+_DOUBLE_ESCAPES = {
+    "0": "\0",
+    "a": "\a",
+    "b": "\b",
+    "t": "\t",
+    "n": "\n",
+    "v": "\v",
+    "f": "\f",
+    "r": "\r",
+    "e": "\x1b",
+    " ": " ",
+    '"': '"',
+    "/": "/",
+    "\\": "\\",
+    "N": "\u0085",
+    "_": "\u00a0",
+    "L": "\u2028",
+    "P": "\u2029",
+}
+
+
+def _leading_spaces(line: str) -> int:
+    return len(line) - len(line.lstrip(" "))
+
+
+def _strip_comment(raw: str) -> str:
+    """Strip a YAML comment while preserving quoted ``#`` characters."""
+
+    quote: Optional[str] = None
+    for index, char in enumerate(raw):
+        if quote is not None:
+            if char == quote:
+                quote = None
+            continue
+        if char in ("'", '"'):
+            quote = char
+            continue
+        if char == "#" and (index == 0 or raw[index - 1] in " \t"):
+            return raw[:index]
+    return raw
+
+
+def _unquote_scalar(raw: str) -> str:
+    text = raw.strip()
+    if len(text) < 2 or text[0] not in ("'", '"') or text[-1] != text[0]:
+        return text
+    if text[0] == "'":
+        return text[1:-1].replace("''", "'")
+    inner = text[1:-1]
+    out: List[str] = []
+    index = 0
+    while index < len(inner):
+        char = inner[index]
+        if char != "\\":
+            out.append(char)
+            index += 1
+            continue
+        if index + 1 >= len(inner):
+            return inner
+        marker = inner[index + 1]
+        if marker == "u" and index + 6 <= len(inner):
+            try:
+                out.append(chr(int(inner[index + 2 : index + 6], 16)))
+            except ValueError:
+                return inner
+            index += 6
+            continue
+        out.append(_DOUBLE_ESCAPES.get(marker, marker))
+        index += 2
+    return "".join(out)
+
+
+def _split_mapping_entry(text: str) -> Optional[Tuple[str, str]]:
+    quote: Optional[str] = None
+    for index, char in enumerate(text):
+        if quote is not None:
+            if char == quote:
+                quote = None
+            continue
+        if char in ("'", '"'):
+            quote = char
+            continue
+        if char == ":" and (index + 1 == len(text) or text[index + 1] in " \t"):
+            key = text[:index].strip()
+            if key[:1] in ("'", '"') and key[-1:] == key[:1]:
+                key = _unquote_scalar(key)
+            if not key:
+                return None
+            return key, text[index + 1 :].strip()
+    return None
+
+
+def _fold_block_lines(lines: Sequence[str]) -> str:
+    parts: List[str] = []
+    pending_blank = 0
+    previous_more_indented = False
+    has_previous = False
+    for line in lines:
+        if line == "":
+            pending_blank += 1
+            continue
+        more_indented = line[:1] in (" ", "\t")
+        if has_previous:
+            if pending_blank:
+                parts.append("\n" * pending_blank)
+            elif previous_more_indented or more_indented:
+                parts.append("\n")
+            else:
+                parts.append(" ")
+        elif pending_blank:
+            parts.append("\n" * pending_blank)
+        parts.append(line)
+        has_previous = True
+        previous_more_indented = more_indented
+        pending_blank = 0
+    if pending_blank:
+        parts.append("\n" * pending_blank)
+    return "".join(parts)
+
+
+def _parse_block_scalar(
+    header: str, lines: Sequence[str], start: int, parent_indent: int
+) -> Tuple[str, int]:
+    """Parse a YAML ``|``/``>`` block scalar starting on ``start``."""
+
+    style = header[0]
+    chomp = ""
+    indicator = 0
+    for char in header[1:]:
+        if char in "+-":
+            chomp = char
+        elif char.isdigit():
+            indicator = int(char)
+    if indicator:
+        content_indent = parent_indent + indicator
+    else:
+        content_indent = parent_indent + 1
+        for probe in range(start, len(lines)):
+            raw = lines[probe]
+            if not raw.strip():
+                continue
+            indent = _leading_spaces(raw)
+            if indent > parent_indent:
+                content_indent = indent
+            break
+    collected: List[str] = []
+    index = start
+    while index < len(lines):
+        raw = lines[index]
+        if not raw.strip():
+            collected.append("")
+            index += 1
+            continue
+        indent = _leading_spaces(raw)
+        if indent < content_indent:
+            break
+        collected.append(raw[content_indent:])
+        index += 1
+    if style == "|":
+        text = "\n".join(collected)
+    else:
+        text = _fold_block_lines(collected)
+    if chomp == "-":
+        text = text.rstrip("\n")
+    elif chomp == "+":
+        if text and not text.endswith("\n"):
+            text += "\n"
+    elif text:
+        text = text.rstrip("\n") + "\n"
+    return text, index
+
+
+def _is_shell_comment_only(command: str) -> bool:
+    has_content = False
+    for line in command.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        has_content = True
+        if not stripped.startswith("#"):
+            return False
+    return has_content
+
+
+def _find_validation_caller(
+    lines: Sequence[str],
+) -> Optional[Tuple[int, int]]:
+    """Locate the ``uses:`` entry for the primary validation caller."""
+
+    for index, raw in enumerate(lines):
+        code = _strip_comment(raw)
+        if not code.strip():
+            continue
+        indent = _leading_spaces(raw)
+        text = code.strip()
+        if text.startswith("- "):
+            rest = text[2:]
+            key_indent = indent + 2 + (len(rest) - len(rest.lstrip()))
+            text = rest.lstrip()
+        else:
+            key_indent = indent
+        entry = _split_mapping_entry(text)
+        if entry is None or entry[0] != "uses":
+            continue
+        value = _unquote_scalar(entry[1])
+        if not value:
+            continue
+        base = value.split("@", 1)[0].rstrip("/")
+        if base.rsplit("/", 1)[-1] == "continuum-validation.yml":
+            return index, key_indent
+    return None
+
+
+def _find_with_entry(
+    lines: Sequence[str], uses_index: int, key_indent: int
+) -> Optional[Tuple[int, str]]:
+    for index in range(uses_index + 1, len(lines)):
+        raw = lines[index]
+        code = _strip_comment(raw)
+        if not code.strip():
+            continue
+        indent = _leading_spaces(raw)
+        if indent < key_indent:
+            return None
+        if indent > key_indent:
+            continue
+        text = code.strip()
+        if text.startswith("- "):
+            return None
+        entry = _split_mapping_entry(text)
+        if entry is not None and entry[0] == "with":
+            return index, entry[1]
+    return None
+
+
+def _with_mapping_indent(
+    lines: Sequence[str], with_index: int, with_indent: int
+) -> Optional[int]:
+    for index in range(with_index + 1, len(lines)):
+        raw = lines[index]
+        if not raw.strip() or not _strip_comment(raw).strip():
+            continue
+        indent = _leading_spaces(raw)
+        if indent <= with_indent:
+            return None
+        return indent
+    return None
 
 
 def _ci_caller_commands(
@@ -196,10 +444,10 @@ def _ci_caller_commands(
 ) -> Tuple[Dict[str, Tuple[str, str]], List[str]]:
     """Read literal hook commands from the consumer's primary CI caller.
 
-    The file is scanned textually on purpose: a workflow's ``on:`` block may use
-    YAML features that Continuum's restricted config parser rejects, while the
-    values Continuum needs are plain ``<hook>_command:`` scalars. Only files that
-    actually call ``continuum-validation.yml`` are considered.
+    Only the ``with:`` mapping of the job/step that calls
+    ``continuum-validation.yml`` is read, so an unrelated ``uses:`` block cannot
+    supply a hook. Values obey YAML scalar rules: block scalars are expanded,
+    quoted scalars are unquoted, and comments do not become commands.
     """
 
     values: Dict[str, Tuple[str, str]] = {}
@@ -208,33 +456,66 @@ def _ci_caller_commands(
         path = repo_root / relative
         if not path.is_file():
             continue
-        text = _read_text(path)
-        if "continuum-validation.yml" not in text:
+        lines = _read_text(path).splitlines()
+        caller = _find_validation_caller(lines)
+        if caller is None:
             continue
-        for line in text.splitlines():
-            match = _HOOK_LINE.match(line)
-            if match is None:
+        uses_index, key_indent = caller
+        with_entry = _find_with_entry(lines, uses_index, key_indent)
+        if with_entry is None:
+            continue
+        with_index, raw_with = with_entry
+        if raw_with:
+            continue
+        mapping_indent = _with_mapping_indent(lines, with_index, key_indent)
+        if mapping_indent is None:
+            continue
+        index = with_index + 1
+        while index < len(lines):
+            raw = lines[index]
+            code = _strip_comment(raw)
+            if not code.strip():
+                index += 1
                 continue
-            hook = match.group(2)
-            if hook in values:
+            indent = _leading_spaces(raw)
+            if indent <= key_indent:
+                break
+            if indent != mapping_indent:
+                index += 1
                 continue
-            raw = match.group(3).strip()
-            if raw[:1] in ("'", '"') and len(raw) >= 2 and raw.endswith(raw[0]):
-                quote = raw[0]
-                raw = raw[1:-1]
-                if quote == '"':
-                    raw = raw.replace('\\"', '"').replace("\\\\", "\\")
-                else:
-                    raw = raw.replace("''", "'")
-            literal, error = _resolve_literal(raw, environ)
+            entry = _split_mapping_entry(code.strip())
+            if entry is None:
+                index += 1
+                continue
+            key, raw_value = entry
+            hook = _HOOK_KEYS.get(key)
+            if hook is None or hook in values:
+                index += 1
+                continue
+            header = raw_value if _BLOCK_SCALAR_HEADER.match(raw_value) else None
+            if header is not None:
+                scalar, index = _parse_block_scalar(
+                    header, lines, index + 1, indent
+                )
+            else:
+                scalar = _unquote_scalar(raw_value) if raw_value else ""
+                index += 1
+            literal, error = _resolve_literal(scalar, environ)
             if error:
                 errors.append("{}: {}".format(relative, error))
                 continue
-            if literal:
-                values[hook] = (
-                    literal,
-                    "{}:{}_{}".format(relative, hook, "command"),
+            if not literal:
+                continue
+            if _is_shell_comment_only(literal):
+                errors.append(
+                    "{}: {}_command is a shell comment with no command; "
+                    "refusing a silent no-op".format(relative, hook)
                 )
+                continue
+            values[hook] = (
+                literal,
+                "{}:{}_{}".format(relative, hook, "command"),
+            )
         if values:
             break
     return values, errors

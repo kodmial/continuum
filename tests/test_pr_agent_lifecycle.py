@@ -108,10 +108,11 @@ APPROVED_413_OPENCODE_SHA256 = (
 )
 # kodmial/continuum#168: the reviewed issue-mode verification contract adds the
 # pre-implementation baseline, the fresh verifier/fix session, and the identical
-# post-change run before the workflow-owned commit. Historical digests above
-# remain for audit.
+# post-change run before the workflow-owned commit. The reviewed repair keeps
+# the stop-signal traps armed through the final verification and empty-change
+# gate. Historical digests above remain for audit.
 APPROVED_168_OPENCODE_SHA256 = (
-    "af14142a56033870f8dd3bcd6eb7751008178205dd828aa91b2388ef3056c48f"
+    "2291ad53984296d8a88b177c7b137bb1396f97a7efea0c3800d281dc6a707491"
 )
 
 APPROVED_350_SELF_CALLER_SHA256 = (

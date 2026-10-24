@@ -82,6 +82,11 @@ class VerificationContractTest(unittest.TestCase):
             lines.append("      {}_command: {}".format(name, json.dumps(command)))
         (workflows / "ci.yml").write_text("\n".join(lines) + "\n", encoding="utf-8")
 
+    def write_ci(self, text: str) -> None:
+        workflows = self.repo / ".github" / "workflows"
+        workflows.mkdir(parents=True, exist_ok=True)
+        (workflows / "ci.yml").write_text(text, encoding="utf-8")
+
     def test_unconfigured_contract_is_an_explicit_failure(self):
         contract = verification.resolve_contract(self.repo, self.env)
         self.assertEqual("unconfigured", contract.state)
@@ -137,6 +142,73 @@ class VerificationContractTest(unittest.TestCase):
             verification.ensure_baseline(
                 self.repo, self.evidence, self.base, self.env
             )
+
+    def test_ci_caller_block_scalars_are_parsed_as_commands(self):
+        self.write_ci(
+            "name: CI\n"
+            "on: [push]\n"
+            "jobs:\n"
+            "  validate:\n"
+            "    uses: kodmial/continuum/.github/workflows/continuum-validation.yml@main\n"
+            "    with:\n"
+            "      test_command: | # inline comment is not part of the command\n"
+            "        test -f canary.txt\n"
+            "      build_command: >-\n"
+            "        python3 -c\n"
+            '        "print(\'build\')"\n'
+        )
+        contract = verification.resolve_contract(self.repo, self.env)
+        self.assertEqual("configured", contract.state)
+        self.assertEqual("ci-caller", contract.source)
+        commands = {command.name: command.command for command in contract.commands}
+        self.assertEqual("test -f canary.txt", commands["test"])
+        self.assertEqual('python3 -c "print(\'build\')"', commands["build"])
+
+    def test_ci_caller_comment_only_scalar_falls_back_to_repository_variables(self):
+        self.write_ci(
+            "name: CI\n"
+            "on: [push]\n"
+            "jobs:\n"
+            "  validate:\n"
+            "    uses: kodmial/continuum/.github/workflows/continuum-validation.yml@main\n"
+            "    with:\n"
+            "      test_command: # disabled in this caller\n"
+        )
+        self.env["CONTINUUM_TEST_COMMAND"] = "custom-check --all"
+        contract = verification.resolve_contract(self.repo, self.env)
+        self.assertEqual("repository-variables", contract.source)
+        self.assertEqual(["custom-check --all"],
+                         [command.command for command in contract.commands])
+
+    def test_ci_caller_quoted_comment_only_command_fails_closed(self):
+        self.make_ci(test="# no test configured")
+        self.env["CONTINUUM_TEST_COMMAND"] = "different-check"
+        contract = verification.resolve_contract(self.repo, self.env)
+        self.assertEqual("unconfigured", contract.state)
+        self.assertIn("silent no-op", contract.errors[0])
+        with self.assertRaises(verification.VerificationError):
+            verification.ensure_baseline(
+                self.repo, self.evidence, self.base, self.env
+            )
+
+    def test_ci_caller_ignores_hooks_from_an_unrelated_uses_block(self):
+        self.write_ci(
+            "name: CI\n"
+            "on: [push]\n"
+            "jobs:\n"
+            "  unrelated:\n"
+            "    uses: example/action@main\n"
+            "    with:\n"
+            "      test_command: echo wrong\n"
+            "  validate:\n"
+            "    uses: kodmial/continuum/.github/workflows/continuum-validation.yml@main\n"
+            "    with:\n"
+            "      test_command: echo right\n"
+        )
+        contract = verification.resolve_contract(self.repo, self.env)
+        self.assertEqual("configured", contract.state)
+        self.assertEqual(["echo right"],
+                         [command.command for command in contract.commands])
 
     def test_baseline_runs_once_then_is_reused_on_a_checkpoint(self):
         marker = self.repo / "baseline-runs.txt"

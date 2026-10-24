@@ -3261,7 +3261,6 @@ jobs:
               rm -f "$OPENCODE_VERIFIER_LOG"
               checkpoint_issue_progress "$OPENCODE_VERIFIER_RC"
             fi
-            trap - TERM INT HUP
             if [[ "$OPENCODE_VERIFIER_RC" -eq 75 || "$OPENCODE_VERIFIER_RC" -eq 76 ]]; then
               rm -f "$OPENCODE_VERIFIER_LOG"
               export CONTINUUM_429_LEGACY_REF="$CHECKPOINT_BRANCH"
@@ -3282,6 +3281,11 @@ jobs:
           else
             echo "429 checkpoint already carries a successful independent verifier/fix session; reusing that evidence."
           fi
+          # Keep stop signals checkpointing until the publish boundary, including
+          # the resumed path where no fresh verifier session runs.
+          trap 'checkpoint_issue_progress 143' TERM
+          trap 'checkpoint_issue_progress 130' INT
+          trap 'checkpoint_issue_progress 129' HUP
 
           # kodmial/continuum#168: the final run repeats the exact command set
           # recorded by the baseline. A failed or unavailable required check
