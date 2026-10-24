@@ -92,7 +92,7 @@ class VerificationContractTest(unittest.TestCase):
             ROOT / ".github" / "workflows" / "continuum-opencode.yml"
         ).read_text(encoding="utf-8")
         self.assertIn(
-            "      validation_command:\\n"
+            "      validation_command:\n"
             "        description: >-",
             workflow,
         )
