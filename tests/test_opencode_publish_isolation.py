@@ -123,12 +123,14 @@ class PublishIsolationTest(unittest.TestCase):
             ".continuum-cancel-engine",
             ".continuum-429-recovery.json",
             ".continuum-429-stage",
+            ".continuum-verification.json",
         ):
             self.assertFalse((repo / name).exists(), "{} leaked".format(name))
         staged = run_git(repo, "ls-files", "--stage")
         self.assertNotIn(".continuum-cancel-engine", staged)
         self.assertNotIn(".continuum-429-recovery.json", staged)
         self.assertNotIn(".continuum-429-stage", staged)
+        self.assertNotIn(".continuum-verification.json", staged)
 
     def test_missing_ignore_untracked_gitlink_is_excluded_from_real_checkout(self):
         self.assertFalse((self.repo / ".gitignore").exists())
@@ -187,15 +189,20 @@ class PublishIsolationTest(unittest.TestCase):
         (self.repo / ".continuum-429-recovery.json").write_text(
             '{"schema_version": 1}\n', encoding="utf-8"
         )
+        (self.repo / ".continuum-verification.json").write_text(
+            '{"schema_version": 1}\n', encoding="utf-8"
+        )
 
         completed = self.stage("continuum_stage_checkpoint")
         self.assertEqual(completed.returncode, 0, completed.stderr)
         self.assertTrue((self.repo / ".continuum-429-stage").is_file())
         self.assertTrue((self.repo / ".continuum-429-recovery.json").is_file())
+        self.assertTrue((self.repo / ".continuum-verification.json").is_file())
         self.assertFalse((self.repo / ".continuum-cancel-engine").exists())
         staged = run_git(self.repo, "ls-files", "--stage")
         self.assertIn(".continuum-429-stage", staged)
         self.assertIn(".continuum-429-recovery.json", staged)
+        self.assertIn(".continuum-verification.json", staged)
         self.assertNotIn(".continuum-cancel-engine", staged)
 
     def test_interrupted_429_checkpoint_resumes_to_a_clean_pull_request(self):

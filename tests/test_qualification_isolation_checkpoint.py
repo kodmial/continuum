@@ -95,7 +95,7 @@ class InterruptedIssueCheckpointTests(unittest.TestCase):
             # instead of the bare interruption exit.
             'continuum_infra_evacuate "opencode-429-issue-issue${ISSUE_NUMBER}"',
             'git push --force origin "HEAD:refs/heads/$CHECKPOINT_BRANCH"',
-            'COMMITS_FROM_START="$(git rev-list --count "$BASE_START_SHA..HEAD"',
+            'verification_python changes --repo "$GITHUB_WORKSPACE" --base-sha "$BASE_START_SHA"',
         ):
             self.assertIn(marker, implement)
 

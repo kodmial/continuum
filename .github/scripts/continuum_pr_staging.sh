@@ -23,6 +23,7 @@ CONTINUUM_PUBLISH_EXCLUDED_PATHS=(
   ".continuum-admission-engine"
   ".continuum-429-recovery.json"
   ".continuum-429-stage"
+  ".continuum-verification.json"
 )
 
 CONTINUUM_CHECKPOINT_EXCLUDED_PATHS=(

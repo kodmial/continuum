@@ -106,6 +106,13 @@ APPROVED_415_OPENCODE_SHA256 = (
 APPROVED_413_OPENCODE_SHA256 = (
     "566da1b1ccb719f0016a68a54542e6917155bdbd7918711e0051d8f30dc119be"
 )
+# kodmial/continuum#168: the reviewed issue-mode verification contract adds the
+# pre-implementation baseline, the fresh verifier/fix session, and the identical
+# post-change run before the workflow-owned commit. Historical digests above
+# remain for audit.
+APPROVED_168_OPENCODE_SHA256 = (
+    "04e8f58157d4eb5f6b348aa18dcdba0d213b12e2dd40893e81d027ca482c6bdb"
+)
 
 APPROVED_350_SELF_CALLER_SHA256 = (
     "f06cdcb9affc06f976aed97945ff9d31496e5954ca225971164f87ec4e1ca22c"
@@ -2521,13 +2528,14 @@ class ProtectedBaselineTests(unittest.TestCase):
                     self.assertIn("CONTINUUM_OPENCODE_PUBLISH_RACE_RETRY_REQUIRED", original)
                     self.assertIn("steps.model_route.outputs.model", original)
                 if path == ".github/workflows/continuum-opencode.yml":
-                    # #415 replaces whole-transcript quota greps with the
-                    # authenticated provider-event classifier atop the exact
-                    # #350/#374/#400 metadata, routing, and checkout artifacts.
+                    # #168 brackets the reviewed #415 implementation with the
+                    # repository baseline, fresh verifier/fix session, and
+                    # identical final command set atop the #413 publish
+                    # isolation artifact.
                     self.assertEqual(
                         protected_file_digest(path),
-                        APPROVED_413_OPENCODE_SHA256,
-                        f"{path}: unexpected drift outside reviewed #413 publish isolation",
+                        APPROVED_168_OPENCODE_SHA256,
+                        f"{path}: unexpected drift outside reviewed #168 issue verification",
                     )
                 else:
                     # The self-dogfood caller is the dispatchable surface
@@ -2575,10 +2583,23 @@ class ProtectedBaselineTests(unittest.TestCase):
         out = subprocess.run(["git", "status", "--porcelain"], cwd=ROOT,
                              capture_output=True, text=True, timeout=30)
         self.assertEqual(out.returncode, 0, out.stderr)
+        # Issue-mode final verification deliberately runs before the workflow
+        # creates its task commit (#168). Approved protected artifacts may
+        # therefore be dirty in this pre-commit worktree; any unapproved byte
+        # change still fails the exact digest assertions above.
+        approved = {
+            ".github/workflows/continuum-opencode.yml": APPROVED_168_OPENCODE_SHA256,
+            ".github/workflows/opencode.yml": APPROVED_350_SELF_CALLER_SHA256,
+        }
         for path in PROTECTED_FILES:
             with self.subTest(path=path):
-                self.assertNotIn(path, out.stdout,
-                                 "protected runtime and task-policy files must be committed")
+                if path not in out.stdout:
+                    continue
+                self.assertEqual(
+                    protected_file_digest(path),
+                    approved[path],
+                    "uncommitted protected-file drift must still be the reviewed artifact",
+                )
 
 
 

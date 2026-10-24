@@ -5652,6 +5652,113 @@ class ContinuumTest < Minitest::Test
   # A task implementation command must obey the same dependency/DoR gate as
   # the scheduler. Manual /oc is not an escape hatch that may turn a blocked
   # tracking issue into a partial PR.
+  # kodmial/continuum#168: issue mode must not accept an implementation merely
+  # because one coding-agent run ended. The workflow owns the ordered contract
+  # baseline -> primary session -> fresh verifier/fix session -> identical final
+  # verification -> existing commit/PR lifecycle.
+  def test_issue_mode_brackets_implementation_with_authoritative_verification
+    issue = step_body(workflow_body('continuum-opencode.yml'), 'Implement issue')
+    refute_nil issue
+
+    baseline = issue.index('verification_python baseline')
+    primary = issue.index('continuum-opencode run --auto --model "$OPENCODE_MODEL" "$PROMPT"')
+    verifier = issue.index('continuum-opencode run --auto --model "$OPENCODE_MODEL" "$VERIFIER_PROMPT"')
+    final = issue.index('verification_python final')
+    commit = issue.index('git commit -m "${COMMIT_PREFIX}: implement issue')
+    refute_nil baseline, 'the authoritative baseline invocation is missing'
+    refute_nil primary, 'the primary OpenCode session is missing'
+    refute_nil verifier, 'the fresh implementation-verifier session is missing'
+    refute_nil final, 'the post-change verification invocation is missing'
+    refute_nil commit, 'the task commit is missing'
+    assert_operator baseline, :<, primary,
+                    'the repository baseline must run before implementation mutation'
+    assert_operator primary, :<, verifier,
+                    'the verifier must be a distinct session after the primary implementation'
+    assert_operator verifier, :<, final,
+                    'the identical post-change verification must follow the verifier/fix pass'
+    assert_operator final, :<, commit,
+                    'post-change verification must precede the task commit/PR lifecycle'
+
+    assert_includes issue, 'Post-change verification did not pass; refusing to commit or publish a successful implementation.'
+    assert_includes issue, 'POST_VERIFICATION_CHANGES="$(verification_python changes'
+    assert_includes issue, 'refusing an empty implementation commit'
+    assert_operator issue.index('POST_VERIFICATION_CHANGES='), :<, commit,
+                    'the verified tree must still contain task changes before commit'
+    assert_includes issue, '--resume-stage "$RECOVERY_STAGE_NOW"'
+    assert_includes issue, 'VERIFICATION_EVIDENCE_PATH: .continuum-verification.json'
+    assert_includes issue, 'CONTINUUM_PREPARE_COMMAND: ${{ vars.CONTINUUM_PREPARE_COMMAND }}'
+    assert_includes issue, 'CONTINUUM_BUILD_COMMAND: ${{ vars.CONTINUUM_BUILD_COMMAND }}'
+    assert_includes issue, 'CONTINUUM_TEST_COMMAND: ${{ vars.CONTINUUM_TEST_COMMAND }}'
+    assert_includes issue, 'CONTINUUM_VALIDATION_COMMAND: ${{ vars.CONTINUUM_VALIDATION_COMMAND }}'
+    refute_includes issue, 'swift test',
+                    'issue-mode verification must not hard-code a consumer language command'
+  end
+
+  def test_issue_mode_verifier_is_an_independent_completeness_and_regression_role
+    issue = step_body(workflow_body('continuum-opencode.yml'), 'Implement issue')
+    refute_nil issue
+
+    assert_includes issue, 'VERIFIER_PROMPT="$(cat <<EOF'
+    for marker in [
+      'This is a verification/fix role, not another generic implementation session.',
+      'Do not assume the previous implementation is correct merely because it finished or claimed success.',
+      'Complete specification / Definition of Done:',
+      '${EFFECTIVE_TITLE}',
+      '${EFFECTIVE_BODY}',
+      'git diff ${BASE_START_SHA}',
+      'Determine whether every requirement in the task is actually implemented',
+      'existing behavior outside the intended change was accidentally broken or degraded',
+      'missing edge cases, error handling, regressions, incomplete migrations',
+      'Reject unrelated refactoring or scope creep',
+      'fix it now in this same checkout, then re-inspect the resulting diff',
+      'Do not treat the first agent\'s explanation or claimed test results as proof',
+      'Do not edit, delete, or commit .continuum-verification.json',
+      'verification_python record-verifier',
+      'verification_python needs-verifier'
+    ]
+      assert_includes issue, marker
+    end
+    # A checkpoint before the verifier is complete must not be treated as a
+    # finished verification merely because the primary session ended.
+    assert_includes issue, 'if [[ "$VERIFIER_NEEDED" == "true" ]]; then'
+    assert_includes issue, 'echo "429 checkpoint already carries a successful independent verifier/fix session; reusing that evidence."'
+  end
+
+  def test_issue_mode_429_resume_skips_primary_coding_without_skipping_verification
+    issue = step_body(workflow_body('continuum-opencode.yml'), 'Implement issue')
+    refute_nil issue
+
+    assert_includes issue, 'SKIP_PRIMARY_IMPLEMENTATION=false'
+    assert_includes issue, 'implementation-complete|tests-running|tests-passed|publish-pr)'
+    assert_includes issue, 'SKIP_PRIMARY_IMPLEMENTATION=true'
+    assert_includes issue, 'already completed primary implementation; skipping the primary OpenCode coding session.'
+    assert_includes issue, 'printf \'implementation-complete\n\' > .continuum-429-stage'
+    assert_includes issue, 'printf \'tests-running\n\' > .continuum-429-stage'
+    assert_includes issue, 'printf \'tests-passed\n\' > .continuum-429-stage'
+    assert_includes issue, '"implementation-complete" "issue" "$ISSUE_NUMBER"',
+                    'a verifier 429 must checkpoint the completed primary implementation stage'
+    assert_includes issue, 'continuum_infra_evacuate "opencode-429-issue-issue${ISSUE_NUMBER}" "implementation-incomplete"',
+                    'the primary session still checkpoints an incomplete stage'
+  end
+
+  # The verification contract is consumer-owned and is resolved from the same
+  # existing configuration the validation engine uses, never from hard-coded
+  # project-specific commands.
+  def test_issue_mode_verification_resolver_is_repository_agnostic
+    source = File.read(File.join(ROOT, 'src/continuum/verification.py'))
+    assert_includes source, 'CONTINUUM_PREPARE_COMMAND'
+    assert_includes source, 'CONTINUUM_BUILD_COMMAND'
+    assert_includes source, 'CONTINUUM_TEST_COMMAND'
+    assert_includes source, 'CONTINUUM_VALIDATION_COMMAND'
+    assert_includes source, 'continuum-validation.yml'
+    assert_includes source, 'unconfigured'
+    assert_includes source, 'output_tail'
+    assert_includes source, 'environment_fingerprint'
+    assert_includes source, 'new_failures'
+    assert_includes source, 'preexisting_failures'
+    refute_match(/swift|java|phpunit|cargo|gradle|npm test/i, source)
+  end
+
   def test_issue_mode_checks_definition_of_ready_before_starting_the_agent
     body = workflow_body('continuum-opencode.yml')
 

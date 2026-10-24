@@ -34,6 +34,25 @@ repository variable shown below.
 | `CONTINUUM_CI_REPAIR_WORKFLOWS` | `CI` | Comma- or newline-separated exact workflow names whose completed pull-request runs may dispatch an OpenCode `ci-fix`. Only these exact names are admitted; the repair caller wakes broadly because a `workflow_run` filter cannot read repository variables. |
 | `CONTINUUM_SKIP_OPENCODE_PR` | `false` | Suppress duplicate pull_request validation for `opencode/*` branches. |
 
+Issue mode uses the same repository-authoritative verification contract. Before
+the primary coding session it resolves the consumer's literal
+`prepare_command`, `build_command`, `test_command`, and `validation_command`
+values from the primary `CI` caller (the file that calls
+`continuum-validation.yml`), falling back to the matching
+`CONTINUUM_*_COMMAND` repository variables. At least one of build, test, or
+validation must resolve; otherwise the implementation fails closed with an
+explicit unconfigured state instead of inventing a stack-specific check. A
+non-literal GitHub expression other than `${{ vars.NAME }}` is also an explicit
+unconfigured failure, never a silent fallback to a different command.
+
+The resolved command set runs once before implementation to record the baseline,
+then again after a fresh independent verifier/fix OpenCode session. The final
+run reuses the baseline's exact commands and environment fingerprint. A failed
+or unavailable post-change check never produces a successful result; a
+pre-existing baseline failure is recorded separately and does not become green.
+The workflow-owned `.continuum-verification.json` evidence is retained on a
+429 checkpoint and removed before the implementation commit/PR.
+
 The reusable engine is **not** installed as a `continuum-validation.yml`
 caller. Each consumer owns one primary `.github/workflows/ci.yml` whose
 workflow `name:` is **CI** and calls
