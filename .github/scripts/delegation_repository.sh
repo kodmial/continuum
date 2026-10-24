@@ -20,6 +20,21 @@ parent_children="${PARENT_CHILDREN:-}"
 # disclose the private child repository name in public parent logs.
 UNAVAILABLE=4
 
+# Plan-only inventory snapshot. These caches live for one process invocation
+# and are never read or written by resolve/verify/validation. They let a
+# multi-child plan read the owned-repository inventory once and probe each
+# candidate repository at most once while preserving the per-child checks.
+PLAN_LISTING=""
+PLAN_LISTING_LOADED=0
+PLAN_LEGACY_COUNTER=0
+PLAN_VARIABLES_JSON=""
+PLAN_LEGACY_FILE=""
+PLAN_RESOLVED_REPOSITORY=""
+declare -A PLAN_VARIABLES_CACHE=()
+declare -A PLAN_VARIABLES_STATE=()
+declare -A PLAN_LEGACY_CACHE=()
+declare -A PLAN_LEGACY_STATE=()
+
 # Bounded, classified GitHub REST read for delegated discovery
 # (kodmial/continuum#326). The retry policy is authoritative in
 # delegation_runtime.py: a transient 5xx/timeout or a rate-limited response
@@ -146,6 +161,11 @@ verify_child_variables_json() {
   python3 "$relation" verify-child-variables     --role "$role"     --declared-id "$declared_id"     --declared-parent "$declared_parent"     --child-id "$child_id"     --parent-repository "$GITHUB_REPOSITORY"
 }
 
+verify_child_legacy_config_file() {
+  local config_file="$1" child_id="$2"
+  python3 "$relation" verify-child     --config "$config_file"     --child-id "$child_id"     --parent-repository "$GITHUB_REPOSITORY"
+}
+
 verify_child_legacy_config() {
   local repository="$1" child_id="$2"
   local config_file="$RUNNER_TEMP/continuum-child-legacy-${child_id}.yml"
@@ -153,7 +173,7 @@ verify_child_legacy_config() {
     rm -f "$config_file"
     return 2
   fi
-  python3 "$relation" verify-child     --config "$config_file"     --child-id "$child_id"     --parent-repository "$GITHUB_REPOSITORY"
+  verify_child_legacy_config_file "$config_file" "$child_id"
   local rc=$?
   rm -f "$config_file"
   return "$rc"
@@ -179,6 +199,117 @@ verify_child_repository() {
   # only after a successful variables read, so a failed file fetch means the
   # candidate declares no usable legacy relationship and stays a non-match.
   verify_child_legacy_config "$repository" "$child_id" >/dev/null 2>&1
+}
+
+# Plan snapshot readers. Each stores its result in a global because command
+# substitution would run the cache update in a subshell that dies immediately.
+load_plan_listing() {
+  if [[ "$PLAN_LISTING_LOADED" -eq 1 ]]; then
+    return 0
+  fi
+  if ! PLAN_LISTING="$(api_read --paginate '/user/repos?affiliation=owner&per_page=100' --jq '.[].full_name')"; then
+    return "$UNAVAILABLE"
+  fi
+  PLAN_LISTING_LOADED=1
+}
+
+plan_repository_variables() {
+  local repository="$1"
+  if [[ "${PLAN_VARIABLES_STATE[$repository]:-0}" -eq 1 ]]; then
+    PLAN_VARIABLES_JSON="${PLAN_VARIABLES_CACHE[$repository]}"
+    return 0
+  fi
+  if ! PLAN_VARIABLES_JSON="$(repository_variables "$repository")"; then
+    return "$UNAVAILABLE"
+  fi
+  PLAN_VARIABLES_CACHE[$repository]="$PLAN_VARIABLES_JSON"
+  PLAN_VARIABLES_STATE[$repository]=1
+}
+
+plan_legacy_config() {
+  local repository="$1"
+  local config_file
+  if [[ "${PLAN_LEGACY_STATE[$repository]:-0}" -eq 1 ]]; then
+    PLAN_LEGACY_FILE="${PLAN_LEGACY_CACHE[$repository]}"
+    return 0
+  fi
+  PLAN_LEGACY_COUNTER=$((PLAN_LEGACY_COUNTER + 1))
+  config_file="$RUNNER_TEMP/continuum-child-legacy-plan-${PLAN_LEGACY_COUNTER}.yml"
+  if gh api "repos/$repository/contents/.continuum.yml" --jq '.content' 2>/dev/null     | tr -d '\n' | base64 -d >"$config_file" 2>/dev/null; then
+    PLAN_LEGACY_CACHE[$repository]="$config_file"
+    PLAN_LEGACY_STATE[$repository]=1
+    PLAN_LEGACY_FILE="$config_file"
+    return 0
+  fi
+  rm -f "$config_file"
+  PLAN_LEGACY_CACHE[$repository]=""
+  PLAN_LEGACY_STATE[$repository]=1
+  PLAN_LEGACY_FILE=""
+  return 1
+}
+
+plan_verify_child_repository() {
+  local repository="$1" child_id="$2"
+  local rc=0
+  plan_repository_variables "$repository" || rc=$?
+  if [[ "$rc" -ne 0 ]]; then
+    return "$rc"
+  fi
+  if [[ -n "$(variable_value "$PLAN_VARIABLES_JSON" CONTINUUM_ROLE)" ||
+        -n "$(variable_value "$PLAN_VARIABLES_JSON" CONTINUUM_CHILD_ID)" ||
+        -n "$(variable_value "$PLAN_VARIABLES_JSON" CONTINUUM_PARENT)" ]]; then
+    # An explicit relationship must never fall back to stale tracked settings.
+    verify_child_variables_json "$PLAN_VARIABLES_JSON" "$child_id"
+    return $?
+  fi
+
+  rc=0
+  plan_legacy_config "$repository" || rc=$?
+  if [[ "$rc" -ne 0 || -z "$PLAN_LEGACY_FILE" ]]; then
+    # Match verify_child_repository: a missing legacy file is a non-match, not
+    # an infrastructure outage, because the variables read already succeeded.
+    return 2
+  fi
+  verify_child_legacy_config_file "$PLAN_LEGACY_FILE" "$child_id" >/dev/null 2>&1
+}
+
+resolve_plan_child() {
+  local child_id="$1"
+  local candidate matched="" rc=0
+  local count=0
+
+  assert_parent_allows_child "$child_id"
+
+  load_plan_listing || rc=$?
+  if [[ "$rc" -ne 0 ]]; then
+    return "$rc"
+  fi
+
+  while IFS= read -r candidate; do
+    [[ -n "$candidate" ]] || continue
+    [[ "$candidate" == "$GITHUB_REPOSITORY" ]] && continue
+
+    local candidate_rc=0
+    plan_verify_child_repository "$candidate" "$child_id" >/dev/null 2>&1 || candidate_rc=$?
+    if [[ "$candidate_rc" -eq 0 ]]; then
+      matched="$candidate"
+      count=$((count + 1))
+      if [[ "$count" -gt 1 ]]; then
+        echo "::error::More than one repository declares the same child relationship." >&2
+        return 2
+      fi
+    elif [[ "$candidate_rc" -eq "$UNAVAILABLE" ]]; then
+      echo "::error::Delegated child discovery is unavailable; refusing to guess." >&2
+      return "$UNAVAILABLE"
+    fi
+  done <<<"$PLAN_LISTING"
+
+  if [[ "$count" -ne 1 ]]; then
+    echo "::error::No unique repository declares the requested child relationship." >&2
+    return 2
+  fi
+
+  PLAN_RESOLVED_REPOSITORY="$matched"
 }
 
 resolve_by_roles() {
@@ -307,7 +438,15 @@ case "${1:-}" in
     entries=()
     while IFS= read -r child_id; do
       [[ -n "$child_id" ]] || continue
-      repository="$(resolve_child "$child_id")"
+      if [[ -z "$repository_map_json" ]]; then
+        # Role-based plan reads one inventory snapshot and reuses candidate
+        # evidence across every requested child id. The result and checks stay
+        # identical to the per-child resolve path.
+        resolve_plan_child "$child_id"
+        repository="$PLAN_RESOLVED_REPOSITORY"
+      else
+        repository="$(resolve_child "$child_id")"
+      fi
       entries+=(
         "$(jq -cn --arg id "$child_id" --arg repository "$repository" \
           '{id:$id,repository:$repository}')"
