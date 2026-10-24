@@ -126,6 +126,9 @@ jobs:
       RETRY_MARKER: ${{ inputs.retry_marker || vars.AUTOMATION_WATCHDOG_RETRY_MARKER || '<!-- opencode-watchdog-retry -->' }}
       IN_PROGRESS_LABEL: ${{ inputs.in_progress_label || vars.AUTOMATION_IN_PROGRESS_LABEL || 'automation:in-progress' }}
       PAUSE_LABEL: ${{ inputs.pause_marker || vars.AUTOMATION_PAUSE_LABEL || 'automation:paused' }}
+      BLOCKED_LABEL: ${{ vars.AUTOMATION_BLOCKED_LABEL || 'automation:blocked' }}
+      QUALIFYING_LABEL: ${{ vars.AUTOMATION_QUALIFYING_LABEL || 'automation:qualifying' }}
+      NO_AUTO_MERGE_LABEL: ${{ vars.AUTOMATION_NO_AUTO_MERGE_LABEL || 'no-auto-merge' }}
       DISPATCH_MARKER: ${{ inputs.dispatch_marker || vars.AUTOMATION_DISPATCH_MARKER || '<!-- issue-scheduler-dispatch -->' }}
       PAUSE_ON_FAILURE: ${{ inputs.pause_on_failure || vars.AUTOMATION_PAUSE_ON_FAILURE || 'false' }}
       READ_GITHUB_TOKEN: ${{ github.token }}
@@ -298,7 +301,7 @@ jobs:
             }
 
             function parseRecoveryStates(body, operation, generation) {
-              const re = /<!--\s*continuum-429-recovery\s+op=(\S+)\s+gen=(\d+)\s+state=(\S+)\s+attempt=(\d+)\s+next_due=(\d+)\s+checkpoint=(\S*)\s+sha=(\S*)\s+run=(\S*)\s+detail=(\S*)\s*-->/g;
+              const re = /<!--\s*continuum-429-recovery\s+op=(\S+)\s+gen=(\d+)\s+state=(\S+)\s+attempt=(\d+)\s+next_due=(\d+)\s+checkpoint=(\S*)\s+sha=(\S*)\s+run=(\S*)(?:\s+detail=(\S*))?\s*-->/g;
               const text = String(body || '');
               const found = [];
               let match;
@@ -313,7 +316,7 @@ jobs:
                   checkpointRef: match[6] === '-' ? '' : match[6],
                   checkpointSha: match[7] === '-' ? '' : match[7],
                   runId: match[8] === '-' ? '' : match[8],
-                  detail: match[9] === '-' ? '' : match[9],
+                  detail: !match[9] || match[9] === '-' ? '' : match[9],
                 });
               }
               return found;
@@ -778,8 +781,10 @@ jobs:
             }
 
             // Publication evidence is checked through the API, never by
-            // reading arbitrary comment prose. Any PR on the issue branch (open,
-            // closed, or merged) proves the run already published.
+            // reading arbitrary comment prose. An open or merged PR on the
+            // issue branch proves the run already published; a PR closed
+            // without merge is not publication evidence and must not fence a
+            // verified newer checkpoint forever.
             async function hasPublishedResumptionPullRequest({
               mode, issueNumber, prNumber, identity,
             }) {
@@ -796,7 +801,16 @@ jobs:
                   const headRepo = String(pull.head?.repo?.full_name || '');
                   const headRef = String(pull.head?.ref || '');
                   if (headRepo !== owner + '/' + repo) return false;
-                  return branch ? headRef === branch : headRef.startsWith(prefix);
+                  const published =
+                    pull.state === 'open' ||
+                    Boolean(pull.merged_at) ||
+                    pull.merged === true;
+                  if (!published) return false;
+                  // Any published PR on this issue's OpenCode branch family
+                  // proves the work already published, even when the current
+                  // branch name advanced.
+                  return headRef.startsWith(prefix) ||
+                    (Boolean(branch) && headRef === branch);
                 });
               }
               if (/^[0-9]+$/.test(String(prNumber || ''))) {
@@ -910,6 +924,263 @@ jobs:
               };
             }
 
+            // kodmial/continuum#418: recent Actions history is only a wake-up
+            // hint. A durable `continuum-429-recovery` marker plus its
+            // checkpoint ref is the authoritative inventory, so a valid old
+            // checkpoint must remain recoverable no matter how many unrelated
+            // runs arrived afterwards. Discovery is bounded to currently
+            // reserved open issues, which keeps API cost WIP-sized.
+            const blockedLabel =
+              process.env.BLOCKED_LABEL || 'automation:blocked';
+            const qualifyingLabel =
+              process.env.QUALIFYING_LABEL || 'automation:qualifying';
+            const noAutoMergeLabel =
+              process.env.NO_AUTO_MERGE_LABEL || 'no-auto-merge';
+
+            function parseAnyRecoveryStates(body) {
+              const re = /<!--\s*continuum-429-recovery\s+op=(\S+)\s+gen=(\d+)\s+state=(\S+)\s+attempt=(\d+)\s+next_due=(\d+)\s+checkpoint=(\S*)\s+sha=(\S*)\s+run=(\S*)(?:\s+detail=(\S*))?\s*-->/g;
+              const text = String(body || '');
+              const found = [];
+              let match;
+              while ((match = re.exec(text)) !== null) {
+                found.push({
+                  operation: match[1],
+                  generation: Number(match[2]),
+                  state: match[3],
+                  attempt: Number(match[4]),
+                  nextDue: Number(match[5]),
+                  checkpointRef: match[6] === '-' ? '' : match[6],
+                  checkpointSha: match[7] === '-' ? '' : match[7],
+                  runId: match[8] === '-' ? '' : match[8],
+                  detail: !match[9] || match[9] === '-' ? '' : match[9],
+                });
+              }
+              return found;
+            }
+
+            // Only the workflow actor may publish recovery state. A commenter
+            // cannot forge ownership of a checkpoint by copying the marker.
+            function trustedRecoveryMarkerComment(comment) {
+              const login = String(comment.user?.login || '').toLowerCase();
+              if (login === 'github-actions[bot]') return true;
+              return login === String(owner || '').toLowerCase();
+            }
+
+            function latestTrustedRecoveryState(comments) {
+              let latest = null;
+              const ordered = comments.slice().sort(
+                (a, b) => Number(a.id || 0) - Number(b.id || 0)
+              );
+              for (const comment of ordered) {
+                if (!trustedRecoveryMarkerComment(comment)) continue;
+                const markers = parseAnyRecoveryStates(comment.body || '');
+                for (let index = 0; index < markers.length; index += 1) {
+                  const state = markers[index];
+                  const candidate = {
+                    ...state,
+                    commentId: Number(comment.id || 0),
+                    markerIndex: index,
+                  };
+                  if (
+                    !latest ||
+                    candidate.commentId > latest.commentId ||
+                    (candidate.commentId === latest.commentId &&
+                      candidate.markerIndex >= latest.markerIndex)
+                  ) {
+                    latest = candidate;
+                  }
+                }
+              }
+              return latest;
+            }
+
+            function parseCheckpointIdentity(checkpointRef) {
+              const match = /^opencode\/(?:429|infra)-checkpoint-(.+)-gen-(\d+)$/.exec(
+                String(checkpointRef || '')
+              );
+              if (!match) return null;
+              return {
+                operation: match[1],
+                generation: Number(match[2]),
+              };
+            }
+
+            function issueLabelNames(issue) {
+              return new Set(
+                (issue.labels || []).map(label =>
+                  typeof label === 'string' ? label : label.name
+                )
+              );
+            }
+
+            function isOpenCodeWorkflowCandidate(candidate) {
+              const path = String(candidate.path || '');
+              if (
+                /(?:^|\/)continuum-opencode\.yml$/.test(path) ||
+                /(?:^|\/)opencode\.yml$/.test(path)
+              ) {
+                return true;
+              }
+              return watchedWorkflow !== '' && candidate.name === watchedWorkflow;
+            }
+
+            async function listActiveOpenCodeRuns() {
+              const active = new Map();
+              for (const status of [
+                'in_progress', 'queued', 'requested', 'waiting', 'pending',
+              ]) {
+                const runs = await readGithub.paginate(
+                  readGithub.rest.actions.listWorkflowRunsForRepo,
+                  { owner, repo, status, per_page: 100 }
+                );
+                for (const candidate of runs) {
+                  if (candidate.status === 'completed') continue;
+                  active.set(String(candidate.id), candidate);
+                }
+              }
+              return [...active.values()];
+            }
+
+            async function discoverDurableRecoveryCandidates() {
+              const reserved = await readGithub.paginate(
+                readGithub.rest.issues.listForRepo,
+                {
+                  owner,
+                  repo,
+                  state: 'open',
+                  labels: inProgressLabel,
+                  per_page: 100,
+                }
+              );
+              const issues = reserved
+                .filter(issue => !issue.pull_request)
+                .slice(0, 100);
+              let activeRuns = null;
+              let activeRunsError = null;
+              let inspected = 0;
+              for (const listedIssue of issues) {
+                let issue = listedIssue;
+                try {
+                  issue = (await readGithub.rest.issues.get({
+                    owner, repo, issue_number: listedIssue.number,
+                  })).data;
+                } catch (err) {
+                  core.warning(
+                    'OpenCode durable 429 recovery could not re-read issue #' +
+                    listedIssue.number + ': ' + (err.message || err)
+                  );
+                  continue;
+                }
+                if (!issue || issue.state !== 'open' || issue.pull_request) {
+                  continue;
+                }
+                const labels = issueLabelNames(issue);
+                const blockedBy = [
+                  pausedLabel, blockedLabel, qualifyingLabel, noAutoMergeLabel,
+                ].filter(label => labels.has(label));
+                if (blockedBy.length > 0) {
+                  core.notice(
+                    'OpenCode durable 429 recovery leaves issue #' +
+                    issue.number + ' alone: reservation is ' +
+                    blockedBy.join(', ') + '.'
+                  );
+                  continue;
+                }
+                let comments;
+                try {
+                  comments = await listThreadComments(issue.number);
+                } catch (err) {
+                  core.warning(
+                    'OpenCode durable 429 recovery could not read comments for ' +
+                    'issue #' + issue.number + ': ' + (err.message || err)
+                  );
+                  continue;
+                }
+                const state = latestTrustedRecoveryState(comments);
+                if (!state) continue;
+                inspected += 1;
+                const identity = parseCheckpointIdentity(state.checkpointRef);
+                if (
+                  !identity ||
+                  identity.operation !== state.operation ||
+                  identity.generation !== Number(state.generation) ||
+                  !String(state.operation).split('-').includes(
+                    'issue' + issue.number
+                  )
+                ) {
+                  core.warning(
+                    'OpenCode durable 429 recovery ignored a malformed or ' +
+                    'foreign marker on issue #' + issue.number + ' (op=' +
+                    state.operation + ' gen=' + state.generation +
+                    ' checkpoint=' + (state.checkpointRef || '-') + ' run=' +
+                    (state.runId || '-') + ').'
+                  );
+                  continue;
+                }
+                if (activeRuns === null && !activeRunsError) {
+                  try {
+                    activeRuns = await listActiveOpenCodeRuns();
+                  } catch (err) {
+                    activeRunsError = err;
+                  }
+                }
+                if (activeRunsError) {
+                  core.warning(
+                    'OpenCode durable 429 recovery cannot verify competing ' +
+                    'runs for issue #' + issue.number + ' (op=' +
+                    state.operation + ' gen=' + state.generation +
+                    ' checkpoint=' + state.checkpointRef + ' run=' +
+                    (state.runId || '-') + '); failing closed for this pass.'
+                  );
+                  continue;
+                }
+                const competing = activeRuns.find(candidate => {
+                  if (String(candidate.id) === String(state.runId || '')) {
+                    return false;
+                  }
+                  if (!isOpenCodeWorkflowCandidate(candidate)) return false;
+                  return candidate.display_title ===
+                      'OpenCode issue #' + issue.number ||
+                    candidate.display_title ===
+                      recoveryRunName(state.operation, state.generation);
+                });
+                if (competing) {
+                  core.notice(
+                    'OpenCode durable 429 recovery stands down for issue #' +
+                    issue.number + ': active competing run ' + competing.id +
+                    ' owns the work (op=' + state.operation + ' gen=' +
+                    state.generation + ').'
+                  );
+                  continue;
+                }
+                await recoverFrom429OnFreshVm({
+                  owner,
+                  repo,
+                  run: {
+                    id: Number(state.runId) || 0,
+                    path: '',
+                    display_title: 'OpenCode issue #' + issue.number,
+                  },
+                  evacuated429: {
+                    checkpointRef: state.checkpointRef,
+                    checkpointSha: state.checkpointSha,
+                    operationId: state.operation,
+                    stage: '',
+                    generation: state.generation,
+                    mode: 'issue',
+                    issueNumber: String(issue.number),
+                    prNumber: '',
+                    branch: '',
+                  },
+                  max429Restarts,
+                });
+              }
+              core.notice(
+                'OpenCode 429 durable recovery inspected ' + inspected +
+                ' trusted recovery marker(s) on ' + issues.length +
+                ' reserved open issue(s).'
+              );
+            }
             async function recoverFrom429OnFreshVm({
               owner, repo, run, evacuated429,
               max429Restarts,
@@ -1060,6 +1331,74 @@ jobs:
                   ' advanced from stale event pointer ' + pointerSha +
                   ' to current ref tip ' + checkpointSha + '; using the tip.'
                 );
+              }
+
+              // Publication is authoritative for durable discovery too: an
+              // existing PR already carries the saved work, so no second
+              // implementation may be dispatched from this checkpoint. The
+              // observed path performs the same check with its exact run.
+              if (!previous || !observedFenceStates.has(previous.state)) {
+                let published = false;
+                try {
+                  published = await hasPublishedResumptionPullRequest({
+                    mode,
+                    issueNumber: issueText,
+                    prNumber: prText,
+                    identity,
+                  });
+                } catch (err) {
+                  const apiStatus = Number(err && err.status || 0);
+                  const retryAttempt =
+                    (Number(previous && previous.attempt) || 0) + 1;
+                  const retryBudget = Math.max(1, max429Restarts + 1);
+                  if (retryAttempt >= retryBudget) {
+                    await recordRecoveryState({
+                      ...baseState,
+                      checkpointSha,
+                      state: 'backoff',
+                      attempt: retryAttempt,
+                      nextDue: now + 3600,
+                      runId: previous && previous.runId || '',
+                      detail: 'attempts-exhausted',
+                      summary: 'OpenCode infrastructure resumption could not ' +
+                        'verify publication from authoritative GitHub evidence (' +
+                        'publication-status-' + (apiStatus || 'unavailable') +
+                        ') and the bounded retry budget is exhausted. The ' +
+                        'checkpoint is preserved; no duplicate dispatch was made.',
+                    });
+                    return;
+                  }
+                  await recordRecoveryState({
+                    ...baseState,
+                    checkpointSha,
+                    state: 'reconcile-pending',
+                    attempt: retryAttempt,
+                    nextDue: now + 300,
+                    runId: previous && previous.runId || '',
+                    detail: 'publication-status-' + (apiStatus || 'unavailable'),
+                    summary: 'OpenCode infrastructure resumption could not ' +
+                      'verify whether this checkpoint already published a PR (' +
+                      'publication-status-' + (apiStatus || 'unavailable') +
+                      '). The checkpoint is preserved and a bounded watchdog ' +
+                      'catch-up will retry; no duplicate dispatch was made.',
+                  });
+                  core.warning(
+                    'OpenCode infrastructure operation ' + operation +
+                    ' generation ' + generation + ' publication evidence is ' +
+                    'unavailable (' + (apiStatus || 'unavailable') +
+                    '); retrying on a bounded catch-up without dispatch.'
+                  );
+                  return;
+                }
+                if (published) {
+                  core.notice(
+                    'OpenCode infrastructure operation ' + operation +
+                    ' generation ' + generation + ' already has a pull request ' +
+                    'for checkpoint ' + checkpointRef + '; watchdog will not ' +
+                    'start another implementation.'
+                  );
+                  return;
+                }
               }
 
               // An owner STOP is authoritative for this operation. It is
@@ -1463,6 +1802,7 @@ jobs:
                 checkpointSha + '.'
               );
             }
+
             if (!run) {
               // kodmial/continuum#350: scheduled/eventless catch-up. The normal
               // path wakes only when a completed workflow_run is delivered. A
@@ -1592,6 +1932,7 @@ jobs:
                 'OpenCode 429 scheduled catch-up inspected ' +
                 catchUpCandidates.length + ' recent completed run(s).'
               );
+              await discoverDurableRecoveryCandidates();
               return;
             }
             const jobs = await readGithub.paginate(
