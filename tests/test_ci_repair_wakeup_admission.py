@@ -281,6 +281,27 @@ class WakeupAdmissionTests(unittest.TestCase):
         values = {"CONTINUUM_CI_REPAIR_WORKFLOWS": workflows} if workflows is not None else {}
         return render(self.group_template, context(event, vars=values, inputs=inputs))
 
+    def simulate_burst(self, events, *, workflows):
+        """Model GitHub's one-running-plus-one-pending queue per group.
+
+        Every event occupies the concurrency group its expression renders,
+        even when its job is later skipped. A group's first event starts
+        immediately; later events replace its single pending slot. Draining
+        the pending slot after the burst is the conservative worst case for
+        rapid arrivals.
+        """
+        queues = {}
+        started = []
+        for event in events:
+            queue = queues.setdefault(self.group(event, workflows=workflows), {"running": None, "pending": None})
+            if queue["running"] is None:
+                queue["running"] = event
+                started.append(event)
+            else:
+                queue["pending"] = event
+        started.extend(queue["pending"] for queue in queues.values() if queue["pending"] is not None)
+        return started
+
     # Approved completions and every supported delimiter style stay admitted.
 
     def test_default_ci_completion_is_admitted(self):
@@ -372,6 +393,49 @@ class WakeupAdmissionTests(unittest.TestCase):
         ]
         groups = {self.group(event, workflows="CI,Windows host") for event in events}
         self.assertEqual({"opencode-repair-" + "a" * 40}, groups)
+
+    def test_unapproved_burst_cannot_strand_an_approved_failure(self):
+        # Replay the concern from review: while an approved workflow is running,
+        # its approved failure is pending and a burst of unapproved completions
+        # arrives. GitHub keeps one running and one pending per group; because
+        # the unapproved events render unique groups they cannot replace the
+        # approved pending slot, so the approved survivor still reconciles the
+        # latest state and notices the failure.
+        workflows = "CI,Windows host"
+        events = [
+            workflow_run("Windows host", "success", run_id=10),
+            workflow_run("CI", "failure", run_id=11),
+            workflow_run("Release notes", "success", run_id=12),
+            workflow_run("Packaging smoke", "success", run_id=13),
+            workflow_run("Release notes", "failure", run_id=14),
+        ]
+        started = self.simulate_burst(events, workflows=workflows)
+        approved_started = [event for event in started if self.repair_admits(event, workflows=workflows)]
+
+        self.assertIn(events[1], approved_started,
+                      'the approved failure must survive an unapproved completion burst')
+        payload = listing(
+            *(run_record(event["event"]["workflow_run"]["id"], event["event"]["workflow_run"]["name"],
+                         conclusion=event["event"]["workflow_run"]["conclusion"]) for event in events)
+        )
+        expected = ("failure", "11", "CI")
+        for event in approved_started:
+            self.assertEqual(
+                expected,
+                classify_latest_state(payload, trusted=True, allowed_workflows=workflows),
+                f'{event["event"]["workflow_run"]["name"]} survivor did not reconcile the approved failure',
+            )
+
+    def test_caller_declares_and_forwards_the_admission_input(self):
+        caller_on = self.caller.get("on") or self.caller.get(True)
+        declaration = caller_on["workflow_dispatch"]["inputs"]["ci_repair_workflows"]
+        self.assertEqual("string", declaration["type"])
+        self.assertFalse(declaration["required"])
+        self.assertEqual(
+            "${{ inputs.ci_repair_workflows }}",
+            self.caller["jobs"]["call"]["with"]["ci_repair_workflows"],
+            'the declared caller input must be forwarded rather than left as dead expression code',
+        )
 
     def test_dispatch_and_branch_sync_keep_their_existing_group_keys(self):
         self.assertEqual(

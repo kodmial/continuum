@@ -79,7 +79,10 @@ jobs:
     #
     # Both non-workflow_run paths (pull_request_target branch sync and the
     # workflow_dispatch CI report) always pass. An empty variable keeps the
-    # controller's CI default.
+    # controller's CI default. `ci_repair_workflows` is declared as an optional
+    # workflow_dispatch input above and forwarded in `with` below, so this
+    # branch is a real caller-side override; on the other events it is empty
+    # and the `vars.` fallback applies.
     if: >-
       github.event_name != 'workflow_run' ||
       (github.event.workflow_run.name != 'OpenCode repair controller' &&

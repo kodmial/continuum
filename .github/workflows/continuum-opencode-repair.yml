@@ -101,6 +101,14 @@ concurrency:
   # every approved completion keeps the same-head serialization above while an
   # unapproved completion can never displace it. `contains` is a conservative
   # superset of the exact allow-list, exactly as in the caller admission.
+  #
+  # That isolation replaces the old backstop in which an unapproved completion
+  # could itself reconcile an approved failure after displacing its controller
+  # run: an unapproved completion can no longer enter (or be replaced within)
+  # the approved group, so the approved-group survivor is still present and
+  # re-reconciles the LATEST exact-head state. The burst replay tests model
+  # GitHub's one-running-plus-one-pending limit so no-missed-repair is checked
+  # rather than assumed from that queue behaviour.
   group: >-
     opencode-repair-${{
       (github.event_name == 'workflow_run' &&
