@@ -6,6 +6,8 @@ import subprocess
 import tempfile
 import unittest
 
+import yaml
+
 
 ROOT = Path(__file__).resolve().parents[1]
 ACTION = ROOT / ".github/actions/agent-toolchain"
@@ -70,6 +72,33 @@ class ToolchainCacheContractTests(unittest.TestCase):
     def test_invalid_component_fails_closed(self):
         result, _ = self.run_resolve(components="unknown")
         self.assertNotEqual(result.returncode, 0)
+
+    def test_review_bootstrap_selects_supported_python_before_cache(self):
+        # Regression: AA PR-Agent run 40146315087 hit Python 3.14 on
+        # ubuntu-latest and failed before review (venv requires 3.12).
+        workflow = yaml.safe_load(
+            (ROOT / ".github/workflows/continuum-pr-agent.yml").read_text()
+        )
+        steps = workflow["jobs"]["pr_agent"]["steps"]
+        python_step = next(
+            step for step in steps
+            if step.get("name") == "Set up Python 3.12 for PR-Agent venv"
+        )
+        bootstrap_step = next(
+            step for step in steps
+            if step.get("name") == "Restore verified cached PR-Agent and OpenCode"
+        )
+        self.assertLess(steps.index(python_step), steps.index(bootstrap_step))
+        self.assertEqual(python_step["if"], bootstrap_step["if"])
+        self.assertEqual(
+            python_step["uses"],
+            "actions/setup-python@82c7e631bb3cdc910f68e0081d67478d79c6982d",
+        )
+        self.assertEqual(python_step["with"]["python-version"], "3.12")
+        self.assertIn(
+            "PR-Agent venv requires Python 3.12",
+            (ACTION / "resolve.sh").read_text(),
+        )
 
     def test_no_cached_user_or_secret_data(self):
         action = (ACTION / "action.yml").read_text()
