@@ -3033,6 +3033,7 @@ jobs:
           always() &&
           steps.stack.outputs.enabled == 'true' &&
           steps.admit.outputs.admitted == 'true' &&
+          steps.runtime.outcome == 'success' &&
           failure() &&
           (steps.model_route.outcome == 'failure' ||
            steps.install_pragent.outcome == 'failure' ||
