@@ -776,6 +776,16 @@ class PrAgentTargetWorkflowContractTests(unittest.TestCase):
                     resolve,
                 )
 
+    def test_review_completion_watchdog_and_outer_timeout_are_aligned(self):
+        review = read(".github/workflows/continuum-pr-agent.yml")
+        # Upstream reviews of exact current HEADs were reproducibly cut off at
+        # 600s by the bridge although the runner/job had ample remaining time.
+        self.assertIn("PR_AGENT_TIMEOUT_SECONDS: '1200'", review)
+        self.assertEqual(review.count("CONFIG__AI_TIMEOUT: '1260'"), 2)
+        self.assertNotIn("PR_AGENT_TIMEOUT_SECONDS: '600'", review)
+        self.assertNotIn("CONFIG__AI_TIMEOUT: '660'", review)
+        self.assertIn("timeout-minutes: ${{ fromJSON(vars.AUTOMATION_PR_AGENT_TIMEOUT_MINUTES || '60') }}", review)
+
     def test_target_identity_rejects_dot_only_components(self):
         helper = read(".github/scripts/pr_agent_target.sh")
         self.assertIn("pr_agent_valid_target_repository", helper)
