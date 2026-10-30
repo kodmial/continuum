@@ -339,7 +339,7 @@ class Handler(BaseHTTPRequestHandler):
             # Python socket read timeout says "timed out", not "timeout".
             # Expose a 504 to reviewer routing, not a generic 502.
             timeout_detected = any(
-                token in str(exc).lower() for token in ("timeout", "timed out")
+                token in str(exc).lower() for token in ("timeout", "timed out", "watchdog")
             )
             status = 504 if timeout_detected else 502
             self._send(status, openai_error("upstream_error", str(exc)))
