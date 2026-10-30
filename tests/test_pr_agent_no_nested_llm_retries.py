@@ -115,8 +115,10 @@ class ReviewerRetryPolicy(unittest.TestCase):
         self.assertIn("steps.pragent.outputs.provider_failure", workflow)
         self.assertIn("operation: fail", workflow)
         self.assertIn("steps.model_route.outputs.model", workflow)
-        self.assertEqual(workflow.count("CONFIG__AI_TIMEOUT: '660'"), 2)
-        self.assertIn("PR_AGENT_TIMEOUT_SECONDS: '600'", workflow)
+        self.assertEqual(workflow.count("CONFIG__AI_TIMEOUT: '1260'"), 2)
+        self.assertIn("PR_AGENT_TIMEOUT_SECONDS: '1200'", workflow)
+        self.assertNotIn("CONFIG__AI_TIMEOUT: '660'", workflow)
+        self.assertNotIn("PR_AGENT_TIMEOUT_SECONDS: '600'", workflow)
         self.assertIn("Report safe OpenCode bridge phase timings", workflow)
 
 
