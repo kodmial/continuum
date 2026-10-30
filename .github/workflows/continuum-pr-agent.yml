@@ -691,6 +691,15 @@ jobs:
           fi
           echo "CONTINUUM_PR_AGENT_WORKTREE=$worktree" >> "$GITHUB_ENV"
 
+      # PR-Agent's verified venv is intentionally Python 3.12-only. The
+      # ubuntu-latest runner's default python3 may be newer (observed 3.14),
+      # so select the supported interpreter before resolving the cache key.
+      - name: Set up Python 3.12 for PR-Agent venv
+        if: steps.stack.outputs.enabled == 'true' && steps.admit.outputs.admitted == 'true'
+        uses: actions/setup-python@82c7e631bb3cdc910f68e0081d67478d79c6982d # v5
+        with:
+          python-version: '3.12'
+
       # Shared verified cache handles both the Python reviewer and OpenCode backend
       # once per fresh GitHub-hosted job; output/path validated by the action.
       - name: Restore verified cached PR-Agent and OpenCode
@@ -3024,6 +3033,7 @@ jobs:
           always() &&
           steps.stack.outputs.enabled == 'true' &&
           steps.admit.outputs.admitted == 'true' &&
+          steps.runtime.outcome == 'success' &&
           failure() &&
           (steps.model_route.outcome == 'failure' ||
            steps.install_pragent.outcome == 'failure' ||
