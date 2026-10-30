@@ -98,6 +98,10 @@ const readGithub = {
     issues: {
       listComments: async (params) => {
         maybeFail('comments');
+        if (scenario.commentPages) {
+          const pages = scenario.commentPages[String(params.issue_number)] || [];
+          return { data: pages[(params.page || 1) - 1] || [] };
+        }
         return { data: commentsByIssue[String(params.issue_number)] || [] };
       },
       get: async (params) => {
@@ -715,6 +719,36 @@ class NegativeEvidenceTests(unittest.TestCase):
                 self.assertEqual(decision.state, NOOP)
                 self.assertIn("post-marker", decision.reason)
 
+    def test_untrusted_marker_shaped_comments_do_not_fence_retry(self):
+        bodies = (
+            "<!-- issue-scheduler-dispatch -->\n/oc",
+            "<!-- continuum-429-recovery op=x gen=1 state=observed -->",
+        )
+        for body in bodies:
+            with self.subTest(body=body):
+                untrusted = self.complete(
+                    comments=[
+                        marker(374, cid=1, at=NOW - timedelta(hours=2)),
+                        comment(
+                            body, author="attacker", cid=2,
+                            at=NOW - timedelta(hours=1), association="NONE",
+                        ),
+                    ]
+                )
+                self.assertEqual(untrusted.state, RESUME)
+
+                trusted = self.complete(
+                    comments=[
+                        marker(374, cid=1, at=NOW - timedelta(hours=2)),
+                        comment(
+                            body, author="github-actions[bot]", cid=2,
+                            at=NOW - timedelta(hours=1), association="NONE",
+                        ),
+                    ]
+                )
+                self.assertEqual(trusted.state, NOOP)
+                self.assertIn("post-marker", trusted.reason)
+
     def test_fake_pr_binding_or_non_merged_latest_pr_fails(self):
         title_only = pr(900, 374, branch_prefix="feature/not-bound-")
         self.assertEqual(
@@ -1268,6 +1302,77 @@ class ExecutableProductionWorkflowTests(unittest.TestCase):
                     self.decision_scenario(commentsByIssue={"373": comments})
                 )
                 self.assertEqual(outcome["state"], "NOOP")
+
+    def test_production_js_untrusted_markers_do_not_fence_retry(self):
+        bodies = (
+            "<!-- issue-scheduler-dispatch -->\n/oc",
+            "<!-- continuum-429-recovery op=x gen=1 state=observed -->",
+        )
+        for body in bodies:
+            with self.subTest(body=body):
+                untrusted = self.decision_scenario(
+                    commentsByIssue={
+                        "373": [
+                            marker(374, cid=1, at=NOW - timedelta(hours=2)),
+                            comment(
+                                body, author="attacker", cid=2,
+                                at=NOW - timedelta(hours=1),
+                                association="NONE",
+                            ),
+                        ],
+                    },
+                )
+                self.assertEqual(
+                    self.run_workflow(untrusted)["state"], "RESUME"
+                )
+
+                trusted = self.decision_scenario(
+                    commentsByIssue={
+                        "373": [
+                            marker(374, cid=1, at=NOW - timedelta(hours=2)),
+                            comment(
+                                body, author="github-actions[bot]", cid=2,
+                                at=NOW - timedelta(hours=1),
+                                association="NONE",
+                            ),
+                        ],
+                    },
+                )
+                self.assertEqual(
+                    self.run_workflow(trusted)["state"], "NOOP"
+                )
+
+    def test_production_js_truncated_comment_window_fails_closed(self):
+        filler = [
+            comment(
+                "routine comment %d" % index, author="contributor",
+                cid=1000 + index, at=NOW - timedelta(hours=1),
+                association="NONE",
+            )
+            for index in range(100)
+        ]
+        truncated = self.decision_scenario(
+            commentPages={"373": [filler] * 5 + [filler[:1]]},
+        )
+        outcome = self.run_workflow(truncated)
+        self.assertEqual(outcome["state"], "NOOP")
+        self.assertIn("truncated", outcome["reason"])
+
+        complete = self.decision_scenario(
+            commentPages={
+                "373": [
+                    [marker(374)] + [
+                        comment(
+                            "routine comment %d" % index,
+                            author="contributor", cid=2000 + index,
+                            at=NOW - timedelta(hours=1), association="NONE",
+                        )
+                        for index in range(99)
+                    ]
+                ] + [filler] * 4 + [[]],
+            },
+        )
+        self.assertEqual(self.run_workflow(complete)["state"], "RESUME")
 
     def test_production_js_marker_scan_and_baseline_are_exact(self):
         scenario = self.decision_scenario(op="scan")

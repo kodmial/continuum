@@ -179,11 +179,21 @@ def _is_owner(comment: Any, repository_owner: str) -> bool:
     return bool(getattr(comment, "author_is_owner", False))
 
 
+def _is_scheduler_bot(comment: Any) -> bool:
+    return _login(comment).lower() == "github-actions[bot]"
+
+
+def _is_trusted_fencer(comment: Any, repository_owner: str) -> bool:
+    # Dispatch and 429 recovery markers are only ever produced by the
+    # scheduler bot.  Any other author can merely quote them, so they must
+    # never fence an owner-armed target.
+    return _is_owner(comment, repository_owner) or _is_scheduler_bot(comment)
+
+
 def _is_trusted_stop(comment: Any, repository_owner: str) -> bool:
     if _is_owner(comment, repository_owner):
         return True
-    login = _login(comment).lower()
-    if login == "github-actions[bot]":
+    if _is_scheduler_bot(comment):
         return True
     if isinstance(comment, Mapping):
         association = str(comment.get("author_association") or "").upper()
@@ -284,9 +294,10 @@ def _has_activity_after(
         if instruction.comment_id and _comment_id(comment) == instruction.comment_id:
             continue
         body = _body(comment)
-        if dispatch_marker and dispatch_marker in body:
+        trusted_fencer = _is_trusted_fencer(comment, repository_owner)
+        if trusted_fencer and dispatch_marker and dispatch_marker in body:
             return True
-        if RECOVERY_MARKER_RE.search(body):
+        if trusted_fencer and RECOVERY_MARKER_RE.search(body):
             return True
         if _is_owner(comment, repository_owner) and OWNER_COMMAND_RE.search(body):
             return True

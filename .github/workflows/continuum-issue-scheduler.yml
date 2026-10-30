@@ -2248,10 +2248,14 @@ jobs:
                 }
                 if (!(ownerResumeCreatedAt(comment) > baseline)) return false;
                 const body = String(comment.body || '');
-                if (body.includes(dispatchMarker)) return true;
-                if (ownerResumeRecoveryRe.test(body)) return true;
+                const login = ownerResumeLogin(comment);
+                const trustedFencer =
+                  login === 'github-actions[bot]' ||
+                  login === owner.toLowerCase();
+                if (trustedFencer && body.includes(dispatchMarker)) return true;
+                if (trustedFencer && ownerResumeRecoveryRe.test(body)) return true;
                 return (
-                  ownerResumeLogin(comment) === owner.toLowerCase() &&
+                  login === owner.toLowerCase() &&
                   ownerResumeCommandRe.test(body)
                 );
               });
@@ -2299,6 +2303,7 @@ jobs:
             }
             async function ownerResumeIssueComments(issueNumber) {
               const comments = [];
+              let truncated = false;
               for (let page = 1; page <= ownerResumeCommentPageLimit; page += 1) {
                 const { data } = await readGithub.rest.issues.listComments({
                   owner,
@@ -2306,9 +2311,42 @@ jobs:
                   issue_number: issueNumber,
                   per_page: 100,
                   page,
+                  sort: 'created',
+                  direction: 'desc',
                 });
                 comments.push(...data);
-                if (data.length < 100) break;
+                if (data.length < 100) {
+                  truncated = false;
+                  break;
+                }
+                truncated = page === ownerResumeCommentPageLimit;
+              }
+              if (truncated) {
+                // Probe one page beyond the bound so an exactly-full window
+                // is not mistaken for a truncated comment stream.  Any
+                // remaining comments mean the scan is incomplete, and an
+                // incomplete scan must never authorize or fence a resume.
+                const { data: overflow } =
+                  await readGithub.rest.issues.listComments({
+                    owner,
+                    repo,
+                    issue_number: issueNumber,
+                    per_page: 100,
+                    page: ownerResumeCommentPageLimit + 1,
+                    sort: 'created',
+                    direction: 'desc',
+                  });
+                if (overflow.length > 0) {
+                  core.notice(
+                    'Owner-armed resume comment scan for #' + issueNumber +
+                      ' was truncated after ' + comments.length +
+                      ' newest comments; failing closed.'
+                  );
+                  throw new Error(
+                    'comment stream truncated after ' + comments.length +
+                      ' newest comments'
+                  );
+                }
               }
               return comments;
             }
