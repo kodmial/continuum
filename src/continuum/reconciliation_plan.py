@@ -247,6 +247,9 @@ def plan_snapshot(
             qualification_trackers=state.qualification_trackers,
             terminal_stopped=state.terminal_stopped,
             generations=state.generations,
+            repository_owner=(
+                state.repository.split("/", 1)[0] if state.repository else ""
+            ),
         )
     )
 
