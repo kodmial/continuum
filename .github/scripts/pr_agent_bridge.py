@@ -338,9 +338,10 @@ class Handler(BaseHTTPRequestHandler):
         except BridgeUpstreamError as exc:
             # Python socket read timeout says "timed out", not "timeout".
             # Expose a 504 to reviewer routing, not a generic 502.
+            message = str(exc).lower()
             timeout_detected = any(
-                token in str(exc).lower() for token in ("timeout", "timed out", "watchdog")
-            )
+                token in message for token in ("timeout", "timed out")
+            ) or "session exceeded its configured completion watchdog" in message
             status = 504 if timeout_detected else 502
             self._send(status, openai_error("upstream_error", str(exc)))
             outcome = f"http_{status}"
