@@ -71,6 +71,29 @@ class BridgeTimingTests(unittest.TestCase):
         self.assertEqual(handler.observed_status, 504)
         self.assertEqual(handler.observed_payload["error"]["type"], "upstream_error")
 
+    def test_completion_watchdog_is_http_504_for_route_cooldown(self):
+        class RecordingHandler(bridge.Handler):
+            def _send(self, status, payload):
+                self.observed_status = status
+                self.observed_payload = payload
+
+        handler = object.__new__(RecordingHandler)
+        handler.path = "/v1/chat/completions"
+        handler.headers = {"Content-Length": "2"}
+        handler.rfile = io.BytesIO(b"{}")
+        with patch.object(handler, "_authorized", return_value=True):
+            with patch.object(
+                bridge,
+                "run_completion",
+                side_effect=bridge.BridgeUpstreamError(
+                    "opencode session exceeded its configured completion watchdog",
+                    retryable=True,
+                ),
+            ):
+                handler.do_POST()
+        self.assertEqual(handler.observed_status, 504)
+        self.assertEqual(handler.observed_payload["error"]["type"], "upstream_error")
+
     def test_session_status_monitor_does_not_expose_session_or_prompt(self):
         class StatusReply(FakeReply):
             def read(self):
