@@ -100,6 +100,17 @@ class ToolchainCacheContractTests(unittest.TestCase):
             (ACTION / "resolve.sh").read_text(),
         )
 
+    def test_retry_state_handler_requires_runtime_policy_bundle(self):
+        workflow = yaml.safe_load(
+            (ROOT / ".github/workflows/continuum-pr-agent.yml").read_text()
+        )
+        steps = workflow["jobs"]["pr_agent"]["steps"]
+        state_step = next(
+            step for step in steps
+            if step.get("name") == "Update persistent PR-Agent retry controller state"
+        )
+        self.assertIn("steps.runtime.outcome == 'success'", str(state_step.get("if", "")))
+
     def test_no_cached_user_or_secret_data(self):
         action = (ACTION / "action.yml").read_text()
         self.assertIn("~/.cache/continuum/toolchains", action)
