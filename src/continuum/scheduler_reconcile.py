@@ -39,6 +39,7 @@ import re
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 from .delegation_priority import effective_priority
+from . import owner_resume
 
 
 @dataclass
@@ -78,6 +79,7 @@ class CommentRecord:
     body: str
     author_is_owner: bool
     created_at: datetime
+    author_login: str = ""
 
 
 @dataclass
@@ -190,6 +192,7 @@ def reconcile(
     dispatch_hook: Optional[Callable[[int], None]] = None,
     terminal_stopped: Optional[Set[Any]] = None,
     generations: Optional[Dict[int, int]] = None,
+    repository_owner: str = "",
 ) -> ReconcileResult:
     """Run one deterministic scheduled reconcile pass (cron, no event).
 
@@ -264,6 +267,24 @@ def reconcile(
         scheduler_dispatches = _scheduler_dispatch_comments(
             issue_comments, config.dispatch_marker
         )
+        # An owner-armed resume marker establishes a fresh bounded retry
+        # budget only after its predecessor has been proven complete and the
+        # pause has been lifted. While the target remains paused, do not let
+        # lease expiry release it or burn the old generation's retry budget.
+        marker_baseline = owner_resume.resume_baseline(
+            issue_comments, target=number, repository_owner=repository_owner
+        )
+        marker_waiting = (
+            marker_baseline is not None and config.pause_label in labels
+        )
+        baseline = None if marker_waiting else marker_baseline
+        counted_dispatches = scheduler_dispatches
+        if baseline is not None:
+            counted_dispatches = [
+                comment
+                for comment in scheduler_dispatches
+                if comment.created_at > baseline
+            ]
         if latest is None:
             labels.discard(in_progress)
             result.reservations_removed.append(number)
@@ -277,14 +298,18 @@ def reconcile(
         labels.discard(in_progress)
         result.reservations_removed.append(number)
         if (
-            len(scheduler_dispatches) >= config.max_dispatch_attempts
+            len(counted_dispatches) >= config.max_dispatch_attempts
             and config.pause_on_failure
         ):
             labels.add(config.pause_label)
             result.paused.append(number)
             result.skip_reasons[number] = (
                 "paused after %d scheduler dispatch attempt(s) with no "
-                "OpenCode PR" % len(scheduler_dispatches)
+                "OpenCode PR" % len(counted_dispatches)
+            )
+        elif marker_waiting:
+            result.skip_reasons[number] = (
+                "owner-armed resume is waiting for predecessor completion"
             )
         else:
             labels.discard(config.pause_label)
@@ -292,7 +317,7 @@ def reconcile(
                 "lease expired: eligible for an automatic retry"
                 + (
                     " because pause_on_failure=false"
-                    if len(scheduler_dispatches) >= config.max_dispatch_attempts
+                    if len(counted_dispatches) >= config.max_dispatch_attempts
                     else ""
                 )
             )

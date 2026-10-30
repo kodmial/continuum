@@ -540,6 +540,9 @@ jobs:
       RESET_MARKERS: ${{ inputs.reset_markers || 'false' }}
       REQUIRE_PRIORITY_LABEL: ${{ inputs.require_priority_label || vars.AUTOMATION_REQUIRE_PRIORITY_LABEL || 'false' }}
       READY_LABEL: ${{ inputs.ready_label || vars.AUTOMATION_READY_LABEL }}
+      DEFAULT_BRANCH: ${{ github.event.repository.default_branch || 'main' }}
+      OWNER_RESUME_CI_WORKFLOW: ${{ vars.CONTINUUM_CI_WORKFLOW_NAME || 'CI' }}
+      OWNER_RESUME_CONTRACT_GATE_WORKFLOW: ${{ vars.CONTINUUM_CONTRACT_GATE_WORKFLOW_NAME || 'Continuum Contract Gate' }}
       COMMAND_GRACE_MINUTES: ${{ inputs.command_grace_minutes || vars.AUTOMATION_COMMAND_GRACE_MINUTES || '5' }}
       OPENCODE_WORKFLOW_NAME: ${{ inputs.opencode_workflow_name || vars.CONTINUUM_OPENCODE_WORKFLOW_NAME || 'OpenCode agent' }}
       OPENCODE_WORKFLOW_PATH: ${{ inputs.opencode_workflow_path || vars.CONTINUUM_OPENCODE_WORKFLOW_PATH || '.github/workflows/continuum-opencode.yml' }}
@@ -2070,7 +2073,591 @@ jobs:
                 'start an explicit new generation instead of redispatching.';
             }
 
-            async function openDeclaredBlockers(
+            const ownerResumeMarkerRe =
+              /^[ \t]*<!--\s*continuum-resume-after:v1\s+predecessor=([1-9]\d*)\s*-->[ \t]*(?:\r?\n|$)/;
+            const ownerResumeMarkerLineRe =
+              /^[ \t]*<!--\s*continuum-resume-after:v1\s+predecessor=([1-9]\d*)\s*-->[ \t]*$/gm;
+            const ownerResumeMarkerShapeRe =
+              /continuum-resume-after(?::v1)?\b/;
+            const ownerResumeMarkerShapeCountRe =
+              /continuum-resume-after(?::v1)?\b/g;
+            const ownerResumeRecoveryRe =
+              /<!--\s*continuum-429-(?:recovery|resumption|backoff)\b/;
+            const ownerResumeCommandRe =
+              /^[ ]{0,3}\/(?:opencode|oc)(?=\s|$)/m;
+            const ownerResumeTaskContextRe =
+              /<!--\s*continuum-task-context\s+repo=([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)\s+issue=(\d+)\s*-->/g;
+            const ownerResumeSnapshotRefRe =
+              /<!--\s*continuum-task-snapshot-ref\s+repo=([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)\s+issue=(\d+)\s+generation=(\d+)\s+title-sha256=([0-9a-fA-F]{64})\s+body-sha256=([0-9a-fA-F]{64})\s+spec-sha256=([0-9a-fA-F]{64})\s*-->/g;
+            const ownerResumeSnapshotMarkerRe =
+              /<!--\s*continuum-task-snapshot\s+repo=([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)\s+issue=(\d+)\s+generation=(\d+)\s+title-sha256=([0-9a-fA-F]{64})\s+body-sha256=([0-9a-fA-F]{64})\s+spec-sha256=([0-9a-fA-F]{64})\s*-->/g;
+            const ownerResumeCommentPageLimit = 5;
+            const ownerResumeCiWorkflow =
+              (process.env.OWNER_RESUME_CI_WORKFLOW || 'CI').trim();
+            const ownerResumeContractGateWorkflow =
+              (process.env.OWNER_RESUME_CONTRACT_GATE_WORKFLOW ||
+                'Continuum Contract Gate').trim();
+            const ownerResumeDefaultBranch = (
+              process.env.DEFAULT_BRANCH ||
+              context.payload.repository?.default_branch ||
+              'main'
+            ).trim();
+
+            function ownerResumeLogin(comment) {
+              return String(comment?.user?.login || '').toLowerCase();
+            }
+            function ownerResumeCreatedAt(comment) {
+              return new Date(comment?.created_at || 0).getTime();
+            }
+            function ownerResumeMarkerComments(comments) {
+              return (comments || []).filter(comment =>
+                ownerResumeMarkerShapeRe.test(String(comment.body || ''))
+              );
+            }
+            function ownerResumeScan(targetNumber, comments) {
+              const shaped = ownerResumeMarkerComments(comments);
+              if (shaped.length === 0) {
+                return { instruction: null, reason: 'not owner-armed' };
+              }
+              if (shaped.length !== 1) {
+                return {
+                  instruction: null,
+                  reason: 'duplicate or conflicting owner-resume markers',
+                };
+              }
+              const comment = shaped[0];
+              if (ownerResumeLogin(comment) !== owner.toLowerCase()) {
+                return {
+                  instruction: null,
+                  reason: 'owner-resume marker author is not the repository owner',
+                };
+              }
+              const body = String(comment.body || '');
+              if ((body.match(ownerResumeMarkerShapeCountRe) || []).length !== 1) {
+                return {
+                  instruction: null,
+                  reason: 'duplicate or conflicting owner-resume markers',
+                };
+              }
+              const match = body.match(ownerResumeMarkerRe);
+              if (!match || (body.match(ownerResumeMarkerLineRe) || []).length !== 1) {
+                return {
+                  instruction: null,
+                  reason: 'owner-resume marker syntax is not supported',
+                };
+              }
+              const predecessor = Number.parseInt(match[1], 10);
+              if (
+                !Number.isInteger(predecessor) ||
+                predecessor < 1 ||
+                predecessor === targetNumber
+              ) {
+                return {
+                  instruction: null,
+                  reason: 'owner-resume marker predecessor is invalid',
+                };
+              }
+              return {
+                instruction: { predecessor, comment },
+                reason: 'owner-authorized resume',
+              };
+            }
+            function ownerResumeBaselineNumber(comments, targetNumber) {
+              const scan = ownerResumeScan(targetNumber, comments);
+              if (!scan.instruction) return null;
+              const at = ownerResumeCreatedAt(scan.instruction.comment);
+              return Number.isFinite(at) && at > 0 ? at : null;
+            }
+            function ownerResumePrSnapshotBinding(pr, predecessorNumber) {
+              const body = String(pr?.body || '');
+              const contexts = [...body.matchAll(ownerResumeTaskContextRe)];
+              const refs = [...body.matchAll(ownerResumeSnapshotRefRe)];
+              if (contexts.length === 0 && refs.length === 0) return null;
+              if (contexts.length > 1 || refs.length > 1) return false;
+              if (contexts.length === 1) {
+                const context = contexts[0];
+                if (String(context[1]).toLowerCase() !== repoFullName.toLowerCase()) {
+                  return false;
+                }
+                if (Number(context[2]) !== predecessorNumber) return false;
+              }
+              if (refs.length === 0) return null;
+              const ref = refs[0];
+              if (String(ref[1]).toLowerCase() !== repoFullName.toLowerCase()) {
+                return false;
+              }
+              if (Number(ref[2]) !== predecessorNumber) return false;
+              if (String(ref[3]) !== '1') return false;
+              return {
+                title: String(ref[4]).toLowerCase(),
+                body: String(ref[5]).toLowerCase(),
+                spec: String(ref[6]).toLowerCase(),
+              };
+            }
+            function ownerResumeBoundPr(pr, predecessorNumber) {
+              const branchBound = String(pr?.head?.ref || '').startsWith(
+                'opencode/issue' + predecessorNumber + '-'
+              );
+              const binding = ownerResumePrSnapshotBinding(pr, predecessorNumber);
+              if (binding === false) return null;
+              if (!branchBound && binding === null) return null;
+              return { branchBound, binding };
+            }
+            function ownerResumeSnapshotBindingMatches(
+              comments, predecessorNumber, binding
+            ) {
+              for (const comment of comments || []) {
+                const association = String(
+                  comment.author_association || ''
+                ).toUpperCase();
+                const login = ownerResumeLogin(comment);
+                if (
+                  login !== owner.toLowerCase() &&
+                  login !== 'github-actions[bot]' &&
+                  !['OWNER', 'MEMBER', 'COLLABORATOR'].includes(association)
+                ) {
+                  continue;
+                }
+                const markers = [
+                  ...String(comment.body || '').matchAll(ownerResumeSnapshotMarkerRe)
+                ];
+                for (const marker of markers) {
+                  if (
+                    String(marker[1]).toLowerCase() !== repoFullName.toLowerCase() ||
+                    Number(marker[2]) !== predecessorNumber ||
+                    String(Number(marker[3])) !== '1'
+                  ) {
+                    continue;
+                  }
+                  if (
+                    String(marker[4]).toLowerCase() === binding.title &&
+                    String(marker[5]).toLowerCase() === binding.body &&
+                    String(marker[6]).toLowerCase() === binding.spec
+                  ) {
+                    return true;
+                  }
+                }
+              }
+              return false;
+            }
+            function ownerResumeActivityAfter(comments, instruction) {
+              const baseline = ownerResumeCreatedAt(instruction.comment);
+              return (comments || []).some(comment => {
+                if (String(comment.id || '') === String(instruction.comment.id || '')) {
+                  return false;
+                }
+                if (!(ownerResumeCreatedAt(comment) > baseline)) return false;
+                const body = String(comment.body || '');
+                const login = ownerResumeLogin(comment);
+                const trustedFencer =
+                  login === 'github-actions[bot]' ||
+                  login === owner.toLowerCase();
+                if (trustedFencer && body.includes(dispatchMarker)) return true;
+                if (trustedFencer && ownerResumeRecoveryRe.test(body)) return true;
+                return (
+                  login === owner.toLowerCase() &&
+                  ownerResumeCommandRe.test(body)
+                );
+              });
+            }
+            function ownerResumeGenerationStopped(comments, targetNumber) {
+              const wantedRepo = repoFullName.toLowerCase();
+              let lastStop = null;
+              let lastRecover = null;
+              for (const comment of comments || []) {
+                const association = String(
+                  comment.author_association || ''
+                ).toUpperCase();
+                const login = ownerResumeLogin(comment);
+                if (
+                  login !== owner.toLowerCase() &&
+                  login !== 'github-actions[bot]' &&
+                  !['OWNER', 'MEMBER', 'COLLABORATOR'].includes(association)
+                ) {
+                  continue;
+                }
+                const body = String(comment.body || '');
+                const stop = body.match(generationStopMarkerRe);
+                if (
+                  stop &&
+                  stop[1].toLowerCase() === wantedRepo &&
+                  Number(stop[2]) === targetNumber &&
+                  Number(stop[3]) === 1
+                ) {
+                  const key = stopOrderKey(comment);
+                  if (!lastStop || key > lastStop) lastStop = key;
+                  continue;
+                }
+                const recover = body.match(generationRecoverMarkerRe);
+                if (
+                  recover &&
+                  recover[1].toLowerCase() === wantedRepo &&
+                  Number(recover[2]) === targetNumber &&
+                  Number(recover[3]) === 1
+                ) {
+                  const key = stopOrderKey(comment);
+                  if (!lastRecover || key > lastRecover) lastRecover = key;
+                }
+              }
+              return lastStop !== null && (!lastRecover || lastRecover < lastStop);
+            }
+            async function ownerResumeIssueComments(issueNumber) {
+              const comments = [];
+              let truncated = false;
+              for (let page = 1; page <= ownerResumeCommentPageLimit; page += 1) {
+                const { data } = await readGithub.rest.issues.listComments({
+                  owner,
+                  repo,
+                  issue_number: issueNumber,
+                  per_page: 100,
+                  page,
+                  sort: 'created',
+                  direction: 'desc',
+                });
+                comments.push(...data);
+                if (data.length < 100) {
+                  truncated = false;
+                  break;
+                }
+                truncated = page === ownerResumeCommentPageLimit;
+              }
+              if (truncated) {
+                // Probe one page beyond the bound so an exactly-full window
+                // is not mistaken for a truncated comment stream.  Any
+                // remaining comments mean the scan is incomplete, and an
+                // incomplete scan must never authorize or fence a resume.
+                const { data: overflow } =
+                  await readGithub.rest.issues.listComments({
+                    owner,
+                    repo,
+                    issue_number: issueNumber,
+                    per_page: 100,
+                    page: ownerResumeCommentPageLimit + 1,
+                    sort: 'created',
+                    direction: 'desc',
+                  });
+                if (overflow.length > 0) {
+                  core.notice(
+                    'Owner-armed resume comment scan for #' + issueNumber +
+                      ' was truncated after ' + comments.length +
+                      ' newest comments; failing closed.'
+                  );
+                  throw new Error(
+                    'comment stream truncated after ' + comments.length +
+                      ' newest comments'
+                  );
+                }
+              }
+              return comments;
+            }
+            function newestOwnerResumeRun(runs, headSha, workflowNames, workflowPaths) {
+              const names = new Set(workflowNames.filter(Boolean));
+              const paths = new Set(workflowPaths.filter(Boolean));
+              const matching = (runs || []).filter(run =>
+                String(run.head_sha || '').toLowerCase() === headSha &&
+                (names.has(String(run.name || '')) ||
+                 paths.has(String(run.path || '')))
+              );
+              if (matching.length === 0) return null;
+              matching.sort((a, b) => {
+                const at = new Date(a.run_started_at || a.created_at || 0).getTime();
+                const bt = new Date(b.run_started_at || b.created_at || 0).getTime();
+                if (at !== bt) return at - bt;
+                return Number(a.id || 0) - Number(b.id || 0);
+              });
+              return matching[matching.length - 1];
+            }
+            function ownerResumeIndependentReview(reviews, statuses, headSha, prAuthor) {
+              const cleanStatus = (statuses || []).some(status =>
+                String(status.context || '') === 'continuum/pr-agent-review' &&
+                String(status.state || '').toLowerCase() === 'success' &&
+                String(status.description || '').trim() ===
+                  'PR-Agent review complete: clean'
+              );
+              if (cleanStatus) return true;
+              const author = String(prAuthor || '').toLowerCase();
+              return (reviews || []).some(review => {
+                const login = String(review.user?.login || '').toLowerCase();
+                return (
+                  String(review.state || '').toUpperCase() === 'APPROVED' &&
+                  String(review.commit_id || '').toLowerCase() === headSha &&
+                  login &&
+                  login !== author &&
+                  !login.endsWith('[bot]') &&
+                  String(review.author_association || '').toUpperCase() !== 'BOT'
+                );
+              });
+            }
+            async function ownerResumeDecision(issue, instruction, comments) {
+              const targetNumber = issue.number;
+              const labels =
+                labelsByIssue.get(targetNumber) || new Set();
+              if (!readyLabel || !labels.has(readyLabel) || !labels.has(pausedLabel)) {
+                return { state: 'NOOP', reason: 'target is not paused and admitted' };
+              }
+              if (labels.has('no-auto-merge') || labels.has(blockedLabel)) {
+                return { state: 'NOOP', reason: 'target carries an explicit stop label' };
+              }
+              if (openPrIssues.has(targetNumber) || activeRunIssues.has(targetNumber)) {
+                return {
+                  state: 'NOOP',
+                  reason: 'target already has an open implementation PR or run',
+                };
+              }
+              if (ownerResumeGenerationStopped(comments, targetNumber)) {
+                return { state: 'NOOP', reason: 'target generation has an owner STOP' };
+              }
+              if (ownerResumeActivityAfter(comments, instruction)) {
+                return {
+                  state: 'NOOP',
+                  reason: 'a post-marker run or recovery attempt already owns this target',
+                };
+              }
+
+              const predecessorNumber = instruction.predecessor;
+              let predecessor;
+              try {
+                predecessor = (await readGithub.rest.issues.get({
+                  owner,
+                  repo,
+                  issue_number: predecessorNumber,
+                })).data;
+              } catch (err) {
+                core.warning(
+                  'Owner-armed resume predecessor read failed for #' +
+                    predecessorNumber + '; failing closed: ' + err.message
+                );
+                return { state: 'NOOP', reason: 'predecessor state is unavailable' };
+              }
+              if (predecessor.pull_request) {
+                return { state: 'NOOP', reason: 'predecessor is a pull request' };
+              }
+              if (String(predecessor.state || '').toLowerCase() === 'open') {
+                return {
+                  state: 'WAIT',
+                  reason: 'predecessor issue #' + predecessorNumber + ' is still open',
+                };
+              }
+              if (
+                String(predecessor.state || '').toLowerCase() !== 'closed' ||
+                String(predecessor.state_reason || '').toLowerCase() !== 'completed'
+              ) {
+                return {
+                  state: 'NOOP',
+                  reason: 'predecessor is not closed as completed',
+                };
+              }
+
+              const bound = [];
+              for (const candidatePr of pulls) {
+                if (candidatePr.head?.repo?.full_name !== repoFullName) continue;
+                const bindingInfo = ownerResumeBoundPr(
+                  candidatePr, predecessorNumber
+                );
+                if (!bindingInfo) continue;
+                bound.push({ pr: candidatePr, ...bindingInfo });
+              }
+              if (bound.length === 0) {
+                return {
+                  state: 'NOOP',
+                  reason: 'predecessor has no trusted implementation PR binding',
+                };
+              }
+              bound.sort(
+                (a, b) => Number(a.pr.number || 0) - Number(b.pr.number || 0)
+              );
+              const latest = bound[bound.length - 1].pr;
+              if (!latest.merged_at || String(latest.state || '').toLowerCase() !== 'closed') {
+                return {
+                  state: 'NOOP',
+                  reason: 'latest predecessor implementation PR is not merged',
+                };
+              }
+
+              let fullPr;
+              try {
+                fullPr = (await readGithub.rest.pulls.get({
+                  owner,
+                  repo,
+                  pull_number: latest.number,
+                })).data;
+              } catch (err) {
+                core.warning(
+                  'Owner-armed resume PR read failed for #' + latest.number +
+                    '; failing closed: ' + err.message
+                );
+                return { state: 'NOOP', reason: 'predecessor PR state is unavailable' };
+              }
+              const fullBindingInfo = ownerResumeBoundPr(
+                fullPr, predecessorNumber
+              );
+              if (!fullBindingInfo) {
+                return {
+                  state: 'NOOP',
+                  reason: 'predecessor PR binding is not trusted',
+                };
+              }
+              if (
+                !fullPr.merged ||
+                !fullPr.merged_at ||
+                String(fullPr.state || '').toLowerCase() !== 'closed'
+              ) {
+                return {
+                  state: 'NOOP',
+                  reason: 'predecessor implementation PR is not truly merged',
+                };
+              }
+              if (fullBindingInfo.binding) {
+                let predecessorComments;
+                try {
+                  predecessorComments = await ownerResumeIssueComments(
+                    predecessorNumber
+                  );
+                } catch (err) {
+                  core.warning(
+                    'Owner-armed resume predecessor snapshot read failed for #' +
+                      predecessorNumber + '; failing closed: ' + err.message
+                  );
+                  return {
+                    state: 'NOOP',
+                    reason: 'predecessor snapshot evidence is unavailable',
+                  };
+                }
+                if (
+                  !ownerResumeSnapshotBindingMatches(
+                    predecessorComments,
+                    predecessorNumber,
+                    fullBindingInfo.binding
+                  )
+                ) {
+                  return {
+                    state: 'NOOP',
+                    reason: 'predecessor PR snapshot binding is not trusted',
+                  };
+                }
+              }
+              if (String(fullPr.base?.ref || '') !== ownerResumeDefaultBranch) {
+                return {
+                  state: 'NOOP',
+                  reason: 'predecessor PR base is not the expected default branch',
+                };
+              }
+              if (fullPr.head?.repo?.full_name !== repoFullName) {
+                return {
+                  state: 'NOOP',
+                  reason: 'predecessor PR head repository is not trusted',
+                };
+              }
+              const headSha = String(fullPr.head?.sha || '').toLowerCase();
+              const mergeSha = String(fullPr.merge_commit_sha || '').toLowerCase();
+              if (
+                !/^[0-9a-f]{40}(?:[0-9a-f]{24})?$/.test(headSha) ||
+                !/^[0-9a-f]{40}(?:[0-9a-f]{24})?$/.test(mergeSha)
+              ) {
+                return {
+                  state: 'NOOP',
+                  reason: 'predecessor merge or HEAD SHA is missing or stale',
+                };
+              }
+
+              let exactHeadRuns = [];
+              try {
+                exactHeadRuns = await readGithub.paginate(
+                  readGithub.rest.actions.listWorkflowRunsForRepo,
+                  { owner, repo, head_sha: headSha, per_page: 100 }
+                );
+              } catch (err) {
+                core.warning(
+                  'Owner-armed resume exact-HEAD run read failed for ' +
+                    headSha + '; failing closed: ' + err.message
+                );
+                return { state: 'NOOP', reason: 'exact-HEAD run evidence is unavailable' };
+              }
+              for (const required of [
+                {
+                  names: [ownerResumeCiWorkflow],
+                  paths: ['.github/workflows/' + 'ci.yml'],
+                  label: 'CI',
+                },
+                {
+                  names: [ownerResumeContractGateWorkflow],
+                  paths: ['.github/workflows/' + 'contract-gate.yml'],
+                  label: 'Contract Gate',
+                },
+              ]) {
+                const run = newestOwnerResumeRun(
+                  exactHeadRuns, headSha, required.names, required.paths
+                );
+                if (!run) {
+                  return {
+                    state: 'NOOP',
+                    reason: required.label + ' evidence is missing on the PR HEAD',
+                  };
+                }
+                if (
+                  String(run.status || '').toLowerCase() !== 'completed' ||
+                  String(run.conclusion || '').toLowerCase() !== 'success'
+                ) {
+                  return {
+                    state: 'NOOP',
+                    reason: required.label + ' is not successful on the PR HEAD',
+                  };
+                }
+              }
+
+              let statuses = [];
+              let reviews = [];
+              try {
+                statuses = (await readGithub.rest.repos.getCombinedStatusForRef({
+                  owner,
+                  repo,
+                  ref: headSha,
+                })).data.statuses || [];
+              } catch (err) {
+                core.warning(
+                  'Owner-armed resume review status read failed for ' +
+                    headSha + '; failing closed: ' + err.message
+                );
+                return {
+                  state: 'NOOP',
+                  reason: 'independent review evidence is unavailable',
+                };
+              }
+              try {
+                reviews = await readGithub.paginate(
+                  readGithub.rest.pulls.listReviews,
+                  { owner, repo, pull_number: fullPr.number, per_page: 100 }
+                );
+              } catch (err) {
+                core.warning(
+                  'Owner-armed resume review read failed for #' +
+                    fullPr.number + '; failing closed: ' + err.message
+                );
+                return {
+                  state: 'NOOP',
+                  reason: 'independent review evidence is unavailable',
+                };
+              }
+              if (!ownerResumeIndependentReview(
+                reviews,
+                statuses,
+                headSha,
+                fullPr.user?.login || ''
+              )) {
+                return {
+                  state: 'NOOP',
+                  reason: 'independent clean review evidence is missing',
+                };
+              }
+              return {
+                state: 'RESUME',
+                reason: 'predecessor #' + predecessorNumber + ' is complete',
+                pullRequest: fullPr.number,
+                headSha,
+              };
+            }
+
+                        async function openDeclaredBlockers(
               issue,
               targetOwner = owner,
               targetRepo = repo
@@ -4064,6 +4651,80 @@ jobs:
               return { ...base, reason: 'checkpoint-' + checkpoint.kind };
             }
 
+            // Owner-armed resume is evaluated only over the scheduler's
+            // existing bounded open-issue list and only for paused+ready
+            // targets. Comments are fetched lazily for those targets; every
+            // read/write failure leaves the pause intact. The transition
+            // removes exactly the armed target's pause label and lets the
+            // normal recovery path (checkpoint/429 watchdog + dispatch) do
+            // the work. It never edits task snapshots or starts a new
+            // generation.
+            const ownerResumeTargets = issues.filter(issue => {
+              const labels = labelsByIssue.get(issue.number) || new Set();
+              return (
+                Boolean(readyLabel) &&
+                labels.has(readyLabel) &&
+                labels.has(pausedLabel) &&
+                !labels.has(qualifyingLabel) &&
+                !labels.has(blockedLabel)
+              );
+            });
+            for (const issue of ownerResumeTargets) {
+              let ownerResumeComments;
+              try {
+                ownerResumeComments = await ownerResumeIssueComments(issue.number);
+              } catch (err) {
+                core.warning(
+                  'Owner-armed resume comment read failed for #' + issue.number +
+                    '; failing closed: ' + err.message
+                );
+                continue;
+              }
+              const ownerResumeScanResult = ownerResumeScan(
+                issue.number, ownerResumeComments
+              );
+              if (!ownerResumeScanResult.instruction) {
+                if (ownerResumeScanResult.reason !== 'not owner-armed') {
+                  core.notice(
+                    'Owner-armed resume skipped for #' + issue.number + ': ' +
+                      ownerResumeScanResult.reason + '.'
+                  );
+                }
+                continue;
+              }
+              let ownerResumeDecisionResult;
+              try {
+                ownerResumeDecisionResult = await ownerResumeDecision(
+                  issue,
+                  ownerResumeScanResult.instruction,
+                  ownerResumeComments
+                );
+              } catch (err) {
+                core.warning(
+                  'Owner-armed resume evaluation failed for #' + issue.number +
+                    '; failing closed: ' + err.message
+                );
+                continue;
+              }
+              if (ownerResumeDecisionResult.state !== 'RESUME') {
+                core.notice(
+                  'Owner-armed resume for #' + issue.number + ' is ' +
+                    ownerResumeDecisionResult.state + ': ' +
+                    ownerResumeDecisionResult.reason + '.'
+                );
+                continue;
+              }
+              await removeLabel(issue.number, pausedLabel);
+              core.notice(
+                'Owner-armed resume for #' + issue.number +
+                  ' admitted after predecessor completion: ' +
+                  ownerResumeDecisionResult.reason +
+                  '; implementation PR #' + ownerResumeDecisionResult.pullRequest +
+                  ' at ' + ownerResumeDecisionResult.headSha +
+                  '. Checkpoint/snapshot state was not modified.'
+              );
+            }
+
             // Reconcile reservations for the gap between posting /oc and the PR
             // appearing. The dispatch comment is audit/timing metadata only; it
             // never blocks an issue forever.
@@ -4149,6 +4810,25 @@ jobs:
               const schedulerDispatches = comments.filter(comment =>
                 (comment.body || '').includes(dispatchMarker)
               );
+              // A verified owner marker scopes a fresh, bounded retry budget
+              // for this exact target. Pre-marker infrastructure attempts are
+              // history; attempts after admission remain bounded.
+              const ownerResumeMarkerBaselineMs = ownerResumeBaselineNumber(
+                comments, issueNumber
+              );
+              const ownerResumeMarkerPending =
+                ownerResumeMarkerBaselineMs !== null &&
+                labels.has(pausedLabel);
+              const ownerResumeBaselineMs = ownerResumeMarkerPending
+                ? null
+                : ownerResumeMarkerBaselineMs;
+              const countedSchedulerDispatches =
+                ownerResumeBaselineMs === null
+                  ? schedulerDispatches
+                  : schedulerDispatches.filter(comment =>
+                      new Date(comment.created_at || 0).getTime() >
+                        ownerResumeBaselineMs
+                    );
               // Durable 429 recovery state is infrastructure, never a task
               // failure. While it is fresh, the scheduler leaves the
               // reservation with the watchdog catch-up instead of burning
@@ -4294,22 +4974,29 @@ jobs:
               await removeLabel(issueNumber, inProgressLabel);
 
               if (
-                schedulerDispatches.length >= maxDispatchAttempts &&
+                countedSchedulerDispatches.length >= maxDispatchAttempts &&
                 pauseOnFailure &&
                 !hasFresh429Recovery
               ) {
                 await addLabel(issueNumber, pausedLabel);
                 core.warning(
                   'Issue #' + issueNumber + ' produced no OpenCode PR after ' +
-                  schedulerDispatches.length +
+                  countedSchedulerDispatches.length +
                   ' scheduler dispatch attempt(s); automation paused.'
+                );
+              } else if (ownerResumeMarkerPending) {
+                // The predecessor is not yet provably complete. Keep the pause
+                // label and do not release an infrastructure-stalled generation.
+                core.notice(
+                  'Owner-armed resume for issue #' + issueNumber +
+                  ' is waiting for predecessor completion.'
                 );
               } else {
                 await removeLabel(issueNumber, pausedLabel);
                 core.warning(
                   'Lease expired for issue #' + issueNumber +
                   '; it is eligible for an automatic retry' +
-                  (schedulerDispatches.length >= maxDispatchAttempts
+                  (countedSchedulerDispatches.length >= maxDispatchAttempts
                     ? ' because pause_on_failure=false.'
                     : '.')
                 );
