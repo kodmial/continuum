@@ -872,7 +872,9 @@ jobs:
           OPENCODE_SERVER_URL: http://127.0.0.1:${{ steps.stack.outputs.server_port }}
           OPENCODE_MODEL: ${{ steps.model_route.outputs.model }}
           PR_AGENT_BRIDGE_PORT: ${{ steps.stack.outputs.bridge_port }}
-          PR_AGENT_TIMEOUT_SECONDS: '600'
+          # Full exact-HEAD reviews may need more than ten minutes.
+          # Keep this infrastructure watchdog below LiteLLM's outer cap.
+          PR_AGENT_TIMEOUT_SECONDS: '1200'
           BRIDGE_SCRIPT: ${{ steps.runtime.outputs.bridge_script }}
         run: |
           set -euo pipefail
@@ -1300,12 +1302,11 @@ jobs:
           GITHUB__USER_TOKEN: ${{ env.CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED == 'true' && secrets.TAP_PAT || (env.CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED != 'true' && github.token || '') }}
           CONFIG__GIT_PROVIDER: github
           CONFIG__MODEL: ${{ steps.stack.outputs.model }}
-          # OpenCode inference now uses asynchronous /prompt_async and polls for a
-          # completed assistant message. A 600s *infrastructure liveness
-          # watchdog* is separate from short per-HTTP-call socket timeouts.
-          # PR-Agent's outer cap must exceed that watchdog and cleanup.
-          # Neither number is an application-answer performance SLO.
-          CONFIG__AI_TIMEOUT: '660'
+          # OpenCode inference uses asynchronous /prompt_async and polls for a
+          # completed assistant message. The bridge has a 1200s infrastructure
+          # liveness watchdog; LiteLLM's outer request cap includes cleanup
+          # margin. Neither number is an application-answer performance SLO.
+          CONFIG__AI_TIMEOUT: '1260'
           CONFIG__CUSTOM_MODEL_MAX_TOKENS: ${{ steps.stack.outputs.max_tokens }}
           CONFIG__MAX_MODEL_TOKENS: ${{ steps.stack.outputs.max_tokens }}
           # Keep every request on the trusted, route-qualified OpenCode model.
@@ -2019,10 +2020,9 @@ jobs:
           GITHUB__USER_TOKEN: ${{ env.CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED == 'true' && secrets.TAP_PAT || (env.CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED != 'true' && github.token || '') }}
           CONFIG__GIT_PROVIDER: github
           CONFIG__MODEL: ${{ steps.stack.outputs.model }}
-          # PR-Agent defaults to 120s, while the synchronous OpenCode bridge
-          # can legitimately wait up to 170s for a whole session response.
-          # Bound the outer reviewer at 200s (>170s bridge + cleanup margin).
-          CONFIG__AI_TIMEOUT: '660'
+          # Keep the improve call's outer timeout aligned with the 1200s
+          # async OpenCode completion watchdog plus cleanup margin.
+          CONFIG__AI_TIMEOUT: '1260'
           CONFIG__CUSTOM_MODEL_MAX_TOKENS: ${{ steps.stack.outputs.max_tokens }}
           CONFIG__MAX_MODEL_TOKENS: ${{ steps.stack.outputs.max_tokens }}
           # Keep every request on the trusted, route-qualified OpenCode model.
