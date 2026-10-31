@@ -20,11 +20,11 @@ LOADER_LIMIT_BYTES = 4 * 1024
 
 def reconcile_loader() -> str:
     body = WORKFLOW.read_text(encoding="utf-8")
-    step_marker = "      - name: Reconcile state and dispatch ready issues\\n"
+    step_marker = "      - name: Reconcile state and dispatch ready issues\n"
     step_start = body.index(step_marker)
-    next_step = body.find("\\n      - name: ", step_start + len(step_marker))
+    next_step = body.find("\n      - name: ", step_start + len(step_marker))
     step = body[step_start:next_step if next_step >= 0 else len(body)]
-    script_marker = "          script: |\\n"
+    script_marker = "          script: |\n"
     script_start = step.index(script_marker) + len(script_marker)
 
     loader_lines: list[str] = []
@@ -35,7 +35,7 @@ def reconcile_loader() -> str:
             loader_lines.append("")
         else:
             break
-    return "\\n".join(loader_lines).strip()
+    return "\n".join(loader_lines).strip()
 
 
 class SchedulerWorkflowPayloadTests(unittest.TestCase):
