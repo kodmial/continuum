@@ -33,7 +33,29 @@ class ContinuumTest < Minitest::Test
   end
 
   def workflow_body(name)
-    File.read(File.join(ROOT, '.github/workflows', name))
+    body = File.read(File.join(ROOT, '.github/workflows', name))
+    return body unless name == 'continuum-issue-scheduler.yml'
+
+    marker = "          script: |\n"
+    step = "      - name: Reconcile state and dispatch ready issues"
+    start = body.index(marker, body.index(step))
+    raise 'scheduler reconcile script block is missing' unless start
+    finish = body.index("\n      - name: Wake the configured downstream dispatcher", start)
+    raise 'scheduler downstream dispatcher step is missing' unless finish
+
+    module_body = File.read(File.join(ROOT, '.github/scripts/issue_scheduler.js'))
+    prefix = "'use strict';\n\nmodule.exports = async function runIssueScheduler({ github, context, core }) {\n"
+    suffix = "\n};\n"
+    raise 'extracted scheduler module wrapper changed' unless module_body.start_with?(prefix) && module_body.end_with?(suffix)
+    inline_body = module_body[prefix.length...-suffix.length]
+    inline_body = inline_body.lines.map do |line|
+      stripped = line.sub(/\A  /, '')
+      stripped.strip.empty? ? '' : stripped
+    end.join
+    embedded = inline_body.lines.map do |line|
+      line.strip.empty? ? '' : "            #{line.chomp}"
+    end.join("\n")
+    body[0...start] + marker + embedded + body[finish..]
   end
 
   # The code portion of a workflow line with `#` comments stripped (mirrors
@@ -167,6 +189,18 @@ class ContinuumTest < Minitest::Test
   # not see the `workflow_call.inputs` defaults, which legitimately name the
   # same values as the fallback chain.
   def script_body(name)
+    if name == 'continuum-issue-scheduler.yml'
+      module_body = File.read(File.join(ROOT, '.github/scripts/issue_scheduler.js'))
+      prefix = "'use strict';\n\nmodule.exports = async function runIssueScheduler({ github, context, core }) {\n"
+      suffix = "\n};\n"
+      raise 'extracted scheduler module wrapper changed' unless module_body.start_with?(prefix) && module_body.end_with?(suffix)
+      inline_body = module_body[prefix.length...-suffix.length]
+      return inline_body.lines.map do |line|
+        stripped = line.sub(/\A  /, '')
+        stripped.strip.empty? ? '' : stripped
+      end.join
+    end
+
     lines = workflow_body(name).lines
     start = lines.index { |line| line =~ /^\s*script: \|\s*$/ }
     refute_nil start, "#{name}: no embedded script block"
@@ -2579,7 +2613,7 @@ class ContinuumTest < Minitest::Test
     refute_includes opencode, 'sw_vers'
     assert_includes opencode, 'CONTINUUM_AGENT_PREPARE_COMMAND'
 
-    scheduler = File.read(File.join(ROOT, '.github/workflows/continuum-issue-scheduler.yml'))
+    scheduler = workflow_body('continuum-issue-scheduler.yml')
     assert_includes scheduler, "vars.AUTOMATION_WIP_LIMIT || '2'"
     assert_includes scheduler, "vars.AUTOMATION_LEASE_MINUTES || '45'"
     assert_includes scheduler, "vars.AUTOMATION_MAX_DISPATCH_ATTEMPTS || '2'"
@@ -2902,7 +2936,7 @@ class ContinuumTest < Minitest::Test
   # Each assertion below fails if the corresponding implementation is deleted
   # while the input remains, which is exactly the dead-parameterisation bug.
   def test_scheduler_naming_knobs_drive_implementation
-    body = File.read(File.join(ROOT, '.github/workflows/continuum-issue-scheduler.yml'))
+    body = workflow_body('continuum-issue-scheduler.yml')
 
     # post_pause_comment gates the actual comment creation.
     assert_match(/if \(postPauseComment\)/, body)
@@ -3009,7 +3043,7 @@ class ContinuumTest < Minitest::Test
     assert_includes automation, "github.event_name == 'schedule'"
     assert_includes automation, "opencode_workflow: 'opencode.yml'"
 
-    scheduler = File.read(File.join(ROOT, '.github/workflows/continuum-issue-scheduler.yml'))
+    scheduler = workflow_body('continuum-issue-scheduler.yml')
     assert_includes scheduler, "run.event !== 'workflow_dispatch'",
                     'scheduler must treat a recovery dispatch as in-flight work'
     assert_includes scheduler, 'hasFresh429Recovery'
@@ -4865,7 +4899,7 @@ class ContinuumTest < Minitest::Test
   # that each stub-covered knob really does reach a `vars.` fallback, so the
   # consumer's repository variable is the live source of truth.
   def test_every_stub_parameterized_knob_is_backed_by_a_vars_fallback
-    scheduler = File.read(File.join(ROOT, '.github/workflows/continuum-issue-scheduler.yml'))
+    scheduler = workflow_body('continuum-issue-scheduler.yml')
     {
       'WIP_LIMIT' => %w[wip_limit AUTOMATION_WIP_LIMIT 2],
       'LEASE_MINUTES' => %w[lease_minutes AUTOMATION_LEASE_MINUTES 45],
@@ -8988,7 +9022,7 @@ class ContinuumTest < Minitest::Test
   end
 
   def test_command_comments_keep_their_command_first
-    scheduler = File.read(File.join(ROOT, '.github/workflows/continuum-issue-scheduler.yml'))
+    scheduler = workflow_body('continuum-issue-scheduler.yml')
     assert_includes scheduler, "body: ['/oc', '', marker, dispatchMarker,",
                     'scheduler dispatch must keep /oc on the first significant line'
     watchdog = File.read(File.join(ROOT, '.github/workflows/continuum-opencode-watchdog.yml'))

@@ -20,11 +20,33 @@ from continuum.opencode_commands import classify_issue_comment
 
 ROOT = Path(__file__).resolve().parents[1]
 SCHEDULER = ROOT / ".github" / "workflows" / "continuum-issue-scheduler.yml"
+SCHEDULER_SCRIPT = ROOT / ".github" / "scripts" / "issue_scheduler.js"
 RECOVERY = ROOT / ".github" / "workflows" / "continuum-pr-agent-recovery.yml"
 
 
 def scheduler_body() -> str:
-    return SCHEDULER.read_text(encoding="utf-8")
+    body = SCHEDULER.read_text(encoding="utf-8")
+    module_body = SCHEDULER_SCRIPT.read_text(encoding="utf-8")
+    prefix = "'use strict';\n\nmodule.exports = async function runIssueScheduler({ github, context, core }) {\n"
+    suffix = "\n};\n"
+    if not module_body.startswith(prefix) or not module_body.endswith(suffix):
+        raise AssertionError("extracted scheduler module wrapper changed")
+    inline_body = module_body[len(prefix):-len(suffix)]
+    inline_body = "\n".join(
+        "" if not line.strip() else (
+            line[2:] if line.startswith("  ") else line
+        )
+        for line in inline_body.split("\n")
+    )
+    step = "      - name: Reconcile state and dispatch ready issues"
+    marker = "          script: |\n"
+    start = body.index(marker, body.index(step))
+    finish = body.index("\n      - name: Wake the configured downstream dispatcher", start)
+    embedded = "\n".join(
+        "" if not line.strip() else "            " + line
+        for line in inline_body.split("\n")
+    )
+    return body[:start] + marker + embedded + body[finish:]
 
 
 def recovery_body() -> str:

@@ -37,6 +37,32 @@ from continuum.scheduler_reconcile import (
 
 ROOT = Path(__file__).resolve().parents[1]
 SCHEDULER = ROOT / ".github" / "workflows" / "continuum-issue-scheduler.yml"
+SCHEDULER_SCRIPT = ROOT / ".github" / "scripts" / "issue_scheduler.js"
+
+
+def scheduler_body() -> str:
+    body = SCHEDULER.read_text(encoding="utf-8")
+    module_body = SCHEDULER_SCRIPT.read_text(encoding="utf-8")
+    prefix = "'use strict';\n\nmodule.exports = async function runIssueScheduler({ github, context, core }) {\n"
+    suffix = "\n};\n"
+    if not module_body.startswith(prefix) or not module_body.endswith(suffix):
+        raise AssertionError("extracted scheduler module wrapper changed")
+    inline_body = module_body[len(prefix):-len(suffix)]
+    inline_body = "\n".join(
+        "" if not line.strip() else (
+            line[2:] if line.startswith("  ") else line
+        )
+        for line in inline_body.split("\n")
+    )
+    step = "      - name: Reconcile state and dispatch ready issues"
+    marker = "          script: |\n"
+    start = body.index(marker, body.index(step))
+    finish = body.index("\n      - name: Wake the configured downstream dispatcher", start)
+    embedded = "\n".join(
+        "" if not line.strip() else "            " + line
+        for line in inline_body.split("\n")
+    )
+    return body[:start] + marker + embedded + body[finish:]
 
 
 def utcnow() -> datetime:
@@ -400,14 +426,14 @@ class WorkflowContractPinTests(unittest.TestCase):
     PR-Agent introduction, no paid provider keys in the core path."""
 
     def test_scheduler_workflow_explains_every_skip(self):
-        body = SCHEDULER.read_text(encoding="utf-8")
+        body = scheduler_body()
         self.assertIn("WIP slot held", body)
         self.assertIn("open implementation PR must not be duplicated", body)
         self.assertIn("waiting for a free WIP slot", body)
         self.assertIn("active local issues", body)
 
     def test_wip_saturation_keeps_backlog_queued_without_failing(self):
-        body = SCHEDULER.read_text(encoding="utf-8")
+        body = scheduler_body()
         self.assertIn("waiting for a free WIP slot", body)
         self.assertIn("WIP is saturated;", body)
         self.assertIn("eligible issue(s) remain queued", body)
@@ -416,7 +442,7 @@ class WorkflowContractPinTests(unittest.TestCase):
         )
 
     def test_no_review_gate_or_credential_regression(self):
-        body = SCHEDULER.read_text(encoding="utf-8")
+        body = scheduler_body()
         # CodeRabbit stays the consumer review gate: the local automatic
         # implementation dispatch path must not route through PR-Agent.
         # (Delegated parent-side PR-Agent fan-out for child tasks predates
