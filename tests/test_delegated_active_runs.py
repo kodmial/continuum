@@ -25,34 +25,13 @@ import subprocess
 import tempfile
 import unittest
 
+try:
+    from tests.scheduler_workflow import scheduler_workflow_text
+except ModuleNotFoundError:
+    from scheduler_workflow import scheduler_workflow_text
+
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / ".github" / "scripts" / "delegated_active_runs.sh"
-SCHEDULER = ROOT / ".github" / "workflows" / "continuum-issue-scheduler.yml"
-
-SCHEDULER_SCRIPT = ROOT / ".github" / "scripts" / "issue_scheduler.js"
-
-
-def scheduler_workflow_text() -> str:
-    body = SCHEDULER.read_text(encoding="utf-8")
-    module_body = SCHEDULER_SCRIPT.read_text(encoding="utf-8")
-    prefix = "'use strict';\n\nmodule.exports = async function runIssueScheduler({ github, context, core }) {\n"
-    suffix = "\n};\n"
-    if not module_body.startswith(prefix) or not module_body.endswith(suffix):
-        raise AssertionError("extracted scheduler module wrapper changed")
-    inline_body = module_body[len(prefix):-len(suffix)]
-    inline_body = "\n".join(
-        "" if not line.strip() else (line[2:] if line.startswith("  ") else line)
-        for line in inline_body.split("\n")
-    )
-    step = "      - name: Reconcile state and dispatch ready issues"
-    marker = "          script: |\n"
-    start = body.index(marker, body.index(step))
-    finish = body.index("\n      - name: Wake the configured downstream dispatcher", start)
-    embedded = "\n".join(
-        "" if not line.strip() else "            " + line
-        for line in inline_body.split("\n")
-    )
-    return body[:start] + marker + embedded + body[finish:]
 
 ACTIVE_STATUSES = ("in_progress", "queued", "pending", "waiting", "requested")
 

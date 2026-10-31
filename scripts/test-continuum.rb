@@ -32,6 +32,21 @@ class ContinuumTest < Minitest::Test
     YAML.load_file(path)
   end
 
+  # The scheduler implementation is the checked-in module; both the full
+  # workflow reconstruction and the script-only view consume this single
+  # extraction so wrapper, step-name, and indentation rules cannot drift.
+  def scheduler_inline_body
+    module_body = File.read(File.join(ROOT, '.github/scripts/issue_scheduler.js'))
+    prefix = "'use strict';\n\nmodule.exports = async function runIssueScheduler({ github, context, core }) {\n"
+    suffix = "\n};\n"
+    raise 'extracted scheduler module wrapper changed' unless module_body.start_with?(prefix) && module_body.end_with?(suffix)
+
+    inline_body = module_body[prefix.length...-suffix.length]
+    inline_body.split("\n", -1).map do |line|
+      line.strip.empty? ? '' : (line.start_with?('  ') ? line[2..] : line)
+    end.join("\n")
+  end
+
   def workflow_body(name)
     body = File.read(File.join(ROOT, '.github/workflows', name))
     return body unless name == 'continuum-issue-scheduler.yml'
@@ -43,17 +58,8 @@ class ContinuumTest < Minitest::Test
     finish = body.index("\n      - name: Wake the configured downstream dispatcher", start)
     raise 'scheduler downstream dispatcher step is missing' unless finish
 
-    module_body = File.read(File.join(ROOT, '.github/scripts/issue_scheduler.js'))
-    prefix = "'use strict';\n\nmodule.exports = async function runIssueScheduler({ github, context, core }) {\n"
-    suffix = "\n};\n"
-    raise 'extracted scheduler module wrapper changed' unless module_body.start_with?(prefix) && module_body.end_with?(suffix)
-    inline_body = module_body[prefix.length...-suffix.length]
-    inline_body = inline_body.lines.map do |line|
-      stripped = line.sub(/\A  /, '')
-      stripped.strip.empty? ? '' : stripped
-    end.join
-    embedded = inline_body.lines.map do |line|
-      line.strip.empty? ? '' : "            #{line.chomp}"
+    embedded = scheduler_inline_body.split("\n", -1).map do |line|
+      line.strip.empty? ? '' : "            #{line}"
     end.join("\n")
     body[0...start] + marker + embedded + body[finish..]
   end
@@ -189,17 +195,7 @@ class ContinuumTest < Minitest::Test
   # not see the `workflow_call.inputs` defaults, which legitimately name the
   # same values as the fallback chain.
   def script_body(name)
-    if name == 'continuum-issue-scheduler.yml'
-      module_body = File.read(File.join(ROOT, '.github/scripts/issue_scheduler.js'))
-      prefix = "'use strict';\n\nmodule.exports = async function runIssueScheduler({ github, context, core }) {\n"
-      suffix = "\n};\n"
-      raise 'extracted scheduler module wrapper changed' unless module_body.start_with?(prefix) && module_body.end_with?(suffix)
-      inline_body = module_body[prefix.length...-suffix.length]
-      return inline_body.lines.map do |line|
-        stripped = line.sub(/\A  /, '')
-        stripped.strip.empty? ? '' : stripped
-      end.join
-    end
+    return scheduler_inline_body if name == 'continuum-issue-scheduler.yml'
 
     lines = workflow_body(name).lines
     start = lines.index { |line| line =~ /^\s*script: \|\s*$/ }

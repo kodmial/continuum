@@ -24,39 +24,14 @@ from continuum import api_budget
 from continuum import lifecycle_recovery as lifecycle
 from continuum import tap_pat_inventory as inventory
 
+try:
+    from tests.scheduler_workflow import read_workflow, reconstruct_scheduler_workflow
+except ModuleNotFoundError:
+    from scheduler_workflow import read_workflow, reconstruct_scheduler_workflow
+
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 WORKFLOWS_DIR = os.path.join(ROOT, ".github", "workflows")
 SECRET_RE = re.compile(r"secrets\.([A-Za-z0-9_]+)")
-
-SCHEDULER_SCRIPT = os.path.join(ROOT, ".github", "scripts", "issue_scheduler.js")
-
-
-def reconstruct_scheduler_workflow(body):
-    with open(SCHEDULER_SCRIPT, encoding="utf-8") as handle:
-        module_body = handle.read()
-    prefix = "'use strict';\n\nmodule.exports = async function runIssueScheduler({ github, context, core }) {\n"
-    suffix = "\n};\n"
-    if not module_body.startswith(prefix) or not module_body.endswith(suffix):
-        raise AssertionError("extracted scheduler module wrapper changed")
-    inline_body = module_body[len(prefix):-len(suffix)]
-    inline_body = "\n".join(
-        "" if not line.strip() else (line[2:] if line.startswith("  ") else line)
-        for line in inline_body.split("\n")
-    )
-    step = "      - name: Reconcile state and dispatch ready issues"
-    marker = "          script: |\n"
-    start = body.index(marker, body.index(step))
-    finish = body.index("\n      - name: Wake the configured downstream dispatcher", start)
-    embedded = "\n".join(
-        "" if not line.strip() else "            " + line
-        for line in inline_body.split("\n")
-    )
-    return body[:start] + marker + embedded + body[finish:]
-
-def read_workflow(name):
-    with open(os.path.join(WORKFLOWS_DIR, name), encoding="utf-8") as handle:
-        body = handle.read()
-    return reconstruct_scheduler_workflow(body) if name == "continuum-issue-scheduler.yml" else body
 
 
 class InventoryShapeTests(unittest.TestCase):

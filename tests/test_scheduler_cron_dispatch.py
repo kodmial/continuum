@@ -26,7 +26,6 @@ from __future__ import annotations
 
 import unittest
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
 
 from continuum.scheduler_reconcile import (
     CommentRecord,
@@ -35,34 +34,10 @@ from continuum.scheduler_reconcile import (
     reconcile,
 )
 
-ROOT = Path(__file__).resolve().parents[1]
-SCHEDULER = ROOT / ".github" / "workflows" / "continuum-issue-scheduler.yml"
-SCHEDULER_SCRIPT = ROOT / ".github" / "scripts" / "issue_scheduler.js"
-
-
-def scheduler_body() -> str:
-    body = SCHEDULER.read_text(encoding="utf-8")
-    module_body = SCHEDULER_SCRIPT.read_text(encoding="utf-8")
-    prefix = "'use strict';\n\nmodule.exports = async function runIssueScheduler({ github, context, core }) {\n"
-    suffix = "\n};\n"
-    if not module_body.startswith(prefix) or not module_body.endswith(suffix):
-        raise AssertionError("extracted scheduler module wrapper changed")
-    inline_body = module_body[len(prefix):-len(suffix)]
-    inline_body = "\n".join(
-        "" if not line.strip() else (
-            line[2:] if line.startswith("  ") else line
-        )
-        for line in inline_body.split("\n")
-    )
-    step = "      - name: Reconcile state and dispatch ready issues"
-    marker = "          script: |\n"
-    start = body.index(marker, body.index(step))
-    finish = body.index("\n      - name: Wake the configured downstream dispatcher", start)
-    embedded = "\n".join(
-        "" if not line.strip() else "            " + line
-        for line in inline_body.split("\n")
-    )
-    return body[:start] + marker + embedded + body[finish:]
+try:
+    from tests.scheduler_workflow import scheduler_workflow_text as scheduler_body
+except ModuleNotFoundError:
+    from scheduler_workflow import scheduler_workflow_text as scheduler_body
 
 
 def utcnow() -> datetime:
