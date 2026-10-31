@@ -71,9 +71,9 @@ MERGE_B = "d" * 40
 PAUSE = "automation:paused"
 READY = "automation:ready"
 
-# Executes the real owner-resume JavaScript embedded in the production
-# scheduler. The Python decision model below documents the contract; this
-# harness proves the shipped workflow implements the same decisions instead
+# Executes the real owner-resume JavaScript from the extracted production
+# scheduler module. The Python decision model below documents the contract;
+# this harness proves the shipped module implements the same decisions instead
 # of a parallel mock.
 WORKFLOW_HARNESS = r"""
 const fs = require('fs');
@@ -1166,7 +1166,7 @@ class SchedulerResumeBudgetTests(unittest.TestCase):
 class ExecutableProductionWorkflowTests(unittest.TestCase):
     def run_workflow(self, scenario):
         env = os.environ.copy()
-        env["SCHEDULER"] = str(SCHEDULER)
+        env["SCHEDULER"] = str(SCHEDULER_SCRIPT)
         env["SCENARIO_JSON"] = json.dumps(scenario)
         completed = subprocess.run(
             ["node", "-e", WORKFLOW_HARNESS],
