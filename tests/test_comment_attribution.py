@@ -50,6 +50,32 @@ WORKFLOWS_DIR = os.path.join(ROOT, ".github", "workflows")
 POLICY_JS = os.path.join(ROOT, ".github", "scripts", "pr_agent_policy.js")
 RECOVERY_WORKFLOW = os.path.join(WORKFLOWS_DIR, "continuum-pr-agent-recovery.yml")
 
+SCHEDULER_SCRIPT = os.path.join(ROOT, ".github", "scripts", "issue_scheduler.js")
+
+
+def reconstruct_scheduler_workflow(body):
+    with open(SCHEDULER_SCRIPT, encoding="utf-8") as handle:
+        module_body = handle.read()
+    prefix = "'use strict';\\n\\nmodule.exports = async function runIssueScheduler({ github, context, core }) {\\n"
+    suffix = "\\n};\\n"
+    if not module_body.startswith(prefix) or not module_body.endswith(suffix):
+        raise AssertionError("extracted scheduler module wrapper changed")
+    inline_body = module_body[len(prefix):-len(suffix)]
+    inline_body = "\\n".join(
+        "" if not line.strip() else (line[2:] if line.startswith("  ") else line)
+        for line in inline_body.split("\\n")
+    )
+    step = "      - name: Reconcile state and dispatch ready issues"
+    marker = "          script: |\\n"
+    start = body.index(marker, body.index(step))
+    finish = body.index("\\n      - name: Wake the configured downstream dispatcher", start)
+    embedded = "\\n".join(
+        "" if not line.strip() else "            " + line
+        for line in inline_body.split("\\n")
+    )
+    return body[:start] + marker + embedded + body[finish:]
+
+
 MUTATION_RES = (
     re.compile(r"(?:github|commentGithub)\.rest\.issues\.(?:createComment|updateComment)"),
     re.compile(r"gh\s+(?:issue|pr)\s+comment\b"),
@@ -287,7 +313,8 @@ SECRET_RES = (
 
 def read_workflow(name):
     with open(os.path.join(WORKFLOWS_DIR, name), encoding="utf-8") as handle:
-        return handle.read()
+        body = handle.read()
+    return reconstruct_scheduler_workflow(body) if name == "continuum-issue-scheduler.yml" else body
 
 
 def mutation_positions(text):

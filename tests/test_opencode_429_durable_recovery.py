@@ -21,6 +21,32 @@ ROOT = Path(__file__).resolve().parents[1]
 TMP_PARENT = ROOT / ".opencode-tmp"
 SCHEDULER = ROOT / ".github" / "workflows" / "continuum-issue-scheduler.yml"
 
+SCHEDULER_SCRIPT = ROOT / ".github" / "scripts" / "issue_scheduler.js"
+
+
+def scheduler_workflow_text() -> str:
+    body = scheduler_workflow_text()
+    module_body = SCHEDULER_SCRIPT.read_text(encoding="utf-8")
+    prefix = "'use strict';\\n\\nmodule.exports = async function runIssueScheduler({ github, context, core }) {\\n"
+    suffix = "\\n};\\n"
+    if not module_body.startswith(prefix) or not module_body.endswith(suffix):
+        raise AssertionError("extracted scheduler module wrapper changed")
+    inline_body = module_body[len(prefix):-len(suffix)]
+    inline_body = "\\n".join(
+        "" if not line.strip() else (line[2:] if line.startswith("  ") else line)
+        for line in inline_body.split("\\n")
+    )
+    step = "      - name: Reconcile state and dispatch ready issues"
+    marker = "          script: |\\n"
+    start = body.index(marker, body.index(step))
+    finish = body.index("\\n      - name: Wake the configured downstream dispatcher", start)
+    embedded = "\\n".join(
+        "" if not line.strip() else "            " + line
+        for line in inline_body.split("\\n")
+    )
+    return body[:start] + marker + embedded + body[finish:]
+
+
 OWNER = "kodmial"
 REPO = "continuum"
 OPERATION = "opencode-429-issue-issue382"
@@ -178,7 +204,7 @@ class SchedulerDurableRecoveryTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         TMP_PARENT.mkdir(parents=True, exist_ok=True)
-        body = SCHEDULER.read_text(encoding="utf-8")
+        body = scheduler_workflow_text()
         cls.source = "\n\n".join(
             extract_function(body, name)
             for name in (
@@ -439,7 +465,7 @@ class SchedulerDurableRecoveryTests(unittest.TestCase):
                 self.assertFalse(evaluation["countWip"])
 
     def test_no_dispatch_record_still_retains_verified_recovery(self):
-        body = SCHEDULER.read_text(encoding="utf-8")
+        body = scheduler_workflow_text()
         block = body.split("if (!latestDispatch) {", 1)[1].split(
             "const ageMs", 1
         )[0]
@@ -451,7 +477,7 @@ class SchedulerDurableRecoveryTests(unittest.TestCase):
         )
 
     def test_scheduler_source_wires_recovery_to_wip_lifecycle(self):
-        body = SCHEDULER.read_text(encoding="utf-8")
+        body = scheduler_workflow_text()
         self.assertIn("evaluateScheduler429Recovery", body)
         self.assertIn("getWorkflowRun", body)
         self.assertIn("recoveryPendingIssueNumbers", body)

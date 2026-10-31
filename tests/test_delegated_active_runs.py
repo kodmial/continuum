@@ -28,6 +28,32 @@ import unittest
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / ".github" / "scripts" / "delegated_active_runs.sh"
 SCHEDULER = ROOT / ".github" / "workflows" / "continuum-issue-scheduler.yml"
+
+SCHEDULER_SCRIPT = ROOT / ".github" / "scripts" / "issue_scheduler.js"
+
+
+def scheduler_workflow_text() -> str:
+    body = scheduler_workflow_text()
+    module_body = SCHEDULER_SCRIPT.read_text(encoding="utf-8")
+    prefix = "'use strict';\\n\\nmodule.exports = async function runIssueScheduler({ github, context, core }) {\\n"
+    suffix = "\\n};\\n"
+    if not module_body.startswith(prefix) or not module_body.endswith(suffix):
+        raise AssertionError("extracted scheduler module wrapper changed")
+    inline_body = module_body[len(prefix):-len(suffix)]
+    inline_body = "\\n".join(
+        "" if not line.strip() else (line[2:] if line.startswith("  ") else line)
+        for line in inline_body.split("\\n")
+    )
+    step = "      - name: Reconcile state and dispatch ready issues"
+    marker = "          script: |\\n"
+    start = body.index(marker, body.index(step))
+    finish = body.index("\\n      - name: Wake the configured downstream dispatcher", start)
+    embedded = "\\n".join(
+        "" if not line.strip() else "            " + line
+        for line in inline_body.split("\\n")
+    )
+    return body[:start] + marker + embedded + body[finish:]
+
 ACTIVE_STATUSES = ("in_progress", "queued", "pending", "waiting", "requested")
 
 
@@ -323,7 +349,7 @@ print(json.dumps({"total_count": len(runs), "workflow_runs": batch}))
 
 class SchedulerWorkflowWiringTests(unittest.TestCase):
     def test_scheduler_uses_status_filtered_discovery_not_newest_100(self):
-        body = SCHEDULER.read_text(encoding="utf-8")
+        body = scheduler_workflow_text()
         self.assertIn("delegated_active_runs.sh", body)
         self.assertIn(
             'bash "$active_script" snapshot --output "$active_runs_file"', body
@@ -339,7 +365,7 @@ class SchedulerWorkflowWiringTests(unittest.TestCase):
         self.assertNotIn("--json status,displayTitle", body)
 
     def test_dispatch_is_guarded_by_a_fresh_authoritative_recheck(self):
-        body = SCHEDULER.read_text(encoding="utf-8")
+        body = scheduler_workflow_text()
         dispatch = body.index("await dispatchWorkflow(childWorkerWorkflow")
         recheck = body.rindex("freshDelegatedTaskActive", 0, dispatch)
         self.assertLess(recheck, dispatch)
@@ -356,7 +382,7 @@ class SchedulerWorkflowWiringTests(unittest.TestCase):
         self.assertIn("skipping dispatch for this pass", helper)
 
     def test_recheck_reuses_one_pass_snapshot_instead_of_per_candidate_checks(self):
-        body = SCHEDULER.read_text(encoding="utf-8")
+        body = scheduler_workflow_text()
         helper = body[
             body.index("function ensureFreshDelegatedActiveRuns"):
             body.index("function positiveInt")
