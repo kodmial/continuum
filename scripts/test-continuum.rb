@@ -48,8 +48,13 @@ class ContinuumTest < Minitest::Test
     suffix = "\n};\n"
     raise 'extracted scheduler module wrapper changed' unless module_body.start_with?(prefix) && module_body.end_with?(suffix)
     inline_body = module_body[prefix.length...-suffix.length]
-    inline_body = inline_body.lines.map { |line| line.sub(/\A  /, '') }.join
-    embedded = inline_body.lines.map { |line| "            #{line.chomp}" }.join("\n")
+    inline_body = inline_body.lines.map do |line|
+      stripped = line.sub(/\A  /, '')
+      stripped.strip.empty? ? '' : stripped
+    end.join
+    embedded = inline_body.lines.map do |line|
+      line.strip.empty? ? '' : "            #{line.chomp}"
+    end.join("\n")
     body[0...start] + marker + embedded + body[finish..]
   end
 
@@ -184,6 +189,18 @@ class ContinuumTest < Minitest::Test
   # not see the `workflow_call.inputs` defaults, which legitimately name the
   # same values as the fallback chain.
   def script_body(name)
+    if name == 'continuum-issue-scheduler.yml'
+      module_body = File.read(File.join(ROOT, '.github/scripts/issue_scheduler.js'))
+      prefix = "'use strict';\n\nmodule.exports = async function runIssueScheduler({ github, context, core }) {\n"
+      suffix = "\n};\n"
+      raise 'extracted scheduler module wrapper changed' unless module_body.start_with?(prefix) && module_body.end_with?(suffix)
+      inline_body = module_body[prefix.length...-suffix.length]
+      return inline_body.lines.map do |line|
+        stripped = line.sub(/\A  /, '')
+        stripped.strip.empty? ? '' : stripped
+      end.join
+    end
+
     lines = workflow_body(name).lines
     start = lines.index { |line| line =~ /^\s*script: \|\s*$/ }
     refute_nil start, "#{name}: no embedded script block"
