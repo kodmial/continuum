@@ -41,7 +41,16 @@ SCHEDULER_SCRIPT = ROOT / ".github" / "scripts" / "issue_scheduler.js"
 
 
 def scheduler_body() -> str:
-    return SCHEDULER.read_text(encoding="utf-8") + "\n" + SCHEDULER_SCRIPT.read_text(encoding="utf-8")
+    body = SCHEDULER.read_text(encoding="utf-8")
+    module_body = SCHEDULER_SCRIPT.read_text(encoding="utf-8")
+    step = "      - name: Reconcile state and dispatch ready issues"
+    marker = "          script: |\n"
+    start = body.index(marker, body.index(step))
+    finish = body.index("\n      - name: Wake the configured downstream dispatcher", start)
+    embedded = "\n".join(
+        "            " + line for line in module_body.rstrip("\n").split("\n")
+    )
+    return body[:start] + marker + embedded + body[finish:]
 
 
 def utcnow() -> datetime:
