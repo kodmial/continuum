@@ -31,7 +31,7 @@ RESOLVER = ROOT / ".github" / "scripts" / "delegation_repository.sh"
 
 
 def scheduler_body() -> str:
-    return SCHEDULER.read_text(encoding="utf-8") + "\\n" + SCHEDULER_SCRIPT.read_text(encoding="utf-8")
+    return SCHEDULER.read_text(encoding="utf-8") + "\n" + SCHEDULER_SCRIPT.read_text(encoding="utf-8")
 
 
 class WorkflowDecouplingTest(unittest.TestCase):
