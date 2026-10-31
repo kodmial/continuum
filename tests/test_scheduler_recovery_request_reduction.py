@@ -20,11 +20,12 @@ from continuum.opencode_commands import classify_issue_comment
 
 ROOT = Path(__file__).resolve().parents[1]
 SCHEDULER = ROOT / ".github" / "workflows" / "continuum-issue-scheduler.yml"
+SCHEDULER_SCRIPT = ROOT / ".github" / "scripts" / "issue_scheduler.js"
 RECOVERY = ROOT / ".github" / "workflows" / "continuum-pr-agent-recovery.yml"
 
 
 def scheduler_body() -> str:
-    return SCHEDULER.read_text(encoding="utf-8")
+    return SCHEDULER.read_text(encoding="utf-8") + "\\n" + SCHEDULER_SCRIPT.read_text(encoding="utf-8")
 
 
 def recovery_body() -> str:
