@@ -33,13 +33,20 @@ RESOLVER = ROOT / ".github" / "scripts" / "delegation_repository.sh"
 def scheduler_body() -> str:
     body = SCHEDULER.read_text(encoding="utf-8")
     module_body = SCHEDULER_SCRIPT.read_text(encoding="utf-8")
+    prefix = "'use strict';\n\nmodule.exports = async function runIssueScheduler({ github, context, core }) {\n"
+    suffix = "\n};\n"
+    if not module_body.startswith(prefix) or not module_body.endswith(suffix):
+        raise AssertionError("extracted scheduler module wrapper changed")
+    inline_body = module_body[len(prefix):-len(suffix)]
+    inline_body = "\n".join(
+        line[2:] if line.startswith("  ") else line
+        for line in inline_body.split("\n")
+    )
     step = "      - name: Reconcile state and dispatch ready issues"
     marker = "          script: |\n"
     start = body.index(marker, body.index(step))
     finish = body.index("\n      - name: Wake the configured downstream dispatcher", start)
-    embedded = "\n".join(
-        "            " + line for line in module_body.rstrip("\n").split("\n")
-    )
+    embedded = "\n".join("            " + line for line in inline_body.split("\n"))
     return body[:start] + marker + embedded + body[finish:]
 
 
