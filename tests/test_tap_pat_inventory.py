@@ -26,6 +26,7 @@ from continuum import tap_pat_inventory as inventory
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 WORKFLOWS_DIR = os.path.join(ROOT, ".github", "workflows")
+SECRET_RE = re.compile(r"secrets\\.([A-Za-z0-9_]+)")
 
 SCHEDULER_SCRIPT = os.path.join(ROOT, ".github", "scripts", "issue_scheduler.js")
 
