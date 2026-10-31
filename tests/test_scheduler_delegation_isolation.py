@@ -39,14 +39,19 @@ def scheduler_body() -> str:
         raise AssertionError("extracted scheduler module wrapper changed")
     inline_body = module_body[len(prefix):-len(suffix)]
     inline_body = "\n".join(
-        line[2:] if line.startswith("  ") else line
+        "" if not line.strip() else (
+            line[2:] if line.startswith("  ") else line
+        )
         for line in inline_body.split("\n")
     )
     step = "      - name: Reconcile state and dispatch ready issues"
     marker = "          script: |\n"
     start = body.index(marker, body.index(step))
     finish = body.index("\n      - name: Wake the configured downstream dispatcher", start)
-    embedded = "\n".join("            " + line for line in inline_body.split("\n"))
+    embedded = "\n".join(
+        "" if not line.strip() else "            " + line
+        for line in inline_body.split("\n")
+    )
     return body[:start] + marker + embedded + body[finish:]
 
 
