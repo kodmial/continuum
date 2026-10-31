@@ -44,7 +44,12 @@ class ContinuumTest < Minitest::Test
     raise 'scheduler downstream dispatcher step is missing' unless finish
 
     module_body = File.read(File.join(ROOT, '.github/scripts/issue_scheduler.js'))
-    embedded = module_body.lines.map { |line| "            #{line.chomp}" }.join("\n")
+    prefix = "'use strict';\n\nmodule.exports = async function runIssueScheduler({ github, context, core }) {\n"
+    suffix = "\n};\n"
+    raise 'extracted scheduler module wrapper changed' unless module_body.start_with?(prefix) && module_body.end_with?(suffix)
+    inline_body = module_body[prefix.length...-suffix.length]
+    inline_body = inline_body.lines.map { |line| line.sub(/\A  /, '') }.join
+    embedded = inline_body.lines.map { |line| "            #{line.chomp}" }.join("\n")
     body[0...start] + marker + embedded + body[finish..]
   end
 
