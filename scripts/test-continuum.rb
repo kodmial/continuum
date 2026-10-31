@@ -36,7 +36,16 @@ class ContinuumTest < Minitest::Test
     body = File.read(File.join(ROOT, '.github/workflows', name))
     return body unless name == 'continuum-issue-scheduler.yml'
 
-    body + "\n" + File.read(File.join(ROOT, '.github/scripts/issue_scheduler.js'))
+    marker = "          script: |\n"
+    step = "      - name: Reconcile state and dispatch ready issues"
+    start = body.index(marker, body.index(step))
+    raise 'scheduler reconcile script block is missing' unless start
+    finish = body.index("\n      - name: Wake the configured downstream dispatcher", start)
+    raise 'scheduler downstream dispatcher step is missing' unless finish
+
+    module_body = File.read(File.join(ROOT, '.github/scripts/issue_scheduler.js'))
+    embedded = module_body.lines.map { |line| "            #{line.chomp}" }.join("\n")
+    body[0...start] + marker + embedded + body[finish..]
   end
 
   # The code portion of a workflow line with `#` comments stripped (mirrors
