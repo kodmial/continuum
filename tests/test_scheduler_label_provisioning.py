@@ -34,6 +34,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 SCHEDULER = ROOT / ".github" / "workflows" / "continuum-issue-scheduler.yml"
+SCHEDULER_SCRIPT = ROOT / ".github" / "scripts" / "issue_scheduler.js"
 
 CANONICAL_LABELS = [
     "priority:p0",
@@ -47,7 +48,7 @@ CANONICAL_LABELS = [
 
 
 def scheduler_body() -> str:
-    return SCHEDULER.read_text(encoding="utf-8")
+    return SCHEDULER.read_text(encoding="utf-8") + "\\n" + SCHEDULER_SCRIPT.read_text(encoding="utf-8")
 
 
 def extract_function(body: str, name: str) -> str:
@@ -69,24 +70,14 @@ def extract_function(body: str, name: str) -> str:
 
 
 def extract_github_script(body: str, step_name: str) -> str:
-    step = body.index("- name: " + step_name)
-    marker = body.index("script: |", step)
-    lines = body[marker:].splitlines()
-    content = []
-    indent = None
-    for line in lines[1:]:
-        if not line.strip():
-            content.append("")
-            continue
-        current = len(line) - len(line.lstrip(" "))
-        if indent is None:
-            indent = current
-        if current < indent:
-            break
-        content.append(line[indent:])
-    if not content or not content[0].strip():
-        raise AssertionError("could not extract github-script body: " + step_name)
-    return "\n".join(content) + "\n"
+    if step_name != "Reconcile state and dispatch ready issues":
+        raise AssertionError("unexpected scheduler github-script step: " + step_name)
+    return (
+        "const runScheduler = require("
+        + json.dumps(str(SCHEDULER_SCRIPT))
+        + ");\\n"
+        + "await runScheduler({ github, context, core });\\n"
+    )
 
 
 HARNESS = r"""
