@@ -33,29 +33,24 @@ SCHEDULER_SCRIPT = os.path.join(ROOT, ".github", "scripts", "issue_scheduler.js"
 def reconstruct_scheduler_workflow(body):
     with open(SCHEDULER_SCRIPT, encoding="utf-8") as handle:
         module_body = handle.read()
-    prefix = "'use strict';\\n\\nmodule.exports = async function runIssueScheduler({ github, context, core }) {\\n"
-    suffix = "\\n};\\n"
+    prefix = "'use strict';\n\nmodule.exports = async function runIssueScheduler({ github, context, core }) {\n"
+    suffix = "\n};\n"
     if not module_body.startswith(prefix) or not module_body.endswith(suffix):
         raise AssertionError("extracted scheduler module wrapper changed")
     inline_body = module_body[len(prefix):-len(suffix)]
-    inline_body = "\\n".join(
+    inline_body = "\n".join(
         "" if not line.strip() else (line[2:] if line.startswith("  ") else line)
-        for line in inline_body.split("\\n")
+        for line in inline_body.split("\n")
     )
     step = "      - name: Reconcile state and dispatch ready issues"
-    marker = "          script: |\\n"
+    marker = "          script: |\n"
     start = body.index(marker, body.index(step))
-    finish = body.index("\\n      - name: Wake the configured downstream dispatcher", start)
-    embedded = "\\n".join(
+    finish = body.index("\n      - name: Wake the configured downstream dispatcher", start)
+    embedded = "\n".join(
         "" if not line.strip() else "            " + line
-        for line in inline_body.split("\\n")
+        for line in inline_body.split("\n")
     )
     return body[:start] + marker + embedded + body[finish:]
-
-STUBS_DIR = os.path.join(ROOT, ".github", "caller-stubs")
-
-SECRET_RE = re.compile(r"secrets\.([A-Za-z0-9_]+)")
-
 
 def read_workflow(name):
     with open(os.path.join(WORKFLOWS_DIR, name), encoding="utf-8") as handle:
