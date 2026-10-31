@@ -41,7 +41,7 @@ SCHEDULER_SCRIPT = ROOT / ".github" / "scripts" / "issue_scheduler.js"
 
 
 def scheduler_body() -> str:
-    return scheduler_body() + "\\n" + SCHEDULER_SCRIPT.read_text(encoding="utf-8")
+    return SCHEDULER.read_text(encoding="utf-8") + "\n" + SCHEDULER_SCRIPT.read_text(encoding="utf-8")
 
 
 def utcnow() -> datetime:
