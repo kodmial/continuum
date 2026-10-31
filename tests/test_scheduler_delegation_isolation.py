@@ -26,11 +26,12 @@ from continuum.scheduler_reconcile import (
 
 ROOT = Path(__file__).resolve().parents[1]
 SCHEDULER = ROOT / ".github" / "workflows" / "continuum-issue-scheduler.yml"
+SCHEDULER_SCRIPT = ROOT / ".github" / "scripts" / "issue_scheduler.js"
 RESOLVER = ROOT / ".github" / "scripts" / "delegation_repository.sh"
 
 
 def scheduler_body() -> str:
-    return SCHEDULER.read_text(encoding="utf-8")
+    return SCHEDULER.read_text(encoding="utf-8") + "\\n" + SCHEDULER_SCRIPT.read_text(encoding="utf-8")
 
 
 class WorkflowDecouplingTest(unittest.TestCase):
