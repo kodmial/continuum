@@ -48,7 +48,7 @@ CANONICAL_LABELS = [
 
 
 def scheduler_body() -> str:
-    return SCHEDULER.read_text(encoding="utf-8") + "\\n" + SCHEDULER_SCRIPT.read_text(encoding="utf-8")
+    return SCHEDULER.read_text(encoding="utf-8") + "\n" + SCHEDULER_SCRIPT.read_text(encoding="utf-8")
 
 
 def extract_function(body: str, name: str) -> str:
@@ -75,8 +75,8 @@ def extract_github_script(body: str, step_name: str) -> str:
     return (
         "const runScheduler = require("
         + json.dumps(str(SCHEDULER_SCRIPT))
-        + ");\\n"
-        + "await runScheduler({ github, context, core });\\n"
+        + ");\n"
+        + "await runScheduler({ github, context, core });\n"
     )
 
 
