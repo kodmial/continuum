@@ -56,22 +56,22 @@ ATTESTATION_KEY_ENV = "CONTINUUM_VERIFICATION_ATTESTATION_KEY"
 #: The key is delivered through a private file outside the task worktree. Its
 #: path is read from this environment variable, never the key itself: a
 #: repository-controlled command can read the engine's inherited environment
-#: through ``/proc/$PPID/environ``, so the value must not be in it. A process
-#: that runs repository-controlled commands reads the file into memory and
-#: removes the on-disk copy before the first command starts; it never writes
-#: the copy back. A later invocation re-provisions the file from its
-#: authoritative source with :func:`provision_attestation_key` (the
-#: ``provision-key`` CLI command), and fails closed with a clear error when the
-#: file is absent.
+#: through ``/proc/$PPID/environ``, so the value must not be in it. Every
+#: process that reads the file removes the on-disk copy as soon as it has the
+#: value in memory, and never writes the copy back. A later invocation
+#: re-provisions the file from its authoritative source with
+#: :func:`provision_attestation_key` (the ``provision-key`` CLI command), and
+#: fails closed with a clear error when the file is absent.
 ATTESTATION_KEY_FILE_ENV = "CONTINUUM_VERIFICATION_ATTESTATION_KEY_FILE"
 
 #: Keys already read from a file in this process, keyed by resolved path. The
-#: file is removed before consumer commands run, so later signing within the
-#: same invocation uses this cache instead of re-reading a file that is gone.
+#: file is removed as soon as it is read, so later signing within the same
+#: invocation uses this cache instead of re-reading a file that is gone.
 _ATTESTATION_KEY_CACHE: Dict[str, bytes] = {}
 
-#: Resolved key-file paths already removed by this process. The removal is
-#: idempotent: a second command set in the same process reuses the cached key.
+#: Resolved key-file paths already removed by this process. Reading removes the
+#: file; this set makes the removal idempotent and lets the command-set path
+#: re-check after an in-process re-provisioning.
 _ATTESTATION_KEY_CONSUMED: Set[str] = set()
 
 ATTESTATION_ALGORITHM = "hmac-sha256"
@@ -774,6 +774,34 @@ def _attestation_key_paths(
     return path, resolved
 
 
+def _remove_attestation_key_files(path: Path, resolved: Path) -> None:
+    """Unlink the configured key file and its resolved symlink target.
+
+    Both names are removed: unlinking only the configured name would leave the
+    key bytes readable through a symbolic link's target, and unlinking only the
+    target would leave the link. A missing file is not an error because another
+    consumer may have removed it first and the in-memory value is
+    authoritative. Any other failure raises :class:`VerificationError` so the
+    caller stops instead of continuing while a readable copy remains.
+    """
+
+    targets = [path]
+    if resolved != path:
+        targets.append(resolved)
+    for target in targets:
+        try:
+            target.unlink()
+        except FileNotFoundError:
+            # Another consumer removed it first, or this is the same inode
+            # already removed through another name.
+            pass
+        except OSError as exc:
+            raise VerificationError(
+                "the verification attestation key file cannot be removed after "
+                "it was read: {}".format(exc)
+            ) from exc
+
+
 def _attestation_key(
     environ: Optional[Mapping[str, str]] = None,
     worktree: Optional[Path | str] = None,
@@ -781,15 +809,20 @@ def _attestation_key(
     """The runner-controlled attestation key, or ``None`` when unset.
 
     The key value is read once from the private file named by
-    :data:`ATTESTATION_KEY_FILE_ENV` and cached in this process's memory. A
-    read-only command (the evidence summary, needs-verifier, and changes
-    commands) leaves the file in place, so sequential read-only verification
-    CLI processes can read the same key. A process that runs a command set
-    removes the file with :func:`_consume_attestation_key` before the first
-    repository-controlled command starts; nothing is restored, so a survivor
-    process spawned by that command cannot read the key after the engine exits.
-    The next invocation must re-provision the file from its authoritative
-    source with :func:`provision_attestation_key`. The value stays in this
+    :data:`ATTESTATION_KEY_FILE_ENV`, cached in this process's memory, and the
+    on-disk copy is removed immediately: the configured path and, when it
+    differs, its resolved symlink target. Every key-reading command (the
+    evidence summary, baseline, needs-verifier, record-verifier, and final
+    commands) therefore leaves no key on disk after the process has read it.
+    Nothing is restored at exit or on a signal, so a same-uid survivor process
+    spawned by a repository-controlled command cannot read the key after the
+    engine exits. The next verification CLI invocation that needs the key must
+    re-provision the file from its authoritative source with
+    :func:`provision_attestation_key` (``python -m continuum.verification
+    provision-key``), and must never provision it during an agent session: an
+    agent runs with the same user permissions and could read the file and sign
+    forged evidence. When the file is absent, reading fails closed instead of
+    silently continuing without an attestation. The value stays in this
     process's memory and is never written into the environment handed to
     repository-controlled commands, so a child cannot inherit it or its path.
     """
@@ -798,7 +831,8 @@ def _attestation_key(
     if location is None:
         return None
     path, resolved = location
-    cached = _ATTESTATION_KEY_CACHE.get(str(resolved))
+    marker = str(resolved)
+    cached = _ATTESTATION_KEY_CACHE.get(marker)
     if cached is not None:
         return cached
     try:
@@ -812,7 +846,9 @@ def _attestation_key(
     if not raw:
         raise VerificationError("the verification attestation key file is empty")
     key = raw.encode("utf-8")
-    _ATTESTATION_KEY_CACHE[str(resolved)] = key
+    _ATTESTATION_KEY_CACHE[marker] = key
+    _remove_attestation_key_files(path, resolved)
+    _ATTESTATION_KEY_CONSUMED.add(marker)
     return key
 
 
@@ -820,10 +856,12 @@ def _consume_attestation_key(
     environ: Optional[Mapping[str, str]] = None,
     worktree: Optional[Path | str] = None,
 ) -> None:
-    """Remove the key file before any repository-controlled command runs.
+    """Ensure no on-disk key remains before a repository-controlled command.
 
-    The value is already cached in this process's memory. The on-disk copy is
-    deliberately not restored at exit or on a signal: a repository-controlled
+    Reading the key already removes the file. This explicit guard covers the
+    command-set path even when this process re-provisioned the key after an
+    earlier read: the value is cached in memory, and the on-disk copy is
+    deliberately not restored at exit or on a signal. A repository-controlled
     command can spawn a same-uid survivor that outlives the engine and reads
     any file the engine can read, so leaving the key at its configured path
     after a command has run would hand the key to that survivor. A later
@@ -841,28 +879,10 @@ def _consume_attestation_key(
     path, resolved = location
     marker = str(resolved)
     if marker in _ATTESTATION_KEY_CONSUMED:
-        # A previous command set in this process already removed the file; the
-        # cached value remains authoritative.
+        # A previous read in this process already removed the file; the cached
+        # value remains authoritative.
         return
-    targets = [path]
-    if resolved != path:
-        # A symbolic link or a symlinked parent directory: unlinking the
-        # configured name alone would leave the key bytes readable at the
-        # resolved target.
-        targets.append(resolved)
-    for target in targets:
-        try:
-            target.unlink()
-        except FileNotFoundError:
-            # Another consumer removed it first, or this is the same inode
-            # already removed through another name. The cached value is
-            # authoritative and the no-leak property already holds.
-            pass
-        except OSError as exc:
-            raise VerificationError(
-                "the verification attestation key file cannot be removed before a "
-                "repository command runs: {}".format(exc)
-            ) from exc
+    _remove_attestation_key_files(path, resolved)
     _ATTESTATION_KEY_CONSUMED.add(marker)
 
 
@@ -878,7 +898,9 @@ def provision_attestation_key(
     they do not appear in process listings or ``/proc/$PPID/environ``). The
     write is atomic, owner-only (``0600``), and refuses to replace a different
     key that is already present so a mistake cannot invalidate existing
-    evidence. Re-provisioning the same key again is a no-op.
+    evidence. Re-provisioning the same key again is a no-op. The caller must
+    run this outside any agent session: an agent in the same job has the same
+    user permissions and could read the file and sign forged evidence.
     """
 
     location = _attestation_key_paths(environ, worktree)

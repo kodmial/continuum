@@ -91,22 +91,26 @@ through `/proc/$PPID/environ`, so setting
 `CONTINUUM_VERIFICATION_ATTESTATION_KEY` in the engine environment fails
 closed instead of being accepted. The engine reads the key file in every
 verification CLI process and never passes the key value or its file path to a
-repository-controlled command. Read-only subcommands (`summary`,
-`needs-verifier`, `changes`, `record-verifier`) leave the file in place, so
-separate sequential read-only processes verify the same evidence. A subcommand
-that runs repository-controlled commands (`baseline`, `final`) reads the key
-into memory and removes the on-disk copy before the first command starts, and
-it never writes the copy back: a command can spawn a same-uid process that
+repository-controlled command. Every invocation that reads the key (`baseline`,
+`needs-verifier`, `record-verifier`, `final`, `summary`) reads it
+into memory and immediately removes the on-disk copy — the configured path and
+its resolved symlink target — so after any such invocation no key file remains.
+The copy is never written back: a command can spawn a same-uid process that
 outlives the engine and reads any file the engine can read, so restoring the
 file at command end or at process exit, or leaving it after an interrupt,
 would hand the key to that process. A later invocation that needs the key must
 re-provision it explicitly from its authoritative source, for example
 `printf '%s' "$KEY" | python -m continuum.verification provision-key --repo "$GITHUB_WORKSPACE"`,
 which reads the key from standard input (never an argument or the environment),
-writes atomically with mode `0600`, and refuses to replace a different key. If
-the file is absent when it is needed, the engine fails closed with an explicit
-"the verification attestation key file is unavailable" error instead of
-continuing without an attestation. No shipped
+writes atomically with mode `0600`, and refuses to replace a different key.
+The workflow must re-provision the key before each verification CLI call that
+needs it and must never provision it during an agent session: an agent runs
+with the same user permissions in the same job and could read the file and
+sign a forged `verifier` or `final` record, which a resumed `tests-passed` or
+`publish-pr` run would accept when the HMAC verifies. If the file is absent
+when it is needed, or if the on-disk copy cannot be removed after it was read,
+the engine fails closed with an explicit `::error::` instead of continuing
+without an attestation. No shipped
 Continuum workflow declares or passes this hook; it is not a consumer secret
 and requires no consumer configuration. If supplied, it signs the recorded
 contract, baseline, verifier result, and accepted final record, and a resumed
