@@ -277,6 +277,13 @@ class YamlSubsetTests(unittest.TestCase):
     def test_hyphen_inside_a_plain_word_is_not_a_sequence_marker(self):
         parsed = yamlmini.loads("key: foo-'bar'\n")
         self.assertEqual(parsed, {"key": "foo-'bar'"})
+        # A mid-word hyphen must not open a quoted region. A wrongly-treated
+        # hyphen would keep the comment inside the quotes.
+        self.assertEqual(
+            yamlmini.loads("key: foo-'bar # baz'\n"), {"key": "foo-'bar"}
+        )
+        # And a lone quote after a mid-word hyphen must not raise.
+        self.assertEqual(yamlmini.loads("key: foo-'bar\n"), {"key": "foo-'bar"})
 
     def test_quote_after_a_plain_word_is_not_a_quote(self):
         self.assertEqual(yamlmini.loads("key: foo 'bar'\n"), {"key": "foo 'bar'"})
