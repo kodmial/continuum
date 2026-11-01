@@ -1,6 +1,7 @@
 """Work Lock #66: routing is policy-driven, bounded and independently tested."""
 from __future__ import annotations
 import importlib.util
+import io
 import pathlib
 import sys
 import tempfile
@@ -103,6 +104,33 @@ class ConfigurationTests(unittest.TestCase):
             self.assertEqual(route.classify(raw, 1), expected)
 
 
+class FakeProcess:
+    """Minimal subprocess.Popen surface for the semantic probe seam."""
+
+    def __init__(self, stdout: str = "", stderr: str = "", returncode: int = 0,
+                 hang: bool = False):
+        self.stdout = io.StringIO(stdout)
+        self.stderr = io.StringIO(stderr)
+        self.returncode = None if hang else returncode
+        self.terminated = False
+
+    def poll(self):
+        return self.returncode
+
+    def terminate(self):
+        self.terminated = True
+        self.returncode = -15
+
+    def kill(self):
+        self.terminated = True
+        self.returncode = -9
+
+    def wait(self, timeout=None):
+        if self.returncode is None:
+            raise route.subprocess.TimeoutExpired("opencode", timeout)
+        return self.returncode
+
+
 class ProbeTests(unittest.TestCase):
     def test_observed_model_mismatch_is_fatal(self):
         answer = '{"type":"text","part":{"type":"text","text":"Use >="}}\n'
@@ -117,36 +145,26 @@ class ProbeTests(unittest.TestCase):
 
     def test_probe_does_not_inherit_tokens_and_checks_review_answer(self):
         seen = {}
-        class Result:
-            returncode = 0
-            stdout = '{"type":"text","part":{"type":"text","text":"Replace > with >="}}\n'
-            stderr = ""
         def runner(command, **kwargs):
             seen.update(kwargs)
             self.assertEqual(command[0:2], ["opencode", "run"])
-            return Result()
+            return FakeProcess(
+                stdout='{"type":"text","part":{"type":"text","text":"Replace > with >="}}\n')
         with patch.dict("os.environ", {"GH_TOKEN": "no", "GITHUB_TOKEN": "also-no"}, clear=True):
             route.semantic_probe(A, "review", 30, runner=runner)
         self.assertNotIn("GH_TOKEN", seen["env"])
         self.assertNotIn("GITHUB_TOKEN", seen["env"])
 
     def test_probe_requires_actual_tool_created_file(self):
-        class Result:
-            returncode = 0
-            stdout = '{"type":"text","part":{"type":"text","text":"done"}}\n'
-            stderr = ""
         def runner(command, **kwargs):
-            return Result()
+            return FakeProcess(
+                stdout='{"type":"text","part":{"type":"text","text":"done"}}\n')
         with self.assertRaisesRegex(route.RouteError, "coding_tool_capability"):
             route.semantic_probe(A, "coder", 30, runner=runner)
 
     def test_429_burns_runner_and_skips_any_second_probe(self):
-        class Result:
-            returncode = 1
-            stdout = ""
-            stderr = "FreeUsageLimitError 429"
         def runner(command, **kwargs):
-            return Result()
+            return FakeProcess(stderr="FreeUsageLimitError 429", returncode=1)
         with tempfile.TemporaryDirectory() as tmp:
             with patch.dict("os.environ", {"RUNNER_TEMP": tmp}, clear=True):
                 with self.assertRaises(route.BurnedRunner):
@@ -158,13 +176,9 @@ class ProbeTests(unittest.TestCase):
         event = ('{"type":"error","error":{"name":"RateLimitError",'
                  '"data":{"statusCode":429}}}\n')
         calls = []
-        class Result:
-            returncode = 0
-            stdout = event
-            stderr = ""
         def runner(command, **kwargs):
             calls.append(command)
-            return Result()
+            return FakeProcess(stdout=event)
         # The local classifier alone misses this exit-0 structured event.
         self.assertEqual(route.classify(event, 0), "invalid_response")
         with tempfile.TemporaryDirectory() as tmp:
@@ -178,12 +192,8 @@ class ProbeTests(unittest.TestCase):
     def test_structured_exit_zero_non_quota_event_keeps_previous_path(self):
         event = ('{"type":"error","error":{"name":"ProviderAuthError",'
                  '"data":{"statusCode":401}}}\n')
-        class Result:
-            returncode = 0
-            stdout = event
-            stderr = ""
         def runner(command, **kwargs):
-            return Result()
+            return FakeProcess(stdout=event)
         with tempfile.TemporaryDirectory() as tmp:
             with patch.dict("os.environ", {"RUNNER_TEMP": tmp}, clear=True):
                 with self.assertRaisesRegex(route.RouteError,
@@ -192,13 +202,9 @@ class ProbeTests(unittest.TestCase):
                 self.assertFalse((pathlib.Path(tmp) / "continuum-opencode-429").exists())
 
     def test_nonzero_429_still_burns_without_structured_event(self):
-        class Result:
-            returncode = 1
-            stdout = ""
-            stderr = "HTTP 429 too many requests"
         def runner(command, **kwargs):
-            return Result()
-        raw = Result.stdout + "\n" + Result.stderr
+            return FakeProcess(stderr="HTTP 429 too many requests", returncode=1)
+        raw = "\n" + "HTTP 429 too many requests"
         # The shared helper needs structured evidence, so this path is the
         # pre-existing non-zero text classifier.
         self.assertFalse(route.is_opencode_429(raw, 1))
@@ -220,6 +226,34 @@ class ProbeTests(unittest.TestCase):
         self.assertIn(src, sys.path)
         self.assertTrue(callable(route.is_opencode_429))
 
+    def test_stalled_429_is_terminated_early_and_reported_as_quota_exhausted(self):
+        """The provider answers 429 but `opencode run` never exits: do not wait."""
+        # No trailing newline: the stalled child may leave a partial line.
+        process = FakeProcess(stderr="FreeUsageLimitError: HTTP 429 too many requests",
+                              hang=True)
+        def runner(command, **kwargs):
+            return process
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.dict("os.environ", {"RUNNER_TEMP": tmp}, clear=True):
+                started = route.time.monotonic()
+                with self.assertRaises(route.BurnedRunner) as caught:
+                    route.semantic_probe(A, "review", 30, runner=runner)
+                elapsed = route.time.monotonic() - started
+                self.assertTrue((pathlib.Path(tmp) / "continuum-opencode-429").exists())
+        self.assertEqual(str(caught.exception), route.QUOTA_EXHAUSTED)
+        self.assertTrue(process.terminated)
+        self.assertLess(elapsed, 5)
+
+    def test_stalled_probe_without_quota_still_reports_timeout(self):
+        process = FakeProcess(hang=True)
+        def runner(command, **kwargs):
+            return process
+        started = route.time.monotonic()
+        with self.assertRaisesRegex(route.RouteError, "^timeout$"):
+            route.semantic_probe(A, "review", 0.3, runner=runner)
+        elapsed = route.time.monotonic() - started
+        self.assertTrue(process.terminated)
+        self.assertLess(elapsed, 3)
 
 
 class CompletionTicketTests(unittest.TestCase):
