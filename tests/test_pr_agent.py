@@ -7,6 +7,7 @@ import os
 import threading
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib import error as urlerror
 from urllib import request as urlrequest
 
 from continuum import pr_agent
@@ -39,6 +40,17 @@ class ProviderConfigTests(unittest.TestCase):
         self.assertTrue(runtime.api_base.startswith("http://127.0.0.1:"))
         self.assertEqual(runtime.model, pr_agent.DEFAULT_MODEL)
         self.assertEqual(runtime.max_tokens, pr_agent.DEFAULT_MAX_TOKENS)
+
+    def test_default_max_tokens_matches_documented_contract(self):
+        # docs/pr-agent-opencode.md and docs/consumer-variables.md document
+        # PR_AGENT_MAX_TOKENS as 128000; an unset or invalid value must resolve
+        # to that same cap, not a smaller hidden fallback.
+        self.assertEqual(pr_agent.DEFAULT_MAX_TOKENS, 128000)
+        self.assertEqual(pr_agent.resolve_runtime(runtime_env()).max_tokens, 128000)
+        self.assertEqual(
+            pr_agent.resolve_runtime(runtime_env(PR_AGENT_MAX_TOKENS="not-a-number")).max_tokens,
+            128000,
+        )
 
     def test_generic_contract_is_configuration(self):
         runtime = pr_agent.resolve_runtime(
@@ -364,6 +376,122 @@ class BridgeIsolationTests(unittest.TestCase):
             server.shutdown()
             thread.join(timeout=10)
             server.server_close()
+
+
+class MalformedSessionHandler(BaseHTTPRequestHandler):
+    """OpenCode stand-in whose ``POST /session`` reply is not a JSON object."""
+
+    response = b"not json"
+
+    def log_message(self, *args: object) -> None:
+        pass
+
+    def do_POST(self) -> None:  # noqa: N802
+        length = int(self.headers.get("Content-Length", "0") or "0")
+        self.rfile.read(length)
+        data = type(self).response
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def do_DELETE(self) -> None:  # noqa: N802
+        self.send_response(200)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+
+class BridgeErrorResponseTests(unittest.TestCase):
+    """Every bad input must reach the reviewer as an HTTP status, not a reset."""
+
+    ENV_KEYS = ("OPENCODE_SERVER_URL", "OPENCODE_MODEL", "PR_AGENT_TIMEOUT_SECONDS")
+
+    def setUp(self):
+        import sys
+
+        self.saved_env = {key: os.environ.get(key) for key in self.ENV_KEYS}
+        self.addCleanup(self._restore_env)
+        root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+        script_dir = os.path.join(root, ".github", "scripts")
+        sys.path.insert(0, script_dir)
+        try:
+            import pr_agent_bridge as bridge
+        finally:
+            sys.path.remove(script_dir)
+        self.bridge = bridge
+        os.environ["OPENCODE_MODEL"] = "opencode/test-fixture-route"
+
+    def _restore_env(self):
+        for key, value in self.saved_env.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+    def _serve(self, handler):
+        server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(thread.join, 10)
+        self.addCleanup(server.shutdown)
+        return server.server_address[1]
+
+    def _post(self, port, payload):
+        request = urlrequest.Request(
+            f"http://127.0.0.1:{port}/v1/chat/completions",
+            data=payload,
+            headers={"Content-Type": "application/json"},
+        )
+        try:
+            with urlrequest.urlopen(request, timeout=30) as response:
+                return response.status, json.loads(response.read().decode())
+        except urlerror.HTTPError as exc:
+            return exc.code, json.loads(exc.read().decode())
+
+    def test_non_object_request_body_is_a_400(self):
+        port = self._serve(self.bridge.Handler)
+        status, payload = self._post(port, json.dumps([1, 2]).encode())
+        self.assertEqual(status, 400)
+        self.assertEqual(payload["error"]["type"], "invalid_request")
+
+    def test_non_numeric_timeout_falls_back_instead_of_dropping_the_request(self):
+        upstream = self._serve(FakeOpenCodeHandler)
+        os.environ["OPENCODE_SERVER_URL"] = f"http://127.0.0.1:{upstream}"
+        os.environ["PR_AGENT_TIMEOUT_SECONDS"] = "not-a-number"
+        port = self._serve(self.bridge.Handler)
+        status, payload = self._post(
+            port,
+            json.dumps(
+                {
+                    "model": "openai/continuum-review",
+                    "messages": [{"role": "user", "content": "hi"}],
+                }
+            ).encode(),
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["object"], "chat.completion")
+
+    def test_malformed_session_response_is_a_502(self):
+        for raw in (b"not json", b"[]"):
+            with self.subTest(response=raw):
+                MalformedSessionHandler.response = raw
+                upstream = self._serve(MalformedSessionHandler)
+                os.environ["OPENCODE_SERVER_URL"] = f"http://127.0.0.1:{upstream}"
+                port = self._serve(self.bridge.Handler)
+                status, payload = self._post(
+                    port,
+                    json.dumps(
+                        {
+                            "model": "openai/continuum-review",
+                            "messages": [{"role": "user", "content": "hi"}],
+                        }
+                    ).encode(),
+                )
+                self.assertEqual(status, 502)
+                self.assertEqual(payload["error"]["type"], "upstream_error")
+                self.assertIn("malformed opencode response", payload["error"]["message"])
 
 
 class FindingStateTests(unittest.TestCase):

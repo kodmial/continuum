@@ -2702,12 +2702,25 @@ class ReviewOutputTests(unittest.TestCase):
 
 class ImproveChannelTests(unittest.TestCase):
     def test_improve_uses_runner_local_push_outputs_file(self):
+        import sys
+
         body = read_repo(".github/workflows/continuum-pr-agent.yml")
         self.assertIn("pr-agent-outputs/continuum.jsonl", body)
         self.assertIn("push_outputs", body.lower())
         self.assertIn("payload.code_suggestions", body)
+        sys.path.insert(0, SRC)
+        try:
+            from continuum import pr_agent_lifecycle as life
+        finally:
+            sys.path.remove(SRC)
+        # v0.46.0 drops a repository-local [push_outputs] section, so the host
+        # configuration owns it and the checked-in file must not pretend otherwise.
         toml = read_repo(".pr_agent.toml")
-        self.assertIn('file_path = "pr-agent-outputs/continuum.jsonl"', toml)
+        self.assertNotIn("\n[push_outputs]\n", "\n" + toml + "\n")
+        host = life.required_toml()["push_outputs"]
+        self.assertEqual(host["enable"], True)
+        self.assertEqual(host["channels"], ["file"])
+        self.assertEqual(host["file_path"], "pr-agent-outputs/continuum.jsonl")
 
     def test_improve_payload_parsed_from_file_never_comments(self):
         import sys
@@ -3030,9 +3043,6 @@ class ConfigurationTests(unittest.TestCase):
             "suggestions_score_threshold = 7",
             "max_suggestions_per_file = 0",
             "enable_suggestions_coverage_footer = true",
-            "enable = true",
-            'channels = ["file"]',
-            'file_path = "pr-agent-outputs/continuum.jsonl"',
             "publish_as_check_run = false",
             "enable_output = true",
             "fail_on_tool_errors = true",

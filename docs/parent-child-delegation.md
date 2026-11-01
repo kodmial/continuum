@@ -79,6 +79,7 @@ invoke:
 - `continuum-consumer-child-worker.yml`
 - `continuum-consumer-child-review.yml`
 - `continuum-consumer-child-pr-review.yml`
+- `continuum-consumer-child-run-cleanup.yml` (completed-run cleanup only)
 
 There is no separate parent/child dispatcher caller. The core Issue scheduler
 resolves the verified child relationships, reconciles child reviews, and merges

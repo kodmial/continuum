@@ -8,8 +8,9 @@ any position:
   `ownership-conflict`, and `prune` entries and changes nothing. A preview of an
   explicit ref fetches templates from that ref, so it needs network access but
   never credentials.
-- `--yes` (or `CONTINUUM_INSTALL_ASSUME_YES=1`) preserves the existing
-  superseded-caller prune confirmation semantics.
+- `--yes` (or `CONTINUUM_INSTALL_ASSUME_YES=1`) is the explicit opt-out from
+  the terminal confirmation: it removes the listed superseded Continuum callers
+  without a prompt. Without it, a non-interactive install deletes nothing.
 
 ## Preflight and apply
 

@@ -97,6 +97,32 @@ class EvidenceAttestationTests(unittest.TestCase):
         self.assertNotIn("attestation", loaded)
 
 
+class ChildEnvironmentTests(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
+
+    def test_parent_side_evidence_signing_still_uses_the_key(self):
+        path = self.root / verification.EVIDENCE_FILE_NAME
+        verification._save_evidence(
+            path,
+            {
+                "schema_version": verification.SCHEMA_VERSION,
+                "contract": _contract().as_dict(),
+            },
+            KEY_ENV_VALUES,
+        )
+        self.assertIn("attestation", json.loads(path.read_text(encoding="utf-8")))
+        loaded = verification._load_evidence(path, KEY_ENV_VALUES)
+        self.assertEqual(
+            loaded["attestation"]["algorithm"],
+            verification.ATTESTATION_ALGORITHM,
+        )
+        with self.assertRaises(verification.VerificationError):
+            verification._load_evidence(path, {KEY_ENV: "different-secret"})
+
+
 class ContractResolutionAtRefTests(unittest.TestCase):
     def setUp(self):
         temporary = tempfile.TemporaryDirectory()

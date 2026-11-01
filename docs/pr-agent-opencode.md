@@ -93,6 +93,14 @@ coverage footer, reviewer behavior). A repository-local `.pr_agent.toml`
 may tune review *behavior*, but provider routing is forced through the
 `OPENAI__API_BASE` / `CONFIG__MODEL` environment, which override files.
 
+PR-Agent v0.46.0 treats the whole `[push_outputs]` section as host-only:
+every key from a repository-local `.pr_agent.toml` is dropped, because the
+sinks can write host files or reach arbitrary hosts. The reusable workflow
+therefore supplies `PUSH_OUTPUTS__ENABLE`, `PUSH_OUTPUTS__CHANNELS`, and
+`PUSH_OUTPUTS__FILE_PATH` in its own environment, and the
+`pr-agent-outputs/continuum.jsonl` file it points at is created before the
+run and consumed by the lifecycle parser.
+
 ## Review lifecycle
 
 The installed PR-Agent caller wakes on PR events and again when the repository's

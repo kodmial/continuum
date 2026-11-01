@@ -35,7 +35,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
-from typing import Any, Callable, Dict, List, Optional, Set, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 from .delegation_priority import effective_priority
 from . import opencode_commands
@@ -143,7 +143,7 @@ def terminal_stop_skip_reason(number: int, generation: int = 1) -> str:
 
 
 def _normalize_terminal_stopped(
-    terminal_stopped: Optional[Set[Any]],
+    terminal_stopped: Optional[Iterable[Any]],
 ) -> Set[Tuple[int, int]]:
     """Normalize the stopped set to generation-keyed ``(issue, generation)``.
 
@@ -184,7 +184,7 @@ def reconcile(
     qualification_trackers: Set[int],
     config: SchedulerConfig,
     dispatch_hook: Optional[Callable[[int], None]] = None,
-    terminal_stopped: Optional[Set[Any]] = None,
+    terminal_stopped: Optional[Iterable[Any]] = None,
     generations: Optional[Dict[int, int]] = None,
     repository_owner: str = "",
 ) -> ReconcileResult:

@@ -80,10 +80,10 @@ performance regression, or meaningful maintainability risk. Avoid formatting-onl
 or subjective style suggestions.
 """
 
-[push_outputs]
-enable = true
-channels = ["file"]
-file_path = "pr-agent-outputs/continuum.jsonl"
+# `[push_outputs]` is deliberately absent: PR-Agent v0.46.0 treats the whole
+# section as host-only and drops every key from a repository-local file. The
+# invoking workflow supplies `PUSH_OUTPUTS__ENABLE`, `PUSH_OUTPUTS__CHANNELS`,
+# and `PUSH_OUTPUTS__FILE_PATH` in its own environment instead.
 
 [github]
 publish_as_check_run = false

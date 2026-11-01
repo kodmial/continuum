@@ -339,7 +339,7 @@ def plan_issue_admissions(
 
     records = _issue_records(issues)
     comments_by_number = _comments_by_number(issues, comments)
-    stopped = _normalize_terminal_stopped(set(terminal_stopped))
+    stopped = _normalize_terminal_stopped(list(terminal_stopped or ()))
     generations = {int(key): int(value) for key, value in (generations or {}).items()}
     result = reconcile(
         now,
@@ -358,7 +358,7 @@ def plan_issue_admissions(
         {int(number) for number in qualification_trackers},
         config or SchedulerConfig(),
         dispatch_hook=None,
-        terminal_stopped=set(terminal_stopped),
+        terminal_stopped=set(stopped),
         generations=generations,
         repository_owner=repository_owner,
     )

@@ -31,7 +31,9 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 FORBIDDEN_PROVIDER_SUBSTRINGS = ("groq", "anthropic", "openai_api_key")
 
 DEFAULT_MODEL = "openai/continuum-review"
-DEFAULT_MAX_TOKENS = 4096
+#: Matches the documented ``PR_AGENT_MAX_TOKENS`` / ``custom_model_max_tokens``
+#: default: the custom-model context cap used for prompt budgeting.
+DEFAULT_MAX_TOKENS = 128000
 DEFAULT_TIMEOUT_SECONDS = 180
 DEFAULT_BRIDGE_PATH = "/v1"
 

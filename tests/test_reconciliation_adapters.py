@@ -118,6 +118,26 @@ class IssueAdmissionTests(unittest.TestCase):
         self.assertEqual(decision.kind, adapters.TERMINAL)
         self.assertIn("terminal generation stop", decision.reason)
 
+    def test_json_list_terminal_stop_pairs_are_normalized_before_set(self):
+        # A persisted snapshot or dry-run fixture carries ``[[5, 2]]``; the
+        # pairs must be normalized before they are hashed, and only the named
+        # generation stops.
+        stopped = adapters.decide_issue_admission(
+            issue(5),
+            now=NOW,
+            terminal_stopped=[[5, 2]],
+            generations={5: 2},
+        )
+        self.assertEqual(stopped.kind, adapters.TERMINAL)
+        self.assertIn("terminal generation stop", stopped.reason)
+        eligible = adapters.decide_issue_admission(
+            issue(5),
+            now=NOW,
+            terminal_stopped=[[5, 2]],
+            generations={5: 1},
+        )
+        self.assertEqual(eligible.kind, adapters.ACTION)
+
     def test_closed_issue_is_terminal(self):
         decision = adapters.decide_issue_admission(issue(6, state="closed"), now=NOW)
         self.assertEqual(decision.kind, adapters.TERMINAL)

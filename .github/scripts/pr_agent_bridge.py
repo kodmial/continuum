@@ -327,7 +327,16 @@ class Handler(BaseHTTPRequestHandler):
         except (json.JSONDecodeError, UnicodeDecodeError) as exc:
             self._send(400, openai_error("invalid_request", f"invalid JSON: {exc}"))
             return
-        timeout = int(_env("PR_AGENT_TIMEOUT_SECONDS", "600") or "600")
+        try:
+            timeout = int(_env("PR_AGENT_TIMEOUT_SECONDS", "600") or "600")
+        except ValueError:
+            timeout = 600
+        if not isinstance(body, dict):
+            self._send(
+                400,
+                openai_error("invalid_request", "request body must be a JSON object"),
+            )
+            return
         started = time.monotonic()
         try:
             self._send(200, run_completion(body, timeout))
@@ -345,6 +354,18 @@ class Handler(BaseHTTPRequestHandler):
             status = 504 if timeout_detected else 502
             self._send(status, openai_error("upstream_error", str(exc)))
             outcome = f"http_{status}"
+        except (ValueError, AttributeError, TypeError) as exc:
+            # A malformed OpenCode response (non-JSON or non-object session
+            # payload) must still reach the reviewer as a classified status,
+            # never as a dropped connection.
+            self._send(
+                502,
+                openai_error(
+                    "upstream_error",
+                    "malformed opencode response: {}".format(type(exc).__name__),
+                ),
+            )
+            outcome = "http_502"
         except (BrokenPipeError, ConnectionResetError):
             # The reviewer has already ended the HTTP request. Record the
             # disconnection rather than misattribute it to OpenCode.
