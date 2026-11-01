@@ -1,0 +1,1726 @@
+name: PR-Agent merge gate
+
+on:
+  workflow_call:
+    inputs:
+      continuum_ref:
+        description: Continuum revision supplying fallback scripts
+        type: string
+        default: main
+        required: false
+      review_provider:
+        description: >-
+          Review provider: none, coderabbit, or pr-agent. Empty falls back to
+          vars.CONTINUUM_REVIEW_PROVIDER, then to none.
+        type: string
+        default: ''
+        required: false
+      pr_number:
+        description: Pull request number carrying the candidate HEAD.
+        type: string
+        default: ''
+        required: false
+      target_child_id:
+        description: Opaque verified child id for delegated execution. Empty targets the caller repository.
+        type: string
+        default: ''
+        required: false
+      head_sha:
+        description: Exact HEAD SHA the review evaluated.
+        type: string
+        default: ''
+        required: false
+      ci_run_id:
+        description: >-
+          Immutable CI workflow run id verified on the exact HEAD at admission.
+          Empty falls back to a bounded exact-SHA listing.
+        type: string
+        default: ''
+        required: false
+      ci_workflow_name:
+        description: >-
+          Exact CI workflow name verified on the exact HEAD at admission. Empty
+          falls back to vars.CONTINUUM_CI_WORKFLOW_NAME, then to 'CI'.
+        type: string
+        default: ''
+        required: false
+      gate_verified:
+        description: >-
+          Safe scalar attestation produced after the full runner-local
+          PR-Agent review/persistent-state gate. Avoids forwarding raw review
+          payloads across a GitHub Actions job boundary where masked target
+          identities can trigger secret-output suppression.
+        type: string
+        default: 'false'
+        required: false
+      review_json:
+        description: >-
+          Canonical upstream review JSON (steps.pragent.outputs.review) for the
+          exact HEAD.
+        type: string
+        default: ''
+        required: false
+      improve_jsonl:
+        description: >-
+          Runner-local push_outputs file payload
+          (pr-agent-outputs/continuum.jsonl) for the exact HEAD.
+        type: string
+        default: ''
+        required: false
+      persistent_state_json:
+        description: >-
+          Upstream PR-Agent v0.46.0 persistent finding state for the latest
+          successful full review (findings[].state plus last_run metadata).
+        type: string
+        default: ''
+        required: false
+      post_merge_wakeups:
+        description: Workflows to wake after a successful merge, comma-separated.
+        type: string
+        default: ''
+        required: false
+      post_merge_wakeup_ref:
+        description: Git ref used for post-merge wakeups.
+        type: string
+        default: ''
+        required: false
+      required_workflow_gate_label:
+        description: Label enabling an additional required workflow gate.
+        type: string
+        default: ''
+        required: false
+      required_workflow_gate_name:
+        description: Required workflow name when the gate label is present.
+        type: string
+        default: ''
+        required: false
+
+permissions: {}
+
+concurrency:
+  group: ${{ inputs.target_child_id && format('pr-agent-merge-child-{0}-{1}', inputs.target_child_id, inputs.pr_number || github.run_id) || format('pr-agent-merge-{0}', inputs.pr_number || github.run_id) }}
+  cancel-in-progress: false
+
+jobs:
+  gate:
+    # Child-local suppression (issue #244): delegated merges execute in the
+    # parent; a verified child never merges locally so no competing merge
+    # path can race the parent. Local/non-child behavior is unchanged.
+    if: vars.CONTINUUM_ROLE != 'child'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    permissions:
+      contents: write
+      issues: write
+      pull-requests: write
+      statuses: read
+
+    steps:
+      - name: Resolve the isolated PR-Agent stack
+        id: stack
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
+        env:
+          INPUT_REVIEW_PROVIDER: ${{ inputs.review_provider }}
+          CFG_REVIEW_PROVIDER: ${{ vars.CONTINUUM_REVIEW_PROVIDER }}
+        with:
+          github-token: ${{ secrets.TAP_PAT }}
+          script: |
+            // Only the PR-Agent-owned merge path is active in PR-Agent mode.
+            // The generic merge path cannot merge a green-CI HEAD without the
+            // PR-Agent green gate, and no CodeRabbit workflow is dispatched here.
+            const reviewProvider = String(
+              process.env.INPUT_REVIEW_PROVIDER || process.env.CFG_REVIEW_PROVIDER || 'none'
+            ).trim().toLowerCase();
+            if (!['none', 'coderabbit', 'pr-agent'].includes(reviewProvider)) {
+              core.setFailed(
+                `Invalid CONTINUUM_REVIEW_PROVIDER="${reviewProvider}". Expected none, coderabbit, or pr-agent.`
+              );
+              return;
+            }
+            if (reviewProvider !== 'pr-agent') {
+              core.setFailed(
+                `PR-Agent merge requires CONTINUUM_REVIEW_PROVIDER=pr-agent; got ${reviewProvider}.`
+              );
+              return;
+            }
+            core.setOutput('stack', 'pr-agent');
+
+      - name: Resolve PR-Agent target context
+        env:
+          GH_TOKEN: ${{ secrets.TAP_PAT }}
+          READ_GITHUB_TOKEN: ${{ github.token }}
+          TARGET_CHILD_ID: ${{ inputs.target_child_id }}
+          CONTINUUM_REF: ${{ inputs.continuum_ref }}
+        run: |
+          set -euo pipefail
+          continuum_b64_decode() {
+            if printf '' | base64 --decode >/dev/null 2>&1; then
+              base64 --decode
+            elif printf '' | base64 -d >/dev/null 2>&1; then
+              base64 -d
+            elif printf '' | base64 -D >/dev/null 2>&1; then
+              base64 -D
+            elif command -v python3 >/dev/null 2>&1; then
+              python3 -c 'import sys,base64; sys.stdout.buffer.write(base64.b64decode(sys.stdin.read()))'
+            else
+              openssl base64 -d
+            fi
+          }
+          CONTINUUM_SOURCE_REPO="kodmial/continuum"
+          if [[ -z "${TARGET_CHILD_ID:-}" ]]; then
+            # Local fast path: no delegated resolver is needed and
+            # CONTINUUM_REF is not required for local-only merge.
+            if ! [[ "$GITHUB_REPOSITORY" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || [[ "${GITHUB_REPOSITORY%%/*}" =~ ^\.+$ ]] || [[ "${GITHUB_REPOSITORY#*/}" =~ ^\.+$ ]]; then
+              echo "::error::PR-Agent target repository identity is invalid."
+              exit 2
+            fi
+            {
+              printf 'CONTINUUM_PR_AGENT_TARGET_REPOSITORY=%s\n' "$GITHUB_REPOSITORY"
+              printf 'CONTINUUM_PR_AGENT_TARGET_OWNER=%s\n' "${GITHUB_REPOSITORY%%/*}"
+              printf 'CONTINUUM_PR_AGENT_TARGET_REPO=%s\n' "${GITHUB_REPOSITORY#*/}"
+              printf 'CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED=%s\n' "false"
+            } >> "$GITHUB_ENV"
+            echo "PR-Agent target context resolved locally."
+            exit 0
+          fi
+          : "${CONTINUUM_REF:?CONTINUUM_REF is required for pinned target resolution}"
+          RUNTIME_ROOT="$RUNNER_TEMP/continuum-pr-agent-target-runtime"
+          mkdir -p "$RUNTIME_ROOT/.github/scripts" "$RUNTIME_ROOT/src/continuum"
+          fetch_runtime_file() {
+            local path="$1" dest="$2"
+            if ! GH_TOKEN="$READ_GITHUB_TOKEN" gh api --method GET "repos/$CONTINUUM_SOURCE_REPO/contents/$path" -f ref="$CONTINUUM_REF" --jq .content 2>/dev/null \
+              | tr -d '\n' | continuum_b64_decode > "$dest" 2>/dev/null; then
+              echo "::error::Unable to load the Continuum PR-Agent target resolver."
+              exit 1
+            fi
+            if [[ ! -s "$dest" ]]; then
+              echo "::error::Unable to load the Continuum PR-Agent target resolver."
+              exit 1
+            fi
+          }
+          fetch_runtime_file ".github/scripts/pr_agent_target.sh" "$RUNTIME_ROOT/.github/scripts/pr_agent_target.sh"
+          fetch_runtime_file ".github/scripts/delegation_repository.sh" "$RUNTIME_ROOT/.github/scripts/delegation_repository.sh"
+          fetch_runtime_file ".github/scripts/delegation_runtime.py" "$RUNTIME_ROOT/.github/scripts/delegation_runtime.py"
+          fetch_runtime_file "src/continuum/__init__.py" "$RUNTIME_ROOT/src/continuum/__init__.py"
+          fetch_runtime_file "src/continuum/config.py" "$RUNTIME_ROOT/src/continuum/config.py"
+          fetch_runtime_file "src/continuum/yamlmini.py" "$RUNTIME_ROOT/src/continuum/yamlmini.py"
+          fetch_runtime_file "src/continuum/api_budget.py" "$RUNTIME_ROOT/src/continuum/api_budget.py"
+          fetch_runtime_file "src/continuum/delegation_discovery.py" "$RUNTIME_ROOT/src/continuum/delegation_discovery.py"
+          PARENT_CONFIG_FILE="$RUNTIME_ROOT/parent.continuum.yml"
+          # The parent config lives in the execution repository: fetch its
+          # default branch, never the Continuum engine pin (which may not
+          # exist in the execution repository).
+          if ! GH_TOKEN="$READ_GITHUB_TOKEN" gh api --method GET "repos/$GITHUB_REPOSITORY/contents/.continuum.yml" --jq .content 2>/dev/null \
+            | tr -d '\n' | continuum_b64_decode > "$PARENT_CONFIG_FILE" 2>/dev/null || [[ ! -s "$PARENT_CONFIG_FILE" ]]; then
+            echo "::error::Unable to load the parent Continuum configuration for delegated target resolution; refusing to guess."
+            exit 1
+          fi
+          CONTINUUM_ENGINE_ROOT="$RUNTIME_ROOT" PARENT_CONFIG="$PARENT_CONFIG_FILE" \
+            bash "$RUNTIME_ROOT/.github/scripts/pr_agent_target.sh" "$TARGET_CHILD_ID"
+
+      - name: Validate upstream exact-head merge attestation
+        if: inputs.gate_verified == 'true'
+        id: attested_gate
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
+        env:
+          PR_NUMBER: ${{ inputs.pr_number }}
+          HEAD_SHA: ${{ inputs.head_sha }}
+          GATE_VERIFIED: ${{ inputs.gate_verified }}
+          TAP_PAT: ${{ secrets.TAP_PAT }}
+        with:
+          github-token: ${{ env.CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED == 'true' && secrets.TAP_PAT || (env.CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED != 'true' && github.token || '') }}
+          script: |
+            if (
+              process.env.CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED === 'true' &&
+              !String(process.env.TAP_PAT || '').trim()
+            ) {
+              core.setFailed(
+                'Delegated PR-Agent merge attestation requires TAP_PAT; refusing to fall back to github.token.'
+              );
+              return;
+            }
+            const prNumber = Number(process.env.PR_NUMBER);
+            const headSha = String(process.env.HEAD_SHA || '').trim().toLowerCase();
+            if (
+              String(process.env.GATE_VERIFIED || '').trim().toLowerCase() !== 'true' ||
+              !Number.isInteger(prNumber) ||
+              prNumber < 1 ||
+              !/^[0-9a-f]{40}$/.test(headSha)
+            ) {
+              core.setFailed(
+                'PR-Agent merge requires a verified runner-local gate, pr_number, and exact 40-char HEAD.'
+              );
+              return;
+            }
+            const owner = process.env.CONTINUUM_PR_AGENT_TARGET_OWNER;
+            const repo = process.env.CONTINUUM_PR_AGENT_TARGET_REPO;
+            if (!owner || !repo) {
+              core.setFailed('PR-Agent merge target context is missing.');
+              return;
+            }
+            const { data } = await github.rest.repos.getCombinedStatusForRef({
+              owner,
+              repo,
+              ref: headSha,
+              per_page: 100,
+              page: 1,
+            });
+            const reviewStatuses = (data.statuses || [])
+              .filter(status => status.context === 'continuum/pr-agent-review')
+              .sort((a, b) => {
+                const at = new Date(a.updated_at || a.created_at || 0).getTime();
+                const bt = new Date(b.updated_at || b.created_at || 0).getTime();
+                if (bt !== at) return bt - at;
+                return Number(b.id || 0) - Number(a.id || 0);
+              });
+            const latest = reviewStatuses[0];
+            const expectedTargetPrefix =
+              context.serverUrl + '/' + context.repo.owner + '/' +
+              context.repo.repo + '/actions/runs/';
+            if (
+              !latest ||
+              latest.state !== 'success' ||
+              String(latest.description || '') !== 'PR-Agent review complete: clean' ||
+              !String(latest.target_url || '').startsWith(expectedTargetPrefix)
+            ) {
+              core.setFailed(
+                'PR-Agent merge attestation is not backed by a durable clean exact-HEAD review status from this control plane.'
+              );
+              return;
+            }
+            core.setOutput('green', 'true');
+            core.setOutput('head_sha', headSha);
+            core.notice(
+              'PR #' + prNumber + ' durable clean review attestation verified at ' + headSha + '.'
+            );
+
+      - name: Resolve PR-Agent signal policy
+        if: inputs.gate_verified != 'true'
+        id: policy
+        env:
+          GH_TOKEN: ${{ secrets.TAP_PAT }}
+          CONTINUUM_REF: ${{ inputs.continuum_ref }}
+        run: |
+          set -euo pipefail
+          continuum_b64_decode() {
+            if printf '' | base64 --decode >/dev/null 2>&1; then
+              base64 --decode
+            elif printf '' | base64 -d >/dev/null 2>&1; then
+              base64 -d
+            elif printf '' | base64 -D >/dev/null 2>&1; then
+              base64 -D
+            elif command -v python3 >/dev/null 2>&1; then
+              python3 -c 'import sys,base64; sys.stdout.buffer.write(base64.b64decode(sys.stdin.read()))'
+            else
+              openssl base64 -d
+            fi
+          }
+          POLICY_SCRIPT="$RUNNER_TEMP/pr_agent_policy.js"
+          gh api --method GET \
+            "repos/kodmial/continuum/contents/.github/scripts/pr_agent_policy.js" \
+            -f ref="$CONTINUUM_REF" --jq .content \
+            | tr -d '\n' | continuum_b64_decode > "$POLICY_SCRIPT"
+          node --check "$POLICY_SCRIPT"
+          # Policy-bundle sync: the merge gate requires these exports with
+          # fail-closed semantics (mirrors GateInputs.improve_skipped_clean).
+          # Validate now so a stale bundle fails closed here instead of
+          # throwing in the gate and blocking the exact HEAD.
+          POLICY_SCRIPT="$POLICY_SCRIPT" node -e '
+            const p = require(process.env.POLICY_SCRIPT);
+            for (const key of [
+              "unwrapReview",
+              "qualifyingImproveSuggestions",
+              "reviewDisposition",
+              "isCleanReviewForImproveSkip",
+              "isSkippedCleanImprovePayload",
+              "hasToolErrorSignal",
+              "hasIncompleteCoverageSignal",
+              "hasBlockingSecuritySignal"
+            ]) {
+              if (typeof p[key] !== "function") {
+                console.error("::error::Continuum PR-Agent policy bundle is missing export: " + key);
+                process.exit(1);
+              }
+            }
+            if (!/^[0-9]+$/.test(String(p.IMPROVE_REPAIR_THRESHOLD))) {
+              console.error("::error::Invalid centralized PR-Agent improve threshold in policy bundle.");
+              process.exit(1);
+            }
+            if (!/^[0-9]+$/.test(String(p.REVIEW_MAX_FINDINGS))) {
+              console.error("::error::Invalid centralized PR-Agent review findings cap in policy bundle.");
+              process.exit(1);
+            }
+            if (typeof p.REVIEW_MERGE_SAFE !== "string" || !p.REVIEW_MERGE_SAFE.trim()) {
+              console.error("::error::Invalid centralized PR-Agent merge-safe recommendation in policy bundle.");
+              process.exit(1);
+            }
+          '
+          echo "policy_script=$POLICY_SCRIPT" >> "$GITHUB_OUTPUT"
+
+      - name: Evaluate the exact-head PR-Agent gate
+        if: inputs.gate_verified != 'true'
+        id: gate
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
+        env:
+          PR_NUMBER: ${{ inputs.pr_number }}
+          HEAD_SHA: ${{ inputs.head_sha }}
+          REVIEW_JSON: ${{ inputs.review_json }}
+          IMPROVE_JSONL: ${{ inputs.improve_jsonl }}
+          PERSISTENT_STATE_JSON: ${{ inputs.persistent_state_json }}
+          POLICY_SCRIPT: ${{ steps.policy.outputs.policy_script }}
+        with:
+          github-token: ${{ secrets.TAP_PAT }}
+          script: |
+            // Exact-head, fail-closed PR-Agent gate. Green requires every
+            // native signal at once for the exact current HEAD:
+            //   - no tool error (config.propagate_tool_errors,
+            //     github_action_config.fail_on_tool_errors)
+            //   - complete review and improve coverage (upstream chunking
+            //     coverage footers; truncated/invalid improve payloads never
+            //     green), except that a marked skipped-clean improve payload
+            //     (continuum.improve_skipped_clean) satisfies the improve leg
+            //     with zero suggestions and no improve run, and an empty
+            //     improve payload parses to zero suggestions judged via
+            //     `disposition` so a clean HEAD cannot deadlock
+            //   - green CI on the exact HEAD, revalidated immediately before
+            //     merge, plus draft/conflict revalidation
+            //   - matching HEAD (results for SHA A never merge SHA B;
+            //     main synchronization never carries approval)
+            //   - safe_to_merge, or a narrowly validated non-actionable caution with
+            //     explicit no-security/no-ticket-noncompliance evidence; changes_required blocks
+            //   - empty current key_issues_to_review (a batch at the findings
+            //     cap is potentially truncated and never clean)
+            //   - no high-signal improve code_suggestions according to the
+            //     centralized PR-Agent provider policy (threshold 7)
+            //   - native persistent review state has no ACTIVE finding
+            // Inline presentation (inline_key_issues) never decides the gate:
+            // absence of inline comments cannot produce green while summary
+            // or output findings remain.
+            const prNumber = Number(process.env.PR_NUMBER);
+            const headSha = String(process.env.HEAD_SHA || '').trim().toLowerCase();
+            if (!prNumber || !headSha) {
+              core.setFailed('PR-Agent merge requires pr_number and head_sha.');
+              return;
+            }
+            let review;
+            try {
+              review = JSON.parse(String(process.env.REVIEW_JSON || ''));
+            } catch (err) {
+              core.setFailed(`Invalid PR-Agent review JSON: ${err.message}`);
+              return;
+            }
+            const policy = require(process.env.POLICY_SCRIPT);
+            let inner;
+            try {
+              inner = policy.unwrapReview(review);
+            } catch (err) {
+              core.setFailed(err.message);
+              return;
+            }
+            const keyIssues = inner.key_issues_to_review;
+            if (!Array.isArray(keyIssues)) {
+              core.setFailed('PR-Agent review JSON has no key_issues_to_review list.');
+              return;
+            }
+            const recommendation = String(inner.merge_recommendation || '').trim();
+            if (!recommendation) {
+              core.setFailed('PR-Agent review has no merge_recommendation (require_merge_recommendation).');
+              return;
+            }
+            const raw = String(process.env.IMPROVE_JSONL || '').trim();
+            let qualifying;
+            try {
+              qualifying = policy.qualifyingImproveSuggestions(raw);
+            } catch (err) {
+              // A non-empty but truncated/invalid improve payload must fail
+              // closed on the improve-coverage leg explicitly, not as a
+              // generic error: no complete improve evidence exists for this
+              // HEAD.
+              core.setOutput('green', 'false');
+              core.setOutput('reason', 'incomplete improve coverage: failing closed');
+              core.setFailed(
+                `PR-Agent gate blocks PR #${prNumber}: incomplete improve coverage: failing closed (${err.message})`
+              );
+              return;
+            }
+            let disposition;
+            try {
+              disposition = policy.reviewDisposition(review, raw);
+            } catch (err) {
+              core.setFailed(err.message);
+              return;
+            }
+            // Wire the skipped-clean flag into the merge gate (mirrors
+            // GateInputs.improve_skipped_clean): a skipped-clean HEAD
+            // carries an empty improve payload with incomplete improve
+            // coverage, so only the marked payload greens here without an
+            // improve run. A skipped HEAD with remaining qualifying
+            // suggestions never greens.
+            let improveSkippedClean = false;
+            try {
+              improveSkippedClean = policy.isSkippedCleanImprovePayload(raw);
+            } catch (err) {
+              core.setFailed(err.message);
+              return;
+            }
+            const stateRaw = String(process.env.PERSISTENT_STATE_JSON || '').trim();
+            if (!stateRaw) {
+              core.setFailed('PR-Agent gate requires native persistent finding state for the exact reviewed HEAD.');
+              return;
+            }
+            let persistentState;
+            try {
+              persistentState = JSON.parse(stateRaw);
+            } catch (err) {
+              core.setFailed(`Invalid PR-Agent persistent state JSON: ${err.message}`);
+              return;
+            }
+            if (!persistentState || typeof persistentState !== 'object' || Array.isArray(persistentState)) {
+              core.setFailed('PR-Agent persistent state must be the upstream state object.');
+              return;
+            }
+            if (persistentState.schema_version !== 1 || !Array.isArray(persistentState.findings)) {
+              core.setFailed('PR-Agent persistent state does not match upstream v0.46.0 schema.');
+              return;
+            }
+            const lastRun = persistentState.last_run;
+            if (!lastRun || typeof lastRun !== 'object') {
+              core.setFailed('PR-Agent persistent state has no last_run metadata.');
+              return;
+            }
+            const stateHead = String(lastRun.head_sha || '').trim().toLowerCase();
+            if (stateHead !== headSha) {
+              core.setFailed(
+                `PR-Agent persistent state is stale: last_run.head_sha=${stateHead || '<empty>'}, expected=${headSha}.`
+              );
+              return;
+            }
+            if (lastRun.complete !== true || String(lastRun.kind || '') !== 'full') {
+              core.setFailed('PR-Agent persistent state is not from a complete full review.');
+              return;
+            }
+            let hasActive = false;
+            for (const entry of persistentState.findings) {
+              if (!entry || typeof entry !== 'object') {
+                core.setFailed('PR-Agent persistent state contains a non-object finding.');
+                return;
+              }
+              const state = String(entry.state || '').trim().toUpperCase();
+              if (!['ACTIVE', 'RESOLVED'].includes(state)) {
+                core.setFailed(`PR-Agent persistent finding has invalid state "${state || '<empty>'}".`);
+                return;
+              }
+              if (state === 'ACTIVE') hasActive = true;
+            }
+            const fail = (reason) => {
+              core.setOutput('green', 'false');
+              core.setOutput('reason', reason);
+              core.setFailed(`PR-Agent gate blocks PR #${prNumber}: ${reason}`);
+            };
+            // Tool-error and review-coverage legs: a failing tool or a
+            // partial review never greens, even with zero findings. The
+            // coverage leg mirrors GateInputs.review_coverage_complete and
+            // the improve-skip policy's explicit `reviewCoverageComplete`
+            // flag: only an explicit complete signal greens, never the mere
+            // absence of a failure.
+            let toolError = false;
+            try {
+              toolError = policy.hasToolErrorSignal(review);
+            } catch (err) {
+              core.setFailed(err.message);
+              return;
+            }
+            if (toolError) {
+              fail('tool error: failing closed');
+              return;
+            }
+            let reviewCoverageComplete = false;
+            try {
+              reviewCoverageComplete = !policy.hasIncompleteCoverageSignal(review);
+            } catch (err) {
+              core.setFailed(err.message);
+              return;
+            }
+            if (!reviewCoverageComplete) {
+              fail('incomplete review coverage: failing closed');
+              return;
+            }
+            // Improve-coverage leg wired to the skipped-clean flag
+            // (mirrors GateInputs.improve_skipped_clean): a skipped-clean
+            // HEAD carries the marked empty payload
+            // `{"payload": {"code_suggestions": []}, "continuum":
+            // {"improve_skipped_clean": true}}` for the exact clean HEAD
+            // (producer: continuum-pr-agent.yml `improve_gate`
+            // skip_improve decision plus the `improve_skipped` step, which
+            // forwards it here as `improve_jsonl`; the `improve` step runs
+            // only when `skip_improve != 'true'`). An empty improve payload
+            // without the marker parses to zero suggestions and proceeds
+            // via `disposition` below, so an improve run for the exact HEAD
+            // that emitted no suggestions (or a missing/miswired
+            // `improve_skipped` step) cannot deadlock a clean HEAD.
+            // Truncated/invalid payloads still fail closed on the
+            // improve-coverage leg above. A marked skipped-clean payload is
+            // additionally re-validated through
+            // policy.isCleanReviewForImproveSkip below, so the marker alone
+            // never greens a dirty review.
+            if (!disposition || disposition.action !== 'merge') {
+              fail(
+                'central review disposition blocks merge: ' +
+                  String(disposition?.action || 'unknown') + ': ' +
+                  String(disposition?.reason || recommendation)
+              );
+              return;
+            }
+            if (keyIssues.length > 0) {
+              if (keyIssues.length === policy.REVIEW_MAX_FINDINGS) {
+                fail('review batch reached the findings cap: potentially truncated');
+              } else {
+                fail(`${keyIssues.length} current key issue(s) remain`);
+              }
+              return;
+            }
+            // Security leg (mirrors the improve skip policy): explicit
+            // blocking security prose never greens, even with zero key
+            // issues and safe_to_merge.
+            let blockingSecurity = false;
+            try {
+              blockingSecurity = policy.hasBlockingSecuritySignal(review);
+            } catch (err) {
+              core.setFailed(err.message);
+              return;
+            }
+            if (blockingSecurity) {
+              fail('blocking security signal remains');
+              return;
+            }
+            // Skipped-clean re-validation: a marked payload only greens when
+            // the review itself satisfies the clean-review skip policy for
+            // this exact HEAD (producer: continuum-pr-agent.yml
+            // `improve_gate` skip_improve decision via
+            // policy.isCleanReviewForImproveSkip). A miswired or stale marker
+            // for a dirty review still blocks here with the skip reason.
+            // Exact-HEAD liveness against the live PR head is revalidated in
+            // the next step immediately before merge; headMatches is true
+            // here because persistent state was already pinned to headSha
+            // above.
+            if (improveSkippedClean) {
+              let skipDecision;
+              try {
+                skipDecision = policy.isCleanReviewForImproveSkip(
+                  review,
+                  persistentState,
+                  {
+                    headMatches: true,
+                    toolError,
+                    reviewCoverageComplete,
+                    reviewedHeadSha: headSha,
+                  }
+                );
+              } catch (err) {
+                core.setFailed(err.message);
+                return;
+              }
+              if (!skipDecision || skipDecision.skip !== true) {
+                fail(
+                  'improve skip not justified: ' +
+                    String((skipDecision && skipDecision.reason) || 'failing closed')
+                );
+                return;
+              }
+            }
+            // /improve suggestions are advisory once the authoritative
+            // exact-HEAD review is clean. They can enrich a repair batch only
+            // when the review itself found an actionable defect; they are not
+            // an independent merge gate.
+            if (qualifying.length > 0) {
+              core.notice(
+                `${qualifying.length} advisory improve suggestion(s) ignored after clean authoritative review.`
+              );
+            }
+            if (disposition.action !== 'merge') {
+              fail(disposition.reason);
+              return;
+            }
+            if (hasActive) {
+              fail('native persistent state has an ACTIVE finding');
+              return;
+            }
+            // Exact-HEAD plus CI plus draft/conflict revalidation happens in
+            // the next step immediately before merge; this step records that
+            // the review portion of the gate is satisfied for this HEAD.
+            core.setOutput('green', 'true');
+            core.setOutput('reason', 'review portion satisfied');
+            core.setOutput('head_sha', headSha);
+            core.notice(`PR #${prNumber} review portion satisfied at ${headSha}.`);
+
+
+      - name: Reconcile current PR state and merge only the exact reviewed HEAD
+        if: steps.attested_gate.outputs.green == 'true' || steps.gate.outputs.green == 'true'
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
+        env:
+          PR_NUMBER: ${{ inputs.pr_number }}
+          REVIEWED_HEAD: ${{ inputs.head_sha }}
+          CI_RUN_ID: ${{ inputs.ci_run_id }}
+          CI_WORKFLOW_NAME: ${{ inputs.ci_workflow_name || vars.CONTINUUM_CI_WORKFLOW_NAME || 'CI' }}
+          POST_MERGE_WAKEUPS: ${{ inputs.post_merge_wakeups || vars.CONTINUUM_POST_MERGE_WAKEUPS }}
+          POST_MERGE_WAKEUP_REF: ${{ inputs.post_merge_wakeup_ref || vars.CONTINUUM_POST_MERGE_WAKEUP_REF || github.event.repository.default_branch || 'main' }}
+          REQUIRED_WORKFLOW_GATE_LABEL: ${{ inputs.required_workflow_gate_label || vars.CONTINUUM_REQUIRED_WORKFLOW_GATE_LABEL || '' }}
+          REQUIRED_WORKFLOW_GATE_NAME: ${{ inputs.required_workflow_gate_name || vars.CONTINUUM_REQUIRED_WORKFLOW_GATE_NAME || '' }}
+          TARGET_CHILD_ID: ${{ inputs.target_child_id }}
+        with:
+          github-token: ${{ secrets.TAP_PAT }}
+          script: |
+            // Canonical shared lifecycle (#304): provider-neutral decisions
+            // below mirror src/continuum/merge_lifecycle.py and
+            // .github/scripts/merge_lifecycle.js (PR/HEAD reconciliation,
+            // CI/gates, no-auto-merge, main-sync, conflict plumbing,
+            // packaging/required gates, exact-HEAD validation, atomic merge,
+            // merge titles, post-merge wakeups, idempotency). PR-Agent-only
+            // semantics (review JSON, merge recommendation, improve,
+            // persistent state, no-progress/retry) stay provider-owned in
+            // src/continuum/pr_agent_lifecycle.py and
+            // .github/scripts/pr_agent_policy.js. See
+            // docs/provider-lifecycle-ownership.md and
+            // docs/provider-lifecycle-duplication-matrix.md.
+            // Work Lock #33 mirrors the mature provider-neutral mechanics from
+            // continuum-auto-merge.yml while keeping CodeRabbit untouched.
+            // Target-aware: review, repair, recovery, merge and exact-HEAD
+            // validation operate against the resolved target repository while
+            // execution remains in the parent. Only the opaque child id ever
+            // selects the target; concrete identity stays runner-local.
+            const executionOwner = context.repo.owner;
+            const executionRepo = context.repo.repo;
+            const owner = process.env.CONTINUUM_PR_AGENT_TARGET_OWNER;
+            const repo = process.env.CONTINUUM_PR_AGENT_TARGET_REPO;
+            const repoFullName = process.env.CONTINUUM_PR_AGENT_TARGET_REPOSITORY;
+            const delegated =
+              process.env.CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED === 'true';
+            if (!owner || !repo || !repoFullName) {
+              core.setFailed(
+                delegated
+                  ? 'PR-Agent target relationship is missing: delegated execution requires non-empty CONTINUUM_PR_AGENT_TARGET_OWNER/REPO/REPOSITORY.'
+                  : 'PR-Agent target context is missing: CONTINUUM_PR_AGENT_TARGET_OWNER/REPO/REPOSITORY must be non-empty.'
+              );
+              return;
+            }
+            const targetChildId = String(process.env.TARGET_CHILD_ID || '').trim();
+            const prNumber = Number(process.env.PR_NUMBER);
+            const reviewedHead = String(process.env.REVIEWED_HEAD || '').trim().toLowerCase();
+            const ciRunId = String(process.env.CI_RUN_ID || '').trim();
+            const ciWorkflowName = String(process.env.CI_WORKFLOW_NAME || 'CI').trim();
+            const AUTO_MERGE_BLOCK_LABEL = 'no-auto-merge';
+            const CONFLICT_LOCK_LABEL = 'opencode-conflict-repair';
+            const requiredWorkflowGateLabel =
+              String(process.env.REQUIRED_WORKFLOW_GATE_LABEL || '').trim();
+            const requiredWorkflowGateName =
+              String(process.env.REQUIRED_WORKFLOW_GATE_NAME || '').trim();
+            const postMergeWakeups = String(process.env.POST_MERGE_WAKEUPS || '')
+              .split(',')
+              .map(name => name.trim())
+              .filter(Boolean);
+            let postMergeWakeupRef =
+              String(process.env.POST_MERGE_WAKEUP_REF || 'main').trim();
+            if (!/^[A-Za-z0-9][A-Za-z0-9._/-]*$/.test(postMergeWakeupRef) || postMergeWakeupRef.includes('..') || postMergeWakeupRef.includes('//') || postMergeWakeupRef.includes('@{') || postMergeWakeupRef.endsWith('/') || postMergeWakeupRef.endsWith('.') || postMergeWakeupRef.endsWith('.lock') || postMergeWakeupRef === 'HEAD' || postMergeWakeupRef === '@' || postMergeWakeupRef.startsWith('refs/') || postMergeWakeupRef.startsWith('-') || postMergeWakeupRef.startsWith('.')) {
+              core.warning('Invalid post-merge wakeup ref; falling back to main: ' + postMergeWakeupRef);
+              postMergeWakeupRef = 'main';
+            }
+
+            if (!prNumber || !reviewedHead) {
+              core.setFailed('PR-Agent reconciliation requires pr_number and reviewed HEAD.');
+              return;
+            }
+
+            async function getPull() {
+              const response = await github.rest.pulls.get({
+                owner, repo, pull_number: prNumber,
+              });
+              return response.data;
+            }
+
+            function hasLabel(pr, name) {
+              return (pr.labels || []).some(label =>
+                (typeof label === 'string' ? label : label.name) === name
+              );
+            }
+
+            async function ensureLabel(name, color, description) {
+              try {
+                await github.rest.issues.createLabel({
+                  owner, repo, name, color, description,
+                });
+              } catch (err) {
+                if (err.status !== 422) throw err;
+              }
+            }
+
+            // Canonical exact-HEAD CI proof shared with admission and
+            // pre-review revalidation (issue #368). The run id verified at
+            // admission is re-fetched as immutable evidence; the filtered
+            // listing is a cross-check. An empty/stale listing can never
+            // erase a verified green run, while a newer red or pending run
+            // still blocks the merge. An unreadable listing fails closed
+            // because it cannot prove the verified run is still the newest.
+            function ciRunCreatedAt(run) {
+              const parsed = Date.parse(String((run && run.created_at) || ''));
+              return Number.isFinite(parsed) ? parsed : 0;
+            }
+            function ciRunUpdatedAt(run) {
+              const parsed = Date.parse(String((run && run.updated_at) || ''));
+              return Number.isFinite(parsed) ? parsed : 0;
+            }
+            function ciRunMatchesExactHead(run, workflowName, head) {
+              return Boolean(
+                run &&
+                String(run.name || '') === String(workflowName || '') &&
+                String(run.head_sha || '').trim().toLowerCase() ===
+                  String(head || '').trim().toLowerCase() &&
+                String(run.event || '') === 'pull_request'
+              );
+            }
+            function ciRunProofState(run, delegatedTarget) {
+              if (!run) return 'unavailable';
+              if (String(run.status || '') !== 'completed') return 'pending';
+              const conclusion = String(run.conclusion || '');
+              if (conclusion === 'success') return 'green';
+              if (delegatedTarget && conclusion === 'skipped') return 'green';
+              return 'red';
+            }
+            function decideExactHeadCi({ proofRun = null, runs = [], workflowName, headSha: head, delegated: delegatedTarget = false }) {
+              // Deduplicate by immutable run id while keeping the freshest
+              // observed state of that run: the proof run fetched by id and
+              // the filtered listing may describe the same run at different
+              // moments (pending -> completed), so the newer snapshot wins.
+              const byKey = new Map();
+              for (const run of [proofRun, ...(runs || [])]) {
+                if (!ciRunMatchesExactHead(run, workflowName, head)) continue;
+                const key = run.id !== undefined && run.id !== null
+                  ? 'id:' + String(run.id)
+                  : [
+                      String(run.name || ''),
+                      String(run.head_sha || '').toLowerCase(),
+                      String(run.created_at || ''),
+                      String(run.status || ''),
+                      String(run.conclusion || ''),
+                    ].join('|');
+                const previous = byKey.get(key);
+                if (!previous) {
+                  byKey.set(key, run);
+                  continue;
+                }
+                const previousUpdated = ciRunUpdatedAt(previous);
+                const currentUpdated = ciRunUpdatedAt(run);
+                if (
+                  currentUpdated > previousUpdated ||
+                  (
+                    currentUpdated === previousUpdated &&
+                    previous.status !== 'completed' &&
+                    run.status === 'completed'
+                  )
+                ) {
+                  byKey.set(key, run);
+                }
+              }
+              const candidates = [...byKey.values()];
+              const newest = candidates.sort((a, b) => {
+                const at = ciRunCreatedAt(a);
+                const bt = ciRunCreatedAt(b);
+                if (bt !== at) return bt - at;
+                return Number(b.id || 0) - Number(a.id || 0);
+              })[0] || null;
+              if (!newest) {
+                return {
+                  state: 'unavailable',
+                  run: null,
+                  runId: null,
+                  reason: 'no exact-HEAD pull_request CI run is visible',
+                };
+              }
+              return {
+                state: ciRunProofState(newest, delegatedTarget),
+                run: newest,
+                runId: Number(newest.id) || null,
+                reason: 'newest exact-HEAD pull_request CI run decides',
+              };
+            }
+            async function readCiProofRun() {
+              if (!/^[0-9]+$/.test(ciRunId)) return null;
+              try {
+                const { data } = await github.rest.actions.getWorkflowRun({
+                  owner,
+                  repo,
+                  run_id: Number(ciRunId),
+                });
+                return data;
+              } catch (err) {
+                core.info(
+                  `Could not re-read admitted CI run ${ciRunId}; falling back to the exact-HEAD listing: ${err.message}`
+                );
+                return null;
+              }
+            }
+            async function listCiRunsForHead(pr, headSha) {
+              try {
+                const runs = [];
+                for (let page = 1; page <= 2; page += 1) {
+                  const { data } = await github.rest.actions.listWorkflowRunsForRepo(
+                    {
+                      owner,
+                      repo,
+                      event: 'pull_request',
+                      head_sha: headSha,
+                      per_page: 100,
+                      page,
+                    }
+                  );
+                  const batch = data.workflow_runs || [];
+                  if (batch.length === 0) break;
+                  runs.push(...batch);
+                  if (batch.length < 100) break;
+                }
+                return runs;
+              } catch (err) {
+                core.info(
+                  `Could not read the exact-HEAD CI listing; refusing to treat verified run evidence as newest: ${err.message}`
+                );
+                return null;
+              }
+            }
+            function decideWithCiListing({ proofRun, runs, workflowName, headSha }) {
+              // A failed listing read is not evidence that the verified run
+              // is the newest exact-HEAD run: fail closed instead of letting
+              // a transient API failure hide a superseding red/pending run.
+              if (runs === null) {
+                return {
+                  state: 'unavailable',
+                  run: null,
+                  runId: null,
+                  reason: 'exact-HEAD CI listing could not be read',
+                };
+              }
+              return decideExactHeadCi({
+                proofRun,
+                runs,
+                workflowName,
+                headSha,
+                delegated,
+              });
+            }
+            async function resolveExactHeadCi(pr, headSha, workflowName) {
+              let proofRun = await readCiProofRun();
+              let decision = decideWithCiListing({
+                proofRun,
+                runs: await listCiRunsForHead(pr, headSha),
+                workflowName,
+                headSha,
+              });
+              // Pending or unreadable evidence is not a deterministic red
+              // verdict: re-evaluate from latest state with short bounded
+              // backoff before any merge decision.
+              for (let attempt = 1; attempt <= 2 && ['pending', 'unavailable'].includes(decision.state); attempt += 1) {
+                await new Promise(resolve => setTimeout(resolve, attempt * 5000));
+                proofRun = await readCiProofRun();
+                decision = decideWithCiListing({
+                  proofRun,
+                  runs: await listCiRunsForHead(pr, headSha),
+                  workflowName,
+                  headSha,
+                });
+              }
+              return decision;
+            }
+
+            // Single-pass gate memo (#254): CI/packaging/required checks
+            // share one branch listing per workflow name within a single
+            // gate evaluation. The memo is per-evaluation only: it is
+            // cleared on every currentHeadGates entry and misses (null or
+            // incomplete runs) are never cached, so a gate that first sees
+            // no completed run re-reads fresh runs on the next evaluation
+            // instead of returning a stale null.
+            const gateCache = new Map();
+            async function latestWorkflowForHead(pr, headSha, workflowName) {
+              const cacheKey = `${pr.head.ref}|${headSha}|${workflowName}`;
+              if (gateCache.has(cacheKey)) return gateCache.get(cacheKey);
+              // Branch/event/head-filtered server-side; only the newest runs can
+              // decide the gate, so two pages bound the cost (#254).
+              const runs = [];
+              for (let page = 1; page <= 2; page += 1) {
+                const { data } = await github.rest.actions.listWorkflowRunsForRepo(
+                  {
+                    owner,
+                    repo,
+                    branch: pr.head.ref,
+                    event: 'pull_request',
+                    head_sha: headSha,
+                    per_page: 100,
+                    page,
+                  }
+                );
+                const batch = data.workflow_runs || [];
+                if (batch.length === 0) break;
+                runs.push(...batch);
+                if (batch.length < 100) break;
+              }
+              const latest = runs
+                .filter(run => run.name === workflowName && run.head_sha === headSha)
+                .sort((a, b) =>
+                  new Date(b.created_at || 0).getTime() -
+                  new Date(a.created_at || 0).getTime()
+                )[0] || null;
+              // Cache only completed runs: misses and in-progress runs are
+              // re-read on the next evaluation so newly finished runs are
+              // always observed.
+              if (latest && latest.status === 'completed') {
+                gateCache.set(cacheKey, latest);
+              }
+              return latest;
+            }
+
+            async function currentHeadGates(pr) {
+              // Per-evaluation memo only: each gate check starts fresh so
+              // initial/final/pre-merge evaluations never reuse a stale entry.
+              gateCache.clear();
+              const ciDecision = await resolveExactHeadCi(pr, pr.head.sha, ciWorkflowName);
+              if (ciDecision.state !== 'green') {
+                return {
+                  ok: false,
+                  reason:
+                    'Current-head CI is not acceptable (' +
+                    ciDecision.state +
+                    ': ' + ciDecision.reason + ')',
+                };
+              }
+
+              if (repoFullName === 'kodmial/continuum') {
+                const continuumContractGate =
+                  await latestWorkflowForHead(
+                    pr,
+                    pr.head.sha,
+                    'Continuum Contract Gate'
+                  );
+                if (
+                  !continuumContractGate ||
+                  continuumContractGate.status !== 'completed' ||
+                  continuumContractGate.conclusion !== 'success'
+                ) {
+                  return {
+                    ok: false,
+                    reason: 'Continuum Contract Gate is not successful',
+                  };
+                }
+              }
+
+              // Do not gate on GitHub's aggregate combined status here.
+              // Lifecycle contexts such as continuum/pr-agent-repair are
+              // historical per context: an earlier failed repair can remain
+              // failure even after a later complete review proves the exact
+              // HEAD clean. Required merge gates are checked explicitly below
+              // (current-head CI, contract qualification, packaging, and
+              // configured required workflow), while this reusable PR-Agent
+              // gate validates review state itself.
+
+              // Contract qualification (kodmial/continuum#286) runs
+              // Continuum's own regression/lifecycle suite and therefore is
+              // a merge gate only when the target repository is Continuum.
+              // Consumer/Child repositories keep their own CI/packaging and
+              // configured required-workflow gates.
+              if (repoFullName === 'kodmial/continuum') {
+                const contractQualificationGate =
+                  await latestWorkflowForHead(pr, pr.head.sha, 'Contract qualification');
+                if (
+                  !contractQualificationGate ||
+                  contractQualificationGate.status !== 'completed' ||
+                  contractQualificationGate.conclusion !== 'success'
+                ) {
+                  return {
+                    ok: false,
+                    reason:
+                      'Contract qualification is ' +
+                      (contractQualificationGate ? contractQualificationGate.status + '/' + (contractQualificationGate.conclusion || 'pending') : 'missing') +
+                      ' for the exact HEAD',
+                  };
+                }
+              }
+
+              const packaging =
+                await latestWorkflowForHead(pr, pr.head.sha, 'Packaging smoke');
+              if (
+                packaging &&
+                (packaging.status !== 'completed' || packaging.conclusion !== 'success')
+              ) {
+                return {
+                  ok: false,
+                  reason:
+                    'Packaging smoke is ' + packaging.status + '/' +
+                    (packaging.conclusion || 'pending'),
+                };
+              }
+
+              if (
+                requiredWorkflowGateLabel &&
+                requiredWorkflowGateName &&
+                hasLabel(pr, requiredWorkflowGateLabel)
+              ) {
+                const required =
+                  await latestWorkflowForHead(pr, pr.head.sha, requiredWorkflowGateName);
+                if (
+                  !required ||
+                  required.status !== 'completed' ||
+                  required.conclusion !== 'success'
+                ) {
+                  return {
+                    ok: false,
+                    reason:
+                      'required workflow ' + requiredWorkflowGateName + ' is not successful',
+                  };
+                }
+              }
+
+              return { ok: true };
+            }
+
+            function isNonMergeCriticalMainPath(path) {
+              if (path.startsWith('.github/workflows/continuum-')) return false;
+              return (
+                path === 'LICENSE' ||
+                path === '.gitignore' ||
+                path === '.release-please-manifest.json' ||
+                path === 'CHANGELOG.md' ||
+                path.endsWith('.md') ||
+                path.startsWith('docs/') ||
+                path.startsWith('.github/')
+              );
+            }
+
+            function sanitizeBranch(name, fallback = 'main') {
+              let value = String(name || '').trim() || String(fallback || '').trim() || 'main';
+              if (!/^[A-Za-z0-9][A-Za-z0-9._/-]*$/.test(value)) return 'main';
+              if (value.includes('..') || value.includes('//') || value.includes('@{')) return 'main';
+              if (value.endsWith('/') || value.endsWith('.') || value.endsWith('.lock')) return 'main';
+              if (value === 'HEAD' || value === '@') return 'main';
+              if (value.startsWith('refs/') || value.startsWith('-') || value.startsWith('.')) return 'main';
+              if (value.split('/').some(part => part.startsWith('.') || part.endsWith('.lock'))) return 'main';
+              return value;
+            }
+            let cachedDefaultBranch = null;
+            async function getDefaultBranch() {
+              if (cachedDefaultBranch) return cachedDefaultBranch;
+              try {
+                const { data: repoInfo } = await github.rest.repos.get({
+                  owner, repo,
+                });
+                const name = String(repoInfo.default_branch || '').trim();
+                cachedDefaultBranch = sanitizeBranch(name, 'main');
+              } catch (err) {
+                core.warning(
+                  'Could not resolve the repository default branch; falling back to main: ' +
+                  (err.message || err)
+                );
+                cachedDefaultBranch = 'main';
+              }
+              return cachedDefaultBranch;
+            }
+            // kodmial/continuum#302: strict default-branch discovery for
+            // code-mutation decisions. Unlike getDefaultBranch (whose main
+            // fallback serves read-only compares and workflow-dispatch
+            // refs), this returns '' when the default is undiscoverable so
+            // main-sync mutations fail closed instead of assuming main.
+            async function getStrictDefaultBranch() {
+              try {
+                const { data: repoInfo } = await github.rest.repos.get({
+                  owner, repo,
+                });
+                const name = String(repoInfo.default_branch || '')
+                  .replace(/^refs\/heads\//, '').trim();
+                if (!name) return '';
+                if (['HEAD', '@', 'FETCH_HEAD', 'ORIG_HEAD', 'MERGE_HEAD'].includes(name)) return '';
+                if (/(\.\.|~|\^|\?|\*|\[|\s|@\{|^[-/.]|[/.]$|\/\/|\.lock$)/.test(name)) return '';
+                return name;
+              } catch (err) {
+                return '';
+              }
+            }
+            // kodmial/continuum#302: canonical fail-closed branch safety
+            // for the main-sync mutation below. The PR head must be a proven
+            // non-default ref; only the PR merge operation may update the
+            // default branch, and there is no bypass.
+            const continuumAssertSafePush = (dest, default_branch) => {
+              const norm = String(dest || '').replace(/^refs\/heads\//, '').trim();
+              if (!norm) {
+                throw new Error('Continuum branch safety: refusing main sync with an empty PR head ref.');
+              }
+              if (['HEAD', '@', 'FETCH_HEAD', 'ORIG_HEAD', 'MERGE_HEAD'].includes(norm)) {
+                throw new Error(`Continuum branch safety: refusing ambiguous main-sync destination '${norm}'.`);
+              }
+              if (/(\.\.|~|\^|\?|\*|\[|\s|@\{|^[-/.]|[/.]$|\/\/|\.lock$)/.test(norm)) {
+                throw new Error(`Continuum branch safety: refusing ambiguous main-sync destination '${norm}'.`);
+              }
+              if (!default_branch) {
+                throw new Error('Continuum branch safety: repository default branch is undiscoverable; refusing main sync.');
+              }
+              if (norm === default_branch) {
+                throw new Error(`Continuum branch safety: refusing main sync for a PR headed at the default branch '${norm}'. Only the PR merge operation may update the default branch.`);
+              }
+            };
+
+            async function mainSyncDecision(pr) {
+              const defaultBranch = await getDefaultBranch();
+              const comparison = await github.request(
+                'GET /repos/{owner}/{repo}/compare/{basehead}',
+                {
+                  owner,
+                  repo,
+                  basehead: defaultBranch + '...' + pr.head.sha,
+                }
+              );
+              if ((comparison.data.behind_by || 0) <= 0) {
+                return {
+                  required: false,
+                  reason: 'up-to-date',
+                  files: [],
+                  criticalFiles: [],
+                };
+              }
+
+              const reverse = await github.request(
+                'GET /repos/{owner}/{repo}/compare/{basehead}',
+                {
+                  owner,
+                  repo,
+                  basehead: pr.head.sha + '...' + defaultBranch,
+                }
+              );
+              const files = (reverse.data.files || []).map(file => file.filename);
+              const criticalFiles =
+                files.filter(path => !isNonMergeCriticalMainPath(path));
+              const onlyNonCritical =
+                files.length > 0 && criticalFiles.length === 0;
+              return {
+                required: !onlyNonCritical,
+                reason:
+                  files.length === 0
+                    ? 'unknown-main-delta'
+                    : onlyNonCritical
+                      ? 'non-merge-critical-main-delta'
+                      : 'merge-critical-main-delta',
+                files,
+                criticalFiles,
+              };
+            }
+
+            function conflictAttemptMarker(headSha) {
+              return '<!-- opencode-conflict-repair-attempt head=' +
+                String(headSha || '').toLowerCase() + ' -->';
+            }
+
+            async function releaseConflictLock() {
+              try {
+                await github.rest.issues.removeLabel({
+                  owner,
+                  repo,
+                  issue_number: prNumber,
+                  name: CONFLICT_LOCK_LABEL,
+                });
+              } catch (err) {
+                if (err.status !== 404) throw err;
+              }
+            }
+
+            async function dispatchConflictRepair(pr, reason) {
+              await ensureLabel(
+                CONFLICT_LOCK_LABEL,
+                'B60205',
+                'One automatic OpenCode conflict-repair attempt per conflict episode.'
+              );
+              const defaultBranch = await getDefaultBranch();
+              let fresh = await getPull();
+              if (hasLabel(fresh, CONFLICT_LOCK_LABEL)) {
+                // This merge workflow is serialized per PR. A bare label is
+                // therefore never treated as a repository-global liveness
+                // signal: the exact-HEAD attempt marker below is authoritative.
+                // Release stale/inherited lock state before deciding this HEAD.
+                await releaseConflictLock();
+                core.warning(
+                  'PR #' + prNumber +
+                  ': released pre-existing conflict-repair lock; exact-HEAD marker decides whether this PR may dispatch.'
+                );
+                fresh = await getPull();
+              }
+
+              // Bounded retry: exactly one automatic conflict-repair attempt
+              // per PR HEAD. A repeat conflict on the same HEAD after an
+              // attempt already ran means OpenCode could not resolve it;
+              // re-dispatching the same full run would replay the whole task
+              // duration with no new information. A new HEAD starts a new
+              // episode.
+              if (fresh.head.sha.toLowerCase() !== reviewedHead) {
+                core.warning('PR #' + prNumber + ': head moved during conflict handling; stale repair cancelled.');
+                return;
+              }
+              const attemptMarker = conflictAttemptMarker(fresh.head.sha);
+              // Bounded idempotency scan (#254): newest ten pages via the
+              // total. Fail closed: truncated (>10) or unreadable window
+              // may hide the HEAD marker, so treat it as seen.
+              const priorComments = [];
+              const total = (await github.rest.issues.get({ owner, repo, issue_number: prNumber })).data.comments || 0;
+              const lastPage = Math.max(1, Math.ceil(total / 100));
+              if (lastPage > 10) {
+                await releaseConflictLock();
+                core.warning('PR #' + prNumber + ' HEAD ' + fresh.head.sha + ': marker window truncated; assuming attempted.');
+                return;
+              }
+              let unknown = false;
+              for (let page = 1; page <= 10; page += 1) {
+                const targetPage = lastPage - (page - 1);
+                if (targetPage < 1) break;
+                let d;
+                try {
+                  ({ data: d } = await github.rest.issues.listComments(
+                    { owner, repo, issue_number: prNumber, per_page: 100, page: targetPage }
+                  ));
+                } catch (err) { unknown = true; break; }
+                if (!Array.isArray(d)) { unknown = true; break; }
+                if (d.length === 0) continue;
+                priorComments.push(...d);
+              }
+              if (unknown) {
+                await releaseConflictLock();
+                core.warning('PR #' + prNumber + ' HEAD ' + fresh.head.sha + ': marker window unknown; assuming attempted.');
+                return;
+              }
+              if (priorComments.some(comment =>
+                String(comment.body || '').includes(attemptMarker)
+              )) {
+                await releaseConflictLock();
+                core.warning(
+                  'PR #' + prNumber + ' HEAD ' + fresh.head.sha +
+                  ': a conflict-repair attempt already ran for this HEAD; ' +
+                  'not re-dispatching. Push a new HEAD to start a new episode.'
+                );
+                return;
+              }
+
+              await github.rest.issues.addLabels({
+                owner,
+                repo,
+                issue_number: prNumber,
+                labels: [CONFLICT_LOCK_LABEL],
+              });
+              // Task-replay record: the repair run merges the default branch
+              // into this exact HEAD and preserves intent from both sides; it
+              // never redoes the original task. The marker bounds retries and
+              // carries the replay coordinates (HEAD, base, reason) so a timed
+              // out episode can be replaced from evidence instead of rerun.
+              const attemptComment = await github.rest.issues.createComment({
+                owner,
+                repo,
+                issue_number: prNumber,
+                body: [
+                  attemptMarker,
+                  '⚡ **Continuum · pr-agent-auto-merge**',
+                  '<!-- continuum-origin role=continuum component=pr-agent-auto-merge -->',
+                  'Automatic OpenCode conflict repair, attempt 1/1 for HEAD `' +
+                    fresh.head.sha + '` (base `' + defaultBranch + '`, reason: ' +
+                    reason + '). Scope is merge-conflict resolution only; ' +
+                    'the repair merges the base into the PR branch and preserves ' +
+                    'intent from both sides without redoing the original task.',
+                ].join('\n'),
+              });
+              try {
+                if (delegated) {
+                  // Delegated: execution stays in the parent, so dispatch
+                  // target-aware repair in the execution repository with the
+                  // opaque child id (the repair workflow resolves the target
+                  // via target_child_id). The exact-HEAD attempt marker and
+                  // lock are preserved as this HEAD's single bounded attempt.
+                  if (!targetChildId) {
+                    core.setFailed(
+                      'PR #' + prNumber +
+                      ': delegated conflict repair requires target_child_id; ' +
+                      'no target-aware dispatch was made for HEAD ' + fresh.head.sha +
+                      ' (' + reason + ').'
+                    );
+                    return;
+                  }
+                  try {
+                    await github.request(
+                      'POST /repos/{owner}/{repo}/actions/workflows/{workflow_id}/dispatches',
+                      {
+                        owner: executionOwner,
+                        repo: executionRepo,
+                        workflow_id: 'continuum-pr-agent-repair.yml',
+                        ref: defaultBranch,
+                        inputs: {
+                          pr_number: String(prNumber),
+                          head_sha: fresh.head.sha,
+                          target_child_id: targetChildId,
+                        },
+                      }
+                    );
+                  } catch (dispatchErr) {
+                    const dispatchMessage = String(dispatchErr.message || dispatchErr);
+                    const dispatchStatus = Number(dispatchErr.status || 0);
+                    // Narrow input-rejection detection (mirrors recovery/wakeup):
+                    // only a 422 naming the opaque target_child_id input means
+                    // the repair workflow lacks the delegated selector. Any
+                    // other 422 or message is a transient/payload failure and
+                    // is rethrown for the outer cleanup; the marker/lock are
+                    // removed there so recovery per #224 can reconcile a
+                    // transient dispatch on its next wakeup.
+                    const isMissingTargetInput =
+                      dispatchStatus === 422 &&
+                      /target_child_id/i.test(dispatchMessage);
+                    if (isMissingTargetInput) {
+                      throw new Error(
+                        'PR #' + prNumber +
+                        ': delegated conflict repair requires continuum-pr-agent-repair.yml ' +
+                        'to declare a target_child_id input; refusing bare retry to preserve the delegated target: ' +
+                        dispatchMessage
+                      );
+                    }
+                    throw dispatchErr;
+                  }
+                  core.notice(
+                    'PR #' + prNumber + ': dispatched delegated conflict repair via parent (' + reason + ').'
+                  );
+                  return;
+                }
+                await github.request(
+                  'POST /repos/{owner}/{repo}/actions/workflows/{workflow_id}/dispatches',
+                  {
+                    owner,
+                    repo,
+                    workflow_id: 'continuum-opencode.yml',
+                    ref: defaultBranch,
+                    inputs: {
+                      mode: 'resolve-conflict',
+                      pr_number: String(prNumber),
+                      head_ref: fresh.head.ref,
+                      conflict_strategy: 'merge',
+                      timeout_minutes: '60',
+                    },
+                  }
+                );
+                core.notice(
+                  'PR #' + prNumber + ': dispatched OpenCode conflict repair (' + reason + ').'
+                );
+              } catch (err) {
+                try {
+                  await github.rest.issues.deleteComment({
+                    owner,
+                    repo,
+                    comment_id: attemptComment.data.id,
+                  });
+                } catch (cleanupErr) {
+                  core.warning(
+                    'PR #' + prNumber +
+                    ': failed to remove uncommitted conflict-attempt marker: ' +
+                    (cleanupErr.message || cleanupErr)
+                  );
+                }
+                await releaseConflictLock();
+                throw err;
+              }
+            }
+
+            async function syncFromMain(pr, reason) {
+              const oldHead = pr.head.sha;
+              // kodmial/continuum#302: fail closed before any sync mutation
+              // when the PR head is empty, ambiguous, undiscoverable, or
+              // the default branch itself.
+              try {
+                continuumAssertSafePush(pr.head.ref, await getStrictDefaultBranch());
+              } catch (safetyErr) {
+                core.setFailed('PR #' + prNumber + ': ' + (safetyErr.message || safetyErr));
+                return false;
+              }
+              try {
+                await github.request(
+                  'PUT /repos/{owner}/{repo}/pulls/{pull_number}/update-branch',
+                  {
+                    owner,
+                    repo,
+                    pull_number: prNumber,
+                    expected_head_sha: oldHead,
+                  }
+                );
+                core.notice(
+                  'PR #' + prNumber +
+                  ': synchronized merge-critical main delta (' + reason +
+                  '); the new HEAD must pass fresh CI and a fresh full PR-Agent review.'
+                );
+                return true;
+              } catch (err) {
+                const fresh = await getPull();
+                if (fresh.head.sha !== oldHead) {
+                  core.notice(
+                    'PR #' + prNumber +
+                    ': head advanced during main sync; stale review will not be merged.'
+                  );
+                  return true;
+                }
+                const message = String(err.message || err);
+                if (
+                  err.status === 409 ||
+                  /merge conflict|conflict|cannot be performed|not updateable/i.test(message)
+                ) {
+                  await dispatchConflictRepair(fresh, message);
+                  return true;
+                }
+                throw err;
+              }
+            }
+
+            let pr = await getPull();
+            if (
+              pr.state !== 'open' ||
+              pr.draft ||
+              !pr.head.repo ||
+              pr.head.repo.full_name !== repoFullName
+            ) {
+              core.setFailed(
+                'PR-Agent candidate is no longer an open non-draft same-repository PR.'
+              );
+              return;
+            }
+            if (pr.head.sha.toLowerCase() !== reviewedHead) {
+              core.setFailed(
+                'PR head moved (' + reviewedHead + ' -> ' + pr.head.sha +
+                '); refusing to merge a stale result.'
+              );
+              return;
+            }
+
+            if (hasLabel(pr, AUTO_MERGE_BLOCK_LABEL)) {
+              core.notice(
+                'PR #' + prNumber + ': ' + AUTO_MERGE_BLOCK_LABEL +
+                ' blocks automatic merge.'
+              );
+              return;
+            }
+
+            const initialGates = await currentHeadGates(pr);
+            if (!initialGates.ok) {
+              core.setFailed('PR #' + prNumber + ': ' + initialGates.reason + '.');
+              return;
+            }
+
+            const mainSync = await mainSyncDecision(pr);
+            if (mainSync.required) {
+              core.notice(
+                'PR #' + prNumber + ': main advanced in merge-critical files: ' +
+                (mainSync.criticalFiles.join(', ') || mainSync.reason) + '.'
+              );
+              await syncFromMain(pr, mainSync.reason);
+              return;
+            }
+            if (mainSync.reason === 'non-merge-critical-main-delta') {
+              core.notice(
+                'PR #' + prNumber +
+                ': main advanced only in non-merge-critical files; preserving the reviewed HEAD.'
+              );
+            }
+
+            pr = await getPull();
+            if (
+              pr.state !== 'open' ||
+              pr.draft ||
+              !pr.head.repo ||
+              pr.head.repo.full_name !== repoFullName ||
+              pr.head.sha.toLowerCase() !== reviewedHead ||
+              hasLabel(pr, AUTO_MERGE_BLOCK_LABEL)
+            ) {
+              core.setFailed(
+                'PR state changed during final PR-Agent revalidation; merge cancelled.'
+              );
+              return;
+            }
+
+            const finalSync = await mainSyncDecision(pr);
+            if (finalSync.required) {
+              core.notice(
+                'PR #' + prNumber +
+                ': merge-critical main delta appeared during final revalidation.'
+              );
+              await syncFromMain(pr, finalSync.reason);
+              return;
+            }
+
+            const finalGates = await currentHeadGates(pr);
+            if (!finalGates.ok) {
+              core.setFailed(
+                'PR #' + prNumber +
+                ': gate changed during final revalidation: ' + finalGates.reason + '.'
+              );
+              return;
+            }
+
+            // Re-read after all asynchronous gate queries. Mergeability and
+            // main delta from an older PR object are not authoritative here.
+            pr = await getPull();
+            if (
+              pr.state !== 'open' ||
+              pr.draft ||
+              !pr.head.repo ||
+              pr.head.repo.full_name !== repoFullName ||
+              pr.head.sha.toLowerCase() !== reviewedHead ||
+              hasLabel(pr, AUTO_MERGE_BLOCK_LABEL)
+            ) {
+              core.setFailed(
+                'PR state changed immediately before merge; merge cancelled.'
+              );
+              return;
+            }
+
+            const preMergeSync = await mainSyncDecision(pr);
+            if (preMergeSync.required) {
+              core.notice(
+                'PR #' + prNumber +
+                ': merge-critical main delta appeared immediately before merge.'
+              );
+              await syncFromMain(pr, preMergeSync.reason);
+              return;
+            }
+            const preMergeGates = await currentHeadGates(pr);
+            if (!preMergeGates.ok) {
+              core.setFailed(
+                'PR #' + prNumber +
+                ': gate changed immediately before merge: ' + preMergeGates.reason + '.'
+              );
+              return;
+            }
+
+            if (pr.mergeable === false || pr.mergeable_state === 'dirty') {
+              await dispatchConflictRepair(
+                pr,
+                'mergeable_state=' + pr.mergeable_state
+              );
+              return;
+            }
+            if (pr.mergeable === null) {
+              core.notice(
+                'PR #' + prNumber +
+                ': GitHub mergeability is still being computed; waiting.'
+              );
+              return;
+            }
+
+            const conventionalTitle =
+              /^(?:fix|feat|perf|refactor)(?:\([^)]*\))?!?:\s/i.test(pr.title)
+                ? pr.title
+                : 'fix: ' + pr.title;
+
+            let mergeResponse;
+            try {
+              mergeResponse = await github.rest.pulls.merge({
+                owner,
+                repo,
+                pull_number: prNumber,
+                merge_method: 'squash',
+                commit_title: conventionalTitle,
+                sha: reviewedHead,
+              });
+            } catch (err) {
+              const fresh = await getPull();
+              if (fresh.head.sha.toLowerCase() !== reviewedHead) {
+                core.setFailed(
+                  'PR HEAD moved during atomic merge; stale reviewed HEAD was not merged.'
+                );
+                return;
+              }
+              const message = String(err.message || err);
+              const isConflictMessage =
+                /merge conflict|conflict|not mergeable|cannot be merged/i.test(message);
+              if (err.status === 409 || isConflictMessage) {
+                await dispatchConflictRepair(fresh, message);
+                return;
+              }
+              if (err.status === 422) {
+                core.setFailed(
+                  'Atomic merge rejected with HTTP 422 without conflict evidence: ' +
+                  message
+                );
+                return;
+              }
+              throw err;
+            }
+            const result = mergeResponse.data;
+
+            if (!result.merged) {
+              core.setFailed(
+                'PR #' + prNumber +
+                ': GitHub refused exact-head merge: ' +
+                (result.message || 'unknown reason')
+              );
+              return;
+            }
+
+            core.notice(
+              'PR #' + prNumber + ': merged exact reviewed HEAD ' +
+              reviewedHead + '; merge commit ' + result.sha + '.'
+            );
+
+            for (const workflow of postMergeWakeups) {
+              if (!/^[\w][\w.\-]*\.yml$/.test(workflow)) {
+                core.warning('PR #' + prNumber + ': skipping invalid post-merge wakeup: ' + workflow);
+                continue;
+              }
+              try {
+                const dispatchParams = {
+                  owner: executionOwner,
+                  repo: executionRepo,
+                  workflow_id: workflow,
+                  ref: postMergeWakeupRef,
+                };
+                // Preserve the opaque delegated selection for the follow-up
+                // run, mirroring the recovery dispatch. Local runs dispatch
+                // bare to preserve the existing best-effort contract.
+                if (targetChildId) {
+                  dispatchParams.inputs = { target_child_id: targetChildId };
+                }
+                try {
+                  await github.request(
+                    'POST /repos/{owner}/{repo}/actions/workflows/{workflow_id}/dispatches',
+                    dispatchParams
+                  );
+                } catch (dispatchErr) {
+                  const dispatchMessage = String(dispatchErr.message || dispatchErr);
+                  const dispatchStatus = Number(dispatchErr.status || 0);
+                  // Narrow input-rejection detection: only a 422 whose
+                  // message names the opaque input (or GitHub's
+                  // unexpected/unknown-input wording) means the wakeup
+                  // target does not accept target_child_id. Any other
+                  // 422 (invalid ref, payload validation, or a message
+                  // merely mentioning inputs) is rethrown verbatim so
+                  // reviewers get the true remediation path.
+                  const isInputRejection =
+                    dispatchStatus === 422 &&
+                    /(target_child_id|unexpected\s+inputs?|unknown\s+inputs?)/i.test(dispatchMessage);
+                  if (dispatchParams.inputs && isInputRejection) {
+                    // A delegated wakeup must never retry bare: a bare
+                    // dispatch would wake the execution repository instead of
+                    // the delegated child target. Fail closed so the missing
+                    // post-merge chain is visible instead of a silent success.
+                    throw new Error(
+                      'PR #' + prNumber +
+                      ': wakeup ' + workflow + ' does not accept target_child_id inputs; ' +
+                      'refusing bare retry to preserve the delegated target: ' +
+                      dispatchMessage
+                    );
+                  } else {
+                    throw dispatchErr;
+                  }
+                }
+                core.notice('Woke ' + workflow + ' at ' + postMergeWakeupRef + '.');
+              } catch (err) {
+                // Post-merge wakeup is best-effort: the merge already
+                // succeeded, so a wakeup failure warns without failing the
+                // merge run. A delegated wakeup is never retried bare: the
+                // explicit refusal above surfaces here as a warning, never
+                // as a parent-targeted dispatch.
+                core.warning(
+                  'PR #' + prNumber +
+                  ': could not wake ' + workflow + ': ' + err.message
+                );
+              }
+            }

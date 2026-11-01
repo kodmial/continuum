@@ -1,0 +1,50 @@
+name: CodeRabbit retry controller
+
+# Self-dogfood entry for the CodeRabbit review queue. The reusable engine is
+# workflow_call-only, so this file owns the triggers and calls the engine
+# locally. Installed consumers keep using the continuum-coderabbit-retry.yml
+# caller stub instead.
+
+on:
+  # Any new/edited CodeRabbit rate-limit response wakes the global controller.
+  issue_comment:
+    types: [created, edited]
+
+  # A completed CodeRabbit review counts as the review for that push.
+  pull_request_review:
+    types: [submitted]
+
+  # A CodeRabbit finding verdict is a lifecycle transition too. Wake the
+  # serialized queue immediately after RESOLVED/UNRESOLVED instead of waiting
+  # for cron or an unrelated status/review event.
+  pull_request_review_comment:
+    types: [created, edited]
+
+  # Provider-owned safety net: CodeRabbit recovery must not depend on any
+  # PR-Agent workflow or generic merge-controller completion.
+  schedule:
+    - cron: "3,13,23,33,43,53 * * * *"
+
+  # Manual/safety-net reconciliation.
+  workflow_dispatch:
+
+permissions:
+  # The review queue only reads Actions state; exact-finding verification
+  # remains owned by the auto-merge reconciler.
+  actions: read
+  contents: read
+  issues: write
+  pull-requests: read
+  statuses: read
+
+jobs:
+  call:
+    # Private child repositories do not run local PR lifecycle controllers.
+    # Non-CodeRabbit consumers do not run this controller either.
+    if: >-
+      vars.CONTINUUM_ROLE != 'child' &&
+      (vars.CONTINUUM_REVIEW_PROVIDER || 'none') == 'coderabbit'
+    uses: ./.github/workflows/continuum-coderabbit-retry.yml
+    secrets: inherit
+    with:
+      continuum_ref: main

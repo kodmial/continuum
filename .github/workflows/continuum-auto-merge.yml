@@ -1,0 +1,3711 @@
+name: Auto-merge reviewed pull requests
+
+on:
+  workflow_call:
+    inputs:
+      continuum_ref:
+        description: Continuum revision supplying fallback scripts
+        type: string
+        default: main
+        required: false
+      opencode_workflow:
+        description: >-
+          Consumer-owned OpenCode caller workflow used for automatic conflict
+          repair. Defaults to continuum-opencode.yml for installed consumers;
+          Continuum dogfood overrides this to opencode.yml.
+        type: string
+        default: 'continuum-opencode.yml'
+        required: false
+      coderabbit_retry_workflow:
+        description: >-
+          Workflow dispatched when a current head still needs its CodeRabbit
+          review. Empty falls back to
+          vars.CONTINUUM_CODERABBIT_RETRY_WORKFLOW, then to
+          continuum-coderabbit-retry.yml. Continuum dogfood overrides this to
+          the dispatchable coderabbit-retry.yml entry.
+        type: string
+        default: ''
+        required: false
+      coderabbit_unresolved_workflow:
+        description: >-
+          Workflow dispatched to reconcile a CodeRabbit unresolved-thread
+          verdict. Empty falls back to
+          vars.CONTINUUM_CODERABBIT_UNRESOLVED_WORKFLOW, then to
+          continuum-coderabbit-unresolved.yml. Continuum dogfood overrides this
+          to the dispatchable coderabbit-unresolved.yml entry.
+        type: string
+        default: ''
+        required: false
+      review_provider:
+        description: >-
+          Review provider: none, coderabbit, or pr-agent. Empty falls back to
+          vars.CONTINUUM_REVIEW_PROVIDER, then to none. This is the authoritative
+          review selector.
+        type: string
+        default: ''
+        required: false
+      require_coderabbit:
+        description: Deprecated compatibility input; review_provider is authoritative.
+        type: string
+        default: ''
+        required: false
+      post_merge_wakeups:
+        description: >-
+          Workflows to wake after a successful merge, comma-separated. The fork
+          auto-merger woke a knowledge-sync workflow and re-woke the issue
+          scheduler; neither is a core workflow (`knowledge-sync.yml` does not
+          exist in Continuum at all), so the list must come from the consumer.
+          Empty — the default — wakes nothing after a merge. Empty falls back to
+          vars.CONTINUUM_POST_MERGE_WAKEUPS.
+        type: string
+        default: ''
+        required: false
+      post_merge_wakeup_ref:
+        description: >-
+          Git ref the post-merge wake-ups are dispatched at. Empty falls back to
+          vars.CONTINUUM_POST_MERGE_WAKEUP_REF, then to the main branch.
+        type: string
+        default: ''
+        required: false
+      required_workflow_gate_label:
+        description: >-
+          Optional PR label that activates an additional current-head workflow
+          gate before auto-merge. Empty disables the extra gate.
+        type: string
+        default: ''
+        required: false
+      required_workflow_gate_name:
+        description: >-
+          Exact GitHub Actions workflow name required to complete successfully
+          when required_workflow_gate_label is present on a PR.
+        type: string
+        default: ''
+        required: false
+  # Successful PR CI explicitly dispatches this reconciler from
+  # mark-ready-for-coderabbit. CodeRabbit status/review and main pushes are
+  # additional event-driven wake-ups; no critical transition depends on cron.
+
+permissions: {}
+
+concurrency:
+  # Every trigger (CI dispatch, CodeRabbit, push, manual, or cron) enters the
+  # same pure latest-state reconciler. It revalidates every gate immediately
+  # before each write. Runs are never cancelled: the repository-global group
+  # below serializes runs so at most one reconciler executes at a time and a
+  # queued run re-reconciles from latest state when it starts. With GitHub's
+  # default single pending slot, newer wake-ups replace older pending work
+  # without cancelling the in-flight scan. The in-memory per-PR/HEAD lease
+  # inside the reconciler only coalesces duplicate wakeups within a single
+  # run; cross-run safety comes from that serialization plus the exact-HEAD
+  # re-read and the atomic `sha:` guard on the merge call, so a stale queued
+  # run becomes a safe no-op instead of a concurrent writer. Cancelling the
+  # running pass let status storms repeatedly abort before later PRs were
+  # reconciled, starving conflict repair and merge progress, and
+  # repository-global cancellation would let a busy PR starve unrelated PRs
+  # via repeated cancel/requeue livelock.
+  group: ${{ github.workflow }}-auto-merge
+  cancel-in-progress: false
+
+jobs:
+  controller:
+    # Verified child PR merge/review is owned by the public parent delegated
+    # review workflow; this controller does not run in child repositories.
+    if: vars.CONTINUUM_ROLE != 'child'
+    runs-on: ubuntu-latest
+    timeout-minutes: ${{ fromJSON(vars.AUTOMATION_AUTOMERGE_TIMEOUT_MINUTES || '10') }}
+
+    permissions:
+      actions: write
+      contents: write
+      issues: write
+      pull-requests: write
+      statuses: read
+
+    steps:
+      - name: Merge only fully reviewed current heads
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
+        # Use the repository PAT intentionally. A merge performed with the
+        # ephemeral GITHUB_TOKEN does not reliably fan out into the downstream
+        # push/merge workflows (version bump, release, PR reconciliation).
+        env:
+          CONTINUUM_VERSION_FILE: ${{ vars.CONTINUUM_VERSION_FILE || '' }}
+          REVIEW_PROVIDER: ${{ inputs.review_provider || vars.CONTINUUM_REVIEW_PROVIDER || 'none' }}
+          OPENCODE_WORKFLOW: ${{ inputs.opencode_workflow || 'continuum-opencode.yml' }}
+          # Dispatch targets are resolved through one env var per target so a
+          # dogfood caller can point at its dispatchable entry workflow while an
+          # installed consumer that sets nothing keeps the legacy engine name.
+          CONTINUUM_CODERABBIT_RETRY_WORKFLOW: ${{ inputs.coderabbit_retry_workflow || vars.CONTINUUM_CODERABBIT_RETRY_WORKFLOW || 'continuum-coderabbit-retry.yml' }}
+          CONTINUUM_CODERABBIT_UNRESOLVED_WORKFLOW: ${{ inputs.coderabbit_unresolved_workflow || vars.CONTINUUM_CODERABBIT_UNRESOLVED_WORKFLOW || 'continuum-coderabbit-unresolved.yml' }}
+          POST_MERGE_WAKEUPS: ${{ inputs.post_merge_wakeups || vars.CONTINUUM_POST_MERGE_WAKEUPS }}
+          POST_MERGE_WAKEUP_REF: ${{ inputs.post_merge_wakeup_ref || vars.CONTINUUM_POST_MERGE_WAKEUP_REF || github.event.repository.default_branch || 'main' }}
+          REQUIRED_WORKFLOW_GATE_LABEL: ${{ inputs.required_workflow_gate_label || vars.CONTINUUM_REQUIRED_WORKFLOW_GATE_LABEL || '' }}
+          REQUIRED_WORKFLOW_GATE_NAME: ${{ inputs.required_workflow_gate_name || vars.CONTINUUM_REQUIRED_WORKFLOW_GATE_NAME || '' }}
+          # Same-repository read-only discovery and housekeeping reads
+          # (main SHA, active run listing, obsolete-run metadata) use the
+          # run-scoped installation token instead of TAP_PAT. Mutations stay
+          # PAT-backed.
+          READ_GITHUB_TOKEN: ${{ github.token }}
+        with:
+          github-token: ${{ secrets.TAP_PAT }}
+          script: |
+            // Canonical shared lifecycle (#304): provider-neutral decisions
+            // below mirror src/continuum/merge_lifecycle.py and
+            // .github/scripts/merge_lifecycle.js (PR/HEAD reconciliation,
+            // CI/gates, no-auto-merge, main-sync, conflict plumbing,
+            // packaging/required gates, exact-HEAD validation, atomic merge,
+            // merge titles, post-merge wakeups, idempotency). CodeRabbit-only
+            // semantics (approval basis, unresolved/nitpick, quota/rate-limit,
+            // review commands, carried approval) stay provider-owned in
+            // src/continuum/coderabbit_adapter.py. See
+            // docs/provider-lifecycle-ownership.md and
+            // docs/provider-lifecycle-duplication-matrix.md.
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const repoFullName = `${owner}/${repo}`;
+            // Lifecycle self-healing (#224): same-repository read-only
+            // discovery uses the run-scoped GITHUB_TOKEN instead of TAP_PAT.
+            // Mutations and dispatches below stay on the PAT-authenticated
+            // action client, preserving actor and event fan-out semantics.
+            const readToken = String(process.env.READ_GITHUB_TOKEN || '').trim();
+            const readBaseUrl = (
+              (github && github.request && github.request.endpoint &&
+                github.request.endpoint.DEFAULTS && github.request.endpoint.DEFAULTS.baseUrl) ||
+              process.env.GITHUB_API_URL || 'https://api.github.com'
+            );
+            if (!readToken) {
+              core.setFailed('READ_GITHUB_TOKEN is empty; same-repository reads require GITHUB_TOKEN and must not fall back to TAP_PAT.');
+              return;
+            }
+            const readGithub = new github.constructor({ auth: readToken, baseUrl: readBaseUrl });
+            // Fail fast when the injected constructor lacks the composed
+            // paginate/rest plugins. Without this, per-PR housekeeping reads
+            // fail later with `client.paginate is not a function`, which the
+            // per-PR isTransientApiError catch would misclassify as
+            // deterministic and fail the whole run obscurely.
+            if (
+              typeof readGithub.paginate !== 'function' ||
+              typeof readGithub.graphql !== 'function' ||
+              typeof readGithub.request !== 'function' ||
+              typeof readGithub.rest?.issues?.listComments !== 'function' ||
+              typeof readGithub.rest?.pulls?.get !== 'function' ||
+              typeof readGithub.rest?.pulls?.list !== 'function' ||
+              typeof readGithub.rest?.pulls?.listReviews !== 'function' ||
+              typeof readGithub.rest?.pulls?.listReviewComments !== 'function' ||
+              typeof readGithub.rest?.repos?.getBranch !== 'function' ||
+              typeof readGithub.rest?.repos?.getCommit !== 'function' ||
+              typeof readGithub.rest?.repos?.getCombinedStatusForRef !== 'function' ||
+              typeof readGithub.rest?.actions?.listWorkflowRunsForRepo !== 'function' ||
+              typeof readGithub.rest?.actions?.listWorkflowRuns !== 'function'
+            ) {
+              throw new Error(
+                'readGithub client lacks the paginate/rest/graphql plugins; ' +
+                'cannot perform same-repository housekeeping reads.'
+              );
+            }
+            let readTokenUnavailable = false;
+            function isRateLimitError(err, status) {
+              if (status === 429) return true;
+              if (status !== 403) return false;
+              const headers = (err && ((err.response && err.response.headers) || err.headers)) || {};
+              const lowered = {};
+              for (const [key, value] of Object.entries(headers)) {
+                lowered[String(key).toLowerCase()] = value;
+              }
+              if (lowered['retry-after'] !== undefined && String(lowered['retry-after']).trim() !== '') return true;
+              if (lowered['x-ratelimit-reset'] !== undefined && String(lowered['x-ratelimit-reset']).trim() !== '') return true;
+              if (lowered['x-ratelimit-remaining'] !== undefined && String(lowered['x-ratelimit-remaining']).trim() === '0') return true;
+              return /rate limit|rate-limit|ratelimit|quota exhaustion|secondary rate limit|retry after/i.test(
+                String((err && err.message) || '')
+              );
+            }
+            async function withReadFallback(fn) {
+              // Per-call fallback only: a single per-PR 401/non-rate-limit
+              // 403 falls back for that call alone and never flips the rest
+              // of the watchdog scan to PAT-heavy polling. (readTokenUnavailable
+              // is retained only so the repository-token health check above
+              // keeps its shape; it is never set sticky here.)
+              if (readTokenUnavailable || readGithub === github) {
+                return await fn(github);
+              }
+              try {
+                return await fn(readGithub);
+              } catch (err) {
+                const status = err ? (err.status ?? err.response?.status) : undefined;
+                // A 429 or rate-limited 403 read is deferred to the next wakeup and does not retry inline:
+                // the error surfaces so the caller warns and defers instead
+                // of re-issuing the same scan on the PAT client. Only
+                // authentication/permission gaps (401, non-rate-limit 403)
+                // fall back to the PAT client, one call at a time.
+                if (status === 401 || (status === 403 && !isRateLimitError(err, status))) {
+                  core.warning('Repository-token read failed (' + status + '); retrying with PAT client: ' + err.message);
+                  return await fn(github);
+                }
+                throw err;
+              }
+            }
+            // Generic transient-failure classification (#224): infrastructure
+            // gaps (rate limit with an empty budget, 429/Retry-After, 5xx,
+            // network timeout/reset, runner cancellation/eviction, temporary
+            // provider outage) are retryable via the next event/scheduled
+            // wakeup. Deterministic policy outcomes (red CI, unresolved
+            // findings, merge conflict, malformed state, moved HEAD) never
+            // consume the transient budget and hold instead.
+            // kodmial/continuum#302: canonical fail-closed branch safety
+            // for the main-sync mutations below (GitHub-native update-branch
+            // and the exact-main fallback merge into the PR branch). The PR
+            // head must be a proven non-default ref; the default branch is
+            // discovered from repository metadata, never hardcoded. A
+            // missing/ambiguous/undiscoverable/default head fails closed
+            // before any mutation. Only the PR merge operation may update
+            // the default branch, and there is no bypass.
+            let default_branch = '';
+            try {
+              const repoMeta = await withReadFallback(client =>
+                client.rest.repos.get({ owner, repo })
+              );
+              default_branch = String(repoMeta?.data?.default_branch || '')
+                .replace(/^refs\/heads\//, '').trim();
+            } catch (err) {
+              default_branch = '';
+            }
+            const continuumAssertSafePush = (dest) => {
+              const norm = String(dest || '').replace(/^refs\/heads\//, '').trim();
+              if (!norm) {
+                throw new Error('Continuum branch safety: refusing main sync with an empty PR head ref.');
+              }
+              if (['HEAD', '@', 'FETCH_HEAD', 'ORIG_HEAD', 'MERGE_HEAD'].includes(norm)) {
+                throw new Error(`Continuum branch safety: refusing ambiguous main-sync destination '${norm}'.`);
+              }
+              if (/(\.\.|~|\^|\?|\*|\[|\s|@\{|^[-/.]|[/.]$|\/\/|\.lock$)/.test(norm)) {
+                throw new Error(`Continuum branch safety: refusing ambiguous main-sync destination '${norm}'.`);
+              }
+              if (!default_branch) {
+                throw new Error('Continuum branch safety: repository default branch is undiscoverable; refusing main sync.');
+              }
+              if (norm === default_branch) {
+                throw new Error(`Continuum branch safety: refusing main sync for a PR headed at the default branch '${norm}'. Only the PR merge operation may update the default branch.`);
+              }
+            };
+            function isTransientApiError(err) {
+              const status = err ? (err.status ?? err.response?.status) : undefined;
+              if (status === 429) return true;
+              if (typeof status === 'number' && status >= 500 && status <= 599) return true;
+              if (status === 403) {
+                const headers = (err.response && err.response.headers) || err.headers || {};
+                const lowered = {};
+                for (const [key, value] of Object.entries(headers)) {
+                  lowered[String(key).toLowerCase()] = value;
+                }
+                if (lowered['retry-after'] !== undefined && String(lowered['retry-after']).trim() !== '') return true;
+                if (lowered['x-ratelimit-reset'] !== undefined && String(lowered['x-ratelimit-reset']).trim() !== '') return true;
+                if (lowered['x-ratelimit-remaining'] !== undefined && String(lowered['x-ratelimit-remaining']).trim() === '0') return true;
+                const message = String(err.message || '');
+                if (/rate limit|rate-limit|ratelimit|quota exhaustion|secondary rate limit|retry after/i.test(message)) return true;
+                return false;
+              }
+              const retryable = new Set(['cancelled', 'timed_out', 'stale', 'startup_failure']);
+              if (err && retryable.has(String(err.conclusion || '').toLowerCase())) return true;
+              // Bare timeout alone never proves infrastructure: deterministic
+              // current-head CI text such as `tests timed out: assertion
+              // failed` must hold. Only qualified infrastructure timeouts
+              // retry. Infrastructure evidence wins over an incidental
+              // `assert` substring (e.g. a bootstrap/runner/TLS message
+              // mentioning an assertion); only when no infrastructure
+              // token matches does an assertion mention hold.
+              if (/econnreset|econnrefused|eai_again|epipe|socket hang up|network error|network failure|network timeout|network unreachable|dns error|dns failure|dns resolution|tls handshake|tls error|ssl error|connection reset|connection refused|connection aborted|temporarily unavailable|service unavailable|bad gateway|gateway timeout|bootstrap failed|bootstrap error|runner evicted|runner cancelled|runner timeout|runner lost|run evicted|run cancelled/i.test(
+                String((err && err.message) || '')
+              )) {
+                return true;
+              }
+              const _msg = String((err && err.message) || '');
+              if (/timed out|timeout/i.test(_msg)) {
+                if (/read|connection|network|runner|socket|dns|tls|ssl|gateway|http|request|operation|bootstrap|provider/i.test(_msg)) return true;
+                return false;
+              }
+              if (_msg.toLowerCase().includes('assert')) return false;
+              return false;
+            }
+            // Reset-aware scheduling (#224, single lifecycle contract): the
+            // canonical retry schedule plus bounded jitter is the floor and
+            // any Retry-After / X-RateLimit-Reset / provider reset wait that
+            // is longer wins. A long wait exits the run: delays beyond the
+            // inline threshold defer to the scheduled safety net (the cron
+            // caller stub), which redispatches when the window expires.
+            // Mirrors continuum-pr-agent-recovery.yml.
+            const MAX_INLINE_WAIT_SECONDS = 60;
+            const LIFECYCLE_RETRY_DELAY_SCHEDULE = [0, 10, 30, 60, 180, 300, 600, 1200, 2400, 3600];
+            const JITTER_CAP_SECONDS = 5;
+            // Deterministic bounded jitter so concurrent PRs hitting the same
+            // reset window do not redispatch in lockstep and re-hammer the
+            // limit. Mirrors continuum-pr-agent-recovery.yml.
+            function jitterSeconds(key, attempt, cap = JITTER_CAP_SECONDS) {
+              let hash = 2166136261;
+              const text = String(key || 'lifecycle') + ':' + String(attempt);
+              for (let i = 0; i < text.length; i += 1) {
+                hash ^= text.charCodeAt(i);
+                hash = Math.imul(hash, 16777619);
+              }
+              return cap > 0 ? (hash >>> 0) % (cap + 1) : 0;
+            }
+            function resetAwareDelaySeconds({ attempt, retryAfterSeconds, ratelimitResetEpoch, providerResetEpoch, nowEpoch, operationKey }) {
+              // Clamp to the last schedule entry: an attempt at or beyond
+              // the schedule end still defers the full 60m tail instead of
+              // returning 0 and hot-retrying through quota exhaustion.
+              let delay = attempt <= 0
+                ? 0
+                : LIFECYCLE_RETRY_DELAY_SCHEDULE[
+                  Math.min(attempt, LIFECYCLE_RETRY_DELAY_SCHEDULE.length - 1)
+                ] + jitterSeconds(operationKey || 'lifecycle', attempt);
+              if (Number.isFinite(retryAfterSeconds) && retryAfterSeconds >= 0) {
+                delay = Math.max(delay, retryAfterSeconds);
+              }
+              for (const resetEpoch of [ratelimitResetEpoch, providerResetEpoch]) {
+                if (Number.isFinite(resetEpoch) && Number.isFinite(nowEpoch)) {
+                  delay = Math.max(delay, Math.max(0, resetEpoch - nowEpoch));
+                }
+              }
+              return delay;
+            }
+
+            // Reset-signal extraction (#224): server-provided Retry-After /
+            // X-RateLimit-Reset / provider reset minimums are read from the
+            // failed call's headers so a 429/403 does not fall back to an
+            // immediate retry that hammers the limit. Callers always pass
+            // the live clock, so a reset epoch is never silently dropped.
+            function extractRateLimitSignals(err) {
+              const headers = (err && ((err.response && err.response.headers) || err.headers)) || {};
+              const lowered = {};
+              for (const [key, value] of Object.entries(headers)) {
+                lowered[String(key).toLowerCase()] = value;
+              }
+              const retryAfterRaw = lowered['retry-after'];
+              let retryAfterSeconds;
+              if (retryAfterRaw !== undefined && retryAfterRaw !== null && String(retryAfterRaw).trim() !== '') {
+                const text = String(retryAfterRaw).trim();
+                const parsed = Number.parseInt(text, 10);
+                if (Number.isFinite(parsed) && parsed >= 0 && /^\d+/.test(text)) {
+                  retryAfterSeconds = parsed;
+                } else {
+                  const when = Date.parse(text);
+                  if (Number.isFinite(when)) {
+                    retryAfterSeconds = Math.max(0, Math.ceil((when - Date.now()) / 1000));
+                  }
+                }
+              }
+              const resetRaw = lowered['x-ratelimit-reset'] ?? lowered['ratelimit-reset'];
+              let ratelimitResetEpoch;
+              if (resetRaw !== undefined && resetRaw !== null && String(resetRaw).trim() !== '') {
+                const parsed = Number.parseInt(String(resetRaw).trim(), 10);
+                if (Number.isFinite(parsed) && parsed > 0) ratelimitResetEpoch = parsed;
+              }
+              const providerRaw = lowered['x-provider-reset'] ?? lowered['provider-reset'];
+              let providerResetEpoch;
+              if (providerRaw !== undefined && providerRaw !== null && String(providerRaw).trim() !== '') {
+                const parsed = Number.parseInt(String(providerRaw).trim(), 10);
+                if (Number.isFinite(parsed) && parsed > 0) providerResetEpoch = parsed;
+              }
+              return { retryAfterSeconds, ratelimitResetEpoch, providerResetEpoch };
+            }
+            // Per-PR/HEAD lease (#224): at most one authoritative
+            // reconciliation owns a PR/HEAD transition at a time. Duplicate
+            // wakeups for the same key coalesce; independent PRs never block
+            // each other behind a repository-global lock.
+            const ownedLeases = new Set();
+            function leaseKey(prNumber, headSha) {
+              return String(prNumber) + ':' + String(headSha || '').toLowerCase();
+            }
+            function tryAcquireLease(prNumber, headSha) {
+              const key = leaseKey(prNumber, headSha);
+              if (ownedLeases.has(key)) return false;
+              ownedLeases.add(key);
+              return true;
+            }
+            function releaseLease(prNumber, headSha) {
+              ownedLeases.delete(leaseKey(prNumber, headSha));
+            }
+            const AUTO_MERGE_BLOCK_LABEL = 'no-auto-merge';
+            // A lost CodeRabbit thread-verification reply must never strand a PR forever.
+            // Reconcile at a bounded cadence; the existing 17/47 safety-net wakeups will
+            // retry only after this timeout instead of spamming the external reviewer.
+            const CODERABBIT_THREAD_VERIFICATION_TIMEOUT_MS = 30 * 60_000;
+            const CONFLICT_LOCK_LABEL = 'opencode-conflict-repair';
+            // Self-healing conflict recovery (issue #246). Every
+            // reconciliation pass rediscovers every open dirty PR, including
+            // PRs that turned dirty before the current wake. Dispatch is
+            // idempotent per PR + exact HEAD and bounded per HEAD; a stale
+            // lock with no active repair run is reconciled and redispatched,
+            // never left to strand the PR. Retry never applies
+            // `automation:paused` and never requires manual label removal.
+            const MAX_CONFLICT_DISPATCHES_PER_HEAD = 3;
+            const CONFLICT_DISPATCH_GRACE_MS = 10 * 60_000;
+            const ACTIVE_REPAIR_STATUSES = new Set([
+              'queued',
+              'in_progress',
+              'waiting',
+              'pending',
+              'requested',
+            ]);
+            const TRUSTED_COMMENT_ASSOCIATIONS = new Set([
+              'OWNER',
+              'MEMBER',
+              'COLLABORATOR',
+            ]);
+            const CONFLICT_MARKER_RE =
+              /<!--\s*continuum-conflict-repair\s+head=([0-9a-f]{7,64})\s+attempt=(\d+)\s*-->/gi;
+            // Durable rate-limit wait (#224): a conflict-repair dispatch that
+            // fails rate-limited persists a deferred not-before so the next
+            // wakeup waits for the reset window instead of retrying
+            // immediately against an unexpired limit. Deferred waits never
+            // consume the bounded per-HEAD dispatch budget.
+            const CONFLICT_DEFER_RE =
+              /<!--\s*continuum-conflict-repair-deferred\s+head=([0-9a-f]{7,64})\s+not-before=(\d+)\s*-->/gi;
+            function conflictRepairNotBefore(comments, headSha, nowEpoch) {
+              const exactHead = String(headSha || '').toLowerCase();
+              let notBefore = null;
+              for (const comment of comments || []) {
+                const association = String(
+                  comment.author_association || ''
+                ).toUpperCase();
+                const login = String(
+                  comment.user?.login || ''
+                ).toLowerCase();
+                const trusted =
+                  TRUSTED_COMMENT_ASSOCIATIONS.has(association) ||
+                  login === 'github-actions[bot]' ||
+                  login === owner.toLowerCase();
+                if (!trusted) continue;
+                const body = String(comment.body || '');
+                CONFLICT_DEFER_RE.lastIndex = 0;
+                for (const match of body.matchAll(CONFLICT_DEFER_RE)) {
+                  if (String(match[1] || '').toLowerCase() !== exactHead) continue;
+                  const epoch = Number.parseInt(match[2], 10);
+                  if (!Number.isFinite(epoch) || epoch <= 0) continue;
+                  if (notBefore === null || epoch > notBefore) notBefore = epoch;
+                }
+              }
+              if (notBefore !== null && Number.isFinite(nowEpoch) && nowEpoch < notBefore) {
+                return notBefore;
+              }
+              return null;
+            }
+            // CodeRabbit is an optional integration. When this project did not
+            // ask for it, every CodeRabbit gate below is skipped and no
+            // CodeRabbit workflow is ever dispatched: requiring an approval
+            // nobody will give would hang the PR forever, and dispatching a
+            // workflow the repository does not have is a 404.
+            const reviewProvider =
+              String(process.env.REVIEW_PROVIDER || 'none').trim().toLowerCase();
+            if (!['none', 'coderabbit', 'pr-agent'].includes(reviewProvider)) {
+              throw new Error(
+                `Invalid CONTINUUM_REVIEW_PROVIDER="${reviewProvider}". Expected none, coderabbit, or pr-agent.`
+              );
+            }
+            // PR-Agent owns a separate exact-head merge gate. Keep this
+            // mature legacy reconciler alive in sync-only mode so
+            // push-to-main still refreshes open PR branches, but never let the
+            // generic path merge a PR-Agent-managed PR.
+            const prAgentSyncOnly = reviewProvider === 'pr-agent';
+            if (prAgentSyncOnly) {
+              core.notice(
+                'PR-Agent review provider selected; generic reconciler is sync-only. ' +
+                'Main synchronization remains active; merge stays PR-Agent-owned.'
+              );
+            }
+            const requireCodeRabbit = reviewProvider === 'coderabbit';
+            const requiredWorkflowGateLabel =
+              String(process.env.REQUIRED_WORKFLOW_GATE_LABEL || '').trim();
+            const requiredWorkflowGateName =
+              String(process.env.REQUIRED_WORKFLOW_GATE_NAME || '').trim();
+
+            // Housekeeping below reuses the repository-token read client
+            // defined above (`readGithub`, built from the injected
+            // constructor so paginate/rest plugins are kept). The
+            // github-script action client (`github`) stays PAT-authenticated
+            // for every mutation below (merge, cancel, label, comment,
+            // dispatch).
+
+            // Bounded Actions housekeeping budget (kodmial/continuum#253).
+            // The obsolete-run scan must never grow with repository age: only
+            // active/non-terminal states are listed, one status value per
+            // request (the API accepts a single status), with an explicit page
+            // cap per status. Completed history is never walked to discover
+            // active runs. With 5 statuses x 2 pages x 100 rows the list phase
+            // costs at most 10 REST calls and never requests page 10+.
+            const HOUSEKEEPING_ACTIVE_STATUSES = [
+              'queued', 'in_progress', 'waiting', 'requested', 'pending',
+            ];
+            const HOUSEKEEPING_PER_PAGE = 100;
+            const HOUSEKEEPING_MAX_PAGES_PER_STATUS = 2;
+            const HOUSEKEEPING_MAX_RELEASE_PROBES = 10;
+
+            function housekeepingStatus(err) {
+              return err?.status ?? err?.response?.status;
+            }
+
+            // Best-effort housekeeping: a rate-limit/transient read or cancel
+            // skips cleanup and lets core reconciliation continue. Any other
+            // deterministic error (programming/config bug) still fails loudly.
+            // A 403 is transient only with rate-limit evidence: GitHub also
+            // uses 403 for deterministic permission/config denials (missing
+            // scope, private-repo denial, SSO enforcement), which must fail
+            // loudly instead of hiding as skipped cleanup.
+            function isHousekeepingRateLimit403(err) {
+              const message = [
+                err?.message,
+                err?.response?.data?.message,
+                typeof err?.response?.data === 'string'
+                  ? err.response.data
+                  : '',
+              ]
+                .filter(value => typeof value === 'string' && value.length > 0)
+                .join('\n')
+                .toLowerCase();
+              if (/rate[\s_-]*limit|secondary|abuse/.test(message)) {
+                return true;
+              }
+              const rawHeaders =
+                err?.response?.headers ?? err?.headers ?? null;
+              if (rawHeaders && typeof rawHeaders === 'object') {
+                const headers = {};
+                for (const [key, value] of Object.entries(rawHeaders)) {
+                  headers[String(key).toLowerCase()] =
+                    String(value).toLowerCase().trim();
+                }
+                if ('retry-after' in headers) return true;
+                if (headers['x-ratelimit-remaining'] === '0') return true;
+              }
+              return false;
+            }
+
+            function isHousekeepingTransientError(err) {
+              const status = housekeepingStatus(err);
+              if (status === 429) return true;
+              if (status === 403) return isHousekeepingRateLimit403(err);
+              if ([500, 502, 503, 504].includes(status)) return true;
+              return false;
+            }
+
+            // Downstream wake-ups after a merge are consumer-owned. The fork
+            // auto-merger woke `knowledge-sync.yml` (which has no core
+            // equivalent at all) and re-woke the issue scheduler, so the list
+            // is configuration and is empty unless the consumer sets it:
+            // dispatching a workflow the repository does not own is a 404 and
+            // would fail a run that did nothing wrong.
+            const postMergeWakeups = String(process.env.POST_MERGE_WAKEUPS || '')
+              .split(',')
+              .map(name => name.trim())
+              .filter(name => name.length > 0);
+            const postMergeWakeupRef = String(
+              process.env.POST_MERGE_WAKEUP_REF || ''
+            ).trim();
+
+            async function ensureLabel(name, color, description) {
+              try {
+                await github.rest.issues.createLabel({
+                  owner, repo, name, color, description,
+                });
+              } catch (err) {
+                if (err.status !== 422) throw err; // label already exists
+              }
+            }
+
+            await ensureLabel(
+              AUTO_MERGE_BLOCK_LABEL,
+              'B60205',
+              'Do not automatically merge this pull request.'
+            );
+            await ensureLabel(
+              CONFLICT_LOCK_LABEL,
+              'B60205',
+              'One automatic OpenCode conflict-repair attempt per conflict episode.'
+            );
+
+            if (requiredWorkflowGateLabel) {
+              await ensureLabel(
+                requiredWorkflowGateLabel,
+                '0E8A16',
+                'Required additional workflow gate.'
+              );
+            }
+
+            function hasLabel(pr, name) {
+              return (pr.labels || []).some(label => label.name === name);
+            }
+
+            async function getPull(pullNumber) {
+              const { data } = await withReadFallback(client =>
+                client.rest.pulls.get({
+                  owner, repo, pull_number: pullNumber,
+                })
+              );
+              return data;
+            }
+
+            async function withAuthoritativeHead(pr) {
+              if (!pr?.head?.ref) {
+                return pr;
+              }
+              const headRepoFullName = pr.head.repo?.full_name;
+              if (headRepoFullName && headRepoFullName !== repoFullName) {
+                return pr;
+              }
+              const { data: ref } = await withReadFallback(client =>
+                client.rest.git.getRef({
+                  owner,
+                  repo,
+                  ref: `heads/${pr.head.ref}`,
+                })
+              );
+              const refSha = ref?.object?.sha;
+              if (!refSha || refSha === pr.head.sha) {
+                return pr;
+              }
+              core.notice(
+                `PR #${pr.number}: pull metadata HEAD ${pr.head.sha} lags authoritative branch ref ${refSha}; reconciling the branch ref.`
+              );
+              return {
+                ...pr,
+                head: {
+                  ...pr.head,
+                  sha: refSha,
+                },
+              };
+            }
+
+            async function getPullWithAuthoritativeHead(pullNumber) {
+              return withAuthoritativeHead(await getPull(pullNumber));
+            }
+
+            async function compareWithMain(headSha) {
+              const { data } = await withReadFallback(client =>
+                client.request(
+                  'GET /repos/{owner}/{repo}/compare/{basehead}',
+                  {
+                    owner,
+                    repo,
+                    basehead: `main...${headSha}`,
+                  }
+                )
+              );
+              return data;
+            }
+
+            function isNonMergeCriticalMainPath(path) {
+              // Continuum caller pins are executable control-plane code. A
+              // consumer that advances its pinned Continuum revision must
+              // synchronize open PRs so their CI/review/repair semantics are
+              // evaluated against that exact revision as well.
+              if (path.startsWith('.github/workflows/continuum-')) {
+                return false;
+              }
+              return (
+                path === 'LICENSE' ||
+                path === '.gitignore' ||
+                path === '.release-please-manifest.json' ||
+                path === 'CHANGELOG.md' ||
+                path.endsWith('.md') ||
+                path.startsWith('docs/') ||
+                path.startsWith('.github/')
+              );
+            }
+
+            async function mainDeltaSincePrHead(headSha) {
+              const { data } = await withReadFallback(client =>
+                client.request(
+                  'GET /repos/{owner}/{repo}/compare/{basehead}',
+                  {
+                    owner,
+                    repo,
+                    // Reverse the normal PR comparison on purpose. GitHub uses
+                    // the merge base, so this side contains only commits/files
+                    // that advanced main since the PR diverged.
+                    basehead: `${headSha}...main`,
+                  }
+                )
+              );
+
+              const files = (data.files || []).map(file => file.filename);
+              const criticalFiles = files.filter(
+                path => !isNonMergeCriticalMainPath(path)
+              );
+
+              return {
+                files,
+                criticalFiles,
+                onlyNonCritical:
+                  files.length > 0 && criticalFiles.length === 0,
+              };
+            }
+
+            async function shouldSyncFromMain(pr, comparison) {
+              if (comparison.behind_by <= 0) {
+                return {
+                  required: false,
+                  reason: 'up-to-date',
+                  files: [],
+                  criticalFiles: [],
+                };
+              }
+
+              const delta = await mainDeltaSincePrHead(pr.head.sha);
+              if (delta.onlyNonCritical) {
+                return {
+                  required: false,
+                  reason: 'non-merge-critical-main-delta',
+                  ...delta,
+                };
+              }
+
+              // Be conservative if GitHub cannot provide a useful file list:
+              // an unknown main delta must never silently bypass integration
+              // validation.
+              return {
+                required: true,
+                reason:
+                  delta.files.length === 0
+                    ? 'unknown-main-delta'
+                    : 'merge-critical-main-delta',
+                ...delta,
+              };
+            }
+
+            async function latestWorkflowForHead(pr, headSha, workflowName) {
+              // Same-repository merge-gate evidence reads use the
+              // repository token via withReadFallback instead of TAP_PAT.
+              // Mutations below stay PAT-backed.
+              const runs = await withReadFallback(client =>
+                client.paginate(
+                  client.rest.actions.listWorkflowRunsForRepo,
+                  {
+                    owner,
+                    repo,
+                    branch: pr.head.ref,
+                    event: 'pull_request',
+                    per_page: 100,
+                  }
+                )
+              );
+
+              return runs
+                .filter(run =>
+                  run.name === workflowName &&
+                  run.head_sha === headSha
+                )
+                .sort(
+                  (a, b) =>
+                    new Date(b.created_at).getTime() -
+                    new Date(a.created_at).getTime()
+                )[0] || null;
+            }
+
+            async function latestCiForHead(pr, headSha) {
+              return latestWorkflowForHead(pr, headSha, 'CI');
+            }
+
+            async function latestCurrentHeadCi(pr) {
+              return latestCiForHead(pr, pr.head.sha);
+            }
+
+            async function latestContinuumContractGate(pr, headSha = pr.head.sha) {
+              if (repoFullName !== 'kodmial/continuum') return null;
+              return latestWorkflowForHead(
+                pr,
+                headSha,
+                'Continuum Contract Gate'
+              );
+            }
+
+            async function latestCurrentHeadPackagingSmoke(pr) {
+              return latestWorkflowForHead(pr, pr.head.sha, 'Packaging smoke');
+            }
+
+            // Contract qualification (kodmial/continuum#286) validates
+            // changes to Continuum itself: its runner executes Continuum's
+            // own contract suite. Consumer/Child repositories must never be
+            // blocked on or asked to execute this Continuum-only workflow.
+            async function latestCurrentHeadContractQualification(pr) {
+              if (repoFullName !== 'kodmial/continuum') return null;
+              return latestWorkflowForHead(pr, pr.head.sha, 'Contract qualification');
+            }
+
+            async function requiredWorkflowGate(pr, headSha = pr.head.sha) {
+              if (
+                !requiredWorkflowGateLabel ||
+                !requiredWorkflowGateName ||
+                !hasLabel(pr, requiredWorkflowGateLabel)
+              ) {
+                return null;
+              }
+              return latestWorkflowForHead(
+                pr,
+                headSha,
+                requiredWorkflowGateName
+              );
+            }
+
+            async function latestCodeRabbitStatus(headSha) {
+              const { data } = await withReadFallback(client =>
+                client.rest.repos.getCombinedStatusForRef({
+                  owner, repo, ref: headSha,
+                })
+              );
+
+              return (data.statuses || [])
+                .filter(status => status.context === 'CodeRabbit')
+                .sort(
+                  (a, b) =>
+                    new Date(b.updated_at || b.created_at).getTime() -
+                    new Date(a.updated_at || a.created_at).getTime()
+                )[0] || null;
+            }
+
+            // A running PR-Agent review/repair is a live Work Lock on this
+            // exact source HEAD. An automatic main-sync during the agent run
+            // discards minutes of valid repair work; do not mutate that branch
+            // until its authoritative GitHub Actions run finishes.
+            // Pending statuses are not permanent locks: validate the linked
+            // run's live status so a crashed/completed old run cannot strand
+            // the queue. Only invoked when a merge-critical sync is required.
+            async function activePrAgentHeadOperation(pr) {
+              const { data } = await withReadFallback(client =>
+                client.rest.repos.getCombinedStatusForRef({
+                  owner, repo, ref: pr.head.sha,
+                })
+              );
+              const contexts = new Set([
+                'continuum/pr-agent-review',
+                'continuum/pr-agent-repair',
+              ]);
+              const latestByContext = new Map();
+              for (const status of data.statuses || []) {
+                if (!contexts.has(status.context)) continue;
+                const earlier = latestByContext.get(status.context);
+                if (!earlier ||
+                    new Date(status.updated_at || status.created_at || 0).getTime() >
+                    new Date(earlier.updated_at || earlier.created_at || 0).getTime() ||
+                    ((status.updated_at || status.created_at) === (earlier.updated_at || earlier.created_at) &&
+                     Number(status.id || 0) > Number(earlier.id || 0))) {
+                  latestByContext.set(status.context, status);
+                }
+              }
+              for (const status of latestByContext.values()) {
+                if (status.state !== 'pending') continue;
+                const runRef = String(status.target_url || '').match(
+                  /^https:\/\/github\.com\/([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+)\/actions\/runs\/([0-9]+)(?:\/.*)?$/
+                );
+                if (!runRef) {
+                  core.warning(
+                    `PR #${pr.number}: pending ${status.context} has no verifiable run URL; holding main sync rather than racing an unknown repair.`
+                  );
+                  return { active: true, reason: `unverifiable ${status.context} run` };
+                }
+                const { data: run } = await withReadFallback(client =>
+                  client.rest.actions.getWorkflowRun({
+                    owner: runRef[1], repo: runRef[2], run_id: Number(runRef[3]),
+                  })
+                );
+                if (ACTIVE_REPAIR_STATUSES.has(String(run.status || '').toLowerCase())) {
+                  return { active: true, reason: `${status.context} run ${run.id || runRef[3]} is ${run.status}` };
+                }
+                // An old pending commit status whose run finished is not a
+                // lease; normal exact-HEAD CI and reviewer gates still apply.
+              }
+              return { active: false, reason: '' };
+            }
+
+            async function codeRabbitNoProgressBlocked(pr, headSha) {
+              const comments = await withReadFallback(client =>
+                client.paginate(
+                  client.rest.issues.listComments,
+                  {
+                    owner,
+                    repo,
+                    issue_number: pr.number,
+                    per_page: 100,
+                  }
+                )
+              );
+              const markerPrefix =
+                `<!-- continuum-coderabbit-no-progress head=${headSha} `;
+              const markers = comments
+                .filter(comment => {
+                  const login = comment.user?.login || '';
+                  const trusted =
+                    login === 'github-actions[bot]' || login === owner;
+                  return trusted &&
+                    (comment.body || '').includes(markerPrefix);
+                })
+                .sort(
+                  (a, b) =>
+                    new Date(b.created_at || 0).getTime() -
+                    new Date(a.created_at || 0).getTime()
+                );
+              const marker = markers[0] || null;
+              if (!marker) return false;
+
+              const decision = await latestCodeRabbitDecision(pr, headSha);
+              if (
+                decision?.state === 'APPROVED' &&
+                new Date(decision.submitted_at || 0).getTime() >
+                  new Date(marker.created_at || 0).getTime()
+              ) {
+                return false;
+              }
+              // Summary-only CHANGES_REQUESTED is not a terminal state.
+              // The serialized CodeRabbit queue owns cooldown and re-review.
+              return false;
+            }
+
+            function retryWindowText(body = '') {
+              const patterns = [
+                /next\s+(?:included\s+)?review\b[^\n<.]{0,120}?\bavailable\b[^\n<.]{0,40}?\b(?:in|after)\s+([^\n<.]+)/i,
+                /(?:try|retry)\s+again\b[^\n<.]{0,40}?\b(?:in|after)\s+([^\n<.]+)/i,
+              ];
+              for (const pattern of patterns) {
+                const match = body.match(pattern);
+                if (match) return match[1];
+              }
+              return null;
+            }
+
+            function parseDurationMs(text = '') {
+              if (/less than\s+(?:a|one)\s+minute/i.test(text)) {
+                return 60_000;
+              }
+
+              let totalMs = 0;
+              let found = false;
+              for (const part of text.matchAll(
+                /(\d+)\s*(hours?|hrs?|minutes?|mins?|seconds?|secs?)/gi
+              )) {
+                found = true;
+                const value = Number(part[1]);
+                const unit = part[2].toLowerCase();
+                if (unit.startsWith('hour') || unit.startsWith('hr')) {
+                  totalMs += value * 60 * 60_000;
+                } else if (unit.startsWith('minute') || unit.startsWith('min')) {
+                  totalMs += value * 60_000;
+                } else {
+                  totalMs += value * 1_000;
+                }
+              }
+              return found ? totalMs : null;
+            }
+
+            function parseCodeRabbitRetryDelayMs(body = '') {
+              const windowText = retryWindowText(body);
+              const parsed = windowText === null
+                ? null
+                : parseDurationMs(windowText);
+              if (parsed !== null) return parsed;
+
+              if (/Review rate limited|Review limit reached/i.test(body)) {
+                core.warning(
+                  'Could not parse CodeRabbit quota countdown; using 65-minute fallback.'
+                );
+                return 65 * 60_000;
+              }
+              return null;
+            }
+
+            const retryParserCases = [
+              [
+                'Review rate limited. Next included review available in 13 minutes.',
+                13 * 60_000,
+              ],
+              [
+                'Review rate limited. Your next included review will be available in 13 minutes.',
+                13 * 60_000,
+              ],
+              [
+                'Review limit reached. Your next review is available after 1 hour 5 minutes.',
+                65 * 60_000,
+              ],
+              [
+                'Review rate limited. Try again in less than a minute.',
+                60_000,
+              ],
+            ];
+            for (const [sample, expected] of retryParserCases) {
+              const actual = parseCodeRabbitRetryDelayMs(sample);
+              if (actual !== expected) {
+                throw new Error(
+                  `CodeRabbit retry parser regression: expected ${expected}, got ${actual} for "${sample}"`
+                );
+              }
+            }
+
+            function latestCodeRabbitRateLimit(comments) {
+              return comments
+                .filter(comment => comment.user?.login === 'coderabbitai[bot]')
+                .map(comment => {
+                  const delayMs = parseCodeRabbitRetryDelayMs(comment.body || '');
+                  return delayMs === null ? null : { comment, delayMs };
+                })
+                .filter(Boolean)
+                .sort(
+                  (a, b) =>
+                    new Date(b.comment.updated_at).getTime() -
+                    new Date(a.comment.updated_at).getTime()
+                )[0] || null;
+            }
+
+            function reviewCommandPostedAfter(comments, timestamp) {
+              return comments.some(comment =>
+                comment.user?.login !== 'coderabbitai[bot]' &&
+                /^@coderabbitai\s+(?:full\s+)?review\s*$/i.test(
+                  comment.body?.trim() || ''
+                ) &&
+                new Date(comment.created_at).getTime() > timestamp
+              );
+            }
+
+            async function retryRateLimitedCodeRabbit(pr, ci, rabbitStatus) {
+              if (!/Review rate limited|Review limit reached/i.test(
+                rabbitStatus?.description || ''
+              )) {
+                return false;
+              }
+
+              let comments = await withReadFallback(client =>
+                client.paginate(
+                  client.rest.issues.listComments,
+                  {
+                    owner,
+                    repo,
+                    issue_number: pr.number,
+                    per_page: 100,
+                  }
+                )
+              );
+
+              const limited = latestCodeRabbitRateLimit(comments);
+              if (!limited) {
+                core.info(
+                  `PR #${pr.number}: CodeRabbit status is rate-limited but no rate-limit comment with retry timing was found.`
+                );
+                return false;
+              }
+
+              const limitedAt =
+                new Date(limited.comment.updated_at).getTime();
+              const dueAt = limitedAt + limited.delayMs + 30_000;
+              if (Date.now() < dueAt) {
+                core.info(
+                  `PR #${pr.number}: CodeRabbit retry is not due yet; waiting until ${new Date(dueAt).toISOString()}.`
+                );
+                return false;
+              }
+
+              if (reviewCommandPostedAfter(comments, limitedAt)) {
+                core.info(
+                  `PR #${pr.number}: a CodeRabbit review command was already posted after the latest rate-limit response.`
+                );
+                return false;
+              }
+
+              const fresh = await getPull(pr.number);
+              if (
+                fresh.state !== 'open' ||
+                fresh.draft ||
+                fresh.head.sha !== pr.head.sha ||
+                fresh.head.repo?.full_name !== repoFullName
+              ) {
+                core.info(
+                  `PR #${pr.number}: PR/head changed before CodeRabbit retry; cancelling retry.`
+                );
+                return false;
+              }
+
+              const freshCi = await latestCurrentHeadCi(fresh);
+              if (
+                !freshCi ||
+                freshCi.status !== 'completed' ||
+                freshCi.conclusion !== 'success' ||
+                freshCi.id !== ci.id
+              ) {
+                core.info(
+                  `PR #${pr.number}: current-head CI changed before CodeRabbit retry; cancelling retry.`
+                );
+                return false;
+              }
+
+              const freshStatus = await latestCodeRabbitStatus(fresh.head.sha);
+              if (
+                !freshStatus ||
+                !/Review rate limited|Review limit reached/i.test(
+                  freshStatus.description || ''
+                )
+              ) {
+                core.info(
+                  `PR #${pr.number}: CodeRabbit status changed before retry; cancelling retry.`
+                );
+                return false;
+              }
+
+              comments = await withReadFallback(client =>
+                client.paginate(
+                  client.rest.issues.listComments,
+                  {
+                    owner,
+                    repo,
+                    issue_number: fresh.number,
+                    per_page: 100,
+                  }
+                )
+              );
+
+              const freshLimited = latestCodeRabbitRateLimit(comments);
+              if (
+                !freshLimited ||
+                freshLimited.comment.id !== limited.comment.id ||
+                freshLimited.comment.updated_at !== limited.comment.updated_at ||
+                reviewCommandPostedAfter(comments, limitedAt)
+              ) {
+                core.info(
+                  `PR #${pr.number}: CodeRabbit rate-limit state changed during retry evaluation.`
+                );
+                return false;
+              }
+
+              await github.rest.issues.createComment({
+                owner,
+                repo,
+                issue_number: fresh.number,
+                // Continuum comment attribution (kodmial/continuum#258): the
+                // @coderabbitai command stays first so the review request
+                // still triggers; the header is the first rendered line.
+                body: '@coderabbitai full review\n\n⚡ **Continuum · auto-merge**\n<!-- continuum-origin role=continuum component=auto-merge -->',
+              });
+              core.notice(
+                `PR #${pr.number}: retried full CodeRabbit review after the rate-limit window expired.`
+              );
+              return true;
+            }
+
+            async function latestCodeRabbitDecision(pr, headSha = pr.head.sha) {
+              // Same-repository review reads use the repository token
+              // instead of TAP_PAT.
+              const reviews = await withReadFallback(client =>
+                client.paginate(
+                  client.rest.pulls.listReviews,
+                  {
+                    owner,
+                    repo,
+                    pull_number: pr.number,
+                    per_page: 100,
+                  }
+                )
+              );
+
+              return reviews
+                .filter(review =>
+                  review.user?.login?.startsWith('coderabbitai') &&
+                  review.commit_id === headSha &&
+                  (review.state === 'APPROVED' ||
+                   review.state === 'CHANGES_REQUESTED')
+                )
+                .sort((a, b) => {
+                  const time =
+                    new Date(a.submitted_at || 0).getTime() -
+                    new Date(b.submitted_at || 0).getTime();
+                  return time || Number(a.id) - Number(b.id);
+                })
+                .at(-1) || null;
+            }
+
+            async function codeRabbitNitpickReviews(pr, headSha = pr.head.sha) {
+              // Same-repository review reads use the repository token
+              // instead of TAP_PAT.
+              const reviews = await withReadFallback(client =>
+                client.paginate(
+                  client.rest.pulls.listReviews,
+                  {
+                    owner,
+                    repo,
+                    pull_number: pr.number,
+                    per_page: 100,
+                  }
+                )
+              );
+
+              const headReviews = reviews.filter(review =>
+                review.user?.login?.startsWith('coderabbitai') &&
+                review.commit_id === headSha
+              );
+
+              // A later decisive CodeRabbit review supersedes earlier advisory
+              // nitpick-only COMMENTED reviews on the exact same head. Without
+              // this, an APPROVED review can never clear an older nitpick review
+              // because GitHub keeps both review records forever.
+              const latestDecision = headReviews
+                .filter(review =>
+                  review.state === 'APPROVED' ||
+                  review.state === 'CHANGES_REQUESTED'
+                )
+                .sort((a, b) => {
+                  const time =
+                    new Date(a.submitted_at || 0).getTime() -
+                    new Date(b.submitted_at || 0).getTime();
+                  return time || Number(a.id) - Number(b.id);
+                })
+                .at(-1) || null;
+              const decisionAt = latestDecision
+                ? new Date(latestDecision.submitted_at || 0).getTime()
+                : 0;
+
+              return headReviews.filter(review =>
+                review.state === 'COMMENTED' &&
+                /comments?\s*\(\s*[1-9]\d*\s*\)/i.test(review.body || '') &&
+                (
+                  !latestDecision ||
+                  new Date(review.submitted_at || 0).getTime() > decisionAt
+                )
+              );
+            }
+
+            async function directCodeRabbitReviewBasis(pr, headSha) {
+              const [ci, decision] = await Promise.all([
+                latestCiForHead(pr, headSha),
+                latestCodeRabbitDecision(pr, headSha),
+              ]);
+
+              if (
+                !ci ||
+                ci.status !== 'completed' ||
+                ci.conclusion !== 'success' ||
+                !decision ||
+                decision.state !== 'APPROVED'
+              ) {
+                return null;
+              }
+
+              const nitpicks = await codeRabbitNitpickReviews(pr, headSha);
+              if (nitpicks.length !== 0) {
+                return null;
+              }
+
+              // Bind both gates to the exact same immutable head SHA. Their
+              // relative timestamps do not add safety: a later CI rerun does not
+              // change the reviewed code. CodeRabbit's commit status is kept for
+              // operational state/rate-limit recovery, but it is not merge
+              // evidence because auto-review-disabled events can overwrite a
+              // prior "Review completed" status with "Review skipped".
+              return {
+                sourceSha: headSha,
+                carried: false,
+                decision,
+              };
+            }
+
+            // Shipped CodeRabbit gate wait condition. A missing review basis
+            // waits unless the commit status proves a finished review; the
+            // status is operational state only, never merge evidence, because
+            // auto-review-disabled events can overwrite a finished status
+            // with a skipped one without changing any review record.
+            function waitingForCompletedCodeRabbitReview(reviewBasis, rabbitStatus) {
+              return (
+                !reviewBasis &&
+                (
+                  !rabbitStatus ||
+                  rabbitStatus.state !== 'success' ||
+                  !/Review completed/i.test(rabbitStatus.description || '')
+                )
+              );
+            }
+
+            async function carriedCodeRabbitReviewBasis(pr, headSha) {
+              const { data: commit } = await withReadFallback(client =>
+                client.rest.repos.getCommit({
+                  owner,
+                  repo,
+                  ref: headSha,
+                })
+              );
+              const parents = (commit.parents || []).map(parent =>
+                parent.sha.toLowerCase()
+              );
+              if (parents.length !== 2) return null;
+
+              const comments = await withReadFallback(client =>
+                client.paginate(
+                  client.rest.issues.listComments,
+                  {
+                    owner,
+                    repo,
+                    issue_number: pr.number,
+                    per_page: 100,
+                  }
+                )
+              );
+
+              const markerPattern =
+                /<!-- auto-main-sync head=([0-9a-f]{40}) from=([0-9a-f]{40}) main=([0-9a-f]{40}) carry=([0-9a-f]{40}) -->/i;
+
+              const marker = comments
+                .filter(comment => comment.user?.login === owner)
+                .map(comment => {
+                  const match = (comment.body || '').match(markerPattern);
+                  if (!match) return null;
+                  return {
+                    head: match[1].toLowerCase(),
+                    from: match[2].toLowerCase(),
+                    main: match[3].toLowerCase(),
+                    carry: match[4].toLowerCase(),
+                    createdAt: new Date(comment.created_at || 0).getTime(),
+                  };
+                })
+                .filter(Boolean)
+                .filter(item => item.head === headSha.toLowerCase())
+                .sort((a, b) => b.createdAt - a.createdAt)[0];
+
+              if (!marker) return null;
+
+              const parentSet = new Set(parents);
+              if (
+                !parentSet.has(marker.from) ||
+                !parentSet.has(marker.main)
+              ) {
+                return null;
+              }
+
+              const source = await directCodeRabbitReviewBasis(
+                pr,
+                marker.carry
+              );
+              if (!source) return null;
+
+              return {
+                ...source,
+                carried: true,
+                syncedHead: headSha,
+                fromHead: marker.from,
+                mainHead: marker.main,
+              };
+            }
+
+            async function cleanNoProgressCodeRabbitReviewBasis(pr, headSha) {
+              const [ci, decision, rabbitStatus, comments] = await Promise.all([
+                latestCiForHead(pr, headSha),
+                latestCodeRabbitDecision(pr, headSha),
+                latestCodeRabbitStatus(headSha),
+                withReadFallback(client =>
+                  client.paginate(
+                    client.rest.issues.listComments,
+                    {
+                      owner,
+                      repo,
+                      issue_number: pr.number,
+                      per_page: 100,
+                    }
+                  )
+                ),
+              ]);
+
+              if (
+                !ci ||
+                ci.status !== 'completed' ||
+                ci.conclusion !== 'success' ||
+                !decision ||
+                decision.state !== 'CHANGES_REQUESTED' ||
+                !rabbitStatus ||
+                rabbitStatus.state !== 'success' ||
+                !/Review completed/i.test(rabbitStatus.description || '')
+              ) {
+                return null;
+              }
+
+              const markerPattern = new RegExp(
+                `<!-- continuum-coderabbit-no-progress head=${headSha} review=(\\d+) kind=non-code -->`,
+                'i'
+              );
+              const marker = comments
+                .filter(comment => {
+                  const login = comment.user?.login || '';
+                  return login === 'github-actions[bot]' || login === owner;
+                })
+                .map(comment => {
+                  const match = (comment.body || '').match(markerPattern);
+                  if (!match) return null;
+                  return {
+                    reviewId: Number(match[1]),
+                    at: new Date(comment.created_at || 0).getTime(),
+                  };
+                })
+                .filter(Boolean)
+                .sort((a, b) => b.at - a.at)[0] || null;
+              if (!marker || Number(decision.id) !== marker.reviewId) {
+                return null;
+              }
+
+              const commandMarker =
+                `<!-- continuum-coderabbit-command head=${headSha} -->`;
+              const command = comments
+                .filter(comment =>
+                  comment.user?.login !== 'coderabbitai[bot]' &&
+                  /^@coderabbitai\\s+(?:full\\s+)?review/m.test(comment.body || '') &&
+                  (comment.body || '').includes(commandMarker) &&
+                  new Date(comment.created_at || 0).getTime() > marker.at
+                )
+                .sort(
+                  (a, b) =>
+                    new Date(b.created_at || 0).getTime() -
+                    new Date(a.created_at || 0).getTime()
+                )[0] || null;
+              if (!command) return null;
+
+              const commandAt = new Date(command.created_at || 0).getTime();
+              const completion = comments
+                .filter(comment =>
+                  comment.user?.login === 'coderabbitai[bot]' &&
+                  /Action performed/i.test(comment.body || '') &&
+                  /Full review finished/i.test(comment.body || '') &&
+                  new Date(comment.updated_at || comment.created_at || 0).getTime() >
+                    commandAt
+                )
+                .sort(
+                  (a, b) =>
+                    new Date(b.updated_at || b.created_at || 0).getTime() -
+                    new Date(a.updated_at || a.created_at || 0).getTime()
+                )[0] || null;
+              if (!completion) return null;
+
+              const completionAt =
+                new Date(completion.updated_at || completion.created_at || 0).getTime();
+              const statusAt =
+                new Date(rabbitStatus.updated_at || rabbitStatus.created_at || 0).getTime();
+              // CodeRabbit publishes status and completion reply independently;
+              // either timestamp may win by a second. Both must postdate the
+              // exact-HEAD command, but ordering them against each other would
+              // create a false permanent block.
+              if (
+                !Number.isFinite(completionAt) ||
+                !Number.isFinite(statusAt) ||
+                completionAt < commandAt ||
+                statusAt < commandAt
+              ) return null;
+
+              // A later decisive review supersedes this evidence. In particular,
+              // never reinterpret a new CHANGES_REQUESTED as clean convergence.
+              const latestDecisionAt =
+                new Date(decision.submitted_at || 0).getTime();
+              if (latestDecisionAt > marker.at) return null;
+
+              const nitpicks = await codeRabbitNitpickReviews(pr, headSha);
+              if (nitpicks.length !== 0) return null;
+
+              return {
+                sourceSha: headSha,
+                carried: false,
+                decision,
+                convergedNoProgress: true,
+                completedAt: completionAt,
+              };
+            }
+
+            async function codeRabbitReviewBasis(pr, headSha = pr.head.sha) {
+              const direct = await directCodeRabbitReviewBasis(pr, headSha);
+              if (direct) return direct;
+              const converged =
+                await cleanNoProgressCodeRabbitReviewBasis(pr, headSha);
+              if (converged) return converged;
+              return carriedCodeRabbitReviewBasis(pr, headSha);
+            }
+
+            function codeRabbitExplicitlyResolved(body = '') {
+              if (/\bUNRESOLVED\b/i.test(body)) return false;
+              return (
+                /\*\*RESOLVED(?:\.|\*\*)/i.test(body) ||
+                /✅\s*Review thread resolved\.?/i.test(body)
+              );
+            }
+
+            async function unresolvedCodeRabbitThreads(pr) {
+              const unresolved = [];
+              let cursor = null;
+
+              do {
+                // Same-repository review-thread reads use the repository
+                // token instead of TAP_PAT. The resolveReviewThread
+                // mutation below stays PAT-backed.
+                const data = await withReadFallback(client =>
+                  client.graphql(
+                    `query($owner: String!, $repo: String!, $number: Int!, $cursor: String) {
+                    repository(owner: $owner, name: $repo) {
+                      pullRequest(number: $number) {
+                        reviewThreads(first: 100, after: $cursor) {
+                          nodes {
+                            id
+                            isResolved
+                            isOutdated
+                            path
+                            comments(first: 100) {
+                              nodes {
+                                databaseId
+                                body
+                                author { login }
+                              }
+                            }
+                          }
+                          pageInfo {
+                            hasNextPage
+                            endCursor
+                          }
+                        }
+                      }
+                    }
+                  }`,
+                    {
+                      owner,
+                      repo,
+                      number: pr.number,
+                      cursor,
+                    }
+                  )
+                );
+
+                const connection =
+                  data.repository.pullRequest.reviewThreads;
+                for (const thread of connection.nodes || []) {
+                  const comments = thread.comments?.nodes || [];
+                  const root = comments[0];
+                  if (!root?.author?.login?.startsWith('coderabbitai')) {
+                    continue;
+                  }
+
+                  if (thread.isResolved) {
+                    continue;
+                  }
+
+                  // CodeRabbit can explicitly answer RESOLVED without flipping
+                  // GitHub's review-thread isResolved bit. Treat the bot's latest
+                  // reply as the semantic verdict and normalize GitHub state with
+                  // our own write-capable token. UNRESOLVED always wins.
+                  const latestRabbitReply = comments
+                    .slice(1)
+                    .filter(comment =>
+                      comment.author?.login?.startsWith('coderabbitai')
+                    )
+                    .at(-1);
+                  if (
+                    latestRabbitReply &&
+                    codeRabbitExplicitlyResolved(latestRabbitReply.body || '')
+                  ) {
+                    try {
+                      await github.graphql(
+                        `mutation($threadId: ID!) {
+                          resolveReviewThread(input: {threadId: $threadId}) {
+                            thread { id isResolved }
+                          }
+                        }`,
+                        { threadId: thread.id }
+                      );
+                      core.notice(
+                        `PR #${pr.number}: normalized CodeRabbit RESOLVED reply into GitHub thread resolution for ${thread.id} (${thread.path}).`
+                      );
+                      continue;
+                    } catch (err) {
+                      core.warning(
+                        `PR #${pr.number}: CodeRabbit marked ${thread.id} resolved, but GitHub thread resolution failed: ${err.message}`
+                      );
+                    }
+                  }
+
+                  unresolved.push({
+                    id: thread.id,
+                    commentId: root.databaseId,
+                    path: thread.path,
+                    outdated: thread.isOutdated,
+                  });
+                }
+
+                cursor = connection.pageInfo.hasNextPage
+                  ? connection.pageInfo.endCursor
+                  : null;
+              } while (cursor);
+
+              return unresolved;
+            }
+
+            async function requestCodeRabbitThreadVerification(pr, threads) {
+              if (!threads.length) return 0;
+
+              const comments = await withReadFallback(client =>
+                client.paginate(
+                  client.rest.pulls.listReviewComments,
+                  {
+                    owner,
+                    repo,
+                    pull_number: pr.number,
+                    per_page: 100,
+                  }
+                )
+              );
+
+              let requested = 0;
+              let repairReconciliationDispatched = false;
+              for (const thread of threads) {
+                if (!thread.commentId) continue;
+
+                const marker =
+                  `<!-- auto-merge-coderabbit-verification finding=${thread.commentId} head=${pr.head.sha} -->`;
+
+                const verificationRequests = comments
+                  .filter(comment =>
+                    comment.in_reply_to_id === thread.commentId &&
+                    comment.body?.includes(marker)
+                  )
+                  .sort(
+                    (a, b) =>
+                      new Date(b.created_at || 0).getTime() -
+                      new Date(a.created_at || 0).getTime()
+                  );
+                const latestVerification = verificationRequests[0] || null;
+                if (latestVerification) {
+                  const verificationAt =
+                    new Date(latestVerification.created_at || 0).getTime();
+                  // CodeRabbit often answers with "the finding remains
+                  // valid" rather than the literal word UNRESOLVED. Such a
+                  // reply completes verification, and the still-unresolved
+                  // GitHub thread must be forwarded to the canonical batcher.
+                  // Never keep asking the provider the same question.
+                  const latestAnswer = comments
+                    .filter(comment =>
+                      comment.in_reply_to_id === thread.commentId &&
+                      comment.user?.login?.startsWith('coderabbitai') &&
+                      Number(comment.id) > Number(latestVerification.id) &&
+                      !/Review rate limited|Review limit reached/i.test(comment.body || '')
+                    )
+                    .sort((a, b) => Number(b.id) - Number(a.id))[0] || null;
+                  if (latestAnswer) {
+                    if (!repairReconciliationDispatched &&
+                        !codeRabbitExplicitlyResolved(latestAnswer.body || '')) {
+                      // The event-driven CodeRabbit batcher normally handles
+                      // this reply. A scheduled reconciliation also wakes the
+                      // batcher when that event was lost or the old keyword
+                      // filter discarded the actual bot response.
+                      const answeredAt = String(latestAnswer.created_at || '');
+                      const laterBatches = await withReadFallback(client =>
+                        client.paginate(client.rest.issues.listComments, {
+                          owner, repo, issue_number: pr.number,
+                          per_page: 100, since: answeredAt,
+                        })
+                      );
+                      // Queuing is not completion: an OpenCode run may
+                      // succeed after skipping the actual repair. A recent
+                      // enqueue is an in-flight lease only, not a permanent
+                      // proof that the review finding was fixed. The canonical
+                      // batcher below owns dedupe, runner activity checks and
+                      // exponential infrastructure backoff.
+                      const latestBatch = laterBatches
+                        .filter(comment =>
+                          (comment.body || '').includes(
+                            `<!-- continuum-coderabbit-batch head=${pr.head.sha} `
+                          )
+                        )
+                        .sort((a, b) => Number(b.id) - Number(a.id))[0];
+                      const batchAt = latestBatch
+                        ? Date.parse(latestBatch.created_at || '') : 0;
+                      const recentBatchLease = !!latestBatch &&
+                        (!Number.isFinite(batchAt) ||
+                         Date.now() - batchAt < 10 * 60_000);
+                      if (requireCodeRabbit && !recentBatchLease) {
+                        // Older installed consumers may not yet support a
+                        // workflow_dispatch PR identity. Do not turn that
+                        // compatibility gap into an auto-merge failure.
+                        const source = await withReadFallback(client =>
+                          client.rest.repos.getContent({
+                            owner, repo,
+                            path: `.github/workflows/${codeRabbitUnresolvedWorkflow}`,
+                            ref: context.payload.repository?.default_branch || 'main',
+                          })
+                        );
+                        const callerText = source?.data?.type === 'file' &&
+                          typeof source.data.content === 'string'
+                          ? Buffer.from(source.data.content, 'base64').toString('utf8')
+                          : '';
+                        if (/^  workflow_dispatch:/m.test(callerText) &&
+                            /^      pr_number:/m.test(callerText)) {
+                          const currentPr = await withReadFallback(client =>
+                            client.rest.pulls.get({
+                              owner, repo, pull_number: pr.number,
+                            })
+                          );
+                          if (currentPr.data.state === 'open' &&
+                              currentPr.data.head.sha === pr.head.sha) {
+                            await github.rest.actions.createWorkflowDispatch({
+                              owner, repo,
+                              workflow_id: codeRabbitUnresolvedWorkflow,
+                              ref: context.payload.repository?.default_branch || 'main',
+                              inputs: { pr_number: String(pr.number) },
+                            });
+                            repairReconciliationDispatched = true;
+                            core.notice(
+                              `PR #${pr.number}: recovered CodeRabbit reply for unresolved thread #${thread.commentId} via canonical batch reconciler.`
+                            );
+                          }
+                        }
+                      }
+                    }
+                    continue;
+                  }
+                  if (
+                    Date.now() - verificationAt <
+                    CODERABBIT_THREAD_VERIFICATION_TIMEOUT_MS
+                  ) {
+                    continue;
+                  }
+                  core.warning(
+                    `PR #${pr.number}: CodeRabbit did not answer thread verification #${thread.commentId} within the bounded timeout; retrying the same exact-HEAD verification.`
+                  );
+                }
+
+                const body = [
+                  marker,
+                  '⚡ **Continuum · auto-merge**',
+                  '<!-- continuum-origin role=continuum component=auto-merge -->',
+                  '@coderabbitai Re-check this unresolved original finding against the current PR HEAD.',
+                  '',
+                  `Current PR HEAD: \`${pr.head.sha}\``,
+                  '',
+                  'Inspect the current code itself, not only the incremental diff.',
+                  'Resolve this thread only if the underlying issue is fully fixed.',
+                  'Otherwise explain exactly what remains unresolved.',
+                ].join('\n');
+
+                await github.request(
+                  'POST /repos/{owner}/{repo}/pulls/{pull_number}/comments/{comment_id}/replies',
+                  {
+                    owner,
+                    repo,
+                    pull_number: pr.number,
+                    comment_id: thread.commentId,
+                    body,
+                  }
+                );
+                requested += 1;
+              }
+
+              return requested;
+            }
+
+            async function cancelObsoleteRuns(openPulls) {
+              // Best-effort housekeeping wrapper: a transient/rate-limit read
+              // skips this cleanup pass and lets core PR synchronization,
+              // review, and merge reconciliation continue. Deterministic
+              // programming/config errors still fail loudly.
+              try {
+                return await cancelObsoleteRunsInner(openPulls);
+              } catch (err) {
+                if (isHousekeepingTransientError(err)) {
+                  core.warning(
+                    `Skipping obsolete-run cleanup: housekeeping read failed with transient status ${housekeepingStatus(err)}: ${err.message}`
+                  );
+                  return { ci: 0, noopRelease: 0, skipped: true };
+                }
+                throw err;
+              }
+            }
+
+            async function cancelObsoleteRunsInner(openPulls) {
+              // Same-repository housekeeping reads stay on the repository
+              // token; only the cancellation mutation below uses TAP_PAT.
+              const { data: mainBranch } = await readGithub.rest.repos.getBranch({
+                owner,
+                repo,
+                branch: 'main',
+              });
+              const mainSha = mainBranch.commit.sha;
+
+              const liveHeads = new Set([
+                mainSha,
+                ...openPulls.map(pr => pr.head.sha),
+              ]);
+
+              // Bounded status-filtered listing: one status per request (the
+              // API accepts a single status value) with an explicit page cap.
+              // Completed history is never walked to discover active runs, so
+              // the list phase costs at most
+              // HOUSEKEEPING_ACTIVE_STATUSES.length *
+              // HOUSEKEEPING_MAX_PAGES_PER_STATUS REST calls regardless of
+              // repository history size, and never requests page 10+.
+              const runs = [];
+              for (const status of HOUSEKEEPING_ACTIVE_STATUSES) {
+                for (let page = 1; page <= HOUSEKEEPING_MAX_PAGES_PER_STATUS; page += 1) {
+                  const { data } = await readGithub.rest.actions.listWorkflowRunsForRepo({
+                    owner,
+                    repo,
+                    per_page: HOUSEKEEPING_PER_PAGE,
+                    page,
+                    status,
+                  });
+                  const batch = data.workflow_runs || [];
+                  for (const run of batch) runs.push(run);
+                  if (batch.length < HOUSEKEEPING_PER_PAGE) break;
+                }
+              }
+
+              let ci = 0;
+              let noopRelease = 0;
+              let releaseProbes = 0;
+
+              async function cancelRun(run, reason) {
+                try {
+                  // Cancellation is a mutation: it stays PAT-backed so the
+                  // actor identity and downstream fan-out are unchanged.
+                  await github.rest.actions.cancelWorkflowRun({
+                    owner,
+                    repo,
+                    run_id: run.id,
+                  });
+                  core.notice(
+                    `Cancelled ${reason} run ${run.id} for head ${run.head_sha}.`
+                  );
+                  return true;
+                } catch (err) {
+                  // A run may finish or be cancelled by concurrency between the
+                  // list and the write; that race is harmless.
+                  if ([409, 422].includes(housekeepingStatus(err))) {
+                    core.info(
+                      `Run ${run.id} changed state before cancellation: ${err.message}`
+                    );
+                    return false;
+                  }
+                  // A rate-limit/transient cancel is best-effort housekeeping:
+                  // skip this run and let reconciliation continue instead of
+                  // turning the controller red. No retry storm: no retry here.
+                  if (isHousekeepingTransientError(err)) {
+                    core.warning(
+                      `Skipping cancellation of ${reason} run ${run.id}: transient status ${housekeepingStatus(err)}: ${err.message}`
+                    );
+                    return false;
+                  }
+                  throw err;
+                }
+              }
+
+              for (const run of runs) {
+                if (!HOUSEKEEPING_ACTIVE_STATUSES.includes(run.status)) continue;
+
+                if (
+                  run.name === 'CI' &&
+                  !liveHeads.has(run.head_sha)
+                ) {
+                  if (await cancelRun(run, 'obsolete CI')) ci += 1;
+                  continue;
+                }
+
+                // Older push-to-main Release runs for a version that was already
+                // published before the run started are guaranteed preflight
+                // no-ops. They used to queue two unnecessary macOS builds.
+                // Never cancel the current-main Release run, and never cancel a
+                // run that may itself be publishing a new release.
+                if (
+                  run.name === 'Release' &&
+                  run.event === 'push' &&
+                  run.head_branch === 'main' &&
+                  run.head_sha !== mainSha
+                ) {
+                  if (releaseProbes >= HOUSEKEEPING_MAX_RELEASE_PROBES) {
+                    core.info(
+                      `Housekeeping release-probe budget exhausted; skipping Release run ${run.id}.`
+                    );
+                    continue;
+                  }
+                  releaseProbes += 1;
+                  try {
+                    const { data: versionFile } =
+                      await readGithub.rest.repos.getContent({
+                        owner,
+                        repo,
+                        path: process.env.CONTINUUM_VERSION_FILE,
+                        ref: run.head_sha,
+                      });
+                    if (Array.isArray(versionFile) || !versionFile.content) {
+                      continue;
+                    }
+
+                    const source = Buffer.from(
+                      versionFile.content,
+                      'base64'
+                    ).toString('utf8');
+                    const match = source.match(/\b\d+\.\d+\.\d+\b/);
+                    if (!match) continue;
+
+                    const { data: release } =
+                      await readGithub.rest.repos.getReleaseByTag({
+                        owner,
+                        repo,
+                        tag: `v${match[0]}`,
+                      });
+
+                    const publishedAt = new Date(
+                      release.published_at || release.created_at || 0
+                    ).getTime();
+                    const runCreatedAt = new Date(run.created_at || 0).getTime();
+
+                    if (
+                      publishedAt > 0 &&
+                      runCreatedAt > 0 &&
+                      publishedAt < runCreatedAt
+                    ) {
+                      if (await cancelRun(run, 'stale no-op Release')) {
+                        noopRelease += 1;
+                      }
+                    }
+                  } catch (err) {
+                    if (housekeepingStatus(err) === 404) {
+                      // No matching release existed: this may be a real release.
+                      continue;
+                    }
+                    // A transient metadata read skips this Release candidate
+                    // only; deterministic errors still fail loudly.
+                    if (isHousekeepingTransientError(err)) {
+                      core.warning(
+                        `Skipping Release housekeeping for run ${run.id}: transient status ${housekeepingStatus(err)}: ${err.message}`
+                      );
+                      continue;
+                    }
+                    throw err;
+                  }
+                }
+              }
+
+              return { ci, noopRelease, skipped: false };
+            }
+
+            function resolveOpencodeWorkflow() {
+              // Conflict repair always dispatches the configured consumer
+              // OpenCode caller (Continuum dogfood: opencode.yml). The
+              // reusable engine file owns no workflow_dispatch trigger, so a
+              // hardcoded engine dispatch can never start a repair run.
+              const configured = String(
+                process.env.OPENCODE_WORKFLOW || 'continuum-opencode.yml'
+              ).trim();
+              if (!configured) {
+                throw new Error(
+                  'Conflict repair has no configured OpenCode caller workflow.'
+                );
+              }
+              if (
+                !configured.endsWith('.yml') ||
+                configured.includes('/') ||
+                configured.includes('\\') ||
+                configured.includes('..')
+              ) {
+                throw new Error(
+                  `Invalid OpenCode caller workflow: ${configured}. ` +
+                  'Expected a bare workflow file name such as opencode.yml.'
+                );
+              }
+              return configured;
+            }
+
+            function resolveDispatchWorkflow(configuredValue, fallback, label) {
+              // CodeRabbit dispatch targets are optional integrations too.
+              // The literal fallback reproduces the pre-parameterization
+              // consumer behavior exactly; a dogfood caller overrides it with
+              // its own dispatchable entry workflow name.
+              const configured = String(
+                configuredValue || fallback
+              ).trim();
+              if (
+                !configured.endsWith('.yml') ||
+                configured.includes('/') ||
+                configured.includes('\\') ||
+                configured.includes('..')
+              ) {
+                throw new Error(
+                  `Invalid ${label} workflow: ${configured}. ` +
+                  'Expected a bare workflow file name such as coderabbit-retry.yml.'
+                );
+              }
+              return configured;
+            }
+
+            const codeRabbitRetryWorkflow = resolveDispatchWorkflow(
+              process.env.CONTINUUM_CODERABBIT_RETRY_WORKFLOW,
+              'continuum-coderabbit-retry.yml',
+              'CodeRabbit retry'
+            );
+            const codeRabbitUnresolvedWorkflow = resolveDispatchWorkflow(
+              process.env.CONTINUUM_CODERABBIT_UNRESOLVED_WORKFLOW,
+              'continuum-coderabbit-unresolved.yml',
+              'CodeRabbit unresolved'
+            );
+
+            // Mirrors src/continuum/conflict_repair.py:is_conflicted. Keep the
+            // two in sync: mergeable may be a REST boolean (or null) or a
+            // GraphQL-style string such as CONFLICTING; mergeable_state is
+            // the REST dirty/clean style string. Returns true (dirty),
+            // false (clean), or null (still computing).
+            function isConflictedMergeability(mergeable, mergeableState) {
+              const state = String(mergeableState || '').trim().toLowerCase();
+              if (state === 'dirty') return true;
+              if (typeof mergeable === 'boolean') return !mergeable;
+              if (mergeable === null || mergeable === undefined) {
+                return state === '' || state === 'unknown' ? null : false;
+              }
+              const text = String(mergeable).trim().toLowerCase();
+              if (
+                text === 'false' ||
+                text === 'conflicting' ||
+                text === 'conflicted' ||
+                text === 'dirty'
+              ) {
+                return true;
+              }
+              if (
+                text === 'true' ||
+                text === 'mergeable' ||
+                text === 'clean' ||
+                text === 'stable' ||
+                text === 'blocked' ||
+                text === 'behind'
+              ) {
+                return false;
+              }
+              if (text === '' || text === 'null' || text === 'unknown') {
+                return null;
+              }
+              return null;
+            }
+
+            function conflictRepairMarkers(comments, headSha) {
+              const exactHead = String(headSha || '').toLowerCase();
+              const markers = [];
+              for (const comment of comments || []) {
+                const association = String(
+                  comment.author_association || ''
+                ).toUpperCase();
+                const login = String(
+                  comment.user?.login || ''
+                ).toLowerCase();
+                const trusted =
+                  TRUSTED_COMMENT_ASSOCIATIONS.has(association) ||
+                  login === 'github-actions[bot]' ||
+                  login === owner.toLowerCase();
+                if (!trusted) continue;
+                const body = String(comment.body || '');
+                CONFLICT_MARKER_RE.lastIndex = 0;
+                for (const match of body.matchAll(CONFLICT_MARKER_RE)) {
+                  if (String(match[1] || '').toLowerCase() !== exactHead) {
+                    continue;
+                  }
+                  markers.push({
+                    attempt: Number.parseInt(match[2], 10),
+                    createdAt: Date.parse(
+                      String(
+                        comment.updated_at || comment.created_at || ''
+                      )
+                    ),
+                  });
+                }
+              }
+              markers.sort((a, b) => a.attempt - b.attempt);
+              return markers;
+            }
+
+            function conflictRepairMarker(headSha, attempt) {
+              // Continuum comment attribution (kodmial/continuum#258): the
+              // election marker stays first for positional matching; the
+              // attribution header is the first rendered line.
+              return (
+                `<!-- continuum-conflict-repair head=${headSha} attempt=${attempt} -->\n` +
+                '⚡ **Continuum · auto-merge**\n' +
+                '<!-- continuum-origin role=continuum component=auto-merge -->\n' +
+                'Continuum dispatched automatic OpenCode conflict repair ' +
+                'for this exact HEAD.'
+              );
+            }
+
+            async function findActiveConflictRepairRun(prNumber) {
+              const opencodeWorkflow = resolveOpencodeWorkflow();
+              let runs;
+              try {
+                // Same-repository run discovery uses the repository token
+                // instead of TAP_PAT.
+                runs = await withReadFallback(client =>
+                  client.paginate(
+                    client.rest.actions.listWorkflowRuns,
+                    {
+                      owner,
+                      repo,
+                      workflow_id: opencodeWorkflow,
+                      per_page: 100,
+                    }
+                  )
+                );
+              } catch (err) {
+                // A missing caller file surfaces loudly at dispatch time;
+                // the liveness probe itself must not fail the pass.
+                core.warning(
+                  `PR #${prNumber}: could not list ${opencodeWorkflow} runs: ${err.message}`
+                );
+                return null;
+              }
+              // Word-boundary match: `PR #23` must not match the live run
+              // for `PR #237`.
+              const titlePattern = new RegExp(`PR #${prNumber}(?!\\d)`);
+              return runs.find(run =>
+                ACTIVE_REPAIR_STATUSES.has(
+                  String(run.status || '').toLowerCase()
+                ) &&
+                titlePattern.test(String(run.display_title || ''))
+              ) || null;
+            }
+
+            async function removeConflictLock(prNumber) {
+              try {
+                await github.rest.issues.removeLabel({
+                  owner,
+                  repo,
+                  issue_number: prNumber,
+                  name: CONFLICT_LOCK_LABEL,
+                });
+              } catch (err) {
+                if (err.status !== 404) throw err;
+              }
+            }
+
+            async function dispatchConflictRepair(pr, reason) {
+              const opencodeWorkflow = resolveOpencodeWorkflow();
+
+              // Exact-HEAD revalidation: the PR may have advanced between the
+              // scan read and this dispatch.
+              const fresh = await getPull(pr.number);
+              if (
+                fresh.state !== 'open' ||
+                fresh.draft ||
+                fresh.head.repo?.full_name !== repoFullName
+              ) {
+                core.info(
+                  `PR #${pr.number}: no longer an open same-repository PR; cancelling conflict dispatch.`
+                );
+                return;
+              }
+              if (fresh.head.sha !== pr.head.sha) {
+                core.info(
+                  `PR #${pr.number}: head advanced from ${pr.head.sha} to ${fresh.head.sha} before conflict dispatch; re-evaluating.`
+                );
+                return;
+              }
+              pr = fresh;
+              const headSha = pr.head.sha;
+
+              // Dirty recheck: the PR may have turned clean (or GitHub may
+              // still be recomputing mergeability) between the scan read and
+              // this dispatch. Never dispatch repair for a clean HEAD.
+              // Uses isConflictedMergeability so REST booleans and
+              // GraphQL-style strings match src/continuum/conflict_repair.py.
+              {
+                const conflicted = isConflictedMergeability(
+                  pr.mergeable,
+                  pr.mergeable_state
+                );
+                if (conflicted !== true) {
+                  if (conflicted === null) {
+                    core.info(
+                      `PR #${pr.number}: mergeability is still being computed for head ${headSha}; waiting.`
+                    );
+                    return;
+                  }
+                  if (hasLabel(pr, CONFLICT_LOCK_LABEL)) {
+                    await removeConflictLock(pr.number);
+                    core.notice(
+                      `PR #${pr.number}: head ${headSha} is no longer dirty; reconciled ${CONFLICT_LOCK_LABEL} and resuming CI/review lifecycle.`
+                    );
+                  } else {
+                    core.info(
+                      `PR #${pr.number}: head ${headSha} is no longer dirty; cancelling conflict dispatch.`
+                    );
+                  }
+                  return;
+                }
+              }
+
+              // A live repair run for this PR owns the lock: wait instead of
+              // dispatching a duplicate.
+              const activeRun = await findActiveConflictRepairRun(pr.number);
+              if (activeRun) {
+                core.info(
+                  `PR #${pr.number}: conflict repair run ${activeRun.id} (${activeRun.status}) is already active for this PR; waiting.`
+                );
+                return;
+              }
+
+              const comments = await withReadFallback(client =>
+                client.paginate(
+                  client.rest.issues.listComments,
+                  {
+                    owner,
+                    repo,
+                    issue_number: pr.number,
+                    per_page: 100,
+                  }
+                )
+              );
+              const markers = conflictRepairMarkers(comments, headSha);
+              // Durable rate-limit wait: a deferred not-before from a prior
+              // rate-limited dispatch wins over a fresh dispatch.
+              const deferredNotBefore = conflictRepairNotBefore(
+                comments, headSha, Math.floor(Date.now() / 1000)
+              );
+              if (deferredNotBefore !== null) {
+                core.info(
+                  `PR #${pr.number}: conflict-repair deferred until ${new Date(deferredNotBefore * 1000).toISOString()}; waiting for the scheduled safety net.`
+                );
+                return;
+              }
+              const latest = markers.at(-1) || null;
+              const markerAgeMs =
+                latest && Number.isFinite(latest.createdAt)
+                  ? Date.now() - latest.createdAt
+                  : null;
+
+              // Idempotency per PR/current HEAD: a dispatch that just happened
+              // has a fresh marker even before its run becomes visible.
+              if (
+                markers.length > 0 &&
+                markerAgeMs !== null &&
+                markerAgeMs < CONFLICT_DISPATCH_GRACE_MS
+              ) {
+                core.info(
+                  `PR #${pr.number}: conflict-repair dispatch for head ${headSha} is inside its grace window; waiting.`
+                );
+                return;
+              }
+
+              // Bounded autonomy: stop redispatching one unchanged HEAD after
+              // the per-HEAD budget is spent. No pause label is applied and no
+              // manual label removal is required; a new HEAD starts a fresh
+              // budget.
+              if (markers.length >= MAX_CONFLICT_DISPATCHES_PER_HEAD) {
+                core.warning(
+                  `PR #${pr.number}: bounded conflict-repair budget exhausted for head ${headSha} (${markers.length}/${MAX_CONFLICT_DISPATCHES_PER_HEAD}); waiting for a new HEAD.`
+                );
+                return;
+              }
+              let attempt = markers.length;
+
+              // A stale lock with no active run and no fresh marker must not
+              // strand the PR: reconcile it, then redispatch safely.
+              if (hasLabel(pr, CONFLICT_LOCK_LABEL)) {
+                await removeConflictLock(pr.number);
+                core.notice(
+                  `PR #${pr.number}: reconciled stale ${CONFLICT_LOCK_LABEL} lock with no active repair run; redispatching.`
+                );
+              }
+
+              await github.rest.issues.addLabels({
+                owner,
+                repo,
+                issue_number: pr.number,
+                labels: [CONFLICT_LOCK_LABEL],
+              });
+
+              // Overlap guard (best-effort): two overlapping reconciler jobs
+              // can both pass the pre-lock checks before either dispatches,
+              // and the lock label itself is not atomic, so revalidate after
+              // acquiring it and before dispatching. An overlapping job that
+              // already dispatched leaves either a visible run or a fresh
+              // marker; seeing either here means waiting instead of
+              // dispatching a duplicate. This recheck cannot see an
+              // overlapping job that has not dispatched yet, so the claim
+              // comment written below is the authoritative linearization
+              // point. The acquired lock is shared and left in place on
+              // these waits.
+              {
+                const confirmRun =
+                  await findActiveConflictRepairRun(pr.number);
+                if (confirmRun) {
+                  core.info(
+                    `PR #${pr.number}: conflict repair run ${confirmRun.id} (${confirmRun.status}) appeared while acquiring the lock; waiting.`
+                  );
+                  return;
+                }
+                const confirmComments = await withReadFallback(client =>
+                  client.paginate(
+                    client.rest.issues.listComments,
+                    {
+                      owner,
+                      repo,
+                      issue_number: pr.number,
+                      per_page: 100,
+                    }
+                  )
+                );
+                const confirmMarkers = conflictRepairMarkers(
+                  confirmComments,
+                  headSha
+                );
+                const confirmLatest = confirmMarkers.at(-1) || null;
+                const confirmAgeMs =
+                  confirmLatest &&
+                  Number.isFinite(confirmLatest.createdAt)
+                    ? Date.now() - confirmLatest.createdAt
+                    : null;
+                if (
+                  confirmMarkers.length > 0 &&
+                  confirmAgeMs !== null &&
+                  confirmAgeMs < CONFLICT_DISPATCH_GRACE_MS
+                ) {
+                  core.info(
+                    `PR #${pr.number}: conflict-repair dispatch for head ${headSha} appeared while acquiring the lock; waiting.`
+                  );
+                  return;
+                }
+                if (
+                  confirmMarkers.length >= MAX_CONFLICT_DISPATCHES_PER_HEAD
+                ) {
+                  core.warning(
+                    `PR #${pr.number}: bounded conflict-repair budget exhausted for head ${headSha} (${confirmMarkers.length}/${MAX_CONFLICT_DISPATCHES_PER_HEAD}); waiting for a new HEAD.`
+                  );
+                  return;
+                }
+                attempt = confirmMarkers.length;
+              }
+
+              // Claim-before-dispatch: the label is not atomic, and neither a
+              // run nor a post-dispatch marker is visible until after
+              // dispatch, so two overlapping jobs can both pass every check
+              // above and both dispatch. The claim comment IS visible before
+              // dispatch, so it is the linearization point: write it first,
+              // then elect the smallest comment id among fresh markers for
+              // this HEAD as the single winner. Only the winner dispatches;
+              // the loser deletes its own claim (best-effort) and waits,
+              // leaving the shared lock in place for the winner's run.
+              let claimCommentId = null;
+              try {
+                const { data: claimComment } =
+                  await github.rest.issues.createComment({
+                    owner,
+                    repo,
+                    issue_number: pr.number,
+                    body: conflictRepairMarker(headSha, attempt),
+                  });
+                claimCommentId = claimComment.id;
+              } catch (markerErr) {
+                try {
+                  await removeConflictLock(pr.number);
+                } catch (unlockErr) {
+                  core.warning(
+                    `PR #${pr.number}: could not remove ${CONFLICT_LOCK_LABEL} after marker failure: ${unlockErr.message}`
+                  );
+                }
+                throw markerErr;
+              }
+              {
+                const electionComments = await withReadFallback(client =>
+                  client.paginate(
+                    client.rest.issues.listComments,
+                    {
+                      owner,
+                      repo,
+                      issue_number: pr.number,
+                      per_page: 100,
+                    }
+                  )
+                );
+                let winnerId = claimCommentId;
+                for (const comment of electionComments) {
+                  // Same trust as conflictRepairMarkers: an untrusted forged
+                  // marker must never win the smallest-id election and
+                  // suppress the legitimate repair.
+                  const association = String(
+                    comment.author_association || ''
+                  ).toUpperCase();
+                  const login = String(
+                    comment.user?.login || ''
+                  ).toLowerCase();
+                  const trusted =
+                    TRUSTED_COMMENT_ASSOCIATIONS.has(association) ||
+                    login === 'github-actions[bot]' ||
+                    login === owner.toLowerCase();
+                  if (!trusted) continue;
+                  const body = String(comment.body || '');
+                  CONFLICT_MARKER_RE.lastIndex = 0;
+                  let matchedHead = false;
+                  for (const match of body.matchAll(CONFLICT_MARKER_RE)) {
+                    if (
+                      String(match[1] || '').toLowerCase() ===
+                      String(headSha || '').toLowerCase()
+                    ) {
+                      matchedHead = true;
+                      break;
+                    }
+                  }
+                  if (!matchedHead) continue;
+                  const createdAt = Date.parse(
+                    String(comment.updated_at || comment.created_at || '')
+                  );
+                  if (
+                    !Number.isFinite(createdAt) ||
+                    Date.now() - createdAt >= CONFLICT_DISPATCH_GRACE_MS
+                  ) {
+                    continue;
+                  }
+                  if (
+                    typeof comment.id === 'number' &&
+                    comment.id < winnerId
+                  ) {
+                    winnerId = comment.id;
+                  }
+                }
+                if (winnerId !== claimCommentId) {
+                  try {
+                    await github.rest.issues.deleteComment({
+                      owner,
+                      repo,
+                      comment_id: claimCommentId,
+                    });
+                  } catch (cleanupErr) {
+                    core.warning(
+                      `PR #${pr.number}: lost conflict-repair race for head ${headSha}; could not delete duplicate claim comment: ${cleanupErr.message}`
+                    );
+                  }
+                  core.info(
+                    `PR #${pr.number}: another reconciler claimed conflict repair for head ${headSha} first; waiting.`
+                  );
+                  return;
+                }
+              }
+
+              try {
+                await github.request(
+                  'POST /repos/{owner}/{repo}/actions/workflows/{workflow_id}/dispatches',
+                  {
+                    owner,
+                    repo,
+                    workflow_id: opencodeWorkflow,
+                    ref: 'main',
+                    inputs: {
+                      mode: 'resolve-conflict',
+                      pr_number: String(pr.number),
+                      head_ref: pr.head.ref,
+                    },
+                  }
+                );
+                core.notice(
+                  `PR #${pr.number}: dispatched OpenCode conflict repair via ${opencodeWorkflow} for head ${headSha} (attempt ${attempt + 1}/${MAX_CONFLICT_DISPATCHES_PER_HEAD}, ${reason}).`
+                );
+              } catch (err) {
+                // A failed dispatch leaves no run behind, so its claim must
+                // not linger inside the grace window (that would stall the
+                // next retry). Best-effort cleanup must never mask the
+                // original dispatch error needed to diagnose a bad caller
+                // name or a missing workflow_dispatch trigger.
+                //
+                // Reset-aware deferral (#224, single lifecycle contract):
+                // honor the server-provided reset wait instead of retrying
+                // immediately on the next wakeup and hammering the limit.
+                // Short waits sleep inline; long waits defer to the
+                // scheduled safety net (the cron caller stub redispatches
+                // when the window expires) and the run exits. The claim
+                // is still deleted so a deferred wait never consumes the
+                // bounded per-HEAD budget for work that never executed.
+                // Deferral is transient-only: a deterministic dispatch
+                // error (404/422) must surface immediately, never persist
+                // a schedule-derived wait that hides the real failure.
+                const isDispatchTransient = isTransientApiError(err);
+                const signals = isDispatchTransient ? extractRateLimitSignals(err) : {};
+                const resetDelay = isDispatchTransient ? resetAwareDelaySeconds({
+                  attempt,
+                  retryAfterSeconds: signals.retryAfterSeconds,
+                  ratelimitResetEpoch: signals.ratelimitResetEpoch,
+                  providerResetEpoch: signals.providerResetEpoch,
+                  nowEpoch: Math.floor(Date.now() / 1000),
+                  operationKey: `${repoFullName}#${pr.number}:${headSha}`,
+                }) : 0;
+                // Never sleep inline: a rate-limited PR must not hold the
+                // single run/loop slot while healthy independent PRs wait
+                // behind it. Short and long waits alike defer to the next
+                // wakeup/scheduled safety net without blocking the loop.
+                if (resetDelay > 0) {
+                  core.notice(
+                    `PR #${pr.number}: conflict-repair dispatch hit a rate limit; ` +
+                    `deferring execution for ~${resetDelay}s to the scheduled safety net ` +
+                    `without sleeping the runner: ` + (err.message || err)
+                  );
+                }
+                // Durable not-before: persist the reset-aware wait so the
+                // next wakeup honors it instead of retrying immediately
+                // against an unexpired limit. The schedule-based backoff is
+                // durable even without a server reset signal: a generic
+                // 5xx/network failure with no Retry-After/Reset headers must
+                // still defer instead of hot-retrying. Deferred waits never
+                // consume the per-HEAD dispatch budget (no conflict-repair
+                // marker is written for work that never executed).
+                {
+                  if (resetDelay > 0) {
+                    const notBefore = Math.floor(Date.now() / 1000) + resetDelay;
+                    try {
+                      await github.rest.issues.createComment({
+                        owner,
+                        repo,
+                        issue_number: pr.number,
+                        body:
+                          `<!-- continuum-conflict-repair-deferred head=${headSha} not-before=${notBefore} -->\n` +
+                          `⚡ **Continuum · auto-merge**\n` +
+                          `<!-- continuum-origin role=continuum component=auto-merge -->\n` +
+                          `Continuum deferred automatic OpenCode conflict repair for this exact HEAD until ` +
+                          `${new Date(notBefore * 1000).toISOString()} (rate-limited dispatch; reset-aware backoff ${resetDelay}s).`,
+                      });
+                    } catch (deferErr) {
+                      core.warning(
+                        `PR #${pr.number}: could not persist conflict-repair deferral: ${deferErr.message}`
+                      );
+                    }
+                  }
+                }
+                try {
+                  await github.rest.issues.deleteComment({
+                    owner,
+                    repo,
+                    comment_id: claimCommentId,
+                  });
+                } catch (cleanupErr) {
+                  core.warning(
+                    `PR #${pr.number}: repair dispatch failed and claim cleanup failed: ${cleanupErr.message}`
+                  );
+                }
+                try {
+                  await removeConflictLock(pr.number);
+                } catch (unlockErr) {
+                  core.warning(
+                    `PR #${pr.number}: repair dispatch failed and lock removal failed: ${unlockErr.message}`
+                  );
+                }
+                throw err;
+              }
+            }
+
+            // Early self-healing scan for one PR. Returns true when the PR was
+            // handled here (dirty: dispatched, waiting, or bounded hold) and
+            // the caller must continue to the next PR. Returns false when the
+            // PR is clean so the normal CI/review/merge gates evaluate this
+            // same pass; a leftover lock on a clean PR is reconciled first so
+            // CI runs on the repaired HEAD and the lifecycle resumes.
+            // GitHub mergeability of null means "still computing": the normal
+            // sync path (update-branch) remains authoritative for that case.
+            async function reconcileDirtyPr(pr) {
+              // Matches src/continuum/conflict_repair.py:is_conflicted so
+              // REST booleans and GraphQL-style strings agree on dirty.
+              const conflicted = isConflictedMergeability(
+                pr.mergeable,
+                pr.mergeable_state
+              );
+              if (conflicted !== true) {
+                if (
+                  conflicted === false &&
+                  hasLabel(pr, CONFLICT_LOCK_LABEL)
+                ) {
+                  await removeConflictLock(pr.number);
+                  core.notice(
+                    `PR #${pr.number}: repaired HEAD ${pr.head.sha} is no longer dirty; reconciled ${CONFLICT_LOCK_LABEL} and resuming CI/review lifecycle.`
+                  );
+                }
+                return false;
+              }
+              await dispatchConflictRepair(
+                pr,
+                `mergeable_state=${pr.mergeable_state}`
+              );
+              return true;
+            }
+
+            async function updateFromMain(pr) {
+              const oldHead = pr.head.sha;
+              // Exact-HEAD revalidation immediately before mutation (#224):
+              // the caller reconciles from a snapshot taken earlier in a long
+              // loop. If the HEAD moved since, hold instead of syncing stale
+              // state: the next wakeup reconciles the new HEAD from latest.
+              const liveBeforeSync = await getPullWithAuthoritativeHead(pr.number);
+              if (
+                liveBeforeSync.state !== 'open' ||
+                liveBeforeSync.head.sha !== oldHead
+              ) {
+                core.info(
+                  `PR #${pr.number}: HEAD moved ${oldHead} -> ${liveBeforeSync.head.sha} before main sync; holding stale reconciliation.`
+                );
+                return false;
+              }
+              // kodmial/continuum#302: fail closed before any sync mutation
+              // when the PR head is empty, ambiguous, or the default branch.
+              try {
+                continuumAssertSafePush(pr.head.ref);
+              } catch (safetyErr) {
+                core.error(`PR #${pr.number}: ${safetyErr.message}`);
+                return false;
+              }
+              const { data: mainBranch } = await withReadFallback(client =>
+                client.rest.repos.getBranch({
+                  owner,
+                  repo,
+                  branch: 'main',
+                })
+              );
+              const mainHead = mainBranch.commit.sha;
+
+              // Carry is allowed only from a fully valid review basis and only
+              // when there are no unresolved CodeRabbit threads. If update-branch
+              // hits a conflict, no marker is ever written; OpenCode's conflict
+              // resolution therefore becomes an ordinary new commit that must be
+              // reviewed again.
+              // Carry exists only to reuse a CodeRabbit approval across a
+              // controller-generated sync. With CodeRabbit disabled there is no
+              // approval to carry, so no marker is written and the
+              // GraphQL thread queries are skipped entirely.
+              const unresolvedBeforeSync = requireCodeRabbit
+                ? await unresolvedCodeRabbitThreads(pr)
+                : [];
+              const reviewBasis =
+                requireCodeRabbit && unresolvedBeforeSync.length === 0
+                  // Only a literal APPROVED decision may be carried across a
+                  // controller-generated main sync. A clean post-no-progress
+                  // completion is exact-HEAD evidence and must be re-reviewed
+                  // after any HEAD change.
+                  ? await directCodeRabbitReviewBasis(pr, oldHead)
+                  : null;
+
+              try {
+                // Prefer exact-HEAD protection. GitHub can temporarily keep
+                // pull metadata behind the actual same-repository branch ref,
+                // causing expected_head_sha to reject the authoritative HEAD.
+                // When that specific 422 occurs, revalidate the branch ref and
+                // merge the exact main SHA directly into the same-repository
+                // branch. This bypasses only stale PR metadata; it never rewrites
+                // branch history. Review carry below is still granted only when
+                // the resulting commit has exactly oldHead + mainHead as parents.
+                // Recheck immediately before GitHub's update-branch mutation
+                // (not only in the caller) to narrow review/repair startup
+                // races during the API work above.
+                const liveOperation = await activePrAgentHeadOperation(pr);
+                if (liveOperation.active) {
+                  core.notice(`PR #${pr.number}: deferring main sync: ${liveOperation.reason}.`);
+                  return false;
+                }
+                let updateSucceeded = false;
+                try {
+                  await github.request(
+                    'PUT /repos/{owner}/{repo}/pulls/{pull_number}/update-branch',
+                    {
+                      owner,
+                      repo,
+                      pull_number: pr.number,
+                      expected_head_sha: oldHead,
+                    }
+                  );
+                  updateSucceeded = true;
+                } catch (updateErr) {
+                  const updateMessage = String(updateErr.message || updateErr);
+                  const expectedHeadRace =
+                    updateErr.status === 422 &&
+                    /expected head sha.*current head ref/i.test(updateMessage);
+                  if (!expectedHeadRace) throw updateErr;
+
+                  const refreshed = await getPullWithAuthoritativeHead(pr.number);
+                  if (refreshed.state !== 'open') {
+                    return false;
+                  }
+                  if (refreshed.head.sha !== oldHead) {
+                    core.info(
+                      `PR #${pr.number}: authoritative HEAD moved ${oldHead} -> ${refreshed.head.sha} during update-branch; the next reconciliation will evaluate it.`
+                    );
+                    return false;
+                  }
+
+                  core.notice(
+                    `PR #${pr.number}: pull metadata rejected authoritative HEAD ${oldHead}; merging main directly into branch ${pr.head.ref} after branch-ref revalidation.`
+                  );
+                  const { data: directMerge } = await github.request(
+                    'POST /repos/{owner}/{repo}/merges',
+                    {
+                      owner,
+                      repo,
+                      base: pr.head.ref,
+                      head: mainHead,
+                      commit_message: `Merge branch 'main' into ${pr.head.ref}`,
+                    }
+                  );
+                  if (!directMerge?.sha) {
+                    throw new Error(
+                      `PR #${pr.number}: direct main-sync merge returned no commit SHA.`
+                    );
+                  }
+                  updateSucceeded = true;
+                }
+                if (!updateSucceeded) {
+                  throw new Error(
+                    `PR #${pr.number}: update-branch exited without success for HEAD ${oldHead}.`
+                  );
+                }
+
+                let fresh = null;
+                for (let attempt = 0; attempt < 6; attempt += 1) {
+                  fresh = await getPullWithAuthoritativeHead(pr.number);
+                  if (fresh.head.sha !== oldHead) break;
+                  await new Promise(resolve => setTimeout(resolve, 1000));
+                }
+
+                let carried = false;
+                if (reviewBasis && fresh && fresh.head.sha !== oldHead) {
+                  const { data: newCommit } = await withReadFallback(client =>
+                    client.rest.repos.getCommit({
+                      owner,
+                      repo,
+                      ref: fresh.head.sha,
+                    })
+                  );
+                  const parents = (newCommit.parents || []).map(parent =>
+                    parent.sha.toLowerCase()
+                  );
+                  const parentSet = new Set(parents);
+
+                  // The marker is written only after GitHub itself completed a
+                  // clean update-branch merge, and only when the resulting
+                  // commit has exactly the old PR head + the exact main head as
+                  // its two parents. A human/OpenCode conflict resolution can
+                  // never satisfy this path because update-branch failed before
+                  // any marker was emitted.
+                  if (
+                    parents.length === 2 &&
+                    parentSet.has(oldHead.toLowerCase()) &&
+                    parentSet.has(mainHead.toLowerCase())
+                  ) {
+                    const marker =
+                      `<!-- auto-main-sync head=${fresh.head.sha} from=${oldHead} main=${mainHead} carry=${reviewBasis.sourceSha} -->`;
+                    // Continuum comment attribution (kodmial/continuum#258):
+                    // marker-only election record; the hidden origin marker
+                    // identifies the producer without rendering new prose.
+                    await github.rest.issues.createComment({
+                      owner,
+                      repo,
+                      issue_number: pr.number,
+                      body: marker + '\n<!-- continuum-origin role=continuum component=auto-merge -->',
+                    });
+                    carried = true;
+                    core.notice(
+                      `PR #${pr.number}: clean main sync ${oldHead} -> ${fresh.head.sha}; carrying CodeRabbit approval from ${reviewBasis.sourceSha}.`
+                    );
+                  }
+                }
+
+                core.notice(
+                  carried
+                    ? `PR #${pr.number}: updated from main; waiting for fresh CI only (CodeRabbit approval carried).`
+                    : `PR #${pr.number}: updated from main; waiting for fresh CI and a fresh CodeRabbit review.`
+                );
+                return true;
+              } catch (err) {
+                const message = String(err.message || err);
+
+                // GitHub returns 422 when expected_head_sha became stale. That is
+                // a normal race with OpenCode/CI/main-sync, not a merge conflict.
+                // Re-read before deciding whether a repair agent is warranted.
+                const fresh = await getPullWithAuthoritativeHead(pr.number);
+                if (fresh.head.sha !== oldHead) {
+                  core.info(
+                    `PR #${pr.number}: head advanced from ${oldHead} to ${fresh.head.sha} during update; no conflict repair needed.`
+                  );
+                  return false;
+                }
+
+                if (
+                  err.status === 409 ||
+                  /merge conflict|conflict|cannot be performed|not updateable/i.test(message)
+                ) {
+                  await dispatchConflictRepair(fresh, message);
+                  return false;
+                }
+
+                core.warning(
+                  `PR #${pr.number}: update-branch failed without a confirmed conflict: ${message}`
+                );
+                return false;
+              }
+            }
+
+            // Storm coalescing (#224): cancel-in-progress:false serializes
+            // runs, so a burst of triggers queues full-scan runs back to
+            // back. A run that starts while a NEWER run of this workflow is
+            // already queued skips its scan entirely: the newer run
+            // re-reconciles from latest state when it starts, so this run
+            // would only duplicate its work and its read API load. The probe
+            // pages repo-wide runs (up to 3 pages, newest first) so a newer
+            // queued reconciler is not missed when a busy repository pushes
+            // it outside the first page; if it fails deterministically the
+            // run scans anyway (fail-open: a broken probe must never strand
+            // reconciliation), and a transient probe failure defers green to
+            // the next wakeup.
+            try {
+              const queuedStatuses = new Set(['queued', 'waiting', 'requested', 'pending']);
+              let newerQueued = false;
+              for (let page = 1; page <= 3 && !newerQueued; page += 1) {
+                const { data: recentRuns } = await withReadFallback(client =>
+                  client.rest.actions.listWorkflowRunsForRepo({
+                    owner,
+                    repo,
+                    per_page: 100,
+                    page,
+                  })
+                );
+                const runs = recentRuns.workflow_runs || [];
+                newerQueued = runs.some(run =>
+                  run.name === context.workflow &&
+                  typeof run.id === 'number' &&
+                  run.id > context.runId &&
+                  queuedStatuses.has(String(run.status || '').toLowerCase())
+                );
+                if (runs.length < 100) break;
+              }
+              if (newerQueued) {
+                core.info(
+                  'A newer run of this workflow is already queued; skipping this scan ' +
+                  'so the burst coalesces onto the latest reconciliation.'
+                );
+                return;
+              }
+            } catch (err) {
+              if (isTransientApiError(err)) {
+                core.warning(
+                  'Storm-coalescing probe hit a transient/rate-limit read; ' +
+                  'deferring the whole scan to the next wakeup: ' +
+                  (err.message || err)
+                );
+                return;
+              }
+              core.warning(
+                'Storm-coalescing probe failed; scanning anyway: ' +
+                (err.message || err)
+              );
+            }
+
+            let pulls;
+            try {
+              pulls = await withReadFallback(client =>
+                client.paginate(client.rest.pulls.list, {
+                  owner,
+                  repo,
+                  state: 'open',
+                  base: 'main',
+                  per_page: 100,
+                })
+              );
+            } catch (err) {
+              // Top-level discovery sits outside the per-PR loop, so a
+              // 429/rate-limited 403 here must defer green to the next
+              // wakeup (the read is deferred to the next wakeup and does
+              // not retry inline) instead of failing the whole watchdog run
+              // red. Deterministic errors still throw and fail loudly.
+              if (isTransientApiError(err)) {
+                core.warning(
+                  'Open-PR discovery hit a transient/rate-limit read; ' +
+                  'deferring the whole scan to the next wakeup: ' +
+                  (err.message || err)
+                );
+                return;
+              }
+              throw err;
+            }
+
+            const cancelledRuns = await cancelObsoleteRuns(pulls);
+            if (cancelledRuns.ci > 0 || cancelledRuns.noopRelease > 0) {
+              core.notice(
+                `Cancelled ${cancelledRuns.ci} obsolete CI run(s) and ${cancelledRuns.noopRelease} stale no-op Release run(s) before reconciliation.`
+              );
+            }
+
+            // Oldest first makes autonomous behavior deterministic.
+            pulls.sort(
+              (a, b) =>
+                new Date(a.created_at).getTime() -
+                new Date(b.created_at).getTime()
+            );
+
+            let codeRabbitRetryControllerDispatched = false;
+            // Deterministic per-PR failures must not strand healthy PRs
+            // behind one bad PR: record loudly and continue the loop.
+            let deterministicFailure = null;
+
+            for (const listed of pulls) {
+              // Single live re-read per PR (#224 read budget): the open-PR
+              // listing already carries number/draft/head identity for the
+              // pre-lease filter, so only one authoritative pulls.get follows
+              // lease acquisition. A second pulls.get per PR would double
+              // read load (~2N) on every wakeup during quota exhaustion.
+              let authoritativeListed = listed;
+              try {
+                authoritativeListed = await withAuthoritativeHead(listed);
+              } catch (err) {
+                if (isTransientApiError(err)) {
+                  core.warning(
+                    `PR #${listed.number}: authoritative HEAD lookup hit a transient error; deferred to next wakeup: ${err.message || err}`
+                  );
+                  continue;
+                }
+                throw err;
+              }
+              const listedHead = authoritativeListed.head && authoritativeListed.head.sha;
+              const listedFork = authoritativeListed.head && authoritativeListed.head.repo && authoritativeListed.head.repo.full_name;
+              if (
+                (listed.state && listed.state !== 'open') ||
+                listed.draft ||
+                (listedFork && listedFork !== repoFullName)
+              ) {
+                continue;
+              }
+
+              // Per-PR/HEAD coalescing (#224): duplicate wakeups for the same
+              // transition collapse onto one lease; unrelated PRs proceed
+              // independently instead of queuing behind a repository lock.
+              // The lease pins the HEAD observed at acquisition: if the HEAD
+              // moves mid-reconciliation, the reconciler re-reads and refuses
+              // to merge the stale result.
+              const leaseHead = listedHead;
+              if (!leaseHead) {
+                continue;
+              }
+              if (!tryAcquireLease(listed.number, leaseHead)) {
+                core.info(
+                  `PR #${listed.number}: HEAD ${leaseHead} is already owned by this reconciliation; coalescing duplicate wakeup.`
+                );
+                continue;
+              }
+              try {
+              // Guarded live fetch: one transient or deterministic fetch
+              // failure must not abort the repository loop and strand
+              // healthy PRs behind a single bad PR.
+              let pr;
+              try {
+                pr = await getPullWithAuthoritativeHead(listed.number);
+              } catch (err) {
+                if (isTransientApiError(err)) {
+                  core.warning(`PR #${listed.number}: transient fetch error; deferred to next wakeup: ` + (err.message || err));
+                } else {
+                  core.error(`PR #${listed.number}: deterministic fetch error; skipping PR: ` + (err.stack || err.message || err));
+                  if (!deterministicFailure) deterministicFailure = err;
+                }
+                continue;
+              }
+              if (pr.head.sha !== leaseHead) {
+                core.info(`PR #${pr.number}: HEAD moved ${leaseHead} -> ${pr.head.sha}; holding stale reconciliation.`);
+                continue;
+              }
+              if (
+                pr.state !== 'open' ||
+                pr.draft ||
+                pr.head.repo?.full_name !== repoFullName
+              ) {
+                continue;
+              }
+
+              if (hasLabel(pr, AUTO_MERGE_BLOCK_LABEL)) {
+                core.info(
+                  `PR #${pr.number}: ${AUTO_MERGE_BLOCK_LABEL} is set; skipping.`
+                );
+                continue;
+              }
+
+              // Self-healing conflict scan runs on every pass, before the
+              // CI/review gates, so an already-dirty PR is never stranded
+              // behind a red CI check and a PR that predates this controller
+              // revision is rediscovered without any new PR event or manual
+              // command. Clean PRs (including freshly repaired HEADs) fall
+              // through to the normal gates below.
+              if (await reconcileDirtyPr(pr)) {
+                continue;
+              }
+
+              // Do not churn PR HEADs merely because main advanced in
+              // documentation or repository control-plane files. CodeRabbit
+              // review is a property of the PR source HEAD; changing README or
+              // workflow plumbing must not invalidate it. Runtime/build/test/
+              // packaging changes on main remain strict and force a real sync.
+              const comparison = await compareWithMain(pr.head.sha);
+              const mainSync = await shouldSyncFromMain(pr, comparison);
+              if (mainSync.required) {
+                const agentOperation = await activePrAgentHeadOperation(pr);
+                if (agentOperation.active) {
+                  core.notice(
+                    `PR #${pr.number}: preserving current HEAD while ${agentOperation.reason}; exact-HEAD review/repair keeps its Work Lock.`
+                  );
+                  continue;
+                }
+                core.notice(
+                  `PR #${pr.number}: main advanced in merge-critical files; synchronizing before merge: ${mainSync.criticalFiles.join(', ') || mainSync.reason}.`
+                );
+                await updateFromMain(pr);
+                continue;
+              }
+              if (mainSync.reason === 'non-merge-critical-main-delta') {
+                core.notice(
+                  `PR #${pr.number}: main advanced only in non-merge-critical files; preserving PR HEAD and existing review/CI state: ${mainSync.files.join(', ')}.`
+                );
+              }
+
+              if (prAgentSyncOnly) {
+                core.info(
+                  `PR #${pr.number}: PR-Agent owns review/merge; generic reconciler stops after main-sync evaluation.`
+                );
+                continue;
+              }
+
+              const ci = await latestCurrentHeadCi(pr);
+              if (
+                !ci ||
+                ci.status !== 'completed' ||
+                ci.conclusion !== 'success'
+              ) {
+                core.info(
+                  `PR #${pr.number}: waiting for successful CI on head ${pr.head.sha}.`
+                );
+                continue;
+              }
+
+              const continuumContractGate =
+                await latestContinuumContractGate(pr);
+              if (
+                repoFullName === 'kodmial/continuum' &&
+                (
+                  !continuumContractGate ||
+                  continuumContractGate.status !== 'completed' ||
+                  continuumContractGate.conclusion !== 'success'
+                )
+              ) {
+                core.info(
+                  `PR #${pr.number}: waiting for successful Continuum Contract Gate on head ${pr.head.sha}.`
+                );
+                continue;
+              }
+
+              // Packaging smoke is conditional/path-filtered. If this HEAD has
+              // a Packaging smoke run, it is a blocking quality gate just like
+              // CI; an absent run means the workflow was not applicable.
+              const packagingSmoke =
+                await latestCurrentHeadPackagingSmoke(pr);
+              if (
+                packagingSmoke &&
+                (packagingSmoke.status !== 'completed' ||
+                 packagingSmoke.conclusion !== 'success')
+              ) {
+                core.info(
+                  `PR #${pr.number}: waiting for successful Packaging smoke on head ${pr.head.sha}; current state=${packagingSmoke.status}/${packagingSmoke.conclusion || 'pending'}.`
+                );
+                continue;
+              }
+
+              const extraWorkflowGate =
+                await requiredWorkflowGate(pr, pr.head.sha);
+              if (
+                requiredWorkflowGateLabel &&
+                requiredWorkflowGateName &&
+                hasLabel(pr, requiredWorkflowGateLabel) &&
+                (
+                  !extraWorkflowGate ||
+                  extraWorkflowGate.status !== 'completed' ||
+                  extraWorkflowGate.conclusion !== 'success'
+                )
+              ) {
+                core.info(
+                  `PR #${pr.number}: waiting for required workflow '${requiredWorkflowGateName}' on head ${pr.head.sha}; current state=${extraWorkflowGate ? `${extraWorkflowGate.status}/${extraWorkflowGate.conclusion || 'pending'}` : 'missing'}.`
+                );
+                continue;
+              }
+
+              // Continuum-only contract qualification. Consumer repositories
+              // retain their own CI/packaging/configured required gates.
+              const contractGate = await latestCurrentHeadContractQualification(pr);
+              if (
+                repoFullName === 'kodmial/continuum' &&
+                (
+                  !contractGate ||
+                  contractGate.status !== 'completed' ||
+                  contractGate.conclusion !== 'success'
+                )
+              ) {
+                core.info(
+                  `PR #${pr.number}: waiting for successful Contract qualification on head ${pr.head.sha}; current state=${contractGate ? `${contractGate.status}/${contractGate.conclusion || 'pending'}` : 'missing'}.`
+                );
+                continue;
+              }
+
+              // A clean controller-generated merge of main can reuse a prior
+              // completed APPROVED review. Any other new HEAD must have its own
+              // CodeRabbit review. Without CodeRabbit there is no review basis
+              // to establish and nothing to wait for.
+              const reviewBasis = requireCodeRabbit
+                ? await codeRabbitReviewBasis(pr, pr.head.sha)
+                : null;
+              const rabbitStatus = requireCodeRabbit
+                ? await latestCodeRabbitStatus(pr.head.sha)
+                : null;
+              const reviewNoProgressBlocked =
+                requireCodeRabbit && !reviewBasis
+                  ? await codeRabbitNoProgressBlocked(pr, pr.head.sha)
+                  : false;
+
+              // A policy/task-contract verdict with no actionable code finding
+              // is not a coding-agent repair request and must never become a
+              // human-required terminal state. The global CodeRabbit controller
+              // keeps the exact HEAD queued behind the provider cooldown until
+              // approval or an actionable finding appears.
+              if (reviewNoProgressBlocked) {
+                core.warning(
+                  `PR #${pr.number}: exact HEAD ${pr.head.sha} has a summary-only CodeRabbit verdict; keeping it in the autonomous re-review queue.`
+                );
+                continue;
+              }
+
+              // Any green current HEAD that still lacks a valid CodeRabbit
+              // approval belongs to the global serialized review queue. Wake
+              // that controller even when CodeRabbit reports "review skipped",
+              // a stale success status, or no status at all. The controller
+              // owns quota timing and de-duplicates in-flight commands.
+              //
+              // `requireCodeRabbit` is checked here, not only through
+              // `!reviewBasis`: with the flag off there is no review queue to
+              // wake, and a repository without `continuum-coderabbit-retry.yml`
+              // would answer the dispatch with a 404.
+              if (requireCodeRabbit && !reviewBasis && !codeRabbitRetryControllerDispatched) {
+                await github.rest.actions.createWorkflowDispatch({
+                  owner,
+                  repo,
+                  workflow_id: codeRabbitRetryWorkflow,
+                  ref: 'main',
+                });
+                codeRabbitRetryControllerDispatched = true;
+                core.notice(
+                  `PR #${pr.number}: missing a valid CodeRabbit approval; dispatched the global review controller.`
+                );
+              }
+
+              // Rate-limit recovery applies only when this HEAD still needs its
+              // own review. A safely carried approval must not burn another
+              // included CodeRabbit review merely because the merge SHA changed.
+              if (
+                requireCodeRabbit &&
+                !reviewBasis &&
+                rabbitStatus &&
+                /Review rate limited|Review limit reached/i.test(
+                  rabbitStatus.description || ''
+                )
+              ) {
+                // Full-review quota is shared across PRs. Delegate selection to
+                // the global CodeRabbit retry controller, which ranks the
+                // source issues P0 -> P1 -> P2 and emits at most one review
+                // command for the next legal quota slot.
+                if (!codeRabbitRetryControllerDispatched) {
+                  await github.rest.actions.createWorkflowDispatch({
+                    owner,
+                    repo,
+                    workflow_id: codeRabbitRetryWorkflow,
+                    ref: 'main',
+                  });
+                  codeRabbitRetryControllerDispatched = true;
+                  core.notice(
+                    'Delegated rate-limited CodeRabbit reviews to the global priority controller.'
+                  );
+                }
+                continue;
+              }
+
+              // Never lose an old CodeRabbit finding just because its diff is
+              // now outdated. Thread convergence must run before the generic
+              // "completed review" status wait: CodeRabbit can overwrite a
+              // completed-review status with "Review skipped" while an
+              // exact-head finding still needs verification. Waiting first
+              // creates a deadlock where no verifier is ever re-requested.
+              const unresolvedThreads = requireCodeRabbit
+                ? await unresolvedCodeRabbitThreads(pr)
+                : [];
+              if (unresolvedThreads.length > 0) {
+                const requested = await requestCodeRabbitThreadVerification(
+                  pr,
+                  unresolvedThreads
+                );
+                core.info(
+                  `PR #${pr.number}: waiting for ${unresolvedThreads.length} unresolved CodeRabbit thread(s); requested ${requested} fresh verification(s) for head ${pr.head.sha}: ` +
+                  unresolvedThreads
+                    .map(thread =>
+                      `#${thread.commentId || thread.id} ${thread.path}${thread.outdated ? ' (outdated)' : ''}`
+                    )
+                    .join(', ')
+                );
+                continue;
+              }
+
+              if (
+                requireCodeRabbit &&
+                waitingForCompletedCodeRabbitReview(reviewBasis, rabbitStatus)
+              ) {
+                core.info(
+                  `PR #${pr.number}: waiting for completed CodeRabbit review on current head.`
+                );
+                continue;
+              }
+
+              // If CodeRabbit happened to comment on the synchronized current
+              // head, do not ignore those findings merely because the approval
+              // basis came from an older cleanly-carried head.
+              const currentHeadNitpicks = requireCodeRabbit
+                ? await codeRabbitNitpickReviews(pr)
+                : [];
+              if (currentHeadNitpicks.length > 0) {
+                core.info(
+                  `PR #${pr.number}: waiting for ${currentHeadNitpicks.length} current-head CodeRabbit nitpick review(s) to be addressed.`
+                );
+                continue;
+              }
+
+              if (requireCodeRabbit && !reviewBasis) {
+                const decision = await latestCodeRabbitDecision(pr);
+                core.info(
+                  `PR #${pr.number}: current-head CodeRabbit decision is ${decision?.state || 'missing'}; not mergeable yet.`
+                );
+                continue;
+              }
+
+              if (reviewBasis && reviewBasis.carried) {
+                core.info(
+                  `PR #${pr.number}: using CodeRabbit approval from ${reviewBasis.sourceSha} for clean main-sync head ${pr.head.sha}; current-head CI remains mandatory.`
+                );
+              }
+
+              // Re-read every merge-critical fact immediately before the write.
+              pr = await getPullWithAuthoritativeHead(pr.number);
+              if (
+                pr.state !== 'open' ||
+                pr.draft ||
+                pr.head.repo?.full_name !== repoFullName ||
+                hasLabel(pr, AUTO_MERGE_BLOCK_LABEL)
+              ) {
+                continue;
+              }
+
+              const finalComparison = await compareWithMain(pr.head.sha);
+              const finalMainSync =
+                await shouldSyncFromMain(pr, finalComparison);
+              if (finalMainSync.required) {
+                core.notice(
+                  `PR #${pr.number}: merge-critical main delta appeared during final revalidation; synchronizing instead of merging.`
+                );
+                await updateFromMain(pr);
+                continue;
+              }
+
+              const finalCi = await latestCurrentHeadCi(pr);
+              const finalContinuumContractGate =
+                await latestContinuumContractGate(pr, pr.head.sha);
+              const finalPackagingSmoke =
+                await latestCurrentHeadPackagingSmoke(pr);
+              const finalExtraWorkflowGate =
+                await requiredWorkflowGate(pr, pr.head.sha);
+              const finalContractGate =
+                await latestCurrentHeadContractQualification(pr);
+              const finalReviewBasis = requireCodeRabbit
+                ? await codeRabbitReviewBasis(pr, pr.head.sha)
+                : null;
+              const finalUnresolvedThreads = requireCodeRabbit
+                ? await unresolvedCodeRabbitThreads(pr)
+                : [];
+              const finalCurrentHeadNitpicks = requireCodeRabbit
+                ? await codeRabbitNitpickReviews(pr)
+                : [];
+
+              if (
+                !finalCi ||
+                finalCi.status !== 'completed' ||
+                finalCi.conclusion !== 'success' ||
+                (repoFullName === 'kodmial/continuum' &&
+                 (!finalContinuumContractGate ||
+                  finalContinuumContractGate.status !== 'completed' ||
+                  finalContinuumContractGate.conclusion !== 'success')) ||
+                (repoFullName === 'kodmial/continuum' &&
+                 (!finalContractGate ||
+                  finalContractGate.status !== 'completed' ||
+                  finalContractGate.conclusion !== 'success')) ||
+                (finalPackagingSmoke &&
+                 (finalPackagingSmoke.status !== 'completed' ||
+                  finalPackagingSmoke.conclusion !== 'success')) ||
+                (requiredWorkflowGateLabel &&
+                 requiredWorkflowGateName &&
+                 hasLabel(pr, requiredWorkflowGateLabel) &&
+                 (!finalExtraWorkflowGate ||
+                  finalExtraWorkflowGate.status !== 'completed' ||
+                  finalExtraWorkflowGate.conclusion !== 'success')) ||
+                // The CodeRabbit half of the revalidation is itself conditional:
+                // with the integration off there is nothing to re-read, and
+                // requiring a review basis that can never exist would cancel
+                // every merge.
+                (requireCodeRabbit &&
+                  (!finalReviewBasis ||
+                   finalUnresolvedThreads.length !== 0 ||
+                   finalCurrentHeadNitpicks.length !== 0))
+              ) {
+                core.info(
+                  `PR #${pr.number}: gate changed during final revalidation; merge cancelled.`
+                );
+                continue;
+              }
+
+              // Dirty check matches src/continuum/conflict_repair.py:is_conflicted:
+              // REST booleans and GraphQL-style mergeable strings agree.
+              const mergeConflicted = isConflictedMergeability(
+                pr.mergeable,
+                pr.mergeable_state
+              );
+              if (mergeConflicted === true) {
+                await dispatchConflictRepair(
+                  pr,
+                  `mergeable_state=${pr.mergeable_state}`
+                );
+                continue;
+              }
+              if (mergeConflicted === null) {
+                core.info(
+                  `PR #${pr.number}: GitHub mergeability is still being computed; waiting.`
+                );
+                continue;
+              }
+
+              // kodmial/continuum#295: frozen task-spec revalidation right
+              // before merge closes every time-of-check/time-of-use gap.
+              // The durable record is the bot-owned snapshot comment on
+              // the issue: the PR's snapshot reference must match it
+              // exactly, and the live issue is re-read here so a
+              // last-second edit cannot slip through the earlier gates.
+              // Drift (or an unverifiable read) holds the merge with an
+              // actionable diagnostic instead of merging a stale contract.
+              // PRs without a reference are legacy and merge under the
+              // existing gates. Canonical digests mirror
+              // src/continuum/task_snapshot.py (UTF-8, NFC, LF, SHA-256).
+              {
+                const snapshotRefBlock = String(pr.body || '').match(
+                  /<!--\s*continuum-task-snapshot-ref\b[^>]*-->/i
+                );
+                const attr = (name) => {
+                  if (!snapshotRefBlock) return null;
+                  const m = snapshotRefBlock[0].match(new RegExp(`${name}=([^\\s>]+)`, 'i'));
+                  return m ? m[1] : null;
+                };
+                const snapshotRefMatch = (() => {
+                  if (!snapshotRefBlock) return null;
+                  const repoAttr = attr('repo');
+                  const issueAttr = attr('issue');
+                  const generationAttr = attr('generation');
+                  const titleAttr = attr('title-sha256');
+                  const bodyAttr = attr('body-sha256');
+                  const specAttr = attr('spec-sha256');
+                  if (!repoAttr || !issueAttr || !generationAttr || !titleAttr || !bodyAttr || !specAttr) return null;
+                  if (!/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(repoAttr)) return null;
+                  if (!/^\d+$/.test(generationAttr)) return null;
+                  if (!/^[0-9a-fA-F]{64}$/.test(titleAttr) || !/^[0-9a-fA-F]{64}$/.test(bodyAttr) || !/^[0-9a-fA-F]{64}$/.test(specAttr)) return null;
+                  return [snapshotRefBlock[0], repoAttr, issueAttr, generationAttr, titleAttr, bodyAttr, specAttr];
+                })();
+                if (snapshotRefMatch) {
+                  const { createHash } = require('crypto');
+                  const taskRepoFull = snapshotRefMatch[1];
+                  const taskOwner = taskRepoFull.split('/')[0];
+                  const taskRepoName = taskRepoFull.split('/')[1];
+                  const taskIssue = Number(snapshotRefMatch[2]);
+                  const refGeneration = snapshotRefMatch[3];
+                  const pinnedTitleSha = snapshotRefMatch[4].toLowerCase();
+                  const pinnedBodySha = snapshotRefMatch[5].toLowerCase();
+                  const pinnedSpecSha = snapshotRefMatch[6].toLowerCase();
+                  if (refGeneration !== '1') {
+                    core.warning(
+                      `PR #${pr.number}: task snapshot reference is for generation ${refGeneration}, expected generation 1 (stale contract); merge held.`
+                    );
+                    continue;
+                  }
+                  const normText = (value) =>
+                    String(value ?? '').replace(/\r\n/g, '\n').replace(/\r/g, '\n').normalize('NFC');
+                  const shaHex = (text) => createHash('sha256').update(text, 'utf8').digest('hex');
+                  // The PR body is mutable, so the reference alone never
+                  // defines the contract: fetch the durable snapshot
+                  // comment and require the reference to match it. A
+                  // PR-body edit that retargets the ref shas to an edited
+                  // issue otherwise bypasses the drift hold.
+                  const snapshotMarkerRe =
+                    /<!--\s*continuum-task-snapshot\s+repo=([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)\s+issue=(\d+)\s+generation=(\d+)\s+title-sha256=([0-9a-fA-F]{64})\s+body-sha256=([0-9a-fA-F]{64})\s+spec-sha256=([0-9a-fA-F]{64})\s*-->/;
+                  const isTrustedSnapshotComment = (comment) => {
+                    const association = String(comment.author_association || '').toUpperCase();
+                    if (['OWNER', 'MEMBER', 'COLLABORATOR'].includes(association)) return true;
+                    const login = String((comment.user && comment.user.login) || '').toLowerCase();
+                    return login === 'github-actions[bot]';
+                  };
+                  let snapshotComments = [];
+                  try {
+                    if (taskRepoFull.toLowerCase() === repoFullName.toLowerCase()) {
+                      snapshotComments = await withReadFallback((client) =>
+                        client.paginate(client.rest.issues.listComments, {
+                          owner: taskOwner,
+                          repo: taskRepoName,
+                          issue_number: taskIssue,
+                          per_page: 100,
+                        })
+                      );
+                    } else {
+                      // Cross-repository snapshot comments are read with the
+                      // PAT-backed client (mirroring the live-issue fetch
+                      // below); the repository token is never installed on
+                      // the task repository. Bounded to three pages without
+                      // the paginate helper, which stays reserved for
+                      // repository-token scans.
+                      snapshotComments = [];
+                      for (let snapshotPage = 1; snapshotPage <= 3; snapshotPage++) {
+                        const { data: snapshotPageComments } = await github.rest.issues.listComments({
+                          owner: taskOwner,
+                          repo: taskRepoName,
+                          issue_number: taskIssue,
+                          per_page: 100,
+                          page: snapshotPage,
+                        });
+                        snapshotComments = snapshotComments.concat(snapshotPageComments || []);
+                        if ((snapshotPageComments || []).length < 100) break;
+                      }
+                    }
+                  } catch (err) {
+                    core.warning(
+                      `PR #${pr.number}: task snapshot verification failed (${err.message || err}); holding merge instead of merging blind.`
+                    );
+                    continue;
+                  }
+                  let durableSnapshot = null;
+                  for (const comment of snapshotComments || []) {
+                    const text = String((comment && comment.body) || '');
+                    const match = text.match(snapshotMarkerRe);
+                    if (!match) continue;
+                    if (match[1].toLowerCase() !== taskRepoFull.toLowerCase()) continue;
+                    if (Number(match[2]) !== taskIssue) continue;
+                    if (String(match[3]) !== String(refGeneration)) continue;
+                    if (!isTrustedSnapshotComment(comment || {})) continue;
+                    durableSnapshot = {
+                      titleSha: match[4].toLowerCase(),
+                      bodySha: match[5].toLowerCase(),
+                      specSha: match[6].toLowerCase(),
+                    };
+                    break;
+                  }
+                  if (!durableSnapshot) {
+                    core.warning(
+                      `PR #${pr.number}: no trusted task snapshot comment found for ${taskRepoFull}#${taskIssue} generation ${refGeneration}; merge held.`
+                    );
+                    continue;
+                  }
+                  if (
+                    durableSnapshot.titleSha !== pinnedTitleSha ||
+                    durableSnapshot.bodySha !== pinnedBodySha ||
+                    durableSnapshot.specSha !== pinnedSpecSha
+                  ) {
+                    core.warning(
+                      `PR #${pr.number}: task snapshot reference does not match the durable snapshot comment for ${taskRepoFull}#${taskIssue}; merge held.`
+                    );
+                    continue;
+                  }
+                  let liveIssue = null;
+                  try {
+                    if (taskRepoFull.toLowerCase() === repoFullName.toLowerCase()) {
+                      liveIssue = await withReadFallback((client) =>
+                        client.rest.issues.get({
+                          owner: taskOwner,
+                          repo: taskRepoName,
+                          issue_number: taskIssue,
+                        })
+                      );
+                    } else {
+                      liveIssue = await github.rest.issues.get({
+                        owner: taskOwner,
+                        repo: taskRepoName,
+                        issue_number: taskIssue,
+                      });
+                    }
+                  } catch (err) {
+                    core.warning(
+                      `PR #${pr.number}: task snapshot verification failed (${err.message || err}); holding merge instead of merging blind.`
+                    );
+                    continue;
+                  }
+                  const liveTitleSha = shaHex(normText(liveIssue.data.title || ''));
+                  const liveBodySha = shaHex(normText(liveIssue.data.body || ''));
+                  const liveSpecSha = shaHex(`${liveTitleSha}:${liveBodySha}`);
+                  if (liveTitleSha !== pinnedTitleSha || liveBodySha !== pinnedBodySha || liveSpecSha !== pinnedSpecSha) {
+                    const driftMarker =
+                      `<!-- continuum-task-snapshot-drift spec=${pinnedSpecSha} -->`;
+                    let alreadyNoted = false;
+                    try {
+                      const noted = await withReadFallback((client) =>
+                        client.rest.issues.listComments({
+                          owner, repo, issue_number: pr.number, per_page: 30, page: 1,
+                        })
+                      );
+                      alreadyNoted = (noted.data || []).some((comment) =>
+                        String(comment.body || '').includes(driftMarker)
+                      );
+                    } catch (err) {
+                      core.warning(`PR #${pr.number}: drift-note dedupe read failed; posting once.`);
+                    }
+                    if (!alreadyNoted) {
+                      try {
+                        await github.rest.issues.createComment({
+                          owner,
+                          repo,
+                          issue_number: pr.number,
+                          body: [
+                            driftMarker,
+                            '⚡ **Continuum · auto-merge**',
+                            '<!-- continuum-origin role=continuum component=auto-merge -->',
+                            `Task contract drift detected for ${taskRepoFull}#${taskIssue}: the live issue no longer matches this PR's pinned snapshot (spec ${pinnedSpecSha}).`,
+                            '',
+                            'Merge is held for this generation. Open a new follow-up issue with an explicit dependency instead of editing the working issue.',
+                          ].join('\n'),
+                        });
+                      } catch (err) {
+                        core.warning(`PR #${pr.number}: could not post drift diagnostic: ${err.message || err}`);
+                      }
+                    }
+                    core.warning(
+                      `PR #${pr.number}: task contract drift for ${taskRepoFull}#${taskIssue}; merge held.`
+                    );
+                    continue;
+                  }
+                } else if (snapshotRefBlock) {
+                  // The marker is present but malformed (truncated,
+                  // hand-edited, or tampered): the contract is unverifiable,
+                  // so hold the merge with a diagnostic. Only a truly absent
+                  // marker is legacy.
+                  const unverifiableMarker =
+                    '<!-- continuum-task-snapshot-unverifiable -->';
+                  let alreadyNoted = false;
+                  try {
+                    const noted = await withReadFallback((client) =>
+                      client.rest.issues.listComments({
+                        owner, repo, issue_number: pr.number, per_page: 30, page: 1,
+                      })
+                    );
+                    alreadyNoted = (noted.data || []).some((comment) =>
+                      String(comment.body || '').includes(unverifiableMarker)
+                    );
+                  } catch (err) {
+                    core.warning(`PR #${pr.number}: unverifiable-note dedupe read failed; posting once.`);
+                  }
+                  if (!alreadyNoted) {
+                    try {
+                      await github.rest.issues.createComment({
+                        owner,
+                        repo,
+                        issue_number: pr.number,
+                        body: [
+                          unverifiableMarker,
+                          '⚡ **Continuum · auto-merge**',
+                          '<!-- continuum-origin role=continuum component=auto-merge -->',
+                          `Task snapshot reference on PR #${pr.number} is present but malformed, so the task contract cannot be verified.`,
+                          '',
+                          'Merge is held until a verifiable snapshot reference is present. Open a new follow-up issue with an explicit dependency instead of editing the working issue.',
+                        ].join('\n'),
+                      });
+                    } catch (err) {
+                      core.warning(`PR #${pr.number}: could not post unverifiable diagnostic: ${err.message || err}`);
+                    }
+                  }
+                  core.warning(
+                    `PR #${pr.number}: task snapshot reference is malformed and unverifiable; merge held.`
+                  );
+                  continue;
+                }
+              }
+
+              // release-please parses the squash commit on main, not the PR
+              // title separately. Keep PR titles human-friendly and normalize
+              // the generated squash commit here so contributors never need to
+              // write Conventional Commit prefixes themselves.
+              const conventionalTitle = /^(?:fix|feat|perf|refactor)(?:\([^)]*\))?!?:\s/i.test(pr.title)
+                ? pr.title
+                : `fix: ${pr.title}`;
+
+              const { data: result } = await github.rest.pulls.merge({
+                owner,
+                repo,
+                pull_number: pr.number,
+                merge_method: 'squash',
+                commit_title: conventionalTitle,
+                sha: pr.head.sha,
+              });
+
+              if (!result.merged) {
+                core.warning(
+                  `PR #${pr.number}: GitHub refused merge: ${result.message || 'unknown reason'}`
+                );
+                continue;
+              }
+
+              core.notice(
+                `PR #${pr.number}: auto-merged head ${pr.head.sha} using ${
+                  requireCodeRabbit
+                    ? (
+                      finalReviewBasis.convergedNoProgress
+                        ? `clean CodeRabbit full review after summary-only blocker on ${finalReviewBasis.sourceSha}`
+                        : `CodeRabbit approval from ${finalReviewBasis.sourceSha}`
+                    )
+                    : 'CI only; CodeRabbit is disabled for this repository'
+                }; merge commit ${result.sha}.`
+              );
+
+              // Waking downstream workflows is best-effort and never changes the
+              // merge outcome: a merge already landed, so a wake-up that cannot
+              // be delivered must not turn the run red or stop the scheduler
+              // from being woken at all.
+              for (const workflow of postMergeWakeups) {
+                try {
+                  await github.request(
+                    'POST /repos/{owner}/{repo}/actions/workflows/{workflow_id}/dispatches',
+                    { owner, repo, workflow_id: workflow, ref: postMergeWakeupRef }
+                  );
+                  core.notice(`Woke ${workflow} at ${postMergeWakeupRef}.`);
+                } catch (err) {
+                  core.warning(
+                    `PR #${pr.number}: could not wake ${workflow}: ${err.message}`
+                  );
+                }
+              }
+
+              // Merge at most one PR per controller run. The main push triggers
+              // a new run, which first refreshes every remaining branch from the
+              // new main. Clean controller-generated syncs keep an already valid
+              // CodeRabbit approval; all other new commits require a fresh review.
+              break;
+              } catch (err) {
+                // Transient infrastructure gaps warn and defer to the next
+                // event/scheduled wakeup from latest state. A deterministic
+                // per-PR failure is loud but never aborts the loop: one
+                // malformed PR, red CI fetcher error, or permission failure
+                // must not strand healthy PRs behind it. `listed.number` is
+                // loop-stable; `pr` is let-scoped inside the try above and
+                // is not visible here.
+                if (isTransientApiError(err)) {
+                  core.warning(
+                    `PR #${listed.number}: transient reconciliation error; a later wakeup retries from latest state: ` +
+                    (err.message || err)
+                  );
+                } else {
+                  core.error(
+                    `PR #${listed.number}: deterministic reconciliation error; skipping PR but continuing run: ` +
+                    (err.stack || err.message || err)
+                  );
+                  if (!deterministicFailure) deterministicFailure = err;
+                }
+              } finally {
+                // Release by the listed identity: `pr` stays undefined when
+                // the guarded getPull above fails, and dereferencing it here
+                // would throw in `finally` and abort the whole open-PR loop
+                // behind one bad fetch. The number never changes mid-loop.
+                releaseLease(listed.number, leaseHead);
+              }
+            }
+            if (deterministicFailure) {
+              core.setFailed(
+                'Deterministic auto-merge reconciliation failure(s) held loudly: ' +
+                (deterministicFailure.message || deterministicFailure)
+              );
+            }
