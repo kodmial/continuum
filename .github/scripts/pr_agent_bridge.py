@@ -330,11 +330,32 @@ class Handler(BaseHTTPRequestHandler):
         try:
             timeout = int(_env("PR_AGENT_TIMEOUT_SECONDS", "600") or "600")
         except ValueError:
+            print(
+                "bridge: PR_AGENT_TIMEOUT_SECONDS is not an integer; "
+                "falling back to 600 seconds",
+                file=sys.stderr,
+                flush=True,
+            )
             timeout = 600
         if not isinstance(body, dict):
             self._send(
                 400,
                 openai_error("invalid_request", "request body must be a JSON object"),
+            )
+            return
+        messages = body.get("messages", [])
+        if not isinstance(messages, list) or not all(
+            isinstance(message, dict) for message in messages
+        ):
+            # The caller's request shape is validated here so a malformed
+            # `messages` value is a 400, never an upstream "malformed
+            # opencode response" 502.
+            self._send(
+                400,
+                openai_error(
+                    "invalid_request",
+                    "messages must be a list of JSON objects",
+                ),
             )
             return
         started = time.monotonic()

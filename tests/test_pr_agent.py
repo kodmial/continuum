@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import contextlib
+import io
 import json
 import os
 import threading
@@ -11,6 +13,7 @@ from urllib import error as urlerror
 from urllib import request as urlrequest
 
 from continuum import pr_agent
+from continuum import pr_agent_lifecycle
 from continuum.pr_agent import (
     BLOCKING_SEVERITIES,
     Coverage,
@@ -88,6 +91,22 @@ class ProviderConfigTests(unittest.TestCase):
         )
         self.assertTrue(runtime.enabled)
         self.assertFalse(runtime.api_key_present)
+
+
+class ConfigurationTests(unittest.TestCase):
+    """Workflow-independent configuration contract for the PR-Agent stack."""
+
+    def test_push_outputs_belongs_to_host_configuration(self):
+        root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+        with open(os.path.join(root, ".pr_agent.toml"), "r", encoding="utf-8") as handle:
+            toml = handle.read()
+        # v0.46.0 drops a repository-local [push_outputs] section, so the host
+        # configuration owns it and the checked-in file must not pretend otherwise.
+        self.assertNotIn("\n[push_outputs]\n", "\n" + toml + "\n")
+        host = pr_agent_lifecycle.required_toml()["push_outputs"]
+        self.assertEqual(host["enable"], True)
+        self.assertEqual(host["channels"], ["file"])
+        self.assertEqual(host["file_path"], "pr-agent-outputs/continuum.jsonl")
 
 
 class BridgeConversionTests(unittest.TestCase):
@@ -456,22 +475,40 @@ class BridgeErrorResponseTests(unittest.TestCase):
         self.assertEqual(status, 400)
         self.assertEqual(payload["error"]["type"], "invalid_request")
 
+    def test_non_list_messages_is_a_400_not_an_upstream_502(self):
+        port = self._serve(self.bridge.Handler)
+        status, payload = self._post(port, json.dumps({"messages": 5}).encode())
+        self.assertEqual(status, 400)
+        self.assertEqual(payload["error"]["type"], "invalid_request")
+
+    def test_non_mapping_message_entry_is_a_400_not_an_upstream_502(self):
+        port = self._serve(self.bridge.Handler)
+        status, payload = self._post(port, json.dumps({"messages": [1]}).encode())
+        self.assertEqual(status, 400)
+        self.assertEqual(payload["error"]["type"], "invalid_request")
+
     def test_non_numeric_timeout_falls_back_instead_of_dropping_the_request(self):
         upstream = self._serve(FakeOpenCodeHandler)
         os.environ["OPENCODE_SERVER_URL"] = f"http://127.0.0.1:{upstream}"
         os.environ["PR_AGENT_TIMEOUT_SECONDS"] = "not-a-number"
         port = self._serve(self.bridge.Handler)
-        status, payload = self._post(
-            port,
-            json.dumps(
-                {
-                    "model": "openai/continuum-review",
-                    "messages": [{"role": "user", "content": "hi"}],
-                }
-            ).encode(),
-        )
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            status, payload = self._post(
+                port,
+                json.dumps(
+                    {
+                        "model": "openai/continuum-review",
+                        "messages": [{"role": "user", "content": "hi"}],
+                    }
+                ).encode(),
+            )
         self.assertEqual(status, 200)
         self.assertEqual(payload["object"], "chat.completion")
+        # The fallback must be announced, not silent.
+        warning = stderr.getvalue()
+        self.assertIn("PR_AGENT_TIMEOUT_SECONDS", warning)
+        self.assertIn("falling back", warning)
 
     def test_malformed_session_response_is_a_502(self):
         for raw in (b"not json", b"[]"):
