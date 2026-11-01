@@ -9,6 +9,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from continuum import verification
 
@@ -194,6 +195,22 @@ class ChildEnvironmentTests(unittest.TestCase):
         missing = self.key_directory / "missing.key"
         with self.assertRaises(verification.VerificationError):
             verification._attestation_key({KEY_FILE_ENV: str(missing)})
+
+    def test_key_file_read_failure_leaves_the_key_file_in_place(self):
+        key_path = Path(self.key_env[KEY_FILE_ENV])
+        original_read_text = Path.read_text
+
+        def deny_key_file_read(path, *args, **kwargs):
+            if path == key_path:
+                raise PermissionError("permission denied")
+            return original_read_text(path, *args, **kwargs)
+
+        with mock.patch.object(Path, "read_text", deny_key_file_read):
+            with self.assertRaises(verification.VerificationError) as caught:
+                verification._attestation_key({KEY_FILE_ENV: str(key_path)})
+        self.assertIn("unavailable", str(caught.exception))
+        self.assertTrue(key_path.exists())
+        self.assertEqual(key_path.read_text(encoding="utf-8"), KEY_VALUE)
 
 
 class ContractResolutionAtRefTests(unittest.TestCase):

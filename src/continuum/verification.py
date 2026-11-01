@@ -772,11 +772,10 @@ def _attestation_key(
         raise VerificationError(
             "the verification attestation key file is unavailable: {}".format(exc)
         ) from exc
-    finally:
-        try:
-            path.unlink()
-        except OSError:
-            pass
+    try:
+        path.unlink()
+    except OSError:
+        pass
     if not raw:
         raise VerificationError("the verification attestation key file is empty")
     key = raw.encode("utf-8")
