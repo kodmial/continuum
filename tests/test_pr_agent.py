@@ -487,13 +487,29 @@ class BridgeErrorResponseTests(unittest.TestCase):
         self.assertEqual(status, 400)
         self.assertEqual(payload["error"]["type"], "invalid_request")
 
+    def test_pr_agent_error_is_a_400_invalid_request(self):
+        # An empty `messages` list and an unknown role both pass the
+        # bridge's request-shape check and raise PrAgentError inside
+        # run_completion; the handler must classify them as 400, never
+        # drop the connection or blame the upstream.
+        port = self._serve(self.bridge.Handler)
+        for messages in ([], [{"role": "critic", "content": "hi"}]):
+            with self.subTest(messages=messages):
+                status, payload = self._post(
+                    port, json.dumps({"messages": messages}).encode()
+                )
+                self.assertEqual(status, 400)
+                self.assertEqual(payload["error"]["type"], "invalid_request")
+                self.assertTrue(payload["error"]["message"])
+
     def test_non_numeric_timeout_falls_back_instead_of_dropping_the_request(self):
         upstream = self._serve(FakeOpenCodeHandler)
         os.environ["OPENCODE_SERVER_URL"] = f"http://127.0.0.1:{upstream}"
         os.environ["PR_AGENT_TIMEOUT_SECONDS"] = "not-a-number"
         port = self._serve(self.bridge.Handler)
+        stdout = io.StringIO()
         stderr = io.StringIO()
-        with contextlib.redirect_stderr(stderr):
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
             status, payload = self._post(
                 port,
                 json.dumps(
@@ -505,10 +521,14 @@ class BridgeErrorResponseTests(unittest.TestCase):
             )
         self.assertEqual(status, 200)
         self.assertEqual(payload["object"], "chat.completion")
-        # The fallback must be announced, not silent.
-        warning = stderr.getvalue()
-        self.assertIn("PR_AGENT_TIMEOUT_SECONDS", warning)
-        self.assertIn("falling back", warning)
+        # The fallback must be announced exactly once on stderr, with the
+        # literal effective timeout, and nothing may leak to stdout.
+        captured = stderr.getvalue()
+        self.assertEqual(
+            captured.count("PR_AGENT_TIMEOUT_SECONDS is not an integer"), 1
+        )
+        self.assertIn("600 seconds", captured)
+        self.assertEqual(stdout.getvalue(), "")
 
     def test_malformed_session_response_is_a_502(self):
         for raw in (b"not json", b"[]"):
