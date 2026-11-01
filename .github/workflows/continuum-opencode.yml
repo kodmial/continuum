@@ -398,6 +398,31 @@ jobs:
               if (start === -1) return '';
               return normalizeCaller(text.slice(start).split('@')[0]);
             };
+            // A dispatch ref must be a branch or tag name. `github.workflow_ref`
+            // for pull-request events points at the un-dispatchable
+            // `refs/pull/<n>/merge`, so only heads and tags are accepted.
+            const dispatchRefFromWorkflowRef = value => {
+              const text = String(value || '').trim();
+              const at = text.lastIndexOf('@');
+              if (at === -1) return '';
+              const ref = text.slice(at + 1);
+              if (ref.startsWith('refs/heads/') && ref.length > 'refs/heads/'.length) {
+                return ref.slice('refs/heads/'.length);
+              }
+              if (ref.startsWith('refs/tags/') && ref.length > 'refs/tags/'.length) {
+                return ref.slice('refs/tags/'.length);
+              }
+              return '';
+            };
+            const normalizeBranchRef = value => {
+              const text = String(value || '').trim();
+              if (!text || text.startsWith('-') || text.startsWith('/') ||
+                  text.endsWith('/') || text.includes('..') ||
+                  !/^[A-Za-z0-9._/-]+$/.test(text)) {
+                return '';
+              }
+              return text;
+            };
             const callerCandidates = [...new Set([
               normalizeCaller(process.env.OPENCODE_WORKFLOW),
               callerFromRef(process.env.OPENCODE_CALLER_WORKFLOW),
@@ -407,41 +432,54 @@ jobs:
               const defaultBranch = (await github.rest.repos.get({
                 owner, repo,
               })).data.default_branch;
-              for (const candidate of callerCandidates) {
-                let source;
-                try {
-                  const response = await github.rest.repos.getContent({
-                    owner, repo, path: candidate, ref: defaultBranch,
-                  });
-                  if (Array.isArray(response.data) || response.data.type !== 'file') {
-                    continue;
+              // Prefer the default branch so an installed consumer always
+              // dispatches the reviewed caller, then the ref this run came
+              // from, then the PR head branch. Continuum's own checkout keeps
+              // the dispatchable caller only on the PR branch, so the fallback
+              // is required there without weakening consumer routing.
+              const candidateRefs = [...new Set([
+                defaultBranch,
+                dispatchRefFromWorkflowRef(process.env.OPENCODE_CALLER_WORKFLOW),
+                normalizeBranchRef(process.env.HEAD_REF),
+              ].filter(Boolean))];
+              for (const ref of candidateRefs) {
+                for (const candidate of callerCandidates) {
+                  let source;
+                  try {
+                    const response = await github.rest.repos.getContent({
+                      owner, repo, path: candidate, ref,
+                    });
+                    if (Array.isArray(response.data) || response.data.type !== 'file') {
+                      continue;
+                    }
+                    source = Buffer.from(
+                      String(response.data.content || '').replace(/\n/g, ''),
+                      'base64'
+                    ).toString('utf8');
+                  } catch (err) {
+                    if (err.status === 404) continue;
+                    throw err;
                   }
-                  source = Buffer.from(
-                    String(response.data.content || '').replace(/\n/g, ''),
-                    'base64'
-                  ).toString('utf8');
-                } catch (err) {
-                  if (err.status === 404) continue;
-                  throw err;
-                }
-                const lines = source.split(/\r?\n/);
-                const onIndex = lines.findIndex(line => /^on:\s*(?:#.*)?$/.test(line));
-                if (onIndex === -1) continue;
-                const onBlock = [];
-                for (let index = onIndex + 1; index < lines.length; index += 1) {
-                  if (/^\S/.test(lines[index]) && !lines[index].startsWith('#')) break;
-                  onBlock.push(lines[index]);
-                }
-                if (/^\s{2}workflow_dispatch:\s*(?:#.*)?$/m.test(onBlock.join('\n'))) {
-                  return {
-                    path: candidate,
-                    workflowId: candidate.slice(candidate.lastIndexOf('/') + 1),
-                    ref: defaultBranch,
-                  };
+                  const lines = source.split(/\r?\n/);
+                  const onIndex = lines.findIndex(line => /^on:\s*(?:#.*)?$/.test(line));
+                  if (onIndex === -1) continue;
+                  const onBlock = [];
+                  for (let index = onIndex + 1; index < lines.length; index += 1) {
+                    if (/^\S/.test(lines[index]) && !lines[index].startsWith('#')) break;
+                    onBlock.push(lines[index]);
+                  }
+                  if (/^\s{2}workflow_dispatch:\s*(?:#.*)?$/m.test(onBlock.join('\n'))) {
+                    return {
+                      path: candidate,
+                      workflowId: candidate.slice(candidate.lastIndexOf('/') + 1),
+                      ref,
+                    };
+                  }
                 }
               }
               throw new Error(
-                'No repository-local OpenCode caller declares workflow_dispatch; ' +
+                'No repository-local OpenCode caller declares workflow_dispatch on ' +
+                `any dispatchable ref (${candidateRefs.join(', ')}); ` +
                 'refusing to dispatch the reusable workflow-call engine.'
               );
             }
@@ -2859,6 +2897,9 @@ jobs:
           # coding agent, or consumer verification command inherits the secret.
           CONTINUUM_ATTESTATION_KEY_VALUE="${CONTINUUM_VERIFICATION_ATTESTATION_KEY:-}"
           unset CONTINUUM_VERIFICATION_ATTESTATION_KEY
+          # The key file must live outside the task worktree. The verification
+          # engine removes it after reading, so each call re-provisions it.
+          ATTESTATION_KEY_FILE="${RUNNER_TEMP:-/tmp}/continuum-attestation-key"
           continuum_assert_no_stop() {
             local stop_repo="${1:?repo}" stop_issue="${2:?issue}" stop_file stop_kind
             stop_file="$(mktemp "${RUNNER_TEMP:-/tmp}/continuum-operator-stop.XXXXXX")"
@@ -3060,7 +3101,17 @@ jobs:
             exit 1
           }
           verification_python() {
-            CONTINUUM_VERIFICATION_ATTESTATION_KEY="$CONTINUUM_ATTESTATION_KEY_VALUE" \
+            # The engine rejects the key in its own environment (a repository
+            # command can read /proc/$PPID/environ). Re-provision the private
+            # key file from the non-exported shell value before each
+            # invocation, then pass only its path; reading consumes the file.
+            if [[ -n "${CONTINUUM_ATTESTATION_KEY_VALUE:-}" ]]; then
+              printf '%s' "$CONTINUUM_ATTESTATION_KEY_VALUE" | \
+                CONTINUUM_VERIFICATION_ATTESTATION_KEY_FILE="$ATTESTATION_KEY_FILE" \
+                PYTHONPATH="$VERIFICATION_ENGINE_ROOT/src${PYTHONPATH:+:$PYTHONPATH}" \
+                python3 -m continuum.verification provision-key --repo "$GITHUB_WORKSPACE" || return 1
+            fi
+            CONTINUUM_VERIFICATION_ATTESTATION_KEY_FILE="$ATTESTATION_KEY_FILE" \
               PYTHONPATH="$VERIFICATION_ENGINE_ROOT/src${PYTHONPATH:+:$PYTHONPATH}" python3 -m continuum.verification "$@"
           }
           RECOVERY_STAGE_NOW="${RECOVERY_STAGE_IN:-implementation-incomplete}"

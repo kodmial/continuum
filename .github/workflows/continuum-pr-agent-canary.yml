@@ -125,7 +125,7 @@ jobs:
               const lowered = value.toLowerCase();
               for (const needle of ['groq', 'anthropic', 'openai_api_key']) {
                 if (lowered.includes(needle)) {
-                  core.setFailed(`Canary refuses paid-provider reference ${needle!r} in ${value!r}.`);
+                  core.setFailed(`Canary refuses paid-provider reference ${needle} in ${value}.`);
                   return;
                 }
               }

@@ -20,6 +20,13 @@ on:
         type: string
         default: ''
         required: false
+      mode:
+        description: >-
+          repair runs a bounded review-finding repair; conflict merges the
+          default branch into the PR branch and resolves merge conflicts.
+        type: string
+        default: repair
+        required: false
       target_child_id:
         description: Opaque verified child id for delegated execution. Empty targets the caller repository.
         type: string
@@ -90,9 +97,16 @@ jobs:
         env:
           INPUT_REVIEW_PROVIDER: ${{ inputs.review_provider }}
           CFG_REVIEW_PROVIDER: ${{ vars.CONTINUUM_REVIEW_PROVIDER }}
+          MODE: ${{ inputs.mode || 'repair' }}
         with:
           github-token: ${{ secrets.TAP_PAT }}
           script: |
+            // Conflict repair consumes no review signal, so it must work in a
+            // repository whose review provider is not PR-Agent.
+            if (String(process.env.MODE || 'repair').trim().toLowerCase() === 'conflict') {
+              core.setOutput('stack', 'conflict');
+              return;
+            }
             // One selector owns the entire review stack.
             const reviewProvider = String(
               process.env.INPUT_REVIEW_PROVIDER || process.env.CFG_REVIEW_PROVIDER || 'none'
@@ -261,6 +275,7 @@ jobs:
         uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
         env:
           PR_NUMBER: ${{ inputs.pr_number }}
+          MODE: ${{ inputs.mode || 'repair' }}
           HEAD_SHA: ${{ inputs.head_sha }}
           REPAIR_BATCH_COMMENT_ID: ${{ inputs.repair_batch_comment_id }}
           REVIEW_JSON: ${{ inputs.review_json }}
@@ -282,6 +297,30 @@ jobs:
             ) {
               core.setFailed(
                 'Delegated PR-Agent repair handoff read requires TAP_PAT; refusing to fall back to github.token.'
+              );
+              return;
+            }
+
+            // Conflict mode has no review payload: it merges the default
+            // branch into the PR branch and resolves the conflicts. The
+            // synthetic fingerprint still gives the convergence transition a
+            // stable exact-HEAD identity.
+            if (String(process.env.MODE || 'repair').trim().toLowerCase() === 'conflict') {
+              const crypto = require('crypto');
+              const fingerprint = crypto
+                .createHash('sha256')
+                .update('conflict:' + headSha)
+                .digest('hex');
+              core.setOutput('empty', 'false');
+              core.setOutput('count', '1');
+              core.setOutput('truncated', 'false');
+              core.setOutput('fingerprint', fingerprint);
+              core.setOutput('finding_ids', fingerprint);
+              core.setOutput('identified_batch', JSON.stringify([{ id: fingerprint, item: { source: 'conflict' } }]));
+              core.setOutput('batch', JSON.stringify([{ source: 'conflict' }]));
+              core.notice(
+                'Conflict repair for PR #' + prNumber + ' exact HEAD ' + headSha +
+                ' does not consume review findings.'
               );
               return;
             }
@@ -450,6 +489,7 @@ jobs:
         uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
         env:
           PR_NUMBER: ${{ inputs.pr_number }}
+          MODE: ${{ inputs.mode || 'repair' }}
           HEAD_SHA: ${{ inputs.head_sha }}
           FINGERPRINT: ${{ steps.batch.outputs.fingerprint }}
           FINDING_IDS: ${{ steps.batch.outputs.finding_ids }}
@@ -468,6 +508,17 @@ jobs:
           # actions/github-script authenticates with that empty token.
           github-token: ${{ env.CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED == 'true' && secrets.TAP_PAT || (env.CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED != 'true' && github.token || '') }}
           script: |
+            if (String(process.env.MODE || 'repair').trim().toLowerCase() === 'conflict') {
+              // Conflict repair is bounded by the caller's exact-HEAD attempt
+              // marker and the repair workflow's own retry controller, not by
+              // review-finding convergence.
+              core.setOutput('held', 'false');
+              core.setOutput('eligible_batch', JSON.stringify([{ source: 'conflict' }]));
+              core.setOutput('eligible_count', '1');
+              core.setOutput('eligible_findings', String(process.env.FINGERPRINT || '').toLowerCase());
+              core.setOutput('surviving_findings', '');
+              return;
+            }
             if (process.env.CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED === 'true' &&
                 !String(process.env.TAP_PAT || '').trim()) {
               core.setFailed(
@@ -829,6 +880,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.TAP_PAT }}
           PR_NUMBER: ${{ inputs.pr_number }}
+          MODE: ${{ inputs.mode || 'repair' }}
           HEAD_SHA: ${{ inputs.head_sha }}
           HEAD_REF: ${{ steps.target.outputs.head_ref }}
           BATCH_JSON: ${{ steps.convergence.outputs.eligible_batch }}
@@ -864,6 +916,17 @@ jobs:
           # finding and qualifying improve suggestion in one bounded pass.
           # The workflow, not OpenCode, owns commit/push so publication always
           # targets the real writable PR source branch.
+          if [[ "${MODE,,}" == "conflict" ]]; then
+            # Conflict mode is delegated from the PR-Agent auto-merge
+            # reconciler. It must not replay the original task: merge the
+            # base into this exact PR branch and resolve only the conflicts.
+            PROMPT="$(printf '%s\n' \
+              'The current branch has merge conflicts with the repository default branch.' \
+              'Merge the default branch into the current branch and resolve every conflict.' \
+              'Preserve the intent of both sides; do not discard either side wholesale.' \
+              'Do not redo the original task, do not change unrelated files, and do not manufacture review state.' \
+              'Do not commit, push, create a PR, or merge; the workflow owns publication.')"
+          else
           PROMPT="$(python3 - <<'PY'
           import json, os
           items = json.loads(os.environ.get('BATCH_JSON', '[]'))
@@ -886,6 +949,7 @@ jobs:
           print('\n'.join(lines))
           PY
           )"
+          fi
           START_HEAD="$(git rev-parse HEAD)"
           # Attribute only explicit external provider failures to the
           # selected OpenCode route. Code/tool failures must not burn models.
@@ -983,9 +1047,14 @@ jobs:
           # identity inline plus the component trailer so automated repair is
           # visibly machine-generated and never rewrites developer commits.
           if [[ -n "$(git status --porcelain)" ]]; then
+            if [[ "${MODE,,}" == "conflict" ]]; then
+              repair_subject="fix: resolve merge conflicts for HEAD $HEAD_SHA"
+            else
+              repair_subject="fix: apply PR-Agent review findings for HEAD $HEAD_SHA"
+            fi
             git -c user.name="github-actions[bot]" \
               -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
-              commit -m "fix: apply PR-Agent review findings for HEAD $HEAD_SHA" \
+              commit -m "$repair_subject" \
               -m "Continuum-Component: pr-agent-repair"
           else
             echo "No repair changes to commit for HEAD $HEAD_SHA."

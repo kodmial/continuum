@@ -57,8 +57,22 @@ class OpenCodeWorkflowEditContractTest(unittest.TestCase):
         )
         self.assertIn("unset CONTINUUM_VERIFICATION_ATTESTATION_KEY", step)
         self.assertIn(
+            'ATTESTATION_KEY_FILE="${RUNNER_TEMP:-/tmp}/continuum-attestation-key"',
+            step,
+        )
+        self.assertIn(
+            "python3 -m continuum.verification provision-key --repo \"$GITHUB_WORKSPACE\"",
+            step,
+            "the key must be provisioned from stdin through the file-based contract",
+        )
+        self.assertIn(
+            'CONTINUUM_VERIFICATION_ATTESTATION_KEY_FILE="$ATTESTATION_KEY_FILE"',
+            step,
+        )
+        self.assertNotIn(
             'CONTINUUM_VERIFICATION_ATTESTATION_KEY="$CONTINUUM_ATTESTATION_KEY_VALUE"',
             step,
+            "the value form is rejected by the verification engine",
         )
         self.assertLess(
             step.index("unset CONTINUUM_VERIFICATION_ATTESTATION_KEY"),

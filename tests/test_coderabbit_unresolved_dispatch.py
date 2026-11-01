@@ -89,6 +89,7 @@ class CodeRabbitBatchContractTests(unittest.TestCase):
         # supersedes one UNRESOLVED; an unrelated author never participates.
         node_fixture = """
 const head = 'a'.repeat(40);
+process.env.COMMENT_PAT = 'test-pat';
 const comments = [
  {id: 100, user:{login:'coderabbitai[bot]'}, pull_request_review_id:11, body:'issue one'},
  {id: 200, user:{login:'coderabbitai[bot]'}, pull_request_review_id:22, body:'issue two'},
@@ -108,6 +109,10 @@ const core = {
 const context = {repo:{owner:'kodmial', repo:'nanodictate'},
  payload:{pull_request:{number:226}}};
 const github = {
+ request: {endpoint: {DEFAULTS: {baseUrl: 'https://api.github.com'}}},
+ constructor: function () {
+   this.rest = {users:{getAuthenticated:async()=>({data:{login:'kodmial'}})}};
+ },
  graphql: async () => ({repository:{pullRequest:{reviewThreads:{
   nodes:[
    {isResolved:false,comments:{nodes:[{databaseId:100,author:{login:'coderabbitai[bot]'}}]}},
@@ -154,6 +159,21 @@ const github = {
         self.assertEqual(result.returncode, 0, result.stderr)
         active = json.loads(json.loads(result.stdout)["items_json"])
         self.assertEqual([item["finding_id"] for item in active], [100, 200])
+
+        # Marker trust needs the PAT identity: without it the collector must
+        # fail closed rather than accept a copied marker from any commenter.
+        missing_pat = node_fixture.replace(
+            "process.env.COMMENT_PAT = 'test-pat';",
+            "delete process.env.COMMENT_PAT;",
+        )
+        result = subprocess.run(
+            ["node", "-"],
+            input=missing_pat + "\nasync function run(){\n" + production +
+                  "\n}\nrun().then(() => console.log(JSON.stringify(out))).catch(e=>{console.error(e);process.exit(1)})",
+            text=True, capture_output=True, check=False,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("COMMENT_PAT is required", result.stderr)
 
 
 class DispatchTargetResolutionTests(unittest.TestCase):

@@ -62,6 +62,17 @@ class VerificationContractTest(unittest.TestCase):
         self.evidence = self.repo / verification.EVIDENCE_FILE_NAME
         self.env = dict(os.environ)
 
+    def provision_attestation(self, environ):
+        # The engine rejects the key value in its own environment because a
+        # repository command can read it through /proc/$PPID/environ. The
+        # runner writes the key to a private file outside the task worktree
+        # and passes only its path; the engine reads and removes it.
+        key_file = self.workdir / "attestation.key"
+        key_file.write_text("test-attestation-key", encoding="utf-8")
+        environ.pop("CONTINUUM_VERIFICATION_ATTESTATION_KEY", None)
+        environ["CONTINUUM_VERIFICATION_ATTESTATION_KEY_FILE"] = str(key_file)
+        return key_file
+
     def tearDown(self):
         shutil.rmtree(self.workdir, ignore_errors=True)
 
@@ -228,7 +239,7 @@ class VerificationContractTest(unittest.TestCase):
                          [command.command for command in contract.commands])
 
     def test_attested_baseline_is_reused_on_a_checkpoint(self):
-        self.env["CONTINUUM_VERIFICATION_ATTESTATION_KEY"] = "test-attestation-key"
+        self.provision_attestation(self.env)
         marker = self.repo / "baseline-runs.txt"
         self.env["CONTINUUM_TEST_COMMAND"] = (
             "python3 -c \"from pathlib import Path; "
@@ -297,7 +308,7 @@ class VerificationContractTest(unittest.TestCase):
 
     def test_environment_change_between_baseline_and_final_fails_closed(self):
         baseline_env = dict(self.env)
-        baseline_env["CONTINUUM_VERIFICATION_ATTESTATION_KEY"] = "test-attestation-key"
+        self.provision_attestation(baseline_env)
         baseline_env["RUNNER_OS"] = "Linux"
         baseline_env["CONTINUUM_TEST_COMMAND"] = "true"
         verification.ensure_baseline(
@@ -338,7 +349,7 @@ class VerificationContractTest(unittest.TestCase):
         )
 
     def test_resume_reuses_final_evidence_before_environment_comparison(self):
-        self.env["CONTINUUM_VERIFICATION_ATTESTATION_KEY"] = "test-attestation-key"
+        self.provision_attestation(self.env)
         self.env["CONTINUUM_TEST_COMMAND"] = "true"
         verification.ensure_baseline(
             self.repo, self.evidence, self.base, self.env
@@ -401,6 +412,7 @@ class VerificationContractTest(unittest.TestCase):
             )
 
     def test_fresh_verifier_can_correct_incomplete_work_then_final_repeats(self):
+        self.provision_attestation(self.env)
         self.env["CONTINUUM_TEST_COMMAND"] = "test -f complete.txt"
         verification.ensure_baseline(
             self.repo, self.evidence, self.base, self.env
@@ -408,7 +420,7 @@ class VerificationContractTest(unittest.TestCase):
 
         # The primary implementation is deliberately incomplete.
         (self.repo / "app.py").write_text("VALUE = 3\n", encoding="utf-8")
-        self.assertTrue(verification.verifier_required(self.evidence))
+        self.assertTrue(verification.verifier_required(self.evidence, self.env))
 
         # The independent verifier fixes the omission in the same checkout.
         (self.repo / "complete.txt").write_text("done\n", encoding="utf-8")
@@ -417,7 +429,7 @@ class VerificationContractTest(unittest.TestCase):
         )
         self.assertEqual("passed", verifier["state"])
         self.assertIn("complete.txt", verifier["changed_paths"])
-        self.assertFalse(verification.verifier_required(self.evidence))
+        self.assertFalse(verification.verifier_required(self.evidence, self.env))
 
         data, comparison = verification.run_final(
             self.repo, self.evidence, self.base, self.env
@@ -431,7 +443,7 @@ class VerificationContractTest(unittest.TestCase):
         )
 
     def test_resume_reuses_exact_final_evidence_without_new_coding(self):
-        self.env["CONTINUUM_VERIFICATION_ATTESTATION_KEY"] = "test-attestation-key"
+        self.provision_attestation(self.env)
         self.env["CONTINUUM_TEST_COMMAND"] = "true"
         verification.ensure_baseline(
             self.repo, self.evidence, self.base, self.env

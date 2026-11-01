@@ -99,7 +99,9 @@ class CoverageTests(unittest.TestCase):
         # CodeRabbit batching now dispatches to canonical OpenCode: two
         # standalone PAT sites disappeared and one PAT dispatch remains.
         # Physical /oc-cancel adds one delegated-parent cancellation binding.
-        self.assertEqual(len(bindings), 122)
+        # Live canary observation adds one recovery-comment/chaining binding,
+        # and CodeRabbit collection reads the marker-author login once.
+        self.assertEqual(len(bindings), 124)
         gaps = inventory.coverage_gaps(WORKFLOWS_DIR)
         self.assertEqual(gaps, [], f"uninventoried TAP_PAT bindings: {gaps}")
 

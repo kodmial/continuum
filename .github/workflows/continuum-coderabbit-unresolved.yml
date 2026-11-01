@@ -68,10 +68,13 @@ jobs:
         uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
         env:
           INPUT_PR_NUMBER: ${{ inputs.pr_number }}
+          COMMENT_PAT: ${{ secrets.TAP_PAT }}
         with:
           # kodmial/continuum#259: read-only collection uses GITHUB_TOKEN so
           # the run is attributed to github-actions[bot] and never uses
-          # TAP_PAT. Checkout/push below intentionally stay PAT-backed.
+          # TAP_PAT for collection. TAP_PAT is read once only to authenticate
+          # the login that authors verification markers, so a forged marker
+          # from an arbitrary commenter can never suppress a finding.
           github-token: ${{ github.token }}
           script: |
             const owner = context.repo.owner;
@@ -165,11 +168,31 @@ jobs:
                 : null;
             }
 
+            // Only the accounts that actually publish verification markers
+            // may suppress a finding. Both repair and auto-merge markers are
+            // authored with TAP_PAT, so resolve that login once instead of
+            // trusting any commenter who can copy the HTML marker shape.
+            const trustedMarkerAuthors = new Set(['github-actions[bot]']);
+            const commentPat = String(process.env.COMMENT_PAT || '').trim();
+            if (!commentPat) {
+              throw new Error(
+                'COMMENT_PAT is required to authenticate verification markers.'
+              );
+            }
+            const markerGithub = new github.constructor({
+              auth: commentPat,
+              baseUrl: github.request.endpoint.DEFAULTS.baseUrl,
+            });
+            trustedMarkerAuthors.add(
+              (await markerGithub.rest.users.getAuthenticated()).data.login
+            );
+
             // Keep only the newest verification request for each original
             // finding. An older UNRESOLVED must never override a newer
             // verification request that is still awaiting CodeRabbit.
             const latestVerification = new Map();
             for (const comment of comments) {
+              if (!trustedMarkerAuthors.has(comment.user?.login || '')) continue;
               const body = comment.body ?? '';
               const opencodeMatch = body.match(opencodeVerificationPattern);
               const autoMergeMatch = body.match(autoMergeVerificationPattern);

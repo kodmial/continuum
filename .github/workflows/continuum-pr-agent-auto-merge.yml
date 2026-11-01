@@ -1352,6 +1352,7 @@ jobs:
                         ref: defaultBranch,
                         inputs: {
                           pr_number: String(prNumber),
+                          mode: 'conflict',
                           head_sha: fresh.head.sha,
                           target_child_id: targetChildId,
                         },

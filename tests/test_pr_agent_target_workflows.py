@@ -621,7 +621,8 @@ class PrAgentTargetWorkflowContractTests(unittest.TestCase):
     def test_delegated_conflict_repair_dispatch_handles_422(self):
         body = read(".github/workflows/continuum-pr-agent-auto-merge.yml")
         start = body.index("async function dispatchConflictRepair")
-        window = body[start : start + 8000]
+        end = body.index("async function syncFromMain", start)
+        window = body[start:end]
         self.assertIn("workflow_id: 'continuum-pr-agent-repair.yml'", window)
         self.assertIn("target_child_id: targetChildId", window)
         # Like recovery/wakeup: a 422 naming the opaque input fails closed
