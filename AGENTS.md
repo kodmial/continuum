@@ -54,7 +54,8 @@ These are public interfaces and must not change silently:
   a candidate); the exact list must be confirmed at a terminal, and a
   non-interactive install deletes nothing and only reports what it would remove;
   `--yes`/`CONTINUUM_INSTALL_ASSUME_YES=1` is the explicit opt-out; and an
-  install into Continuum's own checkout is refused outright before any write;
+  install into the directory containing the installer (Continuum's own
+  checkout) is refused outright before any write;
 - the parent/child repository-variable names (`CONTINUUM_ROLE`,
   `CONTINUUM_CHILDREN`, `CONTINUUM_CHILD_ID`, `CONTINUUM_PARENT`,
   `CONTINUUM_VALIDATION_SCRIPT`);

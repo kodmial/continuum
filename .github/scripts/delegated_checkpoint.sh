@@ -7,7 +7,11 @@
 # Never upload code, patches or agent transcripts to the public parent.
 
 if ! declare -F continuum_stage_checkpoint >/dev/null; then
-  continuum_checkpoint_staging_lib="${BASH_SOURCE[0]%/*}/continuum_pr_staging.sh"
+  continuum_checkpoint_dir="${BASH_SOURCE[0]%/*}"
+  # Sourcing by bare file name leaves no slash, so ``%/*`` keeps the whole
+  # name; fall back to the current directory in that case.
+  [[ "$continuum_checkpoint_dir" == "${BASH_SOURCE[0]}" ]] && continuum_checkpoint_dir=.
+  continuum_checkpoint_staging_lib="$continuum_checkpoint_dir/continuum_pr_staging.sh"
   if [[ -r "$continuum_checkpoint_staging_lib" ]]; then
     # shellcheck source=/dev/null
     source "$continuum_checkpoint_staging_lib"

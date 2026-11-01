@@ -82,15 +82,19 @@ The workflow-owned `.continuum-verification.json` evidence is retained on a
 429 checkpoint and removed before the implementation commit/PR.
 
 The evidence file lives in the task worktree, so the engine never trusts it on
-its own. Set the repository secret `CONTINUUM_VERIFICATION_ATTESTATION_KEY` and
-pass it into the verification step's environment under the same name to sign
-the recorded contract, baseline, verifier result, and accepted final record
-with HMAC-SHA256; a resumed run reuses those records only when the signature
-verifies. Without the key, an existing baseline is rebuilt and the
-final phase re-resolves the contract from the task base commit instead of the
-worktree, so a coding agent cannot rewrite its own verification commands or
-forge an accepted result. The key is read from the environment, never from an
-argument, so it does not appear in process listings.
+its own. The verification engine recognizes the optional HMAC-SHA256
+attestation key in the environment variable
+`CONTINUUM_VERIFICATION_ATTESTATION_KEY`; when that variable is present it
+signs the recorded contract, baseline, verifier result, and accepted final
+record, and a resumed run reuses those records only when the signature
+verifies. The `workflow_call` secret declaration and the step-environment
+export that deliver the key are supplied by the installed Continuum workflow
+set, so declaring the secret in the consumer repository is only meaningful
+once that set is installed. Without the key, an existing baseline is rebuilt
+and the final phase re-resolves the contract from the task base commit instead
+of the worktree, so a coding agent cannot rewrite its own verification commands
+or forge an accepted result. The key is read from the environment, never from
+an argument, so it does not appear in process listings.
 
 The reusable engine is **not** installed as a `continuum-validation.yml`
 caller. Each consumer owns one primary `.github/workflows/ci.yml` whose
@@ -241,7 +245,7 @@ limits and result paths.
 | `RENDER_API_KEY` | Render execution is enabled | Render API credential. |
 | `CHILD_RUNTIME_TOKEN` | Direct parent reusable workflow invocation | Delegated child access; installed parent callers map their configured parent credential. |
 | `CHILD_RUNTIME_REPOSITORIES` | Legacy parent configuration only | Optional compatibility input for child repository relationships. |
-| `CONTINUUM_VERIFICATION_ATTESTATION_KEY` | Resumed verification evidence must be reusable | Optional HMAC-SHA256 key, passed into the verification step's environment. Without it a resumed run rebuilds the baseline and re-resolves the contract instead of trusting attestation. |
+| `CONTINUUM_VERIFICATION_ATTESTATION_KEY` | Resumed verification evidence must be reusable | Optional HMAC-SHA256 key recognized by the verification engine; the installed Continuum workflow set declares the `workflow_call` secret and exports it into the verification step's environment. Without it a resumed run rebuilds the baseline and re-resolves the contract instead of trusting attestation. |
 
 The optional Swift profile defines **no signing or release secrets**. Product
 signing/release credentials belong to the consumer.

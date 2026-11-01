@@ -265,6 +265,28 @@ class CheckpointHistoryTests(unittest.TestCase):
         ).stdout
         self.assertEqual(len(log.strip().splitlines()), 1, log)
 
+    def test_sourcing_by_bare_file_name_loads_the_staging_boundary(self):
+        # `${BASH_SOURCE[0]%/*}` keeps the whole name when the script is
+        # sourced without a directory, which used to look for
+        # "delegated_checkpoint.sh/continuum_pr_staging.sh".
+        result = subprocess.run(
+            [
+                "bash",
+                "-c",
+                'source delegated_checkpoint.sh\n'
+                'if declare -F continuum_stage_checkpoint >/dev/null; then\n'
+                '  printf "loaded\\n"\n'
+                'else\n'
+                '  printf "missing\\n"\n'
+                'fi\n',
+            ],
+            cwd=os.path.dirname(CHECKPOINT),
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        self.assertIn("loaded", result.stdout, result.stderr)
+
     def test_save_loads_and_uses_the_shared_staging_boundary(self):
         self._dirty_clone()
         engine_checkout = os.path.join(self.work, ".continuum-cancel-engine")

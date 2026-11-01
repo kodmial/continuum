@@ -161,7 +161,8 @@ fi
 if [[ -n "$SELF_DIR" && -n "$DEST_ABS" &&
       ( "$DEST_ABS" == "$SELF_DIR" || "$TARGET_DIR" == "$SELF_DIR/.github/workflows" ) ]]; then
   cat >&2 <<EOF
-refusing to install: the target is Continuum's own checkout ($TARGET_DIR).
+refusing to install: the target is the directory containing the installer
+(Continuum's own checkout): $TARGET_DIR.
 
 This repository ships the core workflows themselves; the files this installer
 writes are thin caller stubs that call them. Installing here would overwrite
