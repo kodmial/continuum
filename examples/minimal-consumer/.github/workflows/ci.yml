@@ -14,9 +14,9 @@ permissions:
 
 jobs:
   validate:
-    uses: kodmial/continuum/.github/workflows/continuum-validation.yml@main
+    uses: kodmial/continuum/.github/workflows/continuum-validation.yml@39287bf9f64ca0fb6c81ab13395ba7250667a684
     with:
-      continuum_ref: main
+      continuum_ref: 39287bf9f64ca0fb6c81ab13395ba7250667a684
       auto_detect: 'false'
       build_command: python3 -m compileall -q app.py tests
       test_command: python3 -m unittest discover -s tests -v
