@@ -240,5 +240,60 @@ class YamlSubsetTests(unittest.TestCase):
         )
 
 
+    def test_apostrophe_inside_a_plain_scalar_is_not_a_quote(self):
+        # A quote opens a scalar only where a token can start. An apostrophe
+        # mid-word belongs to the plain scalar, so the line is not an
+        # unterminated quote.
+        parsed = yamlmini.loads(
+            "identity: Developer ID Application: O'Brien\n"
+        )
+        self.assertEqual(parsed, {"identity": "Developer ID Application: O'Brien"})
+
+    def test_double_quoted_value_with_hash_and_apostrophe(self):
+        parsed = yamlmini.loads('a: "quoted # it\'s here"  # real comment\n')
+        self.assertEqual(parsed["a"], "quoted # it's here")
+
+    def test_escaped_quotes_inside_a_double_quoted_value(self):
+        parsed = yamlmini.loads('a: "say \\"hi\\" # not a comment"\n')
+        self.assertEqual(parsed["a"], 'say "hi" # not a comment')
+
+    def test_single_quoted_value_with_hash(self):
+        parsed = yamlmini.loads("a: 'has # hash'  # real comment\n")
+        self.assertEqual(parsed["a"], "has # hash")
+
+    def test_rejects_a_genuine_unterminated_single_quote(self):
+        with self.assertRaises(yamlmini.YamlSubsetError) as raised:
+            yamlmini.loads("a: 'unterminated\n")
+        self.assertIn("unterminated quoted scalar", str(raised.exception))
+
+    def test_rejects_a_trailing_backslash_in_an_unterminated_double_quote(self):
+        with self.assertRaises(yamlmini.YamlSubsetError) as raised:
+            yamlmini.loads('a: "trailing \\\n')
+        self.assertIn("unterminated quoted scalar", str(raised.exception))
+
+    def test_sequence_item_containing_an_apostrophe(self):
+        self.assertEqual(yamlmini.loads("- O'Brien\n"), ["O'Brien"])
+
+    def test_hyphen_inside_a_plain_word_is_not_a_sequence_marker(self):
+        parsed = yamlmini.loads("key: foo-'bar'\n")
+        self.assertEqual(parsed, {"key": "foo-'bar'"})
+
+    def test_quote_after_a_plain_word_is_not_a_quote(self):
+        self.assertEqual(yamlmini.loads("key: foo 'bar'\n"), {"key": "foo 'bar'"})
+
+    def test_quoted_key_at_line_start_is_not_unterminated(self):
+        # A quote at the start of the line is a token start. Keys keep their
+        # quotes in this subset; the point is that the scanner does not treat
+        # the line as an unterminated quoted scalar.
+        parsed = yamlmini.loads("a:\n  'b c': 1\n")
+        self.assertEqual(parsed, {"a": {"'b c'": 1}})
+
+    def test_quoted_sequence_items_open_a_quoted_scalar(self):
+        self.assertEqual(yamlmini.loads("- 'a b'\n"), ["a b"])
+        self.assertEqual(
+            yamlmini.loads("items:\n  - 'a # b'\n"), {"items": ["a # b"]}
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
