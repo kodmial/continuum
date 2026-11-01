@@ -52,19 +52,48 @@ class _Line:
 def _strip_comment(raw: str, number: int) -> str:
     out: List[str] = []
     quote: Optional[str] = None
-    for index, char in enumerate(raw):
+    index = 0
+    while index < len(raw):
+        char = raw[index]
         if quote is not None:
-            out.append(char)
+            if quote == '"' and char == "\\":
+                out.append(char)
+                if index + 1 < len(raw):
+                    out.append(raw[index + 1])
+                    index += 2
+                else:
+                    index += 1
+                continue
             if char == quote:
+                if quote == "'" and index + 1 < len(raw) and raw[index + 1] == "'":
+                    out.extend(("'", "'"))
+                    index += 2
+                    continue
                 quote = None
+            out.append(char)
+            index += 1
             continue
         if char in ("'", '"'):
-            quote = char
-            out.append(char)
-            continue
+            prefix = raw[:index]
+            trimmed_prefix = prefix.rstrip(" \t")
+            at_line_start = not trimmed_prefix.strip()
+            after_mapping_separator = (
+                trimmed_prefix.endswith(":") and len(trimmed_prefix) < len(prefix)
+            )
+            after_sequence_indicator = (
+                trimmed_prefix.endswith("-")
+                and not trimmed_prefix[:-1].strip()
+                and len(trimmed_prefix) < len(prefix)
+            )
+            if at_line_start or after_mapping_separator or after_sequence_indicator:
+                quote = char
+                out.append(char)
+                index += 1
+                continue
         if char == "#" and (index == 0 or raw[index - 1] in " \t"):
             break
         out.append(char)
+        index += 1
     result = "".join(out).rstrip()
     if quote is not None:
         raise YamlSubsetError(f"line {number}: unterminated quoted scalar")
