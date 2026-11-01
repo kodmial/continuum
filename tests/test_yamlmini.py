@@ -146,6 +146,24 @@ class YamlSubsetTests(unittest.TestCase):
         with self.assertRaises(yamlmini.YamlSubsetError):
             yamlmini.loads("a: 1\n---\nb: 2\n")
 
+    def test_apostrophes_in_plain_scalars_are_not_quote_delimiters(self):
+        parsed = yamlmini.loads(
+            textwrap.dedent(
+                """
+            identity: Developer ID Application: O'Brien # signing identity
+            profiles:
+              - O'Brien's signing profile
+                """
+            )
+        )
+        self.assertEqual(
+            parsed,
+            {
+                "identity": "Developer ID Application: O'Brien",
+                "profiles": ["O'Brien's signing profile"],
+            },
+        )
+
     def test_rejects_unterminated_quote(self):
         with self.assertRaises(yamlmini.YamlSubsetError):
             yamlmini.loads('a: "unterminated\n')
