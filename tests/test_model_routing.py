@@ -662,12 +662,15 @@ class GitHubStateFailureClassificationTests(unittest.TestCase):
     def test_secondary_403_retry_after_is_rate_limit_even_with_budget(self):
         import time
         now = int(time.time())
+        reset = now + 3600
         failure = self._failure(self._error(403, {
             "X-RateLimit-Remaining": "4999",
+            "X-RateLimit-Reset": str(reset),
             "Retry-After": "30",
         }))
         self.assertEqual(failure.classification, "rate_limit")
         self.assertGreaterEqual(failure.not_before, now + 30)
+        self.assertLess(failure.not_before, reset)
 
     def test_permission_403_with_budget_stays_deterministic(self):
         with self._raise(self._error(403, {
@@ -737,6 +740,17 @@ class GitHubStateFailureClassificationTests(unittest.TestCase):
                 self._store().api("GET", "git/ref/heads/continuum-model-state")
         self.assertEqual(caught.exception.classification, "transient")
         self.assertNotIn("private-target", str(caught.exception))
+
+    def test_5xx_with_remaining_quota_ignores_rate_limit_reset(self):
+        import time
+        now = int(time.time())
+        reset = now + 3600
+        failure = self._failure(self._error(503, {
+            "X-RateLimit-Remaining": "4999",
+            "X-RateLimit-Reset": str(reset),
+        }))
+        self.assertEqual(failure.classification, "transient")
+        self.assertIsNone(failure.not_before)
 
     def test_malformed_json_and_cas_conflict_remain_deterministic(self):
         class MalformedReply:

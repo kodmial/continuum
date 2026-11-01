@@ -114,7 +114,13 @@ def classify_github_state_failure(err: urllib.error.HTTPError,
     headers = getattr(err, "headers", None)
     current = int(time.time()) if now is None else int(now)
     remaining = _header(headers, "X-RateLimit-Remaining")
-    reset = _positive_epoch(_header(headers, "X-RateLimit-Reset"))
+    # X-RateLimit-Reset ends the quota window; it is a retry time only once
+    # the primary quota is exhausted.
+    reset = (
+        _positive_epoch(_header(headers, "X-RateLimit-Reset"))
+        if remaining == "0"
+        else None
+    )
     retry_after = _retry_after_epoch(_header(headers, "Retry-After"), current)
     not_before = max((value for value in (reset, retry_after)
                       if value is not None), default=0) or None

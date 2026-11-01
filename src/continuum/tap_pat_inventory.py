@@ -884,10 +884,11 @@ def covering_entry(workflow: str, step: str) -> dict | None:
         if _entry_covers(entry, workflow, step):
             return entry
     if workflow == PR_AGENT_FAMILY["workflow"]:
-        if not step.strip():
+        normalized = _normalize_step(step)
+        if not normalized:
             return None
         for family_step in PR_AGENT_FAMILY["steps"]:
-            if family_step in step:
+            if _normalize_step(family_step) == normalized:
                 return {
                     "workflow": workflow,
                     "step": family_step,

@@ -43,7 +43,7 @@ from datetime import datetime, timezone
 import re
 from typing import Any, Iterable, Mapping, Optional, Sequence, Set, Tuple
 
-from . import task_snapshot
+from . import opencode_commands, task_snapshot
 
 
 WAIT = "WAIT"
@@ -303,7 +303,7 @@ def _has_activity_after(
             return True
         if trusted_fencer and RECOVERY_MARKER_RE.search(body):
             return True
-        if _is_owner(comment, repository_owner) and OWNER_COMMAND_RE.search(body):
+        if _is_owner(comment, repository_owner) and opencode_commands.is_manual_command(body):
             return True
     return False
 

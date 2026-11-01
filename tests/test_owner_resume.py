@@ -780,6 +780,17 @@ class NegativeEvidenceTests(unittest.TestCase):
                 self.assertEqual(decision.state, NOOP)
                 self.assertIn("post-marker", decision.reason)
 
+    def test_post_marker_owner_prose_does_not_fence_retry(self):
+        for body in ("/oc please", "Explanation\n/oc"):
+            with self.subTest(body=body):
+                decision = self.complete(
+                    comments=[
+                        marker(374, cid=1, at=NOW - timedelta(hours=2)),
+                        comment(body, cid=2, at=NOW - timedelta(hours=1)),
+                    ]
+                )
+                self.assertEqual(decision.state, RESUME)
+
     def test_untrusted_marker_shaped_comments_do_not_fence_retry(self):
         bodies = (
             "<!-- issue-scheduler-dispatch -->\n/oc",

@@ -1010,6 +1010,10 @@ def verifier_required(
     baseline = data.get("baseline")
     if not isinstance(baseline, dict):
         raise VerificationError("verification evidence has no baseline")
+    # The worktree can rewrite an unattested verifier record. Without the
+    # runner-held key, it cannot prove that this session result is authentic.
+    if _attestation_key(environ) is None:
+        return True
     verifier = data.get("verifier")
     if not isinstance(verifier, dict):
         return True

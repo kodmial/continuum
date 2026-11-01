@@ -96,10 +96,17 @@ class TransientClassificationTests(unittest.TestCase):
         # GitHub secondary rate limits return 403 + Retry-After while the
         # primary quota is still above zero, and the caller may pass no body.
         classified = lifecycle.classify_infrastructure_failure(
-            status=403, headers={"Retry-After": "90"}, error=""
+            status=403,
+            headers={
+                "X-RateLimit-Remaining": "4999",
+                "X-RateLimit-Reset": "2000000000",
+                "Retry-After": "90",
+            },
+            error="",
         )
         self.assertTrue(classified.transient)
         self.assertEqual(classified.retry_after_seconds, 90)
+        self.assertIsNone(classified.ratelimit_reset_epoch)
 
     def test_403_with_empty_retry_after_is_not_transient(self):
         classified = lifecycle.classify_infrastructure_failure(
@@ -131,6 +138,18 @@ class TransientClassificationTests(unittest.TestCase):
                 self.assertTrue(
                     lifecycle.classify_infrastructure_failure(**kwargs).transient
                 )
+
+    def test_5xx_with_remaining_quota_ignores_reset_epoch(self):
+        classified = lifecycle.classify_infrastructure_failure(
+            status=503,
+            headers={
+                "X-RateLimit-Remaining": "4999",
+                "X-RateLimit-Reset": "2000000000",
+            },
+            error="service unavailable",
+        )
+        self.assertTrue(classified.transient)
+        self.assertIsNone(classified.ratelimit_reset_epoch)
 
     def test_deterministic_outcomes_never_consume_budget(self):
         for kwargs in (

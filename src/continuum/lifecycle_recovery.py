@@ -624,6 +624,10 @@ def classify_infrastructure_failure(
     code = _parse_int(status)
 
     def reset_epoch() -> Optional[int]:
+        # X-RateLimit-Reset ends the quota window; it is a retry floor only
+        # once the primary quota is actually exhausted.
+        if _parse_int(norm_headers.get("x-ratelimit-remaining", "")) != 0:
+            return None
         for key in ("x-ratelimit-reset", "ratelimit-reset"):
             epoch = _parse_int(norm_headers.get(key, ""))
             if epoch is not None and epoch > 0:

@@ -79,9 +79,13 @@ class InventoryShapeTests(unittest.TestCase):
         self.assertIsNone(inventory.covering_entry(workflow, "   "))
         self.assertIsNone(inventory.covering_entry(workflow, "Resolve"))
         step = inventory.PR_AGENT_FAMILY["steps"][0]
-        covered = inventory.covering_entry(workflow, "Run " + step)
+        covered = inventory.covering_entry(workflow, step)
         self.assertIsNotNone(covered)
         self.assertEqual(covered["step"], step)
+        self.assertIsNone(inventory.covering_entry(workflow, "Run " + step))
+        self.assertIsNone(
+            inventory.covering_entry(workflow, step + " and dispatch delegated child")
+        )
 
 
 class CoverageTests(unittest.TestCase):

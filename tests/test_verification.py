@@ -96,6 +96,26 @@ class EvidenceAttestationTests(unittest.TestCase):
         loaded = verification._load_evidence(self.path, {})
         self.assertNotIn("attestation", loaded)
 
+    def test_unattested_passed_verifier_requires_a_fresh_session(self):
+        data = self._evidence()
+        data["verifier"] = {
+            "state": "passed",
+            "contract_fingerprint": data["baseline"]["contract"]["fingerprint"],
+        }
+        self.path.write_text(json.dumps(data), encoding="utf-8")
+        self.assertTrue(verification.verifier_required(self.path, {}))
+
+    def test_attested_passed_verifier_can_be_reused(self):
+        data = self._evidence()
+        data["verifier"] = {
+            "state": "passed",
+            "contract_fingerprint": data["baseline"]["contract"]["fingerprint"],
+        }
+        verification._save_evidence(self.path, data, KEY_ENV_VALUES)
+        self.assertFalse(
+            verification.verifier_required(self.path, KEY_ENV_VALUES)
+        )
+
 
 class ChildEnvironmentTests(unittest.TestCase):
     def setUp(self):
