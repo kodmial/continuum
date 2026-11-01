@@ -83,17 +83,23 @@ The workflow-owned `.continuum-verification.json` evidence is retained on a
 
 The evidence file lives in the task worktree, so the engine never trusts it on
 its own. The verification engine recognizes an optional internal HMAC-SHA256
-attestation hook `CONTINUUM_VERIFICATION_ATTESTATION_KEY` only when its
-process environment already supplies it. No shipped Continuum workflow
-declares or passes this hook; it is not a consumer secret and requires no
-consumer configuration. If supplied directly to the verification process,
-it signs the recorded contract, baseline, verifier result, and accepted final
-record, and a resumed run reuses those records only when the signature
-verifies. Without the key, an existing baseline is rebuilt and the final
-phase re-resolves the contract from the task base commit instead of the
-worktree, so a coding agent cannot rewrite its own verification commands or
-forge an accepted result. The key is read from the environment, never from an
-argument, so it does not appear in process listings.
+attestation hook only when its process environment supplies the path
+`CONTINUUM_VERIFICATION_ATTESTATION_KEY_FILE` to a private key file outside
+the task worktree. The key value itself is never read from the environment: a
+repository-controlled command can inspect the engine's inherited environment
+through `/proc/$PPID/environ`, so setting
+`CONTINUUM_VERIFICATION_ATTESTATION_KEY` in the engine environment fails
+closed instead of being accepted. The engine reads the key file before any
+command runs and removes it before the first command starts. No shipped
+Continuum workflow declares or passes this hook; it is not a consumer secret
+and requires no consumer configuration. If supplied, it signs the recorded
+contract, baseline, verifier result, and accepted final record, and a resumed
+run reuses those records only when the signature verifies. Without the key, an
+existing baseline is rebuilt and the final phase re-resolves the contract from
+the task base commit instead of the worktree, so a coding agent cannot rewrite
+its own verification commands or forge an accepted result. The key is read
+from the private file, never from an argument or the environment, so it does
+not appear in process listings.
 
 The reusable engine is **not** installed as a `continuum-validation.yml`
 caller. Each consumer owns one primary `.github/workflows/ci.yml` whose

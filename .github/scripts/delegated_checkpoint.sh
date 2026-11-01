@@ -26,6 +26,28 @@ continuum_checkpoint_ref() {
   printf 'continuum-child/checkpoint-task-%s-g%s-%s\n' "$task" "$generation" "$spec"
 }
 
+# Resolve the Child repository's default branch once per operation. A
+# hardcoded origin/main fails closed on a repository whose default branch has
+# another name (and has no origin/main at all). Prefer the local remote-HEAD
+# symref a clone records, then ask the remote; never guess a branch name.
+continuum_checkpoint_default_branch() {
+  local remote_head target
+  remote_head="$(git symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null)" || remote_head=""
+  if [[ -n "$remote_head" ]]; then
+    printf '%s\n' "${remote_head#origin/}"
+    return 0
+  fi
+  target="$(git ls-remote --symref origin HEAD 2>/dev/null \
+    | sed -n 's|^ref: refs/heads/\([^[:space:]]*\)[[:space:]]*HEAD$|\1|p' \
+    | head -n 1)"
+  if [[ -n "$target" ]]; then
+    printf '%s\n' "$target"
+    return 0
+  fi
+  echo "::error::Delegated checkpoint cannot resolve the child repository default branch." >&2
+  return 4
+}
+
 # A shallow clone does not contain the common ancestor, so a shared-history
 # check would reject a valid checkpoint. Deepen the checkout once, only when
 # it actually is shallow.
@@ -42,14 +64,16 @@ continuum_checkpoint_ensure_history() {
 # rather than discarding work after rate limits or a transport interruption.
 continuum_checkpoint_restore() {
   local checkpoint_ref="$1" branch="$2" spec="$3"
-  local remote_line
+  local remote_line default_branch default_ref
   CONTINUUM_CHECKPOINT_RESTORED=false
+  default_branch="$(continuum_checkpoint_default_branch)" || return 4
+  default_ref="refs/remotes/origin/$default_branch"
   if ! remote_line="$(git ls-remote --heads origin "refs/heads/$checkpoint_ref" 2>/dev/null)"; then
     echo "::error::Delegated checkpoint lookup unavailable; refusing a fresh start." >&2
     return 4
   fi
   if [[ -z "$remote_line" ]]; then
-    git switch -c "$branch" origin/main >/dev/null 2>&1 || return 4
+    git switch -c "$branch" "$default_ref" >/dev/null 2>&1 || return 4
     return 0
   fi
 
@@ -63,11 +87,11 @@ continuum_checkpoint_restore() {
     return 4
   fi
   continuum_checkpoint_ensure_history || return 4
-  if ! git merge-base origin/main "$checkpoint_sha" >/dev/null 2>&1; then
+  if ! git merge-base "$default_ref" "$checkpoint_sha" >/dev/null 2>&1; then
     echo "::error::Delegated checkpoint history is unrelated to the target default branch." >&2
     return 4
   fi
-  if git diff --no-ext-diff "origin/main...$checkpoint_sha" -- . | grep -Eiq '(github_pat_[A-Za-z0-9_]+|ghp_[A-Za-z0-9]+|rnd_[A-Za-z0-9]+|-----BEGIN [A-Z ]*PRIVATE KEY-----)'; then
+  if git diff --no-ext-diff "$default_ref...$checkpoint_sha" -- . | grep -Eiq '(github_pat_[A-Za-z0-9_]+|ghp_[A-Za-z0-9]+|rnd_[A-Za-z0-9]+|-----BEGIN [A-Z ]*PRIVATE KEY-----)'; then
     echo "::error::Token-like content detected; checkpoint restore refused." >&2
     return 31
   fi
@@ -80,7 +104,7 @@ continuum_checkpoint_restore() {
 # canonical non-default-branch guard and only invokes this after snapshot admission.
 continuum_checkpoint_save() {
   local checkpoint_ref="$1" spec="$2" child_repo="$3" task="$4"
-  local attempt=0 checkpoint_sha
+  local attempt=0 checkpoint_sha default_branch default_ref
   if [[ -z "$(git status --porcelain)" ]]; then
     return 0
   fi
@@ -92,6 +116,8 @@ continuum_checkpoint_save() {
     echo "::error::Checkpoint staging boundary is unavailable." >&2
     return 4
   fi
+  default_branch="$(continuum_checkpoint_default_branch)" || return 4
+  default_ref="refs/remotes/origin/$default_branch"
   continuum_stage_checkpoint || return 4
   if git diff --cached --no-ext-diff | grep -Eiq '(github_pat_[A-Za-z0-9_]+|ghp_[A-Za-z0-9]+|rnd_[A-Za-z0-9]+|-----BEGIN [A-Z ]*PRIVATE KEY-----)'; then
     echo "::error::Token-like content detected; checkpoint publication refused." >&2
@@ -124,7 +150,7 @@ continuum_checkpoint_save() {
       return 4
     fi
     continuum_checkpoint_ensure_history || return 4
-    if ! git merge-base origin/main "$checkpoint_sha" >/dev/null 2>&1; then
+    if ! git merge-base "$default_ref" "$checkpoint_sha" >/dev/null 2>&1; then
       echo "::error::Delegated checkpoint history is unrelated to the target default branch." >&2
       return 4
     fi

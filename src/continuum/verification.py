@@ -52,6 +52,19 @@ EVIDENCE_FILE_NAME = ".continuum-verification.json"
 #: phase re-resolves the contract from the task base commit and re-establishes
 #: the baseline on the current runner.
 ATTESTATION_KEY_ENV = "CONTINUUM_VERIFICATION_ATTESTATION_KEY"
+
+#: The key is delivered through a private file outside the task worktree. Its
+#: path is read from this environment variable, never the key itself: a
+#: repository-controlled command can read the engine's inherited environment
+#: through ``/proc/$PPID/environ``, so the value must not be in it. The file is
+#: read before any command runs and removed before the first command starts.
+ATTESTATION_KEY_FILE_ENV = "CONTINUUM_VERIFICATION_ATTESTATION_KEY_FILE"
+
+#: Keys already read from a file in this process, keyed by resolved path. The
+#: file is removed before consumer commands run, so later signing within the
+#: same invocation uses this cache instead of re-reading a file that is gone.
+_ATTESTATION_KEY_CACHE: Dict[str, bytes] = {}
+
 ATTESTATION_ALGORITHM = "hmac-sha256"
 
 #: Evidence sections covered by the attestation signature.
@@ -665,8 +678,10 @@ def _child_environment(environ: Mapping[str, str]) -> Dict[str, str]:
 
     env = dict(environ)
     # Repository-controlled verification commands must never receive the
-    # runner-held HMAC key; otherwise changed tests/scripts can forge evidence.
+    # runner-held HMAC key, or the path to the file it is read from; otherwise
+    # changed tests/scripts can read the key and forge evidence.
     env.pop(ATTESTATION_KEY_ENV, None)
+    env.pop(ATTESTATION_KEY_FILE_ENV, None)
     raw = str(env.get("PYTHONPATH", "") or "")
     kept: List[str] = []
     for entry in raw.split(os.pathsep):
@@ -702,14 +717,71 @@ def _now() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
 
-def _attestation_key(
+def _attestation_key_path(
     environ: Optional[Mapping[str, str]] = None,
-) -> Optional[bytes]:
-    """The runner-controlled attestation key, or ``None`` when unset."""
+) -> str:
+    """The configured key-file path, never the key value itself."""
 
     source = os.environ if environ is None else environ
-    raw = str(source.get(ATTESTATION_KEY_ENV, "") or "").strip()
-    return raw.encode("utf-8") if raw else None
+    if str(source.get(ATTESTATION_KEY_ENV, "") or "").strip():
+        raise VerificationError(
+            "the verification attestation key must not be set in the engine "
+            "process environment: a repository command can read it through "
+            "/proc/$PPID/environ. Write the key to a private file outside the "
+            "task worktree and pass its path in {} instead.".format(
+                ATTESTATION_KEY_FILE_ENV
+            )
+        )
+    return str(source.get(ATTESTATION_KEY_FILE_ENV, "") or "").strip()
+
+
+def _attestation_key(
+    environ: Optional[Mapping[str, str]] = None,
+    worktree: Optional[Path | str] = None,
+) -> Optional[bytes]:
+    """The runner-controlled attestation key, or ``None`` when unset.
+
+    The key value is read once from the private file named by
+    :data:`ATTESTATION_KEY_FILE_ENV`, and the file is removed before any
+    repository-controlled command runs. The value stays in this process's
+    memory only, so it never appears in the engine environment that a child
+    can read through ``/proc/$PPID/environ``.
+    """
+
+    raw_path = _attestation_key_path(environ)
+    if not raw_path:
+        return None
+    path = Path(raw_path).expanduser()
+    try:
+        resolved = path.resolve()
+    except OSError:
+        resolved = path
+    if worktree is not None:
+        root = Path(worktree).resolve()
+        if resolved == root or root in resolved.parents:
+            raise VerificationError(
+                "the verification attestation key file must live outside the "
+                "task worktree"
+            )
+    cached = _ATTESTATION_KEY_CACHE.get(str(resolved))
+    if cached is not None:
+        return cached
+    try:
+        raw = path.read_text(encoding="utf-8").strip()
+    except OSError as exc:
+        raise VerificationError(
+            "the verification attestation key file is unavailable: {}".format(exc)
+        ) from exc
+    finally:
+        try:
+            path.unlink()
+        except OSError:
+            pass
+    if not raw:
+        raise VerificationError("the verification attestation key file is empty")
+    key = raw.encode("utf-8")
+    _ATTESTATION_KEY_CACHE[str(resolved)] = key
+    return key
 
 
 def _attestation_payload(data: Mapping[str, Any]) -> bytes:
@@ -810,7 +882,11 @@ def run_command_set(
     """Execute one resolved command set exactly as recorded."""
 
     root = Path(repo)
-    env = _child_environment(environ if environ is not None else os.environ)
+    source_environ = environ if environ is not None else os.environ
+    # Read and remove the key file before a repository-controlled command can
+    # observe it; the engine process environment never carries the key value.
+    _attestation_key(source_environ, worktree=root)
+    env = _child_environment(source_environ)
     timeout = timeout_seconds
     if timeout is None:
         raw = str(env.get("CONTINUUM_VERIFICATION_TIMEOUT_SECONDS", "") or "")
@@ -959,7 +1035,7 @@ def ensure_baseline(
         if isinstance(existing, dict):
             hint = (
                 " (an unattested baseline was recorded; set {} so a resumed "
-                "run can trust it)".format(ATTESTATION_KEY_ENV)
+                "run can trust it)".format(ATTESTATION_KEY_FILE_ENV)
             )
         raise VerificationError(
             "cannot establish a pre-change baseline: the checkout is already "

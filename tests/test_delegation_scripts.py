@@ -90,17 +90,19 @@ fi
 class CheckpointHistoryTests(unittest.TestCase):
     """A checkpoint must share history with the current default branch."""
 
+    DEFAULT_BRANCH = "main"
+
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         base = self.tmp.name
         self.origin = os.path.join(base, "origin.git")
         self.seed = os.path.join(base, "seed")
         self.work = os.path.join(base, "work")
-        self._git(base, "init", "--bare", "-q", "-b", "main", self.origin)
+        self._git(base, "init", "--bare", "-q", "-b", self.DEFAULT_BRANCH, self.origin)
         self._git(base, "clone", "-q", self.origin, self.seed)
         self._config(self.seed)
         self._commit(self.seed, "M0")
-        self._git(self.seed, "push", "-q", "origin", "main")
+        self._git(self.seed, "push", "-q", "origin", self.DEFAULT_BRANCH)
 
     def tearDown(self):
         self.tmp.cleanup()
@@ -123,14 +125,14 @@ class CheckpointHistoryTests(unittest.TestCase):
         if orphan:
             self._git(self.seed, "checkout", "-q", "--orphan", ref)
         else:
-            self._git(self.seed, "checkout", "-q", "-B", ref, "main")
+            self._git(self.seed, "checkout", "-q", "-B", ref, self.DEFAULT_BRANCH)
         self._commit(self.seed, "checkpoint", "Continuum-Checkpoint: " + spec)
         self._git(self.seed, "push", "-q", "origin", ref)
-        self._git(self.seed, "checkout", "-q", "main")
+        self._git(self.seed, "checkout", "-q", self.DEFAULT_BRANCH)
 
     def _advance_main(self):
         self._commit(self.seed, "M1")
-        self._git(self.seed, "push", "-q", "origin", "main")
+        self._git(self.seed, "push", "-q", "origin", self.DEFAULT_BRANCH)
 
     def test_checkpoint_behind_advanced_default_branch_restores(self):
         ref = "continuum-child/checkpoint-task-1-g1-" + SPEC
@@ -222,6 +224,75 @@ class CheckpointHistoryTests(unittest.TestCase):
         )
         self.assertIn("rc=4", result.stdout, result.stderr)
 
+    def test_fresh_start_uses_the_discovered_default_branch(self):
+        # A child whose default branch is not main has no origin/main at all,
+        # so a hardcoded ref would fail the fresh-start restore.
+        self._git(self.tmp.name, "clone", "-q", self.origin, self.work)
+        self._config(self.work)
+        ref = "continuum-child/checkpoint-task-6-g1-" + SPEC
+        driver = (
+            'source "$CHECKPOINT"\n'
+            'if continuum_checkpoint_restore "$REF" "continuum-child/task-6" "$SPEC"; then\n'
+            '  printf "rc=0\\n"\n'
+            'else\n'
+            '  printf "rc=%s\\n" "$?"\n'
+            'fi\n'
+        )
+        result = subprocess.run(
+            ["bash", "-c", driver],
+            cwd=self.work,
+            capture_output=True,
+            text=True,
+            env={**os.environ, "CHECKPOINT": CHECKPOINT, "REF": ref, "SPEC": SPEC},
+            timeout=120,
+        )
+        self.assertIn("rc=0", result.stdout, result.stderr)
+        head = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=self.work, capture_output=True, text=True, timeout=60,
+        ).stdout.strip()
+        default_head = subprocess.run(
+            ["git", "rev-parse", self.DEFAULT_BRANCH],
+            cwd=self.seed, capture_output=True, text=True, timeout=60,
+        ).stdout.strip()
+        self.assertEqual(head, default_head)
+        if self.DEFAULT_BRANCH != "main":
+            main_ref = subprocess.run(
+                ["git", "rev-parse", "--verify", "--quiet",
+                 "refs/remotes/origin/main"],
+                cwd=self.work, capture_output=True, text=True, timeout=60,
+            ).stdout.strip()
+            self.assertEqual(main_ref, "")
+
+    def test_undiscoverable_default_branch_fails_closed(self):
+        self._git(self.tmp.name, "clone", "-q", self.origin, self.work)
+        self._config(self.work)
+        self._git(self.work, "symbolic-ref", "--delete", "refs/remotes/origin/HEAD")
+        self._git(
+            self.work,
+            "remote", "set-url", "origin",
+            os.path.join(self.tmp.name, "missing.git"),
+        )
+        ref = "continuum-child/checkpoint-task-7-g1-" + SPEC
+        driver = (
+            'source "$CHECKPOINT"\n'
+            'if continuum_checkpoint_restore "$REF" "continuum-child/task-7" "$SPEC"; then\n'
+            '  printf "rc=0\\n"\n'
+            'else\n'
+            '  printf "rc=%s\\n" "$?"\n'
+            'fi\n'
+        )
+        result = subprocess.run(
+            ["bash", "-c", driver],
+            cwd=self.work,
+            capture_output=True,
+            text=True,
+            env={**os.environ, "CHECKPOINT": CHECKPOINT, "REF": ref, "SPEC": SPEC},
+            timeout=120,
+        )
+        self.assertIn("rc=4", result.stdout, result.stderr)
+        self.assertIn("default branch", result.stderr)
+
     def _dirty_clone(self):
         self._git(self.tmp.name, "clone", "-q", self.origin, self.work)
         self._config(self.work)
@@ -311,6 +382,12 @@ class CheckpointHistoryTests(unittest.TestCase):
         ).stdout
         self.assertIn("delta.txt", tracked)
         self.assertNotIn(".continuum-cancel-engine", tracked)
+
+
+class CheckpointNonMainDefaultBranchTests(CheckpointHistoryTests):
+    """Every checkpoint flow against a child whose default branch is ``trunk``."""
+
+    DEFAULT_BRANCH = "trunk"
 
 
 if __name__ == "__main__":

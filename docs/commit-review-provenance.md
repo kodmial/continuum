@@ -68,6 +68,9 @@ App](https://docs.github.com/en/apps/creating-github-apps/authenticating-with-a-
 The baseline implementation introduces no new consumer secret: `TAP_PAT`, the
 Render key (Render API only), the delegated child runtime token, and the
 automatic `github.token` are all it uses. The verification engine also
-recognizes an optional internal HMAC-SHA256 attestation hook
-`CONTINUUM_VERIFICATION_ATTESTATION_KEY`, but no shipped workflow declares or
-passes it. It is not a consumer secret and requires no consumer configuration.
+recognizes an optional internal HMAC-SHA256 attestation hook delivered as a
+private key file outside the task worktree whose path is read from
+`CONTINUUM_VERIFICATION_ATTESTATION_KEY_FILE`; the key value is never read
+from the environment, and setting `CONTINUUM_VERIFICATION_ATTESTATION_KEY`
+there fails closed. No shipped workflow declares or passes the hook. It is not
+a consumer secret and requires no consumer configuration.
