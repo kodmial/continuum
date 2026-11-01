@@ -1,0 +1,103 @@
+# yaml-language-server: $schema=https://coderabbit.ai/integrations/schema.v2.json
+language: en-US
+early_access: false
+reviews:
+  profile: chill
+  request_changes_workflow: true
+  high_level_summary: true
+  poem: false
+  review_status: true
+  # Keep the machine-readable review gate on the legacy commit-status surface.
+  # CodeRabbit documents commit_status as the compatibility surface used when
+  # review_progress is disabled. auto-merge.yml consumes this exact current-HEAD
+  # status and rejects skipped, pending, failed, and rate-limited reviews.
+  review_progress: false
+  commit_status: true
+  fail_commit_status: true
+  collapse_walkthrough: false
+  # Tests are excluded from review; the engine, workflows, and installer are not.
+  path_filters:
+    - "!tests/**"
+    - "!CHANGELOG.md"
+  # Native automatic reviews are disabled. After CI succeeds for the exact
+  # current PR head, the label controller wakes the CodeRabbit retry controller,
+  # which posts the review request. review-ready is only an internal
+  # CI-readiness state marker.
+  auto_review:
+    enabled: false
+    auto_incremental_review: true
+    auto_pause_after_reviewed_commits: 0
+    drafts: false
+    base_branches:
+      - main
+  path_instructions:
+    - path: .github/workflows/**
+      instructions: |
+        These are reusable `workflow_call` workflows and GitHub Actions contracts. Workflow file names and names, inputs, defaults, and secrets are public interfaces — never suggest renaming or reshaping them silently.
+        Core workflows run only on free anonymous models and must never require, read, or forward a paid provider key.
+        Never suggest embedding proxy routes, API keys, or secrets into code.
+    - path: .github/caller-stubs/**
+      instructions: |
+        These are thin caller templates installed verbatim into consumer repositories. Every stored name carries the `continuum-` prefix and must keep it; an installed `continuum-*.yml` is Continuum-owned and never hand-edited in a consumer repository.
+    - path: src/continuum/**
+      instructions: |
+        This is the dependency-free Python engine (standard library only, no external packages) behind a GitHub Actions control plane, not an application.
+        Keep it free of third-party dependencies and never suggest embedding proxy routes, API keys, or secrets into code.
+    - path: .github/scripts/**
+      instructions: |
+        These are the dependency-free Python and Node.js execution scripts driven by the workflows; keep third-party dependencies out.
+        Never suggest embedding proxy routes, API keys, or secrets into code.
+    - path: scripts/**
+      instructions: |
+        Repository test and release tooling (Ruby and shell) run from the repository root by contributors and CI. Keep it dependency-free and safe to run on a clean checkout.
+    - path: install.sh
+      instructions: |
+        The installer argument shape `[path] [ref] [set]`, the `--yes` flag, and the fenced superseded-caller prune are contracts; never suggest changing them casually.
+        Pruning is the only destructive step: a candidate must carry the `continuum-` prefix and reference this repository, and a non-interactive install deletes nothing.
+    - path: docs/**
+      instructions: |
+        Docs describe public contracts. Keep examples consistent with the actual workflow inputs, defaults, secrets, and repository variables.
+    - path: AGENTS.md
+      instructions: |
+        This file holds the project rules and public interface contracts. Flag changes that silently alter them.
+  pre_merge_checks:
+    # Issue-assessment is a probabilistic semantic comparison, not an
+    # executable acceptance test. It can report an opaque CHANGES_REQUESTED
+    # without any actionable inline finding and indefinitely stall the review
+    # queue (see macOS 12 issue #35 / PR #102). Keep its full diagnostic
+    # report, but do not make the model's assessment a merge blocker.
+    # Actionable code-review findings still request changes; exact-head CI,
+    # platform checks, and release gates remain fail-closed.
+    issue_assessment:
+      mode: warning
+  tools:
+    gitleaks:
+      enabled: true
+    shellcheck:
+      enabled: false
+    markdownlint:
+      enabled: false
+    eslint:
+      enabled: false
+    phpstan:
+      enabled: false
+    phpcs:
+      enabled: false
+    rubocop:
+      enabled: false
+    stylelint:
+      enabled: false
+    checkov:
+      enabled: false
+    detekt:
+      enabled: false
+    hadolint:
+      enabled: false
+    staticcheck:
+      enabled: false
+    psalm:
+      enabled: false
+    reek:
+      enabled: false
+chat:
+  auto_reply: true
