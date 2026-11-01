@@ -1603,7 +1603,8 @@ class ContinuumTest < Minitest::Test
     end
   end
 
-  def test_tech_stubs_reference_only_continuum_itself    own_repo = 'kodmial/continuum'
+  def test_tech_stubs_reference_only_continuum_itself
+    own_repo = 'kodmial/continuum'
     # `github.com/owner/repo`, matched case-insensitively because GitHub owners
     # are not case-sensitive and a template may spell one any way. This is
     # stripped before the bare-literal scan so the two never overlap.
