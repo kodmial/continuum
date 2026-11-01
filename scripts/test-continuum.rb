@@ -1769,6 +1769,7 @@ class ContinuumTest < Minitest::Test
     pr-agent-router.yml
     remove-review-label.yml
     continuum-consumer-child-dispatcher.yml
+    continuum-contract-canary.yml
     continuum-contract-qualification.yml
     continuum-validation.yml
     continuum-model-routing-e2e.yml # Repository-owned live test, not a reusable consumer callee
@@ -2637,6 +2638,35 @@ class ContinuumTest < Minitest::Test
     # their permission grants must not diverge again.
     assert_equal stub.fetch('permissions'), permissions,
                  'pr-agent.yml dogfood caller and continuum-pr-agent.yml stub must grant the same permissions'
+  end
+
+  # Project-owned callers of the contract-qualification reusable workflows
+  # must grant every permission each callee job requests. The qualify job
+  # reads issues for the live-reservation probe; the canary workflow writes
+  # issues and dispatches recovery. A caller that omits a scope fails at
+  # startup before any step runs, so the split keeps PR callers read-only.
+  def test_contract_qualification_callers_grant_required_permissions
+    rank = { 'none' => 0, 'read' => 1, 'write' => 2 }
+    callees = {}
+    %w[continuum-contract-qualification.yml continuum-contract-canary.yml].each do |name|
+      callee = yaml(File.join(ROOT, '.github/workflows', name))
+      callees[name] = ([callee['permissions']] + callee['jobs'].values.map { |job| job['permissions'] }).compact
+    end
+
+    %w[contract-qualification.yml contract-qualification-canary.yml].each do |name|
+      caller = yaml(File.join(ROOT, '.github/workflows', name))
+      caller.fetch('jobs').each_value do |job|
+        callee_name = File.basename(job.fetch('uses').to_s)
+        required = callees.fetch(callee_name)
+        permissions = job['permissions'] || caller.fetch('permissions')
+        required.each do |scope|
+          scope.each do |key, value|
+            assert_operator rank.fetch(permissions.fetch(key, 'none')), :>=, rank.fetch(value),
+                            "#{name}: #{key} grants #{permissions.fetch(key, 'none')}, needs #{value}"
+          end
+        end
+      end
+    end
   end
 
   # kodmial/continuum#229: ordinary PR comments must not create heavy
@@ -9485,8 +9515,9 @@ class ContinuumTest < Minitest::Test
     body = File.read(File.join(ROOT, '.github/workflows/continuum-contract-qualification.yml'))
     assert_includes body, 'bash scripts/validate-continuum.sh', 'Layer 1 regression gate must use the canonical validation entrypoint'
     assert_includes body, 'contract_qualification', 'Layer 2 lifecycle probe must exercise the contract module'
-    assert_includes body, 'canary', 'Layer 3 live-canary probe must exist'
     assert_includes body, 'continuum/contract-qualification', 'contract status context must be published'
+    canary = File.read(File.join(ROOT, '.github/workflows/continuum-contract-canary.yml'))
+    assert_includes canary, 'observe_canary', 'Layer 3 live-canary probe must exist'
     engine = File.read(File.join(ROOT, 'src/continuum/contract_qualification.py'))
     assert_includes engine, 'evaluate_regression_gate'
     assert_includes engine, 'evaluate_reservation_liveness'
@@ -9501,8 +9532,9 @@ class ContinuumTest < Minitest::Test
 
   # Layer 3 must observe a real canary task. A canary job that constructs its
   # own state proves nothing, so the scheduled project-owned caller drives the
-  # reusable canary mode and the reusable fails closed when no live issue is
-  # configured.
+  # reusable canary workflow and the reusable fails closed when no live issue is
+  # configured. It is a separate reusable workflow so the pull-request
+  # qualification caller never needs issue/action writes.
   def test_contract_qualification_canary_observes_a_live_task
     entry_path = File.join(ROOT, '.github/workflows/contract-qualification-canary.yml')
     assert File.exist?(entry_path), 'the scheduled live-canary entry is missing'
@@ -9516,33 +9548,39 @@ class ContinuumTest < Minitest::Test
            'the live canary must stay manually dispatchable'
     assert_equal({}, entry.fetch('permissions'),
                  'the project-owned canary entry must grant nothing itself')
-    call = entry.fetch('jobs').fetch('canary')
-    assert_equal './.github/workflows/continuum-contract-qualification.yml', call.fetch('uses')
-    assert_equal 'canary', call.fetch('with').fetch('mode'),
-                 'the live canary entry must request canary mode, not verification'
-    assert_equal 'inherit', call.fetch('secrets')
-    assert_equal %w[actions contents issues pull-requests statuses].sort,
-                 call.fetch('permissions').keys.sort,
-                 'the canary job must request only the permissions its observation needs'
 
-    body = File.read(File.join(ROOT, '.github/workflows/continuum-contract-qualification.yml'))
-    canary = body[body.index('  canary:')..]
-    assert_includes canary, "if: inputs.mode == 'canary'"
-    assert_includes canary, 'CONTINUUM_CANARY_ISSUE',
+    qualify = entry.fetch('jobs').fetch('qualify')
+    assert_equal './.github/workflows/continuum-contract-qualification.yml', qualify.fetch('uses')
+    assert_equal %w[actions contents issues pull-requests statuses].sort,
+                 qualify.fetch('permissions').keys.sort,
+                 'the qualification job must request only read scopes and status writes'
+    canary_call = entry.fetch('jobs').fetch('canary')
+    assert_equal 'qualify', canary_call.fetch('needs')
+    assert_equal './.github/workflows/continuum-contract-canary.yml', canary_call.fetch('uses')
+    assert_equal %w[actions contents issues pull-requests statuses].sort,
+                 canary_call.fetch('permissions').keys.sort,
+                 'the canary job must request only the permissions its observation needs'
+    assert_equal({ 'TAP_PAT' => '${{ secrets.TAP_PAT }}' }, canary_call.fetch('secrets'))
+
+    body = File.read(File.join(ROOT, '.github/workflows/continuum-contract-canary.yml'))
+    assert_includes body, 'CONTINUUM_CANARY_ISSUE',
                     'the live canary must observe a configured real issue'
-    assert_includes canary, 'observe_canary',
+    assert_includes body, 'observe_canary',
                     'the live canary stage must be derived from real GitHub state'
-    assert_includes canary, 'gh issue view "$CANARY_ISSUE"'
-    assert_includes canary, "jq -s 'add // []'",
+    assert_includes body, 'gh issue view "$CANARY_ISSUE"'
+    assert_includes body, "jq -s 'add // []'",
                     'paginated comment pages must be merged into one JSON array'
-    assert_includes canary, '"workflow", "run"',
+    assert_includes body, '"workflow", "run"',
                     'a stalled canary must dispatch bounded autonomous recovery'
-    assert_includes canary, 'continuum-canary-recovery',
+    assert_includes body, 'continuum-canary-recovery',
                     'each bounded recovery attempt must be recorded on the issue'
-    assert_includes canary, 'PUBLISH_STATUS',
+    assert_includes body, 'PUBLISH_STATUS',
                     'the canary status must honour the publish-status knob'
-    refute_includes body[/\A.*?^  canary:/m], 'observe_canary',
-                    'constructed verification mode must not claim live-canary observation'
+    qualification = File.read(File.join(ROOT, '.github/workflows/continuum-contract-qualification.yml'))
+    refute_includes qualification, 'observe_canary',
+                    'the pull-request qualification workflow must not claim live-canary observation'
+    refute_includes qualification, 'secrets.TAP_PAT',
+                    'the pull-request qualification workflow must not hold the PAT'
 
     assert File.exist?(File.join(ROOT, 'src/continuum/contract_observation.py')),
            'the observation helpers must exist in the engine'

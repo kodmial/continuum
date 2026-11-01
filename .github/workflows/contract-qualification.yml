@@ -17,6 +17,7 @@ on:
 permissions:
   actions: read
   contents: read
+  issues: read
   pull-requests: read
   statuses: write
 
@@ -28,4 +29,3 @@ jobs:
       continuum_ref: main
       pr_number: "${{ inputs.pr_number || github.event.pull_request.number }}"
       head_sha: "${{ inputs.head_sha || github.event.pull_request.head.sha }}"
-      mode: verify

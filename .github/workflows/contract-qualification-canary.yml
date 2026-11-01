@@ -11,12 +11,22 @@ on:
 permissions: {}
 
 jobs:
-  canary:
+  qualify:
     uses: ./.github/workflows/continuum-contract-qualification.yml
-    secrets: inherit
     with:
-      mode: canary
       continuum_ref: main
+    permissions:
+      actions: read
+      contents: read
+      issues: read
+      pull-requests: read
+      statuses: write
+
+  canary:
+    needs: qualify
+    uses: ./.github/workflows/continuum-contract-canary.yml
+    secrets:
+      TAP_PAT: ${{ secrets.TAP_PAT }}
     permissions:
       actions: write
       contents: read

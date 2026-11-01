@@ -1573,7 +1573,24 @@
         }
       ],
       "jobs": [
-        "qualify",
+        "qualify"
+      ],
+      "owners": [
+        "contract-qualification"
+      ],
+      "event_payload_dependent": false
+    },
+    {
+      "path": ".github/workflows/continuum-contract-canary.yml",
+      "name": "Contract canary",
+      "layer": "reusable-engine",
+      "installer_set": "not-installed",
+      "triggers": [
+        {
+          "event": "workflow_call"
+        }
+      ],
+      "jobs": [
         "canary"
       ],
       "owners": [
@@ -2084,6 +2101,7 @@
         }
       ],
       "jobs": [
+        "qualify",
         "canary"
       ],
       "owners": [

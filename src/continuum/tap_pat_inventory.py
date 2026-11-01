@@ -477,7 +477,7 @@ ENTRIES = (
     },
     # -- automation / router / bootstrap / render / docker ---------------
     {
-        "workflow": "continuum-contract-qualification.yml",
+        "workflow": "continuum-contract-canary.yml",
         "step": "Observe the live canary task",
         "capability": CHAINING,
         "same_repo": True,
