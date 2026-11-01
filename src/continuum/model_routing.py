@@ -715,10 +715,10 @@ def run() -> int:
             # boundary instead.
             raise
         except BurnedRunner:
-            def pause(current):
+            def pause(current, *, selected_model=model):
                 if current.get("fingerprint") != fingerprint:
                     current = {"fingerprint": fingerprint, "cooldowns": {}}
-                current.setdefault("cooldowns", {})[model] = now + config.cooldown
+                current.setdefault("cooldowns", {})[selected_model] = now + config.cooldown
                 return current
             try:
                 store.update(key, pause)
@@ -729,10 +729,10 @@ def run() -> int:
             raise
         except RouteError as error:
             errors[model] = str(error)
-            def pause(current):
+            def pause(current, *, selected_model=model):
                 if current.get("fingerprint") != fingerprint:
                     current = {"fingerprint": fingerprint, "cooldowns": {}}
-                current.setdefault("cooldowns", {})[model] = now + config.cooldown
+                current.setdefault("cooldowns", {})[selected_model] = now + config.cooldown
                 return current
             store.update(key, pause)
             if config.pinned:
