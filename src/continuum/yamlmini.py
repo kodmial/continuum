@@ -142,7 +142,7 @@ def _unescape_double(inner: str, number: int) -> str:
             out.append(_ESCAPES[marker])
             index += 2
             continue
-        if marker == "u" and index + 5 < len(inner) + 1:
+        if marker == "u" and index + 6 <= len(inner):
             try:
                 out.append(chr(int(inner[index + 2 : index + 6], 16)))
             except ValueError:

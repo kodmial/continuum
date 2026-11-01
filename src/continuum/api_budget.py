@@ -135,7 +135,7 @@ GIT_EQUIVALENT_QUESTIONS: Mapping[str, str] = {
     "commit_history": "git log --format=%H <range>",
     "file_content_at_ref": "git show <ref>:<path>",
     "ref_exists": "git cat-file -e <ref>",
-    "behind_by": "git rev-list --count <head>.. <upstream>",
+    "behind_by": "git rev-list --count <head>..<upstream>",
 }
 
 #: GitHub-only state that must never be inferred from local Git.

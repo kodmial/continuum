@@ -113,6 +113,18 @@ class YamlSubsetTests(unittest.TestCase):
         with self.assertRaises(yamlmini.YamlSubsetError):
             yamlmini.loads('a: "unterminated\n')
 
+    def test_unicode_escape_decodes_exactly_four_hex_digits(self):
+        self.assertEqual(yamlmini.loads('a: "\\u0041"\n'), {"a": "A"})
+
+    def test_rejects_truncated_unicode_escape(self):
+        with self.assertRaises(yamlmini.YamlSubsetError) as raised:
+            yamlmini.loads('a: "\\u041"\n')
+        self.assertIn("line 1", str(raised.exception))
+
+    def test_rejects_non_hex_unicode_escape(self):
+        with self.assertRaises(yamlmini.YamlSubsetError):
+            yamlmini.loads('a: "\\u00zz"\n')
+
     def test_empty_document(self):
         self.assertEqual(yamlmini.loads("\n# only comments\n"), {})
 

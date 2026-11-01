@@ -24,6 +24,7 @@ Standard library only.
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
 import os
 import re
@@ -42,6 +43,19 @@ SCHEMA_VERSION = 1
 #: the publish boundary (see ``continuum_pr_staging.sh``); it is never product
 #: code and is never committed to an implementation PR.
 EVIDENCE_FILE_NAME = ".continuum-verification.json"
+
+#: Runner-controlled key that attests the trusted evidence sections. The
+#: evidence file lives in the worktree, where the coding agent can rewrite it;
+#: a signature keyed by a workflow secret makes a forged contract, baseline,
+#: verifier result, or accepted ``final`` record fail closed instead of being
+#: reused. Without the key the evidence is never trusted for reuse: the final
+#: phase re-resolves the contract from the task base commit and re-establishes
+#: the baseline on the current runner.
+ATTESTATION_KEY_ENV = "CONTINUUM_VERIFICATION_ATTESTATION_KEY"
+ATTESTATION_ALGORITHM = "hmac-sha256"
+
+#: Evidence sections covered by the attestation signature.
+ATTESTED_SECTIONS = ("contract", "baseline", "verifier", "final")
 
 #: Ordered validation hooks, mirroring ``continuum-validation.yml``. The order
 #: is the repository contract; baseline and final use the exact same tuple.
@@ -439,8 +453,22 @@ def _with_mapping_indent(
     return None
 
 
+def _ci_caller_text(repo_root: Path, relative: str, ref: str) -> Optional[str]:
+    """Read one CI caller from ``ref`` or from the worktree when ``ref`` is empty."""
+
+    if ref:
+        completed = _run_git(repo_root, "show", "{}:{}".format(ref, relative))
+        if completed.returncode != 0:
+            return None
+        return completed.stdout or ""
+    path = repo_root / relative
+    if not path.is_file():
+        return None
+    return _read_text(path)
+
+
 def _ci_caller_commands(
-    repo_root: Path, environ: Mapping[str, str]
+    repo_root: Path, environ: Mapping[str, str], ref: str = ""
 ) -> Tuple[Dict[str, Tuple[str, str]], List[str]]:
     """Read literal hook commands from the consumer's primary CI caller.
 
@@ -448,15 +476,19 @@ def _ci_caller_commands(
     ``continuum-validation.yml`` is read, so an unrelated ``uses:`` block cannot
     supply a hook. Values obey YAML scalar rules: block scalars are expanded,
     quoted scalars are unquoted, and comments do not become commands.
+
+    ``ref`` reads the caller from that Git revision instead of the worktree, so
+    a task checkout cannot rewrite its own verification contract after the
+    baseline was recorded.
     """
 
     values: Dict[str, Tuple[str, str]] = {}
     errors: List[str] = []
     for relative in CI_CALLER_CANDIDATES:
-        path = repo_root / relative
-        if not path.is_file():
+        text = _ci_caller_text(repo_root, relative, ref)
+        if text is None:
             continue
-        lines = _read_text(path).splitlines()
+        lines = text.splitlines()
         caller = _find_validation_caller(lines)
         if caller is None:
             continue
@@ -524,17 +556,22 @@ def _ci_caller_commands(
 def resolve_contract(
     repo_root: Path | str,
     environ: Optional[Mapping[str, str]] = None,
+    ref: str = "",
 ) -> VerificationContract:
     """Resolve the consumer's authoritative verification commands.
 
     The explicit CI caller contract wins over repository variables, mirroring
     ``continuum-validation.yml``'s ``inputs.foo || vars.foo`` precedence. Only
     non-empty literal commands are returned; there is no built-in fallback.
+
+    ``ref`` resolves the CI caller from that Git revision. The final phase
+    passes the task base commit so a worktree edit cannot weaken the contract
+    that was recorded at baseline time.
     """
 
     root = Path(repo_root)
     env = environ if environ is not None else os.environ
-    ci_values, errors = _ci_caller_commands(root, env)
+    ci_values, errors = _ci_caller_commands(root, env, ref)
 
     commands: List[VerificationCommand] = []
     sources: List[str] = []
@@ -662,7 +699,60 @@ def _now() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
 
-def _load_evidence(path: Path) -> Dict[str, Any]:
+def _attestation_key(
+    environ: Optional[Mapping[str, str]] = None,
+) -> Optional[bytes]:
+    """The runner-controlled attestation key, or ``None`` when unset."""
+
+    source = os.environ if environ is None else environ
+    raw = str(source.get(ATTESTATION_KEY_ENV, "") or "").strip()
+    return raw.encode("utf-8") if raw else None
+
+
+def _attestation_payload(data: Mapping[str, Any]) -> bytes:
+    """Canonical bytes of the trusted evidence sections."""
+
+    trusted = {
+        section: data[section]
+        for section in ATTESTED_SECTIONS
+        if isinstance(data.get(section), dict)
+    }
+    return json.dumps(
+        trusted, ensure_ascii=True, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+
+
+def _sign_evidence(data: Dict[str, Any], key: bytes) -> None:
+    data["attestation"] = {
+        "algorithm": ATTESTATION_ALGORITHM,
+        "signature": hmac.new(
+            key, _attestation_payload(data), hashlib.sha256
+        ).hexdigest(),
+    }
+
+
+def _verify_evidence(data: Mapping[str, Any], key: bytes) -> None:
+    record = data.get("attestation")
+    if not isinstance(record, dict):
+        raise VerificationError(
+            "verification evidence is not attested; refusing to trust worktree evidence"
+        )
+    if str(record.get("algorithm") or "") != ATTESTATION_ALGORITHM:
+        raise VerificationError(
+            "verification evidence uses an unsupported attestation algorithm"
+        )
+    expected = hmac.new(
+        key, _attestation_payload(data), hashlib.sha256
+    ).hexdigest()
+    if not hmac.compare_digest(expected, str(record.get("signature") or "")):
+        raise VerificationError(
+            "verification evidence attestation does not match; refusing to trust worktree evidence"
+        )
+
+
+def _load_evidence(
+    path: Path, environ: Optional[Mapping[str, str]] = None
+) -> Dict[str, Any]:
     if not path.exists():
         return {"schema_version": SCHEMA_VERSION}
     try:
@@ -675,10 +765,20 @@ def _load_evidence(path: Path) -> Dict[str, Any]:
         raise VerificationError("verification evidence must be a JSON object")
     if int(data.get("schema_version") or 0) != SCHEMA_VERSION:
         raise VerificationError("verification evidence schema is unsupported")
+    key = _attestation_key(environ)
+    if key is not None:
+        _verify_evidence(data, key)
     return data
 
 
-def _save_evidence(path: Path, data: Dict[str, Any]) -> None:
+def _save_evidence(
+    path: Path,
+    data: Dict[str, Any],
+    environ: Optional[Mapping[str, str]] = None,
+) -> None:
+    key = _attestation_key(environ)
+    if key is not None:
+        _sign_evidence(data, key)
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(path.name + ".tmp")
     temporary.write_text(
@@ -821,13 +921,16 @@ def ensure_baseline(
     if not re.fullmatch(r"[0-9a-f]{40}", base):
         raise VerificationError("baseline base SHA is malformed")
 
-    data = _load_evidence(path)
+    data = _load_evidence(path, env)
     contract = resolve_contract(root, env)
     if not contract.configured:
         raise VerificationError(contract.errors[0] if contract.errors else "unconfigured verification contract")
 
     existing = data.get("baseline")
-    if isinstance(existing, dict):
+    # Worktree evidence is only reusable when it is attested by the
+    # runner-controlled key. An unattested baseline is rebuilt below instead of
+    # being trusted after the coding agent could have rewritten it.
+    if isinstance(existing, dict) and _attestation_key(env) is not None:
         recorded_contract = existing.get("contract")
         recorded_fingerprint = ""
         if isinstance(recorded_contract, dict):
@@ -849,9 +952,15 @@ def ensure_baseline(
 
     head = _git_value(root, "rev-parse", "HEAD").lower()
     if head != base:
+        hint = ""
+        if isinstance(existing, dict):
+            hint = (
+                " (an unattested baseline was recorded; set {} so a resumed "
+                "run can trust it)".format(ATTESTATION_KEY_ENV)
+            )
         raise VerificationError(
             "cannot establish a pre-change baseline: the checkout is already "
-            "past the task base ({} != {})".format(head, base)
+            "past the task base ({} != {}){}".format(head, base, hint)
         )
     if task_changes_present(root, base):
         raise VerificationError(
@@ -875,7 +984,7 @@ def ensure_baseline(
             "baseline": result,
         }
     )
-    _save_evidence(path, data)
+    _save_evidence(path, data, env)
     if result["state"] != "passed":
         print(
             "::warning::Baseline verification failed for: {}. The failure is "
@@ -889,9 +998,12 @@ def ensure_baseline(
     return data, False
 
 
-def verifier_required(evidence_path: Path | str) -> bool:
+def verifier_required(
+    evidence_path: Path | str,
+    environ: Optional[Mapping[str, str]] = None,
+) -> bool:
     path = Path(evidence_path)
-    data = _load_evidence(path)
+    data = _load_evidence(path, environ)
     baseline = data.get("baseline")
     if not isinstance(baseline, dict):
         raise VerificationError("verification evidence has no baseline")
@@ -915,7 +1027,7 @@ def record_verifier(
 
     root = Path(repo)
     path = Path(evidence_path)
-    data = _load_evidence(path)
+    data = _load_evidence(path, environ)
     baseline = data.get("baseline")
     if not isinstance(baseline, dict):
         raise VerificationError("verification evidence has no baseline")
@@ -939,7 +1051,7 @@ def record_verifier(
         "changed_paths": changed_paths,
     }
     data["verifier"] = verifier
-    _save_evidence(path, data)
+    _save_evidence(path, data, environ)
     return verifier
 
 
@@ -993,23 +1105,20 @@ def _comparison(
     }
 
 
-def _reestablish_baseline(
+def _baseline_at_base(
     root: Path,
-    evidence_path: Path,
-    data: Dict[str, Any],
-    baseline: Mapping[str, Any],
     contract: VerificationContract,
     base: str,
     env: Mapping[str, str],
     timeout_seconds: Optional[float],
     environment: str,
+    previous_environment: str = "",
 ) -> Dict[str, Any]:
-    """Re-run the baseline at the task base on a resumed, changed runner.
+    """Run the contract against the task base in a throwaway worktree.
 
-    A 429 evacuation moves the task onto a replacement runner whose image or
-    ``PATH`` may differ. The restored baseline is then incomparable. Rebasing
-    only the environment fingerprint would keep stale results, so re-establish
-    a real baseline against the same task base before the final run.
+    The task checkout has already moved past the base, so the baseline is
+    re-derived from the trusted base commit instead of the recorded worktree
+    evidence.
     """
 
     if not _is_ancestor(root, base):
@@ -1017,7 +1126,6 @@ def _reestablish_baseline(
             "cannot re-establish the verification baseline: the task base is "
             "not an ancestor of the current checkout"
         )
-    previous = str(baseline.get("environment_fingerprint") or "")
     temporary = tempfile.mkdtemp(prefix="continuum-verification-")
     try:
         added = _run_git(root, "worktree", "add", "--detach", temporary, base)
@@ -1040,12 +1148,43 @@ def _reestablish_baseline(
             # the temporary worktree path differs from the task checkout.
             "environment_fingerprint": environment,
             "environment_rebaselined": True,
-            "previous_environment_fingerprint": previous,
+            "previous_environment_fingerprint": previous_environment,
         }
+    )
+    return result
+
+
+def _reestablish_baseline(
+    root: Path,
+    evidence_path: Path,
+    data: Dict[str, Any],
+    baseline: Mapping[str, Any],
+    contract: VerificationContract,
+    base: str,
+    env: Mapping[str, str],
+    timeout_seconds: Optional[float],
+    environment: str,
+) -> Dict[str, Any]:
+    """Re-run the baseline at the task base on a resumed, changed runner.
+
+    A 429 evacuation moves the task onto a replacement runner whose image or
+    ``PATH`` may differ. The restored baseline is then incomparable. Rebasing
+    only the environment fingerprint would keep stale results, so re-establish
+    a real baseline against the same task base before the final run.
+    """
+
+    result = _baseline_at_base(
+        root,
+        contract,
+        base,
+        env,
+        timeout_seconds,
+        environment,
+        previous_environment=str(baseline.get("environment_fingerprint") or ""),
     )
     data["baseline"] = result
     data["contract"] = contract.as_dict()
-    _save_evidence(evidence_path, data)
+    _save_evidence(evidence_path, data, env)
     print(
         "Verification environment changed on a resumed run; re-established the "
         "baseline in the current environment."
@@ -1072,15 +1211,39 @@ def run_final(
     path = Path(evidence_path)
     env = environ if environ is not None else os.environ
     base = str(base_sha or "").strip().lower()
-    data = _load_evidence(path)
+    attested = _attestation_key(env) is not None
+    data = _load_evidence(path, env)
     baseline = data.get("baseline")
     if not isinstance(baseline, dict):
         raise VerificationError("verification evidence has no baseline")
     if str(baseline.get("base_sha") or "").strip().lower() != base:
         raise VerificationError("verification evidence baseline base does not match")
-    contract = _contract_from_evidence(data)
-    if not contract.configured:
+    recorded_contract = _contract_from_evidence(data)
+    if not recorded_contract.configured:
         raise VerificationError("verification evidence contract is not executable")
+    if attested:
+        # _load_evidence already verified the signature over this contract.
+        contract = recorded_contract
+    else:
+        # The evidence file lives in the task worktree, where the coding agent
+        # can rewrite both the commands and their unkeyed fingerprint. Resolve
+        # the contract again from the immutable task base commit (repository
+        # variables stay runner-controlled) and run exactly that command set.
+        contract = resolve_contract(root, env, ref=base)
+        if not contract.configured:
+            raise VerificationError(
+                contract.errors[0]
+                if contract.errors
+                else "verification contract is not configured at the task base"
+            )
+        recorded_fingerprint = str(
+            (baseline.get("contract") or {}).get("fingerprint") or ""
+        )
+        if contract.fingerprint != recorded_fingerprint:
+            raise VerificationError(
+                "the verification contract resolved at the task base does not "
+                "match the recorded baseline; refusing unattested evidence"
+            )
 
     baseline_environment = str(baseline.get("environment_fingerprint") or "")
     current_environment = environment_fingerprint(root, env)
@@ -1090,9 +1253,12 @@ def run_final(
     # normal run that could have changed the tree. Reuse precedes the
     # environment comparison because the resumed runner is expected to differ
     # and the already-passed result does not need to be recomputed there.
+    # Unattested worktree evidence is never reused: the agent could have
+    # forged the accepted record.
     existing_final = data.get("final")
     if (
-        resume_stage in ("tests-passed", "publish-pr")
+        attested
+        and resume_stage in ("tests-passed", "publish-pr")
         and isinstance(existing_final, dict)
         and str(existing_final.get("state") or "") == "passed"
         and str(existing_final.get("contract_fingerprint") or "")
@@ -1103,7 +1269,21 @@ def run_final(
             print("Reusing exact post-change verification evidence from the 429 checkpoint.")
             return data, comparison
 
-    if baseline_environment and current_environment != baseline_environment:
+    if not attested:
+        # Re-derive the baseline from the trusted base commit instead of
+        # accepting the recorded results from the writable evidence file.
+        baseline = _baseline_at_base(
+            root,
+            contract,
+            base,
+            env,
+            timeout_seconds,
+            current_environment,
+            previous_environment=baseline_environment,
+        )
+        data["baseline"] = baseline
+        data["contract"] = contract.as_dict()
+    elif baseline_environment and current_environment != baseline_environment:
         if not resume_stage:
             raise VerificationError(
                 "verification environment changed between baseline and final; the "
@@ -1129,7 +1309,7 @@ def run_final(
     result["comparison"] = comparison
     data["final"] = result
     data["result"] = comparison
-    _save_evidence(path, data)
+    _save_evidence(path, data, env)
     if comparison["accepted"]:
         print(
             "Post-change verification passed using the same resolved command set "

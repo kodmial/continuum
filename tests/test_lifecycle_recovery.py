@@ -91,6 +91,23 @@ class TransientClassificationTests(unittest.TestCase):
         )
         self.assertFalse(classified.transient)
 
+    def test_403_with_retry_after_is_transient_without_message(self):
+        # GitHub secondary rate limits return 403 + Retry-After while the
+        # primary quota is still above zero, and the caller may pass no body.
+        classified = lifecycle.classify_infrastructure_failure(
+            status=403, headers={"Retry-After": "90"}, error=""
+        )
+        self.assertTrue(classified.transient)
+        self.assertEqual(classified.retry_after_seconds, 90)
+
+    def test_403_with_empty_retry_after_is_not_transient(self):
+        classified = lifecycle.classify_infrastructure_failure(
+            status=403,
+            headers={"Retry-After": ""},
+            error="Resource not accessible by integration",
+        )
+        self.assertFalse(classified.transient)
+
     def test_429_honors_retry_after(self):
         classified = lifecycle.classify_infrastructure_failure(
             status=429, headers={"Retry-After": "120"}, error="too many requests"

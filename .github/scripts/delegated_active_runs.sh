@@ -17,7 +17,9 @@ set -euo pipefail
 # GitHub Actions REST status values that mean work still owns its
 # concurrency identity. `requested` and `pending` cover jobs that have not
 # been assigned a runner yet.
-ACTIVE_STATUSES=(in_progress queued pending waiting requested)
+# Lifecycle order (earliest first): a run that advances between two status
+# queries is still observed by the later query instead of vanishing.
+ACTIVE_STATUSES=(requested waiting pending queued in_progress)
 PER_PAGE="${CONTINUUM_ACTIVE_RUNS_PER_PAGE:-100}"
 MAX_PAGES="${CONTINUUM_ACTIVE_RUNS_MAX_PAGES:-5}"
 UNAVAILABLE=4

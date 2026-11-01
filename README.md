@@ -189,17 +189,20 @@ The exact commands and expected observations are in
 # Default set (core) from a local checkout
 bash install.sh /path/to/consumer
 
+# Pick a reviewed branch, tag, or full commit SHA
+export CONTINUUM_REF="main"
+
 # Pin a branch, tag, or full commit SHA
-bash install.sh /path/to/consumer <ref> core
+bash install.sh /path/to/consumer "$CONTINUUM_REF" core
 
 # Opt into the consumer-neutral technology library
-bash install.sh /path/to/consumer <ref> tech
+bash install.sh /path/to/consumer "$CONTINUUM_REF" tech
 
 # Add parent/child delegated execution
-bash install.sh /path/to/consumer <ref> parent
+bash install.sh /path/to/consumer "$CONTINUUM_REF" parent
 
 # Also prune superseded callers without a terminal confirmation
-bash install.sh /path/to/consumer <ref> core --yes
+bash install.sh /path/to/consumer "$CONTINUUM_REF" core --yes
 ```
 
 The installer fetches caller templates from the requested revision and rewrites
@@ -276,8 +279,10 @@ present. To migrate a repository, install or update the canonical
 `continuum-coderabbit-unresolved.yml` caller first, then re-run `core`:
 
 ```sh
-bash install.sh /path/to/consumer <ref> core --dry-run
-bash install.sh /path/to/consumer <ref> core
+# Use the reviewed branch, tag, or full commit SHA
+export CONTINUUM_REF="main"
+bash install.sh /path/to/consumer "$CONTINUUM_REF" core --dry-run
+bash install.sh /path/to/consumer "$CONTINUUM_REF" core
 ```
 
 The preview lists every superseded caller that would be pruned and changes

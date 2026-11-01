@@ -81,6 +81,17 @@ pre-existing baseline failure is recorded separately and does not become green.
 The workflow-owned `.continuum-verification.json` evidence is retained on a
 429 checkpoint and removed before the implementation commit/PR.
 
+The evidence file lives in the task worktree, so the engine never trusts it on
+its own. Set the workflow secret
+`CONTINUUM_VERIFICATION_ATTESTATION_KEY` in the verification step's environment
+to sign the recorded contract, baseline, verifier result, and accepted final
+record with HMAC-SHA256; a resumed run reuses those records only when the
+signature verifies. Without the key, an existing baseline is rebuilt and the
+final phase re-resolves the contract from the task base commit instead of the
+worktree, so a coding agent cannot rewrite its own verification commands or
+forge an accepted result. The key is read from the environment, never from an
+argument, so it does not appear in process listings.
+
 The reusable engine is **not** installed as a `continuum-validation.yml`
 caller. Each consumer owns one primary `.github/workflows/ci.yml` whose
 workflow `name:` is **CI** and calls

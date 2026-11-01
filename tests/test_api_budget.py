@@ -131,6 +131,13 @@ class SubstitutionTest(unittest.TestCase):
     def test_no_checkout_falls_back_to_api(self):
         self.assertEqual(substitution_for("head_sha", False, False), "api")
 
+    def test_behind_by_range_has_no_space(self):
+        # A space splits the range and makes git count `<head>..` instead.
+        self.assertEqual(
+            GIT_EQUIVALENT_QUESTIONS["behind_by"],
+            "git rev-list --count <head>..<upstream>",
+        )
+
     def test_github_only_state_never_uses_git(self):
         self.assertTrue(len(GITHUB_ONLY_QUESTIONS) > 0)
         for question in sorted(GITHUB_ONLY_QUESTIONS):

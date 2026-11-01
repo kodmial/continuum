@@ -574,9 +574,10 @@ def classify_infrastructure_failure(
 ) -> FailureClassification:
     """Classify a failure as transient infrastructure or deterministic.
 
-    Transient: GitHub 403 rate limit with X-RateLimit-Remaining=0, 429 with
-    Retry-After, any 5xx, network timeout/reset, runner cancellation/eviction,
-    temporary provider/bootstrap outage.  Everything else fails closed to
+    Transient: GitHub 403 rate limit with X-RateLimit-Remaining=0 or a
+    Retry-After header, 429 with Retry-After, any 5xx, network
+    timeout/reset, runner cancellation/eviction, temporary
+    provider/bootstrap outage.  Everything else fails closed to
     deterministic so it never consumes the transient budget.
 
     ``now`` is the reference clock forwarded to HTTP-date Retry-After
@@ -625,7 +626,10 @@ def classify_infrastructure_failure(
         )
     if code == 403:
         remaining = _parse_int(norm_headers.get("x-ratelimit-remaining", ""))
-        rate_limited = remaining == 0 or any(
+        has_retry_after = bool(
+            norm_headers.get("retry-after") or norm_headers.get("retry_after")
+        )
+        rate_limited = remaining == 0 or has_retry_after or any(
             token in message
             for token in ("rate limit", "rate-limit", "ratelimit", "quota exhaustion")
         )
