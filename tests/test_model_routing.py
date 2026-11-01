@@ -415,6 +415,90 @@ class StateStoreFailureIsolationTests(unittest.TestCase):
         self.assertEqual(calls["update"], 1)
 
 
+class SelectionLoopClosureBindingTests(unittest.TestCase):
+    """Each selection-loop mutator binds the model of its own iteration."""
+
+    def _run(self, store, probe, *, models=None):
+        import os
+        with tempfile.TemporaryDirectory() as tmp, \
+             patch.object(route, "binary_provenance", lambda: ("1.2.3", "d")), \
+             patch.object(route, "GitRefStore", lambda owner, token: store), \
+             patch.object(route, "semantic_probe", probe), \
+             patch.object(route.sys, "argv", ["model_routing.py", "select"]), \
+             patch.dict(os.environ, {
+                 "OPENCODE_MODELS": models or f"{A},{B}",
+                 "CONTINUUM_MODEL_STATE_TOKEN": "t",
+                 "GITHUB_REPOSITORY": "owner/parent",
+                 "GITHUB_RUN_ID": "703",
+                 "GITHUB_RUN_ATTEMPT": "1",
+                 "RUNNER_TEMP": tmp,
+             }, clear=True):
+            return route.main()
+
+    def _store(self, state, apply):
+        store = type("Store", (), {})()
+        store.read = lambda key: (dict(state), None, None)
+        writes = []
+
+        def update(key, mutator):
+            writes.append(mutator(dict(state)) if apply else mutator)
+            return writes[-1] if apply else dict(state)
+        store.update = update
+        return store, writes
+
+    def test_burned_runner_cools_the_probed_model_not_a_later_one(self):
+        fingerprint = route.Configuration.parse(
+            f"{A},{B}").fingerprint("d", "anonymous")
+        state = {"fingerprint": fingerprint}
+        store, writes = self._store(state, apply=True)
+
+        def probe(model, *args, **kwargs):
+            self.assertEqual(model, A)
+            raise route.BurnedRunner("429")
+
+        self.assertEqual(self._run(store, probe), 75)
+        self.assertEqual(len(writes), 1)
+        self.assertIn(A, writes[0]["cooldowns"])
+        self.assertNotIn(B, writes[0]["cooldowns"])
+
+    def test_plain_route_error_cools_failed_model_and_selects_the_next(self):
+        fingerprint = route.Configuration.parse(
+            f"{A},{B}").fingerprint("d", "anonymous")
+        state = {"fingerprint": fingerprint}
+        store, writes = self._store(state, apply=True)
+
+        def probe(model, *args, **kwargs):
+            if model == A:
+                raise route.RouteError("probe failed")
+
+        self.assertEqual(self._run(store, probe), 0)
+        self.assertEqual(len(writes), 2)
+        self.assertIn(A, writes[0]["cooldowns"])
+        self.assertNotIn(B, writes[0]["cooldowns"])
+        self.assertEqual(writes[1]["last_successful_probe"]["model"], B)
+
+    def test_save_mutator_binds_the_model_selected_for_its_iteration(self):
+        fingerprint = route.Configuration.parse(
+            f"{A},{B}").fingerprint("d", "anonymous")
+        state = {"fingerprint": fingerprint}
+        store, deferred = self._store(state, apply=False)
+
+        def probe(model, *args, **kwargs):
+            if model == A:
+                raise route.RouteError("probe failed")
+
+        self.assertEqual(self._run(store, probe), 0)
+        self.assertEqual(len(deferred), 2)
+        # Replay the captured mutators after the loop has finished, i.e.
+        # after `model` would have moved on. The save mutator must still
+        # record the model selected for its own iteration.
+        saved = dict(state)
+        for mutator in deferred:
+            saved = mutator(saved)
+        self.assertIn(A, saved["cooldowns"])
+        self.assertEqual(saved["last_successful_probe"]["model"], B)
+
+
 class GitRefStoreTests(unittest.TestCase):
     def test_first_write_creates_orphan_ref_not_main(self):
         store = route.GitRefStore("example/private", "fake-token")

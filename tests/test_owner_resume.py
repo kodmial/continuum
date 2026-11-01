@@ -1524,8 +1524,8 @@ class ExecutableProductionWorkflowTests(unittest.TestCase):
             runs=ci_only,
         )
 
-        # Unset or default: a consumer resumes on CI alone.
-        for value in ("", "Continuum Contract Gate"):
+        # Unset, default, or whitespace-only: a consumer resumes on CI alone.
+        for value in ("", "Continuum Contract Gate", "   "):
             with self.subTest(value=value):
                 outcome = self.run_workflow(
                     self.decision_scenario(**base),

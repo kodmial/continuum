@@ -11,6 +11,16 @@ semantics stay in ``src/continuum/coderabbit_adapter.py`` and
 
 Consumer contract freeze: these tests never require stub, input,
 secret, variable, label, permission, or workflow-name changes.
+
+Partial-tree boundary: the two workflow inline copies
+(``.github/workflows/continuum-auto-merge.yml`` and
+``.github/workflows/continuum-pr-agent-auto-merge.yml``) are ``pr/part-2``
+files. The parity test for their inline ``isNonMergeCriticalMainPath``
+copies ships with them in the ``pr/part-2`` change. This module therefore
+asserts only the classifiers this branch ships
+(``.github/scripts/merge_lifecycle.js`` and
+``src/continuum/merge_lifecycle.py``) and never passes a workflow-parity
+check by observing that the workflows are absent.
 """
 
 import os
@@ -179,30 +189,9 @@ class MainSyncTests(unittest.TestCase):
             python_source,
         )
 
-    def test_workflow_inline_copies_are_parity_or_explicitly_absent(self):
-        # The two workflow inline classifiers are updated in the pr/part-2
-        # change. In this partial tree they may be absent: assert that
-        # absence explicitly instead of letting the test pass silently.
-        present = [
-            path
-            for path in (GENERIC_MERGE, PR_AGENT_MERGE)
-            if os.path.exists(os.path.join(ROOT, path))
-        ]
-        if not present:
-            for path in (GENERIC_MERGE, PR_AGENT_MERGE):
-                self.assertFalse(
-                    os.path.exists(os.path.join(ROOT, path)),
-                    "{} appeared after the presence scan".format(path),
-                )
-            return
-        self.assertEqual(len(present), 2, present)
-        for path in (GENERIC_MERGE, PR_AGENT_MERGE):
-            with self.subTest(path=path):
-                body = read_repo(path)
-                self.assertIn("function isNonMergeCriticalMainPath", body)
-                self.assertIn(".github/scripts/", body)
-                self.assertIn(".github/actions/", body)
-                self.assertIn("non-merge-critical-main-delta", body)
+    # The workflow inline `isNonMergeCriticalMainPath` copies and their
+    # parity test are `pr/part-2` files. This branch deliberately has no
+    # workflow-parity assertion, so it cannot pass by absence.
 
 
 class ConflictPlumbingTests(unittest.TestCase):

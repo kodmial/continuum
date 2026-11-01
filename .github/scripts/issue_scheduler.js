@@ -748,11 +748,16 @@ module.exports = async function runIssueScheduler({ github, context, core }) {
   // the knob stays at the default the gate remains Continuum-only.
   const ownerResumeContractGateDefaultWorkflow =
     'Continuum Contract Gate';
+  // A whitespace-only value is not an opt-in: trim first, then treat an
+  // empty result as the default and only a non-empty non-default name as
+  // a consumer override.
+  const ownerResumeContractGateRequested =
+    (process.env.OWNER_RESUME_CONTRACT_GATE_WORKFLOW || '').trim();
   const ownerResumeContractGateWorkflow =
-    (process.env.OWNER_RESUME_CONTRACT_GATE_WORKFLOW ||
-      ownerResumeContractGateDefaultWorkflow).trim();
+    ownerResumeContractGateRequested || ownerResumeContractGateDefaultWorkflow;
   const ownerResumeContractGateConfigured =
-    ownerResumeContractGateWorkflow !== ownerResumeContractGateDefaultWorkflow;
+    ownerResumeContractGateRequested !== '' &&
+    ownerResumeContractGateRequested !== ownerResumeContractGateDefaultWorkflow;
   const ownerResumeDefaultBranch = (
     process.env.DEFAULT_BRANCH ||
     context.payload.repository?.default_branch ||

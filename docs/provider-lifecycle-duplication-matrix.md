@@ -62,7 +62,10 @@ Python canonical owner. The two workflow inline
 `isNonMergeCriticalMainPath` copies are updated to match in the
 `pr/part-2` change; until that lands they only recognize the
 `.github/workflows/continuum-*` prefix and fall through to the generic
-`.github/` rule.
+`.github/` rule. This `pr/part-1` partial tree intentionally carries no
+workflow-parity test: that test ships with the workflow copies in the
+`pr/part-2` change, so the gap is tracked here instead of a test passing
+by the workflows' absence.
 
 ## 2. Provider-specific semantics (not equivalent — stay in adapters)
 

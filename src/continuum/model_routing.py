@@ -741,24 +741,24 @@ def run() -> int:
         # The route qualified. Persist the selection outside the probe error
         # handlers: a state-store Conflict/transport failure must propagate
         # without cooling down a healthy route or failing over.
-        def save(current):
+        def save(current, *, selected_model=model):
             if current.get("fingerprint") != fingerprint:
                 current = {"fingerprint": fingerprint, "cooldowns": {}}
             current.update(schema=STATE_VERSION, fingerprint=fingerprint,
                            runtime={"version": version, "sha256": digest},
                            task_class=config.task_class)
             if not qualified:
-                current["last_successful_probe"] = {"model": model, "at": now}
+                current["last_successful_probe"] = {"model": selected_model, "at": now}
             # The proof's TTL is evaluated at selection time. The
             # trusted run identity, not probe age at completion, is
             # authoritative for a successful task receipt.
             chosen_probe = current.get("last_successful_probe") or {}
-            if chosen_probe.get("model") != model:
+            if chosen_probe.get("model") != selected_model:
                 raise RouteError("Selected route has no qualification")
             at = int(chosen_probe.get("at", 0))
             if not 0 <= now - at <= config.ttl:
                 raise RouteError("Selected probe expired before task start")
-            return reserve_completion(current, ticket, model, now, at)
+            return reserve_completion(current, ticket, selected_model, now, at)
         store.update(key, save)
         write_outputs(env, {"model": model})
         print(model)
