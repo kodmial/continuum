@@ -134,19 +134,19 @@ class CheckpointHistoryTests(unittest.TestCase):
         self._commit(self.seed, "M1")
         self._git(self.seed, "push", "-q", "origin", self.DEFAULT_BRANCH)
 
-    def test_checkpoint_behind_advanced_default_branch_restores(self):
+    def test_checkpoint_behind_advanced_default_branch_is_rejected(self):
         ref = "continuum-child/checkpoint-task-1-g1-" + SPEC
         self._checkpoint(ref)
         self._advance_main()
         self._git(self.tmp.name, "clone", "-q", self.origin, self.work)
         self._config(self.work)
         driver = (
-            'source "$CHECKPOINT"\n'
-            'if continuum_checkpoint_restore "$REF" "continuum-child/task-1" "$SPEC"; then\n'
-            '  printf "rc=0\\n"\n'
-            'else\n'
-            '  printf "rc=%s\\n" "$?"\n'
-            'fi\n'
+            'source "$CHECKPOINT"\\n'
+            'if continuum_checkpoint_restore "$REF" "continuum-child/task-1" "$SPEC"; then\\n'
+            '  printf "rc=0\\\\n"\\n'
+            'else\\n'
+            '  printf "rc=%s\\\\n" "$?"\\n'
+            'fi\\n'
         )
         result = subprocess.run(
             ["bash", "-c", driver],
@@ -156,23 +156,33 @@ class CheckpointHistoryTests(unittest.TestCase):
             env={**os.environ, "CHECKPOINT": CHECKPOINT, "REF": ref, "SPEC": SPEC},
             timeout=120,
         )
-        self.assertIn("rc=0", result.stdout, result.stderr)
+        self.assertIn("rc=4", result.stdout, result.stderr)
+        self.assertIn("stale relative to the target default branch", result.stderr)
         branch = subprocess.run(
             ["git", "rev-parse", "--abbrev-ref", "HEAD"],
             cwd=self.work, capture_output=True, text=True, timeout=60,
         ).stdout.strip()
-        self.assertEqual(branch, "continuum-child/task-1")
+        self.assertEqual(branch, "main")
+        head = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=self.work, capture_output=True, text=True, timeout=60,
+        ).stdout.strip()
+        origin_main = subprocess.run(
+            ["git", "rev-parse", "origin/main"],
+            cwd=self.work, capture_output=True, text=True, timeout=60,
+        ).stdout.strip()
+        self.assertEqual(head, origin_main)
 
     def test_shallow_checkout_restores_the_pinned_checkpoint(self):
-        # Deepening a shallow clone fetches again and overwrites FETCH_HEAD.
-        # Restore must switch to the checkpoint SHA captured before that.
+        # The checkpoint remains a descendant of origin/main. Deepening a
+        # shallow clone fetches again and overwrites FETCH_HEAD; restore must
+        # switch to the pinned checkpoint SHA captured before that.
         ref = "continuum-child/checkpoint-task-3-g1-" + SPEC
         self._checkpoint(ref)
         checkpoint_sha = subprocess.run(
             ["git", "rev-parse", ref],
             cwd=self.seed, capture_output=True, text=True, timeout=60,
         ).stdout.strip()
-        self._advance_main()
         self._git(
             self.tmp.name,
             "clone", "-q", "--depth=1", "file://" + self.origin, self.work,
