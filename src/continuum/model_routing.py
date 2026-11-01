@@ -404,6 +404,16 @@ def _stop_probe(process) -> None:
 
 
 def semantic_probe(model: str, kind: str, timeout: int, *, runner=subprocess.Popen) -> None:
+    """Run one anonymous qualification probe of ``model`` and classify it.
+
+    ``timeout`` is only the nominal budget: a stalled child can outlive it,
+    because stopping costs up to two ``PROBE_STOP_SECONDS`` waits (terminate,
+    then kill) and joining the two pipe readers costs up to two
+    ``PROBE_JOIN_SECONDS`` budgets (plus one poll interval of granularity),
+    so the real worst case is roughly
+    ``timeout + 2 * PROBE_STOP_SECONDS + 2 * PROBE_JOIN_SECONDS``. Any outer
+    timeout that must contain a probe has to budget for that overhead.
+    """
     with tempfile.TemporaryDirectory(prefix="continuum-route-probe-") as scratch:
         if kind == "review":
             prompt = ("Read only: this function must accept age 18: "

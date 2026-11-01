@@ -381,7 +381,6 @@ class ProbeTests(unittest.TestCase):
             process = subprocess.Popen(["sh", "-c", script], **kwargs)
             spawned.append(process)
             return process
-        before = set(threading.enumerate())
         with patch.object(route, "PROBE_STOP_SECONDS", 0.2):
             with tempfile.TemporaryDirectory() as tmp:
                 with patch.dict("os.environ", {"RUNNER_TEMP": tmp}, clear=True):
@@ -391,17 +390,42 @@ class ProbeTests(unittest.TestCase):
                     elapsed = route.time.monotonic() - started
                     self.assertTrue((pathlib.Path(tmp) / "continuum-opencode-429").exists())
         self.assertEqual(str(caught.exception), "quota_exhausted")
-        self.assertLess(elapsed, 4)
+        # Well above the real escalate/kill/join bound (well under a second
+        # here) yet far below the child's own 10-second sleep, so a probe
+        # that failed to escalate still fails this test.
+        self.assertLess(elapsed, 8)
         self.assertEqual(len(spawned), 1)
         # SIGTERM was ignored, so -SIGKILL proves the escalation ran.
         self.assertEqual(spawned[0].returncode, -signal.SIGKILL)
-        # The probe joined the reader threads before returning.
-        self.assertEqual(set(threading.enumerate()) - before, set())
+        # The probe joined its reader threads before returning. Only live
+        # drain readers are checked so unrelated background threads cannot
+        # make this flake on a loaded runner.
+        self.assertEqual(
+            [thread for thread in threading.enumerate()
+             if thread.is_alive()
+             and getattr(thread, "_target", None) is route._drain],
+            [])
         # The child was waited for: waitpid finds no zombie to reap.
         with self.assertRaises(ChildProcessError):
             os.waitpid(spawned[0].pid, os.WNOHANG)
         for stream in (spawned[0].stdout, spawned[0].stderr):
             stream.close()
+
+    def test_failing_probe_without_quota_evidence_is_an_execution_error(self):
+        """A non-zero exit with no 429 evidence is a plain execution failure."""
+        def runner(command, **kwargs):
+            return FakeProcess(
+                stdout='{"type":"text","part":{"type":"text","text":"partial"}}\n',
+                stderr="opencode: something went wrong\n", returncode=1)
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.dict("os.environ", {"RUNNER_TEMP": tmp}, clear=True):
+                with self.assertRaises(route.RouteError) as caught:
+                    route.semantic_probe(A, "review", 30, runner=runner)
+                # No quota marker: this route is not burned, only failed.
+                self.assertFalse(
+                    (pathlib.Path(tmp) / "continuum-opencode-429").exists())
+        self.assertEqual(str(caught.exception), "execution_error")
+        self.assertNotIsInstance(caught.exception, route.BurnedRunner)
 
     def test_stalled_probe_without_quota_still_reports_timeout(self):
         process = FakeProcess(hang=True)
