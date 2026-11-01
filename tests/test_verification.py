@@ -77,6 +77,7 @@ class EvidenceAttestationTests(unittest.TestCase):
         self.assertNotIn(
             KEY_ENV, verification._child_environment(KEY_ENV_VALUES)
         )
+
     def test_tampered_contract_is_rejected(self):
         verification._save_evidence(self.path, self._evidence(), KEY_ENV_VALUES)
         raw = json.loads(self.path.read_text(encoding="utf-8"))
