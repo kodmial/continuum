@@ -431,6 +431,7 @@ class VerificationContractTest(unittest.TestCase):
         )
 
     def test_resume_reuses_exact_final_evidence_without_new_coding(self):
+        self.env["CONTINUUM_VERIFICATION_ATTESTATION_KEY"] = "test-attestation-key"
         self.env["CONTINUUM_TEST_COMMAND"] = "true"
         verification.ensure_baseline(
             self.repo, self.evidence, self.base, self.env
