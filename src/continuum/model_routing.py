@@ -25,6 +25,15 @@ import urllib.error
 import urllib.request
 from typing import Optional
 
+# This module runs both as a standalone script and as an imported engine
+# module, so put the engine root on the path before importing the shared
+# structured-event classifier.
+_SRC = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _SRC not in sys.path:
+    sys.path.insert(0, _SRC)
+
+from continuum.opencode_429_recovery import is_opencode_429  # noqa: E402
+
 MODEL_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._/-]{0,120}$")
 REPOSITORY = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 SEMVER = re.compile(r"^[0-9]+\.[0-9]+\.[0-9]+$")
@@ -330,7 +339,11 @@ def semantic_probe(model: str, kind: str, timeout: int, *, runner=subprocess.run
             raise RouteError("local_runtime: " + type(error).__name__) from None
         raw = (finished.stdout or "") + "\n" + (finished.stderr or "")
         # Refuse any second model request on a runner that received a 429.
-        if classify(raw, finished.returncode) == "quota_429":
+        # A structured provider error event is authoritative even when the
+        # CLI exited 0, so consult the shared classifier before parsing the
+        # response (and before any failover can touch another model).
+        if classify(raw, finished.returncode) == "quota_429" or is_opencode_429(
+                raw, finished.returncode):
             marker = Path(os.environ.get("RUNNER_TEMP", scratch)) / "continuum-opencode-429"
             marker.touch()
             raise BurnedRunner("quota_429")

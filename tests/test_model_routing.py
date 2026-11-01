@@ -153,6 +153,73 @@ class ProbeTests(unittest.TestCase):
                     route.semantic_probe(A, "review", 30, runner=runner)
                 self.assertTrue((pathlib.Path(tmp) / "continuum-opencode-429").exists())
 
+    def test_structured_exit_zero_quota_event_burns_runner(self):
+        """A structured quota event wins even when the CLI exits 0."""
+        event = ('{"type":"error","error":{"name":"RateLimitError",'
+                 '"data":{"statusCode":429}}}\n')
+        calls = []
+        class Result:
+            returncode = 0
+            stdout = event
+            stderr = ""
+        def runner(command, **kwargs):
+            calls.append(command)
+            return Result()
+        # The local classifier alone misses this exit-0 structured event.
+        self.assertEqual(route.classify(event, 0), "invalid_response")
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.dict("os.environ", {"RUNNER_TEMP": tmp}, clear=True):
+                with self.assertRaises(route.BurnedRunner):
+                    route.semantic_probe(A, "review", 30, runner=runner)
+                self.assertTrue((pathlib.Path(tmp) / "continuum-opencode-429").exists())
+        # No failover and no second model request on the burned runner.
+        self.assertEqual(len(calls), 1)
+
+    def test_structured_exit_zero_non_quota_event_keeps_previous_path(self):
+        event = ('{"type":"error","error":{"name":"ProviderAuthError",'
+                 '"data":{"statusCode":401}}}\n')
+        class Result:
+            returncode = 0
+            stdout = event
+            stderr = ""
+        def runner(command, **kwargs):
+            return Result()
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.dict("os.environ", {"RUNNER_TEMP": tmp}, clear=True):
+                with self.assertRaisesRegex(route.RouteError,
+                                            "no assistant text events"):
+                    route.semantic_probe(A, "review", 30, runner=runner)
+                self.assertFalse((pathlib.Path(tmp) / "continuum-opencode-429").exists())
+
+    def test_nonzero_429_still_burns_without_structured_event(self):
+        class Result:
+            returncode = 1
+            stdout = ""
+            stderr = "HTTP 429 too many requests"
+        def runner(command, **kwargs):
+            return Result()
+        raw = Result.stdout + "\n" + Result.stderr
+        # The shared helper needs structured evidence, so this path is the
+        # pre-existing non-zero text classifier.
+        self.assertFalse(route.is_opencode_429(raw, 1))
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.dict("os.environ", {"RUNNER_TEMP": tmp}, clear=True):
+                with self.assertRaises(route.BurnedRunner):
+                    route.semantic_probe(A, "review", 30, runner=runner)
+                self.assertTrue((pathlib.Path(tmp) / "continuum-opencode-429").exists())
+
+    def test_engine_root_is_added_when_absent_for_standalone_execution(self):
+        """The shared classifier import works without PYTHONPATH=src."""
+        src = str(PATH.parents[1])
+        original = list(sys.path)
+        try:
+            sys.path[:] = [entry for entry in sys.path if entry != src]
+            spec.loader.exec_module(route)
+        finally:
+            sys.path[:] = original
+        self.assertIn(src, sys.path)
+        self.assertTrue(callable(route.is_opencode_429))
+
 
 
 class CompletionTicketTests(unittest.TestCase):
