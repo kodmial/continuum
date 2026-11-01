@@ -346,6 +346,51 @@ class CheckpointHistoryTests(unittest.TestCase):
         self.assertIn("rc=4", result.stdout, result.stderr)
         self.assertIn("default branch", result.stderr)
 
+    def test_missing_default_branch_ref_is_reported_as_a_git_error(self):
+        # Only exit 1 from merge-base means "no common ancestor". A missing
+        # default-branch ref is infrastructure damage and must not be
+        # disguised as an unrelated checkpoint. The guard is exercised
+        # directly because a restore first fetches the resolved default
+        # branch, which recreates origin/main before the check runs.
+        self._git(self.tmp.name, "clone", "-q", self.origin, self.work)
+        self._config(self.work)
+        missing = "refs/remotes/origin/does-not-exist"
+        probe = subprocess.run(
+            ["git", "merge-base", missing, "origin/" + self.DEFAULT_BRANCH],
+            cwd=self.work, capture_output=True, text=True, timeout=60,
+        )
+        # The environment must actually reproduce a git error. If a future or
+        # different git reported the missing ref as "unrelated" (exit 1), this
+        # test would stop exercising the infrastructure branch and must fail
+        # loudly instead of skipping.
+        self.assertNotIn(probe.returncode, (0, 1), probe.stderr)
+        driver = (
+            'source "$CHECKPOINT"\n'
+            'if continuum_checkpoint_assert_shared_history "$REF" "origin/$BRANCH"; then\n'
+            '  printf "rc=0\\n"\n'
+            'else\n'
+            '  printf "rc=%s\\n" "$?"\n'
+            'fi\n'
+        )
+        result = subprocess.run(
+            ["bash", "-c", driver],
+            cwd=self.work,
+            capture_output=True,
+            text=True,
+            env={
+                **os.environ,
+                "CHECKPOINT": CHECKPOINT,
+                "REF": missing,
+                "BRANCH": self.DEFAULT_BRANCH,
+            },
+            timeout=120,
+        )
+        self.assertIn("rc=4", result.stdout, result.stderr)
+        self.assertIn("git merge-base exited with status", result.stderr, result.stderr)
+        self.assertNotIn(
+            "unrelated to the target default branch", result.stderr, result.stderr
+        )
+
     def _dirty_clone(self):
         self._git(self.tmp.name, "clone", "-q", self.origin, self.work)
         self._config(self.work)
@@ -478,6 +523,38 @@ class CheckpointHistoryTests(unittest.TestCase):
             capture_output=True, text=True, timeout=60,
         ).stdout.strip()
         self.assertEqual(published, head)
+
+    def test_save_with_an_unrelated_concurrent_checkpoint_fails_closed(self):
+        # The competing checkpoint carries the frozen spec marker but shares no
+        # ancestor with the default branch, so save must reject it through the
+        # shared-history guard instead of rebasing onto it.
+        self.ref = "continuum-child/checkpoint-task-8-g1-" + SPEC
+        self._checkpoint(self.ref, orphan=True)
+        winner = subprocess.run(
+            ["git", "rev-parse", self.ref], cwd=self.seed,
+            capture_output=True, text=True, timeout=60,
+        ).stdout.strip()
+        self._dirty_clone()
+        result = self._save(
+            'source "$CHECKPOINT"\n'
+            'continuum_assert_safe_push() { return 0; }\n'
+            'if continuum_checkpoint_save "$REF" "$SPEC" kodmial/continuum 8; then\n'
+            '  printf "rc=0\\n"\n'
+            'else\n'
+            '  printf "rc=%s\\n" "$?"\n'
+            'fi\n'
+        )
+        self.assertIn("rc=4", result.stdout, result.stderr)
+        self.assertIn(
+            "unrelated to the target default branch", result.stderr, result.stderr
+        )
+        # Refusing must leave the unrelated winner untouched rather than
+        # overwriting it with local work.
+        remote = subprocess.run(
+            ["git", "ls-remote", "origin", "refs/heads/" + self.ref],
+            cwd=self.work, capture_output=True, text=True, timeout=60,
+        ).stdout.split()
+        self.assertEqual(remote[0] if remote else None, winner)
 
 
 class CheckpointNonMainDefaultBranchTests(CheckpointHistoryTests):
