@@ -141,12 +141,12 @@ class CheckpointHistoryTests(unittest.TestCase):
         self._git(self.tmp.name, "clone", "-q", self.origin, self.work)
         self._config(self.work)
         driver = (
-            'source "$CHECKPOINT"\\n'
-            'if continuum_checkpoint_restore "$REF" "continuum-child/task-1" "$SPEC"; then\\n'
-            '  printf "rc=0\\\\n"\\n'
-            'else\\n'
-            '  printf "rc=%s\\\\n" "$?"\\n'
-            'fi\\n'
+            'source "$CHECKPOINT"\n'
+            'if continuum_checkpoint_restore "$REF" "continuum-child/task-1" "$SPEC"; then\n'
+            '  printf "rc=0\\n"\n'
+            'else\n'
+            '  printf "rc=%s\\n" "$?"\n'
+            'fi\n'
         )
         result = subprocess.run(
             ["bash", "-c", driver],
