@@ -65,9 +65,9 @@ App](https://docs.github.com/en/apps/creating-github-apps/authenticating-with-a-
 | GitHub-native main-sync (`update-branch`) | Sync merge commits must trigger CI. | Attribute main-sync requests to the App. |
 | Delegated child merge / `update-branch` | Cross-repository access requires PAT; `GITHUB_TOKEN` cannot reach the child. | Attribute delegated merges to a per-child App installation. |
 
-The baseline implementation needs no new consumer secret: only the
-pre-existing `TAP_PAT`, the Render key (Render API only), the delegated
-child runtime token, the automatic `github.token`, and the optional
-`CONTINUUM_VERIFICATION_ATTESTATION_KEY` are used. The verification engine
-recognizes that last one in the environment, but no shipped workflow declares
-or passes it yet, so a consumer has nothing to configure today.
+The baseline implementation introduces no new consumer secret: `TAP_PAT`, the
+Render key (Render API only), the delegated child runtime token, and the
+automatic `github.token` are all it uses. The verification engine additionally
+recognizes the optional `CONTINUUM_VERIFICATION_ATTESTATION_KEY` in the
+environment, but no shipped workflow declares or passes it yet, so a consumer
+has nothing to configure today.

@@ -159,6 +159,17 @@ class InstallerSafetyTest(unittest.TestCase):
         wrapper.chmod(0o755)
         return {"PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}"}
 
+    def test_install_into_continuum_own_checkout_is_refused(self):
+        # A self-install would replace every core workflow with a caller stub,
+        # so the guard must refuse before any write and name the checkout it
+        # protected. A local dry run keeps this offline and fast.
+        status, output = self.run_install([ROOT, "--dry-run"])
+
+        self.assertEqual(status, 1, output)
+        self.assertIn("refusing to install", output)
+        self.assertIn("Continuum's own checkout", output)
+        self.assertIn(str(ROOT), output)
+
     def test_dry_run_lists_the_exact_plan_without_touching_the_target(self):
         directory = self.fixture()
         target = directory / "consumer"

@@ -13,6 +13,7 @@ sys.path.insert(0, SRC)
 
 from continuum import lifecycle_recovery as lifecycle  # noqa: E402
 from continuum import pr_agent_recovery as legacy  # noqa: E402
+from continuum import render_execution as render_engine  # noqa: E402
 
 
 HEAD = "a" * 40
@@ -202,6 +203,80 @@ class TransientClassificationTests(unittest.TestCase):
                 self.assertFalse(
                     lifecycle.classify_infrastructure_failure(error=message).transient
                 )
+
+    def test_merged_timeout_spellings_are_transient(self):
+        # Whole-word matching no longer sees "read"/"connection" inside a
+        # merged spelling, so those spellings stay explicit transient evidence.
+        for message in (
+            "readtimeout after 30s",
+            "connecttimeout while polling the runner",
+        ):
+            with self.subTest(message=message):
+                self.assertTrue(
+                    lifecycle.classify_infrastructure_failure(error=message).transient
+                )
+
+
+class TimeoutRuleParityTests(unittest.TestCase):
+    """The bounded qualified-timeout rule is duplicated; keep the copies in sync.
+
+    ``lifecycle_recovery`` and ``render_execution`` each compile the same
+    whole-word, windowed rule. ``render_execution`` adds the Render-specific
+    ``render``/``api`` qualifiers; that is the only permitted difference.
+    """
+
+    SHARED_QUALIFIERS = (
+        "read",
+        "connection",
+        "network",
+        "runner",
+        "socket",
+        "dns",
+        "tls",
+        "ssl",
+        "gateway",
+        "http",
+        "request",
+        "operation",
+        "bootstrap",
+        "provider",
+    )
+
+    def rule_shape(self, module):
+        pattern = module._QUALIFIED_TIMEOUT_RE.pattern
+        alternation = "|".join(module._TIMEOUT_INFRA_QUALIFIERS)
+        self.assertIn(alternation, pattern)
+        return pattern.replace(alternation, "<qualifiers>")
+
+    def test_window_and_mention_are_identical(self):
+        self.assertEqual(
+            lifecycle._TIMEOUT_QUALIFIER_WINDOW,
+            render_engine._TIMEOUT_QUALIFIER_WINDOW,
+        )
+        self.assertEqual(
+            lifecycle._TIMEOUT_MENTION,
+            render_engine._TIMEOUT_MENTION,
+        )
+
+    def test_shared_qualifiers_and_rule_shape_agree(self):
+        for qualifier in self.SHARED_QUALIFIERS:
+            with self.subTest(qualifier=qualifier):
+                self.assertIn(qualifier, lifecycle._TIMEOUT_INFRA_QUALIFIERS)
+                self.assertIn(qualifier, render_engine._TIMEOUT_INFRA_QUALIFIERS)
+        self.assertEqual(
+            set(render_engine._TIMEOUT_INFRA_QUALIFIERS)
+            - set(lifecycle._TIMEOUT_INFRA_QUALIFIERS),
+            {"render", "api"},
+            "render_execution may only add its Render-specific qualifiers",
+        )
+        self.assertEqual(self.rule_shape(lifecycle), self.rule_shape(render_engine))
+
+    def test_shared_qualifiers_qualify_in_both_modules(self):
+        for qualifier in self.SHARED_QUALIFIERS:
+            message = f"{qualifier} timeout"
+            with self.subTest(message=message):
+                self.assertTrue(lifecycle._has_transient_signature(message))
+                self.assertTrue(render_engine._has_transient_signature(message))
 
 
 class ResetAwareBackoffTests(unittest.TestCase):

@@ -222,6 +222,10 @@ def _has_transient_signature(message: str) -> bool:
 _TRANSIENT_ERROR_PATTERNS = (
     "timeout",
     "timed out",
+    # Merged spellings no longer qualify through the whole-word timeout rule,
+    # so keep them as explicit transient evidence.
+    "readtimeout",
+    "connecttimeout",
     "econnreset",
     "econnrefused",
     "eai_again",
