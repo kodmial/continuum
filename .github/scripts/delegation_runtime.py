@@ -157,7 +157,7 @@ def load_repository_map(raw: str, allowed_ids: Iterable[str]) -> Dict[str, str]:
         repository = _repository(value[child_id], f"repository map entry {child_id!r}")
         if repository in seen:
             raise DelegationError(
-                f"child repository map resolves more than one id to the same repository"
+                "child repository map resolves more than one id to the same repository"
             )
         seen.add(repository)
         repositories[child_id] = repository

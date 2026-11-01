@@ -95,8 +95,12 @@ class EvidenceAttestationTests(unittest.TestCase):
         child = verification._child_environment(self.key_env)
         self.assertNotIn(KEY_ENV, child)
         self.assertNotIn(KEY_FILE_ENV, child)
-        # The key file is removed before the command ran.
-        self.assertFalse(Path(self.key_env[KEY_FILE_ENV]).exists())
+        # The key file is withheld for the command's lifetime, then restored so
+        # later verification CLI processes can read it.
+        key_path = Path(self.key_env[KEY_FILE_ENV])
+        self.assertFalse(key_path.exists())
+        verification._restore_withheld_attestation_keys()
+        self.assertEqual(key_path.read_text(encoding="utf-8"), KEY_VALUE)
 
     def test_attestation_key_value_in_the_engine_environment_fails_closed(self):
         with self.assertRaises(verification.VerificationError) as caught:
@@ -141,6 +145,48 @@ class EvidenceAttestationTests(unittest.TestCase):
             verification.verifier_required(self.path, self.key_env)
         )
 
+    def test_sequential_cli_processes_can_verify_the_same_evidence(self):
+        # Regression: the engine used to delete the key file after the first
+        # read, so a later `python -m continuum.verification` process failed
+        # with "the verification attestation key file is unavailable".
+        verification._save_evidence(self.path, self._evidence(), self.key_env)
+        env = {
+            key: value
+            for key, value in os.environ.items()
+            if key not in (KEY_ENV, KEY_FILE_ENV)
+        }
+        env.update(self.key_env)
+        env["PYTHONPATH"] = str(SRC)
+        command = [
+            sys.executable,
+            "-m",
+            "continuum.verification",
+            "summary",
+            "--evidence",
+            str(self.path),
+        ]
+        outputs = []
+        for _ in range(2):
+            completed = subprocess.run(
+                command, capture_output=True, text=True, env=env
+            )
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            outputs.append(completed.stdout)
+        self.assertIn("baseline: passed", outputs[0])
+        self.assertEqual(outputs[0], outputs[1])
+        self.assertTrue(Path(self.key_env[KEY_FILE_ENV]).exists())
+
+        # The retained key file still rejects worktree-forged evidence in a
+        # later process: only the signature check makes it trustworthy.
+        raw = json.loads(self.path.read_text(encoding="utf-8"))
+        raw["baseline"]["state"] = "failed"
+        self.path.write_text(json.dumps(raw), encoding="utf-8")
+        tampered = subprocess.run(
+            command, capture_output=True, text=True, env=env
+        )
+        self.assertNotEqual(tampered.returncode, 0)
+        self.assertIn("attestation does not match", tampered.stderr)
+
 
 class ChildEnvironmentTests(unittest.TestCase):
     def setUp(self):
@@ -172,15 +218,18 @@ class ChildEnvironmentTests(unittest.TestCase):
         with self.assertRaises(verification.VerificationError):
             verification._load_evidence(path, other)
 
-    def test_key_file_is_removed_before_a_command_runs(self):
-        key_path = self.key_env[KEY_FILE_ENV]
-        command = 'if [ -e "$PROBE_KEY_FILE" ]; then echo present; exit 1; fi'
-        env = dict(self.key_env, PROBE_KEY_FILE=key_path)
+    def test_key_file_is_restored_after_a_command_runs(self):
+        key_path = Path(self.key_env[KEY_FILE_ENV])
         result = verification.run_command_set(
-            _contract(command), self.root, environ=env
+            _contract("true"), self.root, environ=self.key_env
         )
         self.assertEqual(result["state"], "passed")
-        self.assertFalse(Path(key_path).exists())
+        # The file is withheld while a repository-controlled command runs.
+        self.assertFalse(key_path.exists())
+        # It is restored at process exit so later verification CLI processes
+        # read the same key file.
+        verification._restore_withheld_attestation_keys()
+        self.assertEqual(key_path.read_text(encoding="utf-8"), KEY_VALUE)
 
     def test_key_file_inside_the_worktree_is_rejected(self):
         key_path = self.root / "attestation.key"
@@ -457,7 +506,7 @@ class AttestationKeyEnvironmentLeakTests(unittest.TestCase):
         self.key_env = _key_env(base)
         self.key_file = Path(self.key_env[KEY_FILE_ENV])
 
-    def _run(self, extra_env):
+    def _env(self, extra_env):
         env = {
             key: value
             for key, value in os.environ.items()
@@ -473,6 +522,9 @@ class AttestationKeyEnvironmentLeakTests(unittest.TestCase):
             }
         )
         env.update(extra_env)
+        return env
+
+    def _run(self, extra_env):
         return subprocess.run(
             [
                 sys.executable,
@@ -486,7 +538,7 @@ class AttestationKeyEnvironmentLeakTests(unittest.TestCase):
                 "--base-sha",
                 self.base,
             ],
-            env=env,
+            env=self._env(extra_env),
             capture_output=True,
             text=True,
             timeout=120,
@@ -495,11 +547,34 @@ class AttestationKeyEnvironmentLeakTests(unittest.TestCase):
     def test_child_command_cannot_read_the_key_through_the_parent_environment(self):
         completed = self._run(self.key_env)
         self.assertEqual(completed.returncode, 0, completed.stderr)
-        self.assertFalse(self.key_file.exists())
+        # The running command could not read the key file: the report is empty.
+        # The engine restores the file before exiting so the next verification
+        # process can read it.
+        self.assertTrue(self.key_file.exists())
+        self.assertEqual(self.key_file.read_text(encoding="utf-8"), KEY_VALUE)
         self.assertTrue(self.report.exists())
         self.assertEqual(self.report.read_text(encoding="utf-8"), "")
         data = json.loads(self.evidence.read_text(encoding="utf-8"))
         self.assertEqual(data["baseline"]["state"], "passed")
+
+        # A later CLI process runs no commands but must still verify the same
+        # evidence with the restored key file.
+        summary = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "continuum.verification",
+                "summary",
+                "--evidence",
+                str(self.evidence),
+            ],
+            env=self._env(self.key_env),
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        self.assertEqual(summary.returncode, 0, summary.stderr)
+        self.assertIn("baseline: passed", summary.stdout)
 
     def test_key_value_in_the_engine_environment_is_rejected_before_commands_run(self):
         completed = self._run({KEY_ENV: KEY_VALUE})

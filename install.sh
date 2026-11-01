@@ -133,14 +133,14 @@ if [[ -n "$SCRIPT_PATH" ]]; then
   LOCAL_STUBS_DIR="$(dirname "$SCRIPT_PATH")/$STUB_PATH"
   # Only use local templates when installing the default working-tree version.
   # An explicit ref must fetch that revision, even when run from a local clone.
-  SELF_DIR="$(cd "$(dirname "$SCRIPT_PATH")" 2>/dev/null && pwd || echo "$PWD")"
+  SELF_DIR="$(cd "$(dirname "$SCRIPT_PATH")" 2>/dev/null && pwd -P || pwd -P)"
 else
   LOCAL_STUBS_DIR=""
   SELF_DIR=""
 fi
 DEST_ABS=""
 if [[ -d "$DEST" ]]; then
-  DEST_ABS="$(cd "$DEST" && pwd)"
+  DEST_ABS="$(cd "$DEST" && pwd -P)"
 fi
 TARGET_DIR=""
 if [[ -n "$DEST_ABS" ]]; then

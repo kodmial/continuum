@@ -52,6 +52,43 @@ class YamlSubsetTests(unittest.TestCase):
         self.assertEqual(parsed["items"], ["one", "two"])
         self.assertEqual(parsed["records"], [{"name": "a", "value": 1}, {"name": "b", "value": 2}])
 
+    def test_indentless_sequence_under_a_key_inside_a_sequence_item(self):
+        parsed = yamlmini.loads(
+            textwrap.dedent(
+                """
+            release:
+              targets:
+                - id: cli
+                  binaries:
+                  - name: tool
+                    identifier: com.example.tool
+                """
+            )
+        )
+        self.assertEqual(
+            parsed["release"]["targets"],
+            [
+                {
+                    "id": "cli",
+                    "binaries": [
+                        {"name": "tool", "identifier": "com.example.tool"}
+                    ],
+                }
+            ],
+        )
+
+    def test_rejects_a_dash_entry_at_mapping_key_indent(self):
+        with self.assertRaises(yamlmini.YamlSubsetError):
+            yamlmini.loads(
+                textwrap.dedent(
+                    """
+                items:
+                  - id: a
+                    - name: b
+                    """
+                )
+            )
+
     def test_quoted_scalars_and_inline_comment(self):
         parsed = yamlmini.loads(
             textwrap.dedent(

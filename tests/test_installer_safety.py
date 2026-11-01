@@ -170,6 +170,20 @@ class InstallerSafetyTest(unittest.TestCase):
         self.assertIn("Continuum's own checkout", output)
         self.assertIn(str(ROOT), output)
 
+    def test_symlinked_self_install_is_refused(self):
+        # The guard compares physical paths: a symlink to the checkout must
+        # not bypass the refusal just because the destination is spelled
+        # differently.
+        directory = self.fixture()
+        link = directory / "continuum-link"
+        os.symlink(ROOT, link)
+
+        status, output = self.run_install([link, "--dry-run"])
+
+        self.assertEqual(status, 1, output)
+        self.assertIn("refusing to install", output)
+        self.assertIn("Continuum's own checkout", output)
+
     def test_dry_run_lists_the_exact_plan_without_touching_the_target(self):
         directory = self.fixture()
         target = directory / "consumer"

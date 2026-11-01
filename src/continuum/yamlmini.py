@@ -229,6 +229,10 @@ def _parse_sequence(lines: List[_Line], start: int, indent: int) -> Tuple[List[A
             if value_text == "":
                 if index < len(lines) and lines[index].indent > inner_indent:
                     first_value, index = _parse_block(lines, index, lines[index].indent)
+                elif index < len(lines) and lines[index].indent == inner_indent and (
+                    lines[index].text == "-" or lines[index].text.startswith("- ")
+                ):
+                    first_value, index = _parse_sequence(lines, index, inner_indent)
                 else:
                     first_value = None
                 _set(mapping, key, first_value, line.number)
@@ -240,11 +244,20 @@ def _parse_sequence(lines: List[_Line], start: int, indent: int) -> Tuple[List[A
                     raise YamlSubsetError(
                         f"line {inner.number}: inconsistent indentation in sequence item"
                     )
+                if inner.text == "-" or inner.text.startswith("- "):
+                    raise YamlSubsetError(
+                        f"line {inner.number}: unexpected sequence entry inside a "
+                        "sequence item mapping"
+                    )
                 sub_key, sub_value = _split_key(inner.text, inner.number)
                 index += 1
                 if sub_value == "":
                     if index < len(lines) and lines[index].indent > inner_indent:
                         sub_value, index = _parse_block(lines, index, lines[index].indent)
+                    elif index < len(lines) and lines[index].indent == inner_indent and (
+                        lines[index].text == "-" or lines[index].text.startswith("- ")
+                    ):
+                        sub_value, index = _parse_sequence(lines, index, inner_indent)
                     else:
                         sub_value = None
                     _set(mapping, sub_key, sub_value, inner.number)

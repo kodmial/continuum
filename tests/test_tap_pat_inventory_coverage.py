@@ -51,8 +51,9 @@ class ExactStepCoverageTest(unittest.TestCase):
             )
         )
 
-    def test_attestation_key_is_an_allowed_secret(self):
-        self.assertIn(
+    def test_attestation_key_is_not_a_workflow_secret(self):
+        # The hook is a private key file, never a repository/workflow secret.
+        self.assertNotIn(
             "CONTINUUM_VERIFICATION_ATTESTATION_KEY",
             tap_pat_inventory.ALLOWED_SECRETS,
         )

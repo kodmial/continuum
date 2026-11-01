@@ -127,6 +127,11 @@ class MainSyncTests(unittest.TestCase):
             "install.sh",
             ".github/scripts/merge_lifecycle.js",
             ".github/actions/agent-toolchain/action.yml",
+            # Consumer-owned CI workflows resolve the verification contract,
+            # so a main advance in them must force a re-sync.
+            ".github/workflows/ci.yml",
+            ".github/workflows/ci.yaml",
+            ".github/workflows/custom-consumer.yml",
         ):
             self.assertFalse(life.is_non_merge_critical_main_path(path))
 
@@ -145,6 +150,13 @@ class MainSyncTests(unittest.TestCase):
 
     def test_critical_delta_requires_sync(self):
         decision = life.decide_main_sync(2, ["src/continuum/x.py"])
+        self.assertEqual(
+            (decision["required"], decision["reason"]),
+            (True, "merge-critical-main-delta"),
+        )
+
+    def test_consumer_ci_workflow_delta_requires_sync(self):
+        decision = life.decide_main_sync(1, [".github/workflows/ci.yml"])
         self.assertEqual(
             (decision["required"], decision["reason"]),
             (True, "merge-critical-main-delta"),
@@ -603,6 +615,8 @@ class SharedJsMirrorTests(unittest.TestCase):
             "assert.strictEqual(m.isNonMergeCriticalMainPath('src/x.py'),false);"
             "assert.strictEqual(m.isNonMergeCriticalMainPath('.github/scripts/merge_lifecycle.js'),false);"
             "assert.strictEqual(m.isNonMergeCriticalMainPath('.github/actions/x/action.yml'),false);"
+            "assert.strictEqual(m.isNonMergeCriticalMainPath('.github/workflows/ci.yml'),false);"
+            "assert.strictEqual(m.isNonMergeCriticalMainPath('.github/workflows/ci.yaml'),false);"
             "assert.strictEqual(m.validateExactHead('abc','abc').ok,true);"
             "assert.strictEqual(m.validateExactHead('abc','def').ok,false);"
             "assert.strictEqual(m.decideMainSync(0,[]).reason,'up-to-date');"

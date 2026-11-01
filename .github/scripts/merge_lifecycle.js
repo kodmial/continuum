@@ -74,7 +74,7 @@ function isMergeBlocked(labels) {
 
 function isNonMergeCriticalMainPath(path) {
   const text = String(path || '');
-  if (text.startsWith('.github/workflows/continuum-')) return false;
+  if (text.startsWith('.github/workflows/')) return false;
   if (text.startsWith('.github/scripts/') || text.startsWith('.github/actions/')) {
     return false;
   }

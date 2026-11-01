@@ -141,19 +141,20 @@ def is_non_merge_critical_main_path(path: Any) -> bool:
     """Whether a main-delta path never forces a PR re-sync.
 
     The shipped ``.github/scripts/merge_lifecycle.js`` mirror and this
-    Python implementation both carry the executable-surface checks: caller
-    pins (``.github/workflows/continuum-*``) and the
+    Python implementation both carry the executable-surface checks: every
+    ``.github/workflows/`` file (including consumer-owned ``ci.yml``) and the
     ``.github/scripts/`` and ``.github/actions/`` surfaces are control-plane
     code and always merge-critical; docs, other ``.github/`` metadata,
     license/ignore/changelog entries are not. The two auto-merge workflows
     still hold inline copies that only recognize the
     ``.github/workflows/continuum-*`` prefix; the ``pr/part-2`` change adds
-    the ``.github/scripts/`` and ``.github/actions/`` prefix checks to those
-    copies, so exact equality is not claimed until then.
+    the full ``.github/workflows/``, ``.github/scripts/``, and
+    ``.github/actions/`` prefix checks to those copies, so exact equality is
+    not claimed until then.
     """
 
     text = str(path or "")
-    if text.startswith(".github/workflows/continuum-"):
+    if text.startswith(".github/workflows/"):
         return False
     if text.startswith(".github/scripts/") or text.startswith(".github/actions/"):
         return False

@@ -41,7 +41,7 @@ Conventions:
 | S1 | PR / current-HEAD reconciliation (authoritative branch ref wins over stale pull metadata; result valid only for exact HEAD) | `continuum-auto-merge.yml`: `withAuthoritativeHead`, `getPullWithAuthoritativeHead`, `pr.head.sha` re-reads before every write | `continuum-pr-agent-auto-merge.yml`: `getPull`, `fresh.head.sha.toLowerCase() !== reviewedHead` guards (conflict dispatch, initial/final/pre-merge gates, post-merge verify) | `tests/test_merge_lifecycle.py::ExactHeadTests`; `test_pr_agent_lifecycle.py::StabilizationParityTests.test_pr_agent_merge_is_atomic_against_reviewed_head` | Yes — both re-read live HEAD and fail closed on movement | `merge_lifecycle.head_matches`, `merge_lifecycle.validate_exact_head` |
 | S2 | Current-HEAD CI / gate validation (CI success on exact HEAD; Continuum Contract Gate + Contract qualification only on `kodmial/continuum`) | `continuum-auto-merge.yml`: `latestCurrentHeadCi`, `latestContinuumContractGate`, `latestCurrentHeadContractQualification` | `continuum-pr-agent-auto-merge.yml`: `currentHeadGates` (CI + Contract Gate + Contract qualification) | `tests/test_merge_lifecycle.py::CurrentHeadGateTests`; `test_pr_agent_lifecycle.py` gate-window tests | Yes — same gate names, same exact-HEAD scoping, same Continuum-only gating | `merge_lifecycle.evaluate_current_head_gates` |
 | S3 | `no-auto-merge` block label | `continuum-auto-merge.yml:392,2864,3142`: `AUTO_MERGE_BLOCK_LABEL = 'no-auto-merge'`, skip + pre-merge recheck | `continuum-pr-agent-auto-merge.yml:680,1289,1326,1362`: same constant, same skip + initial/final/pre-merge rechecks | `tests/test_merge_lifecycle.py::NoAutoMergeTests`; `StabilizationParityTests.test_pr_agent_merge_reuses_mature_common_safety_contract` | Yes — identical label, identical fail-closed placement | `merge_lifecycle.AUTO_MERGE_BLOCK_LABEL`, `merge_lifecycle.is_merge_blocked` |
-| S4 | Main-sync policy (behind-by + merge-critical file delta; non-critical deltas do not force sync; sync never carries approval) | `continuum-auto-merge.yml`: `compareWithMain`, `mainDeltaSincePrHead`, `shouldSyncFromMain`, `isNonMergeCriticalMainPath` | `continuum-pr-agent-auto-merge.yml:961-1004`: `mainSyncDecision`, `isNonMergeCriticalMainPath` | `tests/test_merge_lifecycle.py::MainSyncTests`; `test_pr_agent_lifecycle.py::StabilizationParityTests.test_pr_agent_main_sync_never_carries_old_review` | Yes — same three outcomes (`up-to-date`, `non-merge-critical-main-delta`, `merge-critical-main-delta`/`unknown-main-delta`); the workflow inline copies gain the executable `.github/scripts/` and `.github/actions/` checks in the `pr/part-2` change | `merge_lifecycle.is_non_merge_critical_main_path`, `merge_lifecycle.decide_main_sync` |
+| S4 | Main-sync policy (behind-by + merge-critical file delta; non-critical deltas do not force sync; sync never carries approval) | `continuum-auto-merge.yml`: `compareWithMain`, `mainDeltaSincePrHead`, `shouldSyncFromMain`, `isNonMergeCriticalMainPath` | `continuum-pr-agent-auto-merge.yml:961-1004`: `mainSyncDecision`, `isNonMergeCriticalMainPath` | `tests/test_merge_lifecycle.py::MainSyncTests`; `test_pr_agent_lifecycle.py::StabilizationParityTests.test_pr_agent_main_sync_never_carries_old_review` | Yes — same three outcomes (`up-to-date`, `non-merge-critical-main-delta`, `merge-critical-main-delta`/`unknown-main-delta`); the workflow inline copies gain the executable `.github/workflows/`, `.github/scripts/`, and `.github/actions/` checks in the `pr/part-2` change | `merge_lifecycle.is_non_merge_critical_main_path`, `merge_lifecycle.decide_main_sync` |
 | S5 | Conflict-repair plumbing (dirty discovery, idempotent per-HEAD dispatch, bounded retry, stale-lock reconcile, `opencode-conflict-repair` label + `continuum-conflict-repair` marker, configured consumer caller) | `continuum-auto-merge.yml:397,2025-2254,2462`: lock label, markers, `OPENCODE_WORKFLOW` caller resolution | `continuum-pr-agent-auto-merge.yml:681,1011-1102`: lock label, `conflictAttemptMarker`, `releaseConflictLock`, `dispatchConflictRepair` | `tests/test_conflict_repair.py` (full suite); `tests/test_merge_lifecycle.py::ConflictPlumbingTests` | Yes — same label, same marker family, same bounded per-HEAD budget, same caller contract | `conflict_repair.py` remains canonical; `merge_lifecycle.conflict_*` constants delegate to it |
 | S6 | Packaging smoke (conditional gate: only blocks when a run exists for the exact HEAD and is not success) | `continuum-auto-merge.yml:786,2943-2954`: `latestCurrentHeadPackagingSmoke` | `continuum-pr-agent-auto-merge.yml:841-852`: same conditional check | `tests/test_merge_lifecycle.py::PackagingAndRequiredGateTests`; `test_api_budget.py`, `test_coderabbit_queue_lifecycle.py` packaging cases | Yes — identical conditional semantics | `merge_lifecycle.evaluate_packaging_gate` |
 | S7 | Configurable required workflow gate (label-gated extra workflow must succeed on exact HEAD) | `continuum-auto-merge.yml:798-811,2960-2972`: `requiredWorkflowGate` | `continuum-pr-agent-auto-merge.yml:855-872`: same label+name gate | `tests/test_merge_lifecycle.py::PackagingAndRequiredGateTests` | Yes — identical label/name/exact-HEAD semantics | `merge_lifecycle.evaluate_required_workflow_gate` |
@@ -56,16 +56,19 @@ Branch safety (#302) underpins S4/S5/S8/S9 in both paths
 `src/continuum/branch_safety.py`). The extraction does not duplicate it;
 `merge_lifecycle.py` delegates to it.
 
-The executable `.github/scripts/` and `.github/actions/` checks for S4
-ship in the shared `.github/scripts/merge_lifecycle.js` mirror and the
-Python canonical owner. At `pr/part-2` HEAD `4a289956` the two workflow
-inline `isNonMergeCriticalMainPath` copies still recognize only the
+The executable `.github/workflows/`, `.github/scripts/`, and
+`.github/actions/` checks for S4 ship in the shared
+`.github/scripts/merge_lifecycle.js` mirror and the Python canonical
+owner. At `pr/part-2` HEAD `4a289956` the two workflow inline
+`isNonMergeCriticalMainPath` copies still recognize only the
 `.github/workflows/continuum-*` prefix and fall through to the generic
-`.github/` rule, and that branch's
+`.github/` rule (so a consumer `ci.yml` advance is misclassified there),
+and that branch's
 `test_both_workflows_share_the_same_path_table` does not yet assert the
-`.github/scripts/` / `.github/actions/` checks. The executable-surface
-parity for those two inline copies, and the matching parity assertion,
-are required in the `pr/part-2` change and are not present there yet.
+`.github/workflows/`, `.github/scripts/`, and `.github/actions/` checks.
+The executable-surface parity for those two inline copies, and the
+matching parity assertion, are required in the `pr/part-2` change and
+are not present there yet.
 This `pr/part-1` partial tree intentionally carries no workflow-parity
 test: that test ships with the workflow copies in the `pr/part-2`
 change, so the gap is tracked here instead of a test passing by the

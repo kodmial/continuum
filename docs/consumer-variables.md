@@ -89,8 +89,12 @@ the task worktree. The key value itself is never read from the environment: a
 repository-controlled command can inspect the engine's inherited environment
 through `/proc/$PPID/environ`, so setting
 `CONTINUUM_VERIFICATION_ATTESTATION_KEY` in the engine environment fails
-closed instead of being accepted. The engine reads the key file before any
-command runs and removes it before the first command starts. No shipped
+closed instead of being accepted. The engine reads the key file in every
+verification CLI process and never passes the key value or its file path to a
+repository-controlled command. While a command set runs, the engine withholds
+the file from its configured path and restores it before the process exits, so
+a running command cannot read it and sequential verification subcommands still
+share the same key. No shipped
 Continuum workflow declares or passes this hook; it is not a consumer secret
 and requires no consumer configuration. If supplied, it signs the recorded
 contract, baseline, verifier result, and accepted final record, and a resumed
