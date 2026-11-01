@@ -383,7 +383,7 @@ class OrderingAndBlockerTests(unittest.TestCase):
         comments = {
             156: [
                 CommentRecord(
-                    body="/oc please", author_is_owner=True,
+                    body="/oc\nplease", author_is_owner=True,
                     created_at=now - timedelta(minutes=1),
                 )
             ]

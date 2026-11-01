@@ -227,7 +227,8 @@ class VerificationContractTest(unittest.TestCase):
         self.assertEqual(["echo right"],
                          [command.command for command in contract.commands])
 
-    def test_baseline_runs_once_then_is_reused_on_a_checkpoint(self):
+    def test_attested_baseline_is_reused_on_a_checkpoint(self):
+        self.env["CONTINUUM_VERIFICATION_ATTESTATION_KEY"] = "test-attestation-key"
         marker = self.repo / "baseline-runs.txt"
         self.env["CONTINUUM_TEST_COMMAND"] = (
             "python3 -c \"from pathlib import Path; "
@@ -250,6 +251,20 @@ class VerificationContractTest(unittest.TestCase):
         self.assertTrue(reused)
         self.assertEqual(1, marker.read_text(encoding="utf-8").count("run"))
 
+    def test_unattested_baseline_is_not_reused_after_checkout_moves(self):
+        self.env["CONTINUUM_TEST_COMMAND"] = "true"
+        verification.ensure_baseline(
+            self.repo, self.evidence, self.base, self.env
+        )
+        (self.repo / "app.py").write_text("VALUE = 2\\n", encoding="utf-8")
+        run_git(self.repo, "add", "-A")
+        run_git(self.repo, "commit", "-m", "implementation")
+        with self.assertRaisesRegex(
+            verification.VerificationError, "already past the task base"
+        ):
+            verification.ensure_baseline(
+                self.repo, self.evidence, self.base, self.env
+            )
     def test_failed_baseline_is_distinct_and_never_becomes_green(self):
         self.env["CONTINUUM_TEST_COMMAND"] = "test -f fixed.txt"
         data, _ = verification.ensure_baseline(
@@ -282,6 +297,7 @@ class VerificationContractTest(unittest.TestCase):
 
     def test_environment_change_between_baseline_and_final_fails_closed(self):
         baseline_env = dict(self.env)
+        baseline_env["CONTINUUM_VERIFICATION_ATTESTATION_KEY"] = "test-attestation-key"
         baseline_env["RUNNER_OS"] = "Linux"
         baseline_env["CONTINUUM_TEST_COMMAND"] = "true"
         verification.ensure_baseline(
@@ -322,6 +338,7 @@ class VerificationContractTest(unittest.TestCase):
         )
 
     def test_resume_reuses_final_evidence_before_environment_comparison(self):
+        self.env["CONTINUUM_VERIFICATION_ATTESTATION_KEY"] = "test-attestation-key"
         self.env["CONTINUUM_TEST_COMMAND"] = "true"
         verification.ensure_baseline(
             self.repo, self.evidence, self.base, self.env

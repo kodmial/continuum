@@ -488,16 +488,25 @@ class GlobalPrWatchdogTest(unittest.TestCase):
         self.assertNotIn("owner-locked", outcome["error"])
         self.assertNotIn("repo-locked", outcome["error"])
 
-    def test_unexpected_403_fails_the_run(self):
+    def test_per_repository_403_is_counted_and_next_repository_is_scanned(self):
+        denied = repo(122, "owner-denied", "repo-denied")
+        healthy = repo(123, "owner-healthy", "repo-healthy")
         outcome = run_node({
             "continuumRepo": CONTINUUM_REPO,
             "continuumRepoId": CONTINUUM_REPO_ID,
-            "pages": [[repo(122, "owner-denied", "repo-denied")]],
-            "markers": {"owner-denied/repo-denied": {"status": 403, "remaining": 312}},
+            "pages": [[denied, healthy]],
+            "markers": {
+                "owner-denied/repo-denied": {"status": 403, "remaining": 312},
+                "owner-healthy/repo-healthy": {"status": 200, "text": CONSUMER_MARKER_TEXT},
+            },
+            "pulls": {"owner-healthy/repo-healthy": True},
         })
-        self.assertFalse(outcome["ok"])
-        self.assertIn("lacks required access", outcome["error"])
-
+        self.assertTrue(outcome["ok"])
+        self.assertEqual(outcome["result"]["counters"]["repositories_seen"], 2)
+        self.assertEqual(
+            outcome["result"]["counters"]["request_failures_by_status"].get("403"), 1
+        )
+        self.assertEqual(outcome["result"]["counters"]["reconciler_dispatches"], 3)
     def test_continuum_own_repository_is_excluded_by_id(self):
         own = repo(CONTINUUM_REPO_ID, "owner-self", "repo-self")
         other = repo(131, "owner-guest", "repo-guest")

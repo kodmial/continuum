@@ -409,12 +409,17 @@ class OpenCode429EndToEndTest(unittest.TestCase):
         self.assertFalse(paused_applied)
 
     def test_normal_failures_keep_existing_semantics(self):
-        self.assertEqual(
-            classify_agent_error("401 unauthorized", 1), "fail-closed"
-        )
-        self.assertEqual(
-            classify_agent_error("tests failed", 1), "task-failure"
-        )
+        unauthorized = json.dumps({
+            "type": "error",
+            "error": {
+                "name": "UnauthorizedError",
+                "data": {"statusCode": 401, "message": "unauthorized"},
+            },
+        })
+        self.assertEqual(classify_agent_error(unauthorized, 1), "fail-closed")
+        # Transcript prose is not authoritative provider evidence.
+        self.assertEqual(classify_agent_error("401 unauthorized", 1), "task-failure")
+        self.assertEqual(classify_agent_error("tests failed", 1), "task-failure")
         self.assertTrue(consumes_task_budget(False))
 
 

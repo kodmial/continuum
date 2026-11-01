@@ -115,11 +115,11 @@ Continuum workflow declares or passes this hook; it is not a consumer secret
 and requires no consumer configuration. If supplied, it signs the recorded
 contract, baseline, verifier result, and accepted final record, and a resumed
 run reuses those records only when the signature verifies. Without the key, an
-existing baseline is rebuilt and the final phase re-resolves the contract from
-the task base commit instead of the worktree, so a coding agent cannot rewrite
-its own verification commands or forge an accepted result. The key is read
-from the private file, never from an argument or the environment, so it does
-not appear in process listings.
+existing baseline is never trusted. If a resumed checkout has advanced beyond
+the task base, verification fails closed and requires a fresh checkout at that
+base; an unattested worktree record is never accepted as evidence. The key is
+read from the private file, never from an argument or the environment, so it
+does not appear in process listings.
 
 The reusable engine is **not** installed as a `continuum-validation.yml`
 caller. Each consumer owns one primary `.github/workflows/ci.yml` whose
