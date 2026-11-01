@@ -877,8 +877,10 @@ def covering_entry(workflow: str, step: str) -> dict | None:
         if _entry_covers(entry, workflow, step):
             return entry
     if workflow == PR_AGENT_FAMILY["workflow"]:
+        if not step.strip():
+            return None
         for family_step in PR_AGENT_FAMILY["steps"]:
-            if family_step in step or step in family_step:
+            if family_step in step:
                 return {
                     "workflow": workflow,
                     "step": family_step,

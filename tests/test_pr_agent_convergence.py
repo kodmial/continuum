@@ -219,6 +219,29 @@ class ConvergenceStateTests(unittest.TestCase):
         )
         self.assertEqual(len(single), 1)
 
+    def test_target_head_filter_precedes_the_marker_cap(self):
+        from continuum.pr_agent_convergence import parse_transitions
+
+        ids = finding_fingerprints([item("bug")])
+        stale = [transition_marker(B, C, ids)] * 60
+        current = transition_marker(B, A, ids)
+        parsed = parse_transitions(stale + [current], target_head=A)
+        self.assertEqual(len(parsed), 1)
+        self.assertEqual(parsed[0].to_head, A)
+
+    def test_current_head_transition_survives_marker_cap_in_decide(self):
+        ids = finding_fingerprints([item("bug")])
+        stale = [transition_marker(B, C, ids)] * 60
+        current = transition_marker(B, A, ids)
+        decision = decide(
+            head_sha=A,
+            batch_fp="3" * 64,
+            current_finding_ids=ids,
+            comment_bodies=stale + [current],
+        )
+        self.assertEqual(decision.surviving, frozenset(ids))
+        self.assertEqual(decision.eligible, frozenset())
+
 
 class WorkflowWiringTests(unittest.TestCase):
     @classmethod

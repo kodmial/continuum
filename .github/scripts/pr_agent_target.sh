@@ -79,14 +79,14 @@ if [[ -n "$child_id" ]]; then
   PARENT_CONFIG="${PARENT_CONFIG:-.continuum.yml}" \
     CHILD_REPOSITORIES="" \
     bash "$resolver" verify "$child_id" "$target_repository" >/dev/null 2>&1 || verify_rc=$?
-  if [[ "$verify_rc" -ne 0 && -n "$legacy_repository_map" ]]; then
-    verify_rc=0
-    PARENT_CONFIG="${PARENT_CONFIG:-.continuum.yml}" \
-      CHILD_REPOSITORIES="$legacy_repository_map" \
-      bash "$resolver" verify "$child_id" "$target_repository" >/dev/null 2>&1 || verify_rc=$?
-  fi
   if [[ "$verify_rc" -ne 0 ]]; then
     echo "::error::PR-Agent delegated target verification failed closed." >&2
+    # ``verify`` never reads the legacy map, so a retry cannot change the
+    # outcome. Preserve its UNAVAILABLE status so a discovery outage is not
+    # reported as a relationship misconfiguration.
+    if [[ "$verify_rc" -eq 4 ]]; then
+      exit 4
+    fi
     exit 2
   fi
   delegated=true

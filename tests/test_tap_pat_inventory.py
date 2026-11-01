@@ -73,6 +73,16 @@ class InventoryShapeTests(unittest.TestCase):
         self.assertGreater(len(family["steps"]), 15)
         self.assertEqual(len(set(family["steps"])), len(family["steps"]))
 
+    def test_blank_or_partial_step_name_does_not_cover_the_family(self):
+        workflow = inventory.PR_AGENT_FAMILY["workflow"]
+        self.assertIsNone(inventory.covering_entry(workflow, ""))
+        self.assertIsNone(inventory.covering_entry(workflow, "   "))
+        self.assertIsNone(inventory.covering_entry(workflow, "Resolve"))
+        step = inventory.PR_AGENT_FAMILY["steps"][0]
+        covered = inventory.covering_entry(workflow, "Run " + step)
+        self.assertIsNotNone(covered)
+        self.assertEqual(covered["step"], step)
+
 
 class CoverageTests(unittest.TestCase):
     def test_every_pat_binding_is_inventoried(self):

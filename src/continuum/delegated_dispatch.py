@@ -22,6 +22,7 @@ operation identity across scheduler/event/recovery wakeups.
 from __future__ import annotations
 
 import re
+import time
 from dataclasses import dataclass
 from typing import Callable, Optional, Sequence
 
@@ -162,7 +163,7 @@ def run_with_retry(
     """
     attempts = max(1, int(max_attempts))
     schedule = list(delays) if delays is not None else list(retry_delays(attempts))
-    waiter = sleep if sleep is not None else (lambda _: None)
+    waiter = sleep if sleep is not None else time.sleep
     last_output = ""
     for attempt in range(1, attempts + 1):
         ok, output = dispatch()

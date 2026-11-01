@@ -114,12 +114,6 @@ never redispatched. The stop is a deterministic typed issue comment:
 |---|---|---|
 | Admission pin/verify | `continuum-opencode.yml` → Pin and verify task specification snapshot | Pins before any agent work; writes the exact record to `RUNNER_TEMP` for the job; `setFailed` on drift/tamper |
 | Agent input freeze | `continuum-opencode.yml` → Implement issue | Fails closed unless verified; prompts OpenCode with the snapshot file content, not a later live body |
-
-The pin deliberately precedes the Definition-of-Ready and duplicate-PR
-gates: per invariant 1 the freeze starts at admission (scheduler
-reservation or manual `/oc` execution), not at agent start, so even a
-readiness-gated trigger freezes its generation. A later edit is drift
-with the same follow-up-issue remedy, never a silent rebaseline.
 | Pre-PR revalidation | `continuum-opencode.yml` → Implement issue (before `gh pr create`) | Re-reads the live issue; drift posts a diagnostic and stops publication |
 | PR provenance | `continuum-opencode.yml` → Implement issue / Recover agent-managed issue branch | Embeds the snapshot reference in every created PR body |
 | Repair guards | `continuum-opencode.yml` → CodeRabbit fix, conflict resolve, CI fix | Re-reads live vs PR reference; drift stops repair (no spurious "fixed"); legacy PRs proceed explicitly unprotected |
@@ -127,6 +121,12 @@ with the same follow-up-issue remedy, never a silent rebaseline.
 | Pre-merge revalidation | `continuum-auto-merge.yml` → before `pulls.merge` | Re-reads live vs PR reference; drift or failed verification holds the merge with a diagnostic comment |
 | Child admission | `continuum-consumer-child-worker.yml` → Execute child task | Pins/verifies with the canonical engine; drift holds before any agent work; PR carries the reference |
 | Child review | `continuum-consumer-child-review.yml` | Reviews the frozen record; drift holds the review with no verdict |
+
+The pin deliberately precedes the Definition-of-Ready and duplicate-PR
+gates: per invariant 1 the freeze starts at admission (scheduler
+reservation or manual `/oc` execution), not at agent start, so even a
+readiness-gated trigger freezes its generation. A later edit is drift
+with the same follow-up-issue remedy, never a silent rebaseline.
 
 Labels, comments and open/closed status never affect verification: only
 title/body digests are compared, so label churn is not drift. The

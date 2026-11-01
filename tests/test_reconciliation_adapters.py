@@ -261,6 +261,14 @@ class ReviewAndRepairTests(unittest.TestCase):
         self.assertEqual(exact.kind, adapters.ACTION)
         self.assertEqual(exact.details["sha"], HEAD)
 
+    def test_missing_reviewed_head_waits_instead_of_merging_live_head(self):
+        decision = adapters.decide_pr_agent_merge(
+            pr(head=HEAD),
+            ci_run={"status": "completed", "conclusion": "success"},
+        )
+        self.assertEqual(decision.kind, adapters.WAIT)
+        self.assertIn("no reviewed HEAD", decision.reason)
+
     def test_no_auto_merge_is_terminal(self):
         decision = adapters.decide_pr_agent_merge(
             pr(labels=("no-auto-merge",)),

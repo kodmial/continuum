@@ -154,14 +154,18 @@ def parse_transitions(
     *,
     max_markers: int = 50,
     max_findings_per_marker: int = 500,
+    target_head: str | None = None,
 ) -> list[Transition]:
     result: list[Transition] = []
+    target_filter = (target_head or "").lower() or None
     for body in bodies:
         for match in TRANSITION_RE.finditer((body or "").lower()):
             if len(result) >= max_markers:
                 break
             source, target, raw = match.groups()
-            if source == target:
+            if source == target or (
+                target_filter is not None and target != target_filter
+            ):
                 continue
             parts = [part for part in raw.split(",") if part][
                 :max_findings_per_marker
@@ -217,7 +221,7 @@ def decide(
     same_head_exact = same_head_hold
     same_head_surviving = frozenset(same_head_findings & current)
     prior: set[str] = set()
-    for transition in parse_transitions(comment_bodies):
+    for transition in parse_transitions(comment_bodies, target_head=head):
         if transition.to_head == head and transition.from_head != head:
             prior.update(transition.findings)
     surviving = frozenset((prior & current) | same_head_surviving)

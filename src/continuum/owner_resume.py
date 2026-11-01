@@ -224,20 +224,24 @@ def scan_resume_marker(
 ) -> MarkerScan:
     """Validate the target's authorization marker set.
 
-    Exactly one marker-shaped comment is accepted.  It must be authored by
-    the repository owner *as reported by the GitHub API*, use the exact
-    supported syntax, and name a positive predecessor different from the
-    target.  Duplicates and conflicts fail closed.
+    Exactly one owner-authored marker-shaped comment is accepted.  Marker
+    lookalikes from other authors are ignored as absent so they can never
+    block a trusted pin.  The marker must be authored by the repository owner
+    *as reported by the GitHub API*, use the exact supported syntax, and name
+    a positive predecessor different from the target.  Duplicates and
+    conflicts fail closed.
     """
 
-    shaped = _marker_shaped(comments)
+    shaped = [
+        comment
+        for comment in _marker_shaped(comments)
+        if _is_owner(comment, repository_owner)
+    ]
     if not shaped:
         return MarkerScan(None, "not owner-armed")
     if len(shaped) != 1:
         return MarkerScan(None, "duplicate or conflicting owner-resume markers")
     comment = shaped[0]
-    if not _is_owner(comment, repository_owner):
-        return MarkerScan(None, "owner-resume marker author is not the repository owner")
     body = _body(comment)
     if len(MARKER_SHAPE_RE.findall(body)) != 1:
         return MarkerScan(None, "duplicate or conflicting owner-resume markers")
@@ -603,9 +607,10 @@ def independent_review_evidence(
         if str(review.get("commit_id") or "").lower() != head:
             continue
         user = review.get("user")
-        login = str(
+        raw_login = (
             user.get("login") if isinstance(user, Mapping) else review.get("author_login")
-        ).lower()
+        )
+        login = str(raw_login or "").strip().lower()
         if not login or login == author or login.endswith("[bot]"):
             continue
         if str(review.get("author_association") or "").upper() == "BOT":

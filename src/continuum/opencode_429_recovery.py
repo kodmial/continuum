@@ -221,7 +221,6 @@ _FAIL_CLOSED_RE = re.compile(
     r"|missing scope",
     re.IGNORECASE,
 )
-_FAIL_CLOSED_STATUS_RE = re.compile(r"\b(?:400|401|403|404|422)\b", re.IGNORECASE)
 _QUOTA_STATUSES = frozenset({429})
 _UPSTREAM_STATUSES = frozenset({500, 502, 504})
 _UNAVAILABLE_STATUSES = frozenset({503})
@@ -507,7 +506,9 @@ def classify_agent_error(log_text: Any, exit_code: Any = 1) -> str:
     ``"infrastructure-unavailable"`` for a provider/transport failure,
     ``"fail-closed"`` for deterministic configuration/auth errors, and
     ``"task-failure"`` for every normal non-429 agent failure (which must
-    never be misclassified as runner replacement).
+    never be misclassified as runner replacement). Only structured provider
+    evidence can classify; status-like values in the agent transcript are
+    never authoritative.
     """
 
     classification = _combined_classification(log_text, exit_code)
@@ -516,9 +517,6 @@ def classify_agent_error(log_text: Any, exit_code: Any = 1) -> str:
     if classification in ("unavailable", "upstream", "timeout"):
         return "infrastructure-unavailable"
     if classification == "fail_closed":
-        return "fail-closed"
-    text = log_text if isinstance(log_text, str) else ""
-    if _FAIL_CLOSED_STATUS_RE.search(text):
         return "fail-closed"
     return "task-failure"
 

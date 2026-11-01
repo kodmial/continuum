@@ -380,7 +380,7 @@ def reconcile(
             )
             continue
         labels = issue.labels
-        if config.pause_on_failure and config.pause_label in labels:
+        if config.pause_label in labels:
             result.skip_reasons[number] = "automation is paused"
             continue
         if config.qualifying_label in labels or config.blocked_label in labels:
@@ -459,7 +459,7 @@ def reconcile(
             continue
         if (
             not issue.is_open
-            or (config.pause_on_failure and config.pause_label in labels)
+            or config.pause_label in labels
             or in_progress in labels
         ):
             result.skip_reasons[number] = "state changed before dispatch"

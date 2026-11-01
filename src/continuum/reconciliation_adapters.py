@@ -885,9 +885,18 @@ def decide_pr_agent_merge(
     if merge_lifecycle.is_merge_blocked(labels):
         return _decision(TERMINAL, domain, owner, subject, "none", "no-auto-merge is present")
     live_head = _head_sha(pr)
-    expected = str(reviewed_head or live_head).strip().lower()
-    if not expected or not live_head:
-        return _decision(TERMINAL, domain, owner, subject, "none", "reviewed or live HEAD is missing")
+    expected = str(reviewed_head or "").strip().lower()
+    if not live_head:
+        return _decision(TERMINAL, domain, owner, subject, "none", "live HEAD is missing")
+    if not expected:
+        return _decision(
+            WAIT,
+            domain,
+            owner,
+            subject,
+            "none",
+            "no reviewed HEAD is attested for this PR",
+        )
     ok, reason = merge_lifecycle.evaluate_current_head_gates(
         ci_run=ci_run,
         contract_gate_run=contract_gate_run,

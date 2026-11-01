@@ -9,6 +9,7 @@ diagnostic at the end.
 
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from continuum.delegated_dispatch import (
     MIN_RETRY_DELAY_SECONDS,
@@ -109,6 +110,19 @@ class RetryScheduleTests(unittest.TestCase):
         self.assertEqual(len(sleeps), MAX_DISPATCH_ATTEMPTS - 1)
         for delay in sleeps:
             self.assertGreaterEqual(delay, 5.0)
+
+    def test_default_sleep_is_not_a_no_op(self):
+        # Omitting ``sleep`` must still pause between transient retries.
+        def always_transient():
+            return (False, "HTTP 500: Internal Server Error")
+
+        with mock.patch("continuum.delegated_dispatch.time.sleep") as sleep:
+            outcome = run_with_retry(always_transient)
+
+        self.assertFalse(outcome.succeeded)
+        self.assertEqual(sleep.call_count, MAX_DISPATCH_ATTEMPTS - 1)
+        for call in sleep.call_args_list:
+            self.assertGreaterEqual(call.args[0], MIN_RETRY_DELAY_SECONDS)
 
 
 class RetryBehaviorTests(unittest.TestCase):

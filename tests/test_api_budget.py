@@ -218,12 +218,41 @@ class RestFailureClassificationTest(unittest.TestCase):
         # An abusive header can never park the pass beyond the cap.
         self.assertEqual(retry_after_seconds({"Retry-After": "9999"}, now=100), 15.0)
         self.assertEqual(
-            retry_after_seconds({"X-RateLimit-Reset": "130"}, now=100), 15.0
+            retry_after_seconds(
+                {"X-RateLimit-Reset": "130", "X-RateLimit-Remaining": "0"},
+                now=100,
+            ),
+            15.0,
         )
         self.assertEqual(
-            retry_after_seconds({"X-RateLimit-Reset": "112"}, now=100), 12.0
+            retry_after_seconds(
+                {"X-RateLimit-Reset": "112", "X-RateLimit-Remaining": "0"},
+                now=100,
+            ),
+            12.0,
         )
         self.assertIsNone(retry_after_seconds(now=100))
+
+    def test_reset_header_is_ignored_until_quota_is_exhausted(self):
+        # ``X-RateLimit-Reset`` is sent on every response and only marks the
+        # end of the quota window. A transient 5xx with quota remaining must
+        # not inherit the full window as a retry delay.
+        self.assertIsNone(
+            retry_after_seconds(
+                {"X-RateLimit-Reset": "130", "X-RateLimit-Remaining": "42"},
+                now=100,
+            )
+        )
+        self.assertIsNone(
+            retry_after_seconds({"X-RateLimit-Reset": "130"}, now=100)
+        )
+        self.assertEqual(
+            retry_after_seconds(
+                {"X-RateLimit-Reset": "130", "X-RateLimit-Remaining": "0"},
+                now=100,
+            ),
+            15.0,
+        )
 
     def test_retry_after_http_date_is_a_delta(self):
         delay = retry_after_seconds(

@@ -8,7 +8,7 @@ fixes are made on `main`. There is no LTS branch, no guaranteed backport to an
 older commit or tag, and no support window for a pinned ref. Consumers that pin
 a tag or commit should update the pin and re-run `install.sh` for every set they
 use so installed `continuum-*.yml` callers reference the fixed ref. See
-[Install](README.md#install) and [Upgrading](README.md#upgrading).
+[Install](README.md#install) and [Upgrading](README.md#upgrading-and-safe-pruning).
 
 ## Reporting a vulnerability
 

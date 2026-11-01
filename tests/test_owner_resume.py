@@ -22,6 +22,7 @@ from continuum.owner_resume import (
     WAIT,
     decide_owner_resume,
     evaluate_predecessor_completion,
+    independent_review_evidence,
     resume_baseline,
     scan_resume_marker,
 )
@@ -390,7 +391,19 @@ class MarkerAuthorizationTests(unittest.TestCase):
                     [item], target=373, repository_owner=OWNER
                 )
                 self.assertIsNone(scan.instruction)
-                self.assertIn("not the repository owner", scan.reason)
+                self.assertIn("not owner-armed", scan.reason)
+
+    def test_non_owner_lookalike_cannot_block_the_owner_marker(self):
+        scan = scan_resume_marker(
+            [
+                marker(374, cid=1),
+                marker(375, author="contributor", cid=2),
+            ],
+            target=373,
+            repository_owner=OWNER,
+        )
+        self.assertIsNotNone(scan.instruction)
+        self.assertEqual(scan.instruction.predecessor, 374)
 
     def test_malformed_markers_fail_closed(self):
         bodies = (
@@ -445,6 +458,47 @@ class MarkerAuthorizationTests(unittest.TestCase):
         )
         self.assertIsNotNone(scan.instruction)
         self.assertEqual(scan.instruction.predecessor, 374)
+
+
+class IndependentReviewEvidenceTests(unittest.TestCase):
+    def test_review_without_author_identity_is_not_evidence(self):
+        # A deleted account (``user: null``) or a null login must never be
+        # normalized into the string ``"none"`` and counted as an
+        # independent clean review.
+        for review in (
+            {"state": "APPROVED", "commit_id": HEAD_A, "user": None},
+            {"state": "APPROVED", "commit_id": HEAD_A, "user": {"login": None}},
+            {
+                "state": "APPROVED",
+                "commit_id": HEAD_A,
+                "user": {"login": None},
+                "author_login": None,
+            },
+        ):
+            with self.subTest(review=review):
+                self.assertFalse(
+                    independent_review_evidence(
+                        [review],
+                        [],
+                        head_sha=HEAD_A,
+                        pr_author="author",
+                    )
+                )
+
+    def test_independent_reviewer_is_still_evidence(self):
+        review = {
+            "state": "APPROVED",
+            "commit_id": HEAD_A,
+            "user": {"login": "reviewer"},
+        }
+        self.assertTrue(
+            independent_review_evidence(
+                [review],
+                [],
+                head_sha=HEAD_A,
+                pr_author="author",
+            )
+        )
 
 
 class CompletionStateMachineTests(unittest.TestCase):
@@ -991,6 +1045,35 @@ class SchedulerResumeBudgetTests(unittest.TestCase):
             lease_minutes=45,
             wip_limit=2,
         )
+
+    def test_pause_label_blocks_admission_without_pause_on_failure(self):
+        # ``pause_on_failure`` only controls the terminal pause after
+        # exhausted attempts; an existing pause label always blocks dispatch.
+        config = SchedulerConfig(
+            ready_label=READY,
+            pause_label=PAUSE,
+            in_progress_label="automation:in-progress",
+            max_dispatch_attempts=2,
+            pause_on_failure=False,
+            lease_minutes=45,
+            wip_limit=2,
+        )
+        issues = self.scheduler_issue({READY, PAUSE})
+        result = reconcile(
+            NOW,
+            issues,
+            set(),
+            set(),
+            {},
+            {},
+            {},
+            set(),
+            config,
+            repository_owner=OWNER,
+        )
+        self.assertEqual(result.dispatched, [])
+        self.assertEqual(result.skip_reasons[373], "automation is paused")
+        self.assertNotIn("automation:in-progress", issues[373].labels)
 
     def test_marker_baseline_is_only_valid_for_api_trusted_exact_marker(self):
         comments = self.records(

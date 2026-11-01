@@ -72,8 +72,8 @@ authoritative relationship contract.
 
 ## Parent workflows
 
-Install the ordinary core `continuum-issue-scheduler.yml` caller plus the three
-thin entry workflows in `.github/caller-stubs/parent/`. The parent callers
+Install the ordinary core `continuum-issue-scheduler.yml` caller plus the thin
+entry workflows in `.github/caller-stubs/parent/`. The parent callers
 invoke:
 
 - `continuum-consumer-child-worker.yml`
@@ -230,7 +230,8 @@ bash install.sh /path/to/parent main parent
 
 For production, replace `main` with a tested full Continuum commit SHA. Both
 `uses:` and `engine_ref` are set to that revision. The parent set installs only `continuum-child-worker.yml`,
-`continuum-child-review.yml`, and `continuum-child-pr-review.yml`. The
+`continuum-child-review.yml`, `continuum-child-pr-review.yml`, and
+`continuum-child-run-cleanup.yml`. The
 ordinary scheduler comes from the core set. The parent set preserves existing
 CI, issue scheduling, OpenCode,
 release, Render, and artifact workflows. The token is supplied through the

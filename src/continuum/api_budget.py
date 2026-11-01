@@ -416,9 +416,10 @@ def retry_after_seconds(headers: Any = None, *, now: Optional[float] = None,
     """Return the bounded retry delay implied by rate-limit headers.
 
     Honours ``Retry-After`` (delta seconds or HTTP date) and
-    ``X-RateLimit-Reset`` (UTC epoch seconds).  The result is clamped to
-    ``[0, max_delay]`` so a header can never block a pass unboundedly.
-    Returns ``None`` when neither header carries a usable value.
+    ``X-RateLimit-Reset`` (UTC epoch seconds) when the remaining quota is
+    exhausted.  The result is clamped to ``[0, max_delay]`` so a header can
+    never block a pass unboundedly.  Returns ``None`` when no header carries
+    a usable value.
     """
     header_map = _headers_lower(headers)
     current = time.time() if now is None else float(now)
@@ -440,7 +441,11 @@ def retry_after_seconds(headers: Any = None, *, now: Optional[float] = None,
                 if 2000 <= parsed.year <= 2100:
                     candidates.append(max(0.0, parsed.timestamp() - current))
     reset = (header_map.get("x-ratelimit-reset") or "").strip()
-    if reset and _DIGITS_RE.match(reset):
+    remaining = (header_map.get("x-ratelimit-remaining") or "").strip()
+    # ``X-RateLimit-Reset`` marks the end of the quota window, not a retry
+    # time.  It is only a retry signal once the quota is actually exhausted;
+    # otherwise every transient 5xx would wait out the full window.
+    if reset and _DIGITS_RE.match(reset) and remaining == "0":
         candidates.append(max(0.0, float(reset) - current))
     if not candidates:
         return None
