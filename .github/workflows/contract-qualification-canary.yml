@@ -1,0 +1,25 @@
+name: Contract qualification canary
+
+# Layer 3 runs a real live-canary task against current `main` on a schedule.
+# It is a project-owned workflow (not a Continuum caller stub): consumers do
+# not install it, and it never executes pull-request code.
+on:
+  schedule:
+    - cron: "43 */6 * * *"
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  canary:
+    uses: ./.github/workflows/continuum-contract-qualification.yml
+    secrets: inherit
+    with:
+      mode: canary
+      continuum_ref: main
+    permissions:
+      actions: write
+      contents: read
+      issues: write
+      pull-requests: read
+      statuses: write
