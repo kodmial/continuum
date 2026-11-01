@@ -301,7 +301,6 @@ _REPOSITORY_TOKENS = (
     "tests failed",
     "test defect",
     "failing test",
-    "pytest",
     "traceback",
     "typeerror",
     "referenceerror",

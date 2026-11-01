@@ -110,6 +110,18 @@ class RepositoryRepairTests(unittest.TestCase):
         self.assertEqual(decision.action, engine.ACTION_REPAIR_REPOSITORY)
         self.assertTrue(decision.create_repair)
 
+    def test_genuine_pytest_assertion_still_creates_repair(self):
+        classification = engine.classify_render_failure(
+            execute_outcome="failure",
+            cleanup_outcome="success",
+            result={"error": "pytest: AssertionError: expected 2 got 3"},
+            memory_summary={},
+            state={},
+        )
+        self.assertEqual(classification.classification, engine.REPOSITORY)
+        decision = engine.decide_render_recovery(classification, cleanup_ok=True)
+        self.assertTrue(decision.create_repair)
+
     def test_generic_failure_without_defect_evidence_creates_no_repair(self):
         classification = engine.classify_render_failure(
             execute_outcome="failure",
@@ -221,6 +233,23 @@ class TransientRecoveryTests(unittest.TestCase):
         decision = engine.decide_render_recovery(classification, cleanup_ok=True)
         self.assertFalse(decision.create_repair)
         self.assertFalse(decision.allow_retry)
+
+    def test_bare_timeout_stays_unknown_even_with_pytest_command_line(self):
+        # The executed command mentions pytest but carries no defect text, so
+        # it must not create a repository repair for an unqualified timeout.
+        classification = engine.classify_render_failure(
+            execute_outcome="failure",
+            cleanup_outcome="success",
+            result={
+                "error": "job timed out after 55 minutes",
+                "command": "pytest -q tests",
+            },
+            memory_summary={},
+            state={},
+        )
+        self.assertEqual(classification.classification, engine.TIMEOUT_UNKNOWN)
+        decision = engine.decide_render_recovery(classification, cleanup_ok=True)
+        self.assertFalse(decision.create_repair)
 
     def test_timeout_qualifier_substrings_do_not_qualify(self):
         # Matching is whole-word, so "read" in "thread" and "api" in "rapid"

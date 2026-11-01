@@ -269,11 +269,12 @@ async function runScan(client, options) {
     failCredential(error);
     throw new Error('global-pr-watchdog: rate-limit guard is unavailable');
   }
-  if (Number(guard.remaining) <= lowWaterMark(guard.limit)) {
+  const guardRemaining = Number(guard && guard.remaining);
+  if (!Number.isFinite(guardRemaining) || guardRemaining <= lowWaterMark(guard && guard.limit)) {
     counters.skipped_low_rate_budget += 1;
     log.info(
       `global-pr-watchdog skipped: shared API budget low ` +
-        `(remaining=${Number(guard.remaining)} low_water=${lowWaterMark(guard.limit)})`
+        `(remaining=${guardRemaining} low_water=${lowWaterMark(guard && guard.limit)})`
     );
     return { counters, truncatedDiscovery: false, stoppedRateLimited: false, lowBudget: true };
   }
@@ -412,12 +413,13 @@ async function runScan(client, options) {
           stopScan = true;
           break;
         }
-        if (Number(check.remaining) <= lowWaterMark(check.limit)) {
+        const checkRemaining = Number(check && check.remaining);
+        if (!Number.isFinite(checkRemaining) || checkRemaining <= lowWaterMark(check && check.limit)) {
           counters.skipped_low_rate_budget += 1;
           lowBudget = true;
           log.info(
             `global-pr-watchdog stopped: shared API budget low ` +
-              `(remaining=${Number(check.remaining)} low_water=${lowWaterMark(check.limit)})`
+              `(remaining=${checkRemaining} low_water=${lowWaterMark(check && check.limit)})`
           );
           stopScan = true;
           break;
