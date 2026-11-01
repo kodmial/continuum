@@ -84,7 +84,7 @@ def _cmd_has_refs(args) -> int:
 def _cmd_has_closing_keyword(args) -> int:
     print(
         "true"
-        if contains_closing_keyword(_read_body(args), args.issue)
+        if contains_closing_keyword(_read_body(args), args.issue, args.repository)
         else "false"
     )
     return 0
@@ -189,6 +189,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     _add_body_options(closing)
     closing.add_argument("--issue", default=None, help="Issue number the keyword must target.")
+    closing.add_argument(
+        "--repository",
+        default=os.environ.get("GITHUB_REPOSITORY", ""),
+        help="Current owner/repo; a cross-repository target counts only when it matches.",
+    )
     closing.set_defaults(func=_cmd_has_closing_keyword)
 
     required = sub.add_parser(

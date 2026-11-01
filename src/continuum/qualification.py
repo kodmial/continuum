@@ -776,12 +776,32 @@ def has_untrusted_dispatch_forgery(
     return False
 
 
-def contains_closing_keyword(text: object, issue_number: object = None) -> bool:
+def _normalize_repository(repository: object) -> str:
+    """Return a lower-case ``owner/repo`` slug, or an empty string."""
+
+    if not isinstance(repository, str):
+        return ""
+    parts = repository.strip().split("/")
+    if len(parts) != 2 or not all(part.strip() for part in parts):
+        return ""
+    return "/".join(part.strip().lower() for part in parts)
+
+
+def contains_closing_keyword(
+    text: object, issue_number: object = None, repository: object = None
+) -> bool:
     """Whether text carries a GitHub auto-close keyword.
 
     With an issue number, only a keyword targeting that issue counts;
     otherwise any auto-close keyword counts. A qualification-gated PR body
     must never contain one for its capability issue.
+
+    ``repository`` disambiguates cross-repository targets. When it is an
+    ``owner/repo`` slug, a bare ``#N``, the matching ``owner/repo#N`` short
+    form, and the matching issue URL all count, while another repository's
+    target does not. Callers that know the current repository should pass it;
+    without it any cross-repository target is treated conservatively as a
+    possible auto-close.
     """
 
     if not isinstance(text, str) or not text:
@@ -792,12 +812,25 @@ def contains_closing_keyword(text: object, issue_number: object = None) -> bool:
         wanted = int(issue_number)
     except (TypeError, ValueError):
         return False
+    current = _normalize_repository(repository)
     pattern = re.compile(
         r"\b(?:close|closes|closed|fix|fixes|fixed|resolve|resolves|resolved)"
-        + _CLOSING_TARGET + str(wanted) + r"(?!\d)",
+        r"\s*:?\s*(?:"
+        r"(?P<slug>[\w.-]+/[\w.-]+)#"
+        r"|https?://github\.com/(?P<url>[\w.-]+/[\w.-]+)/issues/"
+        r"|#"
+        r")?"
+        + str(wanted)
+        + r"(?!\d)",
         re.IGNORECASE,
     )
-    return pattern.search(text) is not None
+    for match in pattern.finditer(text):
+        target = match.group("slug") or match.group("url")
+        if target is None or not current:
+            return True
+        if target.lower() == current:
+            return True
+    return False
 
 
 def _attrs_to_dict(attrs: str) -> Dict[str, str]:

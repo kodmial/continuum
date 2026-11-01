@@ -43,6 +43,8 @@ from __future__ import annotations
 import os
 import re
 
+from .credential_matrix import ALLOWED_SECRETS as _MATRIX_ALLOWED_SECRETS
+
 # ---------------------------------------------------------------------------
 # Capability taxonomy
 # ---------------------------------------------------------------------------
@@ -128,17 +130,9 @@ CAPABILITIES = frozenset({
     SPLIT_ACTOR,
 })
 
-#: Secrets a workflow may reference. Mirrors
-#: :data:`continuum.credential_matrix.ALLOWED_SECRETS` plus the automatic
-#: ``github.token``; #305 introduces no new secret.
-ALLOWED_SECRETS = frozenset({
-    "TAP_PAT",
-    "RENDER_API_KEY",
-    "CHILD_RUNTIME_TOKEN",
-    "CHILD_RUNTIME_REPOSITORIES",
-    "CONTINUUM_CHILD_REPOSITORIES",
-    "CONTINUUM_VERIFICATION_ATTESTATION_KEY",
-})
+#: Secrets a workflow may reference: the credential matrix's allow-list plus
+#: the automatic ``github.token``; #305 introduces no new secret.
+ALLOWED_SECRETS = frozenset(_MATRIX_ALLOWED_SECRETS | {"GITHUB_TOKEN"})
 
 #: Paid-provider keys must never be required, read, or forwarded by core.
 FORBIDDEN_PROVIDER_KEYS = (

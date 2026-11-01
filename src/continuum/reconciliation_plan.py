@@ -223,6 +223,21 @@ def _read_window(
     return items, cursor, False, pages
 
 
+def _retry_evidence(per_pr: Mapping[str, Any], name: str) -> RetryEvidence:
+    """Read the operation-scoped retry evidence, honoring the legacy key.
+
+    #432 split the shared ``retry_evidence`` state into per-operation keys so
+    CI repair and PR-Agent no longer share one budget. A caller still writing
+    the old key must not silently reset that budget to zero attempts, so the
+    scoped key wins when present and the legacy key is the fallback.
+    """
+
+    evidence = per_pr.get(name)
+    if evidence is None:
+        evidence = per_pr.get("retry_evidence")
+    return evidence or RetryEvidence()
+
+
 def plan_snapshot(
     issues: Sequence[Mapping[str, Any]],
     pull_requests: Sequence[Mapping[str, Any]],
@@ -285,7 +300,7 @@ def plan_snapshot(
                 conflict_lock=bool(per_pr.get("conflict_lock", False)),
                 dispatches_for_head=int(per_pr.get("dispatches_for_head", 0) or 0),
                 conflict_marker_age_seconds=per_pr.get("conflict_marker_age_seconds"),
-                retry_evidence=per_pr.get("ci_repair_retry_evidence") or RetryEvidence(),
+                retry_evidence=_retry_evidence(per_pr, "ci_repair_retry_evidence"),
                 max_executions=int(per_pr.get("max_executions", 10) or 10),
             )
         )
@@ -355,7 +370,7 @@ def plan_snapshot(
                     run_conclusion=per_pr.get("run_conclusion"),
                     status_age_seconds=per_pr.get("status_age_seconds"),
                     main_sync_required=bool(per_pr.get("main_sync_required", False)),
-                    evidence=per_pr.get("pr_agent_retry_evidence") or RetryEvidence(),
+                    evidence=_retry_evidence(per_pr, "pr_agent_retry_evidence"),
                     marker_newer_than_status=bool(per_pr.get("marker_newer_than_status", False)),
                     marker_age_seconds=per_pr.get("marker_age_seconds"),
                     not_before_epoch=per_pr.get("not_before_epoch"),

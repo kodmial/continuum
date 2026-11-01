@@ -327,13 +327,36 @@ class AutoCloseSafetyTests(unittest.TestCase):
         for text in (
             "Fixes owner/repo#182",
             "Fixes owner/repo#182 and more",
-            "Closes other/repository#182",
             "Fixes https://github.com/owner/repo/issues/182",
             "Resolved https://github.com/owner/repo/issues/182",
         ):
             with self.subTest(text=text):
                 self.assertTrue(gate.contains_closing_keyword(text))
+                self.assertTrue(
+                    gate.contains_closing_keyword(
+                        text, 182, repository="owner/repo"
+                    )
+                )
+
+    def test_bare_reference_still_counts_with_repository_context(self):
+        self.assertTrue(
+            gate.contains_closing_keyword("Fixes #182", 182, repository="owner/repo")
+        )
+
+    def test_another_repository_short_form_does_not_close_the_local_issue(self):
+        for text in (
+            "Closes other/repository#182",
+            "Fixes https://github.com/other/repository/issues/182",
+        ):
+            with self.subTest(text=text):
+                # Without repository context the engine stays conservative and
+                # treats the target as a possible auto-close.
                 self.assertTrue(gate.contains_closing_keyword(text, 182))
+                self.assertFalse(
+                    gate.contains_closing_keyword(
+                        text, 182, repository="owner/repo"
+                    )
+                )
 
     def test_cross_repository_reference_does_not_match_another_issue(self):
         for text in (

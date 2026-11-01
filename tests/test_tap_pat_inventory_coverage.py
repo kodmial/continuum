@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import unittest
 
+from continuum import credential_matrix
 from continuum import tap_pat_inventory
 
 
@@ -54,6 +55,14 @@ class ExactStepCoverageTest(unittest.TestCase):
         self.assertIn(
             "CONTINUUM_VERIFICATION_ATTESTATION_KEY",
             tap_pat_inventory.ALLOWED_SECRETS,
+        )
+
+    def test_allowlist_derives_from_the_credential_matrix(self):
+        # The inventory allow-list is the credential matrix's set plus the
+        # automatic github.token; a hand-maintained copy already drifted once.
+        self.assertEqual(
+            tap_pat_inventory.ALLOWED_SECRETS,
+            frozenset(credential_matrix.ALLOWED_SECRETS | {"GITHUB_TOKEN"}),
         )
 
 

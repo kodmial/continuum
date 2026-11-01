@@ -278,6 +278,26 @@ class RetryEvidenceIsolationTests(unittest.TestCase):
         )
         self.assertEqual(decision_for(plan, "pr-agent-recovery").kind, TERMINAL)
 
+    def test_legacy_retry_evidence_key_still_feeds_ci_repair(self):
+        # A caller that still writes the pre-split ``retry_evidence`` key must
+        # keep its exhausted budget instead of silently starting over.
+        plan = plan_one_pr(
+            ci_run={"status": "completed", "conclusion": "failure"},
+            per_pr={"retry_evidence": RetryEvidence(exhausted=True)},
+        )
+        self.assertEqual(decision_for(plan, "ci-repair").kind, TERMINAL)
+
+    def test_legacy_retry_evidence_key_still_feeds_pr_agent_recovery(self):
+        plan = plan_one_pr(
+            ci_run={"status": "completed", "conclusion": "success"},
+            per_pr={
+                "retry_evidence": RetryEvidence(exhausted=True),
+                "operation_state": "failure",
+                "failure_transient": True,
+            },
+        )
+        self.assertEqual(decision_for(plan, "pr-agent-recovery").kind, TERMINAL)
+
 
 class PlanClockTests(unittest.TestCase):
     """kodmial/continuum#432: an unset now_epoch defaults to the plan clock."""
