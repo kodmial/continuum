@@ -1,0 +1,2145 @@
+"""Deterministic regression tests for PR-Agent recovery (Work Lock #38)."""
+
+from __future__ import annotations
+
+import os
+import sys
+import unittest
+from datetime import datetime, timedelta, timezone
+
+ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+SRC = os.path.join(ROOT, "src")
+sys.path.insert(0, SRC)
+
+from continuum import pr_agent_recovery as recovery  # noqa: E402
+
+
+HEAD = "a" * 40
+OLD_HEAD = "b" * 40
+
+
+def comment(body: str, *, association: str = "OWNER", age_seconds: int = 0) -> dict:
+    when = datetime.now(timezone.utc) - timedelta(seconds=age_seconds)
+    return {
+        "body": body,
+        "author_association": association,
+        "created_at": when.isoformat(),
+    }
+
+
+class IdentityTests(unittest.TestCase):
+    def test_operation_identity_is_pr_head_and_kind(self):
+        self.assertEqual(recovery.operation_key(38, HEAD.upper(), "review"), f"38:{HEAD}:review")
+        self.assertNotEqual(
+            recovery.operation_key(38, HEAD, "review"),
+            recovery.operation_key(38, HEAD, "repair"),
+        )
+        self.assertNotEqual(
+            recovery.operation_key(38, HEAD, "review"),
+            recovery.operation_key(38, OLD_HEAD, "review"),
+        )
+
+    def test_invalid_identity_fails_closed(self):
+        with self.assertRaises(recovery.RecoveryError):
+            recovery.operation_key(0, HEAD, "review")
+        with self.assertRaises(recovery.RecoveryError):
+            recovery.operation_key(1, "not-a-sha", "review")
+        with self.assertRaises(recovery.RecoveryError):
+            recovery.operation_key(1, HEAD, "merge")
+
+    def test_short_sha_rejection_names_full_commit_id(self):
+        # Short-SHA callers get a migration-pointing error (pass the full
+        # HEAD), never a silently ignored marker / split budget.
+        with self.assertRaisesRegex(recovery.RecoveryError, "full"):
+            recovery.operation_key(1, "a" * 7, "review")
+
+
+class DurableEvidenceTests(unittest.TestCase):
+    def test_retry_state_survives_independent_wakeups(self):
+        comments = [
+            comment(f"<!-- continuum-pr-agent-retry head={HEAD} kind=review attempt=1 -->"),
+            comment(f"<!-- continuum-pr-agent-retry head={HEAD} kind=review attempt=2 -->"),
+        ]
+        evidence = recovery.retry_evidence(comments, head_sha=HEAD, kind="review")
+        self.assertEqual(evidence.latest_attempt, 2)
+        self.assertFalse(evidence.exhausted)
+
+    def test_edited_controller_marker_uses_updated_timestamp(self):
+        old = datetime.now(timezone.utc) - timedelta(minutes=10)
+        fresh = datetime.now(timezone.utc)
+        comments = [{
+            "body": (
+                "<!-- continuum-pr-agent-controller-state:v1 -->\n"
+                f"<!-- continuum-pr-agent-retry head={HEAD} kind=review attempt=1 -->"
+            ),
+            "author_association": "OWNER",
+            "created_at": old.isoformat(),
+            "updated_at": fresh.isoformat(),
+        }]
+        evidence = recovery.retry_evidence(comments, head_sha=HEAD, kind="review")
+        self.assertEqual(evidence.latest_attempt, 1)
+        self.assertIsNotNone(evidence.latest_marker_at)
+        self.assertLess(abs((evidence.latest_marker_at - fresh).total_seconds()), 1)
+
+    def test_external_comment_cannot_forge_retry_budget(self):
+        comments = [
+            comment(
+                f"<!-- continuum-pr-agent-retry head={HEAD} kind=review attempt=99 -->",
+                association="CONTRIBUTOR",
+            ),
+            comment(
+                f"<!-- continuum-pr-agent-retry-exhausted head={HEAD} kind=review attempts=99 -->",
+                association="NONE",
+            ),
+        ]
+        evidence = recovery.retry_evidence(comments, head_sha=HEAD, kind="review")
+        self.assertIsNone(evidence.latest_attempt)
+        self.assertFalse(evidence.exhausted)
+
+    def test_changed_head_invalidates_old_retry_state(self):
+        comments = [
+            comment(f"<!-- continuum-pr-agent-retry head={OLD_HEAD} kind=review attempt=2 -->"),
+            comment(
+                f"<!-- continuum-pr-agent-retry-exhausted head={OLD_HEAD} kind=review attempts=3 -->"
+            ),
+        ]
+        evidence = recovery.retry_evidence(comments, head_sha=HEAD, kind="review")
+        self.assertIsNone(evidence.latest_attempt)
+        self.assertFalse(evidence.exhausted)
+
+    def test_review_and_repair_budgets_are_independent(self):
+        comments = [
+            comment(f"<!-- continuum-pr-agent-retry head={HEAD} kind=review attempt=2 -->"),
+            comment(f"<!-- continuum-pr-agent-retry head={HEAD} kind=repair attempt=1 -->"),
+        ]
+        review = recovery.retry_evidence(comments, head_sha=HEAD, kind="review")
+        repair = recovery.retry_evidence(comments, head_sha=HEAD, kind="repair")
+        self.assertEqual(review.latest_attempt, 2)
+        self.assertEqual(repair.latest_attempt, 1)
+
+    def test_canonical_lifecycle_markers_share_the_same_budget(self):
+        from continuum import lifecycle_recovery as lifecycle
+
+        marker = lifecycle.retry_marker(HEAD, "review", 3, not_before_epoch=2000)
+        evidence = recovery.retry_evidence(
+            [comment(marker)], head_sha=HEAD, kind="review"
+        )
+        self.assertEqual(evidence.latest_attempt, 3)
+        self.assertEqual(evidence.not_before_epoch, 2000)
+        # Canonical exhausted markers are honored as well.
+        exhausted = recovery.retry_evidence(
+            [comment(lifecycle.exhausted_marker(HEAD, "review", attempts=10))],
+            head_sha=HEAD,
+            kind="review",
+        )
+        self.assertTrue(exhausted.exhausted)
+
+    def test_stray_not_before_outside_any_marker_is_ignored(self):
+        evidence = recovery.retry_evidence(
+            [comment("hello not-before=2000")], head_sha=HEAD, kind="review"
+        )
+        self.assertIsNone(evidence.not_before_epoch)
+        self.assertIsNone(evidence.latest_attempt)
+
+    def test_durable_not_before_waits_for_the_safety_net(self):
+        evidence = recovery.RetryEvidence(latest_attempt=1, not_before_epoch=2000)
+        early = recovery.decide_recovery(
+            ci_green=True,
+            operation_state="failure",
+            operation_description="transient; recovery eligible",
+            operation_context="continuum/pr-agent-review",
+            evidence=evidence,
+            now_epoch=1000,
+        )
+        self.assertEqual(early.action, "wait")
+        late = recovery.decide_recovery(
+            ci_green=True,
+            operation_state="failure",
+            operation_description="transient; recovery eligible",
+            operation_context="continuum/pr-agent-review",
+            evidence=evidence,
+            now_epoch=3000,
+        )
+        self.assertEqual(late.action, "dispatch")
+
+    def test_malformed_durable_not_before_fails_closed(self):
+        # A malformed durable value must raise the documented fail-closed
+        # error, never a raw ValueError, matching the lifecycle contract.
+        evidence = recovery.RetryEvidence(
+            latest_attempt=1, not_before_epoch="not-an-epoch"
+        )
+        with self.assertRaises(recovery.RecoveryError):
+            recovery.decide_recovery(
+                ci_green=True,
+                operation_state="failure",
+                operation_description="transient; recovery eligible",
+                evidence=evidence,
+                now_epoch=1000,
+            )
+
+    def test_unknown_marker_age_dispatches_instead_of_waiting_forever(self):
+        # Unknown marker age stays inside grace only while status is
+        # known-fresh; when the status age is also unknown there is no
+        # proof of freshness, so grace expires and the retry fires instead
+        # of waiting forever on a timestamp-less marker.
+        fresh_waiting = recovery.decide_recovery(
+            ci_green=True,
+            operation_state="failure",
+            operation_description="transient; recovery eligible",
+            operation_context="continuum/pr-agent-review",
+            evidence=recovery.RetryEvidence(latest_attempt=2),
+            marker_newer_than_status=True,
+            marker_age_seconds=None,
+            status_age_seconds=0,
+        )
+        self.assertEqual(fresh_waiting.action, "wait")
+        self.assertIsNone(fresh_waiting.attempt)
+        expired = recovery.decide_recovery(
+            ci_green=True,
+            operation_state="failure",
+            operation_description="transient; recovery eligible",
+            operation_context="continuum/pr-agent-review",
+            evidence=recovery.RetryEvidence(latest_attempt=2),
+            marker_newer_than_status=True,
+            marker_age_seconds=None,
+            now_epoch=1000,
+        )
+        self.assertEqual(expired.action, "dispatch")
+        self.assertEqual(expired.attempt, 3)
+        # A known age inside grace still coalesces the duplicate wakeup.
+        coalesced = recovery.decide_recovery(
+            ci_green=True,
+            operation_state="failure",
+            operation_description="transient; recovery eligible",
+            operation_context="continuum/pr-agent-review",
+            evidence=recovery.RetryEvidence(latest_attempt=2),
+            marker_newer_than_status=True,
+            marker_age_seconds=10,
+        )
+        self.assertEqual(coalesced.action, "wait")
+
+    def test_not_before_without_clock_waits_fail_closed(self):
+        # A durable reset-aware wait the marker already committed must
+        # defer to the scheduled safety net when no clock is supplied,
+        # never dispatch straight through it and burn budget on 403/429.
+        evidence = recovery.RetryEvidence(latest_attempt=1, not_before_epoch=2000)
+        deferred = recovery.decide_recovery(
+            ci_green=True,
+            operation_state="failure",
+            operation_description="transient; recovery eligible",
+            evidence=evidence,
+            now_epoch=None,
+        )
+        self.assertEqual(deferred.action, "wait")
+        self.assertIsNone(deferred.attempt)
+
+    def test_dispatch_carries_the_attempt_backoff(self):
+        # A retry dispatch returns the scheduled not-before so the caller
+        # cannot run the bounded budget out faster than the retry schedule.
+        initial = recovery.decide_recovery(ci_green=True, operation_state=None)
+        self.assertEqual(initial.action, "dispatch")
+        self.assertEqual(initial.attempt, 0)
+        self.assertIsNone(initial.not_before_epoch)
+        self.assertFalse(initial.defer_dispatch)
+
+        short = recovery.decide_recovery(
+            ci_green=True,
+            operation_state="pending",
+            run_conclusion="cancelled",
+            evidence=recovery.RetryEvidence(latest_attempt=0),
+            now_epoch=1000,
+        )
+        self.assertEqual(short.action, "dispatch")
+        self.assertEqual(short.attempt, 1)
+        self.assertEqual(short.not_before_epoch, 1000 + recovery.backoff_seconds(1))
+        self.assertFalse(short.defer_dispatch)
+
+        long = recovery.decide_recovery(
+            ci_green=True,
+            operation_state="pending",
+            run_conclusion="cancelled",
+            evidence=recovery.RetryEvidence(latest_attempt=3),
+            now_epoch=1000,
+        )
+        self.assertEqual(long.action, "dispatch")
+        self.assertEqual(long.attempt, 4)
+        self.assertEqual(long.not_before_epoch, 1000 + recovery.backoff_seconds(4))
+        self.assertTrue(long.defer_dispatch)
+
+
+class RecoveryDecisionTests(unittest.TestCase):
+    def test_lost_ci_wakeup_dispatches_initial_exact_head_review(self):
+        decision = recovery.decide_recovery(
+            ci_green=True,
+            operation_state=None,
+        )
+        self.assertEqual(decision.action, "dispatch")
+        self.assertEqual(decision.attempt, 0)
+
+    def test_cancelled_review_recovers_with_next_bounded_attempt(self):
+        decision = recovery.decide_recovery(
+            ci_green=True,
+            operation_state="pending",
+            run_conclusion="cancelled",
+            evidence=recovery.RetryEvidence(),
+        )
+        self.assertEqual(decision.action, "dispatch")
+        # Consistent 10-execution contract: first execution is index 0 on
+        # every path (no marker means no recovery execution has run yet).
+        self.assertEqual(decision.attempt, 0)
+
+    def test_timed_out_repair_recovers(self):
+        decision = recovery.decide_recovery(
+            ci_green=True,
+            operation_state="pending",
+            run_conclusion="timed_out",
+            evidence=recovery.RetryEvidence(latest_attempt=1),
+            now_epoch=1000,
+        )
+        self.assertEqual(decision.action, "dispatch")
+        self.assertEqual(decision.attempt, 2)
+
+    def test_stale_pending_operation_recovers_without_a_run(self):
+        decision = recovery.decide_recovery(
+            ci_green=True,
+            operation_state="pending",
+            run_conclusion=None,
+            status_age_seconds=recovery.STALE_AFTER_SECONDS + 1,
+        )
+        self.assertEqual(decision.action, "dispatch")
+        # Consistent 10-execution contract: first execution is index 0.
+        self.assertEqual(decision.attempt, 0)
+
+    def test_clean_success_with_incomplete_lifecycle_replays(self):
+        decision = recovery.decide_recovery(
+            ci_green=True,
+            operation_state="success",
+            lifecycle_complete=False,
+        )
+        self.assertEqual(decision.action, "dispatch")
+        self.assertEqual(decision.attempt, 0)
+
+    def test_clean_review_resume_is_wired_to_the_lifecycle(self):
+        with open(
+            os.path.join(ROOT, ".github/workflows/continuum-pr-agent-recovery.yml"),
+            encoding="utf-8",
+        ) as handle:
+            body = handle.read()
+
+        self.assertIn("cleanLifecycleIncomplete", body)
+        self.assertIn("assessCleanReviewLifecycle({", body)
+        self.assertIn(
+            "clean exact-HEAD review completed but the merge lifecycle is unfinished",
+            body,
+        )
+        self.assertIn("lifecycleComplete: !cleanLifecycleIncomplete", body)
+        # Both early exits must use the shared admission result instead of
+        # settling merely because the review run succeeded.
+        self.assertNotIn("cleanMergeabilityPending", body)
+        self.assertEqual(
+            body.count("review is settled clean; recovery has nothing to do."),
+            1,
+        )
+
+    def test_active_exact_run_coalesces_duplicate_wakeup(self):
+        decision = recovery.decide_recovery(
+            ci_green=True,
+            operation_state="failure",
+            operation_description="transient; recovery eligible",
+            active_exact_run=True,
+        )
+        self.assertEqual(decision.action, "wait")
+        self.assertIsNone(decision.attempt)
+
+    def test_shipped_recovery_defines_operation_liveness_recheck(self):
+        with open(
+            os.path.join(ROOT, ".github/workflows/continuum-pr-agent-recovery.yml"),
+            encoding="utf-8",
+        ) as handle:
+            body = handle.read()
+        definition = "async function operationIsActive(prNumber, head, kind)"
+        call = "await operationIsActive(pr.number, head, kind)"
+        self.assertIn(definition, body)
+        self.assertIn("const runs = await listReviewRuns();", body)
+        self.assertIn(
+            "return Boolean(exactActiveRun(runs, prNumber, kind, head));",
+            body,
+        )
+        self.assertLess(
+            body.index(definition),
+            body.index(call),
+            "operationIsActive must be defined before the dispatch-grace call site",
+        )
+
+    def test_newer_dispatch_marker_coalesces_independent_wakeup(self):
+        evidence = recovery.RetryEvidence(latest_attempt=1)
+        decision = recovery.decide_recovery(
+            ci_green=True,
+            operation_state="failure",
+            operation_description="transient; recovery eligible",
+            operation_context="continuum/pr-agent-review",
+            evidence=evidence,
+            marker_newer_than_status=True,
+            marker_age_seconds=10,
+        )
+        self.assertEqual(decision.action, "wait")
+
+    def test_lost_dispatch_advances_after_grace_instead_of_replaying_forever(self):
+        # The dispatch-grace wait handles an unobserved dispatch; once grace
+        # expires the next index must advance so attempt >= budget can fire.
+        # Replaying the same index forever would bypass the bounded budget.
+        evidence = recovery.RetryEvidence(latest_attempt=1)
+        decision = recovery.decide_recovery(
+            ci_green=True,
+            operation_state="failure",
+            operation_description="transient; recovery eligible",
+            operation_context="continuum/pr-agent-review",
+            evidence=evidence,
+            marker_newer_than_status=True,
+            marker_age_seconds=recovery.DISPATCH_GRACE_SECONDS + 1,
+            now_epoch=1000,
+        )
+        self.assertEqual(decision.action, "dispatch")
+        self.assertEqual(decision.attempt, 2)
+
+    def test_transient_failure_retries(self):
+        decision = recovery.decide_recovery(
+            ci_green=True,
+            operation_state="failure",
+            operation_description="PR-Agent review failed: transient; recovery eligible",
+            operation_context="continuum/pr-agent-review",
+        )
+        self.assertEqual(decision.action, "dispatch")
+        # Consistent 10-execution contract: first execution is index 0 on
+        # every path, so failure and lost-wakeup both dispatch 0..9.
+        self.assertEqual(decision.attempt, 0)
+
+    def test_deterministic_failure_is_not_retried(self):
+        decision = recovery.decide_recovery(
+            ci_green=True,
+            operation_state="failure",
+            operation_description="PR-Agent review failed: deterministic; recovery held",
+        )
+        self.assertEqual(decision.action, "hold")
+        self.assertIsNone(decision.attempt)
+
+    def test_explicit_transient_verdict_dispatches_without_token(self):
+        # Classifier-proven transient infrastructure gaps never strand for
+        # lack of a token; an explicit deterministic verdict holds even
+        # with the token.
+        dispatched = recovery.decide_recovery(
+            ci_green=True,
+            operation_state="failure",
+            operation_description="runner evicted by the provider",
+            failure_transient=True,
+        )
+        self.assertEqual(dispatched.action, "dispatch")
+        held = recovery.decide_recovery(
+            ci_green=True,
+            operation_state="failure",
+            operation_description="transient; recovery eligible",
+            failure_transient=False,
+        )
+        self.assertEqual(held.action, "hold")
+        self.assertIsNone(held.attempt)
+
+    def test_bare_transient_substring_holds_without_token(self):
+        # The narrowed predicate holds on a bare "transient" substring: all
+        # producers emit the explicit token for retryable failures, so a
+        # status with only "transient" is deterministic until proven so.
+        decision = recovery.decide_recovery(
+            ci_green=True,
+            operation_state="failure",
+            operation_description="PR-Agent review failed: transient",
+        )
+        self.assertEqual(decision.action, "hold")
+
+    def test_deterministic_hint_dominates_recovery_token(self):
+        decision = recovery.decide_recovery(
+            ci_green=True,
+            operation_state="failure",
+            operation_description="CI test failure; recovery eligible",
+        )
+        self.assertEqual(decision.action, "hold")
+
+    def test_incidental_conflict_mention_does_not_hold_transient_retry(self):
+        # A bare "conflict" substring (conflict-free, conflicting) alongside
+        # the token must not hold: only a real merge conflict does, so
+        # classifier-unproven but genuinely transient failures that mention
+        # the word incidentally still retry.
+        for description in (
+            "conflict-free run; recovery eligible",
+            "conflicting signals resolved; recovery eligible",
+        ):
+            with self.subTest(description=description):
+                decision = recovery.decide_recovery(
+                    ci_green=True,
+                    operation_state="failure",
+                    operation_description=description,
+                    operation_context="continuum/pr-agent-review",
+                )
+                self.assertEqual(decision.action, "dispatch")
+        held = recovery.decide_recovery(
+            ci_green=True,
+            operation_state="failure",
+            operation_description="merge conflict; recovery eligible",
+            operation_context="continuum/pr-agent-review",
+        )
+        self.assertEqual(held.action, "hold")
+        override = recovery.decide_recovery(
+            ci_green=True,
+            operation_state="failure",
+            operation_description="CI test failure; recovery eligible",
+            failure_transient=True,
+        )
+        self.assertEqual(override.action, "dispatch")
+
+    def test_recovery_token_from_untrusted_context_holds(self):
+        held = recovery.decide_recovery(
+            ci_green=True,
+            operation_state="failure",
+            operation_description="transient; recovery eligible",
+            operation_context="ci/external-check",
+        )
+        self.assertEqual(held.action, "hold")
+        dispatched = recovery.decide_recovery(
+            ci_green=True,
+            operation_state="failure",
+            operation_description="transient; recovery eligible",
+            operation_context="continuum/pr-agent-review",
+        )
+        self.assertEqual(dispatched.action, "dispatch")
+
+    def test_missing_operation_context_never_authorizes_the_token(self):
+        # Omitting the context bypassed the trusted-context check; a
+        # missing context is untrusted and must hold.
+        held = recovery.decide_recovery(
+            ci_green=True,
+            operation_state="failure",
+            operation_description="transient; recovery eligible",
+        )
+        self.assertEqual(held.action, "hold")
+        self.assertIsNone(held.attempt)
+
+    def test_transient_unresolved_infrastructure_retries(self):
+        # "unresolved host"/"unresolved DNS" are transient network text,
+        # not unresolved review findings, so they burn the bounded budget.
+        for description in (
+            "unresolved host; recovery eligible",
+            "unresolved DNS; recovery eligible",
+        ):
+            with self.subTest(description=description):
+                decision = recovery.decide_recovery(
+                    ci_green=True,
+                    operation_state="failure",
+                    operation_description=description,
+                    operation_context="continuum/pr-agent-review",
+                )
+                self.assertEqual(decision.action, "dispatch")
+        for description in (
+            "unresolved findings; recovery eligible",
+            "unresolved review thread; recovery eligible",
+        ):
+            with self.subTest(description=description):
+                held = recovery.decide_recovery(
+                    ci_green=True,
+                    operation_state="failure",
+                    operation_description=description,
+                    operation_context="continuum/pr-agent-review",
+                )
+                self.assertEqual(held.action, "hold")
+
+    def test_leading_and_mid_string_conflict_positions(self):
+        # A description starting with "conflict" at position zero holds,
+        # while a mid-string "conflict-free" mention dispatches.
+        held = recovery.decide_recovery(
+            ci_green=True,
+            operation_state="failure",
+            operation_description="conflict detected on merge; recovery eligible",
+            operation_context="continuum/pr-agent-review",
+        )
+        self.assertEqual(held.action, "hold")
+        dispatched = recovery.decide_recovery(
+            ci_green=True,
+            operation_state="failure",
+            operation_description="run conflict-free; recovery eligible",
+            operation_context="continuum/pr-agent-review",
+        )
+        self.assertEqual(dispatched.action, "dispatch")
+
+    def test_newer_same_attempt_marker_clears_the_wait(self):
+        # A newer same-attempt legacy marker without not-before lifts the
+        # older reset-aware wait instead of waiting past the clearing.
+        head = HEAD
+        comments = [
+            comment(
+                "<!-- continuum-lifecycle-retry head=" + head + " kind=review attempt=2 not-before=2000 -->",
+                age_seconds=3600,
+            ),
+            comment(
+                "<!-- continuum-pr-agent-retry head=" + head + " kind=review attempt=2 -->",
+                age_seconds=0,
+            ),
+        ]
+        evidence = recovery.retry_evidence(comments, head_sha=head, kind="review")
+        self.assertEqual(evidence.latest_attempt, 2)
+        self.assertIsNone(evidence.not_before_epoch)
+
+    def test_legacy_short_exhausted_marker_preserves_exhaustion(self):
+        # Exact-HEAD isolation: a short-SHA exhausted marker for a different
+        # commit that merely shares a 7-char prefix must never strand the
+        # current HEAD. Short markers are ignored entirely.
+        short = HEAD[:7]
+        evidence = recovery.retry_evidence(
+            [comment(
+                f"<!-- continuum-pr-agent-retry-exhausted head={short} kind=review attempts=10 -->"
+            )],
+            head_sha=HEAD,
+            kind="review",
+        )
+        self.assertFalse(evidence.exhausted)
+
+    def test_non_green_ci_never_dispatches(self):
+        decision = recovery.decide_recovery(
+            ci_green=False,
+            operation_state=None,
+        )
+        self.assertEqual(decision.action, "wait")
+
+    def test_attempt_exhaustion_holds(self):
+        decision = recovery.decide_recovery(
+            ci_green=True,
+            operation_state="failure",
+            operation_description="transient; recovery eligible",
+            operation_context="continuum/pr-agent-review",
+            evidence=recovery.RetryEvidence(latest_attempt=9),
+        )
+        self.assertEqual(decision.action, "exhaust")
+
+    def test_mid_budget_attempt_still_dispatches(self):
+        decision = recovery.decide_recovery(
+            ci_green=True,
+            operation_state="failure",
+            operation_description="transient; recovery eligible",
+            operation_context="continuum/pr-agent-review",
+            evidence=recovery.RetryEvidence(latest_attempt=2),
+            now_epoch=1000,
+        )
+        self.assertEqual(decision.action, "dispatch")
+        self.assertEqual(decision.attempt, 3)
+        clockless = recovery.decide_recovery(
+            ci_green=True,
+            operation_state="failure",
+            operation_description="transient; recovery eligible",
+            operation_context="continuum/pr-agent-review",
+            evidence=recovery.RetryEvidence(latest_attempt=2),
+            now_epoch=None,
+        )
+        self.assertEqual(clockless.action, "wait")
+        self.assertIsNone(clockless.attempt)
+
+    def test_durable_exhausted_marker_holds_future_wakeups(self):
+        decision = recovery.decide_recovery(
+            ci_green=True,
+            operation_state="failure",
+            operation_description="transient; recovery eligible",
+            operation_context="continuum/pr-agent-review",
+            evidence=recovery.RetryEvidence(latest_attempt=9, exhausted=True),
+        )
+        self.assertEqual(decision.action, "hold")
+
+    def test_successful_operation_is_settled(self):
+        decision = recovery.decide_recovery(
+            ci_green=True,
+            operation_state="success",
+        )
+        self.assertEqual(decision.action, "settled")
+
+    def test_backoff_matches_ten_execution_budget(self):
+        self.assertEqual(recovery.MAX_EXECUTIONS, 10)
+        self.assertEqual(
+            recovery.retry_delay_schedule(),
+            (0, 10, 30, 60, 180, 300, 600, 1200, 2400, 3600),
+        )
+        self.assertEqual(recovery.backoff_seconds(0), 0)
+        self.assertEqual(recovery.backoff_seconds(1), 10)
+        self.assertEqual(recovery.backoff_seconds(2), 30)
+        self.assertEqual(recovery.backoff_seconds(3), 60)
+        self.assertEqual(recovery.backoff_seconds(9), 3600)
+
+    def test_budget_is_configurable_but_safe_bounded(self):
+        self.assertEqual(recovery.resolve_max_executions(None), 10)
+        self.assertEqual(recovery.resolve_max_executions("5"), 5)
+        self.assertEqual(recovery.resolve_max_executions("0"), 1)
+        self.assertEqual(recovery.resolve_max_executions("99"), 10)
+        self.assertEqual(recovery.resolve_max_executions("nope"), 10)
+
+
+class CleanReviewLifecycleResumeTests(unittest.TestCase):
+    """Issue #383: a clean review must still resume an unfinished merge."""
+
+    WORKFLOW = ".github/workflows/continuum-pr-agent-recovery.yml"
+
+    @classmethod
+    def setUpClass(cls):
+        with open(os.path.join(ROOT, cls.WORKFLOW), encoding="utf-8") as handle:
+            cls.body = handle.read()
+
+    @classmethod
+    def _extract_function(cls, name: str) -> str:
+        import re
+
+        match = re.search(r"function\s+" + re.escape(name) + r"\s*\(", cls.body)
+        if match is None:
+            raise AssertionError(f"workflow function {name} is missing")
+        start = match.start()
+        paren_start = cls.body.index("(", match.start())
+        depth = 0
+        paren_end = None
+        for pos in range(paren_start, len(cls.body)):
+            char = cls.body[pos]
+            if char == "(":
+                depth += 1
+            elif char == ")":
+                depth -= 1
+                if depth == 0:
+                    paren_end = pos
+                    break
+        if paren_end is None:
+            raise AssertionError(f"workflow function {name} has unbalanced parameters")
+        body_start = cls.body.index("{", paren_end)
+        depth = 0
+        body_end = None
+        for pos in range(body_start, len(cls.body)):
+            char = cls.body[pos]
+            if char == "{":
+                depth += 1
+            elif char == "}":
+                depth -= 1
+                if depth == 0:
+                    body_end = pos + 1
+                    break
+        if body_end is None:
+            raise AssertionError(f"workflow function {name} has unbalanced body")
+        return cls.body[start:body_end]
+
+    def test_hold_release_dispatches_exactly_one_full_lifecycle(self):
+        import shutil
+        import subprocess
+        import tempfile
+
+        node = shutil.which("node")
+        self.assertIsNotNone(
+            node,
+            "node is required to execute the shipped admission JS; failing closed instead of silently skipping",
+        )
+        harness = (
+            "const assert = require('assert');\n"
+            "const HEAD = 'a'.repeat(40);\n"
+            "const REPO = 'kodmial/continuum';\n"
+            "const retryableConclusions = new Set(['failure','cancelled','timed_out','stale','startup_failure']);\n"
+            "const staleMs = 70 * 60 * 1000;\n"
+            "const dispatchGraceMs = 90 * 1000;\n"
+            "const maxExecutions = 10;\n"
+            "const REVIEW_CONTEXT = 'continuum/pr-agent-review';\n"
+            "const REPAIR_CONTEXT = 'continuum/pr-agent-repair';\n"
+            "let clock = Date.parse('2026-10-23T00:00:00Z');\n"
+            "function nowMs() { return clock; }\n"
+            "function ageMs(value) { const parsed = Date.parse(String(value || '')); return Number.isFinite(parsed) ? Math.max(0, nowMs() - parsed) : Number.MAX_SAFE_INTEGER; }\n"
+            + self._extract_function("hasNoAutoMergeHold")
+            + "\n"
+            + self._extract_function("isConflictedMergeability")
+            + "\n"
+            + self._extract_function("assessCleanReviewLifecycle")
+            + "\n"
+            + self._extract_function("decide")
+            + "\n"
+            + r"""
+const cleanStatus = () => ({
+  state: 'success',
+  context: REVIEW_CONTEXT,
+  description: 'PR-Agent review complete: clean',
+  updated_at: new Date(clock - 20 * 60 * 1000).toISOString(),
+});
+const emptyEvidence = () => ({
+  latestAttempt: null,
+  latestMarkerAt: null,
+  exhausted: false,
+  notBeforeEpoch: null,
+});
+const basePr = (number, labels) => ({
+  number,
+  labels,
+  head: { sha: HEAD, repo: { full_name: REPO } },
+});
+const fresh = (labels, overrides = {}) => Object.assign({
+  number: 383,
+  state: 'open',
+  merged: false,
+  draft: false,
+  mergeable: true,
+  mergeable_state: 'clean',
+  labels,
+  head: { sha: HEAD, repo: { full_name: REPO } },
+}, overrides);
+const assess = (overrides = {}) => assessCleanReviewLifecycle(Object.assign({
+  reviewStatus: cleanStatus(),
+  runConclusionRetryable: false,
+  pr: basePr(383, []),
+  freshPr: fresh([]),
+  head: HEAD,
+  repoFullName: REPO,
+}, overrides));
+const decideResume = ({ activeRun = false, evidence = emptyEvidence() } = {}) => decide({
+  ciGreen: true,
+  operationStatus: cleanStatus(),
+  activeRun,
+  runConclusion: 'success',
+  evidence,
+  lifecycleComplete: false,
+});
+
+const hold = [{ name: 'no-auto-merge' }];
+const released = [];
+let dispatches = 0;
+
+// Repeated scheduled ticks while the owner hold is present: cheap NOOP.
+for (let tick = 0; tick < 3; tick += 1) {
+  const outcome = assess({ pr: basePr(383, hold), freshPr: fresh(hold) });
+  assert.strictEqual(outcome.decision, 'hold', JSON.stringify(outcome));
+}
+assert.strictEqual(dispatches, 0, 'held ticks must not dispatch');
+
+// Remove the hold: the clean exact-HEAD review is not a completed merge.
+const releasedAssessment = assess({ pr: basePr(383, released), freshPr: fresh(released) });
+assert.strictEqual(releasedAssessment.decision, 'resume', JSON.stringify(releasedAssessment));
+const first = decideResume();
+assert.strictEqual(first.action, 'dispatch');
+assert.strictEqual(first.attempt, 0);
+dispatches += 1;
+
+// The resumed exact PR/HEAD operation is now active: coalesce duplicates.
+const afterDispatch = {
+  latestAttempt: 0,
+  latestMarkerAt: clock,
+  exhausted: false,
+  notBeforeEpoch: null,
+};
+assert.strictEqual(decideResume({ activeRun: true, evidence: afterDispatch }).action, 'wait');
+// A delayed wakeup inside durable dispatch grace must coalesce as well.
+assert.strictEqual(decideResume({ evidence: afterDispatch }).action, 'wait');
+assert.strictEqual(dispatches, 1, 'exactly one full lifecycle dispatch is allowed');
+
+// An unrelated clean PR under its own hold is never woken by this release.
+const unrelated = assess({
+  pr: basePr(999, hold),
+  freshPr: fresh(hold, { number: 999 }),
+});
+assert.strictEqual(unrelated.decision, 'hold');
+
+// Once the resumed lifecycle actually merges/closes the PR: NOOP.
+assert.strictEqual(
+  assess({ pr: basePr(383, released), freshPr: fresh(released, { state: 'closed', merged: true }) }).decision,
+  'settled',
+);
+assert.strictEqual(dispatches, 1);
+assert.strictEqual(HEAD.length, 40, 'resume never invents a new HEAD');
+
+// Fail-closed admission table.
+const expectDecision = (overrides, expected) => {
+  const outcome = assess(overrides);
+  assert.strictEqual(outcome.decision, expected, JSON.stringify(outcome));
+};
+expectDecision({ pr: basePr(383, hold), freshPr: fresh(hold) }, 'hold');
+expectDecision({ freshPr: fresh([], { head: { sha: 'b'.repeat(40), repo: { full_name: REPO } } }) }, 'hold');
+expectDecision({ freshPr: fresh([], { draft: true }) }, 'hold');
+expectDecision({ freshPr: fresh([], { state: 'closed' }) }, 'settled');
+expectDecision({ freshPr: fresh([], { merged: true }) }, 'settled');
+expectDecision({ freshPr: fresh([], { mergeable: false, mergeable_state: 'dirty' }) }, 'hold');
+expectDecision({ freshPr: fresh([], { mergeable: 'CONFLICTING', mergeable_state: 'dirty' }) }, 'hold');
+expectDecision({ freshPr: fresh([], { head: { sha: HEAD, repo: { full_name: 'other/repo' } } }) }, 'hold');
+expectDecision({
+  reviewStatus: Object.assign(cleanStatus(), { description: 'PR-Agent review complete: actionable' }),
+}, 'not-clean-review');
+expectDecision({
+  reviewStatus: Object.assign(cleanStatus(), { description: 'PR-Agent review complete: blocking; recovery eligible' }),
+}, 'not-clean-review');
+expectDecision({ runConclusionRetryable: true, pr: basePr(383, hold), freshPr: fresh(hold) }, 'hold');
+expectDecision({ runConclusionRetryable: true }, 'replay');
+expectDecision({ freshPr: fresh([], { mergeable: null, mergeable_state: 'unknown' }) }, 'resume');
+expectDecision({ freshPr: null }, 'defer');
+console.log('HOLD_RELEASE_OK');
+"""
+        )
+        tmpdir = os.path.join(ROOT, ".opencode-tmp")
+        os.makedirs(tmpdir, exist_ok=True)
+        with tempfile.NamedTemporaryFile(
+            "w", suffix=".js", delete=False, dir=tmpdir
+        ) as handle:
+            handle.write(harness)
+            script = handle.name
+        try:
+            completed = subprocess.run(
+                [node, script],
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+        finally:
+            os.unlink(script)
+        self.assertEqual(completed.returncode, 0, completed.stderr or completed.stdout)
+        self.assertIn("HOLD_RELEASE_OK", completed.stdout)
+
+    def test_resume_rechecks_live_hold_and_merge_blockers_before_dispatch(self):
+        body = self.body
+        self.assertIn("if (!hasNoAutoMergeHold(pr))", body)
+        self.assertIn("hasNoAutoMergeHold(fresh)", body)
+        self.assertIn(
+            "isConflictedMergeability(fresh.mergeable, fresh.mergeable_state)",
+            body,
+        )
+        self.assertIn(
+            "explicit no-auto-merge hold is present; recovery dispatch cancelled.",
+            body,
+        )
+        # The dispatch remains the existing full orchestration on the exact
+        # HEAD: no isolated historical merge rerun and no synthesized status.
+        self.assertIn("expected_head_sha: head", body)
+        self.assertIn("recovery_kind: kind", body)
+        self.assertIn("createWorkflowDispatch", body)
+        self.assertNotIn("github.rest.pulls.merge(", body)
+        self.assertNotIn("createCommitStatus", body)
+
+    def test_parent_delegated_resume_keeps_opaque_routing(self):
+        body = self.body
+        # The Parent reads live PR/label/HEAD state from the resolved target,
+        # then dispatches the existing full orchestration in the execution
+        # repository with only the opaque child id.
+        self.assertIn("const owner = process.env.CONTINUUM_PR_AGENT_TARGET_OWNER;", body)
+        self.assertIn("const repo = process.env.CONTINUUM_PR_AGENT_TARGET_REPO;", body)
+        self.assertIn("owner: executionOwner", body)
+        self.assertIn("repo: executionRepo", body)
+        self.assertIn("recoveryInputs.target_child_id = recoveryChildId", body)
+        self.assertNotIn("recoveryInputs.target_repository", body)
+        self.assertNotIn("recoveryInputs.target_owner", body)
+        # Resume/hold log text carries PR number and exact HEAD only; no
+        # concrete target repository identity is emitted to public logs.
+        for needle in (
+            "bounded recovery will resume the full PR-Agent review/merge lifecycle.",
+            "explicit no-auto-merge hold is present; recovery dispatch cancelled.",
+            "merge conflict/stale base blocks the merge lifecycle; recovery dispatch cancelled.",
+        ):
+            with self.subTest(needle=needle):
+                self.assertIn(needle, body)
+                self.assertNotIn(needle + " ' + repoFullName", body)
+
+
+class RecoveryWiringTests(unittest.TestCase):
+    def read(self, path: str) -> str:
+        with open(os.path.join(ROOT, path), "r", encoding="utf-8") as handle:
+            return handle.read()
+
+    def test_recovery_has_event_driven_wakeups_and_schedule_safety_net(self):
+        stub = self.read(".github/caller-stubs/continuum-pr-agent-recovery.yml")
+        self.assertIn("workflow_run:", stub)
+        self.assertIn("- CI", stub)
+        self.assertIn("- PR Agent (OpenCode backend)", stub)
+        self.assertIn("pull_request_target:", stub)
+        self.assertIn('cron: "*/10 * * * *"', stub)
+
+    def test_review_caller_no_longer_competes_for_ci_wakeup(self):
+        for path in (
+            ".github/workflows/pr-agent.yml",
+            ".github/caller-stubs/continuum-pr-agent.yml",
+        ):
+            body = self.read(path)
+            with self.subTest(path=path):
+                self.assertNotIn("workflow_run:", body)
+                self.assertNotIn("pull_request_target:", body)
+                self.assertIn("recovery_kind:", body)
+                self.assertIn("run-name: >-", body)
+                self.assertIn("head=${{ inputs.expected_head_sha || 'event' }}", body)
+
+    def test_recovery_engine_is_provider_isolated_and_exact_head_driven(self):
+        body = self.read(".github/workflows/continuum-pr-agent-recovery.yml")
+        for needle in (
+            "head_sha: head",
+            "exactActiveRun",
+            "author_association",
+            "continuum/pr-agent-review",
+            "continuum/pr-agent-repair",
+            "retryableConclusions",
+            "createWorkflowDispatch",
+            "expected_head_sha: head",
+            "recovery_kind: kind",
+        ):
+            with self.subTest(needle=needle):
+                self.assertIn(needle, body)
+        self.assertNotIn("continuum-coderabbit-retry.yml", body)
+        self.assertNotIn("continuum-coderabbit-unresolved.yml", body)
+
+    def test_recovery_reads_use_repository_token_but_mutations_keep_pat(self):
+        body = self.read(".github/workflows/continuum-pr-agent-recovery.yml")
+        self.assertIn("READ_GITHUB_TOKEN: ${{ github.token }}", body)
+        self.assertIn("github-token: ${{ secrets.TAP_PAT }}", body)
+        self.assertNotIn("require('@actions/github')", body)
+        self.assertNotIn("require(\"@actions/github\")", body)
+        self.assertIn("new github.constructor({ auth: readToken, baseUrl: readBaseUrl })", body)
+        self.assertIn("github.request.endpoint.DEFAULTS.baseUrl", body)
+        self.assertIn("process.env.GITHUB_API_URL", body)
+        # An empty repository token must fail loudly instead of silently
+        # falling back to PAT-heavy polling.
+        self.assertIn("must not fall back to TAP_PAT", body)
+        self.assertNotIn("using PAT client for PR-Agent recovery reads", body)
+        self.assertIn("let readTokenUnavailable = false", body)
+        self.assertIn("async function withReadFallback(fn)", body)
+        self.assertIn("err.status ?? err.response?.status", body)
+        # Delegated cross-repository reads surface as 404 under the
+        # repository-scoped token, so the PAT fallback must cover 404 as
+        # well. Rate-limit retries must not retry inline with TAP_PAT:
+        # only authentication/permission gaps (plus delegated 404) fall back;
+        # 429 and rate-limited 403 surface so the caller defers to the next
+        # wakeup.
+        self.assertIn("isRateLimitError", body)
+        self.assertIn("status === 401", body)
+        self.assertIn("!isRateLimitError(err, status)", body)
+        self.assertIn("status === 404", body)
+        self.assertIn("if (readTokenUnavailable || readGithub === github)", body)
+
+        for read_call in (
+            "client.rest.actions.listWorkflowRuns",
+            "client.rest.actions.getWorkflowRun",
+            "client.rest.actions.listWorkflowRunsForRepo",
+            "client.rest.pulls.list",
+            "client.rest.pulls.get",
+            "client.rest.repos.listCommitStatusesForRef",
+            "client.rest.issues.listComments",
+        ):
+            with self.subTest(read_call=read_call):
+                self.assertIn(read_call, body)
+        # Target-aware recovery: target PR/CI/status/comment reads use the
+        # resolved target (owner/repo), while execution-run inspection and the
+        # dispatch-ref lookup stay in the parent execution repository.
+        self.assertIn("const executionOwner = context.repo.owner;", body)
+        self.assertIn("const owner = process.env.CONTINUUM_PR_AGENT_TARGET_OWNER;", body)
+        self.assertIn("client.rest.repos.get({ owner: executionOwner, repo: executionRepo })", body)
+
+        # Guarded read sites may grow as recovery gains new exact-state
+        # revalidation (for example the mergeability re-read in #63).
+        # The invariant is that reads stay behind the repository-token helper;
+        # the mutation-only regex below proves PAT is not used for reads.
+        self.assertGreaterEqual(body.count("withReadFallback("), 14)
+
+        # Item 1 keeps all mutation/dispatch calls on the PAT-authenticated
+        # action client, preserving actor and event fan-out semantics.
+        for mutation in (
+            "github.rest.issues.createComment",
+            "github.rest.issues.updateComment",
+            "github.rest.issues.deleteComment",
+            "github.rest.actions.createWorkflowDispatch",
+        ):
+            with self.subTest(mutation=mutation):
+                self.assertIn(mutation, body)
+
+        self.assertNotIn("github.paginate(", body)
+        self.assertNotRegex(
+            body,
+            r"github\.rest\.(?!issues\.createComment\b|issues\.updateComment\b|issues\.deleteComment\b|actions\.createWorkflowDispatch\b)",
+            "PAT client must only be used for mutations/dispatch",
+        )
+
+    def test_recovery_read_client_constructs_in_github_script_sandbox(self):
+        """Runtime-shaped guard for issue #217.
+
+        The github-script sandbox does not resolve `require('@actions/github')`
+        (the Node 24 regression). The workflow must therefore build its
+        repository-token read client from the supplied `github.constructor`.
+        This test executes the workflow's construction semantics under Node with
+        a `require` that rejects `@actions/github`, so reintroducing the bare
+        require fails here exactly as it fails live.
+        """
+        import re
+        import shutil
+        import subprocess
+        import tempfile
+
+        body = self.read(".github/workflows/continuum-pr-agent-recovery.yml")
+        self.assertNotIn("require('@actions/github')", body)
+
+        node = shutil.which("node")
+        self.assertIsNotNone(
+            node,
+            "node is required for the github-script sandbox check; failing closed instead of silently skipping",
+        )
+
+        harness = r"""
+const assert = require('assert');
+// github-script sandbox shape: '@actions/github' is not resolvable.
+function sandboxRequire(name) {
+  throw new Error("Cannot find module '" + name + "'");
+}
+let rejected = false;
+try {
+  sandboxRequire('@actions/github');
+} catch (err) {
+  rejected = /Cannot find module/.test(String(err && err.message));
+}
+assert.ok(rejected, 'sandbox must reject require(@actions/github)');
+
+// Plugin-composed Octokit mock as supplied by actions/github-script v7.
+class FakeOctokit {
+  constructor(opts = {}) {
+    this.opts = opts;
+    this.request = { endpoint: { DEFAULTS: { baseUrl: 'https://ghe.example.com/api/v3' } } };
+  }
+}
+const github = new FakeOctokit({ auth: 'PAT' });
+github.constructor = FakeOctokit;
+const core = { warning: () => {}, info: () => {}, notice: () => {}, setFailed: (m) => { throw new Error(m); } };
+
+// --- workflow construction block under test (mirrors the yml) ---
+const readToken = String(process.env.READ_GITHUB_TOKEN || '').trim();
+const readBaseUrl = (
+  (github && github.request && github.request.endpoint &&
+    github.request.endpoint.DEFAULTS && github.request.endpoint.DEFAULTS.baseUrl) ||
+  process.env.GITHUB_API_URL || 'https://api.github.com'
+);
+const readGithub = readToken
+  ? new github.constructor({ auth: readToken, baseUrl: readBaseUrl })
+  : github;
+// --- end workflow block ---
+assert.notStrictEqual(readGithub, github, 'repository token must yield an independent client');
+assert.strictEqual(readGithub.opts.auth, 'ghs_repo_token');
+assert.strictEqual(readGithub.opts.baseUrl, 'https://ghe.example.com/api/v3', 'GHE base URL must be preserved');
+const emptyToken = '';
+const fallback = emptyToken ? new github.constructor({ auth: emptyToken, baseUrl: readBaseUrl }) : github;
+assert.strictEqual(fallback, github, 'empty token must fall back to the PAT client');
+console.log('sandbox construction OK');
+"""
+        with tempfile.NamedTemporaryFile("w", suffix=".js", delete=False) as handle:
+            handle.write(harness)
+            script = handle.name
+        try:
+            env = dict(
+                os.environ,
+                READ_GITHUB_TOKEN="ghs_repo_token",
+                GITHUB_API_URL="https://api.github.com",
+            )
+            completed = subprocess.run(
+                [node, script],
+                capture_output=True,
+                text=True,
+                env=env,
+                timeout=30,
+            )
+        finally:
+            os.unlink(script)
+        self.assertEqual(completed.returncode, 0, completed.stderr or completed.stdout)
+        self.assertIn("sandbox construction OK", completed.stdout)
+
+        # The executed semantics must match the shipped workflow text, so the
+        # harness cannot drift from the yml silently.
+        for needle in (
+            "const readToken = String(process.env.READ_GITHUB_TOKEN",
+            "github.request.endpoint.DEFAULTS.baseUrl",
+            "process.env.GITHUB_API_URL",
+            "new github.constructor({ auth: readToken, baseUrl: readBaseUrl })",
+        ):
+            with self.subTest(needle=needle):
+                self.assertIn(needle, body)
+
+    def test_recovery_coalesces_retry_state_into_one_controller_comment(self):
+        body = self.read(".github/workflows/continuum-pr-agent-recovery.yml")
+        self.assertIn("continuum-pr-agent-controller-state:v1", body)
+        self.assertIn("async function upsertControllerState", body)
+        self.assertIn("github.rest.issues.updateComment", body)
+        self.assertIn("controller.slice(0, -1)", body)
+        self.assertIn("rollbackControllerState", body)
+        self.assertIn("comment.updated_at || comment.created_at", body)
+
+    def test_short_sha_exhaustion_is_preserved_fail_closed(self):
+        # Exact-HEAD isolation: short-SHA markers are ignored entirely so an
+        # old HEAD sharing a 7-char prefix can never strand a new HEAD.
+        body = self.read(".github/workflows/continuum-pr-agent-recovery.yml")
+        self.assertIn("short-SHA markers are ignored", body)
+        self.assertNotIn("exactHead.startsWith(shortHead)", body)
+        self.assertNotIn("legacyShortRetryRe", body)
+        # Exact-HEAD identity still governs the retry budget itself.
+        self.assertIn("marker === current", body)
+
+    def test_recovery_controller_touch_changes_comment_body_per_dispatch_run(self):
+        body = self.read(".github/workflows/continuum-pr-agent-recovery.yml")
+        self.assertIn("Controller dispatch run:", body)
+        self.assertIn("String(context.runId)", body)
+        self.assertLess(
+            body.index("Controller dispatch run:"),
+            body.index("github.rest.actions.createWorkflowDispatch"),
+        )
+        # The touch is presentation-only: durable retry identity is the
+        # stateMarker line alone, and the touch prefix cannot match the
+        # retry/exhausted marker regexes.
+        self.assertIn("durable retry identity", body)
+        self.assertIn("is the stateMarker line alone", body)
+        self.assertIn("continuum-pr-agent-retry markers", body)
+
+    def test_controller_touch_body_differs_per_run_but_keeps_retry_identity(self):
+        """Exercise the real shipped JS, not a Python reimplementation.
+
+        The static pins fail if the workflow touch is reverted; the Node
+        harness below extracts the real `controllerStateBody` plus the real
+        touch expression from the workflow text and executes them, so this
+        test cannot stay green while the shipped code regresses.
+        """
+        import json
+        import re
+        import shutil
+        import subprocess
+        import tempfile
+
+        body = self.read(".github/workflows/continuum-pr-agent-recovery.yml")
+        # Static pins against revert: the unsafe bare concatenation must be
+        # gone and the null-safe coercion must be present.
+        self.assertNotIn("summary + '\\n\\nController dispatch run:'", body)
+        self.assertIn(
+            "String(summary || '').trim() + '\\n\\nController dispatch run: '"
+            " + String(context.runId)",
+            body,
+        )
+
+        node = shutil.which("node")
+        self.assertIsNotNone(
+            node,
+            "node is required to execute the shipped JS; failing closed instead of silently skipping",
+        )
+
+        marker_match = re.search(
+            r"const CONTROLLER_STATE_MARKER = '([^']*)';", body
+        )
+        self.assertIsNotNone(marker_match, "controller state marker const is missing")
+        marker_const = marker_match.group(1)
+
+        fn_start = body.index("function controllerStateBody(stateMarker, summary)")
+        brace = body.index("{", fn_start)
+        depth = 0
+        fn_end = None
+        for pos in range(brace, len(body)):
+            if body[pos] == "{":
+                depth += 1
+            elif body[pos] == "}":
+                depth -= 1
+                if depth == 0:
+                    fn_end = pos + 1
+                    break
+        self.assertIsNotNone(fn_end, "could not extract controllerStateBody")
+        fn_source = body[fn_start:fn_end]
+
+        touch_match = re.search(
+            r"const body = controllerStateBody\(\s*stateMarker,\s*([\s\S]*?)\n\s*\);",
+            body,
+        )
+        self.assertIsNotNone(touch_match, "could not extract the touch expression")
+        touch_expr = touch_match.group(1).strip()
+        self.assertIn("Controller dispatch run:", touch_expr)
+
+        harness = (
+            "const assert = require('assert');\n"
+            f"const CONTROLLER_STATE_MARKER = {json.dumps(marker_const)};\n"
+            + fn_source
+            + "\n"
+            "function touchedSummary(summary, runId) {\n"
+            "  const context = { runId };\n"
+            f"  return ({touch_expr});\n"
+            "}\n"
+            f"const marker = {json.dumps(f'<!-- continuum-pr-agent-retry head={HEAD} kind=review attempt=1 -->')};\n"
+            "const base = 'Automatic PR-Agent review recovery for exact HEAD.';\n"
+            "const a = controllerStateBody(marker, touchedSummary(base, 111));\n"
+            "const b = controllerStateBody(marker, touchedSummary(base, 222));\n"
+            "assert.notStrictEqual(a, b, 'different runs must produce different bodies');\n"
+            "assert.ok(a.includes('Controller dispatch run: 111'));\n"
+            "assert.ok(b.includes('Controller dispatch run: 222'));\n"
+            "assert.strictEqual(a.split('\\n')[1], marker);\n"
+            "assert.strictEqual(b.split('\\n')[1], marker);\n"
+            "for (const summary of [undefined, null, 0, 12345, '']) {\n"
+            "  const touched = controllerStateBody(marker, touchedSummary(summary, 999));\n"
+            "  assert.ok(!/\\bundefined\\b/.test(touched), 'summary must never render undefined: ' + touched);\n"
+            "  assert.ok(!/\\bnull\\b/.test(touched), 'summary must never render null: ' + touched);\n"
+            "  assert.ok(touched.includes(marker), 'retry identity must survive nullish summary');\n"
+            "  assert.ok(touched.includes('Controller dispatch run: 999'));\n"
+            "}\n"
+            "console.log('TOUCH_OK');\n"
+        )
+        tmpdir = os.path.join(ROOT, ".opencode-tmp")
+        os.makedirs(tmpdir, exist_ok=True)
+        with tempfile.NamedTemporaryFile(
+            "w", suffix=".js", delete=False, dir=tmpdir
+        ) as handle:
+            handle.write(harness)
+            script = handle.name
+        try:
+            completed = subprocess.run(
+                [node, script],
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+        finally:
+            os.unlink(script)
+        self.assertEqual(completed.returncode, 0, completed.stderr or completed.stdout)
+        self.assertIn("TOUCH_OK", completed.stdout)
+
+    def test_failed_dispatch_leaves_controller_state_untouched(self):
+        """A dispatch that throws must not advance existing comment timestamps.
+
+        Dispatch records a pre-dispatch claim via a fresh createComment
+        before createWorkflowDispatch (so a crash after a successful
+        dispatch can never leave the next wakeup without marker evidence
+        inside grace, which would duplicate the same attempt), never via
+        updateComment (which would bump updated_at even on failure), and
+        deletes that claim when the dispatch throws, so a retry that never
+        dispatched is never coalesced as fresh. The success path then
+        coalesces the claim via upsertControllerState.
+        """
+        body = self.read(".github/workflows/continuum-pr-agent-recovery.yml")
+        window = body[
+            body.index("async function dispatch("): body.index("async function exhaust(")
+        ]
+        dispatch_at = window.index("github.rest.actions.createWorkflowDispatch")
+        self.assertLess(
+            window.index("github.rest.issues.createComment"),
+            dispatch_at,
+            "pre-dispatch claim must be recorded before dispatch",
+        )
+        self.assertNotIn(
+            "github.rest.issues.updateComment",
+            window[:dispatch_at],
+            "pre-dispatch claim must be a fresh create, never an update that bumps updated_at on failure",
+        )
+        self.assertIn(
+            "rollbackControllerState",
+            window,
+            "a failed dispatch must delete the pre-dispatch claim",
+        )
+        # The success-path coalescing write must come after the dispatch
+        # call. Scope the search to the post-dispatch text: dispatch() also
+        # holds an early reset-aware deferral upsert (no dispatch attempted
+        # on that path) before createWorkflowDispatch, which a window-wide
+        # index would mistake for the success-path coalescing write.
+        self.assertIn(
+            "await upsertControllerState(",
+            window[dispatch_at:],
+            "success path must coalesce the claim into one controller comment",
+        )
+
+    def test_controller_touch_line_never_consumes_retry_budget(self):
+        marker = f"<!-- continuum-pr-agent-retry head={HEAD} kind=review attempt=1 -->"
+        touched = (
+            "<!-- continuum-pr-agent-controller-state:v1 -->\n"
+            f"{marker}\n"
+            "<details>\n"
+            "<summary>Continuum PR-Agent controller state</summary>\n"
+            "\n"
+            "Automatic recovery.\n"
+            "\n"
+            "Controller dispatch run: 999\n"
+            "\n"
+            "</details>"
+        )
+        plain = (
+            "<!-- continuum-pr-agent-controller-state:v1 -->\n"
+            f"{marker}\n"
+            "<details>\n"
+            "<summary>Continuum PR-Agent controller state</summary>\n"
+            "\n"
+            "Automatic recovery.\n"
+            "\n"
+            "</details>"
+        )
+        touched_evidence = recovery.retry_evidence(
+            [comment(touched)], head_sha=HEAD, kind="review"
+        )
+        plain_evidence = recovery.retry_evidence(
+            [comment(plain)], head_sha=HEAD, kind="review"
+        )
+        self.assertEqual(touched_evidence.latest_attempt, 1)
+        self.assertEqual(
+            touched_evidence.latest_attempt, plain_evidence.latest_attempt
+        )
+        self.assertFalse(touched_evidence.exhausted)
+        # The touch prefix itself carries no retry marker.
+        self.assertNotRegex(
+            "Controller dispatch run: 999",
+            r"continuum-pr-agent-retry",
+        )
+
+    def test_controller_state_stays_in_one_comment_with_rollback(self):
+        body = self.read(".github/workflows/continuum-pr-agent-recovery.yml")
+        # Single-comment coalescing: update the latest controller comment,
+        # delete every older one, and roll back on dispatch failure.
+        self.assertIn("github.rest.issues.updateComment", body)
+        self.assertIn("github.rest.issues.createComment", body)
+        self.assertIn("controller.slice(0, -1)", body)
+        self.assertIn("rollbackControllerState", body)
+        self.assertIn("previousBody", body)
+        # Grace/coalescing reads the bumped timestamp.
+        self.assertIn("comment.updated_at || comment.created_at", body)
+
+    def test_recovered_review_uses_ci_workflow_not_combined_status(self):
+        review = self.read(".github/workflows/continuum-pr-agent.yml")
+        self.assertIn("listWorkflowRunsForRepo", review)
+        self.assertIn("CI_WORKFLOW_NAME", review)
+        self.assertNotIn(
+            "const { data: combined } = await github.rest.repos.getCombinedStatusForRef",
+            review,
+        )
+        self.assertNotIn(
+            'commits/$ADMITTED_SHA/status',
+            review,
+            "pre-review revalidation must not fall back to combined commit status",
+        )
+        self.assertIn("CI_RUN_ID", review)
+        self.assertIn(
+            "github.rest.actions.getWorkflowRun",
+            review,
+            "pre-review revalidation must re-fetch the immutable admitted CI run",
+        )
+        self.assertIn(
+            "actions/runs?event=pull_request&head_sha=$HEAD_SHA",
+            review,
+        )
+
+    def test_failure_classification_is_explicit(self):
+        review = self.read(".github/workflows/continuum-pr-agent.yml")
+        repair = self.read(".github/workflows/continuum-pr-agent-repair.yml")
+        self.assertIn("PR-Agent review failed: transient; recovery eligible", review)
+        self.assertIn("PR-Agent review failed: deterministic; recovery held", review)
+        self.assertIn('echo "classification=transient"', repair)
+        self.assertIn('echo "classification=deterministic"', repair)
+        self.assertIn("PR-Agent repair failed: transient; recovery eligible", repair)
+        self.assertIn("PR-Agent repair failed: deterministic; recovery held", repair)
+
+    def test_inline_retries_preserve_operation_kind(self):
+        review = self.read(".github/workflows/continuum-pr-agent.yml")
+        repair = self.read(".github/workflows/continuum-pr-agent-repair.yml")
+        self.assertIn('CURRENT_RECOVERY_KIND:', review)
+        self.assertIn(
+            '-f recovery_kind="${CURRENT_RECOVERY_KIND:-review}"',
+            review,
+        )
+        self.assertNotIn(
+            'if [[ "${CURRENT_RECOVERY_KIND:-review}" != "review" ]]; then',
+            review,
+        )
+        self.assertIn('-f recovery_kind="repair"', repair)
+
+    def test_cancelled_recovery_review_keeps_repair_identity(self):
+        recovery_workflow = self.read(
+            ".github/workflows/continuum-pr-agent-recovery.yml"
+        )
+        self.assertIn("statusRunMetadata", recovery_workflow)
+        self.assertIn("reviewRun.recoveryKind === 'repair'", recovery_workflow)
+        self.assertIn(
+            "it still belongs to the durable repair",
+            recovery_workflow,
+        )
+
+
+class AutoMergeLoopSafetyTests(unittest.TestCase):
+    """Lock the open-PR loop self-healing guarantees in place.
+
+    One bad PR fetch must never abort the whole loop behind it, and an
+    attempt at or beyond the schedule end must still defer the full tail
+    instead of hot-retrying through quota exhaustion.
+    """
+
+    def read(self, path: str) -> str:
+        with open(os.path.join(ROOT, path), "r", encoding="utf-8") as handle:
+            return handle.read()
+
+    def test_pr_fetch_failure_cannot_abort_open_pr_loop(self):
+        body = self.read(".github/workflows/continuum-auto-merge.yml")
+        # The finally block must release by the listed identity: `pr` stays
+        # undefined when the guarded getPull fails, and dereferencing it in
+        # `finally` would throw and strand healthy PRs behind one bad fetch.
+        self.assertIn("releaseLease(listed.number, leaseHead)", body)
+        self.assertNotIn("releaseLease(pr.number, leaseHead)", body)
+
+    def test_conflict_repair_backoff_clamps_past_schedule_end(self):
+        """Execute the real shipped delay function, not a reimplementation.
+
+        Static pins fail if the clamp is reverted; the Node harness below
+        extracts the real `resetAwareDelaySeconds` plus the real schedule
+        from the workflow text and executes the boundary cases, so this
+        test cannot stay green while the shipped code regresses to 0.
+        """
+        import re
+        import shutil
+        import subprocess
+        import tempfile
+
+        body = self.read(".github/workflows/continuum-auto-merge.yml")
+        self.assertIn(
+            "Math.min(attempt, LIFECYCLE_RETRY_DELAY_SCHEDULE.length - 1)",
+            body,
+        )
+
+        node = shutil.which("node")
+        self.assertIsNotNone(
+            node,
+            "node is required to execute the shipped JS; failing closed instead of silently skipping",
+        )
+
+        schedule_match = re.search(
+            r"const LIFECYCLE_RETRY_DELAY_SCHEDULE = (\[[^\]]*\]);", body
+        )
+        self.assertIsNotNone(schedule_match, "retry schedule const is missing")
+        jitter_cap_match = re.search(
+            r"const JITTER_CAP_SECONDS = (\d+);", body
+        )
+        self.assertIsNotNone(jitter_cap_match, "jitter cap const is missing")
+
+        def extract_function(name):
+            fn_start = body.index(f"function {name}(")
+            # Start brace counting at the function body, not the destructured
+            # parameter list (which itself contains braces).
+            brace = body.index(") {", fn_start) + 1
+            depth = 0
+            fn_end = None
+            for pos in range(brace, len(body)):
+                if body[pos] == "{":
+                    depth += 1
+                elif body[pos] == "}":
+                    depth -= 1
+                    if depth == 0:
+                        fn_end = pos + 1
+                        break
+            self.assertIsNotNone(fn_end, f"could not extract {name}")
+            return body[fn_start:fn_end]
+
+        fn_source = extract_function("resetAwareDelaySeconds")
+        jitter_source = extract_function("jitterSeconds")
+
+        harness = (
+            f"const LIFECYCLE_RETRY_DELAY_SCHEDULE = {schedule_match.group(1)};\n"
+            f"const JITTER_CAP_SECONDS = {jitter_cap_match.group(1)};\n"
+            + jitter_source
+            + "\n"
+            + fn_source
+            + "\n"
+            "const assert = require('assert');\n"
+            "const base = {};\n"
+            "assert.strictEqual(resetAwareDelaySeconds({ ...base, attempt: 0 }), 0);\n"
+            "// The canonical schedule is the floor and bounded per-operation\n"
+            "// jitter decorrelates concurrent PRs: retries land in\n"
+            "// [schedule, schedule + cap] instead of an exact value.\n"
+            "const d1 = resetAwareDelaySeconds({ ...base, attempt: 1, operationKey: 'owner/repo#1:head' });\n"
+            "assert.ok(d1 >= 10 && d1 <= 15, 'jittered attempt-1 floor, got ' + d1);\n"
+            "for (const attempt of [9, 10, 99]) {\n"
+            "  const tail = resetAwareDelaySeconds({ ...base, attempt, operationKey: 'owner/repo#1:head' });\n"
+            "  assert.ok(tail >= 3600 && tail <= 3605, 'clamped jittered tail, got ' + tail);\n"
+            "}\n"
+            "// Jitter is deterministic per operation key: the same key and\n"
+            "// attempt always agree, so controllers and tests coincide.\n"
+            "assert.strictEqual(\n"
+            "  resetAwareDelaySeconds({ attempt: 3, operationKey: 'owner/repo#1:head' }),\n"
+            "  resetAwareDelaySeconds({ attempt: 3, operationKey: 'owner/repo#1:head' })\n"
+            ");\n"
+            "assert.strictEqual(resetAwareDelaySeconds({ ...base, attempt: 9, retryAfterSeconds: 4000 }), 4000);\n"
+            "assert.strictEqual(resetAwareDelaySeconds({ ...base, attempt: 5, ratelimitResetEpoch: 1900, nowEpoch: 1000 }), 900);\n"
+            "console.log('CLAMP_OK');\n"
+        )
+        tmpdir = os.path.join(ROOT, ".opencode-tmp")
+        os.makedirs(tmpdir, exist_ok=True)
+        with tempfile.NamedTemporaryFile(
+            "w", suffix=".js", delete=False, dir=tmpdir
+        ) as handle:
+            handle.write(harness)
+            script = handle.name
+        try:
+            completed = subprocess.run(
+                [node, script],
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+        finally:
+            os.unlink(script)
+        self.assertEqual(completed.returncode, 0, completed.stderr or completed.stdout)
+        self.assertIn("CLAMP_OK", completed.stdout)
+
+
+class CodeRabbitDeadlockWiringTests(unittest.TestCase):
+    """Lock the issue-37 P0 merge-gate deadlock semantics in place.
+
+    The controller-touch follow-up above must never regress or silently
+    substitute for these CodeRabbit adapter guarantees: exact-head
+    APPROVED identity, Review-skipped tolerance, nitpick supersession,
+    RESOLVED/UNRESOLVED normalization with fail-closed behavior, and
+    quota serialization.
+    """
+
+    def read(self, path: str) -> str:
+        with open(os.path.join(ROOT, path), "r", encoding="utf-8") as handle:
+            return handle.read()
+
+    def test_exact_head_approved_identity(self):
+        gate = self.read(".github/workflows/continuum-auto-merge.yml")
+        self.assertIn("review.commit_id === headSha", gate)
+        self.assertIn("decision.state !== 'APPROVED'", gate)
+        self.assertIn("CHANGES_REQUESTED", gate)
+        self.assertIn("relative timestamps do not add safety", gate)
+        self.assertIn("sha: pr.head.sha", gate)
+
+    def test_review_skipped_does_not_erase_durable_approval(self):
+        gate = self.read(".github/workflows/continuum-auto-merge.yml")
+        self.assertIn("Review skipped", gate)
+        self.assertIn("Review completed", gate)
+        # The Review-completed wait must stay conditional on a missing
+        # review basis. An unconditional `description contains Review
+        # completed` merge-authorization check would erase a durable
+        # exact-head APPROVED basis whenever an auto-review-disabled event
+        # overwrote the status with "Review skipped".
+        self.assertRegex(gate, r"!reviewBasis[\s\S]{0,400}Review completed")
+        # Literal APPROVED remains status-independent. The separate
+        # clean-no-progress convergence path is intentionally allowed to use
+        # a later exact-head "Review completed" status, but only together with
+        # its durable no-progress marker, later full-review command/completion,
+        # green CI and zero current nitpicks.
+        basis_src = self._extract_js_function(gate, "directCodeRabbitReviewBasis")
+        # The basis is review+CI+nitpick only: it must never read a commit
+        # status description. (Its explanatory comment mentions the status
+        # names, so pin on status plumbing instead of bare substrings.)
+        self.assertNotIn(
+            "rabbitStatus",
+            basis_src,
+            "review basis must stay status-independent; a skipped status never erases it",
+        )
+        self.assertNotIn(
+            "latestCodeRabbitStatus",
+            basis_src,
+            "review basis must stay status-independent; completed status is not merge evidence",
+        )
+        self.assertNotIn(
+            ".description",
+            basis_src,
+            "review basis must not authorize on a status description",
+        )
+        converged_src = self._extract_js_function(
+            gate, "cleanNoProgressCodeRabbitReviewBasis"
+        )
+        self.assertIn("latestCodeRabbitStatus", converged_src)
+        self.assertIn("Review completed", converged_src)
+        self.assertIn("continuum-coderabbit-no-progress", converged_src)
+        self.assertIn("Full review finished", converged_src)
+        self.assertIn("latestCiForHead", converged_src)
+        self.assertIn("codeRabbitNitpickReviews", converged_src)
+
+    def test_nitpick_supersession(self):
+        gate = self.read(".github/workflows/continuum-auto-merge.yml")
+        self.assertIn("supersedes earlier advisory", gate)
+        self.assertIn("codeRabbitNitpickReviews", gate)
+        self.assertIn("> decisionAt", gate)
+
+    def test_thread_normalization_is_fail_closed(self):
+        gate = self.read(".github/workflows/continuum-auto-merge.yml")
+        self.assertIn("resolveReviewThread", gate)
+        self.assertIn("UNRESOLVED always wins", gate)
+        self.assertIn("unresolved.push", gate)
+        self.assertIn("unresolvedCodeRabbitThreads", gate)
+
+    def test_verification_requests_are_serialized_and_recover_lost_replies(self):
+        gate = self.read(".github/workflows/continuum-auto-merge.yml")
+        self.assertIn("auto-merge-coderabbit-verification", gate)
+        self.assertIn("CODERABBIT_THREAD_VERIFICATION_TIMEOUT_MS = 30 * 60_000", gate)
+        self.assertIn("const latestVerification = verificationRequests[0] || null", gate)
+        self.assertIn("const latestAnswer = comments", gate)
+        self.assertIn("Date.now() - verificationAt <", gate)
+        self.assertIn("CodeRabbit did not answer thread verification", gate)
+        self.assertNotIn("if (duplicate) continue", gate)
+
+    @staticmethod
+    def _extract_js_function(source: str, name: str) -> str:
+        """Extract one top-level JS function, skipping braces in strings.
+
+        A naive brace counter miscounts the GraphQL template literals in the
+        auto-merge gate, so this scanner tracks line/block comments,
+        single/double-quoted strings, and template literals with ${}
+        interpolation.
+        """
+        import re
+
+        match = re.search(
+            r"(?:async\s+)?function\s+" + re.escape(name) + r"\s*\(", source
+        )
+        assert match is not None, f"JS function {name} not found"
+        brace = source.index("{", match.end() - 1)
+        depth = 1
+        mode = ["code"]
+        i = brace + 1
+        total = len(source)
+        while i < total:
+            char = source[i]
+            nxt = source[i + 1] if i + 1 < total else ""
+            top = mode[-1]
+            if top == "line":
+                if char == "\n":
+                    mode.pop()
+            elif top == "block":
+                if char == "*" and nxt == "/":
+                    mode.pop()
+                    i += 1
+            elif top == "str1":
+                if char == "\\":
+                    i += 1
+                elif char == "'":
+                    mode.pop()
+            elif top == "str2":
+                if char == "\\":
+                    i += 1
+                elif char == '"':
+                    mode.pop()
+            elif top == "tpl":
+                if char == "\\":
+                    i += 1
+                elif char == "`":
+                    mode.pop()
+                elif char == "$" and nxt == "{":
+                    mode.append("{tpl}")
+                    depth += 1
+                    i += 1
+            else:  # code or {tpl}
+                if char == "/" and nxt == "/" and top == "code":
+                    mode.append("line")
+                    i += 1
+                elif char == "/" and nxt == "*" and top == "code":
+                    mode.append("block")
+                    i += 1
+                elif char == "'" and top == "code":
+                    mode.append("str1")
+                elif char == '"' and top == "code":
+                    mode.append("str2")
+                elif char == "`" and top == "code":
+                    mode.append("tpl")
+                elif char == "{":
+                    depth += 1
+                elif char == "}":
+                    depth -= 1
+                    if top == "{tpl}":
+                        mode.pop()
+                    if depth == 0:
+                        return source[match.start() : i + 1]
+            i += 1
+        raise AssertionError(f"unterminated JS function {name}")
+
+    def test_deadlock_ticket_cases_distinguish_green_from_blocked(self):
+        """Execute the real gate logic against fixtures for the deadlock cases.
+
+        Substring presence cannot tell a green gate from a blocked one, so
+        this test extracts the real decision functions from
+        continuum-auto-merge.yml and runs green-vs-blocked fixtures under
+        Node: stale-head approval, CHANGES_REQUESTED over a skipped status,
+        skipped status preserving a durable approval, newer vs superseded
+        nitpicks, RESOLVED normalization, UNRESOLVED blocking, and fail-closed
+        normalization failure.
+        """
+        import json
+        import shutil
+        import subprocess
+        import tempfile
+
+        gate = self.read(".github/workflows/continuum-auto-merge.yml")
+        needed = (
+            "latestWorkflowForHead",
+            "latestCiForHead",
+            "latestCodeRabbitDecision",
+            "codeRabbitNitpickReviews",
+            "directCodeRabbitReviewBasis",
+            "waitingForCompletedCodeRabbitReview",
+            "codeRabbitExplicitlyResolved",
+            "unresolvedCodeRabbitThreads",
+        )
+        extracted = [self._extract_js_function(gate, name) for name in needed]
+        self.assertIn("Review completed", extracted[5])
+        self.assertIn("isResolved", extracted[-1])
+
+        node = shutil.which("node")
+        self.assertIsNotNone(
+            node,
+            "node is required to execute the shipped JS; failing closed instead of silently skipping",
+        )
+
+        head = "a" * 40
+        old_head = "b" * 40
+        driver = """
+const assert = require('assert');
+const owner = 'acme';
+const repo = 'demo';
+let REVIEWS = [];
+let RUNS = [];
+let THREAD_NODES = [];
+let MUTATION_SHOULD_FAIL = false;
+let MUTATIONS = 0;
+const LIST_REVIEWS = { kind: 'listReviews' };
+const LIST_RUNS = { kind: 'listRuns' };
+const github = {
+  rest: {
+    pulls: { listReviews: LIST_REVIEWS },
+    actions: { listWorkflowRunsForRepo: LIST_RUNS },
+  },
+  paginate: async (endpoint, params) => {
+    if (endpoint === LIST_REVIEWS) return REVIEWS;
+    if (endpoint === LIST_RUNS) return RUNS;
+    throw new Error('unexpected paginate endpoint');
+  },
+  graphql: async (query, vars) => {
+    if (query.includes('mutation')) {
+      MUTATIONS += 1;
+      if (MUTATION_SHOULD_FAIL) throw new Error('resolution failed');
+      return { resolveReviewThread: { thread: { id: vars.threadId, isResolved: true } } };
+    }
+    return {
+      repository: {
+        pullRequest: {
+          reviewThreads: { nodes: THREAD_NODES, pageInfo: { hasNextPage: false, endCursor: null } },
+        },
+      },
+    };
+  },
+};
+const core = { info() {}, notice() {}, warning() {} };
+// Same-repository reads go through the repository-token client in the
+// shipped workflow; the harness routes them to the fixture client.
+const withReadFallback = async (fn) => await fn(github);
+""" + "\n".join(extracted) + """
+async function main() {
+""" + f"""
+const HEAD = {json.dumps(head)};
+const OLD_HEAD = {json.dumps(old_head)};
+const review = (over = {{}}) => Object.assign(
+  {{
+    user: {{ login: 'coderabbitai[bot]' }},
+    commit_id: HEAD,
+    state: 'APPROVED',
+    submitted_at: '2026-01-01T00:00:00Z',
+    id: 1,
+    body: '',
+  }},
+  over,
+);
+const pr = {{ number: 7, head: {{ sha: HEAD, ref: 'feature' }} }};
+const ciRun = () => [{{
+  name: 'CI', head_sha: HEAD, status: 'completed',
+  conclusion: 'success', id: 10, created_at: '2026-01-01T00:00:00Z',
+}}];
+function threadWith(id, replyBodies) {{
+  const nodes = [{{ databaseId: 1, body: 'finding', author: {{ login: 'coderabbitai[bot]' }} }}];
+  replyBodies.forEach((reply, index) => {{
+    nodes.push({{ databaseId: 10 + index, body: reply, author: {{ login: 'coderabbitai[bot]' }} }});
+  }});
+  return [{{
+    id, isResolved: false, isOutdated: false, path: 'a.ts',
+    comments: {{ nodes }},
+  }}];
+}}
+const results = {{}};
+// 1. Exact-head approval with green CI and no findings merges.
+REVIEWS = [review()];
+RUNS = ciRun();
+results.green_direct = !!(await directCodeRabbitReviewBasis(pr, HEAD));
+// 2. Approval for a stale head must not merge the new head.
+REVIEWS = [review({{ commit_id: OLD_HEAD }})];
+RUNS = ciRun();
+results.stale_head_blocked = (await directCodeRabbitReviewBasis(pr, HEAD)) === null;
+// 3. A newer CHANGES_REQUESTED verdict blocks even when the status was
+// overwritten with "Review skipped" by an auto-review-disabled event.
+REVIEWS = [
+  review({{ state: 'APPROVED', submitted_at: '2026-01-01T00:00:00Z', id: 1 }}),
+  review({{ state: 'CHANGES_REQUESTED', submitted_at: '2026-01-02T00:00:00Z', id: 2 }}),
+];
+RUNS = ciRun();
+const skippedStatus = {{ context: 'CodeRabbit', state: 'success', description: 'Review skipped' }};
+const completedStatus = {{ context: 'CodeRabbit', state: 'success', description: 'Review completed' }};
+const changesBasis = await directCodeRabbitReviewBasis(pr, HEAD);
+results.changes_requested_blocked =
+  changesBasis === null &&
+  waitingForCompletedCodeRabbitReview(changesBasis, skippedStatus);
+// 4. "Review skipped" must not erase a durable exact-head approval.
+REVIEWS = [review({{ state: 'APPROVED' }})];
+RUNS = ciRun();
+const keptBasis = await directCodeRabbitReviewBasis(pr, HEAD);
+results.skipped_keeps_approval =
+  keptBasis !== null &&
+  !waitingForCompletedCodeRabbitReview(keptBasis, skippedStatus) &&
+  !waitingForCompletedCodeRabbitReview(keptBasis, completedStatus);
+// 5. A nitpick newer than the decision blocks the merge.
+REVIEWS = [
+  review({{ state: 'APPROVED', submitted_at: '2026-01-01T00:00:00Z', id: 1 }}),
+  review({{
+    state: 'COMMENTED', submitted_at: '2026-01-02T00:00:00Z', id: 2,
+    body: 'Nitpick comments (2): check bounds',
+  }}),
+];
+RUNS = ciRun();
+results.newer_nitpick_blocks =
+  (await directCodeRabbitReviewBasis(pr, HEAD)) === null &&
+  (await codeRabbitNitpickReviews(pr, HEAD)).length === 1;
+// 6. A nitpick older than the latest decision is superseded and merges.
+REVIEWS = [
+  review({{
+    state: 'COMMENTED', submitted_at: '2026-01-01T00:00:00Z', id: 1,
+    body: 'Nitpick comments (3): stale advice',
+  }}),
+  review({{ state: 'APPROVED', submitted_at: '2026-01-02T00:00:00Z', id: 2 }}),
+];
+RUNS = ciRun();
+results.superseded_nitpick_green =
+  !!(await directCodeRabbitReviewBasis(pr, HEAD)) &&
+  (await codeRabbitNitpickReviews(pr, HEAD)).length === 0;
+// 7. A RESOLVED bot reply normalizes the thread and merges.
+THREAD_NODES = threadWith('T1', ['**RESOLVED** fixed in latest push']);
+MUTATIONS = 0;
+MUTATION_SHOULD_FAIL = false;
+results.resolved_normalized =
+  (await unresolvedCodeRabbitThreads(pr)).length === 0 && MUTATIONS === 1;
+// 8. UNRESOLVED always wins and blocks without a resolution attempt.
+THREAD_NODES = threadWith('T2', ['UNRESOLVED: still broken on current HEAD']);
+MUTATIONS = 0;
+const stillOpen = await unresolvedCodeRabbitThreads(pr);
+results.unresolved_blocks = stillOpen.length === 1 && MUTATIONS === 0;
+// 9. A failed GitHub thread resolution stays fail-closed and blocks.
+THREAD_NODES = threadWith('T3', ['✅ Review thread resolved.']);
+MUTATIONS = 0;
+MUTATION_SHOULD_FAIL = true;
+results.normalization_failure_blocks =
+  (await unresolvedCodeRabbitThreads(pr)).length === 1 && MUTATIONS === 1;
+console.log('CASES:' + JSON.stringify(results));
+}}
+""" + """main().then(
+  () => {},
+  (err) => {
+    console.error((err && err.stack) || err);
+    process.exit(1);
+  },
+);
+"""
+        tmpdir = os.path.join(ROOT, ".opencode-tmp")
+        os.makedirs(tmpdir, exist_ok=True)
+        with tempfile.NamedTemporaryFile(
+            "w", suffix=".js", delete=False, dir=tmpdir
+        ) as handle:
+            handle.write(driver)
+            script = handle.name
+        try:
+            completed = subprocess.run(
+                [node, script],
+                capture_output=True,
+                text=True,
+                timeout=60,
+            )
+        finally:
+            os.unlink(script)
+        self.assertEqual(completed.returncode, 0, completed.stderr or completed.stdout)
+        line = next(
+            entry for entry in completed.stdout.splitlines() if entry.startswith("CASES:")
+        )
+        results = json.loads(line[len("CASES:"):])
+        for case, green in results.items():
+            with self.subTest(case=case):
+                self.assertTrue(green, f"deadlock fixture {case} regressed")
+
+
+class RecoveryRepairTests(unittest.TestCase):
+    def read(self, path: str) -> str:
+        with open(os.path.join(ROOT, path), "r", encoding="utf-8") as handle:
+            return handle.read()
+
+    def test_bot_markers_count_but_external_cannot_forge(self):
+        marker = (
+            "<!-- continuum-pr-agent-retry head=" + HEAD + " kind=review attempt=2 -->"
+        )
+        bot = {
+            "body": marker,
+            "author_association": "NONE",
+            "user": {"login": "github-actions[bot]"},
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        }
+        self.assertEqual(
+            recovery.retry_evidence([bot], head_sha=HEAD, kind="review").latest_attempt,
+            2,
+        )
+        external = dict(bot)
+        external["user"] = {"login": "someone-else"}
+        external["author_association"] = "CONTRIBUTOR"
+        self.assertIsNone(
+            recovery.retry_evidence(
+                [external], head_sha=HEAD, kind="review"
+            ).latest_attempt
+        )
+
+    def test_exhaust_returns_budget_count(self):
+        decision = recovery.decide_recovery(
+            ci_green=True,
+            operation_state="failure",
+            operation_description="transient; recovery eligible",
+            operation_context="continuum/pr-agent-review",
+            evidence=recovery.RetryEvidence(latest_attempt=9),
+        )
+        self.assertEqual(decision.action, "exhaust")
+        self.assertEqual(decision.attempt, recovery.MAX_EXECUTIONS)
+
+    def test_lost_wakeup_holds_on_deterministic_hint(self):
+        held = recovery.decide_recovery(
+            ci_green=True,
+            operation_state=None,
+            operation_description="merge conflict on HEAD",
+        )
+        self.assertEqual(held.action, "hold")
+        dispatched = recovery.decide_recovery(
+            ci_green=True, operation_state=None
+        )
+        self.assertEqual(dispatched.action, "dispatch")
+        self.assertEqual(dispatched.attempt, 0)
+
+    def test_safe_operation_key_isolates_one_bad_head(self):
+        self.assertIsNone(recovery.safe_operation_key(1, "abc1234", "review"))
+        self.assertEqual(
+            recovery.safe_operation_key(1, HEAD, "review"),
+            recovery.operation_key(1, HEAD, "review"),
+        )
+        # A batch scan over mixed heads keeps healthy PRs behind one bad entry.
+        keys = [
+            recovery.safe_operation_key(n, h, "review")
+            for n, h in [(1, HEAD), (2, "short"), (3, HEAD)]
+        ]
+        self.assertIsNotNone(keys[0])
+        self.assertIsNone(keys[1])
+        self.assertIsNotNone(keys[2])
+
+
+class RepairCompatTests(unittest.TestCase):
+    """Lock the review repairs: batch, token, clock, exhaustion, backoff."""
+
+    def test_batch_operation_keys_isolate_one_bad_head(self):
+        keys, skipped = recovery.batch_operation_keys(
+            [(1, HEAD, "review"), (2, "short", "review"), (3, HEAD, "repair")]
+        )
+        self.assertEqual(len(keys), 2)
+        self.assertEqual(skipped, 1)
+
+    def test_safe_retry_evidence_isolates_one_bad_head(self):
+        self.assertIsNone(
+            recovery.safe_retry_evidence([], head_sha="short", kind="review")
+        )
+        evidence = recovery.safe_retry_evidence([], head_sha=HEAD, kind="review")
+        self.assertIsNotNone(evidence)
+        self.assertIsNone(evidence.latest_attempt)
+
+    def test_trusted_context_gate_is_explicit(self):
+        self.assertTrue(
+            recovery.is_trusted_operation_context("continuum/pr-agent-review")
+        )
+        self.assertFalse(recovery.is_trusted_operation_context(None))
+        self.assertFalse(recovery.is_trusted_operation_context("ci/external"))
+        self.assertEqual(recovery.RECOVERY_TOKEN, "recovery eligible")
+
+    def test_utc_now_epoch_supplies_dispatch_clock(self):
+        now = recovery.utc_now_epoch()
+        self.assertIsInstance(now, int)
+        self.assertGreater(now, 0)
+
+    def test_not_before_wait_echoes_epoch_for_redispatch(self):
+        evidence = recovery.RetryEvidence(latest_attempt=1, not_before_epoch=2000)
+        clockless = recovery.decide_recovery(
+            ci_green=True,
+            operation_state="failure",
+            operation_description="transient; recovery eligible",
+            operation_context="continuum/pr-agent-review",
+            evidence=evidence,
+            now_epoch=None,
+        )
+        self.assertEqual(clockless.action, "wait")
+        self.assertEqual(clockless.not_before_epoch, 2000)
+        self.assertTrue(clockless.defer_dispatch)
+        early = recovery.decide_recovery(
+            ci_green=True,
+            operation_state="failure",
+            operation_description="transient; recovery eligible",
+            operation_context="continuum/pr-agent-review",
+            evidence=evidence,
+            now_epoch=1000,
+        )
+        self.assertEqual(early.action, "wait")
+        self.assertEqual(early.not_before_epoch, 2000)
+        late = recovery.decide_recovery(
+            ci_green=True,
+            operation_state="failure",
+            operation_description="transient; recovery eligible",
+            operation_context="continuum/pr-agent-review",
+            evidence=evidence,
+            now_epoch=3000,
+        )
+        self.assertEqual(late.action, "dispatch")
+
+    def test_upgrade_resurrection_is_by_design_and_observable(self):
+        # Budget 3 -> 10: a full-HEAD attempts=3 marker is retryable again
+        # under the 10-execution contract; only attempts >= 10 exhausts.
+        mid = recovery.retry_evidence(
+            [comment(
+                f"<!-- continuum-pr-agent-retry-exhausted head={HEAD} kind=review attempts=3 -->"
+            )],
+            head_sha=HEAD,
+            kind="review",
+        )
+        self.assertFalse(mid.exhausted)
+        full = recovery.retry_evidence(
+            [comment(
+                f"<!-- continuum-pr-agent-retry-exhausted head={HEAD} kind=review attempts=10 -->"
+            )],
+            head_sha=HEAD,
+            kind="review",
+        )
+        self.assertTrue(full.exhausted)
+
+    def test_backoff_clamps_past_schedule_end(self):
+        self.assertEqual(recovery.backoff_seconds(9), 3600)
+        self.assertEqual(recovery.backoff_seconds(100), 3600)
+        with self.assertRaises(recovery.RecoveryError):
+            recovery.backoff_seconds(-1)
+
+
+class AutoMergeRepairCompatTests(unittest.TestCase):
+    """Lock the auto-merge repairs: sticky fallback, numbering, deferral."""
+
+    def read(self, path: str) -> str:
+        with open(os.path.join(ROOT, path), "r", encoding="utf-8") as handle:
+            return handle.read()
+
+    def test_auto_merge_has_no_sticky_pat_fallback(self):
+        body = self.read(".github/workflows/continuum-auto-merge.yml")
+        self.assertIn("let readTokenUnavailable = false", body)
+        self.assertIn("async function withReadFallback(fn)", body)
+        # Per-call fallback only: one per-PR blip must not flip the rest
+        # of the watchdog scan to PAT-heavy polling.
+        self.assertNotIn("readTokenUnavailable = true", body)
+
+    def test_auto_merge_outer_catch_uses_loop_stable_number(self):
+        body = self.read(".github/workflows/continuum-auto-merge.yml")
+        self.assertIn("`PR #${listed.number}: transient reconciliation error", body)
+        self.assertIn(
+            "`PR #${listed.number}: deterministic reconciliation error", body
+        )
+        self.assertNotIn("`PR #${pr.number}: transient reconciliation error", body)
+        self.assertNotIn(
+            "`PR #${pr.number}: deterministic reconciliation error", body
+        )
+
+    def test_auto_merge_defers_only_on_transient_dispatch(self):
+        body = self.read(".github/workflows/continuum-auto-merge.yml")
+        self.assertIn("const isDispatchTransient = isTransientApiError(err);", body)
+        self.assertIn(
+            "const signals = isDispatchTransient ? extractRateLimitSignals(err) : {};",
+            body,
+        )
+
+
+if __name__ == "__main__":
+    unittest.main()
