@@ -1,0 +1,21 @@
+name: Continuum Contract Gate
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  actions: write
+  contents: read
+  pull-requests: read
+  statuses: write
+
+jobs:
+  contract:
+    uses: ./.github/workflows/continuum-validation.yml
+    secrets: inherit
+    with:
+      auto_detect: ${{ 'false' }}
+      dispatch_repair: ${{ 'false' }}
+      status_context: continuum/contract-gate
+      validation_command: bash scripts/validate-continuum.sh

@@ -1,0 +1,2076 @@
+{
+  "schema_version": 1,
+  "phase": "A",
+  "description": "Authoritative trigger-and-owner inventory for every automatic wake-up and direct executor. Phase A preserves all existing ownership; new adapters are read-only.",
+  "required_owner_categories": [
+    "issue scheduler",
+    "watchdog",
+    "review-ready",
+    "CI repair",
+    "CodeRabbit queue/unresolved",
+    "PR-Agent review/recovery/merge",
+    "global watchdog",
+    "qualifications",
+    "Parent/Child delegation",
+    "self-dogfood",
+    "installer callers"
+  ],
+  "owners": [
+    {
+      "id": "issue-scheduler",
+      "summary": "Automatic issue admission, reservation, WIP accounting, and OpenCode dispatch.",
+      "canonical_policy": [
+        "continuum.scheduler_reconcile.reconcile",
+        "continuum.qualification.should_admit_to_implementation"
+      ],
+      "state_inputs": [
+        "issue labels/body/state",
+        "issue comments and dispatch markers",
+        "open PR issue numbers",
+        "active OpenCode runs",
+        "declared and native blockers",
+        "qualification trackers",
+        "terminal generation stops"
+      ],
+      "event_payload_dependencies": [
+        "issue.number",
+        "issue.labels",
+        "issue.state",
+        "comment.body",
+        "comment.user.login",
+        "comment.created_at",
+        "pull_request.number",
+        "workflow_run.path",
+        "workflow_run.conclusion"
+      ],
+      "fallback_owner": "scheduled issue scheduler pass; a missed event never strands an eligible issue",
+      "mutates": true,
+      "phase_a_adapter": "continuum.reconciliation_adapters.plan_issue_admissions"
+    },
+    {
+      "id": "opencode-watchdog",
+      "summary": "Recovers lost or failed OpenCode executions for an exact issue/PR HEAD.",
+      "canonical_policy": [
+        "workflow:.github/workflows/continuum-opencode-watchdog.yml#recover",
+        "continuum.lifecycle_recovery.decide_recovery",
+        "continuum.opencode_429_recovery"
+      ],
+      "state_inputs": [
+        "OpenCode run status/conclusion",
+        "issue or PR comments and durable retry markers",
+        "exact HEAD",
+        "active leases"
+      ],
+      "event_payload_dependencies": [
+        "workflow_run.id",
+        "workflow_run.path",
+        "workflow_run.conclusion",
+        "workflow_run.head_sha"
+      ],
+      "fallback_owner": "OpenCode watchdog workflow_run wakeup and durable lifecycle markers",
+      "mutates": true,
+      "phase_a_adapter": "continuum.reconciliation_adapters.decide_opencode_recovery"
+    },
+    {
+      "id": "review-ready",
+      "summary": "Marks an exact-HEAD PR ready for the configured optional review provider and wakes the merge controller.",
+      "canonical_policy": [
+        "continuum.merge_lifecycle.evaluate_current_head_gates",
+        "continuum.coderabbit_adapter",
+        "continuum.pr_agent_lifecycle"
+      ],
+      "state_inputs": [
+        "PR state/draft/head",
+        "current-HEAD CI and Continuum gates",
+        "review-provider selection",
+        "review-ready and request labels"
+      ],
+      "event_payload_dependencies": [
+        "workflow_run.path",
+        "workflow_run.conclusion",
+        "pull_request.state",
+        "pull_request.draft",
+        "pull_request.head.sha"
+      ],
+      "fallback_owner": "mark-ready-for-coderabbit workflow_run wakeup plus the auto-merge scheduled safety net",
+      "mutates": true,
+      "phase_a_adapter": "continuum.reconciliation_adapters.decide_review_ready"
+    },
+    {
+      "id": "ci-repair",
+      "summary": "Dispatches conflict repair and CI repair for an open PR without duplicating an active repair.",
+      "canonical_policy": [
+        "continuum.conflict_repair.decide_conflict_repair",
+        "continuum.lifecycle_recovery.decide_recovery"
+      ],
+      "state_inputs": [
+        "PR state/mergeability/exact HEAD",
+        "current-HEAD CI run",
+        "active repair runs",
+        "durable repair markers and retry evidence"
+      ],
+      "event_payload_dependencies": [
+        "pull_request.number",
+        "pull_request.action",
+        "pull_request.head.sha",
+        "workflow_run.path",
+        "workflow_run.conclusion"
+      ],
+      "fallback_owner": "OpenCode repair controller workflow_run/pull_request_target wakeups; scheduled auto-merge reconciliation",
+      "mutates": true,
+      "phase_a_adapter": "continuum.reconciliation_adapters.decide_ci_repair"
+    },
+    {
+      "id": "coderabbit-queue",
+      "summary": "Serializes the shared CodeRabbit review quota and requests the next legal full review.",
+      "canonical_policy": [
+        "continuum.coderabbit_adapter.latest_rate_limit",
+        "continuum.coderabbit_adapter.parse_retry_delay_ms",
+        "continuum.coderabbit_adapter.retry_due_at_ms"
+      ],
+      "state_inputs": [
+        "open PRs",
+        "CodeRabbit quota/rate-limit comments",
+        "exact HEAD and review basis",
+        "controller concurrency state"
+      ],
+      "event_payload_dependencies": [
+        "issue.number",
+        "comment.body",
+        "comment.user.login",
+        "pull_request.number",
+        "pull_request.state",
+        "review.user.login"
+      ],
+      "fallback_owner": "CodeRabbit controller schedule 3,13,23,33,43,53 * * * *",
+      "mutates": true,
+      "phase_a_adapter": "continuum.reconciliation_adapters.decide_coderabbit_queue"
+    },
+    {
+      "id": "coderabbit-unresolved",
+      "summary": "Batches unresolved CodeRabbit findings and dispatches one canonical OpenCode repair.",
+      "canonical_policy": [
+        "continuum.coderabbit_adapter.unresolved_blocking",
+        "workflow:.github/workflows/continuum-coderabbit-unresolved.yml#retry-unresolved"
+      ],
+      "state_inputs": [
+        "PR review comments",
+        "CodeRabbit unresolved replies",
+        "verification markers bound to the exact HEAD",
+        "active OpenCode repair"
+      ],
+      "event_payload_dependencies": [
+        "comment.user.login",
+        "comment.in_reply_to_id",
+        "comment.body",
+        "comment.id",
+        "pull_request.state",
+        "pull_request.head.sha"
+      ],
+      "fallback_owner": "canonical CodeRabbit unresolved caller wakeup; no cron by design",
+      "mutates": true,
+      "phase_a_adapter": "continuum.reconciliation_adapters.decide_coderabbit_unresolved"
+    },
+    {
+      "id": "pr-agent-review",
+      "summary": "Admits and runs the configured PR-Agent review for one exact open non-draft HEAD.",
+      "canonical_policy": [
+        "continuum.pr_agent_lifecycle.admission_allowed",
+        "continuum.pr_agent_lifecycle.parse_review_json",
+        "continuum.lifecycle_recovery.decide_recovery"
+      ],
+      "state_inputs": [
+        "PR state/draft/same-repo/head",
+        "exact-HEAD CI",
+        "existing review evidence",
+        "active review leases"
+      ],
+      "event_payload_dependencies": [
+        "pull_request.number",
+        "pull_request.action",
+        "pull_request.head.sha",
+        "comment.body",
+        "review.state"
+      ],
+      "fallback_owner": "PR-Agent recovery schedule */10 * * * * and workflow_run wakeups",
+      "mutates": true,
+      "phase_a_adapter": "continuum.reconciliation_adapters.decide_pr_agent_review"
+    },
+    {
+      "id": "pr-agent-recovery",
+      "summary": "Recovers missing, stale, or transiently failed PR-Agent review/repair operations.",
+      "canonical_policy": [
+        "continuum.pr_agent_recovery.decide_recovery",
+        "continuum.lifecycle_recovery.decide_recovery"
+      ],
+      "state_inputs": [
+        "PR exact HEAD",
+        "operation state/description/context",
+        "retry evidence and not-before",
+        "CI status",
+        "active leases"
+      ],
+      "event_payload_dependencies": [
+        "pull_request.number",
+        "pull_request.action",
+        "pull_request.head.sha",
+        "workflow_run.path",
+        "workflow_run.conclusion"
+      ],
+      "fallback_owner": "PR-Agent recovery schedule */10 * * * *",
+      "mutates": true,
+      "phase_a_adapter": "continuum.reconciliation_adapters.decide_pr_agent_recovery"
+    },
+    {
+      "id": "pr-agent-merge",
+      "summary": "Evaluates the provider-neutral exact-HEAD merge gates and merges atomically or waits.",
+      "canonical_policy": [
+        "continuum.merge_lifecycle.evaluate_current_head_gates",
+        "continuum.merge_lifecycle.build_merge_params",
+        "continuum.pr_agent_lifecycle"
+      ],
+      "state_inputs": [
+        "PR state/labels/exact HEAD",
+        "current-HEAD CI, Contract Gate, qualification and packaging runs",
+        "review basis",
+        "no-auto-merge"
+      ],
+      "event_payload_dependencies": [
+        "pull_request.number",
+        "pull_request.head.sha",
+        "review.state",
+        "status.state"
+      ],
+      "fallback_owner": "auto-merge schedule 17,47 * * * * and successful-CI workflow_run wakeup",
+      "mutates": true,
+      "phase_a_adapter": "continuum.reconciliation_adapters.decide_pr_agent_merge"
+    },
+    {
+      "id": "auto-merge",
+      "summary": "Provider-neutral CodeRabbit/common merge controller; review policy stays in the CodeRabbit adapter.",
+      "canonical_policy": [
+        "continuum.merge_lifecycle",
+        "continuum.coderabbit_adapter"
+      ],
+      "state_inputs": [
+        "PR state/labels/exact HEAD",
+        "current-HEAD CI and Continuum gates",
+        "CodeRabbit review basis",
+        "no-auto-merge",
+        "main-sync state"
+      ],
+      "event_payload_dependencies": [
+        "pull_request.number",
+        "pull_request.head.sha",
+        "review.state",
+        "status.state",
+        "workflow_run.path"
+      ],
+      "fallback_owner": "auto-merge schedule 17,47 * * * *",
+      "mutates": true,
+      "phase_a_adapter": "continuum.reconciliation_adapters.decide_pr_agent_merge"
+    },
+    {
+      "id": "global-watchdog",
+      "summary": "Discovers Continuum consumers and wakes only their existing repository-local reconcilers.",
+      "canonical_policy": [
+        ".github/scripts/global_pr_watchdog.js#runScan"
+      ],
+      "state_inputs": [
+        "verified consumer inventory",
+        "open PR probe",
+        "GitHub rate-limit remaining/reset"
+      ],
+      "event_payload_dependencies": [],
+      "fallback_owner": "schedule 17,47 * * * * and workflow_dispatch only",
+      "mutates": true,
+      "phase_a_adapter": "continuum.reconciliation_adapters.decide_global_watchdog"
+    },
+    {
+      "id": "qualification",
+      "summary": "Dispatches, retries, and evaluates mandatory post-merge qualification and contract qualification.",
+      "canonical_policy": [
+        "continuum.qualification.should_dispatch_qualification",
+        "continuum.qualification.qualification_needs_retry",
+        "continuum.contract_qualification"
+      ],
+      "state_inputs": [
+        "qualification tracker state/body",
+        "required exact SHA",
+        "trusted evidence",
+        "open blockers",
+        "contract gate evidence"
+      ],
+      "event_payload_dependencies": [
+        "issue.number",
+        "issue.body",
+        "comment.body",
+        "comment.user.login",
+        "pull_request.number",
+        "pull_request.head.sha"
+      ],
+      "fallback_owner": "scheduled issue scheduler for capability qualification; contract qualification schedule 23 5 * * *",
+      "mutates": true,
+      "phase_a_adapter": "continuum.reconciliation_adapters.decide_qualification"
+    },
+    {
+      "id": "delegation",
+      "summary": "Parent/Child delegated scheduling, worker execution, review, and run cleanup with opaque child ids.",
+      "canonical_policy": [
+        "continuum.delegation_discovery.resolve_child_inventory",
+        "continuum.delegated_dispatch.run_with_retry",
+        ".github/scripts/delegation_runtime.py"
+      ],
+      "state_inputs": [
+        "CONTINUUM_ROLE",
+        "CONTINUUM_CHILDREN",
+        "verified child inventory",
+        "child issue/PR state",
+        "active child runs"
+      ],
+      "event_payload_dependencies": [
+        "issue.number",
+        "issue.body",
+        "workflow_run.display_title",
+        "workflow_run.status"
+      ],
+      "fallback_owner": "parent issue-scheduler schedule 7,17,27,37,47,57 * * * *",
+      "mutates": true,
+      "phase_a_adapter": "continuum.reconciliation_adapters.decide_delegation"
+    },
+    {
+      "id": "opencode-agent",
+      "summary": "Executes owner commands and scheduled/synthetic issue or PR work; never owns admission policy.",
+      "canonical_policy": [
+        "continuum.opencode_commands",
+        "continuum.opencode_429_recovery",
+        "continuum.task_snapshot"
+      ],
+      "state_inputs": [
+        "owner command or scheduler dispatch marker",
+        "exact issue/PR context",
+        "immutable task snapshot",
+        "model route"
+      ],
+      "event_payload_dependencies": [
+        "issue.number",
+        "comment.body",
+        "comment.user.login",
+        "pull_request.number",
+        "pull_request.head.sha"
+      ],
+      "fallback_owner": "manual owner /oc command or scheduler dispatch; no autonomous direct trigger",
+      "mutates": true,
+      "phase_a_adapter": "continuum.reconciliation_adapters.decide_opencode_recovery"
+    },
+    {
+      "id": "pr-agent-repair",
+      "summary": "Runs PR-Agent repair for structured findings; does not duplicate review or merge policy.",
+      "canonical_policy": [
+        "continuum.pr_agent_lifecycle",
+        "continuum.pr_agent_recovery"
+      ],
+      "state_inputs": [
+        "PR exact HEAD",
+        "structured PR-Agent findings",
+        "retry evidence",
+        "active repair"
+      ],
+      "event_payload_dependencies": [
+        "pull_request.number",
+        "pull_request.head.sha",
+        "comment.body"
+      ],
+      "fallback_owner": "PR-Agent recovery schedule */10 * * * *",
+      "mutates": true,
+      "phase_a_adapter": "continuum.reconciliation_adapters.decide_pr_agent_recovery"
+    },
+    {
+      "id": "pr-agent-canary",
+      "summary": "Manual PR-Agent canary using the OpenCode backend.",
+      "canonical_policy": [
+        "continuum.pr_agent_canary"
+      ],
+      "state_inputs": [
+        "manual dispatch inputs",
+        "PR exact HEAD",
+        "canary evidence"
+      ],
+      "event_payload_dependencies": [],
+      "fallback_owner": "workflow_dispatch only",
+      "mutates": true,
+      "phase_a_adapter": null
+    },
+    {
+      "id": "render-executor",
+      "summary": "Executes and recovers Render deployments without GitHub-token fallback credentials.",
+      "canonical_policy": [
+        "continuum.render_execution.decide_render_recovery",
+        "continuum.render_execution.classify_render_failure"
+      ],
+      "state_inputs": [
+        "Render deployment state",
+        "RENDER_API_KEY presence",
+        "deployment logs/restart/memory evidence"
+      ],
+      "event_payload_dependencies": [
+        "issue.number",
+        "comment.body",
+        "workflow_run.path"
+      ],
+      "fallback_owner": "manual/workflow dispatch only; no new scheduler",
+      "mutates": true,
+      "phase_a_adapter": null
+    },
+    {
+      "id": "validation",
+      "summary": "Repository contract tests, actionlint, and reusable validation entrypoint.",
+      "canonical_policy": [
+        "scripts/test-continuum.rb",
+        "scripts/validate-continuum.sh",
+        "continuum.trigger_manifest.validate_manifest"
+      ],
+      "state_inputs": [
+        "repository tree",
+        "workflow/caller contracts",
+        "trigger owner manifest"
+      ],
+      "event_payload_dependencies": [],
+      "fallback_owner": "push/pull_request project CI and pull_request Contract Gate",
+      "mutates": false,
+      "phase_a_adapter": null
+    },
+    {
+      "id": "contract-qualification",
+      "summary": "Contract Gate and scheduled contract qualification for the Continuum control plane.",
+      "canonical_policy": [
+        "continuum.contract_qualification.evaluate_regression_gate",
+        "continuum.contract_qualification.evaluate_reservation_liveness"
+      ],
+      "state_inputs": [
+        "contract workflow evidence on exact HEAD",
+        "reservation liveness",
+        "canary stage"
+      ],
+      "event_payload_dependencies": [
+        "pull_request.number",
+        "pull_request.head.sha",
+        "workflow_run.path"
+      ],
+      "fallback_owner": "Contract qualification schedule 23 5 * * *",
+      "mutates": true,
+      "phase_a_adapter": null
+    },
+    {
+      "id": "runtime-secret-bootstrap",
+      "summary": "Publishes the repository runtime secret public key; not an issue/PR lifecycle owner.",
+      "canonical_policy": [
+        "workflow:.github/workflows/continuum-bootstrap-runtime-secret.yml#fetch-public-key"
+      ],
+      "state_inputs": [
+        "repository push/dispatch state"
+      ],
+      "event_payload_dependencies": [
+        "push.ref"
+      ],
+      "fallback_owner": "workflow_dispatch",
+      "mutates": true,
+      "phase_a_adapter": null
+    },
+    {
+      "id": "tech-library",
+      "summary": "Opt-in Swift CI technology library; Continuum never triggers it itself.",
+      "canonical_policy": [
+        "workflow:.github/workflows/continuum-tech-swift-ci.yml"
+      ],
+      "state_inputs": [
+        "consumer push/pull_request state"
+      ],
+      "event_payload_dependencies": [
+        "push.ref",
+        "pull_request.number"
+      ],
+      "fallback_owner": "consumer-owned push/pull_request/manual dispatch only",
+      "mutates": false,
+      "phase_a_adapter": null
+    },
+    {
+      "id": "project-e2e",
+      "summary": "Project-owned live model-routing end-to-end verification.",
+      "canonical_policy": [
+        "workflow:.github/workflows/continuum-model-routing-e2e.yml"
+      ],
+      "state_inputs": [
+        "pull_request changes",
+        "manual dispatch"
+      ],
+      "event_payload_dependencies": [
+        "pull_request.number"
+      ],
+      "fallback_owner": "workflow_dispatch",
+      "mutates": false,
+      "phase_a_adapter": null
+    }
+  ],
+  "surfaces": [
+    {
+      "path": ".github/caller-stubs/continuum-add-review-label.yml",
+      "name": "mark-ready-for-coderabbit",
+      "layer": "core-caller",
+      "installer_set": "core",
+      "triggers": [
+        {
+          "event": "workflow_run",
+          "types": [
+            "completed"
+          ],
+          "workflows": [
+            "CI"
+          ]
+        },
+        {
+          "event": "workflow_dispatch"
+        }
+      ],
+      "jobs": [
+        "call"
+      ],
+      "owners": [
+        "review-ready"
+      ],
+      "event_payload_dependent": true
+    },
+    {
+      "path": ".github/caller-stubs/continuum-auto-merge.yml",
+      "name": "Auto-merge reviewed pull requests",
+      "layer": "core-caller",
+      "installer_set": "core",
+      "triggers": [
+        {
+          "event": "pull_request_review",
+          "types": [
+            "submitted",
+            "dismissed"
+          ]
+        },
+        {
+          "event": "pull_request_review_comment",
+          "types": [
+            "created",
+            "edited"
+          ]
+        },
+        {
+          "event": "status"
+        },
+        {
+          "event": "push",
+          "branches": [
+            "main"
+          ]
+        },
+        {
+          "event": "schedule",
+          "crons": [
+            "17,47 * * * *"
+          ]
+        },
+        {
+          "event": "workflow_dispatch"
+        }
+      ],
+      "jobs": [
+        "call"
+      ],
+      "owners": [
+        "auto-merge"
+      ],
+      "event_payload_dependent": true
+    },
+    {
+      "path": ".github/caller-stubs/continuum-bootstrap-runtime-secret.yml",
+      "name": "Bootstrap runtime secret public key",
+      "layer": "core-caller",
+      "installer_set": "core",
+      "triggers": [
+        {
+          "event": "push"
+        },
+        {
+          "event": "workflow_dispatch"
+        }
+      ],
+      "jobs": [
+        "call"
+      ],
+      "owners": [
+        "runtime-secret-bootstrap"
+      ],
+      "event_payload_dependent": true
+    },
+    {
+      "path": ".github/caller-stubs/continuum-coderabbit-retry.yml",
+      "name": "Retry CodeRabbit after rate limit",
+      "layer": "core-caller",
+      "installer_set": "core",
+      "triggers": [
+        {
+          "event": "issue_comment",
+          "types": [
+            "created",
+            "edited"
+          ]
+        },
+        {
+          "event": "pull_request_review",
+          "types": [
+            "submitted"
+          ]
+        },
+        {
+          "event": "pull_request_review_comment",
+          "types": [
+            "created",
+            "edited"
+          ]
+        },
+        {
+          "event": "schedule",
+          "crons": [
+            "3,13,23,33,43,53 * * * *"
+          ]
+        },
+        {
+          "event": "workflow_dispatch"
+        }
+      ],
+      "jobs": [
+        "call"
+      ],
+      "owners": [
+        "coderabbit-queue"
+      ],
+      "event_payload_dependent": true
+    },
+    {
+      "path": ".github/caller-stubs/continuum-coderabbit-unresolved.yml",
+      "name": "Retry unresolved CodeRabbit findings",
+      "layer": "core-caller",
+      "installer_set": "core",
+      "triggers": [
+        {
+          "event": "pull_request_review_comment",
+          "types": [
+            "created"
+          ]
+        },
+        {
+          "event": "workflow_dispatch"
+        }
+      ],
+      "jobs": [
+        "call"
+      ],
+      "owners": [
+        "coderabbit-unresolved"
+      ],
+      "event_payload_dependent": true
+    },
+    {
+      "path": ".github/caller-stubs/continuum-docker-qualification.yml",
+      "name": "Docker qualification",
+      "layer": "core-caller",
+      "installer_set": "core",
+      "triggers": [
+        {
+          "event": "workflow_dispatch"
+        }
+      ],
+      "jobs": [
+        "call"
+      ],
+      "owners": [
+        "qualification"
+      ],
+      "event_payload_dependent": false
+    },
+    {
+      "path": ".github/caller-stubs/continuum-issue-scheduler.yml",
+      "name": "Issue scheduler",
+      "layer": "core-caller",
+      "installer_set": "core",
+      "triggers": [
+        {
+          "event": "workflow_dispatch"
+        },
+        {
+          "event": "schedule",
+          "crons": [
+            "7,17,27,37,47,57 * * * *"
+          ]
+        },
+        {
+          "event": "push",
+          "branches": [
+            "main"
+          ]
+        },
+        {
+          "event": "issues",
+          "types": [
+            "opened",
+            "reopened",
+            "closed",
+            "labeled",
+            "unlabeled"
+          ]
+        },
+        {
+          "event": "issue_comment",
+          "types": [
+            "created"
+          ]
+        },
+        {
+          "event": "pull_request_target",
+          "types": [
+            "closed"
+          ]
+        },
+        {
+          "event": "workflow_run",
+          "types": [
+            "completed"
+          ],
+          "workflows": [
+            "OpenCode agent",
+            "SubTask",
+            "SubTask review",
+            "SubTask PR review",
+            "PR Agent (OpenCode backend)"
+          ]
+        }
+      ],
+      "jobs": [
+        "call"
+      ],
+      "owners": [
+        "issue-scheduler"
+      ],
+      "event_payload_dependent": true
+    },
+    {
+      "path": ".github/caller-stubs/continuum-opencode-repair.yml",
+      "name": "OpenCode repair controller",
+      "layer": "core-caller",
+      "installer_set": "core",
+      "triggers": [
+        {
+          "event": "pull_request_target",
+          "types": [
+            "opened",
+            "reopened",
+            "synchronize"
+          ]
+        },
+        {
+          "event": "workflow_run",
+          "types": [
+            "completed"
+          ],
+          "workflows": [
+            "*",
+            "!OpenCode repair controller"
+          ]
+        },
+        {
+          "event": "workflow_dispatch"
+        }
+      ],
+      "jobs": [
+        "call"
+      ],
+      "owners": [
+        "ci-repair"
+      ],
+      "event_payload_dependent": true
+    },
+    {
+      "path": ".github/caller-stubs/continuum-opencode-watchdog.yml",
+      "name": "OpenCode watchdog",
+      "layer": "core-caller",
+      "installer_set": "core",
+      "triggers": [
+        {
+          "event": "workflow_run",
+          "types": [
+            "completed"
+          ],
+          "workflows": [
+            "OpenCode agent"
+          ]
+        },
+        {
+          "event": "schedule",
+          "crons": [
+            "*/15 * * * *"
+          ]
+        }
+      ],
+      "jobs": [
+        "call"
+      ],
+      "owners": [
+        "opencode-watchdog"
+      ],
+      "event_payload_dependent": true
+    },
+    {
+      "path": ".github/caller-stubs/continuum-opencode.yml",
+      "name": "OpenCode agent",
+      "layer": "core-caller",
+      "installer_set": "core",
+      "triggers": [
+        {
+          "event": "issue_comment",
+          "types": [
+            "created"
+          ]
+        },
+        {
+          "event": "pull_request_review_comment",
+          "types": [
+            "created"
+          ]
+        },
+        {
+          "event": "pull_request_review",
+          "types": [
+            "submitted"
+          ]
+        },
+        {
+          "event": "workflow_dispatch"
+        }
+      ],
+      "jobs": [
+        "call"
+      ],
+      "owners": [
+        "opencode-agent"
+      ],
+      "event_payload_dependent": true
+    },
+    {
+      "path": ".github/caller-stubs/continuum-pr-agent-auto-merge.yml",
+      "name": "PR-Agent merge gate",
+      "layer": "core-caller",
+      "installer_set": "core",
+      "triggers": [
+        {
+          "event": "workflow_dispatch"
+        }
+      ],
+      "jobs": [
+        "call"
+      ],
+      "owners": [
+        "pr-agent-merge"
+      ],
+      "event_payload_dependent": false
+    },
+    {
+      "path": ".github/caller-stubs/continuum-pr-agent-canary.yml",
+      "name": "PR-Agent canary (OpenCode backend)",
+      "layer": "core-caller",
+      "installer_set": "core",
+      "triggers": [
+        {
+          "event": "workflow_dispatch"
+        }
+      ],
+      "jobs": [
+        "call"
+      ],
+      "owners": [
+        "pr-agent-canary"
+      ],
+      "event_payload_dependent": false
+    },
+    {
+      "path": ".github/caller-stubs/continuum-pr-agent-recovery.yml",
+      "name": "PR-Agent recovery",
+      "layer": "core-caller",
+      "installer_set": "core",
+      "triggers": [
+        {
+          "event": "workflow_dispatch"
+        },
+        {
+          "event": "schedule",
+          "crons": [
+            "*/10 * * * *"
+          ]
+        },
+        {
+          "event": "pull_request_target",
+          "types": [
+            "opened",
+            "reopened",
+            "ready_for_review",
+            "synchronize"
+          ]
+        },
+        {
+          "event": "workflow_run",
+          "types": [
+            "completed"
+          ],
+          "workflows": [
+            "CI",
+            "PR Agent (OpenCode backend)"
+          ]
+        }
+      ],
+      "jobs": [
+        "call"
+      ],
+      "owners": [
+        "pr-agent-recovery"
+      ],
+      "event_payload_dependent": true
+    },
+    {
+      "path": ".github/caller-stubs/continuum-pr-agent-repair.yml",
+      "name": "PR-Agent repair (OpenCode)",
+      "layer": "core-caller",
+      "installer_set": "core",
+      "triggers": [
+        {
+          "event": "workflow_dispatch"
+        }
+      ],
+      "jobs": [
+        "call"
+      ],
+      "owners": [
+        "pr-agent-repair"
+      ],
+      "event_payload_dependent": false
+    },
+    {
+      "path": ".github/caller-stubs/continuum-pr-agent-router.yml",
+      "name": "PR-Agent review router",
+      "layer": "core-caller",
+      "installer_set": "core",
+      "triggers": [
+        {
+          "event": "workflow_dispatch"
+        },
+        {
+          "event": "issue_comment",
+          "types": [
+            "created"
+          ]
+        }
+      ],
+      "jobs": [
+        "call"
+      ],
+      "owners": [
+        "pr-agent-review"
+      ],
+      "event_payload_dependent": true
+    },
+    {
+      "path": ".github/caller-stubs/continuum-pr-agent.yml",
+      "name": "PR Agent (OpenCode backend)",
+      "layer": "core-caller",
+      "installer_set": "core",
+      "triggers": [
+        {
+          "event": "workflow_dispatch"
+        }
+      ],
+      "jobs": [
+        "call"
+      ],
+      "owners": [
+        "pr-agent-review"
+      ],
+      "event_payload_dependent": false
+    },
+    {
+      "path": ".github/caller-stubs/continuum-remove-review-label.yml",
+      "name": "remove-review-ready-on-sync",
+      "layer": "core-caller",
+      "installer_set": "core",
+      "triggers": [
+        {
+          "event": "pull_request",
+          "types": [
+            "synchronize"
+          ]
+        }
+      ],
+      "jobs": [
+        "call"
+      ],
+      "owners": [
+        "review-ready"
+      ],
+      "event_payload_dependent": true
+    },
+    {
+      "path": ".github/caller-stubs/continuum-render-executor.yml",
+      "name": "Render execution controller",
+      "layer": "core-caller",
+      "installer_set": "core",
+      "triggers": [
+        {
+          "event": "workflow_dispatch"
+        }
+      ],
+      "jobs": [
+        "call"
+      ],
+      "owners": [
+        "render-executor"
+      ],
+      "event_payload_dependent": false
+    },
+    {
+      "path": ".github/caller-stubs/parent/continuum-child-pr-review.yml",
+      "name": "SubTask PR review",
+      "layer": "parent-caller",
+      "installer_set": "parent",
+      "triggers": [
+        {
+          "event": "workflow_dispatch"
+        }
+      ],
+      "jobs": [
+        "review"
+      ],
+      "owners": [
+        "delegation"
+      ],
+      "event_payload_dependent": false
+    },
+    {
+      "path": ".github/caller-stubs/parent/continuum-child-review.yml",
+      "name": "SubTask review",
+      "layer": "parent-caller",
+      "installer_set": "parent",
+      "triggers": [
+        {
+          "event": "workflow_dispatch"
+        }
+      ],
+      "jobs": [
+        "review"
+      ],
+      "owners": [
+        "delegation"
+      ],
+      "event_payload_dependent": false
+    },
+    {
+      "path": ".github/caller-stubs/parent/continuum-child-run-cleanup.yml",
+      "name": "SubTask cleanup",
+      "layer": "parent-caller",
+      "installer_set": "parent",
+      "triggers": [
+        {
+          "event": "workflow_run",
+          "types": [
+            "completed"
+          ],
+          "workflows": [
+            "SubTask",
+            "SubTask review",
+            "SubTask PR review"
+          ]
+        }
+      ],
+      "jobs": [
+        "call"
+      ],
+      "owners": [
+        "delegation"
+      ],
+      "event_payload_dependent": true
+    },
+    {
+      "path": ".github/caller-stubs/parent/continuum-child-worker.yml",
+      "name": "SubTask",
+      "layer": "parent-caller",
+      "installer_set": "parent",
+      "triggers": [
+        {
+          "event": "workflow_dispatch"
+        }
+      ],
+      "jobs": [
+        "worker"
+      ],
+      "owners": [
+        "delegation"
+      ],
+      "event_payload_dependent": false
+    },
+    {
+      "path": ".github/caller-stubs/tech/continuum-tech-swift-ci.yml",
+      "name": "Swift CI",
+      "layer": "technology-library-caller",
+      "installer_set": "tech",
+      "triggers": [
+        {
+          "event": "push",
+          "branches": [
+            "main"
+          ]
+        },
+        {
+          "event": "pull_request"
+        },
+        {
+          "event": "workflow_dispatch"
+        }
+      ],
+      "jobs": [
+        "call"
+      ],
+      "owners": [
+        "tech-library"
+      ],
+      "event_payload_dependent": true
+    },
+    {
+      "path": ".github/workflows/automation.yml",
+      "name": "Continuum automation",
+      "layer": "self-dogfood",
+      "installer_set": "not-installed",
+      "triggers": [
+        {
+          "event": "workflow_dispatch"
+        },
+        {
+          "event": "schedule",
+          "crons": [
+            "*/15 * * * *",
+            "17,47 * * * *"
+          ]
+        },
+        {
+          "event": "issues",
+          "types": [
+            "opened",
+            "reopened",
+            "closed",
+            "labeled",
+            "unlabeled"
+          ]
+        },
+        {
+          "event": "issue_comment",
+          "types": [
+            "created"
+          ]
+        },
+        {
+          "event": "pull_request_target",
+          "types": [
+            "opened",
+            "reopened",
+            "synchronize",
+            "closed"
+          ]
+        },
+        {
+          "event": "pull_request_review",
+          "types": [
+            "submitted",
+            "dismissed"
+          ]
+        },
+        {
+          "event": "pull_request_review_comment",
+          "types": [
+            "created",
+            "edited"
+          ]
+        },
+        {
+          "event": "status"
+        },
+        {
+          "event": "push",
+          "branches": [
+            "main"
+          ]
+        },
+        {
+          "event": "workflow_run",
+          "types": [
+            "completed"
+          ],
+          "workflows": [
+            "CI",
+            "OpenCode agent"
+          ]
+        }
+      ],
+      "jobs": [
+        "scheduler",
+        "watchdog",
+        "repair",
+        "auto-merge",
+        "global-pr-watchdog"
+      ],
+      "owners": [
+        "issue-scheduler",
+        "opencode-watchdog",
+        "ci-repair",
+        "auto-merge",
+        "global-watchdog"
+      ],
+      "job_owners": {
+        "scheduler": "issue-scheduler",
+        "watchdog": "opencode-watchdog",
+        "repair": "ci-repair",
+        "auto-merge": "auto-merge",
+        "global-pr-watchdog": "global-watchdog"
+      },
+      "event_payload_dependent": true
+    },
+    {
+      "path": ".github/workflows/ci.yml",
+      "name": "CI",
+      "layer": "self-dogfood",
+      "installer_set": "not-installed",
+      "triggers": [
+        {
+          "event": "push",
+          "branches": [
+            "main"
+          ]
+        },
+        {
+          "event": "pull_request"
+        }
+      ],
+      "jobs": [
+        "validate",
+        "toolchain_cache_qualification"
+      ],
+      "owners": [
+        "validation"
+      ],
+      "event_payload_dependent": true
+    },
+    {
+      "path": ".github/workflows/add-review-label.yml",
+      "name": "CodeRabbit review-ready label",
+      "layer": "self-dogfood",
+      "installer_set": "not-installed",
+      "triggers": [
+        {
+          "event": "workflow_run",
+          "types": [
+            "completed"
+          ],
+          "workflows": [
+            "CI"
+          ]
+        }
+      ],
+      "jobs": [
+        "call"
+      ],
+      "owners": [
+        "review-ready"
+      ],
+      "event_payload_dependent": true
+    },
+    {
+      "path": ".github/workflows/coderabbit-retry.yml",
+      "name": "CodeRabbit retry controller",
+      "layer": "self-dogfood",
+      "installer_set": "not-installed",
+      "triggers": [
+        {
+          "event": "issue_comment",
+          "types": [
+            "created",
+            "edited"
+          ]
+        },
+        {
+          "event": "pull_request_review",
+          "types": [
+            "submitted"
+          ]
+        },
+        {
+          "event": "pull_request_review_comment",
+          "types": [
+            "created",
+            "edited"
+          ]
+        },
+        {
+          "event": "schedule",
+          "crons": [
+            "3,13,23,33,43,53 * * * *"
+          ]
+        },
+        {
+          "event": "workflow_dispatch"
+        }
+      ],
+      "jobs": [
+        "call"
+      ],
+      "owners": [
+        "coderabbit-queue"
+      ],
+      "event_payload_dependent": true
+    },
+    {
+      "path": ".github/workflows/coderabbit-unresolved.yml",
+      "name": "CodeRabbit unresolved repair",
+      "layer": "self-dogfood",
+      "installer_set": "not-installed",
+      "triggers": [
+        {
+          "event": "pull_request_review_comment",
+          "types": [
+            "created"
+          ]
+        },
+        {
+          "event": "workflow_dispatch"
+        }
+      ],
+      "jobs": [
+        "call"
+      ],
+      "owners": [
+        "coderabbit-unresolved"
+      ],
+      "event_payload_dependent": true
+    },
+    {
+      "path": ".github/workflows/remove-review-label.yml",
+      "name": "CodeRabbit review label reset",
+      "layer": "self-dogfood",
+      "installer_set": "not-installed",
+      "triggers": [
+        {
+          "event": "pull_request",
+          "types": [
+            "synchronize"
+          ]
+        }
+      ],
+      "jobs": [
+        "call"
+      ],
+      "owners": [
+        "review-ready"
+      ],
+      "event_payload_dependent": true
+    },
+    {
+      "path": ".github/workflows/continuum-add-review-label.yml",
+      "name": "mark-ready-for-coderabbit",
+      "layer": "reusable-engine",
+      "installer_set": "not-installed",
+      "triggers": [
+        {
+          "event": "workflow_call"
+        }
+      ],
+      "jobs": [
+        "add-label"
+      ],
+      "owners": [
+        "review-ready"
+      ],
+      "event_payload_dependent": false
+    },
+    {
+      "path": ".github/workflows/continuum-auto-merge.yml",
+      "name": "Auto-merge reviewed pull requests",
+      "layer": "reusable-engine",
+      "installer_set": "not-installed",
+      "triggers": [
+        {
+          "event": "workflow_call"
+        }
+      ],
+      "jobs": [
+        "controller"
+      ],
+      "owners": [
+        "auto-merge"
+      ],
+      "event_payload_dependent": false
+    },
+    {
+      "path": ".github/workflows/continuum-bootstrap-runtime-secret.yml",
+      "name": "Bootstrap runtime secret public key",
+      "layer": "reusable-engine",
+      "installer_set": "not-installed",
+      "triggers": [
+        {
+          "event": "workflow_call"
+        }
+      ],
+      "jobs": [
+        "fetch-public-key"
+      ],
+      "owners": [
+        "runtime-secret-bootstrap"
+      ],
+      "event_payload_dependent": false
+    },
+    {
+      "path": ".github/workflows/continuum-coderabbit-retry.yml",
+      "name": "Retry CodeRabbit after rate limit",
+      "layer": "reusable-engine",
+      "installer_set": "not-installed",
+      "triggers": [
+        {
+          "event": "workflow_call"
+        }
+      ],
+      "jobs": [
+        "controller"
+      ],
+      "owners": [
+        "coderabbit-queue"
+      ],
+      "event_payload_dependent": false
+    },
+    {
+      "path": ".github/workflows/continuum-coderabbit-unresolved.yml",
+      "name": "Retry unresolved CodeRabbit findings",
+      "layer": "reusable-engine",
+      "installer_set": "not-installed",
+      "triggers": [
+        {
+          "event": "workflow_call"
+        }
+      ],
+      "jobs": [
+        "retry-unresolved"
+      ],
+      "owners": [
+        "coderabbit-unresolved"
+      ],
+      "event_payload_dependent": false
+    },
+    {
+      "path": ".github/workflows/continuum-consumer-child-dispatcher.yml",
+      "name": "Continuum reusable child dispatcher",
+      "layer": "reusable-engine",
+      "installer_set": "not-installed",
+      "triggers": [
+        {
+          "event": "workflow_call"
+        }
+      ],
+      "jobs": [
+        "dispatch"
+      ],
+      "owners": [
+        "delegation"
+      ],
+      "event_payload_dependent": false
+    },
+    {
+      "path": ".github/workflows/continuum-consumer-child-pr-review.yml",
+      "name": "Continuum reusable child pull-request review",
+      "layer": "reusable-engine",
+      "installer_set": "not-installed",
+      "triggers": [
+        {
+          "event": "workflow_call"
+        }
+      ],
+      "jobs": [
+        "review"
+      ],
+      "owners": [
+        "delegation"
+      ],
+      "event_payload_dependent": false
+    },
+    {
+      "path": ".github/workflows/continuum-consumer-child-review.yml",
+      "name": "Continuum reusable child review",
+      "layer": "reusable-engine",
+      "installer_set": "not-installed",
+      "triggers": [
+        {
+          "event": "workflow_call"
+        }
+      ],
+      "jobs": [
+        "review"
+      ],
+      "owners": [
+        "delegation"
+      ],
+      "event_payload_dependent": false
+    },
+    {
+      "path": ".github/workflows/continuum-consumer-child-run-cleanup.yml",
+      "name": "SubTask run cleanup",
+      "layer": "reusable-engine",
+      "installer_set": "not-installed",
+      "triggers": [
+        {
+          "event": "workflow_call"
+        }
+      ],
+      "jobs": [
+        "cleanup"
+      ],
+      "owners": [
+        "delegation"
+      ],
+      "event_payload_dependent": false
+    },
+    {
+      "path": ".github/workflows/continuum-consumer-child-worker.yml",
+      "name": "Continuum reusable child worker",
+      "layer": "reusable-engine",
+      "installer_set": "not-installed",
+      "triggers": [
+        {
+          "event": "workflow_call"
+        }
+      ],
+      "jobs": [
+        "execute"
+      ],
+      "owners": [
+        "delegation"
+      ],
+      "event_payload_dependent": false
+    },
+    {
+      "path": ".github/workflows/continuum-contract-qualification.yml",
+      "name": "Contract qualification",
+      "layer": "reusable-engine",
+      "installer_set": "not-installed",
+      "triggers": [
+        {
+          "event": "workflow_call"
+        }
+      ],
+      "jobs": [
+        "qualify"
+      ],
+      "owners": [
+        "contract-qualification"
+      ],
+      "event_payload_dependent": false
+    },
+    {
+      "path": ".github/workflows/continuum-docker-qualification.yml",
+      "name": "Docker qualification",
+      "layer": "reusable-engine",
+      "installer_set": "not-installed",
+      "triggers": [
+        {
+          "event": "workflow_call"
+        }
+      ],
+      "jobs": [
+        "qualify"
+      ],
+      "owners": [
+        "qualification"
+      ],
+      "event_payload_dependent": false
+    },
+    {
+      "path": ".github/workflows/continuum-issue-scheduler.yml",
+      "name": "Issue scheduler",
+      "layer": "reusable-engine",
+      "installer_set": "not-installed",
+      "triggers": [
+        {
+          "event": "workflow_call"
+        }
+      ],
+      "jobs": [
+        "wake_parent",
+        "schedule"
+      ],
+      "owners": [
+        "issue-scheduler"
+      ],
+      "event_payload_dependent": false
+    },
+    {
+      "path": ".github/workflows/continuum-model-routing-e2e.yml",
+      "name": "Continuum model routing live E2E",
+      "layer": "self-dogfood",
+      "installer_set": "not-installed",
+      "triggers": [
+        {
+          "event": "pull_request"
+        },
+        {
+          "event": "workflow_dispatch"
+        }
+      ],
+      "jobs": [
+        "first-runner",
+        "fresh-runner"
+      ],
+      "owners": [
+        "project-e2e"
+      ],
+      "event_payload_dependent": true
+    },
+    {
+      "path": ".github/workflows/continuum-opencode-repair.yml",
+      "name": "OpenCode repair controller",
+      "layer": "reusable-engine",
+      "installer_set": "not-installed",
+      "triggers": [
+        {
+          "event": "workflow_call"
+        }
+      ],
+      "jobs": [
+        "sync-current-pr",
+        "ci-repair-dispatch",
+        "ci-repair"
+      ],
+      "owners": [
+        "ci-repair"
+      ],
+      "event_payload_dependent": false
+    },
+    {
+      "path": ".github/workflows/continuum-opencode-unresolved.yml",
+      "name": "Retry OpenCode on CodeRabbit unresolved",
+      "layer": "reusable-engine",
+      "installer_set": "not-installed",
+      "triggers": [
+        {
+          "event": "workflow_call"
+        }
+      ],
+      "jobs": [
+        "dispatch-unresolved-fix"
+      ],
+      "owners": [
+        "coderabbit-unresolved"
+      ],
+      "event_payload_dependent": false
+    },
+    {
+      "path": ".github/workflows/continuum-opencode-watchdog.yml",
+      "name": "OpenCode watchdog",
+      "layer": "reusable-engine",
+      "installer_set": "not-installed",
+      "triggers": [
+        {
+          "event": "workflow_call"
+        }
+      ],
+      "jobs": [
+        "recover"
+      ],
+      "owners": [
+        "opencode-watchdog"
+      ],
+      "event_payload_dependent": false
+    },
+    {
+      "path": ".github/workflows/continuum-opencode.yml",
+      "name": "OpenCode agent",
+      "layer": "reusable-engine",
+      "installer_set": "not-installed",
+      "triggers": [
+        {
+          "event": "workflow_call"
+        }
+      ],
+      "jobs": [
+        "dispatch-coderabbit-fix",
+        "opencode",
+        "cleanup-workflow-repair-lock",
+        "recover-scheduled-issue"
+      ],
+      "owners": [
+        "opencode-agent"
+      ],
+      "event_payload_dependent": false
+    },
+    {
+      "path": ".github/workflows/continuum-pr-agent-auto-merge.yml",
+      "name": "PR-Agent merge gate",
+      "layer": "reusable-engine",
+      "installer_set": "not-installed",
+      "triggers": [
+        {
+          "event": "workflow_call"
+        }
+      ],
+      "jobs": [
+        "gate"
+      ],
+      "owners": [
+        "pr-agent-merge"
+      ],
+      "event_payload_dependent": false
+    },
+    {
+      "path": ".github/workflows/continuum-pr-agent-canary.yml",
+      "name": "PR-Agent canary (OpenCode backend)",
+      "layer": "reusable-engine",
+      "installer_set": "not-installed",
+      "triggers": [
+        {
+          "event": "workflow_call"
+        }
+      ],
+      "jobs": [
+        "canary"
+      ],
+      "owners": [
+        "pr-agent-canary"
+      ],
+      "event_payload_dependent": false
+    },
+    {
+      "path": ".github/workflows/continuum-pr-agent-recovery.yml",
+      "name": "PR-Agent recovery",
+      "layer": "reusable-engine",
+      "installer_set": "not-installed",
+      "triggers": [
+        {
+          "event": "workflow_call"
+        }
+      ],
+      "jobs": [
+        "reconcile"
+      ],
+      "owners": [
+        "pr-agent-recovery"
+      ],
+      "event_payload_dependent": false
+    },
+    {
+      "path": ".github/workflows/continuum-pr-agent-repair.yml",
+      "name": "PR-Agent repair (OpenCode)",
+      "layer": "reusable-engine",
+      "installer_set": "not-installed",
+      "triggers": [
+        {
+          "event": "workflow_call"
+        }
+      ],
+      "jobs": [
+        "repair"
+      ],
+      "owners": [
+        "pr-agent-repair"
+      ],
+      "event_payload_dependent": false
+    },
+    {
+      "path": ".github/workflows/continuum-pr-agent-router.yml",
+      "name": "PR-Agent review router",
+      "layer": "reusable-engine",
+      "installer_set": "not-installed",
+      "triggers": [
+        {
+          "event": "workflow_call"
+        }
+      ],
+      "jobs": [
+        "route"
+      ],
+      "owners": [
+        "pr-agent-review"
+      ],
+      "event_payload_dependent": false
+    },
+    {
+      "path": ".github/workflows/continuum-pr-agent.yml",
+      "name": "PR Agent (OpenCode backend)",
+      "layer": "reusable-engine",
+      "installer_set": "not-installed",
+      "triggers": [
+        {
+          "event": "workflow_call"
+        }
+      ],
+      "jobs": [
+        "pr_agent",
+        "repair",
+        "merge"
+      ],
+      "owners": [
+        "pr-agent-review"
+      ],
+      "event_payload_dependent": false
+    },
+    {
+      "path": ".github/workflows/continuum-remove-review-label.yml",
+      "name": "remove-review-ready-on-sync",
+      "layer": "reusable-engine",
+      "installer_set": "not-installed",
+      "triggers": [
+        {
+          "event": "workflow_call"
+        }
+      ],
+      "jobs": [
+        "remove-label"
+      ],
+      "owners": [
+        "review-ready"
+      ],
+      "event_payload_dependent": false
+    },
+    {
+      "path": ".github/workflows/continuum-render-executor.yml",
+      "name": "Render execution controller",
+      "layer": "reusable-engine",
+      "installer_set": "not-installed",
+      "triggers": [
+        {
+          "event": "workflow_call"
+        }
+      ],
+      "jobs": [
+        "execute"
+      ],
+      "owners": [
+        "render-executor"
+      ],
+      "event_payload_dependent": false
+    },
+    {
+      "path": ".github/workflows/continuum-tech-swift-ci.yml",
+      "name": "Swift CI",
+      "layer": "reusable-engine",
+      "installer_set": "not-installed",
+      "triggers": [
+        {
+          "event": "workflow_call"
+        }
+      ],
+      "jobs": [
+        "call"
+      ],
+      "owners": [
+        "tech-library"
+      ],
+      "event_payload_dependent": false
+    },
+    {
+      "path": ".github/workflows/continuum-validation.yml",
+      "name": "CI",
+      "layer": "reusable-engine",
+      "installer_set": "not-installed",
+      "triggers": [
+        {
+          "event": "workflow_call"
+        }
+      ],
+      "jobs": [
+        "validate"
+      ],
+      "owners": [
+        "validation"
+      ],
+      "event_payload_dependent": false
+    },
+    {
+      "path": ".github/workflows/contract-gate.yml",
+      "name": "Continuum Contract Gate",
+      "layer": "self-dogfood",
+      "installer_set": "not-installed",
+      "triggers": [
+        {
+          "event": "pull_request",
+          "branches": [
+            "main"
+          ]
+        }
+      ],
+      "jobs": [
+        "contract"
+      ],
+      "owners": [
+        "contract-qualification"
+      ],
+      "event_payload_dependent": true
+    },
+    {
+      "path": ".github/workflows/contract-qualification.yml",
+      "name": "Contract qualification",
+      "layer": "self-dogfood",
+      "installer_set": "not-installed",
+      "triggers": [
+        {
+          "event": "pull_request",
+          "types": [
+            "opened",
+            "synchronize",
+            "reopened"
+          ]
+        },
+        {
+          "event": "schedule",
+          "crons": [
+            "23 5 * * *"
+          ]
+        },
+        {
+          "event": "workflow_dispatch"
+        }
+      ],
+      "jobs": [
+        "call"
+      ],
+      "owners": [
+        "contract-qualification"
+      ],
+      "event_payload_dependent": true
+    },
+    {
+      "path": ".github/workflows/opencode.yml",
+      "name": "OpenCode agent",
+      "layer": "self-dogfood",
+      "installer_set": "not-installed",
+      "triggers": [
+        {
+          "event": "issue_comment",
+          "types": [
+            "created"
+          ]
+        },
+        {
+          "event": "pull_request_review_comment",
+          "types": [
+            "created"
+          ]
+        },
+        {
+          "event": "pull_request_review",
+          "types": [
+            "submitted"
+          ]
+        },
+        {
+          "event": "workflow_dispatch"
+        }
+      ],
+      "jobs": [
+        "call"
+      ],
+      "owners": [
+        "opencode-agent"
+      ],
+      "event_payload_dependent": true
+    },
+    {
+      "path": ".github/workflows/pr-agent-recovery.yml",
+      "name": "PR-Agent recovery dogfood",
+      "layer": "self-dogfood",
+      "installer_set": "not-installed",
+      "triggers": [
+        {
+          "event": "workflow_dispatch"
+        },
+        {
+          "event": "schedule",
+          "crons": [
+            "*/10 * * * *"
+          ]
+        },
+        {
+          "event": "pull_request_target",
+          "types": [
+            "opened",
+            "reopened",
+            "ready_for_review",
+            "synchronize"
+          ]
+        },
+        {
+          "event": "workflow_run",
+          "types": [
+            "completed"
+          ],
+          "workflows": [
+            "CI",
+            "PR Agent (OpenCode-backed)"
+          ]
+        }
+      ],
+      "jobs": [
+        "call"
+      ],
+      "owners": [
+        "pr-agent-recovery"
+      ],
+      "event_payload_dependent": true
+    },
+    {
+      "path": ".github/workflows/pr-agent-router.yml",
+      "name": "PR-Agent review router entry",
+      "layer": "self-dogfood",
+      "installer_set": "not-installed",
+      "triggers": [
+        {
+          "event": "workflow_dispatch"
+        },
+        {
+          "event": "issue_comment",
+          "types": [
+            "created"
+          ]
+        }
+      ],
+      "jobs": [
+        "call"
+      ],
+      "owners": [
+        "pr-agent-review"
+      ],
+      "event_payload_dependent": true
+    },
+    {
+      "path": ".github/workflows/pr-agent.yml",
+      "name": "PR Agent (OpenCode-backed)",
+      "layer": "self-dogfood",
+      "installer_set": "not-installed",
+      "triggers": [
+        {
+          "event": "workflow_dispatch"
+        }
+      ],
+      "jobs": [
+        "call"
+      ],
+      "owners": [
+        "pr-agent-review"
+      ],
+      "event_payload_dependent": false
+    }
+  ]
+}

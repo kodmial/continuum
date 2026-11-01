@@ -1,0 +1,60 @@
+{
+  "name": "consumer-coderabbit",
+  "description": "A consumer comment wake-up (A) must still plan runnable issue B and CodeRabbit PR C from trusted state.",
+  "event": {
+    "event": "issue_comment",
+    "action": "created",
+    "issue": {"number": 51},
+    "comment": {"body": "status ping", "user": {"login": "consumer-maintainer"}}
+  },
+  "issues": [
+    {
+      "number": 51,
+      "title": "P2: consumer issue in review",
+      "state": "open",
+      "labels": ["P2", "automation:in-progress"],
+      "body": "Waiting on review."
+    },
+    {
+      "number": 52,
+      "title": "P2: consumer runnable work",
+      "state": "open",
+      "labels": ["P2"],
+      "body": "Ready for implementation."
+    }
+  ],
+  "pull_requests": [
+    {
+      "number": 61,
+      "title": "fix: consumer change",
+      "state": "open",
+      "draft": false,
+      "labels": [],
+      "head_sha": "2222222222222222222222222222222222222222",
+      "head_repo": "consumer/project",
+      "base_repo": "consumer/project",
+      "mergeable": true,
+      "mergeable_state": "clean"
+    }
+  ],
+  "context": {
+    "review_provider": "coderabbit",
+    "repository": "consumer/project",
+    "open_pr_issue_numbers": [51],
+    "active_run_issue_numbers": [],
+    "ci_runs": {
+      "61": {"status": "completed", "conclusion": "success"}
+    },
+    "pull_request_state": {
+      "61": {
+        "provider": "coderabbit",
+        "review_requested": false
+      }
+    }
+  },
+  "expect": {
+    "issue:52": "ACTION",
+    "issue:51": "WAIT",
+    "pull_request:61 domains": ["review-ready", "ci-repair", "pr-agent-merge", "coderabbit-queue", "coderabbit-unresolved"]
+  }
+}

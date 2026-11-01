@@ -1,0 +1,213 @@
+name: Issue scheduler
+
+# An external periodic wake is marked for cross-source dedupe. Native schedule
+# runs are identified by their event, so only the opt-in dispatch needs the
+# token. The input is a mode selector, never an authorization override.
+run-name: >-
+  Issue scheduler ${{ github.event.inputs.periodic_wake == 'true' && '[continuum-periodic]' || github.event_name }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      periodic_wake:
+        description: "External periodic signal; only the periodic pass is deduplicated"
+        required: false
+        type: string
+        default: "false"
+      wip_limit:
+        description: "Concurrent in-progress issues"
+        required: false
+        type: string
+      lease_minutes:
+        description: "Reservation lease in minutes"
+        required: false
+        type: string
+      max_dispatch_attempts:
+        description: "Dispatch attempts before pausing"
+        required: false
+        type: string
+      dispatch_marker:
+        description: "Dispatch comment marker"
+        required: false
+        type: string
+      in_progress_label:
+        description: "Reservation label"
+        required: false
+        type: string
+      pause_marker:
+        description: "Pause label"
+        required: false
+        type: string
+      qualifying_label:
+        description: "Label marking capabilities waiting on mandatory qualification"
+        required: false
+        type: string
+      blocked_label:
+        description: "Label marking capabilities whose qualification failed"
+        required: false
+        type: string
+      post_pause_comment:
+        description: "Comment when pausing an issue"
+        required: false
+        type: string
+      reset_markers:
+        description: "Clear dispatch markers before dispatching"
+        required: false
+        type: string
+      require_priority_label:
+        description: "Dispatch only labelled issues"
+        required: false
+        type: string
+      ready_label:
+        description: "Optional admission label for automatic implementation"
+        required: false
+        type: string
+      command_grace_minutes:
+        description: "Race window after a manual owner command"
+        required: false
+        type: string
+      child_owned_marker:
+        description: "Marker reserving an issue for a child worker"
+        required: false
+        type: string
+      legacy_child_owned_marker:
+        description: "Legacy child-worker marker"
+        required: false
+        type: string
+      opencode_workflow_name:
+        description: "`name:` of the local OpenCode caller"
+        required: false
+        type: string
+      opencode_workflow_path:
+        description: "Path of the local OpenCode caller"
+        required: false
+        type: string
+      dispatch_ref:
+        description: "Git ref every dispatch targets"
+        required: false
+        type: string
+      opencode_dispatch:
+        description: "How a ready issue reaches OpenCode: comment or workflow"
+        required: false
+        type: string
+      execution_label_routes:
+        description: "Label-driven execution routes, one per line"
+        required: false
+        type: string
+      child_dispatch_workflow:
+        description: "Downstream dispatcher woken after each reconcile pass"
+        type: string
+      count_open_prs_as_wip:
+        description: "Count open implementation PRs against WIP"
+        required: false
+        type: string
+      pause_on_failure:
+        description: "Pause after exhausted/closed failed automation"
+        required: false
+        type: string
+  # Parent repositories poll delegated child issues here. This wake-up is
+  # parent-scheduled and independent of child Actions.
+  # Use an offset from the busy :00/:15/:30/:45 boundaries to reduce delayed or
+  # dropped GitHub scheduled events.
+  schedule:
+    - cron: "7,17,27,37,47,57 * * * *"
+  # Preserve the legacy dispatcher wake-up on parent control-plane updates.
+  push:
+    branches: [main]
+  issues:
+    types: [opened, reopened, closed, labeled, unlabeled]
+  issue_comment:
+    types: [created]
+  pull_request_target:
+    types: [closed]
+  workflow_run:
+    workflows:
+      - OpenCode agent
+      - SubTask
+      - SubTask review
+      - SubTask PR review
+      - PR Agent (OpenCode backend)
+    types: [completed]
+
+permissions:
+  actions: read
+  contents: read
+  issues: read
+  pull-requests: read
+
+jobs:
+  call:
+    # Child-skip invariant (kodmial/continuum#261): a child never invokes the
+    # reusable scheduler. The parent's scheduled reconciliation performs every
+    # delegated dispatch.
+    # The public parent's scheduled reconciliation (cron below, plus push /
+    # workflow_run wakes) independently discovers verified child repositories
+    # and their open eligible tasks, so a missed child event can never strand
+    # work. Maximum pickup latency is bounded by the parent cron interval.
+    # The reusable wake_parent job is retained only as a best-effort
+    # acceleration for already-installed child callers that still forward
+    # issue events; it is never required for eventual dispatch.
+    # Parent filtering is unchanged: unrelated issue comments stay caller
+    # skips. A manual owner `/oc` is in-flight work the scheduler must
+    # reserve, and trusted qualification result comments wake the scheduler
+    # immediately; cron remains the missed-event backstop. Continuum's own
+    # scheduler dispatch and watchdog recovery comments are machine-origin
+    # exceptions: they already represent work the scheduler started, so they
+    # must not wake it again. These are exact markers, not a generic origin
+    # check; an owner who manually copies one into a command is intentionally
+    # suppressed with them, so a manual wake must omit the marker. This stub is only
+    # a cheap prefilter: the reusable scheduler applies the canonical exact
+    # parser before it reserves or dispatches anything.
+    if: >-
+      vars.CONTINUUM_ROLE != 'child' &&
+      (github.event_name != 'issue_comment' ||
+       (github.actor == github.repository_owner &&
+        (startsWith(github.event.comment.body, '/oc') ||
+         startsWith(github.event.comment.body, '/opencode')) &&
+        !contains(github.event.comment.body, '<!-- issue-scheduler-dispatch -->') &&
+        !contains(github.event.comment.body, '<!-- continuum-origin role=continuum component=opencode-watchdog -->')) ||
+       ((github.actor == github.repository_owner ||
+         github.actor == 'github-actions[bot]' ||
+         github.event.comment.author_association == 'OWNER' ||
+         github.event.comment.author_association == 'MEMBER' ||
+         github.event.comment.author_association == 'COLLABORATOR') &&
+        (contains(github.event.comment.body, 'continuum-qualification-result') ||
+         contains(github.event.comment.body, 'continuum-docker-qualification-result') ||
+         contains(github.event.comment.body, 'continuum-render-qualification-result'))))
+    uses: kodmial/continuum/.github/workflows/continuum-issue-scheduler.yml@main
+    secrets: inherit
+    with:
+      continuum_ref: main
+      periodic_wake: "${{ inputs.periodic_wake }}"
+      # Every knob below is forwarded as a bare `inputs.*` passthrough, never a
+      # literal. An empty passthrough is what lets the engine fall back to the
+      # consumer's `vars.AUTOMATION_*` value; pinning a literal here would
+      # override that repository variable for every installed caller.
+      wip_limit: "${{ inputs.wip_limit }}"
+      lease_minutes: "${{ inputs.lease_minutes }}"
+      max_dispatch_attempts: "${{ inputs.max_dispatch_attempts }}"
+      dispatch_marker: "${{ inputs.dispatch_marker }}"
+      in_progress_label: "${{ inputs.in_progress_label }}"
+      pause_marker: "${{ inputs.pause_marker }}"
+      qualifying_label: "${{ inputs.qualifying_label }}"
+      blocked_label: "${{ inputs.blocked_label }}"
+      post_pause_comment: "${{ inputs.post_pause_comment }}"
+      reset_markers: "${{ inputs.reset_markers }}"
+      require_priority_label: "${{ inputs.require_priority_label }}"
+      ready_label: "${{ inputs.ready_label }}"
+      command_grace_minutes: "${{ inputs.command_grace_minutes }}"
+      child_owned_marker: "${{ inputs.child_owned_marker }}"
+      legacy_child_owned_marker: "${{ inputs.legacy_child_owned_marker }}"
+      opencode_workflow_name: "${{ inputs.opencode_workflow_name }}"
+      opencode_workflow_path: "${{ inputs.opencode_workflow_path }}"
+      dispatch_ref: "${{ inputs.dispatch_ref }}"
+      opencode_dispatch: "${{ inputs.opencode_dispatch }}"
+      execution_label_routes: "${{ inputs.execution_label_routes }}"
+      child_dispatch_workflow: "${{ inputs.child_dispatch_workflow }}"
+      count_open_prs_as_wip: "${{ inputs.count_open_prs_as_wip }}"
+      pause_on_failure: "${{ inputs.pause_on_failure }}"
+      # Event plumbing for the child wake-up gate. A called workflow always
+      # sees github.event_name as workflow_call with an empty github.event,
+      # so the caller forwards its own trigger name and issue number.
+      caller_event_name: "${{ github.event_name }}"
+      caller_issue_number: "${{ github.event.issue.number }}"

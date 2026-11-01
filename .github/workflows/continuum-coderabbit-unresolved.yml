@@ -1,0 +1,487 @@
+name: Retry unresolved CodeRabbit findings
+
+on:
+  workflow_call:
+    inputs:
+      continuum_ref:
+        description: Continuum revision supplying fallback scripts
+        type: string
+        default: main
+        required: false
+      review_provider:
+        description: >-
+          Review provider: none, coderabbit, or pr-agent. Empty falls back to
+          vars.CONTINUUM_REVIEW_PROVIDER, then to none.
+        type: string
+        default: ''
+        required: false
+      pr_number:
+        description: PR to reconcile when a latest-state caller wakes the batcher.
+        type: string
+        default: ''
+        required: false
+      opencode_workflow:
+        description: >-
+          OpenCode caller workflow that receives the batched repair. Empty falls
+          back to vars.CONTINUUM_OPENCODE_WORKFLOW, then to
+          continuum-opencode.yml. Continuum dogfood overrides this to
+          opencode.yml.
+        type: string
+        default: ''
+        required: false
+
+permissions: {}
+
+jobs:
+  retry-unresolved:
+    if: >-
+      (inputs.review_provider || vars.CONTINUUM_REVIEW_PROVIDER || 'none') == 'coderabbit' &&
+      ((github.event_name == 'workflow_dispatch' && inputs.pr_number != '') ||
+       (github.event_name == 'pull_request_review_comment' &&
+        github.event.action == 'created' &&
+        github.event.comment.user.login == 'coderabbitai[bot]' &&
+        github.event.pull_request.state == 'open' &&
+        github.event.pull_request.head.repo.full_name == github.repository &&
+        github.event.comment.in_reply_to_id != null))
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    permissions:
+      actions: write
+      contents: read
+      issues: write
+      pull-requests: read
+
+    # Serialize the entire batch/dispatch transaction per PR. Never run a
+    # second CodeRabbit repair engine; the canonical OpenCode workflow owns
+    # model selection, runtime, publication, verification and recovery.
+    concurrency:
+      group: coderabbit-unresolved-${{ github.event.pull_request.number || inputs.pr_number }}
+      cancel-in-progress: false
+
+    steps:
+      - name: Coalesce CodeRabbit replies
+        run: sleep 5
+
+      - name: Collect all unresolved findings
+        id: context
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
+        env:
+          INPUT_PR_NUMBER: ${{ inputs.pr_number }}
+        with:
+          # kodmial/continuum#259: read-only collection uses GITHUB_TOKEN so
+          # the run is attributed to github-actions[bot] and never uses
+          # TAP_PAT. Checkout/push below intentionally stay PAT-backed.
+          github-token: ${{ github.token }}
+          script: |
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const pullNumber = Number(
+              context.payload.pull_request?.number || process.env.INPUT_PR_NUMBER || 0
+            );
+            if (!Number.isInteger(pullNumber) || pullNumber <= 0) {
+              throw new Error('No valid PR number for CodeRabbit reconciliation.');
+            }
+            const opencodeVerificationPattern =
+              /<!-- opencode-coderabbit-verification review=(\d+) finding=(\d+) head=([0-9a-f]{40}) -->/;
+            const autoMergeVerificationPattern =
+              /<!-- auto-merge-coderabbit-verification finding=(\d+) head=([0-9a-f]{40}) -->/;
+
+            // Bounded newest-first scan (#254): batching only needs the
+            // latest verification per finding and replies newer than it,
+            // so ten newest-first pages bound the cost. The review-comment
+            // endpoint lists oldest-first and ignores sort/direction, so
+            // pages 1..N would scan only the oldest window and miss the
+            // current-HEAD verification marker. Anchor at the newest end
+            // via the pull-request review-comment total and walk the newest
+            // ten pages instead, enforcing newest-first client-side.
+            // Thread-parent misses outside the window fall back to the
+            // immediate parent id via getRootId, and any stranded finding
+            // is re-batched by its own UNRESOLVED event.
+            const { data: prMeta } = await github.rest.pulls.get({
+              owner,
+              repo,
+              pull_number: pullNumber,
+            });
+            const totalReviewComments = Number(prMeta?.review_comments || 0);
+            const lastReviewPage = Math.max(
+              1,
+              Math.ceil((Number.isFinite(totalReviewComments) ? totalReviewComments : 0) / 100) || 1
+            );
+            const firstReviewPage = Math.max(1, lastReviewPage - 9);
+            const comments = [];
+            for (let page = lastReviewPage; page >= firstReviewPage; page -= 1) {
+              const { data } = await github.rest.pulls.listReviewComments({
+                owner,
+                repo,
+                pull_number: pullNumber,
+                per_page: 100,
+                page,
+              });
+              if (!Array.isArray(data) || data.length === 0) continue;
+              comments.push(...data);
+            }
+
+            const byId = new Map(comments.map((comment) => [comment.id, comment]));
+
+            const getRootId = (comment) => {
+              let current = comment;
+              const seen = new Set();
+              while (current?.in_reply_to_id != null) {
+                if (seen.has(current.id)) {
+                  return current.in_reply_to_id;
+                }
+                seen.add(current.id);
+                const parent = byId.get(current.in_reply_to_id);
+                if (!parent) {
+                  return current.in_reply_to_id;
+                }
+                current = parent;
+              }
+              return current?.id ?? null;
+            };
+
+            // Both repair-owned and auto-merge-owned exact-HEAD verification
+            // requests feed this same batcher. Auto-merge markers intentionally
+            // carry no review id, so recover the ORIGINAL CodeRabbit review id
+            // from the root finding (never from the verification reply's own
+            // synthetic review id). If the bounded newest window omitted that
+            // root, fetch exactly the one known finding id instead of widening
+            // pagination.
+            async function originalReviewIdForFinding(findingId) {
+              let root = byId.get(findingId);
+              if (!root) {
+                const { data } = await github.rest.pulls.getReviewComment({
+                  owner,
+                  repo,
+                  comment_id: findingId,
+                });
+                root = data;
+                if (root?.id) byId.set(root.id, root);
+              }
+              const reviewId = Number(root?.pull_request_review_id);
+              return Number.isInteger(reviewId) && reviewId > 0
+                ? reviewId
+                : null;
+            }
+
+            // Keep only the newest verification request for each original
+            // finding. An older UNRESOLVED must never override a newer
+            // verification request that is still awaiting CodeRabbit.
+            const latestVerification = new Map();
+            for (const comment of comments) {
+              const body = comment.body ?? '';
+              const opencodeMatch = body.match(opencodeVerificationPattern);
+              const autoMergeMatch = body.match(autoMergeVerificationPattern);
+              if (!opencodeMatch && !autoMergeMatch) continue;
+
+              const findingId = Number(
+                opencodeMatch ? opencodeMatch[2] : autoMergeMatch[1]
+              );
+              const verifiedHead =
+                opencodeMatch ? opencodeMatch[3] : autoMergeMatch[2];
+              if (getRootId(comment) !== findingId) continue;
+
+              const reviewId = opencodeMatch
+                ? Number(opencodeMatch[1])
+                : await originalReviewIdForFinding(findingId);
+              if (!Number.isInteger(reviewId) || reviewId <= 0) {
+                core.warning(
+                  `PR #${pullNumber}: could not recover original CodeRabbit review id for finding #${findingId}; skipping this finding for the current pass.`
+                );
+                continue;
+              }
+
+              const previous = latestVerification.get(findingId);
+              if (!previous || comment.id > previous.comment.id) {
+                latestVerification.set(findingId, {
+                  comment,
+                  reviewId,
+                  findingId,
+                  verifiedHead,
+                });
+              }
+            }
+
+            // GitHub review-thread resolution, not a word in the AI response,
+            // determines whether a verified finding is still actionable.
+            // A CodeRabbit reply such as "the finding remains valid" is a
+            // completed reply and must not be silently discarded.
+            const unresolvedRoots = new Set();
+            let threadCursor = null;
+            let threadPages = 0;
+            do {
+              const page = await github.graphql(
+                `query($owner: String!, $repo: String!, $number: Int!, $cursor: String) {
+                  repository(owner: $owner, name: $repo) {
+                    pullRequest(number: $number) {
+                      reviewThreads(first: 100, after: $cursor) {
+                        nodes {
+                          isResolved
+                          comments(first: 1) { nodes { databaseId author { login } } }
+                        }
+                        pageInfo { hasNextPage endCursor }
+                      }
+                    }
+                  }
+                }`,
+                { owner, repo, number: pullNumber, cursor: threadCursor }
+              );
+              const threads = page.repository?.pullRequest?.reviewThreads;
+              if (!threads?.pageInfo || !Array.isArray(threads.nodes)) {
+                throw new Error('Cannot establish current CodeRabbit thread state.');
+              }
+              for (const thread of threads.nodes) {
+                const root = thread.comments?.nodes?.[0];
+                if (!thread.isResolved && root?.author?.login?.startsWith('coderabbitai') &&
+                    Number.isInteger(root.databaseId)) {
+                  unresolvedRoots.add(root.databaseId);
+                }
+              }
+              threadCursor = threads.pageInfo.hasNextPage
+                ? threads.pageInfo.endCursor : null;
+              threadPages += 1;
+              if (threadCursor && threadPages >= 10) {
+                throw new Error('CodeRabbit threads exceed bounded reconciliation window.');
+              }
+            } while (threadCursor);
+
+            const explicitlyResolved = body =>
+              !/\bUNRESOLVED\b/i.test(body || '') &&
+              (/\*\*RESOLVED(?:\.|\*\*)/i.test(body || '') ||
+               /✅\s*Review thread resolved\.?/i.test(body || ''));
+
+            const active = [];
+            for (const verification of latestVerification.values()) {
+              const replies = comments
+                .filter(
+                  (comment) =>
+                    comment.user?.login === 'coderabbitai[bot]' &&
+                    getRootId(comment) === verification.findingId &&
+                    comment.id > verification.comment.id &&
+                    !/Review rate limited|Review limit reached/i.test(comment.body ?? '')
+                )
+                .sort((a, b) => b.id - a.id);
+
+              const latestReply = replies[0];
+              // Verify the latest CodeRabbit answer against the live thread.
+              // An explicit RESOLVED reply is normalized by auto-merge.
+              if (!latestReply ||
+                  !unresolvedRoots.has(verification.findingId) ||
+                  explicitlyResolved(latestReply.body)) {
+                continue;
+              }
+
+              active.push({
+                review_id: verification.reviewId,
+                finding_id: verification.findingId,
+                unresolved_id: latestReply.id,
+                verified_head: verification.verifiedHead,
+              });
+            }
+
+            active.sort((a, b) => a.finding_id - b.finding_id);
+
+            const pr = await github.rest.pulls.get({
+              owner,
+              repo,
+              pull_number: pullNumber,
+            });
+
+            if (active.length === 0) {
+              core.notice('No currently unresolved CodeRabbit findings remain to batch.');
+              core.setOutput('should_run', 'false');
+              core.setOutput('items_json', '[]');
+              return;
+            }
+
+            core.notice(
+              `Batching ${active.length} unresolved CodeRabbit finding(s) in one OpenCode run.`
+            );
+            let headSha = pr.data.head.sha;
+            if (pr.data.head.repo?.full_name === `${owner}/${repo}`) {
+              const { data: headRef } = await github.rest.git.getRef({
+                owner,
+                repo,
+                ref: `heads/${pr.data.head.ref}`,
+              });
+              if (headRef?.object?.sha) headSha = headRef.object.sha;
+            }
+
+            core.setOutput('should_run', 'true');
+            core.setOutput('pr_number', String(pullNumber));
+            core.setOutput('head_ref', pr.data.head.ref);
+            core.setOutput('head_sha', headSha);
+            core.setOutput('items_json', JSON.stringify(active));
+
+      - name: Dispatch one batched repair to canonical OpenCode
+        if: steps.context.outputs.should_run == 'true'
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
+        env:
+          PR_NUMBER: ${{ steps.context.outputs.pr_number }}
+          HEAD_REF: ${{ steps.context.outputs.head_ref }}
+          COLLECTED_HEAD: ${{ steps.context.outputs.head_sha }}
+          UNRESOLVED_ITEMS_JSON: ${{ steps.context.outputs.items_json }}
+          CONTINUUM_OPENCODE_WORKFLOW: ${{ inputs.opencode_workflow || vars.CONTINUUM_OPENCODE_WORKFLOW || 'continuum-opencode.yml' }}
+        with:
+          # A PAT-authored dispatch reliably triggers the OpenCode workflow,
+          # while regular collection uses the cheaper read-only GITHUB_TOKEN.
+          github-token: ${{ secrets.TAP_PAT }}
+          script: |
+            const crypto = require('crypto');
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            // The canonical OpenCode executor is a caller workflow, not this
+            // reusable engine. Keep the legacy name as the default so an
+            // installed consumer that sets nothing is byte-identical, while
+            // Continuum dogfood dispatches its dispatchable opencode.yml.
+            function resolveOpencodeWorkflow() {
+              const configured = String(
+                process.env.CONTINUUM_OPENCODE_WORKFLOW ||
+                  'continuum-opencode.yml'
+              ).trim();
+              if (
+                !configured.endsWith('.yml') ||
+                configured.includes('/') ||
+                configured.includes('\\') ||
+                configured.includes('..')
+              ) {
+                throw new Error(
+                  `Invalid OpenCode caller workflow: ${configured}. ` +
+                  'Expected a bare workflow file name such as opencode.yml.'
+                );
+              }
+              return configured;
+            }
+            const opencodeWorkflow = resolveOpencodeWorkflow();
+            const pullNumber = Number(process.env.PR_NUMBER);
+            const head = String(process.env.COLLECTED_HEAD || '');
+            const headRef = String(process.env.HEAD_REF || '');
+            const items = JSON.parse(process.env.UNRESOLVED_ITEMS_JSON || '[]');
+            if (!Number.isInteger(pullNumber) || pullNumber <= 0 ||
+                !/^[0-9a-f]{40}$/.test(head) ||
+                !/^[A-Za-z0-9_./-]+$/.test(headRef) ||
+                !Array.isArray(items) || items.length === 0 || items.length > 80) {
+              throw new Error('Invalid CodeRabbit batch/PR identity; refusing dispatch.');
+            }
+            const seen = new Set();
+            for (const item of items) {
+              if (!Number.isInteger(item.review_id) || item.review_id <= 0 ||
+                  !Number.isInteger(item.finding_id) || item.finding_id <= 0 ||
+                  !Number.isInteger(item.unresolved_id) || item.unresolved_id <= 0 ||
+                  !/^[0-9a-f]{40}$/.test(String(item.verified_head || '')) ||
+                  seen.has(item.finding_id)) {
+                throw new Error('Malformed or duplicate CodeRabbit unresolved finding.');
+              }
+              seen.add(item.finding_id);
+            }
+            const batch = JSON.stringify(items);
+            if (Buffer.byteLength(batch, 'utf8') > 30000) {
+              throw new Error('CodeRabbit batch exceeds workflow-dispatch safe payload.');
+            }
+            const live = (await github.rest.pulls.get({
+              owner, repo, pull_number: pullNumber,
+            })).data;
+            if (live.state !== 'open' || live.head?.repo?.full_name !== `${owner}/${repo}` ||
+                live.head.sha !== head || live.head.ref !== headRef) {
+              core.notice('PR HEAD or state advanced during CodeRabbit batching; deferring to next reconciliation.');
+              return;
+            }
+            const batchKey = crypto.createHash('sha256')
+              .update(head + '\n' + batch).digest('hex');
+            const marker =
+              `<!-- continuum-coderabbit-batch head=${head} digest=${batchKey} -->`;
+            const priorComments = await github.paginate(github.rest.issues.listComments, {
+              owner, repo, issue_number: pullNumber, per_page: 100,
+            });
+            // Dispatch is NOT completion. The executor can finish a green
+            // workflow without invoking the model when it rejects the batch,
+            // or a provider can fail before publishing anything. Never make
+            // the enqueue marker a permanent terminal state.
+            const attempts = priorComments
+              .filter(comment => (comment.body || '').includes(marker))
+              .sort((a, b) => Number(b.id) - Number(a.id));
+            if (attempts.length) {
+              const latest = attempts[0];
+              const latestAt = Date.parse(latest.created_at || '');
+              if (!Number.isFinite(latestAt)) {
+                throw new Error('Cannot establish the prior batch dispatch time.');
+              }
+              // Bounded infrastructure backoff, shared by event and scheduled
+              // reconciliation. The source finding and exact HEAD are
+              // revalidated on every pass above.
+              const retryDelayMinutes = Math.min(80, 10 * 2 ** Math.min(3, attempts.length - 1));
+              if (Date.now() - latestAt < retryDelayMinutes * 60_000) {
+                core.notice(
+                  `CodeRabbit batch already queued: retry backoff ${retryDelayMinutes}m for this exact head/findings.`
+                );
+                return;
+              }
+              const { data: runsData } = await github.rest.actions.listWorkflowRuns({
+                owner, repo, workflow_id: opencodeWorkflow,
+                event: 'workflow_dispatch', per_page: 100,
+              });
+              const matching = (runsData.workflow_runs || []).filter(run =>
+                String(run.display_title || '') === `OpenCode repair PR #${pullNumber}` &&
+                Date.parse(run.created_at || '') >= latestAt - 15_000
+              );
+              if (matching.some(run => run.status !== 'completed')) {
+                core.notice('Canonical OpenCode repair for this PR is still active; duplicate batch suppressed.');
+                return;
+              }
+              if (!matching.length && Date.now() - latestAt < 4 * 60 * 60_000) {
+                // A bounded workflow-run listing may lose a busy run outside
+                // the window. Do not race an unobservable in-flight agent;
+                // the periodic reconciliation can retry after that deadline.
+                core.warning('Previous dispatch run not visible in bounded Actions history; deferring.');
+                return;
+              }
+              core.warning(
+                `CodeRabbit batch remains unresolved on identical HEAD after ${attempts.length} completed dispatch(es). Re-dispatching through canonical OpenCode with bounded backoff.`
+              );
+            }
+
+            // The optional batch input is an additive consumer API. An
+            // already-installed caller may predate it: route each distinct
+            // source review to the SAME canonical OpenCode executor until
+            // the next installer upgrade. Never invoke an independent model.
+            const caller = (await github.rest.repos.getContent({
+              owner, repo, path: `.github/workflows/${opencodeWorkflow}`,
+              ref: context.payload.repository.default_branch,
+            })).data;
+            if (!caller || typeof caller.content !== 'string') {
+              throw new Error('Cannot inspect consumer OpenCode caller for batch compatibility.');
+            }
+            const callerSource = Buffer.from(caller.content.replace(/\n/g, ''), 'base64').toString('utf8');
+            const supportsBatch = /^\s+unresolved_items_json:\s*$/m.test(callerSource);
+            const distinctReviews = [...new Set(items.map(item => item.review_id))];
+            for (const reviewId of (supportsBatch ? [items[0].review_id] : distinctReviews)) {
+              const inputs = {
+                mode: 'coderabbit-fix',
+                pr_number: String(pullNumber),
+                head_ref: headRef,
+                review_id: String(reviewId),
+              };
+              if (supportsBatch) inputs.unresolved_items_json = batch;
+              await github.rest.actions.createWorkflowDispatch({
+                owner, repo,
+                workflow_id: opencodeWorkflow,
+                ref: context.payload.repository.default_branch,
+                inputs,
+              });
+            }
+            if (!supportsBatch) {
+              core.warning(
+                'Consumer OpenCode caller lacks batch input: used one canonical repair per distinct review. Run the Continuum installer to enable efficient batching.'
+              );
+            }
+            await github.rest.issues.createComment({
+              owner, repo, issue_number: pullNumber,
+              body: [
+                marker,
+                '⚡ **Continuum · coderabbit-unresolved**',
+                '<!-- continuum-origin role=continuum component=coderabbit-unresolved -->',
+                `Queued one canonical OpenCode repair for ${items.length} current unresolved CodeRabbit finding(s) (attempt ${attempts.length + 1}) on HEAD \`${head}\`.`,
+              ].join('\n'),
+            });
+            core.notice(`Dispatched canonical OpenCode for ${items.length} unresolved finding(s) of PR #${pullNumber}.`);

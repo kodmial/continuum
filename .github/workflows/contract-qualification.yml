@@ -1,0 +1,39 @@
+name: Contract qualification
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+  schedule:
+    # Live canary against current main (Layer 3): a bounded probe that
+    # detects lack of forward progress and fails loudly with exact IDs.
+    - cron: '23 5 * * *'
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: Pull request number carrying the candidate HEAD
+        required: false
+        type: string
+      head_sha:
+        description: Exact HEAD SHA to qualify instead of the PR head
+        required: false
+        type: string
+      mode:
+        description: Qualification mode (verify or canary)
+        required: false
+        type: string
+
+permissions:
+  actions: read
+  contents: read
+  pull-requests: read
+  statuses: write
+
+jobs:
+  call:
+    uses: kodmial/continuum/.github/workflows/continuum-contract-qualification.yml@main
+    secrets: inherit
+    with:
+      continuum_ref: main
+      pr_number: "${{ inputs.pr_number || github.event.pull_request.number }}"
+      head_sha: "${{ inputs.head_sha || github.event.pull_request.head.sha }}"
+      mode: "${{ inputs.mode || (github.event_name == 'schedule' && 'canary' || 'verify') }}"

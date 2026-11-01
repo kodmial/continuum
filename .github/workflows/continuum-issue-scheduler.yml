@@ -1,0 +1,1380 @@
+name: Issue scheduler
+
+on:
+  workflow_call:
+    inputs:
+      continuum_ref:
+        description: Continuum revision supplying fallback scripts
+        type: string
+        default: main
+        required: false
+      periodic_wake:
+        description: >-
+          Optional external periodic signal. The exact value `true` marks a
+          workflow_dispatch as periodic so a second delivery in the same
+          native scheduling window is a cheap NOOP. Native schedule runs are
+          always periodic. Any other value keeps ordinary manual dispatch
+          behavior unchanged; this is a mode selector, never an authorization
+          override.
+        type: string
+        default: 'false'
+        required: false
+      wip_limit:
+        description: >-
+          Concurrent in-progress issues the scheduler may hold. Empty falls
+          back to AUTOMATION_WIP_LIMIT.
+        type: string
+        required: false
+        default: ''
+      lease_minutes:
+        description: >-
+          Minutes a reservation stays valid without a PR appearing. Empty falls
+          back to AUTOMATION_LEASE_MINUTES.
+        type: string
+        required: false
+        default: ''
+      max_dispatch_attempts:
+        description: >-
+          Dispatch attempts before an issue is paused. Empty falls back to
+          AUTOMATION_MAX_DISPATCH_ATTEMPTS.
+        type: string
+        required: false
+        default: ''
+      dispatch_marker:
+        description: >-
+          Hidden HTML marker written into each dispatch comment and counted
+          towards max_dispatch_attempts. Empty falls back to
+          AUTOMATION_DISPATCH_MARKER. Must match the marker the consumer's
+          OpenCode workflow and the OpenCode watchdog are called with.
+        type: string
+        required: false
+        default: '<!-- issue-scheduler-dispatch -->'
+      in_progress_label:
+        description: >-
+          Label holding a reservation while OpenCode starts. Empty falls back to
+          AUTOMATION_IN_PROGRESS_LABEL. Must match the watchdog's
+          in_progress_label.
+        type: string
+        required: false
+        default: 'automation:in-progress'
+      pause_marker:
+        description: >-
+          Label that pauses automation until removed by a human. Empty falls
+          back to AUTOMATION_PAUSE_LABEL. Must match the watchdog's
+          pause_marker.
+        type: string
+        required: false
+        default: 'automation:paused'
+      qualifying_label:
+        description: >-
+          Label marking implementation-merged capabilities that are waiting
+          on mandatory live qualification. Empty falls back to
+          AUTOMATION_QUALIFYING_LABEL. The qualification gate adds it
+          instead of closing the issue when an implementation PR merges
+          while mandatory qualification is still pending.
+        type: string
+        required: false
+        default: 'automation:qualifying'
+      blocked_label:
+        description: >-
+          Label marking capabilities whose mandatory qualification failed
+          and that need repair. Empty falls back to
+          AUTOMATION_BLOCKED_LABEL. The qualification gate adds it on
+          qualification failure and clears it when a rerun is due.
+        type: string
+        required: false
+        default: 'automation:blocked'
+      post_pause_comment:
+        description: >-
+          Post a comment on an issue when the scheduler pauses it. Only the
+          exact string `false` disables the comment; any other value, empty
+          included, keeps it enabled.
+        type: string
+        required: false
+        default: 'true'
+      reset_markers:
+        description: >-
+          Clear existing dispatch markers before dispatching, so a consumer
+          restarting automation does not inherit a spent attempt budget.
+        type: string
+        required: false
+        default: 'false'
+      require_priority_label:
+        description: >-
+          Dispatch only issues carrying a priority label. Empty falls back to
+          AUTOMATION_REQUIRE_PRIORITY_LABEL.
+        type: string
+        required: false
+        default: 'false'
+      ready_label:
+        description: >-
+          Optional admission label for automatic implementation. Empty (the
+          default) keeps the current behavior unchanged. When set, falls back
+          to AUTOMATION_READY_LABEL, and the scheduler auto-dispatches only
+          issues carrying that label. Qualification dispatch and manual owner
+          `/oc` never require it.
+        type: string
+        required: false
+        default: ''
+      command_grace_minutes:
+        description: >-
+          Race window after a manual owner `/oc` in which the scheduler will not
+          enqueue a second OpenCode run. Empty falls back to
+          AUTOMATION_COMMAND_GRACE_MINUTES.
+        type: string
+        required: false
+        default: '5'
+      child_owned_marker:
+        description: >-
+          Deprecated compatibility input. Repository-level child routing is
+          controlled by CONTINUUM_ROLE; issue body markers no longer affect
+          scheduler admission.
+        type: string
+        required: false
+        default: '<!-- continuum-child-owned -->'
+      legacy_child_owned_marker:
+        description: >-
+          Deprecated compatibility input retained so older callers keep working.
+          Legacy issue body markers no longer affect scheduler admission.
+        type: string
+        required: false
+        default: '<!-- runtime-worker-owned -->'
+      opencode_workflow_name:
+        description: >-
+          `name:` of the consumer's OpenCode caller whose in-flight runs count as
+          active work. Empty falls back to CONTINUUM_OPENCODE_WORKFLOW_NAME.
+        type: string
+        required: false
+        default: 'OpenCode agent'
+      opencode_workflow_path:
+        description: >-
+          Path of the consumer's OpenCode caller, for callers whose runs predate
+          `run-name:`. Empty falls back to CONTINUUM_OPENCODE_WORKFLOW_PATH.
+        type: string
+        required: false
+        default: '.github/workflows/continuum-opencode.yml'
+      dispatch_ref:
+        description: >-
+          Git ref every `workflow_dispatch` from this job targets. Dispatching
+          at a branch other than the one holding the workflow avoids a self-run
+          on a consumer that pushes to main. Empty falls back to
+          vars.CONTINUUM_DISPATCH_REF, then to `main`.
+        type: string
+        required: false
+        default: 'main'
+      opencode_dispatch:
+        description: >-
+          How a ready issue reaches OpenCode: `comment` posts the owner's `/oc`
+          command on the issue (the default, and the only path that needs no
+          extra permission), `workflow` dispatches the OpenCode caller's
+          `issue` mode directly instead. Use `workflow` only when the OpenCode
+          caller is installed without an `issue_comment` trigger. Any other
+          value fails the run, because `workflow_call` cannot declare an
+          enumerated `choice` input. Empty falls back to
+          vars.CONTINUUM_OPENCODE_DISPATCH.
+        type: string
+        required: false
+        default: 'comment'
+      execution_label_routes:
+        description: >-
+          Label-driven execution routes, one per line, as
+          `<issue label>|<workflow file name>|<input>=<value>,...`. When a
+          selected issue carries one of these labels the scheduler dispatches
+          that workflow with those inputs plus `issue_number` instead of waking
+          OpenCode, and still records the dispatch marker. Empty (the default)
+          routes nothing, so no execution workflow is dispatched by label.
+          Empty falls back to vars.CONTINUUM_EXECUTION_LABEL_ROUTES.
+        type: string
+        required: false
+        default: ''
+      child_dispatch_workflow:
+        description: >-
+          Workflow file name the scheduler wakes after every reconcile pass, so
+          a parent repository's downstream dispatcher does not have to wait for
+          its own cron. Empty — the default — wakes nothing, because a parent
+          that has no dispatcher must not get a 404 dispatch. Empty falls back
+          to vars.CONTINUUM_CHILD_DISPATCH_WORKFLOW.
+        type: string
+        required: false
+        default: ''
+      count_open_prs_as_wip:
+        description: >-
+          Whether an open OpenCode PR consumes an implementation WIP slot.
+          Keep true for legacy consumers that intentionally cap open PRs;
+          set false when WIP means actively running implementation only.
+        type: string
+        required: false
+        default: 'true'
+      pause_on_failure:
+        description: >-
+          Whether exhausted dispatches or closed-without-merge OpenCode PRs
+          enter a terminal automation pause. Set false for fully autonomous
+          consumers that must keep retrying without human intervention.
+        type: string
+        required: false
+        default: 'true'
+      caller_event_name:
+        description: >-
+          Event name observed by the caller (github.event_name). A called
+          workflow always sees github.event_name as workflow_call, so the
+          caller must forward its own trigger name for the child wake-up
+          gate. Empty disables the wake-up; cron remains the backstop.
+        type: string
+        required: false
+        default: ''
+      caller_issue_number:
+        description: >-
+          Issue number observed by the caller (github.event.issue.number).
+          Empty for non-issue events; the wake-up concurrency group falls
+          back to the run id when empty.
+        type: string
+        required: false
+        default: ''
+
+# No `actions: write` here: every dispatch in this workflow authenticates with
+# the TAP_PAT classic PAT (repo + workflow scopes), exactly like every other
+# Continuum dispatcher, so the caller's GITHUB_TOKEN keeps its narrow grant.
+permissions:
+  actions: read
+  contents: read
+  issues: read
+  pull-requests: read
+
+concurrency:
+  group: issue-scheduler
+  cancel-in-progress: false
+
+jobs:
+  wake_parent:
+    # Best-effort acceleration only (kodmial/continuum#261), retained for
+    # already-installed child callers that still forward issue events. It is
+    # never required for eventual dispatch: the public parent's scheduled
+    # reconciler below independently discovers verified child repositories
+    # and their open eligible tasks, so a failed or missing wake-up — for
+    # example a private child that cannot start this job at all — cannot
+    # strand work and needs no manual rerun.
+    # New caller stubs skip child events at the caller level and never reach
+    # this job. Duplicate wakes
+    # coalesce per issue via the concurrency group; the parent dispatch is
+    # idempotent and cron stays the missed-event backstop.
+    # The gate reads inputs.caller_event_name (not github.event_name, which is
+    # always workflow_call inside a called workflow) and groups by
+    # inputs.caller_issue_number (not github.event.issue, which is empty in a
+    # called workflow). Bursts coalesce per issue: the parent dispatch is
+    # idempotent, so a newer wake supersedes queued duplicates and cron stays
+    # the missed-event backstop.
+    if: vars.CONTINUUM_ROLE == 'child' && (inputs.caller_event_name == 'issues' || inputs.caller_event_name == 'issue_comment')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    timeout-minutes: ${{ fromJSON(vars.AUTOMATION_SCHEDULER_TIMEOUT_MINUTES || '5') }}
+    concurrency:
+      group: continuum-child-parent-wakeup-${{ inputs.caller_issue_number || github.run_id }}
+      cancel-in-progress: true
+    steps:
+      - name: Checkout Continuum engine for parent wake-up verification
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: kodmial/continuum
+          ref: ${{ inputs.continuum_ref }}
+          path: .continuum-engine
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Verify relationship and wake parent scheduler
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.TAP_PAT }}
+        run: |
+          set -euo pipefail
+          runtime="$GITHUB_WORKSPACE/.continuum-engine/.github/scripts/delegation_runtime.py"
+
+          # Fetch one named variable directly. A missing variable (404) is
+          # persistent misconfiguration and returns 2 so callers fail closed
+          # with a config error; any other API failure is an outage and
+          # refuses the wake-up. Listing the whole collection
+          # would truncate past 100 variables and over-expose values.
+          fetch_variable() {
+            local repository="$1" name="$2"
+            local err_file value rc
+            if [ -z "${RUNNER_TEMP:-}" ]; then
+              echo "::error::Child relationship lookup is unavailable; parent wake-up refused." >&2
+              return 4
+            fi
+            if ! err_file="$(mktemp -p "$RUNNER_TEMP" continuum-var-err.XXXXXX)"; then
+              echo "::error::Child relationship lookup is unavailable; parent wake-up refused." >&2
+              return 4
+            fi
+            if value="$(gh api "repos/$repository/actions/variables/$name" --jq '.value // ""' 2>"$err_file")"; then
+              rc=0
+            else
+              rc=$?
+              if grep -qiE '\b404\b|Not Found' "$err_file" 2>/dev/null; then
+                cat "$err_file" >&2 || true
+                rm -f "$err_file"
+                return 2
+              fi
+              cat "$err_file" >&2 || true
+            fi
+            rm -f "$err_file"
+            if [ "$rc" -eq 0 ]; then
+              printf '%s' "$value"
+              return 0
+            fi
+            return "$rc"
+          }
+
+          if child_role="$(fetch_variable "$GITHUB_REPOSITORY" CONTINUUM_ROLE)"; then
+            :
+          else
+            rc=$?
+            if [ "$rc" -eq 2 ]; then
+              echo "::error::Child relationship variable CONTINUUM_ROLE is missing; parent wake-up refused."
+              exit 2
+            fi
+            echo "::error::Child relationship lookup is unavailable; parent wake-up refused."
+            exit 4
+          fi
+          if child_id="$(fetch_variable "$GITHUB_REPOSITORY" CONTINUUM_CHILD_ID)"; then
+            :
+          else
+            rc=$?
+            if [ "$rc" -eq 2 ]; then
+              echo "::error::Child relationship variable CONTINUUM_CHILD_ID is missing; parent wake-up refused."
+              exit 2
+            fi
+            echo "::error::Child relationship lookup is unavailable; parent wake-up refused."
+            exit 4
+          fi
+          if parent="$(fetch_variable "$GITHUB_REPOSITORY" CONTINUUM_PARENT)"; then
+            :
+          else
+            rc=$?
+            if [ "$rc" -eq 2 ]; then
+              echo "::error::Child relationship variable CONTINUUM_PARENT is missing; parent wake-up refused."
+              exit 2
+            fi
+            echo "::error::Child relationship lookup is unavailable; parent wake-up refused."
+            exit 4
+          fi
+
+          # Fail fast on visibly malformed declarations without echoing
+          # values. Authoritative format validation and the bidirectional
+          # agreement proof both happen below, where the child declaration
+          # is matched against the verified parent allow-list with the same
+          # parser parent-side delegated discovery uses.
+          if [[ "$parent" == *$'\n'* || "$child_id" == *$'\n'* || "$parent" == *$'\r'* || "$child_id" == *$'\r'* ]]; then
+            echo "::error::Child relationship declaration is invalid; parent wake-up refused."
+            exit 2
+          fi
+          printf '::add-mask::%s\n' "$parent"
+          printf '::add-mask::%s\n' "$child_id"
+          if [ ! -f "$runtime" ]; then
+            echo "::error::Parent verification lookup is unavailable; parent wake-up refused."
+            exit 4
+          fi
+
+          parent_owner="${parent%%/*}"
+          parent_name="${parent#*/}"
+          if [[ ! "$parent" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || [[ "$parent_owner" == "." || "$parent_owner" == ".." || "$parent_name" == "." || "$parent_name" == ".." ]]; then
+            echo "::error::Child relationship declaration is invalid; parent wake-up refused."
+            exit 2
+          fi
+          if [ -z "$child_id" ]; then
+            echo "::error::Bidirectional parent/child verification failed; parent wake-up refused."
+            exit 2
+          fi
+          if parent_role="$(fetch_variable "$parent" CONTINUUM_ROLE)"; then
+            :
+          else
+            rc=$?
+            if [ "$rc" -eq 2 ]; then
+              echo "::error::Parent relationship variable CONTINUUM_ROLE is missing; parent wake-up refused."
+              exit 2
+            fi
+            echo "::error::Parent relationship lookup is unavailable; parent wake-up refused."
+            exit 4
+          fi
+          if parent_children="$(fetch_variable "$parent" CONTINUUM_CHILDREN)"; then
+            :
+          else
+            rc=$?
+            if [ "$rc" -eq 2 ]; then
+              echo "::error::Parent relationship variable CONTINUUM_CHILDREN is missing; parent wake-up refused."
+              exit 2
+            fi
+            echo "::error::Parent relationship lookup is unavailable; parent wake-up refused."
+            exit 4
+          fi
+          if [ -z "${RUNNER_TEMP:-}" ]; then
+            echo "::error::Parent verification lookup is unavailable; parent wake-up refused."
+            exit 4
+          fi
+          if ! parent_ids_err="$(mktemp -p "$RUNNER_TEMP" continuum-parent-ids-err.XXXXXX)"; then
+            echo "::error::Parent verification lookup is unavailable; parent wake-up refused."
+            exit 4
+          fi
+          parent_ids_file="$(mktemp -p "$RUNNER_TEMP" continuum-parent-ids.XXXXXX)" || {
+            echo "::error::Parent verification lookup is unavailable; parent wake-up refused."
+            rm -f "$parent_ids_err"
+            exit 4
+          }
+          if ! python3 "$runtime" parent-variable-ids \
+            --role "$parent_role" \
+            --children-json "$parent_children" >"$parent_ids_file" 2>"$parent_ids_err"; then
+            cat "$parent_ids_err" >&2 || true
+            rm -f "$parent_ids_file" "$parent_ids_err"
+            echo "::error::Parent verification lookup is unavailable; parent wake-up refused."
+            exit 4
+          fi
+          rm -f "$parent_ids_err"
+          # Read the parent repository's canonical identity back from the API
+          # instead of reusing the child's spelling: exact agreement with this
+          # independently verified value is part of the bidirectional proof
+          # below. Casing follows the parent's canonical full_name, matching
+          # the exact-match semantics parent-side discovery already enforces.
+          if [ -z "${RUNNER_TEMP:-}" ]; then
+            echo "::error::Parent verification lookup is unavailable; parent wake-up refused."
+            rm -f "$parent_ids_file"
+            exit 4
+          fi
+          if ! parent_identity_err="$(mktemp -p "$RUNNER_TEMP" continuum-parent-identity-err.XXXXXX)"; then
+            echo "::error::Parent verification lookup is unavailable; parent wake-up refused."
+            rm -f "$parent_ids_file"
+            exit 4
+          fi
+          if ! parent_identity="$(gh api "repos/$parent" --jq '.full_name // ""' 2>"$parent_identity_err")" || \
+             [ -z "$parent_identity" ]; then
+            cat "$parent_identity_err" >&2 || true
+            rm -f "$parent_ids_file" "$parent_identity_err"
+            echo "::error::Parent verification lookup is unavailable; parent wake-up refused."
+            exit 4
+          fi
+          rm -f "$parent_identity_err"
+          printf '::add-mask::%s\n' "$parent_identity"
+          # Bidirectional agreement in one authoritative step. Each candidate
+          # id comes from the verified parent allow-list while the declared
+          # values come from the child, so equality here proves cross-party
+          # agreement instead of comparing the child declaration against
+          # itself. The allow-list holds opaque id slugs (never
+          # `owner/repo` names), so repository-name membership is never
+          # tested against it.
+          verified_child_id=""
+          while IFS= read -r candidate_id; do
+            [ -n "$candidate_id" ] || continue
+            if python3 "$runtime" verify-child-variables \
+              --role "$child_role" \
+              --declared-id "$child_id" \
+              --declared-parent "$parent" \
+              --child-id "$candidate_id" \
+              --parent-repository "$parent_identity" >/dev/null 2>&1; then
+              verified_child_id="$candidate_id"
+              break
+            fi
+          done < "$parent_ids_file"
+          rm -f "$parent_ids_file"
+          if [ -z "$verified_child_id" ]; then
+            echo "::error::Bidirectional parent/child verification failed; parent wake-up refused."
+            exit 2
+          fi
+          if [ -z "${RUNNER_TEMP:-}" ]; then
+            echo "::error::Parent default branch lookup is unavailable; parent wake-up refused."
+            exit 4
+          fi
+          if ! parent_err="$(mktemp -p "$RUNNER_TEMP" continuum-parent-err.XXXXXX)"; then
+            echo "::error::Parent default branch lookup is unavailable; parent wake-up refused."
+            exit 4
+          fi
+          if ! parent_ref="$(gh api "repos/$parent" --jq '.default_branch // ""' 2>"$parent_err")" || \
+             [ -z "$parent_ref" ] || ! git check-ref-format --branch "$parent_ref" >/dev/null 2>&1; then
+            cat "$parent_err" >&2 || true
+            rm -f "$parent_err"
+            echo "::error::Parent default branch lookup is unavailable; parent wake-up refused."
+            exit 4
+          fi
+          rm -f "$parent_err"
+
+          if [ -z "${RUNNER_TEMP:-}" ]; then
+            echo "::error::Parent dispatch lookup is unavailable; parent wake-up refused." >&2
+            exit 4
+          fi
+          if ! dispatch_err="$(mktemp -p "$RUNNER_TEMP" continuum-dispatch-err.XXXXXX)"; then
+            echo "::error::Parent dispatch lookup is unavailable; parent wake-up refused." >&2
+            exit 4
+          fi
+          if ! gh api --method POST \
+            "repos/$parent/actions/workflows/continuum-issue-scheduler.yml/dispatches" \
+            -f ref="$parent_ref" >/dev/null 2>"$dispatch_err"; then
+            cat "$dispatch_err" >&2 || true
+            rm -f "$dispatch_err"
+            echo "::error::Verified parent scheduler could not be dispatched."
+            exit 4
+          fi
+          rm -f "$dispatch_err"
+
+          echo "Woke verified parent scheduler."
+
+  schedule:
+    # Repository role is the routing authority. A child keeps this workflow
+    # installed, but local automatic scheduling is fail-safe disabled.
+    # The parent scheduled reconciler is authoritative for delegated work
+    # (kodmial/continuum#261): child task discovery, dependency checks,
+    # priority ordering, WIP accounting and dispatch all happen here, in the
+    # public parent, without any successful Actions job in the child
+    # repository. A new eligible child issue is therefore dispatched by cron
+    # reconciliation alone; no child wake-up, workflow_dispatch, comment,
+    # label toggle or human rerun is ever required.
+    if: vars.CONTINUUM_ROLE != 'child'
+    runs-on: ubuntu-latest
+    timeout-minutes: ${{ fromJSON(vars.AUTOMATION_SCHEDULER_TIMEOUT_MINUTES || '5') }}
+    env:
+      WIP_LIMIT: ${{ inputs.wip_limit || vars.AUTOMATION_WIP_LIMIT || '2' }}
+      LEASE_MINUTES: ${{ inputs.lease_minutes || vars.AUTOMATION_LEASE_MINUTES || '45' }}
+      MAX_DISPATCH_ATTEMPTS: ${{ inputs.max_dispatch_attempts || vars.AUTOMATION_MAX_DISPATCH_ATTEMPTS || '2' }}
+      DISPATCH_MARKER: ${{ inputs.dispatch_marker || vars.AUTOMATION_DISPATCH_MARKER || '<!-- issue-scheduler-dispatch -->' }}
+      IN_PROGRESS_LABEL: ${{ inputs.in_progress_label || vars.AUTOMATION_IN_PROGRESS_LABEL || 'automation:in-progress' }}
+      PAUSE_LABEL: ${{ inputs.pause_marker || vars.AUTOMATION_PAUSE_LABEL || 'automation:paused' }}
+      QUALIFYING_LABEL: ${{ inputs.qualifying_label || vars.AUTOMATION_QUALIFYING_LABEL || 'automation:qualifying' }}
+      BLOCKED_LABEL: ${{ inputs.blocked_label || vars.AUTOMATION_BLOCKED_LABEL || 'automation:blocked' }}
+      POST_PAUSE_COMMENT: ${{ inputs.post_pause_comment || 'true' }}
+      RESET_MARKERS: ${{ inputs.reset_markers || 'false' }}
+      REQUIRE_PRIORITY_LABEL: ${{ inputs.require_priority_label || vars.AUTOMATION_REQUIRE_PRIORITY_LABEL || 'false' }}
+      READY_LABEL: ${{ inputs.ready_label || vars.AUTOMATION_READY_LABEL }}
+      DEFAULT_BRANCH: ${{ github.event.repository.default_branch || 'main' }}
+      OWNER_RESUME_CI_WORKFLOW: ${{ vars.CONTINUUM_CI_WORKFLOW_NAME || 'CI' }}
+      OWNER_RESUME_CONTRACT_GATE_WORKFLOW: ${{ vars.CONTINUUM_CONTRACT_GATE_WORKFLOW_NAME || 'Continuum Contract Gate' }}
+      COMMAND_GRACE_MINUTES: ${{ inputs.command_grace_minutes || vars.AUTOMATION_COMMAND_GRACE_MINUTES || '5' }}
+      OPENCODE_WORKFLOW_NAME: ${{ inputs.opencode_workflow_name || vars.CONTINUUM_OPENCODE_WORKFLOW_NAME || 'OpenCode agent' }}
+      OPENCODE_WORKFLOW_PATH: ${{ inputs.opencode_workflow_path || vars.CONTINUUM_OPENCODE_WORKFLOW_PATH || '.github/workflows/continuum-opencode.yml' }}
+      DISPATCH_REF: ${{ inputs.dispatch_ref || vars.CONTINUUM_DISPATCH_REF || 'main' }}
+      OPENCODE_DISPATCH: ${{ inputs.opencode_dispatch || vars.CONTINUUM_OPENCODE_DISPATCH || 'comment' }}
+      EXECUTION_LABEL_ROUTES: ${{ inputs.execution_label_routes || vars.CONTINUUM_EXECUTION_LABEL_ROUTES }}
+      CHILD_DISPATCH_WORKFLOW: ${{ inputs.child_dispatch_workflow || vars.CONTINUUM_CHILD_DISPATCH_WORKFLOW }}
+      CHILD_WORKER_WORKFLOW: ${{ vars.CONTINUUM_CHILD_WORKER_WORKFLOW || 'continuum-child-worker.yml' }}
+      CHILD_REVIEW_WORKFLOW: ${{ vars.CONTINUUM_CHILD_REVIEW_WORKFLOW || 'continuum-child-review.yml' }}
+      CHILD_PR_REVIEW_WORKFLOW: ${{ vars.CONTINUUM_CHILD_PR_REVIEW_WORKFLOW || 'continuum-child-pr-review.yml' }}
+      # Authoritative review provider for delegated child PRs (issue #244):
+      # `pr-agent` routes child PR-Agent lifecycles through the parent
+      # control plane; any other value keeps the legacy independent child
+      # review path. Exactly one path ever runs.
+      REVIEW_PROVIDER: ${{ vars.CONTINUUM_REVIEW_PROVIDER || 'none' }}
+      COUNT_OPEN_PRS_AS_WIP: ${{ inputs.count_open_prs_as_wip || vars.AUTOMATION_COUNT_OPEN_PRS_AS_WIP || 'true' }}
+      PAUSE_ON_FAILURE: ${{ inputs.pause_on_failure || vars.AUTOMATION_PAUSE_ON_FAILURE || 'false' }}
+      READ_GITHUB_TOKEN: ${{ github.token }}
+
+    steps:
+      # Cheap cross-source guard (kodmial/continuum#375). Native schedule is
+      # always periodic; an external cron sends workflow_dispatch with
+      # periodic_wake=true. Both map to the same native 10-minute window. A
+      # successful completed periodic run from either source is processing
+      # evidence, so a second periodic signal exits before any checkout,
+      # pagination, runtime download or domain dispatch. This is not an
+      # authorization gate: ordinary manual dispatches, issue/PR events and
+      # time-critical recovery keep their existing behavior.
+      - name: Admit periodic wake for this scheduling window
+        id: periodic_gate
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PERIODIC_WAKE: ${{ inputs.periodic_wake || 'false' }}
+          CALLER_EVENT_NAME: ${{ inputs.caller_event_name }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          set -uo pipefail
+          emit() {
+            echo "run=$1" >> "$GITHUB_OUTPUT"
+            echo "reason=$2" >> "$GITHUB_OUTPUT"
+          }
+
+          periodic=false
+          if [[ "${CALLER_EVENT_NAME,,}" == "schedule" ]]; then
+            periodic=true
+          fi
+          case "${PERIODIC_WAKE,,}" in
+            true|1|yes|on) periodic=true ;;
+          esac
+          if [[ "$periodic" != "true" ]]; then
+            emit true "non-periodic"
+            exit 0
+          fi
+
+          # The native Issue scheduler cron is 7,17,27,37,47,57 * * * *.
+          # Map receipt time onto that anchored 10-minute window instead of
+          # treating two nearby HTTP requests as one window. A native run
+          # delayed by a few minutes stays in its intended window.
+          now="$(date -u +%s)"
+          offset=$((7 * 60))
+          interval=$((10 * 60))
+          window_start=$(( now - ((now - offset) % interval) ))
+
+          if ! workflow_id="$(gh api \
+            "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
+            --jq '.workflow_id' 2>/dev/null)" || [[ -z "$workflow_id" || "$workflow_id" == "null" ]]; then
+            echo "::warning::Periodic wake dedupe lookup is unavailable; running the pass without the guard."
+            emit true "lookup-unavailable"
+            exit 0
+          fi
+
+          created="$(date -u -d "@$window_start" +%Y-%m-%dT%H:%M:%SZ)"
+          filter='[.workflow_runs[]
+            | select(.id != '"$GITHUB_RUN_ID"')
+            | select(.status == "completed" and .conclusion == "success")
+            | select(.event == "schedule" or
+                (.event == "workflow_dispatch" and
+                 ((.display_title // "") | contains("[continuum-periodic]"))))'
+          if [[ -n "${DEFAULT_BRANCH:-}" ]]; then
+            filter="$filter"'
+            | select((.head_branch // "") == "'"$DEFAULT_BRANCH"'")'
+          fi
+          filter="$filter"'
+          ] | length'
+
+          if ! evidence="$(gh api \
+            "repos/$GITHUB_REPOSITORY/actions/workflows/$workflow_id/runs?per_page=100&created=%3E%3D$created" \
+            --jq "$filter" 2>/dev/null)" || [[ -z "$evidence" ]]; then
+            echo "::warning::Periodic wake dedupe evidence could not be read; running the pass without the guard."
+            emit true "lookup-unavailable"
+            exit 0
+          fi
+
+          if [[ "$evidence" -gt 0 ]]; then
+            echo "::notice::Periodic pass for this scheduling window already completed; skipping duplicate periodic work."
+            emit false "duplicate-window"
+            exit 0
+          fi
+
+          emit true "window-due"
+
+      - name: Checkout parent control plane for delegated scheduling
+        if: steps.periodic_gate.outputs.run == 'true' && vars.CONTINUUM_ROLE == 'parent'
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Checkout Continuum engine for admission and delegated scheduling
+        if: steps.periodic_gate.outputs.run == 'true'
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: kodmial/continuum
+          ref: ${{ inputs.continuum_ref }}
+          path: .continuum-engine
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Build delegated child queue
+        id: child_queue
+        if: steps.periodic_gate.outputs.run == 'true' && vars.CONTINUUM_ROLE == 'parent'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.TAP_PAT }}
+          CHILD_CANDIDATES_FILE: ${{ runner.temp }}/continuum-child-candidates.json
+        run: |
+          set -euo pipefail
+          export CONTINUUM_ENGINE_ROOT="$GITHUB_WORKSPACE/.continuum-engine"
+          export PYTHONPATH="$CONTINUUM_ENGINE_ROOT/src"
+          resolver="$CONTINUUM_ENGINE_ROOT/.github/scripts/delegation_repository.sh"
+
+          # Delegated Child discovery is optional and needs cross-repository
+          # REST reads (kodmial/continuum#326). An unavailable discovery
+          # (exit 4) must fail closed for Child dispatch only: report a
+          # distinct degraded delegation state and let the Parent-local
+          # reconcile step still run. It must never be reported as an empty
+          # successful Child inventory, and it must recover on the next
+          # legitimate run. A genuine relationship error (exit 2) still fails
+          # the run so misconfiguration is surfaced.
+          set +e
+          plan="$(PARENT_CONFIG=.continuum.yml CHILD_REPOSITORIES="" bash "$resolver" plan)"
+          plan_rc=$?
+          set -e
+          if [[ "$plan_rc" -eq 4 ]]; then
+            echo "delegation_state=degraded" >> "$GITHUB_OUTPUT"
+            echo "active_wip=0" >> "$GITHUB_OUTPUT"
+            echo "candidate_count=0" >> "$GITHUB_OUTPUT"
+            echo "::warning::Delegated child discovery is unavailable (exit 4); failing closed for Child dispatch and scheduling Parent-local work only on this pass. Recovery happens on the next legitimate run."
+            exit 0
+          fi
+          if [[ "$plan_rc" -ne 0 ]]; then
+            echo "::error::Delegated child queue resolution failed (exit $plan_rc); refusing to continue."
+            exit "$plan_rc"
+          fi
+          echo "delegation_state=ok" >> "$GITHUB_OUTPUT"
+
+          # Keep Actions-history inspection bounded. Three pages cover the latest
+          # 300 completed runs without walking the repository's entire run history.
+          for page in 1 2 3; do
+            gh api "repos/$GITHUB_REPOSITORY/actions/runs?status=completed&per_page=100&page=$page" \
+              --jq '.workflow_runs[]
+                | select(
+                    .name == "SubTask" or
+                    .name == "SubTask review" or
+                    .name == "SubTask PR review" or
+                    .name == "Child task" or
+                    .name == "Child review" or
+                    .name == "Child PR review" or
+                    .name == "Child dispatcher" or
+                    .name == "Worker task" or
+                    .name == "Worker review" or
+                    .name == "Worker dispatcher"
+                  )
+                | .id' 2>/dev/null || break
+          done |
+          while IFS= read -r run_id; do
+            [[ -n "$run_id" ]] || continue
+            [[ "$run_id" == "$GITHUB_RUN_ID" ]] && continue
+            gh api --method DELETE \
+              "repos/$GITHUB_REPOSITORY/actions/runs/$run_id" \
+              >/dev/null 2>&1 || true
+          done
+
+          # Authoritative active-run discovery (kodmial/continuum#387). A
+          # global newest-100 all-status listing loses an older active SubTask
+          # behind completed PR-Agent/recovery churn, which admitted a second
+          # dispatch of the same task. Active states are queried with explicit
+          # server-side status filters, so old active work stays visible no
+          # matter how many unrelated completed runs arrived afterwards.
+          #
+          # A failed, malformed, rate-limited or truncated discovery is never
+          # read as "none active": delegated coding dispatch fails closed for
+          # this pass, while PR-Agent Child review (deduplicated downstream)
+          # and Parent-local scheduling continue. The next scheduler wake
+          # retries automatically.
+          active_script="$CONTINUUM_ENGINE_ROOT/.github/scripts/delegated_active_runs.sh"
+          active_runs_file="$RUNNER_TEMP/continuum-active-runs.tsv"
+          active_runs_state=ok
+          if ! bash "$active_script" snapshot --output "$active_runs_file"; then
+            active_runs_state=degraded
+            echo "::warning::Delegated active-run discovery is unavailable or truncated; new delegated coding dispatch is disabled for this pass. Child review and Parent-local scheduling continue, and the next scheduler wake retries automatically."
+          fi
+          echo "active_runs_state=$active_runs_state" >> "$GITHUB_OUTPUT"
+
+          task_active() {
+            local active_child_id="$1" kind="$2" task="$3"
+            # Uncertainty fails closed: an unavailable inventory never
+            # admits new delegated coding dispatch.
+            if [[ "$active_runs_state" != "ok" ]]; then
+              return 0
+            fi
+            bash "$active_script" task-active --file "$active_runs_file" \
+              --child-id "$active_child_id" --kind "$kind" --task "$task"
+          }
+
+          manual_pr_active() {
+            local child_id="$1" pr="$2" titles
+            if [[ "$active_runs_state" != "ok" ]]; then
+              return 0
+            fi
+            titles="$(awk -F '\t' 'NF >= 2 { print $2 }' "$active_runs_file")"
+            grep -Fxq "SubTask PR review #$pr" <<<"$titles" ||
+              grep -Fxq "Child PR review [$child_id] #$pr" <<<"$titles"
+          }
+
+          candidate_lines="$RUNNER_TEMP/continuum-child-candidates.jsonl"
+          : > "$candidate_lines"
+          declare -A active_wip_keys=()
+
+          if [[ "$active_runs_state" == "ok" ]]; then
+            while IFS= read -r title; do
+              if [[ "$title" =~ ^SubTask[[:space:]]#([0-9]+)$ ]]; then
+                active_wip_keys["subtask#${BASH_REMATCH[1]}"]=1
+              elif [[ "$title" =~ ^Child[[:space:]]task[[:space:]]\[([^]]+)\][[:space:]]#([0-9]+)$ ]]; then
+                active_wip_keys["${BASH_REMATCH[1]}#${BASH_REMATCH[2]}"]=1
+              fi
+            done < <(awk -F '\t' 'NF >= 2 { print $2 }' "$active_runs_file")
+          fi
+          coding_admission_enabled=true
+          if [[ "$active_runs_state" != "ok" ]]; then
+            coding_admission_enabled=false
+          fi
+
+          invalid=0
+          review_dispatches=0
+          pr_agent_dispatch_failures=0
+          pr_agent_transient_failures=0
+          pr_agent_deterministic_failures=0
+
+          # Resilient delegated PR-Agent fan-out (kodmial/continuum#289): one
+          # transient workflow_dispatch failure (for example GitHub HTTP 500
+          # from `gh workflow run`) must not abort the whole scheduler pass.
+          # Classification is authoritative in
+          # src/continuum/delegated_dispatch.py: HTTP 5xx, HTTP 429 /
+          # rate-limit signals, and 403 only with a rate-limit/transient
+          # marker retry with bounded backoff (minimum 5s, never a tight
+          # loop); anything else (400/401/plain 403/404/422/auth) fails
+          # closed on the first attempt and is never retried as transient.
+          # Retries cannot duplicate logical review work: a failed dispatch
+          # creates no run, and a landed recovery run dedups downstream
+          # through the stable PR-Agent operation identity. Only the opaque
+          # child id is ever passed or logged; no resolved repository name
+          # or API URL is printed here.
+          pr_agent_dispatch_is_transient() {
+            CONTINUUM_DISPATCH_OUTPUT="$1" python3 -c 'import os; from continuum.delegated_dispatch import classify_dispatch_failure; raise SystemExit(0 if classify_dispatch_failure(os.environ.get("CONTINUUM_DISPATCH_OUTPUT", "")) == "transient" else 1)'
+          }
+
+          dispatch_pr_agent_recovery_with_retry() {
+            local child_id="$1"
+            local attempt=1 max_attempts=3 delay=5
+            local dispatch_output dispatch_status
+            while true; do
+              set +e
+              dispatch_output="$(gh workflow run "continuum-pr-agent-recovery.yml" --repo "$GITHUB_REPOSITORY" -f target_child_id="$child_id" 2>&1)"
+              dispatch_status=$?
+              set -e
+              if (( dispatch_status == 0 )); then
+                return 0
+              fi
+              if pr_agent_dispatch_is_transient "$dispatch_output"; then
+                if (( attempt >= max_attempts )); then
+                  return 1
+                fi
+                sleep "$delay"
+                attempt=$((attempt + 1))
+                delay=$((delay * 2))
+                continue
+              fi
+              return 2
+            done
+          }
+
+          # Authoritative review path (issue #244): exactly one path ever
+          # runs per parent. `pr-agent` routes every child PR
+          # (owner-created and automation-created alike) through the
+          # parent-side PR-Agent lifecycle; any other value keeps the legacy
+          # independent child review path. Comparison is case-insensitive
+          # with whitespace trimmed so a `PR-Agent` spelling cannot silently
+          # fork both paths.
+          review_provider_normalized="$(tr '[:upper:]' '[:lower:]' <<<"${REVIEW_PROVIDER:-none}" | tr -d '[:space:]')"
+          pr_agent_authoritative=false
+          if [[ "$review_provider_normalized" == "pr-agent" ]]; then
+            pr_agent_authoritative=true
+          fi
+
+          while IFS= read -r row; do
+            [[ -n "$row" ]] || continue
+            child_id="$(jq -r '.id' <<<"$row")"
+            child_repo="$(jq -r '.repository' <<<"$row")"
+
+            # Single-pass dependency-state memo (#254): repeated lookups of
+            # the same blocking issue across tasks in this child cost one
+            # API read. Callers pass an output variable name (no command
+            # substitution) so the cache survives in this shell.
+            declare -A CONTINUUM_DEP_STATE=()
+            dep_state() {
+              local __out="$1" __dep="$2" __cached="__missing__"
+              if [[ -v CONTINUUM_DEP_STATE[$__dep] ]]; then
+                __cached="${CONTINUUM_DEP_STATE[$__dep]}"
+              fi
+              if [[ "$__cached" == "__missing__" ]]; then
+                if __cached="$(gh api "repos/$child_repo/issues/$__dep" --jq '.state' 2>/dev/null)" && [[ "$__cached" == "open" || "$__cached" == "closed" ]]; then
+                  CONTINUUM_DEP_STATE[$__dep]="$__cached"
+                else
+                  __cached="open"
+                fi
+              fi
+              printf -v "$__out" '%s' "$__cached"
+            }
+
+            if ! PARENT_CONFIG=.continuum.yml CHILD_REPOSITORIES="" \
+              bash "$resolver" verify "$child_id" "$child_repo" >/dev/null 2>&1; then
+              echo "::error::Delegated relationship verification failed."
+              invalid=$((invalid + 1))
+              continue
+            fi
+
+            while IFS=$'\t' read -r stale_pr stale_head; do
+              [[ -n "$stale_pr" && -n "$stale_head" ]] || continue
+              stale_task="$(
+                sed -nE 's#^(continuum-child|runtime-worker)/task-([0-9]+)-.*#\2#p' <<<"$stale_head"
+              )"
+              [[ -n "$stale_task" ]] || continue
+              stale_issue_json="$(gh api "repos/$child_repo/issues/$stale_task" 2>/dev/null || true)"
+              [[ "$(jq -r '.state // "closed"' <<<"$stale_issue_json")" == "open" ]] || continue
+
+              stale_ready=true
+              stale_body="$(jq -r '.body // ""' <<<"$stale_issue_json")"
+              stale_deps="$(
+                sed -nE 's/.*<!-- *automation-blocked-by: *([^>]*) *-->.*/\1/p' \
+                  <<<"$stale_body" | head -1 | tr ',' ' '
+              )"
+              for stale_dep in $stale_deps; do
+                stale_dep="${stale_dep//#/}"
+                stale_dep="${stale_dep//[[:space:]]/}"
+                [[ "$stale_dep" =~ ^[0-9]+$ ]] || continue
+                dep_state stale_dep_state "$stale_dep"
+                if [[ "$stale_dep_state" != "closed" ]]; then
+                  stale_ready=false
+                  break
+                fi
+              done
+              [[ "$stale_ready" == true ]] || continue
+
+              gh pr reopen "$stale_pr" --repo "$child_repo" >/dev/null 2>&1 || true
+            done < <(
+              gh pr list --repo "$child_repo" --state closed --limit 100 \
+                --json number,headRefName,mergedAt \
+                --jq '.[] | select(.mergedAt == null) | select(
+                    (.headRefName | startswith("continuum-child/task-")) or
+                    (.headRefName | startswith("runtime-worker/task-"))
+                  ) | [.number,.headRefName] | @tsv' 2>/dev/null || true
+            )
+
+            open_prs="$(
+              gh pr list --repo "$child_repo" --state open --limit 100 \
+                --json number,headRefName \
+                --jq 'sort_by(.number) | reverse | .[] | select(
+                    (.headRefName | startswith("continuum-child/task-")) or
+                    (.headRefName | startswith("runtime-worker/task-"))
+                  ) | [.number,.headRefName] | @tsv' 2>/dev/null || true
+            )"
+            open_pr_tasks="$(
+              cut -f2 <<<"$open_prs" \
+                | sed -nE 's#^(continuum-child|runtime-worker)/task-([0-9]+)-.*#\2#p'
+            )"
+
+            if [[ "${COUNT_OPEN_PRS_AS_WIP:-true}" != "false" ]]; then
+              while IFS= read -r open_task; do
+                [[ -n "$open_task" ]] || continue
+                active_wip_keys["$child_id#$open_task"]=1
+              done <<<"$open_pr_tasks"
+            fi
+
+            local_opencode_pr_tasks="$(
+              gh pr list --repo "$child_repo" --state open --limit 100 \
+                --json headRefName \
+                --jq '.[] | .headRefName | select(startswith("opencode/issue"))' \
+                | sed -nE 's#^opencode/issue([0-9]+)-.*#\1#p'
+            )"
+            local_opencode_run_tasks="$(
+              # The scheduler only needs recent active work. Bound this lookup to
+              # the latest 300 runs instead of paginating the full Actions history.
+              for page in 1 2 3; do
+                gh api "repos/$child_repo/actions/runs?per_page=100&page=$page" \
+                  --jq '.workflow_runs[]
+                    | select(.status != "completed")
+                    | .display_title
+                    | select(test("^OpenCode issue #[0-9]+$"))
+                    | capture("^OpenCode issue #(?<task>[0-9]+)$").task' \
+                  2>/dev/null || break
+              done
+            )"
+            child_owner="$(gh api "repos/$child_repo" --jq '.owner.login' 2>/dev/null || true)"
+            command_grace_seconds=$(( COMMAND_GRACE_MINUTES * 60 ))
+            command_parser="$CONTINUUM_ENGINE_ROOT/.github/scripts/opencode_command.py"
+
+            local_override_active() {
+              local task_number="$1"
+              local recent_command command_epoch now_epoch grace_since
+              if grep -Fxq "$task_number" <<<"$local_opencode_pr_tasks" ||
+                 grep -Fxq "$task_number" <<<"$local_opencode_run_tasks"; then
+                return 0
+              fi
+              [[ -n "$child_owner" ]] || return 1
+              # Width (#254) caps the since scan (A4).
+              grace_since="$(date -u -d "@$(( $(date +%s) - command_grace_seconds - 120 ))" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u +%Y-%m-%dT%H:%M:%SZ)"
+              recent_command=""; override_seen=""
+              # Since-filtered pagination starts at page 1: the filtered set
+              # is already only recent comments, so pages 1..5 cover it
+              # without the extra issue-total read. Keep the first/last
+              # names so the bounded-scan contract still identifies the
+              # window.
+              override_first_page=1
+              override_last_page=5
+              override_failed=0
+              for override_page in $(seq "$override_first_page" "$override_last_page"); do
+                # Fail closed: a fetch or parse failure leaves the window
+                # unknown, so report active instead of reading an empty
+                # window as idle and double-dispatching.
+                if ! override_json="$(gh api "repos/$child_repo/issues/$task_number/comments?per_page=100&page=$override_page&since=$grace_since" 2>/dev/null)"; then
+                  override_failed=1
+                  break
+                fi
+                if ! override_count="$(jq 'length' <<<"$override_json" 2>/dev/null)"; then
+                  override_failed=1
+                  break
+                fi
+                [[ "$override_count" =~ ^[0-9]+$ ]] || { override_failed=1; break; }
+                if ! override_records="$(jq -c --arg owner "$child_owner" '[.[] | select(.user.login == $owner) | {body: (.body // ""), created_at: .created_at}]' <<<"$override_json" 2>/dev/null)"; then
+                  override_failed=1
+                  break
+                fi
+                if ! override_classes="$(python3 "$command_parser" classify-json <<<"$override_records" 2>/dev/null)"; then
+                  override_failed=1
+                  break
+                fi
+                if ! override_cmds="$(jq -r --argjson classes "$override_classes" 'to_entries[] | select($classes[.key] == "run") | .value.created_at' <<<"$override_records" 2>/dev/null)"; then
+                  override_failed=1
+                  break
+                fi
+                override_seen+="${override_cmds}"$'\n'
+                [[ "$override_count" -ge 100 ]] || break
+              done
+              [[ "$override_failed" -eq 0 ]] || return 0
+              recent_command="$(grep -v '^$' <<<"$override_seen" | tail -n 1 | tr -d '[:space:]' || true)"
+              [[ -n "$recent_command" ]] || return 1
+              command_epoch="$(date -d "$recent_command" +%s 2>/dev/null || echo 0)"
+              now_epoch="$(date +%s)"
+              (( command_epoch > 0 && now_epoch - command_epoch < command_grace_seconds ))
+            }
+
+            if [[ "$pr_agent_authoritative" == true ]]; then
+              # Parent-side PR-Agent fan-out (issue #244): one recovery
+              # dispatch per verified child carries only the opaque child id;
+              # the recovery reconciler discovers/admits every eligible child
+              # PR in that target and dispatches parent-side review/repair
+              # with PR number + exact HEAD. Stable dedup/concurrency
+              # identity lives in the PR-Agent operation layer across
+              # scheduler/event/recovery wakeups, and review -> repair ->
+              # re-review -> recovery continues there as child HEADs change.
+              # No concrete child repository identity is passed. Owner and
+              # automation PRs share this single deterministic route: the
+              # reconciler admits every open same-repo non-draft target PR.
+              # A single transient dispatch failure never aborts this loop:
+              # the bounded retry above absorbs 5xx/429/transient-403, an
+              # exhausted or deterministic target is recorded, and fan-out
+              # continues with the next verified child.
+              dispatch_rc=0
+              if dispatch_pr_agent_recovery_with_retry "$child_id"; then
+                review_dispatches=$((review_dispatches + 1))
+              else
+                dispatch_rc=$?
+                pr_agent_dispatch_failures=$((pr_agent_dispatch_failures + 1))
+                if (( dispatch_rc == 2 )); then
+                  pr_agent_deterministic_failures=$((pr_agent_deterministic_failures + 1))
+                  echo "::error::Delegated PR-Agent recovery dispatch failed deterministically for one verified child; fan-out continues."
+                else
+                  pr_agent_transient_failures=$((pr_agent_transient_failures + 1))
+                  echo "::warning::Delegated PR-Agent recovery dispatch failed transiently for one verified child after bounded retries; fan-out continues."
+                fi
+              fi
+            fi
+
+            if [[ -n "$open_prs" ]]; then
+              selected_review_tasks=""
+              while IFS=$'\t' read -r pr_number head_ref; do
+                [[ -n "$pr_number" ]] || continue
+                task_number="$(
+                  sed -nE 's#^(continuum-child|runtime-worker)/task-([0-9]+)-.*#\2#p' <<<"$head_ref"
+                )"
+                [[ -n "$task_number" ]] || continue
+                task_state="$(
+                  gh api "repos/$child_repo/issues/$task_number" --jq '.state' 2>/dev/null || echo closed
+                )"
+                if [[ "$task_state" != "open" ]]; then
+                  gh pr comment "$pr_number" --repo "$child_repo" \
+                    --body "$(printf '%s\n%s\n%s' '⚡ **Continuum · issue-scheduler**' '<!-- continuum-origin role=continuum component=issue-scheduler -->' "Closed automatically: delegated task #$task_number is already completed.")" \
+                    >/dev/null 2>&1 || true
+                  gh pr close "$pr_number" --repo "$child_repo" >/dev/null 2>&1 || true
+                  continue
+                fi
+                if grep -Fxq "$task_number" <<<"$selected_review_tasks"; then
+                  continue
+                fi
+                selected_review_tasks+="$task_number"$'\n'
+                if task_active "$child_id" task "$task_number" ||
+                   task_active "$child_id" review "$task_number"; then
+                  continue
+                fi
+                if [[ "$pr_agent_authoritative" == true ]]; then
+                  # Legacy task review is owned by the per-child PR-Agent
+                  # recovery dispatch above (issue #244): never dispatch the
+                  # legacy review beside it. Completed-task close hygiene
+                  # above still runs in both modes.
+                  continue
+                fi
+                gh workflow run "$CHILD_REVIEW_WORKFLOW" --repo "$GITHUB_REPOSITORY" \
+                  -f child_id="$child_id" -f task_number="$task_number" -f pr_number="$pr_number" >/dev/null
+                review_dispatches=$((review_dispatches + 1))
+              done <<<"$open_prs"
+            fi
+
+            # Legacy independent child review runs only where PR-Agent is not
+            # authoritative (issue #244): under `pr-agent` the per-child
+            # recovery dispatch above owns every child PR, so no legacy
+            # review may race it. No double review, double repair, or
+            # competing merge paths. Without a trustworthy active-run
+            # inventory the legacy path cannot deduplicate itself, so it is
+            # skipped for this pass while PR-Agent review keeps its own
+            # downstream identity.
+            if [[ "$pr_agent_authoritative" != true ]]; then
+              if [[ "$active_runs_state" == "ok" ]]; then
+                manual_prs="$(
+                  gh api --paginate "repos/$child_repo/pulls?state=open&per_page=100" \
+                    --jq '.[] |
+                      select(.draft == false) |
+                      select(.head.repo.full_name == .base.repo.full_name) |
+                      select(.user.login == .base.repo.owner.login) |
+                      select(
+                        ((.head.ref | startswith("continuum-child/task-")) or
+                         (.head.ref | startswith("runtime-worker/task-"))) | not
+                      ) |
+                      select(([.labels[]?.name] | index("no-auto-merge")) | not) |
+                      .number' 2>/dev/null || true
+                )"
+                while IFS= read -r manual_pr; do
+                  [[ -n "$manual_pr" ]] || continue
+                  manual_pr_active "$child_id" "$manual_pr" && continue
+                  gh workflow run "$CHILD_PR_REVIEW_WORKFLOW" --repo "$GITHUB_REPOSITORY" \
+                    -f child_id="$child_id" -f pr_number="$manual_pr" >/dev/null
+                  review_dispatches=$((review_dispatches + 1))
+                done <<<"$manual_prs"
+              else
+                echo "::notice::Skipping legacy child PR review: active-run inventory is unavailable."
+              fi
+            fi
+
+            issues_json="$(gh api --paginate "repos/$child_repo/issues?state=open&per_page=100" 2>/dev/null)"
+
+            while IFS= read -r paused_task; do
+              [[ -n "$paused_task" ]] || continue
+              gh api --method DELETE \
+                "repos/$child_repo/issues/$paused_task/labels/${PAUSE_LABEL//:/%3A}" \
+                >/dev/null 2>&1 || true
+            done < <(
+              jq -r --arg pause "$PAUSE_LABEL" '
+                .[] | select(.pull_request == null)
+                | select(any(.labels[]?.name; . == $pause))
+                | select((.body // "" | contains("<!-- review-hold: owner-approval-required -->")) | not)
+                | .number
+              ' <<<"$issues_json"
+            )
+            issues_json="$(
+              jq --arg pause "$PAUSE_LABEL" '
+                map(if .pull_request == null and ((.body // "" | contains("<!-- review-hold: owner-approval-required -->")) | not)
+                    then .labels = [(.labels[]? | select(.name != $pause))]
+                    else . end)
+              ' <<<"$issues_json"
+            )"
+            # Preload known-open states from the snapshot just fetched: any
+            # dependency number present here is open without another read.
+            # Absent numbers still resolve through dep_state (one live read
+            # each, memoized for the rest of this child).
+            while IFS= read -r open_number; do
+              [[ -n "$open_number" && "$open_number" =~ ^[0-9]+$ ]] || continue
+              CONTINUUM_DEP_STATE[$open_number]="open"
+            done < <(jq -r '.[].number' <<<"$issues_json" 2>/dev/null || true)
+
+            # Qualification/validation trackers are never generic
+            # implementation work (kodmial/continuum#278): they need explicit
+            # qualification dispatch, independent of automation:ready. The set
+            # is derived from the fetched inventory without extra API reads.
+            qualification_trackers="$(
+              jq -r '.[] | select(.pull_request == null) | .body // ""' <<<"$issues_json" \
+                | grep -oiE '<!--[[:space:]]*automation-qualification:[^>]*-->' \
+                | grep -oE '[0-9]+' | sort -n -u | tr '\n' ' ' || true
+            )"
+
+            while IFS= read -r encoded; do
+              [[ -n "$encoded" ]] || continue
+              decoded="$(base64 -d <<<"$encoded")"
+              task_number="$(jq -r '.number' <<<"$decoded")"
+              body="$(jq -r '.body' <<<"$decoded")"
+              title="$(jq -r '.title' <<<"$decoded")"
+              rank="$(jq -r '.rank' <<<"$decoded")"
+              priority="$(jq -r '.priority' <<<"$decoded")"
+              normalized="$(jq -r '.normalized // false' <<<"$decoded")"
+
+              # One priority contract (kodmial/continuum#262): a legacy
+              # `P0:`/`P1:`/`P2:` title prefix normalizes to the matching
+              # priority label when no explicit priority label exists, so a
+              # delegated child task ranks identically to a local issue.
+              # Labels stay authoritative: an explicit label always wins and
+              # is never overridden here. Persisting the label is idempotent
+              # (a second pass observes the label and skips) and never
+              # duplicates; ranking already reflects the effective priority
+              # even if this best-effort write fails. No repository identity
+              # is echoed: public logs carry only the opaque task number.
+              if [[ "$normalized" == "true" && -n "$priority" ]]; then
+                gh api --method POST "repos/$child_repo/issues/$task_number/labels" \
+                  -f "labels[]=$priority" >/dev/null 2>&1 || true
+                echo "Normalized delegated task #$task_number to $priority."
+              fi
+
+              # An unavailable active-run inventory disables new delegated
+              # coding admission for this pass; recovery is the next wake.
+              if [[ "$coding_admission_enabled" != "true" ]]; then
+                continue
+              fi
+
+              task_active "$child_id" task "$task_number" && continue
+              task_active "$child_id" review "$task_number" && continue
+              grep -Fxq "$task_number" <<<"$open_pr_tasks" && continue
+              local_override_active "$task_number" && continue
+
+              # A declared qualification tracker never enters generic
+              # implementation scheduling, even when open and unblocked.
+              if [[ " $qualification_trackers " == *" $task_number "* ]]; then
+                echo "Skipping delegated task #$task_number: qualification tracker needs explicit dispatch, not generic implementation."
+                continue
+              fi
+
+              ready=true
+              task_refs="$(
+                sed -nE 's/.*<!-- *automation-qualification: *([^>]*) *-->.*/\1/p' \
+                  <<<"$body" | head -1 | tr ',' ' ' || true
+              )"
+              deps="$(
+                sed -nE 's/.*<!-- *automation-blocked-by: *([^>]*) *-->.*/\1/p' \
+                  <<<"$body" | head -1 | tr ',' ' '
+              )"
+              for dep in $deps; do
+                dep="${dep//#/}"
+                dep="${dep//[[:space:]]/}"
+                [[ "$dep" =~ ^[0-9]+$ ]] || continue
+                # A direct capability<->qualification back-edge is ignored
+                # with a diagnostic (kodmial/continuum#278): the capability
+                # stays open while it qualifies, so its own validator is
+                # never an implementation blocker.
+                if grep -qw "$dep" <<<"$task_refs" 2>/dev/null; then
+                  echo "Delegated task #$task_number: ignoring qualification back-edge blocker #$dep."
+                  continue
+                fi
+                dep_state state "$dep"
+                if [[ "$state" != "closed" ]]; then ready=false; break; fi
+              done
+              [[ "$ready" == true ]] || continue
+
+              native_blockers="$(
+                gh api --paginate -H 'X-GitHub-Api-Version: 2022-11-28' \
+                  "repos/$child_repo/issues/$task_number/dependencies/blocked_by?per_page=100" \
+                  --jq '.[] | select(.state == "open") | .number' 2>/dev/null || true
+              )"
+              [[ -z "$native_blockers" ]] || continue
+
+              # kodmial/continuum#309: terminal generation-stop gate. A
+              # truly drifted/tampered generation publishes one typed stop
+              # comment (digests only); the queue must never resurface it
+              # on later ticks. The check is trusted, generation-keyed,
+              # and scans the bounded full history (up to 50 pages) so a
+              # stop beyond the first 100 comments still holds, mirroring
+              # the JS gates; a fetch failure keeps the task
+              # eligible (the worker admission still fails closed) so a
+              # transient outage cannot strand work. automation:blocked
+              # semantics are untouched: this is a dedicated stop
+              # identity, never a dependency marker, and successors stay
+              # schedulable.
+              stop_state="active"
+              stop_pages="$RUNNER_TEMP/continuum-stop-pages-$task_number.jsonl"
+              stop_file="$RUNNER_TEMP/continuum-stop-$task_number.json"
+              : > "$stop_pages"
+              stop_ok=true
+              for stop_page in $(seq 1 50); do
+                if ! stop_comments="$(gh api "repos/$child_repo/issues/$task_number/comments?per_page=100&page=$stop_page" 2>/dev/null)"; then
+                  echo "::warning::Terminal-stop lookup failed for delegated task #$task_number; keeping it eligible for this pass."
+                  stop_ok=false
+                  break
+                fi
+                echo "$stop_comments" >> "$stop_pages"
+                stop_count="$(jq 'length' <<<"$stop_comments" 2>/dev/null || echo 0)"
+                [[ "$stop_count" == "100" ]] || break
+              done
+              if [[ "$stop_ok" == "true" ]]; then
+                if jq -s 'add' "$stop_pages" > "$stop_file" 2>/dev/null; then
+                  stop_state="$(python3 "$CONTINUUM_ENGINE_ROOT/.github/scripts/task_snapshot_admission.py" has-stop --comments-json "$stop_file" --repo "$child_repo" --issue "$task_number" --owner "${child_repo%%/*}" --generation 1 2>/dev/null || echo active)"
+                fi
+                rm -f "$stop_file"
+              fi
+              rm -f "$stop_pages"
+              if [[ "$stop_state" == "stopped" ]]; then
+                echo "Skipping delegated task #$task_number: terminal generation stop; open a successor issue with an explicit dependency or start an explicit new generation instead of redispatching."
+                continue
+              fi
+
+              jq -cn \
+                --arg child_id "$child_id" --arg repository "$child_repo" \
+                --argjson task_number "$task_number" --arg title "$title" \
+                --arg priority "$priority" --argjson rank "$rank" \
+                '{child_id:$child_id,repository:$repository,task_number:$task_number,title:$title,
+                  priority:(if $priority == "" then null else $priority end),rank:$rank}' \
+                >> "$candidate_lines"
+            done < <(
+              jq -r --arg ready "$READY_LABEL" '
+                map(
+                  select(.pull_request == null)
+                  | select((.body // "" | contains("<!-- review-hold: owner-approval-required -->")) | not)
+                  | select($ready == "" or ([.labels[]?.name] | index($ready) != null))
+                  | . + {
+                      _label_priority:
+                        (if any(.labels[]?.name; . == "priority:p0") then "priority:p0"
+                         elif any(.labels[]?.name; . == "priority:p1") then "priority:p1"
+                         elif any(.labels[]?.name; . == "priority:p2") then "priority:p2" else "" end),
+                      _title_priority:
+                        (if (.title // "" | test("^P[0-2]:\\s+"; "i"))
+                         then ("priority:p" + ((.title // "" | capture("^P(?<digit>[0-2]):\\s+"; "i").digit | ascii_downcase)))
+                         else "" end)
+                    }
+                  | . + {
+                      _priority:
+                        (if ._label_priority != "" then ._label_priority
+                         elif ._title_priority != "" then ._title_priority else "" end),
+                      _normalized: (._label_priority == "" and ._title_priority != "")
+                    }
+                  | . + {
+                      _rank:
+                        (if ._priority == "priority:p0" then 0
+                         elif ._priority == "priority:p1" then 1
+                         elif ._priority == "priority:p2" then 2 else 3 end)
+                    }
+                )
+                | sort_by(._rank, .number)
+                | .[]
+                | {number:.number,body:(.body//""),title:(.title//""),rank:._rank,priority:._priority,normalized:._normalized}
+                | @base64
+              ' <<<"$issues_json"
+            )
+          done < <(jq -c '.[]' <<<"$plan")
+
+          jq -s '.' "$candidate_lines" > "$CHILD_CANDIDATES_FILE"
+          active_wip="${#active_wip_keys[@]}"
+          candidate_count="$(wc -l < "$candidate_lines" | tr -d ' ')"
+          echo "active_wip=$active_wip" >> "$GITHUB_OUTPUT"
+          echo "candidate_count=$candidate_count" >> "$GITHUB_OUTPUT"
+          echo "Delegated queue: $active_wip active WIP item(s), $candidate_count candidate(s), $review_dispatches review run(s)."
+          if [[ "$pr_agent_dispatch_failures" -gt 0 ]]; then
+            echo "::warning::Delegated PR-Agent recovery fan-out: $pr_agent_dispatch_failures verified child dispatch(es) failed ($pr_agent_transient_failures transient, $pr_agent_deterministic_failures deterministic) after bounded retries; remaining children were still processed and transient targets retry on the next pass."
+          fi
+          if [[ "$invalid" -gt 0 ]]; then
+            echo "::error::$invalid configured child relationship(s) failed bidirectional verification."
+            exit 2
+          fi
+
+      - name: Reconcile state and dispatch ready issues
+        if: steps.periodic_gate.outputs.run == 'true'
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
+        env:
+          CHILD_ACTIVE_WIP: ${{ steps.child_queue.outputs.active_wip || '0' }}
+          CHILD_CANDIDATES_FILE: ${{ runner.temp }}/continuum-child-candidates.json
+          CHILD_ACTIVE_RUNS_STATE: ${{ steps.child_queue.outputs.active_runs_state || 'ok' }}
+          CHILD_ACTIVE_RUNS_SCRIPT: ${{ github.workspace }}/.continuum-engine/.github/scripts/delegated_active_runs.sh
+          CHILD_ACTIVE_RUNS_FILE: ${{ runner.temp }}/continuum-active-runs-fresh.tsv
+          DELEGATION_STATE: ${{ steps.child_queue.outputs.delegation_state }}
+        with:
+          # TAP_PAT is required because the existing OpenCode workflow accepts
+          # /oc only from the repository owner. It also makes issue-state
+          # mutations and comments created here visible as normal owner actions.
+          github-token: ${{ secrets.TAP_PAT }}
+          script: |
+            const path = require('path');
+            const schedulerPath = path.join(
+              process.env.GITHUB_WORKSPACE || process.cwd(),
+              '.continuum-engine',
+              '.github',
+              'scripts',
+              'issue_scheduler.js'
+            );
+            const runScheduler = require(schedulerPath);
+            await runScheduler({ github, context, core });
+      - name: Wake the configured downstream dispatcher
+        if: steps.periodic_gate.outputs.run == 'true' && env.CHILD_DISPATCH_WORKFLOW != '' && vars.CONTINUUM_ROLE != 'parent'
+        env:
+          GH_TOKEN: ${{ secrets.TAP_PAT }}
+          CHILD_DISPATCH_WORKFLOW: ${{ env.CHILD_DISPATCH_WORKFLOW }}
+          DISPATCH_REF: ${{ env.DISPATCH_REF }}
+        run: |
+          set -euo pipefail
+          if ! gh api --method POST \
+            "repos/$GITHUB_REPOSITORY/actions/workflows/$CHILD_DISPATCH_WORKFLOW/dispatches" \
+            -f ref="$DISPATCH_REF" >/dev/null; then
+            echo "::warning::Could not dispatch $CHILD_DISPATCH_WORKFLOW at $DISPATCH_REF."
+          else
+            echo "Dispatched $CHILD_DISPATCH_WORKFLOW at $DISPATCH_REF."
+          fi

@@ -1,0 +1,607 @@
+name: mark-ready-for-coderabbit
+
+on:
+  workflow_call:
+    inputs:
+      continuum_ref:
+        description: Continuum revision supplying fallback scripts
+        type: string
+        default: main
+        required: false
+      review_provider:
+        description: >-
+          Review provider: none, coderabbit, or pr-agent. Empty falls back to
+          vars.CONTINUUM_REVIEW_PROVIDER, then to none.
+        type: string
+        default: ''
+        required: false
+      require_coderabbit:
+        description: Deprecated compatibility input; review_provider is authoritative.
+        type: string
+        default: ''
+        required: false
+      coderabbit_retry_workflow:
+        description: >-
+          Workflow dispatched to queue the current head for CodeRabbit review.
+          Empty falls back to vars.CONTINUUM_CODERABBIT_RETRY_WORKFLOW, then to
+          continuum-coderabbit-retry.yml. Continuum dogfood overrides this to
+          the dispatchable coderabbit-retry.yml entry.
+        type: string
+        default: ''
+        required: false
+      auto_merge_workflow:
+        description: >-
+          Workflow dispatched to reconcile auto-merge after a successful CI
+          run. Empty falls back to vars.CONTINUUM_AUTO_MERGE_WORKFLOW, then to
+          continuum-auto-merge.yml. Continuum dogfood overrides this to the
+          dispatchable automation.yml entry.
+        type: string
+        default: ''
+        required: false
+
+permissions:
+  actions: write
+  contents: read
+  issues: write
+  pull-requests: write
+
+jobs:
+  add-label:
+    # Verified child PR review/readiness is owned by the public parent.
+    if: vars.CONTINUUM_ROLE != 'child'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Mark PR ready and wake controllers
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
+        env:
+          CONTINUUM_VERSION_FILE: ${{ vars.CONTINUUM_VERSION_FILE || '' }}
+          CONTINUUM_RELEASE_MANIFEST_FILES: ${{ vars.CONTINUUM_RELEASE_MANIFEST_FILES || '[]' }}
+          REVIEW_PROVIDER: ${{ inputs.review_provider || vars.CONTINUUM_REVIEW_PROVIDER || 'none' }}
+          # Dispatch targets stay env-configurable for the same reason as the
+          # auto-merge reconciler: installed consumers keep the legacy engine
+          # names, while the dogfood entry points at its own dispatchable
+          # workflows.
+          CONTINUUM_CODERABBIT_RETRY_WORKFLOW: ${{ inputs.coderabbit_retry_workflow || vars.CONTINUUM_CODERABBIT_RETRY_WORKFLOW || 'continuum-coderabbit-retry.yml' }}
+          CONTINUUM_AUTO_MERGE_WORKFLOW: ${{ inputs.auto_merge_workflow || vars.CONTINUUM_AUTO_MERGE_WORKFLOW || 'continuum-auto-merge.yml' }}
+          TAP_PAT: ${{ secrets.TAP_PAT }}
+          READ_GITHUB_TOKEN: ${{ github.token }}
+        with:
+          # kodmial/continuum#259: same-repository label mutations use the
+          # repository-scoped GITHUB_TOKEN (github-actions[bot] actor). The two
+          # workflow dispatches below intentionally stay PAT-backed via a
+          # dedicated PAT client so downstream event chaining is preserved.
+          # Same-repository reads use READ_GITHUB_TOKEN via readGithub (#254).
+          github-token: ${{ github.token }}
+          script: |
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const repoFullName = `${owner}/${repo}`;
+            const run = context.payload.workflow_run;
+            const REQUESTED_LABEL = 'coderabbit-review-requested';
+            // Request-budget observability (#254): counts only, no secrets.
+            // Mutations use the default GITHUB_TOKEN client
+            // (github-actions[bot] actor, #259); dispatches stay PAT-backed
+            // via patClient below; every read moves to the repository token
+            // via readGithub.
+            const apiBudget = { reads: 0, patReads: 0, mutations: 0, pages: 0, git: 0, event: 1 };
+            function noteRead(pages = 1) {
+              apiBudget.reads += 1;
+              apiBudget.pages += pages;
+            }
+            function noteMutation() {
+              apiBudget.mutations += 1;
+            }
+            function reportBudget() {
+              core.notice(
+                `continuum-api-budget: total_calls=${apiBudget.reads + apiBudget.mutations} ` +
+                `reads=${apiBudget.reads} (repository-token) ` +
+                `mutations=${apiBudget.mutations} (github-token) ` +
+                `pages=${apiBudget.pages} event_substitutions=${apiBudget.event}`
+              );
+            }
+            // Same-repository reads run on the repository token, not
+            // TAP_PAT. The github-script action
+            // client is GITHUB_TOKEN-authenticated (github-actions[bot]
+            // actor) for label mutations; workflow dispatches that must fan
+            // out into downstream runs use the dedicated PAT client below.
+            const readToken = String(process.env.READ_GITHUB_TOKEN || '').trim();
+            if (!readToken) {
+              throw new Error(
+                'READ_GITHUB_TOKEN is required for same-repository review-label reads.'
+              );
+            }
+            const readGithub = new github.constructor({
+              auth: readToken,
+              baseUrl: github.request.endpoint.DEFAULTS.baseUrl,
+            });
+            if (
+              typeof readGithub.rest?.repos?.listPullRequestsAssociatedWithCommit !== 'function' ||
+              typeof readGithub.rest?.pulls?.listFiles !== 'function' ||
+              typeof readGithub.rest?.repos?.getCommit !== 'function' ||
+              typeof readGithub.rest?.issues?.listComments !== 'function' ||
+              typeof readGithub.rest?.pulls?.listReviews !== 'function' ||
+              typeof readGithub.rest?.repos?.getCombinedStatusForRef !== 'function' ||
+              typeof readGithub.rest?.issues?.listLabelsOnIssue !== 'function'
+            ) {
+              throw new Error(
+                'readGithub client lacks the rest plugins; ' +
+                'cannot perform same-repository review-label reads.'
+              );
+            }
+            // Bounded page cap for any single list scan (#254): request
+            // count never scales with repository lifetime/history.
+            // Issue comments and pull reviews paginate oldest-first with no
+            // newest-first sort, so a full final page at the cap may hide
+            // newer records. The collected array carries a `truncated` flag;
+            // approval-carry readers must fail closed (no carry) when it is
+            // true instead of deciding on partial oldest data.
+            const MAX_SCAN_PAGES = 5;
+            const MAX_FILES_PAGES = 10;
+            async function boundedPages(request, params) {
+              const perPage = params.per_page || 100;
+              const items = [];
+              let truncated = false;
+              for (let page = 1; page <= MAX_SCAN_PAGES; page += 1) {
+                const { data } = await request({ ...params, per_page: perPage, page });
+                noteRead();
+                if (!Array.isArray(data) || data.length === 0) break;
+                items.push(...data);
+                if (data.length < perPage) break;
+                if (page === MAX_SCAN_PAGES) truncated = true;
+              }
+              items.truncated = truncated;
+              return items;
+            }
+            // PAT client for workflow dispatches only. Label/comment/state
+            // mutations above use the default GITHUB_TOKEN client (`github`)
+            // so GitHub attributes them to github-actions[bot]; dispatches
+            // must fan out into downstream runs and therefore keep PAT actor
+            // semantics. Reuses the github-script Octokit composition so
+            // `rest`/`paginate` plugins stay available.
+            const patToken = String(process.env.TAP_PAT || '').trim();
+            // github-script supplies the plugin-composed Octokit class, so
+            // reusing its constructor keeps the `paginate`/`rest` plugins
+            // (dynamically requiring `@actions/github` is not resolvable from
+            // the script sandbox). Preserve the enterprise base URL and
+            // confirm the composition at runtime so a future
+            // actions/github-script upgrade that returns a bare core fails
+            // here instead of mid-dispatch with
+            // `patClient(...).paginate is not a function`.
+            const patBaseUrl = (
+              (github && github.request && github.request.endpoint &&
+                github.request.endpoint.DEFAULTS && github.request.endpoint.DEFAULTS.baseUrl) ||
+              process.env.GITHUB_API_URL || 'https://api.github.com'
+            );
+            let cachedPatClient = null;
+            function patClient() {
+              if (cachedPatClient) return cachedPatClient;
+              if (!patToken) {
+                throw new Error(
+                  'TAP_PAT is required for workflow dispatches; refusing to dispatch without it.'
+                );
+              }
+              const client = new github.constructor({
+                auth: patToken,
+                baseUrl: patBaseUrl,
+              });
+              if (
+                typeof client.paginate !== 'function' ||
+                typeof client.rest?.actions?.createWorkflowDispatch !== 'function'
+              ) {
+                throw new Error(
+                  'patClient lacks the paginate/rest plugins; ' +
+                  'cannot dispatch downstream workflows.'
+                );
+              }
+              cachedPatClient = client;
+              return cachedPatClient;
+            }
+            // CodeRabbit is an OPTIONAL integration. With the flag off this
+            // workflow must stay a pure CI wake-up for the auto-merge
+            // reconciler: no CodeRabbit lock label, no `review-ready` label,
+            // and no dispatch of a controller the repository may not own.
+            const reviewProvider =
+              String(process.env.REVIEW_PROVIDER || 'none').trim().toLowerCase();
+            if (!['none', 'coderabbit', 'pr-agent'].includes(reviewProvider)) {
+              throw new Error(
+                `Invalid CONTINUUM_REVIEW_PROVIDER="${reviewProvider}". Expected none, coderabbit, or pr-agent.`
+              );
+            }
+            const requireCodeRabbit = reviewProvider === 'coderabbit';
+            // Both dispatch targets are optional integrations. The literal
+            // fallbacks reproduce the pre-parameterization consumer behavior;
+            // the dogfood caller overrides them with dispatchable entries.
+            function resolveDispatchWorkflow(configuredValue, fallback, label) {
+              const configured = String(configuredValue || fallback).trim();
+              if (
+                !configured.endsWith('.yml') ||
+                configured.includes('/') ||
+                configured.includes('\\') ||
+                configured.includes('..')
+              ) {
+                throw new Error(
+                  `Invalid ${label} workflow: ${configured}. ` +
+                  'Expected a bare workflow file name such as coderabbit-retry.yml.'
+                );
+              }
+              return configured;
+            }
+            const codeRabbitRetryWorkflow = resolveDispatchWorkflow(
+              process.env.CONTINUUM_CODERABBIT_RETRY_WORKFLOW,
+              'continuum-coderabbit-retry.yml',
+              'CodeRabbit retry'
+            );
+            const autoMergeWorkflow = resolveDispatchWorkflow(
+              process.env.CONTINUUM_AUTO_MERGE_WORKFLOW,
+              'continuum-auto-merge.yml',
+              'Auto-merge'
+            );
+            const RELEASE_FILES = new Set([
+              '.release-please-manifest.json',
+              'CHANGELOG.md',
+              process.env.CONTINUUM_VERSION_FILE,
+            ]);
+            const MANIFEST_FILES = new Set(
+              JSON.parse(
+                process.env.CONTINUUM_RELEASE_MANIFEST_FILES ||
+                  '[]'
+              )
+            );
+
+            async function trustedReleaseAutomation(pr) {
+              if (
+                pr.base.ref !== 'main' ||
+                pr.head.repo?.full_name !== repoFullName
+              ) {
+                return false;
+              }
+
+              // Release-automation PRs are small; cap the file scan at
+              // MAX_FILES_PAGES and fail closed (not trusted) past the cap
+              // rather than walking unbounded history. Stop at the first
+              // disallowed file so large non-release PRs cost one page.
+              let allowed = null;
+              if (pr.head.ref === 'release-please--branches--main') {
+                const labels = new Set((pr.labels || []).map(label => label.name));
+                if (!labels.has('autorelease: pending')) return false;
+                allowed = RELEASE_FILES;
+              } else if (pr.head.ref.startsWith('chore/release-manifests-v')) {
+                allowed = MANIFEST_FILES;
+              } else {
+                return false;
+              }
+              let seen = 0;
+              let complete = false;
+              for (let page = 1; page <= MAX_FILES_PAGES; page += 1) {
+                const { data: files } = await readGithub.rest.pulls.listFiles({
+                  owner,
+                  repo,
+                  pull_number: pr.number,
+                  per_page: 100,
+                  page,
+                });
+                noteRead();
+                if (!Array.isArray(files) || files.length === 0) {
+                  complete = true;
+                  break;
+                }
+                for (const file of files) {
+                  seen += 1;
+                  if (!allowed.has(file.filename)) return false;
+                }
+                if (files.length < 100) {
+                  complete = true;
+                  break;
+                }
+              }
+              // A full page cap without a short/empty page means the
+              // listing may be truncated: fail closed (not trusted).
+              return seen > 0 && complete;
+            }
+
+            async function carriedApprovalSource(pr) {
+              const { data: commit } = await readGithub.rest.repos.getCommit({
+                owner,
+                repo,
+                ref: pr.head.sha,
+              });
+              noteRead();
+              const parents = (commit.parents || []).map(parent => parent.sha);
+              if (parents.length !== 2) return null;
+
+              // Bounded comment/review scans (#254): both endpoints paginate
+              // oldest-first with no newest-first sort, so the capped window
+              // holds the oldest records. A truncated window fails closed (no
+              // carry) and only costs a fresh review, never a skipped one:
+              // a missed recent carry marker must not carry, and a missed
+              // recent nitpick-gating review must not be treated as absent.
+              const comments = await boundedPages(
+                (params) => readGithub.rest.issues.listComments(params),
+                {
+                  owner,
+                  repo,
+                  issue_number: pr.number,
+                  per_page: 100,
+                }
+              );
+              if (comments.truncated) return null;
+
+              const markerPattern =
+                /<!-- auto-main-sync head=([0-9a-f]{40}) from=([0-9a-f]{40}) main=([0-9a-f]{40}) carry=([0-9a-f]{40}) -->/i;
+
+              const marker = comments
+                .filter(comment => comment.user?.login === owner)
+                .map(comment => {
+                  const match = (comment.body || '').match(markerPattern);
+                  if (!match) return null;
+                  return {
+                    head: match[1].toLowerCase(),
+                    from: match[2].toLowerCase(),
+                    main: match[3].toLowerCase(),
+                    carry: match[4].toLowerCase(),
+                    createdAt: new Date(comment.created_at || 0).getTime(),
+                  };
+                })
+                .filter(Boolean)
+                .filter(item => item.head === pr.head.sha.toLowerCase())
+                .sort((a, b) => b.createdAt - a.createdAt)[0];
+
+              if (!marker) return null;
+
+              const parentSet = new Set(parents.map(sha => sha.toLowerCase()));
+              if (
+                !parentSet.has(marker.from) ||
+                !parentSet.has(marker.main)
+              ) {
+                return null;
+              }
+
+              const reviews = await boundedPages(
+                (params) => readGithub.rest.pulls.listReviews(params),
+                {
+                  owner,
+                  repo,
+                  pull_number: pr.number,
+                  per_page: 100,
+                }
+              );
+              // Fail closed: a truncated oldest-first review window may hide
+              // the newest decision or a nitpick-gating COMMENTED review, so
+              // it must not carry.
+              if (reviews.truncated) return null;
+
+              const sourceReviews = reviews
+                .filter(review =>
+                  review.user?.login?.startsWith('coderabbitai') &&
+                  review.commit_id?.toLowerCase() === marker.carry &&
+                  (review.state === 'APPROVED' ||
+                   review.state === 'CHANGES_REQUESTED')
+                )
+                .sort((a, b) => {
+                  const time =
+                    new Date(a.submitted_at || 0).getTime() -
+                    new Date(b.submitted_at || 0).getTime();
+                  return time || Number(a.id) - Number(b.id);
+                });
+
+              const decision = sourceReviews.at(-1);
+              if (!decision || decision.state !== 'APPROVED') return null;
+
+              const nitpicks = reviews.filter(review =>
+                review.user?.login?.startsWith('coderabbitai') &&
+                review.commit_id?.toLowerCase() === marker.carry &&
+                review.state === 'COMMENTED' &&
+                /comments?\s*\(\s*[1-9]\d*\s*\)/i.test(review.body || '')
+              );
+              if (nitpicks.length > 0) return null;
+
+              const { data: combined } =
+                await readGithub.rest.repos.getCombinedStatusForRef({
+                  owner,
+                  repo,
+                  ref: marker.carry,
+                });
+              noteRead();
+              const completed = (combined.statuses || []).some(status =>
+                status.context === 'CodeRabbit' &&
+                status.state === 'success' &&
+                /Review completed/i.test(status.description || '')
+              );
+              if (!completed) return null;
+
+              return marker.carry;
+            }
+
+            // Resolve candidate PRs through the narrowest endpoint: PRs
+            // associated with the exact CI head commit (#254). Bounded
+            // pagination (per_page 100) replaces the unbounded open-PR
+            // listing, and the exact-head/same-repo/non-draft match below
+            // keeps the admission semantics identical.
+            const associated = [];
+            for (let page = 1; page <= MAX_SCAN_PAGES; page += 1) {
+              const { data: batch } =
+                await readGithub.rest.repos.listPullRequestsAssociatedWithCommit({
+                  owner,
+                  repo,
+                  commit_sha: run.head_sha,
+                  per_page: 100,
+                  page,
+                });
+              noteRead();
+              if (!Array.isArray(batch) || batch.length === 0) break;
+              associated.push(...batch);
+              if (batch.length < 100) break;
+            }
+
+            // Match only an open non-draft same-repository PR whose current
+            // head is exactly the commit tested by this completed CI run.
+            // listPullRequestsAssociatedWithCommit can return closed PRs,
+            // so the open-state check restores the prior pulls.list
+            // state:open semantics.
+            const matched = (associated || []).filter((pr) =>
+              pr.state === 'open' &&
+              !pr.draft &&
+              pr.head.sha === run.head_sha &&
+              pr.head.repo.full_name === repoFullName
+            );
+            const ours = [];
+            for (const pr of matched) {
+              if (await trustedReleaseAutomation(pr)) {
+                core.notice(
+                  `PR #${pr.number}: trusted generated release automation; CodeRabbit review intentionally skipped.`
+                );
+                continue;
+              }
+              ours.push(pr);
+            }
+
+            core.info(
+              `Matched ${ours.length} ordinary open same-repository PR(s) for CI head ${run.head_sha}; ${matched.length - ours.length} trusted automation PR(s) bypass CodeRabbit.`
+            );
+
+            if (run.conclusion !== 'success') {
+              for (const pr of ours) {
+                for (const name of ['review-ready', REQUESTED_LABEL]) {
+                  try {
+                    await github.rest.issues.removeLabel({
+                      owner,
+                      repo,
+                      issue_number: pr.number,
+                      name,
+                    });
+                    noteMutation();
+                  } catch (err) {
+                    if (err.status !== 404) throw err;
+                  }
+                }
+              }
+              reportBudget();
+              return;
+            }
+
+            // Everything below is the CodeRabbit path. Both labels it writes
+            // are read only by the CodeRabbit controllers (`review-ready` is
+            // the queue admission filter in continuum-coderabbit-retry.yml), so with the
+            // optional integration off they must not be written at all. The
+            // auto-merge wake-up stays outside this gate: it is CI-driven and
+            // belongs to the repository whether or not CodeRabbit exists.
+            // Fail fast before any label mutation when a dispatch is certain:
+            // with a green run and matched PRs the auto-merge wake-up below
+            // always dispatches, so a missing TAP_PAT or a broken PAT-client
+            // composition must throw here rather than after partial writes.
+            if (ours.length > 0) {
+              patClient();
+            }
+            if (requireCodeRabbit) {
+              // A visible lock label makes the request idempotent across workflow
+              // reruns for the same head. It is removed on every PR synchronize.
+              try {
+                await github.rest.issues.createLabel({
+                  owner,
+                  repo,
+                  name: REQUESTED_LABEL,
+                  color: 'C5DEF5',
+                  description: 'CodeRabbit review requested or safely carried for the current PR head.',
+                });
+                noteMutation();
+              } catch (err) {
+                if (err.status !== 422) throw err; // already exists
+              }
+
+              let queuedForCodeRabbit = false;
+
+              for (const pr of ours) {
+                await github.rest.issues.addLabels({
+                  owner,
+                  repo,
+                  issue_number: pr.number,
+                  labels: ['review-ready'],
+                });
+                noteMutation();
+
+                // Label state is GitHub-only; the read stays API-backed
+                // but moves to the repository token and a bounded scan.
+                const labels = await boundedPages(
+                  (params) => readGithub.rest.issues.listLabelsOnIssue(params),
+                  {
+                    owner,
+                    repo,
+                    issue_number: pr.number,
+                    per_page: 100,
+                  }
+                );
+
+                if (labels.some(label => label.name === REQUESTED_LABEL)) {
+                  core.info(
+                    `PR #${pr.number}: CodeRabbit review was already requested for head ${pr.head.sha}.`
+                  );
+                  continue;
+                }
+
+                // A clean controller-generated merge of main may carry forward a
+                // previously completed APPROVED CodeRabbit review. The marker is
+                // accepted only when this exact HEAD is a two-parent merge of the
+                // recorded old PR head and recorded main SHA, and the carried SHA
+                // still has a completed APPROVED review with no nitpick review.
+                const carriedSource = await carriedApprovalSource(pr);
+                if (carriedSource) {
+                  await github.rest.issues.addLabels({
+                    owner,
+                    repo,
+                    issue_number: pr.number,
+                    labels: [REQUESTED_LABEL],
+                  });
+                  noteMutation();
+                  core.notice(
+                    `PR #${pr.number}: carried CodeRabbit approval from ${carriedSource} across clean main sync to ${pr.head.sha}; no duplicate full review requested.`
+                  );
+                  continue;
+                }
+
+                // Do not post CodeRabbit commands here. The included-review quota
+                // is repository-wide, so all initial reviews and retries must go
+                // through the single priority controller.
+                queuedForCodeRabbit = true;
+                core.notice(
+                  `PR #${pr.number}: green head ${pr.head.sha} queued for the global CodeRabbit priority controller.`
+                );
+              }
+
+              // `requireCodeRabbit` is checked here too, not only through
+              // `queuedForCodeRabbit`: with the flag off a repository without
+              // `continuum-coderabbit-retry.yml` would answer the dispatch with
+              // a 404.
+              if (requireCodeRabbit && queuedForCodeRabbit) {
+                await patClient().rest.actions.createWorkflowDispatch({
+                  owner,
+                  repo,
+                  workflow_id: codeRabbitRetryWorkflow,
+                  ref: 'main',
+                });
+                noteMutation();
+                core.notice(
+                  `Dispatched the global CodeRabbit priority controller after CI run ${run.id}.`
+                );
+              }
+            }
+
+            // CI completion is now the primary wake-up hook for the reconciler.
+            // Dispatch once per completed CI workflow (not once per PR). The
+            // auto-merge workflow is a latest-state reconciler with a single
+            // concurrency group and full pre-write revalidation, so duplicate
+            // wake-ups from status/review/push/cron remain harmless.
+            if (ours.length > 0) {
+              await patClient().rest.actions.createWorkflowDispatch({
+                owner,
+                repo,
+                workflow_id: autoMergeWorkflow,
+                ref: 'main',
+              });
+              noteMutation();
+              core.notice(
+                `Dispatched auto-merge reconciliation after successful CI run ${run.id} for head ${run.head_sha}.`
+              );
+            }
+
+            reportBudget();

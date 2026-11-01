@@ -1,0 +1,29 @@
+name: OpenCode watchdog
+
+on:
+  # GitHub matches this filter on the watched workflow's `name:` VALUE, never
+  # on its file name. `OpenCode agent` is the `name:` of the OpenCode caller
+  # (continuum-opencode.yml). Renaming that `name:` silently disables this
+  # watchdog: no recovery runs will be delivered any more.
+  workflow_run:
+    workflows: ["OpenCode agent"]
+    types: [completed]
+  # Bounded catch-up timer (kodmial/continuum#350): GitHub cron is not exact
+  # and workflow_run delivery can be late or lost. This scheduled pass reuses
+  # the same watchdog recovery code; it is not a second controller.
+  schedule:
+    - cron: "*/15 * * * *"
+
+permissions:
+  actions: write
+  contents: read
+  issues: write
+  pull-requests: read
+
+jobs:
+  call:
+    uses: kodmial/continuum/.github/workflows/continuum-opencode-watchdog.yml@main
+    secrets: inherit
+    with:
+      continuum_ref: main
+      watched_workflow: "OpenCode agent"
