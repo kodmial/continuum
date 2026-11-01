@@ -110,12 +110,10 @@ class ConfigurationTests(unittest.TestCase):
 
 
 class _CapturedText(str):
-    """Captured text that also supports the stream ``read`` the probe uses.
+    """Captured text shaped like the probe's ``stdout``/``stderr`` stream.
 
-    The fake must fit both seams: a Popen seam that reads ``stdout``/``stderr``
-    incrementally, and a ``subprocess.run`` seam that consumes completed
-    strings. Without both, a regression check could fail on a ``TypeError``
-    instead of on the behavior under test.
+    The probe reads the pipe incrementally through ``buffer.read1``, so the
+    fake exposes both the text value and a byte-wise ``read1``.
     """
 
     def __new__(cls, text: str = ""):
@@ -141,6 +139,17 @@ class _CapturedText(str):
 
     def close(self) -> None:
         pass
+
+
+class _ChunkedStream:
+    """Stream double whose ``buffer.read1`` returns preset byte chunks."""
+
+    def __init__(self, chunks):
+        self._chunks = list(chunks)
+        self.buffer = self
+
+    def read1(self, size: int = -1) -> bytes:
+        return self._chunks.pop(0) if self._chunks else b""
 
 
 class FakeProcess:
@@ -405,6 +414,67 @@ class ProbeTests(unittest.TestCase):
         self.assertTrue(process.terminated)
         self.assertLess(elapsed, 3)
 
+    def test_drain_reassembles_a_multibyte_character_split_across_chunks(self):
+        sink = []
+        route._drain(_ChunkedStream([b"\xf0\x9f", b"\x98\x80"]), sink)
+        self.assertEqual("".join(sink), "\U0001F600")
+
+    def test_drain_flushes_an_incomplete_sequence_at_eof(self):
+        sink = []
+        route._drain(_ChunkedStream([b"\xe2\x82"]), sink)
+        self.assertEqual("".join(sink), "�")
+
+    def test_drain_stops_quietly_when_the_pipe_fails(self):
+        class Failing(_ChunkedStream):
+            def read1(self, size: int = -1) -> bytes:
+                if not self._chunks:
+                    raise OSError("pipe closed")
+                return super().read1(size)
+
+        sink = []
+        route._drain(Failing([b"partial"]), sink)
+        self.assertEqual("".join(sink), "partial")
+
+    def test_probe_returns_while_a_reader_is_still_blocked_on_the_pipe(self):
+        """A live reader holds the buffer lock; closing its pipe would hang.
+
+        A child or grandchild can keep the pipe open after terminate/kill, so
+        the reader never sees EOF. The probe must return on its timeout budget
+        instead of waiting for a ``close`` that blocks on the reader's lock.
+        """
+        gate = threading.Lock()
+        release = threading.Event()
+
+        class StuckStream:
+            def __init__(self):
+                self.buffer = self
+
+            def read1(self, size: int = -1) -> bytes:
+                with gate:
+                    release.wait(30)
+                return b""
+
+            def close(self) -> None:
+                if not gate.acquire(timeout=1):
+                    raise AssertionError("close blocked on a live reader")
+                gate.release()
+
+        process = FakeProcess(hang=True)
+        process.stdout = StuckStream()
+        process.stderr = StuckStream()
+        def runner(command, **kwargs):
+            return process
+        started = route.time.monotonic()
+        try:
+            with patch.object(route, "PROBE_JOIN_SECONDS", 0.2):
+                with self.assertRaisesRegex(route.RouteError, "^timeout$"):
+                    route.semantic_probe(A, "review", 0.2, runner=runner)
+        finally:
+            release.set()
+        elapsed = route.time.monotonic() - started
+        self.assertTrue(process.terminated)
+        self.assertLess(elapsed, 2)
+
 
 class MainBurnedRunnerTests(unittest.TestCase):
     def _main_with(self, error):
@@ -415,7 +485,7 @@ class MainBurnedRunnerTests(unittest.TestCase):
         return code, stderr.getvalue()
 
     def test_exhausted_quota_reason_is_surfaced_in_the_error_annotation(self):
-        code, message = self._main_with(route.BurnedRunner(route.QUOTA_EXHAUSTED))
+        code, message = self._main_with(route.BurnedRunner("quota_exhausted"))
         self.assertEqual(code, 75)
         self.assertIn("retire this runner without another LLM request", message)
         self.assertIn(route.QUOTA_EXHAUSTED, message)

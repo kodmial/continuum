@@ -376,10 +376,11 @@ def _unscanned(parts: list[str], state: list) -> str:
     partial line, so a signature split across chunk boundaries is still seen
     while complete lines are never re-scanned.
     """
-    if state[0] == len(parts):
+    end = len(parts)
+    if state[0] == end:
         return ""
-    pending = state[1] + "".join(parts[state[0]:])
-    state[0] = len(parts)
+    pending = state[1] + "".join(parts[state[0]:end])
+    state[0] = end
     boundary = pending.rfind("\n")
     if boundary < 0:
         state[1] = pending[-PROBE_LINE_TAIL:]
@@ -450,7 +451,13 @@ def semantic_probe(model: str, kind: str, timeout: int, *, runner=subprocess.Pop
             # join budget is separate from the terminate/kill grace period.
             for reader in readers:
                 reader.join(timeout=PROBE_JOIN_SECONDS)
-            for stream in (process.stdout, process.stderr):
+            # Close only pipes whose reader already returned. A reader still
+            # blocked in ``read1`` holds the buffer lock (a child or grandchild
+            # can keep the pipe open after terminate/kill), and ``close`` would
+            # then wait on that lock forever, past the probe's own timeout.
+            for stream, reader in zip((process.stdout, process.stderr), readers):
+                if reader.is_alive():
+                    continue
                 try:
                     stream.close()
                 except (OSError, ValueError):
