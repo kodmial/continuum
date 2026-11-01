@@ -742,9 +742,17 @@ module.exports = async function runIssueScheduler({ github, context, core }) {
   const ownerResumeCommentPageLimit = 5;
   const ownerResumeCiWorkflow =
     (process.env.OWNER_RESUME_CI_WORKFLOW || 'CI').trim();
+  // The scheduler workflow always forwards this knob, falling back to the
+  // Continuum default. A consumer repository opts in to the Contract Gate by
+  // setting CONTINUUM_CONTRACT_GATE_WORKFLOW_NAME to a non-default name; while
+  // the knob stays at the default the gate remains Continuum-only.
+  const ownerResumeContractGateDefaultWorkflow =
+    'Continuum Contract Gate';
   const ownerResumeContractGateWorkflow =
     (process.env.OWNER_RESUME_CONTRACT_GATE_WORKFLOW ||
-      'Continuum Contract Gate').trim();
+      ownerResumeContractGateDefaultWorkflow).trim();
+  const ownerResumeContractGateConfigured =
+    ownerResumeContractGateWorkflow !== ownerResumeContractGateDefaultWorkflow;
   const ownerResumeDefaultBranch = (
     process.env.DEFAULT_BRANCH ||
     context.payload.repository?.default_branch ||
@@ -1229,9 +1237,14 @@ module.exports = async function runIssueScheduler({ github, context, core }) {
       },
     ];
     // The Contract Gate workflow exists only in the Continuum control-plane
-    // repository; consumer repositories never run it, so requiring its run
-    // here would make owner-armed resume permanently NOOP there.
-    if (String(repoFullName || '').toLowerCase() === 'kodmial/continuum') {
+    // repository by default; consumer repositories never run it, so requiring
+    // its run here would make owner-armed resume permanently NOOP there. An
+    // explicit non-default workflow-name override applies the gate in any
+    // repository.
+    if (
+      ownerResumeContractGateConfigured ||
+      String(repoFullName || '').toLowerCase() === 'kodmial/continuum'
+    ) {
       ownerResumeRequiredRuns.push({
         names: [ownerResumeContractGateWorkflow],
         paths: ['.github/workflows/' + 'contract-gate.yml'],

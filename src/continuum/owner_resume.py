@@ -653,8 +653,11 @@ def evaluate_predecessor_completion(
 ) -> Tuple[bool, str, Optional[int], str]:
     """Evaluate the complete trusted completion chain for a predecessor.
 
-    The Contract Gate is required only in the repository that runs it; an
-    explicit ``contract_gate_names``/``contract_gate_paths`` always wins.
+    The Contract Gate is required by default only in the repository that
+    runs it. A non-empty explicit ``contract_gate_names`` or
+    ``contract_gate_paths`` overrides the repository default for that
+    parameter; an explicit empty value for either parameter disables the
+    gate entirely.
     """
 
     if predecessor_issue.get("pull_request"):
@@ -700,18 +703,24 @@ def evaluate_predecessor_completion(
     if not str(latest.get("merged_at") or "").strip():
         return False, "predecessor merge timestamp is missing", None, ""
 
+    names_explicit = contract_gate_names is not None
+    paths_explicit = contract_gate_paths is not None
+    required = contract_gate_is_required(repository)
     if contract_gate_names is None:
         contract_gate_names = (
-            CONTRACT_GATE_WORKFLOW_NAMES
-            if contract_gate_is_required(repository)
-            else ()
+            CONTRACT_GATE_WORKFLOW_NAMES if required else ()
         )
     if contract_gate_paths is None:
         contract_gate_paths = (
-            CONTRACT_GATE_WORKFLOW_PATHS
-            if contract_gate_is_required(repository)
-            else ()
+            CONTRACT_GATE_WORKFLOW_PATHS if required else ()
         )
+    # An explicitly empty override disables the gate outright; a non-empty
+    # explicit value replaces the repository default for that parameter.
+    if (names_explicit and not contract_gate_names) or (
+        paths_explicit and not contract_gate_paths
+    ):
+        contract_gate_names = ()
+        contract_gate_paths = ()
     gates = [(ci_workflow_names, ci_workflow_paths, "CI")]
     if contract_gate_names or contract_gate_paths:
         gates.append(

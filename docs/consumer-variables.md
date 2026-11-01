@@ -174,6 +174,7 @@ publication are not part of the Swift profile.
 | `CONTINUUM_CHILD_OWNED_MARKER` | `<!-- continuum-child-owned -->` | Current delegated-child ownership marker. |
 | `CONTINUUM_LEGACY_CHILD_OWNED_MARKER` | empty | Optional legacy marker supplied by a migrating consumer. |
 | `CONTINUUM_REVIEW_PROVIDER` | `none` | Authoritative review selector: `none`, `coderabbit`, or `pr-agent`. |
+| `CONTINUUM_CONTRACT_GATE_WORKFLOW_NAME` | `Continuum Contract Gate` | Workflow name for the owner-armed resume Contract Gate. At the default, the exact-HEAD gate is required only in `kodmial/continuum`; a non-default name applies the same gate in any consumer repository. |
 | `CONTINUUM_VERSION_FILE` | empty | Optional version file used only by the generic stale-release-run optimization. |
 
 ## Optional CodeRabbit dispatch targets

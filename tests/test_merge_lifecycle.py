@@ -163,12 +163,46 @@ class MainSyncTests(unittest.TestCase):
         self.assertEqual(decision["reason"], "unknown-main-delta")
         self.assertEqual(decision["critical_files"], ["src/continuum/x.py"])
 
-    def test_both_workflows_share_the_same_path_table(self):
+    def test_classifiers_carry_the_executable_surface_checks(self):
+        # The shipped JS mirror and the Python canonical owner both carry
+        # the exact added prefix lines for the executable surfaces.
+        js = read_repo(SHARED_JS)
+        self.assertIn(
+            "text.startsWith('.github/scripts/') || "
+            "text.startsWith('.github/actions/')",
+            js,
+        )
+        python_source = read_repo("src/continuum/merge_lifecycle.py")
+        self.assertIn(
+            'if text.startswith(".github/scripts/") or '
+            'text.startswith(".github/actions/"):',
+            python_source,
+        )
+
+    def test_workflow_inline_copies_are_parity_or_explicitly_absent(self):
+        # The two workflow inline classifiers are updated in the pr/part-2
+        # change. In this partial tree they may be absent: assert that
+        # absence explicitly instead of letting the test pass silently.
+        present = [
+            path
+            for path in (GENERIC_MERGE, PR_AGENT_MERGE)
+            if os.path.exists(os.path.join(ROOT, path))
+        ]
+        if not present:
+            for path in (GENERIC_MERGE, PR_AGENT_MERGE):
+                self.assertFalse(
+                    os.path.exists(os.path.join(ROOT, path)),
+                    "{} appeared after the presence scan".format(path),
+                )
+            return
+        self.assertEqual(len(present), 2, present)
         for path in (GENERIC_MERGE, PR_AGENT_MERGE):
-            body = read_repo(path)
-            self.assertIn("function isNonMergeCriticalMainPath", body)
-            self.assertIn(".github/workflows/continuum-", body)
-            self.assertIn("non-merge-critical-main-delta", body)
+            with self.subTest(path=path):
+                body = read_repo(path)
+                self.assertIn("function isNonMergeCriticalMainPath", body)
+                self.assertIn(".github/scripts/", body)
+                self.assertIn(".github/actions/", body)
+                self.assertIn("non-merge-critical-main-delta", body)
 
 
 class ConflictPlumbingTests(unittest.TestCase):

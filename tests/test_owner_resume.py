@@ -918,6 +918,57 @@ class NegativeEvidenceTests(unittest.TestCase):
         )
         self.assertEqual(decision.state, RESUME)
 
+    def test_explicit_contract_gate_overrides_are_coherent(self):
+        evidence = complete_predecessor()
+        consumer = "example/consumer"
+        ci_only = [green_runs()[0]]
+        custom_gate = run(
+            "Custom Contract Gate",
+            ".github/workflows/custom-contract-gate.yml",
+            HEAD_A,
+        )
+
+        def complete(repository, runs, **overrides):
+            return evaluate_predecessor_completion(
+                predecessor_issue=evidence["issue"],
+                pull_requests=[pr(900, 374, head_repo=repository)],
+                exact_head_runs=runs,
+                statuses=evidence["statuses"],
+                reviews=[],
+                repository=repository,
+                **overrides,
+            )[0]
+
+        # An explicit empty names or paths value disables the gate even in
+        # kodmial/continuum, where the repository default requires it.
+        for overrides in (
+            {"contract_gate_names": ()},
+            {"contract_gate_paths": ()},
+            {"contract_gate_names": (), "contract_gate_paths": ()},
+        ):
+            with self.subTest(overrides=overrides):
+                self.assertTrue(
+                    complete(REPOSITORY, ci_only, **overrides)
+                )
+
+        # A consumer keeps the repository default (no gate) without an
+        # override, and honors non-empty explicit gate identities.
+        self.assertTrue(complete(consumer, ci_only))
+        custom = {
+            "contract_gate_names": ("Custom Contract Gate",),
+            "contract_gate_paths": (
+                ".github/workflows/custom-contract-gate.yml",
+            ),
+        }
+        self.assertFalse(complete(consumer, ci_only, **custom))
+        self.assertTrue(complete(consumer, ci_only + [custom_gate], **custom))
+
+        # The same non-empty explicit override also wins over the Continuum
+        # repository default: the default gate run is no longer required.
+        self.assertTrue(
+            complete(REPOSITORY, ci_only + [custom_gate], **custom)
+        )
+
     def test_independent_review_is_required_and_author_bot_cannot_approve(self):
         self.assertEqual(self.complete(statuses=[]).state, NOOP)
         self.assertEqual(
@@ -1314,10 +1365,11 @@ class SchedulerResumeBudgetTests(unittest.TestCase):
 
 
 class ExecutableProductionWorkflowTests(unittest.TestCase):
-    def run_workflow(self, scenario):
+    def run_workflow(self, scenario, env_overrides=None):
         env = os.environ.copy()
         env["SCHEDULER"] = str(SCHEDULER_SCRIPT)
         env["SCENARIO_JSON"] = json.dumps(scenario)
+        env.update(env_overrides or {})
         completed = subprocess.run(
             ["node", "-e", WORKFLOW_HARNESS],
             capture_output=True,
@@ -1460,6 +1512,55 @@ class ExecutableProductionWorkflowTests(unittest.TestCase):
             runs=[green_runs()[0]],
         )
         self.assertEqual(self.run_workflow(scenario)["state"], "RESUME")
+
+    def test_production_js_contract_gate_override_applies_to_consumers(self):
+        consumer = "kodmial/consumer"
+        candidate = pr(900, 374, head_repo=consumer)
+        ci_only = [green_runs()[0]]
+        base = dict(
+            repo="consumer",
+            pulls=[candidate],
+            fullPrs={"900": candidate},
+            runs=ci_only,
+        )
+
+        # Unset or default: a consumer resumes on CI alone.
+        for value in ("", "Continuum Contract Gate"):
+            with self.subTest(value=value):
+                outcome = self.run_workflow(
+                    self.decision_scenario(**base),
+                    env_overrides={
+                        "OWNER_RESUME_CONTRACT_GATE_WORKFLOW": value,
+                    },
+                )
+                self.assertEqual(outcome["state"], "RESUME")
+
+        # An explicit non-default workflow name requires the same exact-HEAD
+        # gate in the consumer repository.
+        override = {
+            "OWNER_RESUME_CONTRACT_GATE_WORKFLOW": "Consumer Contract Gate",
+        }
+        outcome = self.run_workflow(
+            self.decision_scenario(**base), env_overrides=override
+        )
+        self.assertEqual(outcome["state"], "NOOP")
+        self.assertIn("Contract Gate", outcome["reason"])
+
+        custom_gate = run(
+            "Consumer Contract Gate",
+            ".github/workflows/consumer-contract-gate.yml",
+            HEAD_A,
+        )
+        outcome = self.run_workflow(
+            self.decision_scenario(
+                repo="consumer",
+                pulls=[candidate],
+                fullPrs={"900": candidate},
+                runs=ci_only + [custom_gate],
+            ),
+            env_overrides=override,
+        )
+        self.assertEqual(outcome["state"], "RESUME")
 
     def test_production_js_target_stops_block_resume(self):
         for scenario in (
