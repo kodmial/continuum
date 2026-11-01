@@ -25,8 +25,8 @@ Predecessor completion requires all of the following trusted evidence:
   matching titles);
 * that PR is merged into the expected default branch with a real merge
   commit and exact HEAD;
-* the exact PR HEAD has completed/successful project CI and Contract Gate
-  runs;
+* the exact PR HEAD has completed/successful project CI runs and, in the
+  Continuum control-plane repository only, Contract Gate runs;
 * the exact PR HEAD carries independent clean-review evidence (the durable
   PR-Agent clean status or an approving review from a different actor).
 
@@ -62,6 +62,12 @@ RESUME_MARKER_LINE_RE = re.compile(
 )
 MARKER_SHAPE_RE = re.compile(r"continuum-resume-after(?::v1)?\b")
 DISPATCH_MARKER = "<!-- issue-scheduler-dispatch -->"
+# The Contract Gate workflow exists only in the Continuum control-plane
+# repository. Consumer repositories never run it, so requiring its run on a
+# predecessor PR HEAD would make owner-armed resume permanently NOOP there.
+CONTRACT_GATE_REPOSITORY = "kodmial/continuum"
+CONTRACT_GATE_WORKFLOW_NAMES = ("Continuum Contract Gate",)
+CONTRACT_GATE_WORKFLOW_PATHS = (".github/workflows/contract-gate.yml",)
 OWNER_COMMAND_RE = re.compile(
     r"^[ ]{0,3}/(?:opencode|oc)(?=\s|$)", re.MULTILINE
 )
@@ -619,6 +625,16 @@ def independent_review_evidence(
     return False
 
 
+def contract_gate_is_required(repository: str) -> bool:
+    """Whether the Contract Gate workflow exists for this repository.
+
+    Only the Continuum control-plane repository runs the Contract Gate; a
+    consumer repository never does, so its absence is not missing evidence.
+    """
+
+    return str(repository or "").strip().lower() == CONTRACT_GATE_REPOSITORY
+
+
 def evaluate_predecessor_completion(
     *,
     predecessor_issue: Mapping[str, Any],
@@ -630,14 +646,16 @@ def evaluate_predecessor_completion(
     default_branch: str = "main",
     ci_workflow_names: Sequence[str] = ("CI",),
     ci_workflow_paths: Sequence[str] = (".github/workflows/ci.yml",),
-    contract_gate_names: Sequence[str] = ("Continuum Contract Gate",),
-    contract_gate_paths: Sequence[str] = (
-        ".github/workflows/contract-gate.yml",
-    ),
+    contract_gate_names: Optional[Sequence[str]] = None,
+    contract_gate_paths: Optional[Sequence[str]] = None,
     predecessor_comments: Optional[Sequence[Any]] = None,
     owner_login: str = "",
 ) -> Tuple[bool, str, Optional[int], str]:
-    """Evaluate the complete trusted completion chain for a predecessor."""
+    """Evaluate the complete trusted completion chain for a predecessor.
+
+    The Contract Gate is required only in the repository that runs it; an
+    explicit ``contract_gate_names``/``contract_gate_paths`` always wins.
+    """
 
     if predecessor_issue.get("pull_request"):
         return False, "predecessor is a pull request, not an issue", None, ""
@@ -682,10 +700,24 @@ def evaluate_predecessor_completion(
     if not str(latest.get("merged_at") or "").strip():
         return False, "predecessor merge timestamp is missing", None, ""
 
-    for names, paths, label in (
-        (ci_workflow_names, ci_workflow_paths, "CI"),
-        (contract_gate_names, contract_gate_paths, "Contract Gate"),
-    ):
+    if contract_gate_names is None:
+        contract_gate_names = (
+            CONTRACT_GATE_WORKFLOW_NAMES
+            if contract_gate_is_required(repository)
+            else ()
+        )
+    if contract_gate_paths is None:
+        contract_gate_paths = (
+            CONTRACT_GATE_WORKFLOW_PATHS
+            if contract_gate_is_required(repository)
+            else ()
+        )
+    gates = [(ci_workflow_names, ci_workflow_paths, "CI")]
+    if contract_gate_names or contract_gate_paths:
+        gates.append(
+            (contract_gate_names, contract_gate_paths, "Contract Gate")
+        )
+    for names, paths, label in gates:
         run = newest_exact_head_run(
             exact_head_runs,
             head_sha=head_sha,

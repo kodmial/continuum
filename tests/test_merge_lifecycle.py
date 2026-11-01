@@ -111,7 +111,12 @@ class MainSyncTests(unittest.TestCase):
                 self.assertTrue(life.is_non_merge_critical_main_path(path))
 
     def test_source_paths_are_critical(self):
-        for path in ("src/continuum/merge_lifecycle.py", "install.sh"):
+        for path in (
+            "src/continuum/merge_lifecycle.py",
+            "install.sh",
+            ".github/scripts/merge_lifecycle.js",
+            ".github/actions/agent-toolchain/action.yml",
+        ):
             self.assertFalse(life.is_non_merge_critical_main_path(path))
 
     def test_up_to_date_needs_no_sync(self):
@@ -572,6 +577,8 @@ class SharedJsMirrorTests(unittest.TestCase):
             "assert.strictEqual(m.sanitizeBranch('../evil'),'main');"
             "assert.strictEqual(m.isNonMergeCriticalMainPath('docs/x.md'),true);"
             "assert.strictEqual(m.isNonMergeCriticalMainPath('src/x.py'),false);"
+            "assert.strictEqual(m.isNonMergeCriticalMainPath('.github/scripts/merge_lifecycle.js'),false);"
+            "assert.strictEqual(m.isNonMergeCriticalMainPath('.github/actions/x/action.yml'),false);"
             "assert.strictEqual(m.validateExactHead('abc','abc').ok,true);"
             "assert.strictEqual(m.validateExactHead('abc','def').ok,false);"
             "assert.strictEqual(m.decideMainSync(0,[]).reason,'up-to-date');"

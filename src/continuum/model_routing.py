@@ -720,7 +720,12 @@ def run() -> int:
                     current = {"fingerprint": fingerprint, "cooldowns": {}}
                 current.setdefault("cooldowns", {})[model] = now + config.cooldown
                 return current
-            store.update(key, pause)
+            try:
+                store.update(key, pause)
+            except RouteError:
+                # The runner is burned regardless; a state-store failure
+                # must not mask the exit-75 runner-death outcome.
+                pass
             raise
         except RouteError as error:
             errors[model] = str(error)

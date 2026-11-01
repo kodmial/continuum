@@ -1221,18 +1221,24 @@ module.exports = async function runIssueScheduler({ github, context, core }) {
       );
       return { state: 'NOOP', reason: 'exact-HEAD run evidence is unavailable' };
     }
-    for (const required of [
+    const ownerResumeRequiredRuns = [
       {
         names: [ownerResumeCiWorkflow],
         paths: ['.github/workflows/' + 'ci.yml'],
         label: 'CI',
       },
-      {
+    ];
+    // The Contract Gate workflow exists only in the Continuum control-plane
+    // repository; consumer repositories never run it, so requiring its run
+    // here would make owner-armed resume permanently NOOP there.
+    if (String(repoFullName || '').toLowerCase() === 'kodmial/continuum') {
+      ownerResumeRequiredRuns.push({
         names: [ownerResumeContractGateWorkflow],
         paths: ['.github/workflows/' + 'contract-gate.yml'],
         label: 'Contract Gate',
-      },
-    ]) {
+      });
+    }
+    for (const required of ownerResumeRequiredRuns) {
       const run = newestOwnerResumeRun(
         exactHeadRuns, headSha, required.names, required.paths
       );

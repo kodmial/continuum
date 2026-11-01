@@ -346,11 +346,12 @@ def complete_predecessor(number: int = 374, *, head_sha: str = HEAD_A,
 
 def decide(*, target: int = 373, predecessor: int = 374, comments=None,
            labels=None, predecessor_issue=None, pull_requests=(),
-           runs=(), statuses=(), reviews=(), **kwargs):
+           runs=(), statuses=(), reviews=(), repository: str = REPOSITORY,
+           **kwargs):
     return decide_owner_resume(
         target_issue=issue(target, labels=labels or [PAUSE, READY]),
         repository_owner=OWNER,
-        repository=REPOSITORY,
+        repository=repository,
         comments=comments if comments is not None else [marker(predecessor)],
         labels=labels or {PAUSE, READY},
         predecessor_issue=predecessor_issue,
@@ -881,6 +882,42 @@ class NegativeEvidenceTests(unittest.TestCase):
         ]
         self.assertEqual(self.complete(runs=failed_gate).state, NOOP)
 
+    def test_contract_gate_is_required_only_in_the_continuum_repository(self):
+        consumer = "example/consumer"
+        for repository, expected in (
+            ("kodmial/continuum", False),
+            (consumer, True),
+        ):
+            with self.subTest(repository=repository):
+                evidence = complete_predecessor()
+                evidence["pull_requests"] = [
+                    pr(900, 374, head_repo=repository)
+                ]
+                complete, reason, _pr, _head = evaluate_predecessor_completion(
+                    predecessor_issue=evidence["issue"],
+                    pull_requests=evidence["pull_requests"],
+                    exact_head_runs=[green_runs()[0]],
+                    statuses=evidence["statuses"],
+                    reviews=[],
+                    repository=repository,
+                )
+                self.assertEqual(complete, expected, reason)
+                if not expected:
+                    self.assertIn("Contract Gate", reason)
+
+    def test_consumer_repository_resumes_without_the_contract_gate(self):
+        consumer = "example/consumer"
+        evidence = complete_predecessor()
+        evidence["pull_requests"] = [pr(900, 374, head_repo=consumer)]
+        decision = decide(
+            repository=consumer,
+            predecessor_issue=evidence["issue"],
+            pull_requests=evidence["pull_requests"],
+            runs=[green_runs()[0]],
+            statuses=evidence["statuses"],
+        )
+        self.assertEqual(decision.state, RESUME)
+
     def test_independent_review_is_required_and_author_bot_cannot_approve(self):
         self.assertEqual(self.complete(statuses=[]).state, NOOP)
         self.assertEqual(
@@ -1404,6 +1441,25 @@ class ExecutableProductionWorkflowTests(unittest.TestCase):
         wrong_base["pulls"] = [pr(900, 374, base="release")]
         wrong_base["fullPrs"] = {"900": pr(900, 374, base="release")}
         self.assertEqual(self.run_workflow(wrong_base)["state"], "NOOP")
+
+    def test_production_js_contract_gate_is_continuum_only(self):
+        # The Continuum repository still requires the Contract Gate run.
+        continuum = self.decision_scenario(runs=[green_runs()[0]])
+        outcome = self.run_workflow(continuum)
+        self.assertEqual(outcome["state"], "NOOP")
+        self.assertIn("Contract Gate", outcome["reason"])
+
+        # A consumer repository never runs it, so CI alone completes the
+        # predecessor chain.
+        consumer = "kodmial/consumer"
+        candidate = pr(900, 374, head_repo=consumer)
+        scenario = self.decision_scenario(
+            repo="consumer",
+            pulls=[candidate],
+            fullPrs={"900": candidate},
+            runs=[green_runs()[0]],
+        )
+        self.assertEqual(self.run_workflow(scenario)["state"], "RESUME")
 
     def test_production_js_target_stops_block_resume(self):
         for scenario in (

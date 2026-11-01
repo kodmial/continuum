@@ -381,6 +381,39 @@ class StateStoreFailureIsolationTests(unittest.TestCase):
         self.assertEqual(calls["update"], 1)
         self.assertEqual(calls["probe"], 0)
 
+    def test_cooldown_write_failure_cannot_mask_burned_runner(self):
+        import os
+        config = route.Configuration.parse(A)
+        fingerprint = config.fingerprint("d", "anonymous")
+        state = {"fingerprint": fingerprint}
+        calls = {"update": 0}
+        store = type("Store", (), {})()
+        store.read = lambda key: (state, None, None)
+
+        def conflict_update(key, mutator):
+            calls["update"] += 1
+            raise route.Conflict("state CAS budget exhausted")
+        store.update = conflict_update
+
+        def burned_probe(*args, **kwargs):
+            raise route.BurnedRunner("429")
+        env = {
+            "OPENCODE_MODELS": A,
+            "CONTINUUM_MODEL_STATE_TOKEN": "t",
+            "GITHUB_REPOSITORY": "owner/parent",
+            "GITHUB_RUN_ID": "703",
+            "GITHUB_RUN_ATTEMPT": "1",
+        }
+        with patch.object(route, "binary_provenance", lambda: ("1.2.3", "d")), \
+             patch.object(route, "GitRefStore", lambda owner, token: store), \
+             patch.object(route, "semantic_probe", burned_probe), \
+             patch.object(route.sys, "argv", ["model_routing.py", "select"]), \
+             patch.dict(os.environ, env, clear=True):
+            # The burned-runner exit code drives fresh-VM recovery; a
+            # best-effort cooldown write failure must not replace it.
+            self.assertEqual(route.main(), 75)
+        self.assertEqual(calls["update"], 1)
+
 
 class GitRefStoreTests(unittest.TestCase):
     def test_first_write_creates_orphan_ref_not_main(self):

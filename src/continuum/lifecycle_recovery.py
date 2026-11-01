@@ -1610,7 +1610,12 @@ def requires_pat(action: object, content: object = "") -> bool:
         # The generic-receiver check above already forced github.*
         # generics to PAT, so a False here is always a client-side or
         # receiver-less specific read, never a PAT-channel mutation.
-        if token == leaf_word or token in segments or leaf_word.startswith(token + "_") or (
+        # "request" is generic rather than a read verb: a mutation leaf
+        # such as "pulls.requestReviewers" exposes it as a segment, so it
+        # must not classify that mutation as a read. Bare/leading
+        # "request" is still handled by the generic-receiver check above.
+        segment_hit = token in segments and token != "request"
+        if token == leaf_word or segment_hit or leaf_word.startswith(token + "_") or (
             leaf_word.startswith(token) and leaf_word in {
                 "listreviews", "listreviewcomments", "listcomments",
                 "getcommit", "getbranch", "getpull", "listcommits",

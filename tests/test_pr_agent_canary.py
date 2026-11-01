@@ -77,6 +77,16 @@ class CanaryGateTests(unittest.TestCase):
             canary.assert_free_route("groq/llama-3", canary.DEFAULT_OPENCODE_MODEL)
         with self.assertRaises(CanaryError):
             canary.assert_free_route("openai/continuum-review", "anthropic/paid-model")
+        # A name is not free just because it contains "free"; only the
+        # exact default route is supported.
+        for model in (
+            "openrouter/some-model-free",
+            "vendor/notfree-pro",
+            "opencode/other-contributor-free",
+        ):
+            with self.subTest(model=model):
+                with self.assertRaises(CanaryError):
+                    canary.assert_free_route("openai/continuum-review", model)
 
     def test_coderabbit_untouched(self):
         canary.assert_coderabbit_untouched("CodeRabbit")

@@ -935,6 +935,7 @@ class TokenPolicyTests(unittest.TestCase):
             "github.rest.issues.addLabels",
             "github.rest.actions.createWorkflowDispatch",
             "github.rest.actions.cancelWorkflowRun",
+            "github.rest.pulls.requestReviewers",
             "resolveReviewThread",
         ):
             with self.subTest(mutation=mutation):
@@ -948,6 +949,25 @@ class TokenPolicyTests(unittest.TestCase):
         for action in ("thread", "threads", "spreadsheet", "requester"):
             with self.subTest(action=action):
                 self.assertTrue(lifecycle.requires_pat(action))
+
+    def test_request_reviewers_mutation_is_never_matched_as_a_read(self):
+        # The camel-case segment "request" is generic, not a read verb: a
+        # requestReviewers leaf is a mutation and must stay PAT-backed.
+        self.assertTrue(
+            lifecycle.requires_pat("github.rest.pulls.requestReviewers")
+        )
+        self.assertTrue(
+            lifecycle.requires_pat(
+                "github.rest.pulls.requestRequestedReviewers"
+            )
+        )
+        # A list* discovery leaf that merely carries a "request" segment is
+        # still a read.
+        self.assertFalse(
+            lifecycle.requires_pat(
+                "client.rest.pulls.listRequestedReviewers"
+            )
+        )
 
     def test_generic_clients_fail_closed_without_read_receiver(self):
         # Only the client.* receiver defaults generic graphql/request/

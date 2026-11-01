@@ -141,13 +141,16 @@ def is_non_merge_critical_main_path(path: Any) -> bool:
     """Whether a main-delta path never forces a PR re-sync.
 
     Mirrors ``isNonMergeCriticalMainPath`` in both auto-merge workflows
-    exactly: Continuum caller pins (``.github/workflows/continuum-*``)
-    are executable control-plane code and always merge-critical; docs,
+    exactly: Continuum caller pins (``.github/workflows/continuum-*``) and
+    the executable ``.github/scripts/`` and ``.github/actions/`` surfaces
+    are control-plane code and always merge-critical; docs, other
     ``.github/`` metadata, license/ignore/changelog entries are not.
     """
 
     text = str(path or "")
     if text.startswith(".github/workflows/continuum-"):
+        return False
+    if text.startswith(".github/scripts/") or text.startswith(".github/actions/"):
         return False
     return (
         text == "LICENSE"

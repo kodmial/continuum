@@ -151,7 +151,7 @@ def assert_free_route(request_model: str, opencode_model: str) -> None:
     except pr_agent.PrAgentError as exc:
         raise CanaryError(str(exc)) from None
     effective = (opencode_model or "").strip() or DEFAULT_OPENCODE_MODEL
-    if effective != DEFAULT_OPENCODE_MODEL and "free" not in effective.lower():
+    if effective != DEFAULT_OPENCODE_MODEL:
         raise CanaryError(
             f"canary must use the supported free/default OpenCode route, got {effective!r}"
         )
