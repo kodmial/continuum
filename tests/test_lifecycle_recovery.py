@@ -216,6 +216,32 @@ class TransientClassificationTests(unittest.TestCase):
                     lifecycle.classify_infrastructure_failure(error=message).transient
                 )
 
+    def test_explicit_infrastructure_tokens_win_over_assert_mentions(self):
+        # Explicit infrastructure tokens are evaluated before the ``assert``
+        # hold, so a merged spelling (or any other explicit token) that also
+        # mentions an assertion still retries. This fixes the intended
+        # infra-over-assert priority rather than leaving it incidental.
+        for message in (
+            "readtimeout while waiting for the runner: assertion failed",
+            "connecttimeout after 30s: assertion failed",
+            "connection reset by peer: assertion failed",
+        ):
+            with self.subTest(message=message):
+                self.assertTrue(
+                    lifecycle.classify_infrastructure_failure(error=message).transient
+                )
+        # A bare or qualified timeout is not an explicit infrastructure token:
+        # the assert hold still makes it deterministic, so a test timeout that
+        # reports an assertion never burns the transient budget.
+        for message in (
+            "tests timed out: assertion failed",
+            "read timeout while running tests: assertion failed",
+        ):
+            with self.subTest(message=message):
+                self.assertFalse(
+                    lifecycle.classify_infrastructure_failure(error=message).transient
+                )
+
 
 class TimeoutRuleParityTests(unittest.TestCase):
     """The bounded qualified-timeout rule is duplicated; keep the copies in sync.
@@ -263,10 +289,16 @@ class TimeoutRuleParityTests(unittest.TestCase):
             with self.subTest(qualifier=qualifier):
                 self.assertIn(qualifier, lifecycle._TIMEOUT_INFRA_QUALIFIERS)
                 self.assertIn(qualifier, render_engine._TIMEOUT_INFRA_QUALIFIERS)
+        # Compare the sets in both directions: a one-sided difference hides a
+        # qualifier added to (or removed from) lifecycle_recovery alone.
         self.assertEqual(
-            set(render_engine._TIMEOUT_INFRA_QUALIFIERS)
-            - set(lifecycle._TIMEOUT_INFRA_QUALIFIERS),
-            {"render", "api"},
+            set(lifecycle._TIMEOUT_INFRA_QUALIFIERS),
+            set(self.SHARED_QUALIFIERS),
+            "lifecycle_recovery must carry exactly the shared qualifiers",
+        )
+        self.assertEqual(
+            set(render_engine._TIMEOUT_INFRA_QUALIFIERS),
+            set(self.SHARED_QUALIFIERS) | {"render", "api"},
             "render_execution may only add its Render-specific qualifiers",
         )
         self.assertEqual(self.rule_shape(lifecycle), self.rule_shape(render_engine))

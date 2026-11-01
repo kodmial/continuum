@@ -195,6 +195,13 @@ def _has_transient_signature(message: str) -> bool:
 
     if not message:
         return False
+    # Explicit infrastructure tokens are checked before the ``assert`` hold,
+    # so infrastructure evidence wins over an assertion mentioned in the same
+    # message. That priority is deliberate and covers the merged spellings
+    # too: ``readtimeout ... assertion failed`` and
+    # ``connection reset by peer: assertion failed`` stay transient. Only the
+    # bare ``timeout``/``timed out`` mentions are excluded here; they need an
+    # infrastructure qualifier and fall through to the assert hold instead.
     for token in _TRANSIENT_ERROR_PATTERNS:
         if token in ("timeout", "timed out"):
             continue

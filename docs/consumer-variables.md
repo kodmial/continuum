@@ -83,11 +83,11 @@ The workflow-owned `.continuum-verification.json` evidence is retained on a
 
 The evidence file lives in the task worktree, so the engine never trusts it on
 its own. The verification engine recognizes the optional HMAC-SHA256
-attestation key in the environment variable
-`CONTINUUM_VERIFICATION_ATTESTATION_KEY`; when that variable is present it
+attestation secret `CONTINUUM_VERIFICATION_ATTESTATION_KEY` in the
+environment; when that secret is present it
 signs the recorded contract, baseline, verifier result, and accepted final
 record, and a resumed run reuses those records only when the signature
-verifies. No shipped Continuum workflow declares or passes this variable yet,
+verifies. No shipped Continuum workflow declares or passes this secret yet,
 so a consumer has nothing to configure: the engine reads it only when the
 environment already supplies it. Without the key, an existing baseline is
 rebuilt and the final phase re-resolves the contract from the task base commit
