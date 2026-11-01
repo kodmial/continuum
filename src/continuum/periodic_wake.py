@@ -36,6 +36,7 @@ PERIODIC_RUN_MARKER = "[continuum-periodic]"
 ISSUE_SCHEDULER_INTERVAL_SECONDS = 10 * 60
 ISSUE_SCHEDULER_OFFSET_SECONDS = 7 * 60
 
+
 def parse_periodic_wake(value: Any) -> bool:
     """Return whether the mode selector asks for external periodic behavior."""
     if isinstance(value, bool):

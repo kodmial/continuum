@@ -263,6 +263,11 @@ def plan_snapshot(
             terminal_stopped=state.terminal_stopped,
             generations=state.generations,
             repository_owner=(
+                # The snapshot repository is the authoritative owner source.
+                # When the context omits it the owner is genuinely unknown;
+                # the adapters then fall back to the API ``OWNER``
+                # association documented in ``_comment_records`` rather than
+                # silently dropping the owner race guard.
                 state.repository.split("/", 1)[0] if state.repository else ""
             ),
         )

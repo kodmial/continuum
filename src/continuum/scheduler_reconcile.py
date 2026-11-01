@@ -74,12 +74,27 @@ class IssueState:
 
 @dataclass
 class CommentRecord:
-    """One issue comment."""
+    """One issue comment.
+
+    ``author_is_owner`` is the narrow ``/oc`` predicate: the repository
+    owner's login, or the scheduler bot.  ``author_is_trusted`` is the wider
+    actor-trust bit used for terminal markers (``OWNER``, ``MEMBER`` and
+    ``COLLABORATOR`` associations are trusted actors).  The two are kept
+    distinct so a collaborator cannot post an owner command while a
+    collaborator/org-member generation stop still invalidates a resume.
+    """
 
     body: str
     author_is_owner: bool
     created_at: datetime
     author_login: str = ""
+    author_is_trusted: Optional[bool] = None
+
+    def __post_init__(self) -> None:
+        # Callers that only assert owner identity still express trust;
+        # adapter-built records set the wider bit explicitly.
+        if self.author_is_trusted is None:
+            self.author_is_trusted = bool(self.author_is_owner)
 
 
 @dataclass

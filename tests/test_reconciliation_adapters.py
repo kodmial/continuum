@@ -7,6 +7,7 @@ from datetime import datetime, timedelta, timezone
 
 from continuum import reconciliation_adapters as adapters
 from continuum.lifecycle_recovery import RetryEvidence, retry_marker
+from continuum.owner_resume import generation_stopped, scan_resume_marker
 from continuum.scheduler_reconcile import SchedulerConfig
 
 
@@ -413,6 +414,125 @@ class QualificationDelegationAndWatchdogTests(unittest.TestCase):
         )
         self.assertEqual(decision.kind, adapters.RETRY)
         self.assertEqual(decision.retry_after_seconds, 1000)
+
+
+class AdapterBuiltCommentTrustTests(unittest.TestCase):
+    """Adapter ``CommentRecord``s must keep owner and trusted bits distinct."""
+
+    OWNER = "kodmial"
+    REPOSITORY = "kodmial/continuum"
+    GENERATION_STOP = (
+        "<!-- continuum-task-generation-stop "
+        "repo=kodmial/continuum issue=373 generation=1 "
+        "pinned-spec=%s live-spec=%s reason=drift -->"
+        % ("1" * 64, "2" * 64)
+    )
+
+    def raw(self, body, *, author, association, cid, at):
+        return {
+            "id": cid,
+            "body": body,
+            "user": {"login": author},
+            "author_association": association,
+            "created_at": at.isoformat().replace("+00:00", "Z"),
+        }
+
+    def adapter_records(self, *raws):
+        return adapters._comment_records(list(raws), self.OWNER)
+
+    def marker(self, at):
+        return self.raw(
+            "<!-- continuum-resume-after:v1 predecessor=374 -->",
+            author=self.OWNER,
+            association="OWNER",
+            cid=1,
+            at=at,
+        )
+
+    def test_collaborator_stop_marker_invalidates_adapter_resume_marker(self):
+        records = self.adapter_records(
+            self.marker(NOW - timedelta(hours=2)),
+            self.raw(
+                self.GENERATION_STOP,
+                author="teammate",
+                association="COLLABORATOR",
+                cid=2,
+                at=NOW - timedelta(hours=1),
+            ),
+        )
+        scan = scan_resume_marker(
+            records, target=373, repository_owner=self.OWNER
+        )
+        self.assertIsNotNone(scan.instruction)
+        self.assertEqual(scan.instruction.predecessor, 374)
+        # A collaborator is a trusted marker author but never an owner actor.
+        self.assertFalse(records[1].author_is_owner)
+        self.assertTrue(records[1].author_is_trusted)
+        self.assertTrue(
+            generation_stopped(
+                records,
+                target=373,
+                repository=self.REPOSITORY,
+                repository_owner=self.OWNER,
+            )
+        )
+
+    def test_non_trusted_stop_marker_does_not_invalidate_adapter_resume(self):
+        records = self.adapter_records(
+            self.marker(NOW - timedelta(hours=2)),
+            self.raw(
+                self.GENERATION_STOP,
+                author="stranger",
+                association="NONE",
+                cid=2,
+                at=NOW - timedelta(hours=1),
+            ),
+        )
+        scan = scan_resume_marker(
+            records, target=373, repository_owner=self.OWNER
+        )
+        self.assertIsNotNone(scan.instruction)
+        self.assertFalse(records[1].author_is_owner)
+        self.assertFalse(records[1].author_is_trusted)
+        self.assertFalse(
+            generation_stopped(
+                records,
+                target=373,
+                repository=self.REPOSITORY,
+                repository_owner=self.OWNER,
+            )
+        )
+
+
+class UnknownRepositoryOwnerTests(unittest.TestCase):
+    """An omitted snapshot repository must not silently drop owner trust."""
+
+    def race_comment(self, login, association):
+        return {
+            "body": "/oc",
+            "author_association": association,
+            "user": {"login": login},
+            "created_at": NOW - timedelta(minutes=1),
+        }
+
+    def test_unknown_owner_falls_back_to_api_owner_association(self):
+        decision = adapters.decide_issue_admission(
+            issue(2),
+            now=NOW,
+            comments={2: [self.race_comment("repo-owner", "OWNER")]},
+        )
+        self.assertEqual(decision.kind, adapters.WAIT)
+        self.assertIn("race window", decision.reason)
+
+    def test_unknown_owner_does_not_promote_member_or_collaborator(self):
+        for association in ("MEMBER", "COLLABORATOR", "NONE", "CONTRIBUTOR"):
+            with self.subTest(association=association):
+                decision = adapters.decide_issue_admission(
+                    issue(2),
+                    now=NOW,
+                    comments={2: [self.race_comment("teammate", association)]},
+                )
+                self.assertEqual(decision.kind, adapters.ACTION)
 
 
 if __name__ == "__main__":

@@ -204,8 +204,9 @@ def _is_trusted_stop(comment: Any, repository_owner: str) -> bool:
     if isinstance(comment, Mapping):
         association = str(comment.get("author_association") or "").upper()
         return association in ("OWNER", "MEMBER", "COLLABORATOR")
-    # CommentRecord carries the adapter's already-validated trusted-actor bit.
-    return bool(getattr(comment, "author_is_owner", False))
+    # CommentRecord carries the adapter's already-validated trusted-actor
+    # bit, which covers OWNER/MEMBER/COLLABORATOR associations.
+    return bool(getattr(comment, "author_is_trusted", False))
 
 
 def _order_key(comment: Any) -> Tuple[str, str]:

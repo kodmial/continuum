@@ -180,6 +180,7 @@ def _comment_records(
 ) -> List[CommentRecord]:
     records: List[CommentRecord] = []
     normalized_owner = str(repository_owner or "").strip().casefold()
+    owner_known = bool(normalized_owner)
     for raw in raw_comments or ():
         if isinstance(raw, CommentRecord):
             records.append(raw)
@@ -189,10 +190,24 @@ def _comment_records(
         user = raw.get("user") if isinstance(raw.get("user"), Mapping) else {}
         author_login = str(user.get("login") or "")
         normalized_login = author_login.strip().casefold()
+        association = str(raw.get("author_association") or "").strip().upper()
+        is_scheduler_bot = normalized_login == "github-actions[bot]"
+        if owner_known:
+            login_is_owner = normalized_login == normalized_owner
+        else:
+            # The snapshot omitted its repository, so the owner login is
+            # genuinely unknown.  Fall back to GitHub's own association bit
+            # instead of silently dropping the owner ``/oc`` race guard:
+            # only the exact ``OWNER`` association asserts repository
+            # ownership, while MEMBER/COLLABORATOR remain non-owner actors.
+            login_is_owner = association == "OWNER"
         author_is_owner = bool(
-            raw.get("author_is_owner")
-            or (normalized_owner and normalized_login == normalized_owner)
-            or normalized_login == "github-actions[bot]"
+            raw.get("author_is_owner") or login_is_owner or is_scheduler_bot
+        )
+        author_is_trusted = bool(
+            raw.get("author_is_trusted")
+            or author_is_owner
+            or association in ("OWNER", "MEMBER", "COLLABORATOR")
         )
         created = raw.get("created_at")
         if isinstance(created, datetime):
@@ -211,9 +226,11 @@ def _comment_records(
                 author_is_owner=author_is_owner,
                 created_at=when,
                 author_login=author_login,
+                author_is_trusted=author_is_trusted,
             )
         )
     return records
+
 
 def _issue_records(issues: Sequence[Mapping[str, Any]]) -> Dict[int, IssueState]:
     records: Dict[int, IssueState] = {}
@@ -250,6 +267,7 @@ def _comments_by_number(
             number = int(issue["number"])
             by_number.setdefault(number, _comment_records(embedded, repository_owner))
     return by_number
+
 
 def _issue_decision(
     issue: IssueState,

@@ -5,7 +5,7 @@ from __future__ import annotations
 import copy
 import json
 import unittest
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from continuum.lifecycle_recovery import RetryEvidence
@@ -194,6 +194,42 @@ class PaginationTests(unittest.TestCase):
             plan_repository(source, context=PlanContext(now=NOW), page_size=0)
         with self.assertRaises(ReconciliationPlanError):
             plan_repository(source, context=PlanContext(now=NOW), max_pages_per_pass=0)
+
+
+class OwnerRaceGuardContextTests(unittest.TestCase):
+    """The dry-run plan must keep the owner ``/oc`` race guard."""
+
+    def race_comment(self, login, association):
+        return {
+            "body": "/oc",
+            "author_association": association,
+            "user": {"login": login},
+            "created_at": NOW - timedelta(minutes=1),
+        }
+
+    def test_snapshot_repository_arms_owner_race_guard(self):
+        comments = {2: [self.race_comment("repo-owner", "NONE")]}
+        plan = plan_snapshot(
+            [{"number": 2, "title": "P1: issue", "labels": ["P1"], "state": "open"}],
+            [],
+            context=PlanContext(
+                now=NOW,
+                repository="repo-owner/repository",
+                comments_by_issue=comments,
+            ),
+        )
+        self.assertEqual(plan.by_subject("issue:2")[0].kind, WAIT)
+        self.assertIn("race window", plan.by_subject("issue:2")[0].reason)
+
+    def test_missing_snapshot_repository_keeps_association_race_guard(self):
+        comments = {2: [self.race_comment("repo-owner", "OWNER")]}
+        plan = plan_snapshot(
+            [{"number": 2, "title": "P1: issue", "labels": ["P1"], "state": "open"}],
+            [],
+            context=PlanContext(now=NOW, comments_by_issue=comments),
+        )
+        self.assertEqual(plan.by_subject("issue:2")[0].kind, WAIT)
+        self.assertIn("race window", plan.by_subject("issue:2")[0].reason)
 
 
 def plan_one_pr(*, ci_run, per_pr):
