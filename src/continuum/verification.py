@@ -23,21 +23,19 @@ Standard library only.
 
 from __future__ import annotations
 
-import atexit
 import hashlib
 import hmac
 import json
 import os
 import re
 import shutil
-import stat
 import subprocess
 import sys
 import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Set, Tuple
 
 SCHEMA_VERSION = 1
 
@@ -58,23 +56,23 @@ ATTESTATION_KEY_ENV = "CONTINUUM_VERIFICATION_ATTESTATION_KEY"
 #: The key is delivered through a private file outside the task worktree. Its
 #: path is read from this environment variable, never the key itself: a
 #: repository-controlled command can read the engine's inherited environment
-#: through ``/proc/$PPID/environ``, so the value must not be in it. The file is
-#: read before any command runs. While repository-controlled commands execute,
-#: the file is withheld from its configured path and restored before the
-#: process exits, so a running command cannot read it and a later verification
-#: process still can.
+#: through ``/proc/$PPID/environ``, so the value must not be in it. A process
+#: that runs repository-controlled commands reads the file into memory and
+#: removes the on-disk copy before the first command starts; it never writes
+#: the copy back. A later invocation re-provisions the file from its
+#: authoritative source with :func:`provision_attestation_key` (the
+#: ``provision-key`` CLI command), and fails closed with a clear error when the
+#: file is absent.
 ATTESTATION_KEY_FILE_ENV = "CONTINUUM_VERIFICATION_ATTESTATION_KEY_FILE"
 
 #: Keys already read from a file in this process, keyed by resolved path. The
-#: file is withheld while consumer commands run, so later signing within the
+#: file is removed before consumer commands run, so later signing within the
 #: same invocation uses this cache instead of re-reading a file that is gone.
 _ATTESTATION_KEY_CACHE: Dict[str, bytes] = {}
 
-#: Withheld key files, keyed by resolved path, holding the exact bytes and
-#: permission bits needed to restore them at process exit. Restoring after the
-#: last command keeps sequential verification CLI processes working without
-#: ever exposing the file to a repository-controlled command.
-_ATTESTATION_KEY_WITHHELD: Dict[str, Tuple[bytes, int]] = {}
+#: Resolved key-file paths already removed by this process. The removal is
+#: idempotent: a second command set in the same process reuses the cached key.
+_ATTESTATION_KEY_CONSUMED: Set[str] = set()
 
 ATTESTATION_ALGORITHM = "hmac-sha256"
 
@@ -746,22 +744,16 @@ def _attestation_key_path(
     return str(source.get(ATTESTATION_KEY_FILE_ENV, "") or "").strip()
 
 
-def _attestation_key(
+def _attestation_key_paths(
     environ: Optional[Mapping[str, str]] = None,
     worktree: Optional[Path | str] = None,
-) -> Optional[bytes]:
-    """The runner-controlled attestation key, or ``None`` when unset.
+) -> Optional[Tuple[Path, Path]]:
+    """The configured and resolved key-file paths, or ``None`` when unset.
 
-    The key value is read once from the private file named by
-    :data:`ATTESTATION_KEY_FILE_ENV`. Read-only calls (the evidence summary,
-    needs-verifier, and changes commands) leave the file in place so separate
-    verification CLI processes can read the same key. When a command set runs,
-    :func:`_withhold_attestation_key` removes the file from its configured path
-    for the lifetime of the process and restores it at exit, so a running
-    repository-controlled command cannot read it. The key must live outside the
-    task worktree. The value stays in this process's memory and is never
-    written into the environment handed to repository-controlled commands, so
-    a child cannot inherit it or its file path.
+    The configured path is what gets read, removed, and re-provisioned; the
+    resolved path is the worktree-boundary and cache identity. The path must
+    live outside the task worktree: a repository-controlled command can read
+    anything inside the worktree it can otherwise reach.
     """
 
     raw_path = _attestation_key_path(environ)
@@ -779,6 +771,33 @@ def _attestation_key(
                 "the verification attestation key file must live outside the "
                 "task worktree"
             )
+    return path, resolved
+
+
+def _attestation_key(
+    environ: Optional[Mapping[str, str]] = None,
+    worktree: Optional[Path | str] = None,
+) -> Optional[bytes]:
+    """The runner-controlled attestation key, or ``None`` when unset.
+
+    The key value is read once from the private file named by
+    :data:`ATTESTATION_KEY_FILE_ENV` and cached in this process's memory. A
+    read-only command (the evidence summary, needs-verifier, and changes
+    commands) leaves the file in place, so sequential read-only verification
+    CLI processes can read the same key. A process that runs a command set
+    removes the file with :func:`_consume_attestation_key` before the first
+    repository-controlled command starts; nothing is restored, so a survivor
+    process spawned by that command cannot read the key after the engine exits.
+    The next invocation must re-provision the file from its authoritative
+    source with :func:`provision_attestation_key`. The value stays in this
+    process's memory and is never written into the environment handed to
+    repository-controlled commands, so a child cannot inherit it or its path.
+    """
+
+    location = _attestation_key_paths(environ, worktree)
+    if location is None:
+        return None
+    path, resolved = location
     cached = _ATTESTATION_KEY_CACHE.get(str(resolved))
     if cached is not None:
         return cached
@@ -786,7 +805,9 @@ def _attestation_key(
         raw = path.read_text(encoding="utf-8").strip()
     except OSError as exc:
         raise VerificationError(
-            "the verification attestation key file is unavailable: {}".format(exc)
+            "the verification attestation key file is unavailable: {}; "
+            "re-provision it from its authoritative source with "
+            "`python -m continuum.verification provision-key`".format(exc)
         ) from exc
     if not raw:
         raise VerificationError("the verification attestation key file is empty")
@@ -795,74 +816,148 @@ def _attestation_key(
     return key
 
 
-def _withhold_attestation_key(
+def _consume_attestation_key(
     environ: Optional[Mapping[str, str]] = None,
+    worktree: Optional[Path | str] = None,
 ) -> None:
-    """Remove the key file while repository-controlled commands run.
+    """Remove the key file before any repository-controlled command runs.
 
-    The exact bytes and permission bits are retained in memory and restored by
-    :func:`_restore_withheld_attestation_keys` at process exit, so sequential
-    verification CLI processes share the same key without a running command
-    ever being able to read it.
+    The value is already cached in this process's memory. The on-disk copy is
+    deliberately not restored at exit or on a signal: a repository-controlled
+    command can spawn a same-uid survivor that outlives the engine and reads
+    any file the engine can read, so leaving the key at its configured path
+    after a command has run would hand the key to that survivor. A later
+    invocation re-provisions the file explicitly with
+    :func:`provision_attestation_key`; when it is absent, reading fails closed
+    instead of silently continuing without an attestation.
     """
 
-    raw_path = _attestation_key_path(environ)
-    if not raw_path:
+    key = _attestation_key(environ, worktree=worktree)
+    if key is None:
         return
-    path = Path(raw_path).expanduser()
-    try:
-        resolved = path.resolve()
-    except OSError:
-        resolved = path
-    key = str(resolved)
-    if key in _ATTESTATION_KEY_WITHHELD:
+    location = _attestation_key_paths(environ, worktree)
+    if location is None:  # pragma: no cover - guarded by _attestation_key
         return
-    try:
-        data = resolved.read_bytes()
-        mode = stat.S_IMODE(resolved.stat().st_mode)
-    except FileNotFoundError:
-        # A previous invocation already withheld and restored the same path, or
-        # the file is simply absent; ``_attestation_key`` has already failed
-        # closed for the latter.
+    path, resolved = location
+    marker = str(resolved)
+    if marker in _ATTESTATION_KEY_CONSUMED:
+        # A previous command set in this process already removed the file; the
+        # cached value remains authoritative.
         return
-    except OSError as exc:
-        raise VerificationError(
-            "the verification attestation key file cannot be withheld: {}".format(exc)
-        ) from exc
-    try:
-        resolved.unlink()
-    except OSError as exc:
-        raise VerificationError(
-            "the verification attestation key file cannot be withheld: {}".format(exc)
-        ) from exc
-    _ATTESTATION_KEY_WITHHELD[key] = (data, mode)
-
-
-def _restore_withheld_attestation_keys() -> None:
-    """Restore every withheld key file with its original bytes and mode."""
-
-    for raw_path, (data, mode) in list(_ATTESTATION_KEY_WITHHELD.items()):
-        path = Path(raw_path)
-        temporary = ""
+    targets = [path]
+    if resolved != path:
+        # A symbolic link or a symlinked parent directory: unlinking the
+        # configured name alone would leave the key bytes readable at the
+        # resolved target.
+        targets.append(resolved)
+    for target in targets:
         try:
-            descriptor, temporary = tempfile.mkstemp(
-                dir=str(path.parent), prefix=path.name + ".", suffix=".restore"
+            target.unlink()
+        except FileNotFoundError:
+            # Another consumer removed it first, or this is the same inode
+            # already removed through another name. The cached value is
+            # authoritative and the no-leak property already holds.
+            pass
+        except OSError as exc:
+            raise VerificationError(
+                "the verification attestation key file cannot be removed before a "
+                "repository command runs: {}".format(exc)
+            ) from exc
+    _ATTESTATION_KEY_CONSUMED.add(marker)
+
+
+def provision_attestation_key(
+    data: bytes | str,
+    environ: Optional[Mapping[str, str]] = None,
+    worktree: Optional[Path | str] = None,
+) -> Path:
+    """Write the key file from its authoritative source for a later invocation.
+
+    The caller supplies the key bytes (the ``provision-key`` CLI command reads
+    them from standard input, never from an argument or the environment, so
+    they do not appear in process listings or ``/proc/$PPID/environ``). The
+    write is atomic, owner-only (``0600``), and refuses to replace a different
+    key that is already present so a mistake cannot invalidate existing
+    evidence. Re-provisioning the same key again is a no-op.
+    """
+
+    location = _attestation_key_paths(environ, worktree)
+    if location is None:
+        raise VerificationError(
+            "cannot provision the verification attestation key: {} is not "
+            "set to a private file outside the task worktree".format(
+                ATTESTATION_KEY_FILE_ENV
             )
-            with os.fdopen(descriptor, "wb") as stream:
-                stream.write(data)
-            os.chmod(temporary, mode)
-            os.replace(temporary, path)
-        except OSError:
-            if temporary:
-                try:
-                    Path(temporary).unlink()
-                except OSError:
-                    pass
-            continue
-        _ATTESTATION_KEY_WITHHELD.pop(raw_path, None)
-
-
-atexit.register(_restore_withheld_attestation_keys)
+        )
+    path, resolved = location
+    if isinstance(data, str):
+        key = data.strip().encode("utf-8")
+    else:
+        key = bytes(data).strip()
+    if not key:
+        raise VerificationError(
+            "cannot provision an empty verification attestation key"
+        )
+    try:
+        existing = path.read_bytes().strip()
+    except FileNotFoundError:
+        existing = None
+    except OSError as exc:
+        raise VerificationError(
+            "the existing verification attestation key file cannot be read: "
+            "{}".format(exc)
+        ) from exc
+    if existing is not None:
+        if existing != key:
+            raise VerificationError(
+                "refusing to replace a different verification attestation key "
+                "at {}".format(path)
+            )
+        _ATTESTATION_KEY_CACHE[str(resolved)] = key
+        _ATTESTATION_KEY_CONSUMED.discard(str(resolved))
+        return path
+    temporary = ""
+    try:
+        descriptor, temporary = tempfile.mkstemp(
+            dir=str(path.parent),
+            prefix=path.name + ".",
+            suffix=".provision",
+        )
+        with os.fdopen(descriptor, "wb") as stream:
+            stream.write(key)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.chmod(temporary, 0o600)
+        # Hard-link rather than replace so a concurrent provisioning process
+        # cannot be clobbered with a different key.
+        os.link(temporary, path)
+    except FileExistsError:
+        try:
+            existing = path.read_bytes().strip()
+        except OSError as exc:  # pragma: no cover - raced file disappeared
+            raise VerificationError(
+                "the verification attestation key file cannot be provisioned: "
+                "{}".format(exc)
+            ) from exc
+        if existing != key:
+            raise VerificationError(
+                "refusing to replace a different verification attestation key "
+                "at {}".format(path)
+            )
+    except OSError as exc:
+        raise VerificationError(
+            "the verification attestation key file cannot be provisioned: "
+            "{}".format(exc)
+        ) from exc
+    finally:
+        if temporary:
+            try:
+                Path(temporary).unlink()
+            except OSError:
+                pass
+    _ATTESTATION_KEY_CACHE[str(resolved)] = key
+    _ATTESTATION_KEY_CONSUMED.discard(str(resolved))
+    return path
 
 
 def _attestation_payload(data: Mapping[str, Any]) -> bytes:
@@ -964,11 +1059,11 @@ def run_command_set(
 
     root = Path(repo)
     source_environ = environ if environ is not None else os.environ
-    # Read the key before a repository-controlled command runs, then withhold
-    # its file for the lifetime of this process. The value stays in memory; the
-    # file is restored at exit so later verification CLI processes can use it.
-    _attestation_key(source_environ, worktree=root)
-    _withhold_attestation_key(source_environ)
+    # Read the key into memory, then remove its on-disk copy before any
+    # repository-controlled command runs. The copy is never restored: a command
+    # can spawn a same-uid survivor that reads it after this process exits.
+    # A later invocation re-provisions it from the authoritative source.
+    _consume_attestation_key(source_environ, worktree=root)
     env = _child_environment(source_environ)
     timeout = timeout_seconds
     if timeout is None:
@@ -1545,7 +1640,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if not args:
         print(
             "usage: python -m continuum.verification "
-            "{baseline,needs-verifier,record-verifier,final,summary,changes}",
+            "{baseline,needs-verifier,record-verifier,final,summary,changes,"
+            "provision-key}",
             file=sys.stderr,
         )
         return 2
@@ -1601,6 +1697,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 options.get("repo", "."), options.get("base_sha", "")
             )
             print("true" if present else "false")
+            return 0
+        if command == "provision-key":
+            # The key arrives on standard input, never in an argument or the
+            # environment, so it never appears in process listings or
+            # /proc/$PPID/environ. This is the explicit re-provisioning path
+            # after a command-set invocation consumed the on-disk copy.
+            provision_attestation_key(
+                sys.stdin.buffer.read(),
+                worktree=options.get("repo") or None,
+            )
             return 0
         print("unknown command: {}".format(command), file=sys.stderr)
         return 2

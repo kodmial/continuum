@@ -182,6 +182,30 @@ class YamlSubsetTests(unittest.TestCase):
         )
         self.assertEqual(parsed, [{"name": None}, {"name": "b"}])
 
+    def test_indentless_sequence_as_the_first_key_of_a_sequence_item(self):
+        # Symmetric to the nested-key case: an indentless sequence that is the
+        # first key of a sequence-item mapping aligns with that key.
+        parsed = yamlmini.loads(
+            textwrap.dedent(
+                """
+            items:
+              - binaries:
+                - name: tool
+                  identifier: com.example.tool
+                """
+            )
+        )
+        self.assertEqual(
+            parsed["items"],
+            [
+                {
+                    "binaries": [
+                        {"name": "tool", "identifier": "com.example.tool"}
+                    ]
+                }
+            ],
+        )
+
     def test_nested_block_under_first_key_in_sequence_item(self):
         parsed = yamlmini.loads(
             textwrap.dedent(

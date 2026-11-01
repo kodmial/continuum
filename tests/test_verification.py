@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import json
 import os
+import signal
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -95,12 +97,16 @@ class EvidenceAttestationTests(unittest.TestCase):
         child = verification._child_environment(self.key_env)
         self.assertNotIn(KEY_ENV, child)
         self.assertNotIn(KEY_FILE_ENV, child)
-        # The key file is withheld for the command's lifetime, then restored so
-        # later verification CLI processes can read it.
+        # The key file is removed before the command runs and is never
+        # restored: a same-uid survivor spawned by the command must not read it
+        # after the engine exits.
         key_path = Path(self.key_env[KEY_FILE_ENV])
         self.assertFalse(key_path.exists())
-        verification._restore_withheld_attestation_keys()
-        self.assertEqual(key_path.read_text(encoding="utf-8"), KEY_VALUE)
+        # The engine keeps the key in memory for the rest of the process.
+        self.assertEqual(
+            verification._attestation_key(self.key_env, worktree=self.root),
+            KEY_VALUE.encode("utf-8"),
+        )
 
     def test_attestation_key_value_in_the_engine_environment_fails_closed(self):
         with self.assertRaises(verification.VerificationError) as caught:
@@ -218,18 +224,201 @@ class ChildEnvironmentTests(unittest.TestCase):
         with self.assertRaises(verification.VerificationError):
             verification._load_evidence(path, other)
 
-    def test_key_file_is_restored_after_a_command_runs(self):
+    def test_key_file_is_removed_before_a_command_runs_and_not_restored(self):
         key_path = Path(self.key_env[KEY_FILE_ENV])
         result = verification.run_command_set(
             _contract("true"), self.root, environ=self.key_env
         )
         self.assertEqual(result["state"], "passed")
-        # The file is withheld while a repository-controlled command runs.
+        # The file is removed while a repository-controlled command runs and is
+        # never written back, so a survivor process cannot read it later.
         self.assertFalse(key_path.exists())
-        # It is restored at process exit so later verification CLI processes
-        # read the same key file.
-        verification._restore_withheld_attestation_keys()
+        # A second command set in the same process reuses the cached key and
+        # keeps the file absent instead of failing or recreating it.
+        second = verification.run_command_set(
+            _contract("true"), self.root, environ=self.key_env
+        )
+        self.assertEqual(second["state"], "passed")
+        self.assertFalse(key_path.exists())
+
+    def test_a_failed_removal_fails_closed(self):
+        key_path = Path(self.key_env[KEY_FILE_ENV])
+        original_unlink = Path.unlink
+
+        def deny_unlink(path, *args, **kwargs):
+            if path == key_path:
+                raise PermissionError("permission denied")
+            return original_unlink(path, *args, **kwargs)
+
+        # The key is cached before removal is attempted, so a fresh path in the
+        # cache is not needed; run_command_set must stop rather than run a
+        # repository-controlled command while the key is still readable.
+        with mock.patch.object(Path, "unlink", deny_unlink):
+            with self.assertRaises(verification.VerificationError) as caught:
+                verification.run_command_set(
+                    _contract("true"), self.root, environ=self.key_env
+                )
+        self.assertIn("cannot be removed", str(caught.exception))
+        self.assertTrue(key_path.exists())
+
+    def test_a_concurrently_removed_key_still_runs_the_command(self):
+        key_path = Path(self.key_env[KEY_FILE_ENV])
+        # Another consumer removes the file after this process cached the value.
+        verification._attestation_key(self.key_env)
+        key_path.unlink()
+        result = verification.run_command_set(
+            _contract("true"), self.root, environ=self.key_env
+        )
+        self.assertEqual(result["state"], "passed")
+        self.assertFalse(key_path.exists())
+
+    def test_a_symlinked_key_target_is_removed_too(self):
+        target = self.key_directory / "real.key"
+        target.write_text(KEY_VALUE, encoding="utf-8")
+        link = self.key_directory / "linked.key"
+        os.symlink(target, link)
+        result = verification.run_command_set(
+            _contract("true"), self.root, environ={KEY_FILE_ENV: str(link)}
+        )
+        self.assertEqual(result["state"], "passed")
+        # Removing only the link would leave the secret readable at its target.
+        self.assertFalse(link.exists())
+        self.assertFalse(target.exists())
+
+    def test_provisioning_accepts_a_racing_writer_with_the_same_key(self):
+        key_path = Path(self.key_env[KEY_FILE_ENV])
+        key_path.unlink()
+
+        def raced_link(source, target, *args, **kwargs):
+            Path(target).write_text(KEY_VALUE, encoding="utf-8")
+            raise FileExistsError("already exists")
+
+        with mock.patch.object(verification.os, "link", raced_link):
+            result = verification.provision_attestation_key(
+                KEY_VALUE, self.key_env, worktree=self.root
+            )
+        self.assertEqual(result, key_path)
         self.assertEqual(key_path.read_text(encoding="utf-8"), KEY_VALUE)
+
+    def test_provisioning_refuses_a_racing_writer_with_a_different_key(self):
+        key_path = Path(self.key_env[KEY_FILE_ENV])
+        key_path.unlink()
+
+        def raced_link(source, target, *args, **kwargs):
+            Path(target).write_text("a-different-key", encoding="utf-8")
+            raise FileExistsError("already exists")
+
+        with mock.patch.object(verification.os, "link", raced_link):
+            with self.assertRaises(verification.VerificationError) as caught:
+                verification.provision_attestation_key(
+                    KEY_VALUE, self.key_env, worktree=self.root
+                )
+        self.assertIn("refusing to replace", str(caught.exception))
+        self.assertEqual(
+            key_path.read_text(encoding="utf-8"), "a-different-key"
+        )
+
+    def test_provisioning_succeeds_when_the_temporary_file_cannot_be_removed(self):
+        target = self.key_directory / "cleanup.key"
+        original_unlink = Path.unlink
+
+        def deny_temporary(path, *args, **kwargs):
+            if str(path).endswith(".provision"):
+                raise PermissionError("busy")
+            return original_unlink(path, *args, **kwargs)
+
+        with mock.patch.object(Path, "unlink", deny_temporary):
+            result = verification.provision_attestation_key(
+                KEY_VALUE, {KEY_FILE_ENV: str(target)}, worktree=self.root
+            )
+        self.assertEqual(result, target)
+        self.assertEqual(target.read_text(encoding="utf-8"), KEY_VALUE)
+
+    def test_provision_key_cli_reads_the_key_from_standard_input(self):
+        key_path = Path(self.key_env[KEY_FILE_ENV])
+        key_path.unlink()
+        stdin = mock.Mock()
+        stdin.buffer.read.return_value = KEY_VALUE.encode("utf-8")
+        with mock.patch.dict(os.environ, self.key_env, clear=False), mock.patch.object(
+            sys, "stdin", stdin
+        ):
+            self.assertEqual(
+                verification.main(["provision-key", "--repo", str(self.root)]), 0
+            )
+        self.assertEqual(key_path.read_text(encoding="utf-8"), KEY_VALUE)
+
+    def test_reprovisioning_restores_a_consumed_key_from_stdin(self):
+        key_path = Path(self.key_env[KEY_FILE_ENV])
+        verification.run_command_set(
+            _contract("true"), self.root, environ=self.key_env
+        )
+        self.assertFalse(key_path.exists())
+        verification.provision_attestation_key(
+            KEY_VALUE.encode("utf-8"), self.key_env, worktree=self.root
+        )
+        self.assertTrue(key_path.exists())
+        self.assertEqual(key_path.read_text(encoding="utf-8"), KEY_VALUE)
+        self.assertEqual(
+            key_path.stat().st_mode & 0o777,
+            0o600,
+        )
+        # Provisioning the same key again is an idempotent no-op.
+        verification.provision_attestation_key(
+            KEY_VALUE, self.key_env, worktree=self.root
+        )
+        self.assertEqual(key_path.read_text(encoding="utf-8"), KEY_VALUE)
+
+    def test_provisioning_refuses_to_replace_a_different_key(self):
+        key_path = Path(self.key_env[KEY_FILE_ENV])
+        with self.assertRaises(verification.VerificationError) as caught:
+            verification.provision_attestation_key(
+                "a-different-key", self.key_env, worktree=self.root
+            )
+        self.assertIn("refusing to replace", str(caught.exception))
+        self.assertEqual(key_path.read_text(encoding="utf-8"), KEY_VALUE)
+
+    def test_provisioning_rejects_an_empty_key(self):
+        (self.key_directory / "empty.key").write_text("  \n", encoding="utf-8")
+        with self.assertRaises(verification.VerificationError) as caught:
+            verification.provision_attestation_key(
+                "   \n",
+                {KEY_FILE_ENV: str(self.key_directory / "empty.key")},
+                worktree=self.root,
+            )
+        self.assertIn("empty", str(caught.exception))
+
+    def test_provisioning_requires_a_configured_key_file_path(self):
+        with self.assertRaises(verification.VerificationError) as caught:
+            verification.provision_attestation_key(KEY_VALUE, {})
+        self.assertIn(KEY_FILE_ENV, str(caught.exception))
+
+    def test_provisioning_rejects_a_path_inside_the_worktree(self):
+        key_path = self.root / "attestation.key"
+        with self.assertRaises(verification.VerificationError):
+            verification.provision_attestation_key(
+                KEY_VALUE, {KEY_FILE_ENV: str(key_path)}, worktree=self.root
+            )
+        self.assertFalse(key_path.exists())
+
+    def test_provisioning_reports_a_write_failure(self):
+        write_directory = self.key_directory / "write"
+        write_directory.mkdir()
+        key_path = write_directory / "new.key"
+        with mock.patch.object(
+            verification.os, "link", side_effect=OSError("disk full")
+        ):
+            with self.assertRaises(verification.VerificationError) as caught:
+                verification.provision_attestation_key(
+                    KEY_VALUE,
+                    {KEY_FILE_ENV: str(key_path)},
+                    worktree=self.root,
+                )
+        self.assertIn("cannot be provisioned", str(caught.exception))
+        self.assertFalse(key_path.exists())
+        # The temporary file used for the atomic write is cleaned up.
+        self.assertEqual(
+            [item.name for item in write_directory.iterdir()], []
+        )
 
     def test_key_file_inside_the_worktree_is_rejected(self):
         key_path = self.root / "attestation.key"
@@ -548,17 +737,178 @@ class AttestationKeyEnvironmentLeakTests(unittest.TestCase):
         completed = self._run(self.key_env)
         self.assertEqual(completed.returncode, 0, completed.stderr)
         # The running command could not read the key file: the report is empty.
-        # The engine restores the file before exiting so the next verification
-        # process can read it.
-        self.assertTrue(self.key_file.exists())
-        self.assertEqual(self.key_file.read_text(encoding="utf-8"), KEY_VALUE)
+        # The command-set process must not restore the file, because a survivor
+        # it spawned can read the file after the engine exits.
+        self.assertFalse(self.key_file.exists())
         self.assertTrue(self.report.exists())
         self.assertEqual(self.report.read_text(encoding="utf-8"), "")
         data = json.loads(self.evidence.read_text(encoding="utf-8"))
         self.assertEqual(data["baseline"]["state"], "passed")
 
-        # A later CLI process runs no commands but must still verify the same
-        # evidence with the restored key file.
+        summary_command = [
+            sys.executable,
+            "-m",
+            "continuum.verification",
+            "summary",
+            "--evidence",
+            str(self.evidence),
+        ]
+        # A later process fails closed instead of silently verifying without
+        # the key, because the consumed copy was not restored.
+        missing = subprocess.run(
+            summary_command,
+            env=self._env(self.key_env),
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        self.assertEqual(missing.returncode, 3)
+        self.assertIn(
+            "the verification attestation key file is unavailable", missing.stderr
+        )
+
+        # Re-provisioning from the authoritative source (standard input) makes
+        # the next invocation verify the same evidence again.
+        provision = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "continuum.verification",
+                "provision-key",
+                "--repo",
+                str(self.root),
+            ],
+            input=KEY_VALUE,
+            env=self._env(self.key_env),
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        self.assertEqual(provision.returncode, 0, provision.stderr)
+        self.assertEqual(self.key_file.read_text(encoding="utf-8"), KEY_VALUE)
+        self.assertEqual(self.key_file.stat().st_mode & 0o777, 0o600)
+        summary = subprocess.run(
+            summary_command,
+            env=self._env(self.key_env),
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        self.assertEqual(summary.returncode, 0, summary.stderr)
+        self.assertIn("baseline: passed", summary.stdout)
+
+    def test_background_poller_cannot_read_the_key_after_the_engine_exits(self):
+        """Regression: a restored key file is readable by a survivor process."""
+
+        poll_report = self.root.parent / "poller-report.txt"
+        poll_done = self.root.parent / "poller-done.txt"
+        command = (
+            "nohup bash -c 'i=0; while [ \"$i\" -lt 250 ]; do "
+            'if [ -e "$POLL_KEY_FILE" ]; then '
+            'printf leaked > "$POLL_REPORT"; break; fi; '
+            "i=$((i+1)); sleep 0.02; done; "
+            "printf finished > \"$POLL_DONE\"' >/dev/null 2>&1 &"
+        )
+        completed = self._run(
+            dict(
+                self.key_env,
+                CONTINUUM_TEST_COMMAND=command,
+                POLL_KEY_FILE=str(self.key_file),
+                POLL_REPORT=str(poll_report),
+                POLL_DONE=str(poll_done),
+            )
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline and not poll_done.exists():
+            time.sleep(0.02)
+        self.assertTrue(poll_done.exists(), "the poller did not finish in time")
+        # The poller outlived the engine and watched the configured path the
+        # whole time; it must never have seen the key.
+        self.assertFalse(poll_report.exists())
+        self.assertFalse(self.key_file.exists())
+
+    def test_sigterm_does_not_leak_the_key_and_reprovisioning_recovers(self):
+        base_env = {
+            key: value
+            for key, value in os.environ.items()
+            if key not in (KEY_ENV, KEY_FILE_ENV)
+        }
+        base_env["CONTINUUM_TEST_COMMAND"] = "sleep 30"
+        contract = verification.resolve_contract(self.root, base_env)
+        record = contract.as_dict()
+        environment = verification.environment_fingerprint(self.root, base_env)
+        verification._save_evidence(
+            self.evidence,
+            {
+                "schema_version": verification.SCHEMA_VERSION,
+                "contract": record,
+                "baseline": {
+                    "base_sha": self.base,
+                    "state": "passed",
+                    "contract": record,
+                    "environment_fingerprint": environment,
+                    "commands": [{"name": "test", "exit_code": 0}],
+                },
+            },
+            self.key_env,
+        )
+        env = self._env(
+            dict(self.key_env, CONTINUUM_TEST_COMMAND="sleep 30")
+        )
+        process = subprocess.Popen(
+            [
+                sys.executable,
+                "-m",
+                "continuum.verification",
+                "final",
+                "--repo",
+                str(self.root),
+                "--evidence",
+                str(self.evidence),
+                "--base-sha",
+                self.base,
+            ],
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            start_new_session=True,
+        )
+        try:
+            # Wait until the engine has consumed the key and is running the
+            # repository-controlled command.
+            deadline = time.monotonic() + 30
+            while time.monotonic() < deadline and self.key_file.exists():
+                time.sleep(0.02)
+            self.assertFalse(self.key_file.exists())
+            os.killpg(os.getpgid(process.pid), signal.SIGTERM)
+            process.communicate(timeout=30)
+            self.assertEqual(process.returncode, -signal.SIGTERM)
+        finally:
+            if process.poll() is None:  # pragma: no cover - defensive cleanup
+                os.killpg(os.getpgid(process.pid), signal.SIGKILL)
+                process.wait(timeout=30)
+        # The interrupted process left no readable key behind.
+        self.assertFalse(self.key_file.exists())
+        # The next invocation re-provisions from the authoritative source and
+        # verifies the same evidence, so an interrupt is not permanent loss.
+        provision = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "continuum.verification",
+                "provision-key",
+                "--repo",
+                str(self.root),
+            ],
+            input=KEY_VALUE,
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        self.assertEqual(provision.returncode, 0, provision.stderr)
         summary = subprocess.run(
             [
                 sys.executable,
@@ -568,7 +918,7 @@ class AttestationKeyEnvironmentLeakTests(unittest.TestCase):
                 "--evidence",
                 str(self.evidence),
             ],
-            env=self._env(self.key_env),
+            env=env,
             capture_output=True,
             text=True,
             timeout=120,

@@ -91,10 +91,22 @@ through `/proc/$PPID/environ`, so setting
 `CONTINUUM_VERIFICATION_ATTESTATION_KEY` in the engine environment fails
 closed instead of being accepted. The engine reads the key file in every
 verification CLI process and never passes the key value or its file path to a
-repository-controlled command. While a command set runs, the engine withholds
-the file from its configured path and restores it before the process exits, so
-a running command cannot read it and sequential verification subcommands still
-share the same key. No shipped
+repository-controlled command. Read-only subcommands (`summary`,
+`needs-verifier`, `changes`, `record-verifier`) leave the file in place, so
+separate sequential read-only processes verify the same evidence. A subcommand
+that runs repository-controlled commands (`baseline`, `final`) reads the key
+into memory and removes the on-disk copy before the first command starts, and
+it never writes the copy back: a command can spawn a same-uid process that
+outlives the engine and reads any file the engine can read, so restoring the
+file at command end or at process exit, or leaving it after an interrupt,
+would hand the key to that process. A later invocation that needs the key must
+re-provision it explicitly from its authoritative source, for example
+`printf '%s' "$KEY" | python -m continuum.verification provision-key --repo "$GITHUB_WORKSPACE"`,
+which reads the key from standard input (never an argument or the environment),
+writes atomically with mode `0600`, and refuses to replace a different key. If
+the file is absent when it is needed, the engine fails closed with an explicit
+"the verification attestation key file is unavailable" error instead of
+continuing without an attestation. No shipped
 Continuum workflow declares or passes this hook; it is not a consumer secret
 and requires no consumer configuration. If supplied, it signs the recorded
 contract, baseline, verifier result, and accepted final record, and a resumed

@@ -72,5 +72,9 @@ recognizes an optional internal HMAC-SHA256 attestation hook delivered as a
 private key file outside the task worktree whose path is read from
 `CONTINUUM_VERIFICATION_ATTESTATION_KEY_FILE`; the key value is never read
 from the environment, and setting `CONTINUUM_VERIFICATION_ATTESTATION_KEY`
-there fails closed. No shipped workflow declares or passes the hook. It is not
+there fails closed. A process that runs repository-controlled commands removes
+the on-disk copy before the first command starts and never restores it; the
+next invocation re-provisions it explicitly with
+`python -m continuum.verification provision-key` and fails closed if it is
+absent. No shipped workflow declares or passes the hook. It is not
 a consumer secret and requires no consumer configuration.
