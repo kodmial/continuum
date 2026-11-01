@@ -2,9 +2,11 @@
 """Minimal OpenAI-compatible bridge from PR-Agent to `opencode serve`.
 
 Protocol reality: `opencode serve` is NOT OpenAI Chat Completions
-compatible. It speaks a session/message API (`POST /session`, then
-`POST /session/:id/message` with `{model, agent, system, parts}`, then
-`DELETE /session/:id`). PR-Agent reaches its model through LiteLLM, which
+compatible. It speaks an asynchronous session/message API (`POST /session`,
+then `POST /session/:id/prompt_async` with `{model, agent, system, parts}`,
+then poll `GET /session/status` until the turn completes, read the assistant
+record with `GET /session/:id/message`, and finally `DELETE /session/:id`).
+PR-Agent reaches its model through LiteLLM, which
 routes any `openai/<name>` model to an OpenAI-compatible
 `POST /v1/chat/completions` endpoint. This bridge exposes exactly that
 surface and translates each completion into one isolated OpenCode

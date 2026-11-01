@@ -31,7 +31,9 @@ These are public interfaces and must not change silently:
 - the `continuum-` prefix on every Continuum-owned workflow file and every caller
   stub (project-owned workflows such as `ci.yml` keep their own names), and the
   installer's verbatim copy of each stored stub name (a `continuum-*.yml` file in
-  a consumer repository is Continuum-owned and is never hand-edited there);
+  a consumer repository is Continuum-owned only when its body has a `uses:` line
+  for `kodmial/continuum/.github/workflows/`; a file without that call is
+  consumer-owned and is not treated as an installed caller);
 - the `TAP_PAT` repository secret name (classic PAT, `repo` + `workflow` scopes)
   expected by every set;
 - the `RENDER_API_KEY` repository secret name — the Render API key, read only by

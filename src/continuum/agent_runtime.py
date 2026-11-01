@@ -80,7 +80,7 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 MANIFEST_SCHEMA_VERSION = 1
 
-OPENCODE_VERSION = "1.18.34"
+OPENCODE_VERSION = "1.19.3"
 PR_AGENT_VERSION = "0.46.0"
 RUNNER_VERSION = "2.329.0"
 PYTHON_VERSION = "3.12"

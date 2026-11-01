@@ -29,8 +29,7 @@ instance.
 
 Reference implementation: `src/continuum/agent_runtime.py` (standard library
 only). Deterministic coverage: `tests/test_agent_runtime.py` (20 cases from
-the task specification). Contract coverage for the workflow half lives in
-`scripts/test-continuum.rb`.
+the task specification).
 
 ## Zero idle live instances (non-negotiable)
 
@@ -71,7 +70,7 @@ Continuum owns one versioned manifest (`AgentManifest`,
 
 | Component | Pin |
 | --- | --- |
-| OpenCode | `1.18.34` |
+| OpenCode | `1.19.3` |
 | PR-Agent | `0.46.0` |
 | GitHub Actions runner | `2.329.0` |
 | Python bridge deps | `3.12`, standard library only |

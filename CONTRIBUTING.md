@@ -27,8 +27,9 @@ owns the behavior:
 
 Caller stubs stay thin: behavior belongs in the reusable engine or the Python
 module, not in an installed caller. A `continuum-*.yml` file in a consumer
-repository is Continuum-owned and must never be hand-edited there; project
-specific behavior belongs in a project-owned workflow.
+repository is Continuum-owned only when its body has a `uses:` line for
+`kodmial/continuum/.github/workflows/`; a file without that call is
+consumer-owned. Project-specific behavior belongs in a project-owned workflow.
 
 These are public interfaces and must not change silently:
 
@@ -61,7 +62,7 @@ repository.
 
 ## Validate your change
 
-The canonical full check is:
+In the complete repository tree the canonical full check is:
 
 ```sh
 bash scripts/validate-continuum.sh
@@ -75,6 +76,10 @@ are finished with:
 ```sh
 rm -rf .opencode-tmp
 ```
+
+A split import that does not ship `scripts/` cannot run the canonical command:
+it fails before executing any check. Use the focused checks below in that tree;
+the canonical script and `scripts/test-continuum.rb` are part of the full tree.
 
 For faster iteration, run the focused check that matches your change from the
 repository root:

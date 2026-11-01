@@ -17,18 +17,21 @@ same runner:
 ```text
 PR-Agent (pinned pip release, on the runner)
   -> POST 127.0.0.1:<bridge_port>/v1/chat/completions (this bridge)
-  -> POST 127.0.0.1:<server_port>/session + /session/:id/message (opencode serve)
+  -> POST 127.0.0.1:<server_port>/session + /session/:id/prompt_async
+  -> GET /session/status, then GET /session/:id/message (opencode serve)
   -> configured OpenCode provider/model (default: the free anonymous route)
 ```
 
 `opencode serve` is **not** OpenAI Chat Completions compatible: it speaks
-a session/message API (`POST /session`, then `POST /session/:id/message`
-with `{model, agent, system, parts}`, then `DELETE /session/:id`). The
-bridge (`.github/scripts/pr_agent_bridge.py`, standard library only)
-exposes exactly the OpenAI surface PR-Agent needs — `/v1/chat/completions`,
-`/v1/models`, health — and translates each completion into one isolated
-OpenCode session: a fresh session per request, deleted afterwards, so
-requests never contaminate each other.
+an asynchronous session/message API (`POST /session`, then
+`POST /session/:id/prompt_async` with `{model, agent, system, parts}`, then
+poll `GET /session/status` until the session leaves `busy`/`retry`, read the
+completed assistant turn with `GET /session/:id/message`, and finally
+`DELETE /session/:id`). The bridge (`.github/scripts/pr_agent_bridge.py`,
+standard library only) exposes exactly the OpenAI surface PR-Agent needs —
+`/v1/chat/completions`, `/v1/models`, health — and translates each completion
+into one isolated OpenCode session: a fresh session per request, deleted
+afterwards, so requests never contaminate each other.
 
 ## Networking
 

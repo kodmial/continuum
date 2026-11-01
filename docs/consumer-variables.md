@@ -124,6 +124,16 @@ never clears a lock another approved workflow still needs.
 | `CONTINUUM_IMAGE_DIGEST` | empty | **Legacy native-image/profile digest, preserved for compatibility** with the reusable `image_digest` inputs (which still forward `inputs.image_digest || vars.CONTINUUM_IMAGE_DIGEST`). Before Work Lock #67, Linux GitHub-hosted OpenCode jobs treated this as a possible preinstalled-runtime stamp and otherwise ran an inline cold installer; this was a misleading warm-cache proxy on freshly provisioned hosted VMs. **After #67 migration**, the six active GitHub-hosted coding/review/repair/delegation workflows instead restore and verify OpenCode binaries using `agent-toolchain` + `actions/cache`, so setting this variable cannot create a hosted warm hit. Consumers with a real separately qualified native golden-image provider may still use the digest as a profile identity; those backends and macOS/Windows are not qualified by hosted cache tests. Legacy caller inputs remain accepted, but should not be interpreted as hosted cache pins. |
 | `CONTINUUM_RUNTIME_PRESET` | `agent-linux` | Named ephemeral runtime preset (`agent-linux`, `agent-macos`, `agent-windows`, ...). Strict presets keep `idle_instances: 0` and `max_uses_per_instance: 1`; they cannot be retuned into persistent waiting runners. |
 | `CONTINUUM_RUNTIME_PROVIDER` | `github-hosted` | Provider backend for ephemeral instances (`github-hosted`, `gce`, `ec2`, `azure`, `custom`). |
+| `OPENCODE_MODELS` | empty | Ordered, comma-separated pool of 1–8 unique `provider/model` identifiers for failover routing. Empty disables pool routing; the single-model `OPENCODE_MODEL` fallback applies instead. Malformed, duplicate, or excessive entries fail closed. |
+| `OPENCODE_MODEL_STRATEGY` | `sticky-failover` | Pool selection strategy. `sticky-failover` is the only supported value; any other value fails closed. |
+| `OPENCODE_PROBE_TTL` | `3600` | Seconds a successful route probe remains fresh. Integer in `[60, 86400]`. |
+| `OPENCODE_MODEL_COOLDOWN` | `900` | Seconds a failed or burned route stays out of selection. Integer in `[60, 86400]`. |
+| `OPENCODE_PROBE_TIMEOUT` | `90` | Per-probe timeout in seconds. Integer in `[15, 240]`. |
+
+`OPENCODE_MODEL` is only the legacy single-model fallback: it is used when
+`OPENCODE_MODELS` is empty. A per-run explicit pin must be one of the pool
+routes. The full selection, qualification, and state contract is in
+`docs/opencode-model-routing.md`.
 
 Strict ephemeral invariants (zero live idle instances, one job per
 instance, per-job network lifecycle, reconciler-backed teardown) are
