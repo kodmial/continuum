@@ -269,6 +269,73 @@ class CheckpointHistoryTests(unittest.TestCase):
             ).stdout.strip()
             self.assertEqual(main_ref, "")
 
+    def test_shallow_history_is_reported_as_inconclusive(self):
+        # A shallow checkout can hide a real common ancestor behind the
+        # shallow boundary, and merge-base then exits 1 exactly like genuinely
+        # unrelated history. The guard must say the answer is inconclusive
+        # instead of claiming the checkpoint is unrelated. The bounded
+        # deepening fallback cannot be forced to stop short against a local
+        # file:// remote (``--unshallow`` always succeeds there), so this test
+        # exercises the shared-history seam directly on a genuinely shallow
+        # clone whose fetched refs stop one commit above the shared ancestor.
+        ref = "continuum-child/checkpoint-task-9-g1-" + SPEC
+        self._checkpoint(ref)
+        self._advance_main()
+        self._git(
+            self.tmp.name,
+            "clone", "-q", "--depth=1", "file://" + self.origin, self.work,
+        )
+        self._config(self.work)
+        self._git(
+            self.work,
+            "fetch", "-q", "--depth=1", "origin",
+            ref + ":refs/remotes/origin/" + ref,
+        )
+        checkpoint_sha = subprocess.run(
+            ["git", "rev-parse", "origin/" + ref],
+            cwd=self.work, capture_output=True, text=True, timeout=60,
+        ).stdout.strip()
+        # The fixture must actually reproduce the ambiguous case: shallow
+        # repository plus merge-base exit 1. Fail loudly if git ever stops
+        # behaving that way instead of silently testing a different branch.
+        shallow = subprocess.run(
+            ["git", "rev-parse", "--is-shallow-repository"],
+            cwd=self.work, capture_output=True, text=True, timeout=60,
+        ).stdout.strip()
+        self.assertEqual(shallow, "true")
+        probe = subprocess.run(
+            ["git", "merge-base", "origin/" + self.DEFAULT_BRANCH, checkpoint_sha],
+            cwd=self.work, capture_output=True, text=True, timeout=60,
+        )
+        self.assertEqual(probe.returncode, 1, probe.stderr)
+        driver = (
+            'source "$CHECKPOINT"\n'
+            'if continuum_checkpoint_assert_shared_history "origin/$BRANCH" "$SHA"; then\n'
+            '  printf "rc=0\\n"\n'
+            'else\n'
+            '  printf "rc=%s\\n" "$?"\n'
+            'fi\n'
+        )
+        result = subprocess.run(
+            ["bash", "-c", driver],
+            cwd=self.work,
+            capture_output=True,
+            text=True,
+            env={
+                **os.environ,
+                "CHECKPOINT": CHECKPOINT,
+                "SHA": checkpoint_sha,
+                "BRANCH": self.DEFAULT_BRANCH,
+            },
+            timeout=120,
+        )
+        self.assertIn("rc=4", result.stdout, result.stderr)
+        self.assertIn("shallow", result.stderr, result.stderr)
+        self.assertIn("deeper history", result.stderr, result.stderr)
+        self.assertNotIn(
+            "unrelated to the target default branch", result.stderr, result.stderr
+        )
+
     def test_stale_origin_head_with_missing_tracking_ref_is_refreshed(self):
         # A clone can keep a stale origin/HEAD and lose the resolved
         # remote-tracking ref. Resume must refresh origin/HEAD, then fetch

@@ -57,7 +57,9 @@ continuum_checkpoint_default_branch() {
 
 # A shallow clone does not contain the common ancestor, so a shared-history
 # check would reject a valid checkpoint. Deepen the checkout once, only when
-# it actually is shallow.
+# it actually is shallow. The deepening is bounded, so it may still leave the
+# ancestor outside the fetched history; the shared-history guard treats that
+# unresolved case as inconclusive rather than as unrelated history.
 continuum_checkpoint_ensure_history() {
   if [[ "$(git rev-parse --is-shallow-repository 2>/dev/null)" != "true" ]]; then
     return 0
@@ -67,10 +69,13 @@ continuum_checkpoint_ensure_history() {
     || return 4
 }
 
-# ``git merge-base`` exits 1 only when the two commits genuinely share no
-# common ancestor. Any other non-zero status (a missing default-branch ref, a
-# corrupt object database, a broken repository) is infrastructure damage, and
-# reporting it as "unrelated history" would mask the real failure.
+# In a complete checkout ``git merge-base`` exits 1 only when the two commits
+# genuinely share no common ancestor. A shallow checkout can also exit 1 when
+# the common ancestor merely lies beyond the deepening fallback, so that case
+# is reported separately instead of claiming the checkpoint is unrelated.
+# Any other non-zero status (a missing default-branch ref, a corrupt object
+# database, a broken repository) is infrastructure damage, and reporting it as
+# "unrelated history" would mask the real failure.
 continuum_checkpoint_assert_shared_history() {
   local default_ref="$1" checkpoint_sha="$2" merge_base_rc=0
   git merge-base "$default_ref" "$checkpoint_sha" >/dev/null 2>&1 \
@@ -80,7 +85,11 @@ continuum_checkpoint_assert_shared_history() {
       return 0
       ;;
     1)
-      echo "::error::Delegated checkpoint history is unrelated to the target default branch." >&2
+      if [[ "$(git rev-parse --is-shallow-repository 2>/dev/null)" == "true" ]]; then
+        echo "::error::Delegated checkpoint history is inconclusive: the checkout is shallow and the common ancestor may lie beyond the fetched history; fetch a deeper history and retry." >&2
+      else
+        echo "::error::Delegated checkpoint history is unrelated to the target default branch." >&2
+      fi
       return 4
       ;;
     *)
