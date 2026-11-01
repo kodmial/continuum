@@ -64,12 +64,15 @@ class IssueAdmissionTests(unittest.TestCase):
             2: [
                 {
                     "body": "/oc",
-                    "author_association": "OWNER",
+                    "author_association": "NONE",
+                    "user": {"login": "repo-owner"},
                     "created_at": NOW - timedelta(minutes=1),
                 }
             ]
         }
-        decision = adapters.decide_issue_admission(issue(2), now=NOW, comments=comments)
+        decision = adapters.decide_issue_admission(
+            issue(2), now=NOW, comments=comments, repository_owner="repo-owner"
+        )
         self.assertEqual(decision.kind, adapters.WAIT)
         self.assertIn("race window", decision.reason)
 
@@ -81,13 +84,56 @@ class IssueAdmissionTests(unittest.TestCase):
             2: [
                 {
                     "body": "The earlier dispatch /oc was retried after the timeout.",
-                    "author_association": "OWNER",
+                    "author_association": "NONE",
+                    "user": {"login": "repo-owner"},
                     "created_at": NOW - timedelta(minutes=1),
                 }
             ]
         }
-        decision = adapters.decide_issue_admission(issue(2), now=NOW, comments=comments)
+        decision = adapters.decide_issue_admission(
+            issue(2), now=NOW, comments=comments, repository_owner="repo-owner"
+        )
         self.assertEqual(decision.kind, adapters.ACTION)
+
+    def test_collaborator_association_does_not_authorize_owner_command(self):
+        comments = {
+            2: [
+                {
+                    "body": "/oc",
+                    "author_association": "COLLABORATOR",
+                    "user": {"login": "teammate"},
+                    "created_at": NOW - timedelta(minutes=1),
+                }
+            ]
+        }
+        decision = adapters.decide_issue_admission(
+            issue(2), now=NOW, comments=comments, repository_owner="repo-owner"
+        )
+        self.assertEqual(decision.kind, adapters.ACTION)
+
+    def test_embedded_comments_use_repository_owner_login(self):
+        owner_comment = {
+            "body": "/oc",
+            "author_association": "NONE",
+            "user": {"login": "repo-owner"},
+            "created_at": NOW - timedelta(minutes=1),
+        }
+        decision = adapters.decide_issue_admission(
+            issue(2, comments=[owner_comment]), now=NOW, repository_owner="repo-owner"
+        )
+        self.assertEqual(decision.kind, adapters.WAIT)
+
+    def test_scheduler_bot_dispatch_remains_a_trusted_command(self):
+        bot_comment = {
+            "body": "/oc",
+            "author_association": "BOT",
+            "user": {"login": "github-actions[bot]"},
+            "created_at": NOW - timedelta(minutes=1),
+        }
+        decision = adapters.decide_issue_admission(
+            issue(2), now=NOW, comments={2: [bot_comment]}, repository_owner="repo-owner"
+        )
+        self.assertEqual(decision.kind, adapters.WAIT)
 
     def test_declared_blocker_waits(self):
         decision = adapters.decide_issue_admission(

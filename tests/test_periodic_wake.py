@@ -88,7 +88,13 @@ class WindowTests(unittest.TestCase):
         self.assertFalse(is_periodic_signal("workflow_dispatch", "false"))
         self.assertFalse(is_periodic_signal("issues", ""))
         self.assertTrue(parse_periodic_wake(" TRUE "))
+        self.assertTrue(parse_periodic_wake(True))
+        self.assertFalse(parse_periodic_wake(False))
         self.assertFalse(parse_periodic_wake(None))
+        for legacy_truthy in ("1", "yes", "on"):
+            with self.subTest(value=legacy_truthy):
+                self.assertFalse(parse_periodic_wake(legacy_truthy))
+        self.assertFalse(is_periodic_signal("workflow_dispatch", "yes"))
 
 
 class DedupeDecisionTests(unittest.TestCase):

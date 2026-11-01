@@ -175,8 +175,11 @@ def _run_state(run: Any) -> Tuple[str, str]:
     )
 
 
-def _comment_records(raw_comments: Sequence[Any]) -> List[CommentRecord]:
+def _comment_records(
+    raw_comments: Sequence[Any], repository_owner: str = ""
+) -> List[CommentRecord]:
     records: List[CommentRecord] = []
+    normalized_owner = str(repository_owner or "").strip().casefold()
     for raw in raw_comments or ():
         if isinstance(raw, CommentRecord):
             records.append(raw)
@@ -184,11 +187,12 @@ def _comment_records(raw_comments: Sequence[Any]) -> List[CommentRecord]:
         if not isinstance(raw, Mapping):
             continue
         user = raw.get("user") if isinstance(raw.get("user"), Mapping) else {}
-        association = str(raw.get("author_association") or "").upper()
+        author_login = str(user.get("login") or "")
+        normalized_login = author_login.strip().casefold()
         author_is_owner = bool(
             raw.get("author_is_owner")
-            or association in ("OWNER", "MEMBER", "COLLABORATOR")
-            or str(user.get("login") or "").lower() == "github-actions[bot]"
+            or (normalized_owner and normalized_login == normalized_owner)
+            or normalized_login == "github-actions[bot]"
         )
         created = raw.get("created_at")
         if isinstance(created, datetime):
@@ -206,11 +210,10 @@ def _comment_records(raw_comments: Sequence[Any]) -> List[CommentRecord]:
                 body=str(raw.get("body") or ""),
                 author_is_owner=author_is_owner,
                 created_at=when,
-                author_login=str(user.get("login") or ""),
+                author_login=author_login,
             )
         )
     return records
-
 
 def _issue_records(issues: Sequence[Mapping[str, Any]]) -> Dict[int, IssueState]:
     records: Dict[int, IssueState] = {}
@@ -231,6 +234,7 @@ def _issue_records(issues: Sequence[Mapping[str, Any]]) -> Dict[int, IssueState]
 def _comments_by_number(
     issues: Sequence[Mapping[str, Any]],
     comments: Optional[Mapping[Any, Sequence[Any]]],
+    repository_owner: str = "",
 ) -> Dict[int, List[CommentRecord]]:
     by_number: Dict[int, List[CommentRecord]] = {}
     if comments:
@@ -239,14 +243,13 @@ def _comments_by_number(
                 number = int(key)
             except (TypeError, ValueError):
                 continue
-            by_number[number] = _comment_records(value)
+            by_number[number] = _comment_records(value, repository_owner)
     for issue in issues:
         embedded = issue.get("comments") if isinstance(issue, Mapping) else None
         if embedded and isinstance(issue.get("number"), (int, str)):
             number = int(issue["number"])
-            by_number.setdefault(number, _comment_records(embedded))
+            by_number.setdefault(number, _comment_records(embedded, repository_owner))
     return by_number
-
 
 def _issue_decision(
     issue: IssueState,
@@ -338,7 +341,7 @@ def plan_issue_admissions(
     """
 
     records = _issue_records(issues)
-    comments_by_number = _comments_by_number(issues, comments)
+    comments_by_number = _comments_by_number(issues, comments, repository_owner)
     stopped = _normalize_terminal_stopped(list(terminal_stopped or ()))
     generations = {int(key): int(value) for key, value in (generations or {}).items()}
     result = reconcile(

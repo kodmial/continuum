@@ -36,14 +36,11 @@ PERIODIC_RUN_MARKER = "[continuum-periodic]"
 ISSUE_SCHEDULER_INTERVAL_SECONDS = 10 * 60
 ISSUE_SCHEDULER_OFFSET_SECONDS = 7 * 60
 
-_TRUE_VALUES = frozenset({"true", "1", "yes", "on"})
-
-
 def parse_periodic_wake(value: Any) -> bool:
     """Return whether the mode selector asks for external periodic behavior."""
     if isinstance(value, bool):
         return value
-    return str(value or "").strip().lower() in _TRUE_VALUES
+    return str(value or "").strip().lower() == "true"
 
 
 def is_periodic_signal(
