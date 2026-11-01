@@ -1174,6 +1174,33 @@ class SchedulerResumeBudgetTests(unittest.TestCase):
         self.assertEqual(result.skip_reasons[373], "automation is paused")
         self.assertNotIn("automation:in-progress", issues[373].labels)
 
+    def test_unmarked_expired_lease_keeps_an_existing_pause(self):
+        # Lease expiry below the attempt budget offers an automatic retry,
+        # but it must never clear a pause that the owner (or a previous
+        # terminal failure) set: removing the label here would re-admit the
+        # issue in the same reconcile pass.
+        comments = self.records(
+            ("<!-- issue-scheduler-dispatch -->", True, NOW - timedelta(hours=2)),
+        )
+        issues = self.scheduler_issue(
+            {READY, PAUSE, "automation:in-progress"}
+        )
+        result = reconcile(
+            NOW,
+            issues,
+            set(),
+            set(),
+            {373: comments},
+            {},
+            {},
+            set(),
+            self.config(),
+            repository_owner=OWNER,
+        )
+        self.assertIn(PAUSE, issues[373].labels)
+        self.assertNotIn(373, result.dispatched)
+        self.assertEqual(result.skip_reasons[373], "automation is paused")
+
     def test_marker_baseline_is_only_valid_for_api_trusted_exact_marker(self):
         comments = self.records(
             (marker(374)["body"], True, NOW - timedelta(hours=1)),

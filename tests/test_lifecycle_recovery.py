@@ -969,6 +969,31 @@ class TokenPolicyTests(unittest.TestCase):
             )
         )
 
+    def test_status_check_context_mutations_require_pat(self):
+        # "status" and "check" are read nouns, not read verbs. A mutation
+        # leaf that carries them as camel-case segments must stay
+        # PAT-backed instead of matching the status/check read token.
+        for mutation in (
+            "client.rest.repos.setStatusCheckContexts",
+            "client.rest.repos.addStatusCheckContexts",
+            "client.rest.repos.removeStatusCheckContexts",
+            "client.rest.repos.updateStatusCheckContexts",
+            "set_status_check_contexts",
+            "remove_status_check_contexts",
+        ):
+            with self.subTest(mutation=mutation):
+                self.assertTrue(lifecycle.requires_pat(mutation))
+        # Genuine list*/get* reads of the same noun keep GITHUB_TOKEN.
+        for read_call in (
+            "client.rest.repos.getStatusCheckContexts",
+            "client.rest.repos.listStatusCheckContexts",
+            "get_status_check_contexts",
+            "status",
+            "check",
+        ):
+            with self.subTest(read_call=read_call):
+                self.assertFalse(lifecycle.requires_pat(read_call))
+
     def test_generic_clients_fail_closed_without_read_receiver(self):
         # Only the client.* receiver defaults generic graphql/request/
         # paginate to reads; the PAT receiver and bare names require PAT

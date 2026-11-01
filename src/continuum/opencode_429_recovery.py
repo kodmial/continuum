@@ -973,8 +973,13 @@ def validate_recovery_metadata(
 
     if operation_id not in (None, "") and _safe_token(operation_id) != operation:
         return False, "recovery metadata operation does not match the pointer"
-    if generation not in (None, "") and int(generation) != gen:
-        return False, "recovery metadata generation does not match the pointer"
+    if generation not in (None, ""):
+        try:
+            pointer_generation = int(generation)
+        except (TypeError, ValueError):
+            return False, "recovery pointer generation is not an integer"
+        if pointer_generation != gen:
+            return False, "recovery metadata generation does not match the pointer"
     if mode not in (None, "") and str(mode).strip().lower() != metadata_mode:
         return False, "recovery metadata mode does not match the pointer"
     if issue_number not in (None, "") and str(issue_number).strip() != issue_text:

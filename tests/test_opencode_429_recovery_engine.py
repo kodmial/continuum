@@ -12,6 +12,7 @@ import unittest
 from continuum.opencode_429_recovery import (
     MODES_HONORING_STAGE_FILE,
     RECOVERY_IDENTITY_FIELDS,
+    RECOVERY_METADATA_SCHEMA_VERSION,
     STAGE_FILE_NAME,
     already_resumed,
     checkpoint_ref,
@@ -40,6 +41,7 @@ from continuum.opencode_429_recovery import (
     stage_index,
     unpack_recovery_identity,
     validate_recovery_inputs,
+    validate_recovery_metadata,
     DEFAULT_MAX_429_RUNNER_RESTARTS,
     RUNNER_DEATH_EXIT_CODE,
 )
@@ -675,6 +677,49 @@ class OpacityTest(unittest.TestCase):
         sha = "d" * 40
         text = redact_child_identity("checkpoint at {} for issue 290".format(sha))
         self.assertIn("290", text)
+
+
+class RecoveryMetadataValidationTests(unittest.TestCase):
+    def metadata(self, **overrides):
+        data = {
+            "schema_version": RECOVERY_METADATA_SCHEMA_VERSION,
+            "operation_id": "issue-290",
+            "failure_kind": "quota_429",
+            "generation": 1,
+            "stage": "implementation-incomplete",
+            "mode": "issue",
+            "issue_number": "290",
+            "pr_number": "",
+            "head_ref": "opencode/issue-290",
+            "base_sha": "b" * 40,
+            "head_sha": "a" * 40,
+            "branch": "opencode/issue-290",
+            "checkpoint_ref": "opencode/429-checkpoint-issue-290-gen-1",
+        }
+        data.update(overrides)
+        return data
+
+    def test_matching_pointer_validates(self):
+        ok, reason = validate_recovery_metadata(
+            self.metadata(), generation="1"
+        )
+        self.assertTrue(ok, reason)
+
+    def test_non_integer_pointer_generation_fails_closed(self):
+        # A malformed pointer generation must be an explicit validation
+        # failure, not an uncaught ValueError from int().
+        ok, reason = validate_recovery_metadata(
+            self.metadata(), generation="not-a-number"
+        )
+        self.assertFalse(ok)
+        self.assertEqual(reason, "recovery pointer generation is not an integer")
+
+    def test_mismatched_pointer_generation_is_rejected(self):
+        ok, reason = validate_recovery_metadata(self.metadata(), generation="2")
+        self.assertFalse(ok)
+        self.assertEqual(
+            reason, "recovery metadata generation does not match the pointer"
+        )
 
 
 if __name__ == "__main__":

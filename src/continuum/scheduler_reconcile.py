@@ -327,7 +327,9 @@ def reconcile(
                 "OpenCode PR" % len(counted_dispatches)
             )
         else:
-            labels.discard(config.pause_label)
+            # A retriable lease expiry must never clear a pause the owner or
+            # a prior terminal failure set; candidate selection reads the
+            # label, so removing it here would silently re-admit the issue.
             result.skip_reasons[number] = (
                 "lease expired: eligible for an automatic retry"
                 + (

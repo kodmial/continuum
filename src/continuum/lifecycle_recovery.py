@@ -1614,7 +1614,15 @@ def requires_pat(action: object, content: object = "") -> bool:
         # such as "pulls.requestReviewers" exposes it as a segment, so it
         # must not classify that mutation as a read. Bare/leading
         # "request" is still handled by the generic-receiver check above.
-        segment_hit = token in segments and token != "request"
+        # "status"/"check" are read nouns, not read verbs: their segment
+        # match must not mask a mutation leaf such as
+        # "setStatusCheckContexts" or "removeStatusCheckContexts". The
+        # explicit list/get verbs above still classify the genuine
+        # get*/list* StatusCheckContexts reads, and the bare names below
+        # still classify bare "status"/"check".
+        segment_hit = token in segments and token not in {
+            "request", "status", "check",
+        }
         if token == leaf_word or segment_hit or leaf_word.startswith(token + "_") or (
             leaf_word.startswith(token) and leaf_word in {
                 "listreviews", "listreviewcomments", "listcomments",
