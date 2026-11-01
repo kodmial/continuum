@@ -2851,8 +2851,14 @@ jobs:
           CONTINUUM_VALIDATION_COMMAND: ${{ inputs.validation_command || vars.CONTINUUM_VALIDATION_COMMAND }}
           VERIFICATION_ENGINE_ROOT: ${{ github.workspace }}/.continuum-cancel-engine
           VERIFICATION_EVIDENCE_PATH: .continuum-verification.json
+          CONTINUUM_VERIFICATION_ATTESTATION_KEY: ${{ secrets.CONTINUUM_VERIFICATION_ATTESTATION_KEY }}
         run: |
           set -euo pipefail
+          # Keep the optional attestation key in a non-exported shell variable.
+          # Only the runner-side verification engine receives it; no helper,
+          # coding agent, or consumer verification command inherits the secret.
+          CONTINUUM_ATTESTATION_KEY_VALUE="${CONTINUUM_VERIFICATION_ATTESTATION_KEY:-}"
+          unset CONTINUUM_VERIFICATION_ATTESTATION_KEY
           continuum_assert_no_stop() {
             local stop_repo="${1:?repo}" stop_issue="${2:?issue}" stop_file stop_kind
             stop_file="$(mktemp "${RUNNER_TEMP:-/tmp}/continuum-operator-stop.XXXXXX")"
@@ -3054,7 +3060,8 @@ jobs:
             exit 1
           }
           verification_python() {
-            PYTHONPATH="$VERIFICATION_ENGINE_ROOT/src${PYTHONPATH:+:$PYTHONPATH}" python3 -m continuum.verification "$@"
+            CONTINUUM_VERIFICATION_ATTESTATION_KEY="$CONTINUUM_ATTESTATION_KEY_VALUE" \
+              PYTHONPATH="$VERIFICATION_ENGINE_ROOT/src${PYTHONPATH:+:$PYTHONPATH}" python3 -m continuum.verification "$@"
           }
           RECOVERY_STAGE_NOW="${RECOVERY_STAGE_IN:-implementation-incomplete}"
           SKIP_PRIMARY_IMPLEMENTATION=false

@@ -45,5 +45,26 @@ class OpenCodeWorkflowEditContractTest(unittest.TestCase):
         self.assertNotIn("git push -u origin main", self.body)
 
 
+    def test_attestation_secret_is_scoped_to_runner_verification(self):
+        step = self.body.split("      - name: Implement issue", 1)[1].split("\n      - name:", 1)[0]
+        self.assertIn(
+            "CONTINUUM_VERIFICATION_ATTESTATION_KEY: ${{ secrets.CONTINUUM_VERIFICATION_ATTESTATION_KEY }}",
+            step,
+        )
+        self.assertIn(
+            'CONTINUUM_ATTESTATION_KEY_VALUE="${CONTINUUM_VERIFICATION_ATTESTATION_KEY:-}"',
+            step,
+        )
+        self.assertIn("unset CONTINUUM_VERIFICATION_ATTESTATION_KEY", step)
+        self.assertIn(
+            'CONTINUUM_VERIFICATION_ATTESTATION_KEY="$CONTINUUM_ATTESTATION_KEY_VALUE"',
+            step,
+        )
+        self.assertLess(
+            step.index("unset CONTINUUM_VERIFICATION_ATTESTATION_KEY"),
+            step.index("continuum-opencode run --auto"),
+        )
+        self.assertNotIn("export CONTINUUM_ATTESTATION_KEY_VALUE", step)
+
 if __name__ == "__main__":
     unittest.main()
