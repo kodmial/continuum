@@ -38,21 +38,25 @@ continuum_checkpoint_restore() {
     return 0
   fi
 
+  local checkpoint_sha
   git fetch --quiet origin "refs/heads/$checkpoint_ref" >/dev/null 2>&1 || return 4
-  if ! git log -1 --format=%B FETCH_HEAD | grep -Fxq "Continuum-Checkpoint: $spec"; then
+  # Deepening the checkout fetches again and overwrites FETCH_HEAD, so pin the
+  # checkpoint commit now and use this SHA for every later check and switch.
+  checkpoint_sha="$(git rev-parse FETCH_HEAD 2>/dev/null)" || return 4
+  if ! git log -1 --format=%B "$checkpoint_sha" | grep -Fxq "Continuum-Checkpoint: $spec"; then
     echo "::error::Delegated checkpoint has no matching frozen task specification." >&2
     return 4
   fi
   continuum_checkpoint_ensure_history || return 4
-  if ! git merge-base origin/main FETCH_HEAD >/dev/null 2>&1; then
+  if ! git merge-base origin/main "$checkpoint_sha" >/dev/null 2>&1; then
     echo "::error::Delegated checkpoint history is unrelated to the target default branch." >&2
     return 4
   fi
-  if git diff --no-ext-diff "origin/main...FETCH_HEAD" -- . | grep -Eiq '(github_pat_[A-Za-z0-9_]+|ghp_[A-Za-z0-9]+|rnd_[A-Za-z0-9]+|-----BEGIN [A-Z ]*PRIVATE KEY-----)'; then
+  if git diff --no-ext-diff "origin/main...$checkpoint_sha" -- . | grep -Eiq '(github_pat_[A-Za-z0-9_]+|ghp_[A-Za-z0-9]+|rnd_[A-Za-z0-9]+|-----BEGIN [A-Z ]*PRIVATE KEY-----)'; then
     echo "::error::Token-like content detected; checkpoint restore refused." >&2
     return 31
   fi
-  git switch -c "$branch" FETCH_HEAD >/dev/null 2>&1 || return 4
+  git switch -c "$branch" "$checkpoint_sha" >/dev/null 2>&1 || return 4
   CONTINUUM_CHECKPOINT_RESTORED=true
   echo "::notice::Resumed verified generation-scoped delegated work checkpoint."
 }
@@ -61,7 +65,7 @@ continuum_checkpoint_restore() {
 # canonical non-default-branch guard and only invokes this after snapshot admission.
 continuum_checkpoint_save() {
   local checkpoint_ref="$1" spec="$2" child_repo="$3" task="$4"
-  local attempt=0
+  local attempt=0 checkpoint_sha
   if [[ -z "$(git status --porcelain)" ]]; then
     return 0
   fi
@@ -90,16 +94,18 @@ continuum_checkpoint_save() {
       return 4
     fi
     git fetch --quiet origin "refs/heads/$checkpoint_ref" >/dev/null 2>&1 || continue
-    if ! git log -1 --format=%B FETCH_HEAD | grep -Fxq "Continuum-Checkpoint: $spec"; then
+    # Pin the winner before deepening: the later fetch overwrites FETCH_HEAD.
+    checkpoint_sha="$(git rev-parse FETCH_HEAD 2>/dev/null)" || continue
+    if ! git log -1 --format=%B "$checkpoint_sha" | grep -Fxq "Continuum-Checkpoint: $spec"; then
       echo "::error::Delegated checkpoint changed to an untrusted revision; refusing to overwrite." >&2
       return 4
     fi
     continuum_checkpoint_ensure_history || return 4
-    if ! git merge-base origin/main FETCH_HEAD >/dev/null 2>&1; then
+    if ! git merge-base origin/main "$checkpoint_sha" >/dev/null 2>&1; then
       echo "::error::Delegated checkpoint history is unrelated to the target default branch." >&2
       return 4
     fi
-    if ! git rebase FETCH_HEAD >/dev/null 2>&1; then
+    if ! git rebase "$checkpoint_sha" >/dev/null 2>&1; then
       git rebase --abort >/dev/null 2>&1 || true
       # The losing runner's delta is still only local; the ephemeral workdir
       # is discarded on exit, so preserve it on a side ref instead of

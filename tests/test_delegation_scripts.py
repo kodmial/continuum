@@ -161,6 +161,44 @@ class CheckpointHistoryTests(unittest.TestCase):
         ).stdout.strip()
         self.assertEqual(branch, "continuum-child/task-1")
 
+    def test_shallow_checkout_restores_the_pinned_checkpoint(self):
+        # Deepening a shallow clone fetches again and overwrites FETCH_HEAD.
+        # Restore must switch to the checkpoint SHA captured before that.
+        ref = "continuum-child/checkpoint-task-3-g1-" + SPEC
+        self._checkpoint(ref)
+        checkpoint_sha = subprocess.run(
+            ["git", "rev-parse", ref],
+            cwd=self.seed, capture_output=True, text=True, timeout=60,
+        ).stdout.strip()
+        self._advance_main()
+        self._git(
+            self.tmp.name,
+            "clone", "-q", "--depth=1", "file://" + self.origin, self.work,
+        )
+        self._config(self.work)
+        driver = (
+            'source "$CHECKPOINT"\n'
+            'if continuum_checkpoint_restore "$REF" "continuum-child/task-3" "$SPEC"; then\n'
+            '  printf "rc=0\\n"\n'
+            'else\n'
+            '  printf "rc=%s\\n" "$?"\n'
+            'fi\n'
+        )
+        result = subprocess.run(
+            ["bash", "-c", driver],
+            cwd=self.work,
+            capture_output=True,
+            text=True,
+            env={**os.environ, "CHECKPOINT": CHECKPOINT, "REF": ref, "SPEC": SPEC},
+            timeout=120,
+        )
+        self.assertIn("rc=0", result.stdout, result.stderr)
+        head = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=self.work, capture_output=True, text=True, timeout=60,
+        ).stdout.strip()
+        self.assertEqual(head, checkpoint_sha)
+
     def test_unrelated_checkpoint_history_fails_closed(self):
         ref = "continuum-child/checkpoint-task-2-g1-" + SPEC
         self._checkpoint(ref, orphan=True)
