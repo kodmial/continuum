@@ -137,6 +137,7 @@ ALLOWED_SECRETS = frozenset({
     "CHILD_RUNTIME_TOKEN",
     "CHILD_RUNTIME_REPOSITORIES",
     "CONTINUUM_CHILD_REPOSITORIES",
+    "CONTINUUM_VERIFICATION_ATTESTATION_KEY",
 })
 
 #: Paid-provider keys must never be required, read, or forwarded by core.
@@ -196,8 +197,8 @@ def chaining_evidence() -> dict:
 # Inventory entries: one per owning step that binds secrets.TAP_PAT.
 # ---------------------------------------------------------------------------
 #
-# ``step`` is a unique substring of the owning ``- name:`` line.
-# ``capability`` is one of CAPABILITIES. ``same_repo`` marks whether the
+# ``step`` is the complete owning ``- name:`` line, compared after whitespace
+# normalization (never a substring). ``capability`` is one of CAPABILITIES. ``same_repo`` marks whether the
 # step runs against the same repository (False only for genuine
 # cross-repository work). ``reason`` must name the mechanism that makes
 # ``GITHUB_TOKEN`` non-equivalent. ``evidence`` lists literals the contract
@@ -867,8 +868,20 @@ def scan_workflow_bindings(workflows_dir: str) -> list:
     return bindings
 
 
+def _normalize_step(step: object) -> str:
+    """Normalize an owning step name for exact comparison."""
+    return " ".join(str(step or "").split()).casefold()
+
+
 def _entry_covers(entry: dict, workflow: str, step: str) -> bool:
-    return entry["workflow"] == workflow and entry["step"] in step
+    # Compare complete owning step names by equality. Substring membership
+    # would let a shorter entry cover a longer, different step (for example an
+    # entry for "Run OpenCode" covering a later "Run OpenCode verifier"), so
+    # that PAT binding would silently escape the inventory.
+    return (
+        entry["workflow"] == workflow
+        and _normalize_step(entry["step"]) == _normalize_step(step)
+    )
 
 
 def covering_entry(workflow: str, step: str) -> dict | None:

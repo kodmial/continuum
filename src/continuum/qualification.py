@@ -151,10 +151,18 @@ DOCKER_RESULT_MARKER = "<!-- continuum-docker-qualification-result -->"
 #: Render-controller evidence marker; the JSON payload follows the marker.
 RENDER_RESULT_MARKER = "<!-- continuum-render-qualification-result -->"
 
+#: Optional issue target after a closing keyword: bare ``#N``, a
+#: cross-repository ``owner/repo#N``, or a full GitHub issue URL. GitHub
+#: auto-closes in all three forms, so the gate must recognize all three.
+_CLOSING_TARGET = (
+    r"\s*:?\s*(?:[\w.-]+/[\w.-]+#|https?://github\.com/[\w.-]+/[\w.-]+/issues/|#)?"
+)
+
 #: GitHub auto-close keywords that would bypass the gate via ``Fixes #N``.
 CLOSING_KEYWORDS_RE = re.compile(
     r"\b(?:close|closes|closed|fix|fixes|fixed|resolve|resolves|resolved)"
-    r"\s*:?\s*#?\d+",
+    + _CLOSING_TARGET
+    + r"\d+",
     re.IGNORECASE,
 )
 
@@ -786,7 +794,7 @@ def contains_closing_keyword(text: object, issue_number: object = None) -> bool:
         return False
     pattern = re.compile(
         r"\b(?:close|closes|closed|fix|fixes|fixed|resolve|resolves|resolved)"
-        r"\s*:?\s*#?" + str(wanted) + r"(?!\d)",
+        + _CLOSING_TARGET + str(wanted) + r"(?!\d)",
         re.IGNORECASE,
     )
     return pattern.search(text) is not None

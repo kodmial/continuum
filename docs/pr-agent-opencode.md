@@ -103,8 +103,10 @@ run and consumed by the lifecycle parser.
 
 ## Review lifecycle
 
-The installed PR-Agent caller wakes on PR events and again when the repository's
-`CI` workflow completes successfully for a pull request. The reusable workflow
+The installed `continuum-pr-agent-recovery.yml` caller wakes on PR events and
+again when the repository's `CI` workflow completes for a pull request, then
+dispatches the `continuum-pr-agent.yml` caller (which itself exposes only
+`workflow_dispatch`). The reusable workflow
 admits one exact CI-qualified HEAD, runs upstream PR-Agent v0.46.0 full
 `review`, reads the native v0.46.0 persistent finding state for that exact
 HEAD, and runs a conditional automatic `improve`: a clean authoritative

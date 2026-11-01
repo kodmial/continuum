@@ -1,7 +1,18 @@
 #!/usr/bin/env bash
 # Durable, private, generation-scoped work checkpoints for delegated tasks.
 # Sourced by the reusable worker after the authoritative task snapshot is verified.
+# The shared ``continuum_pr_staging.sh`` boundary is mandatory for checkpoint
+# save, so it is loaded from this script's own directory when the caller has not
+# sourced it already. A checkpoint never falls back to plain ``git add -A``.
 # Never upload code, patches or agent transcripts to the public parent.
+
+if ! declare -F continuum_stage_checkpoint >/dev/null; then
+  continuum_checkpoint_staging_lib="${BASH_SOURCE[0]%/*}/continuum_pr_staging.sh"
+  if [[ -r "$continuum_checkpoint_staging_lib" ]]; then
+    # shellcheck source=/dev/null
+    source "$continuum_checkpoint_staging_lib"
+  fi
+fi
 
 continuum_checkpoint_ref() {
   local task="$1" generation="$2" spec="$3"
@@ -69,7 +80,15 @@ continuum_checkpoint_save() {
   if [[ -z "$(git status --porcelain)" ]]; then
     return 0
   fi
-  git add -A || return 4
+  # The shared staging boundary removes workflow-owned engine checkouts and
+  # rejects undeclared Gitlinks. A plain `git add -A` would let a remaining
+  # checkout enter the checkpoint commit, so require the library explicitly
+  # rather than silently falling back to plain staging.
+  if ! declare -F continuum_stage_checkpoint >/dev/null; then
+    echo "::error::Checkpoint staging boundary is unavailable." >&2
+    return 4
+  fi
+  continuum_stage_checkpoint || return 4
   if git diff --cached --no-ext-diff | grep -Eiq '(github_pat_[A-Za-z0-9_]+|ghp_[A-Za-z0-9]+|rnd_[A-Za-z0-9]+|-----BEGIN [A-Z ]*PRIVATE KEY-----)'; then
     echo "::error::Token-like content detected; checkpoint publication refused." >&2
     return 31

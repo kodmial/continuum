@@ -222,6 +222,74 @@ class CheckpointHistoryTests(unittest.TestCase):
         )
         self.assertIn("rc=4", result.stdout, result.stderr)
 
+    def _dirty_clone(self):
+        self._git(self.tmp.name, "clone", "-q", self.origin, self.work)
+        self._config(self.work)
+        with open(os.path.join(self.work, "delta.txt"), "w", encoding="utf-8") as handle:
+            handle.write("delegated delta\n")
+
+    def _save(self, driver, checkpoint=CHECKPOINT):
+        return subprocess.run(
+            ["bash", "-c", driver],
+            cwd=self.work,
+            capture_output=True,
+            text=True,
+            env={**os.environ, "CHECKPOINT": checkpoint, "REF": self.ref,
+                 "SPEC": SPEC},
+            timeout=120,
+        )
+
+    def test_save_without_the_staging_boundary_fails_closed(self):
+        # A plain `git add -A` fallback could publish a workflow-owned engine
+        # checkout, so the shared boundary is required rather than optional.
+        self._dirty_clone()
+        self.ref = "continuum-child/checkpoint-task-4-g1-" + SPEC
+        isolated = os.path.join(self.tmp.name, "isolated-checkpoint.sh")
+        with open(CHECKPOINT, "r", encoding="utf-8") as source:
+            with open(isolated, "w", encoding="utf-8") as target:
+                target.write(source.read())
+        result = self._save(
+            'source "$CHECKPOINT"\n'
+            'if continuum_checkpoint_save "$REF" "$SPEC" kodmial/continuum 4; then\n'
+            '  printf "rc=0\\n"\n'
+            'else\n'
+            '  printf "rc=%s\\n" "$?"\n'
+            'fi\n',
+            checkpoint=isolated,
+        )
+        self.assertIn("rc=4", result.stdout, result.stderr)
+        self.assertIn("staging boundary is unavailable", result.stderr)
+        log = subprocess.run(
+            ["git", "log", "--oneline"], cwd=self.work,
+            capture_output=True, text=True, timeout=60,
+        ).stdout
+        self.assertEqual(len(log.strip().splitlines()), 1, log)
+
+    def test_save_loads_and_uses_the_shared_staging_boundary(self):
+        self._dirty_clone()
+        engine_checkout = os.path.join(self.work, ".continuum-cancel-engine")
+        os.makedirs(engine_checkout)
+        with open(os.path.join(engine_checkout, "engine.txt"), "w",
+                  encoding="utf-8") as handle:
+            handle.write("workflow-owned checkout\n")
+        self.ref = "continuum-child/checkpoint-task-5-g1-" + SPEC
+        result = self._save(
+            'source "$CHECKPOINT"\n'
+            'continuum_assert_safe_push() { return 0; }\n'
+            'if continuum_checkpoint_save "$REF" "$SPEC" kodmial/continuum 5; then\n'
+            '  printf "rc=0\\n"\n'
+            'else\n'
+            '  printf "rc=%s\\n" "$?"\n'
+            'fi\n'
+        )
+        self.assertIn("rc=0", result.stdout, result.stderr)
+        tracked = subprocess.run(
+            ["git", "ls-tree", "--name-only", "HEAD"], cwd=self.work,
+            capture_output=True, text=True, timeout=60,
+        ).stdout
+        self.assertIn("delta.txt", tracked)
+        self.assertNotIn(".continuum-cancel-engine", tracked)
+
 
 if __name__ == "__main__":
     unittest.main()

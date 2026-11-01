@@ -191,6 +191,27 @@ class RestFailureClassificationTest(unittest.TestCase):
         )
         self.assertTrue(is_retryable_failure(RATE_LIMIT_FAILURE))
 
+    def test_secondary_rate_limit_with_retry_after_and_positive_quota(self):
+        # GitHub returns a secondary rate limit as 403 + Retry-After while the
+        # primary quota is still above zero and the message may be empty.
+        self.assertEqual(
+            classify_rest_failure(
+                403,
+                {"Retry-After": "60", "X-RateLimit-Remaining": "4999"},
+                "GitHub REST failure (403)",
+            ),
+            RATE_LIMIT_FAILURE,
+        )
+        # A blank Retry-After is not a limit signal on its own.
+        self.assertEqual(
+            classify_rest_failure(
+                403,
+                {"Retry-After": "  ", "X-RateLimit-Remaining": "4999"},
+                "Resource not accessible",
+            ),
+            AUTH_FAILURE,
+        )
+
     def test_server_and_timeout_are_transient(self):
         for status in (500, 502, 503, 504):
             self.assertEqual(classify_rest_failure(status), TRANSIENT_FAILURE)

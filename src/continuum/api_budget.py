@@ -364,9 +364,10 @@ def classify_rest_failure(status: Any, headers: Any = None,
 
     Distinguishes an authentication/permission rejection (401, or 403 without
     a limit signal) from primary/secondary rate limiting (429, or 403 while
-    the remaining budget is zero or the body names a limit) from 5xx/timeout
-    transient failures.  Unknown input fails closed as ``PERMANENT_FAILURE``
-    so an unrecognized error is never retried as transient forever.
+    the remaining budget is zero, a ``Retry-After`` header is present, or the
+    body names a limit) from 5xx/timeout transient failures.  Unknown input
+    fails closed as ``PERMANENT_FAILURE`` so an unrecognized error is never
+    retried as transient forever.
     """
     lowered = (message or "").lower()
     status_value: Optional[int]
@@ -383,9 +384,13 @@ def classify_rest_failure(status: Any, headers: Any = None,
 
     header_map = _headers_lower(headers)
     remaining = header_map.get("x-ratelimit-remaining")
+    # GitHub reports a secondary rate limit as 403 + Retry-After while the
+    # primary quota is still above zero, so the header is a limit signal on
+    # its own. This keeps the three failure classifiers in agreement.
     limit_signal = (
         _RATE_LIMIT_RE.search(lowered) is not None
         or (remaining is not None and remaining.strip() == "0")
+        or bool((header_map.get("retry-after") or "").strip())
     )
 
     if status_value == 401:

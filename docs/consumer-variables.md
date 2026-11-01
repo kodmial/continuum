@@ -82,11 +82,11 @@ The workflow-owned `.continuum-verification.json` evidence is retained on a
 429 checkpoint and removed before the implementation commit/PR.
 
 The evidence file lives in the task worktree, so the engine never trusts it on
-its own. Set the workflow secret
-`CONTINUUM_VERIFICATION_ATTESTATION_KEY` in the verification step's environment
-to sign the recorded contract, baseline, verifier result, and accepted final
-record with HMAC-SHA256; a resumed run reuses those records only when the
-signature verifies. Without the key, an existing baseline is rebuilt and the
+its own. Set the repository secret `CONTINUUM_VERIFICATION_ATTESTATION_KEY` and
+pass it into the verification step's environment under the same name to sign
+the recorded contract, baseline, verifier result, and accepted final record
+with HMAC-SHA256; a resumed run reuses those records only when the signature
+verifies. Without the key, an existing baseline is rebuilt and the
 final phase re-resolves the contract from the task base commit instead of the
 worktree, so a coding agent cannot rewrite its own verification commands or
 forge an accepted result. The key is read from the environment, never from an
@@ -241,6 +241,7 @@ limits and result paths.
 | `RENDER_API_KEY` | Render execution is enabled | Render API credential. |
 | `CHILD_RUNTIME_TOKEN` | Direct parent reusable workflow invocation | Delegated child access; installed parent callers map their configured parent credential. |
 | `CHILD_RUNTIME_REPOSITORIES` | Legacy parent configuration only | Optional compatibility input for child repository relationships. |
+| `CONTINUUM_VERIFICATION_ATTESTATION_KEY` | Resumed verification evidence must be reusable | Optional HMAC-SHA256 key, passed into the verification step's environment. Without it a resumed run rebuilds the baseline and re-resolves the contract instead of trusting attestation. |
 
 The optional Swift profile defines **no signing or release secrets**. Product
 signing/release credentials belong to the consumer.

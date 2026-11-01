@@ -323,11 +323,32 @@ class AutoCloseSafetyTests(unittest.TestCase):
             with self.subTest(text=text):
                 self.assertTrue(gate.contains_closing_keyword(text, 182))
 
+    def test_cross_repository_and_url_closing_references_are_detected(self):
+        for text in (
+            "Fixes owner/repo#182",
+            "Fixes owner/repo#182 and more",
+            "Closes other/repository#182",
+            "Fixes https://github.com/owner/repo/issues/182",
+            "Resolved https://github.com/owner/repo/issues/182",
+        ):
+            with self.subTest(text=text):
+                self.assertTrue(gate.contains_closing_keyword(text))
+                self.assertTrue(gate.contains_closing_keyword(text, 182))
+
+    def test_cross_repository_reference_does_not_match_another_issue(self):
+        for text in (
+            "Fixes owner/repo#183",
+            "Fixes https://github.com/owner/repo/issues/1820",
+        ):
+            with self.subTest(text=text):
+                self.assertFalse(gate.contains_closing_keyword(text, 182))
+
     def test_non_closing_references_are_safe(self):
         for text in (
             "Automated implementation for #182.\n\nRelates to #182",
             "See #182 for context",
             "Fixes #183",
+            "See https://github.com/owner/repo/issues/182 for context",
             "",
         ):
             with self.subTest(text=text):

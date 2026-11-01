@@ -222,6 +222,43 @@ class TransientRecoveryTests(unittest.TestCase):
         self.assertFalse(decision.create_repair)
         self.assertFalse(decision.allow_retry)
 
+    def test_timeout_qualifier_must_be_adjacent_to_the_timeout(self):
+        # A qualifier elsewhere in the evidence must not turn an unexplained
+        # timeout into an infrastructure transient: "read" in "read the log"
+        # used to match by substring and route the failure to blind retries.
+        for evidence in (
+            "read the log, then the render job timed out after 55 minutes",
+            "the render job timed out during read",
+            "rapid timeout while polling the render",
+        ):
+            with self.subTest(evidence=evidence):
+                classification = engine.classify_render_failure(
+                    execute_outcome="failure",
+                    cleanup_outcome="success",
+                    result={"error": evidence},
+                    memory_summary={},
+                    state={},
+                )
+                self.assertEqual(
+                    classification.classification, engine.TIMEOUT_UNKNOWN
+                )
+
+    def test_adjacent_timeout_qualifier_stays_transient(self):
+        for evidence in (
+            "network timeout while polling the render",
+            "read timeout",
+            "connection_timed out",
+        ):
+            with self.subTest(evidence=evidence):
+                classification = engine.classify_render_failure(
+                    execute_outcome="failure",
+                    cleanup_outcome="success",
+                    result={"error": evidence},
+                    memory_summary={},
+                    state={},
+                )
+                self.assertEqual(classification.classification, engine.TRANSIENT)
+
 
 class FingerprintCoalescingTests(unittest.TestCase):
     def test_identical_capacity_evidence_produces_identical_fingerprints(self):

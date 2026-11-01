@@ -8,7 +8,8 @@ import unittest
 from datetime import datetime, timezone
 from pathlib import Path
 
-from continuum.reconciliation_adapters import ACTION, WAIT
+from continuum.lifecycle_recovery import RetryEvidence
+from continuum.reconciliation_adapters import ACTION, RETRY, TERMINAL, WAIT
 from continuum.reconciliation_plan import (
     Continuation,
     PlanContext,
@@ -193,6 +194,122 @@ class PaginationTests(unittest.TestCase):
             plan_repository(source, context=PlanContext(now=NOW), page_size=0)
         with self.assertRaises(ReconciliationPlanError):
             plan_repository(source, context=PlanContext(now=NOW), max_pages_per_pass=0)
+
+
+def plan_one_pr(*, ci_run, per_pr):
+    """Plan a single open PR with explicit CI and per-PR state."""
+
+    pr = {
+        "number": 201,
+        "title": "fix: one",
+        "state": "open",
+        "head_sha": "1" * 40,
+        "head_repo": "kodmial/continuum",
+        "base_repo": "kodmial/continuum",
+        "mergeable": True,
+        "mergeable_state": "clean",
+    }
+    state = dict(per_pr)
+    state.setdefault("provider", "pr-agent")
+    return plan_snapshot(
+        (),
+        (pr,),
+        context=PlanContext(
+            now=NOW,
+            review_provider="pr-agent",
+            repository="kodmial/continuum",
+            ci_runs={201: ci_run},
+            pull_request_state={201: state},
+        ),
+    )
+
+
+def decision_for(plan, domain):
+    matches = [item for item in plan.decisions if item.domain == domain]
+    if len(matches) != 1:
+        raise AssertionError("expected exactly one {} decision, got {}".format(
+            domain, [item.domain for item in plan.decisions]))
+    return matches[0]
+
+
+class RetryEvidenceIsolationTests(unittest.TestCase):
+    """kodmial/continuum#432: CI-repair and PR-Agent evidence stay separate."""
+
+    def test_pr_agent_exhaustion_does_not_block_ci_repair(self):
+        plan = plan_one_pr(
+            ci_run={"status": "completed", "conclusion": "failure"},
+            per_pr={
+                "pr_agent_retry_evidence": RetryEvidence(exhausted=True),
+                "operation_state": "failure",
+                "failure_transient": True,
+            },
+        )
+        self.assertEqual(decision_for(plan, "ci-repair").kind, ACTION)
+        # PR-Agent still waits on the red exact HEAD rather than reading the
+        # other operation's budget.
+        self.assertEqual(decision_for(plan, "pr-agent-recovery").kind, WAIT)
+
+    def test_ci_repair_exhaustion_does_not_block_pr_agent_recovery(self):
+        plan = plan_one_pr(
+            ci_run={"status": "completed", "conclusion": "success"},
+            per_pr={
+                "ci_repair_retry_evidence": RetryEvidence(exhausted=True),
+                "operation_state": "failure",
+                "failure_transient": True,
+            },
+        )
+        self.assertEqual(decision_for(plan, "pr-agent-recovery").kind, ACTION)
+
+    def test_ci_repair_still_reads_its_own_budget(self):
+        plan = plan_one_pr(
+            ci_run={"status": "completed", "conclusion": "failure"},
+            per_pr={"ci_repair_retry_evidence": RetryEvidence(exhausted=True)},
+        )
+        self.assertEqual(decision_for(plan, "ci-repair").kind, TERMINAL)
+
+    def test_pr_agent_recovery_still_reads_its_own_budget(self):
+        plan = plan_one_pr(
+            ci_run={"status": "completed", "conclusion": "success"},
+            per_pr={
+                "pr_agent_retry_evidence": RetryEvidence(exhausted=True),
+                "operation_state": "failure",
+                "failure_transient": True,
+            },
+        )
+        self.assertEqual(decision_for(plan, "pr-agent-recovery").kind, TERMINAL)
+
+
+class PlanClockTests(unittest.TestCase):
+    """kodmial/continuum#432: an unset now_epoch defaults to the plan clock."""
+
+    def test_future_not_before_reports_a_retry_delay_from_the_plan_clock(self):
+        not_before = int(NOW.timestamp()) + 300
+        plan = plan_one_pr(
+            ci_run={"status": "completed", "conclusion": "success"},
+            per_pr={
+                "operation_state": "failure",
+                "failure_transient": True,
+                "not_before_epoch": not_before,
+            },
+        )
+        decision = decision_for(plan, "pr-agent-recovery")
+        self.assertEqual(decision.kind, RETRY)
+        self.assertEqual(decision.retry_after_seconds, 300)
+
+    def test_explicit_now_epoch_still_wins(self):
+        not_before = int(NOW.timestamp()) + 300
+        plan = plan_one_pr(
+            ci_run={"status": "completed", "conclusion": "success"},
+            per_pr={
+                "operation_state": "failure",
+                "failure_transient": True,
+                "not_before_epoch": not_before,
+                "now_epoch": not_before - 60,
+            },
+        )
+        decision = decision_for(plan, "pr-agent-recovery")
+        self.assertEqual(decision.kind, RETRY)
+        self.assertEqual(decision.retry_after_seconds, 60)
 
 
 if __name__ == "__main__":

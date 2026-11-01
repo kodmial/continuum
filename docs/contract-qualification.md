@@ -61,9 +61,11 @@ Code cannot protect `main` by itself. Configure GitHub branch protection
 (a ruleset) on `main` with all of the following:
 
 - Require a pull request before merging; no direct pushes.
-- Require status checks to pass before merging, including at minimum:
-  - `CI` (the primary regression suite), and
-  - `Contract qualification` (this contract gate).
+- Require status checks to pass before merging, including at minimum the
+  checks published by the `CI` workflow (its `Validate` job and the
+  `continuum/validation` status context) and the `Contract qualification`
+  workflow. Copy the exact check names from a real pull-request run before
+  saving the rule; no check run is literally named `CI`.
 - Require branches to be up to date before merging (so the exact-HEAD
   evidence the merge reconcilers revalidate is the evidence that was
   reviewed).

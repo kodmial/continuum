@@ -327,6 +327,7 @@ Secret names are part of the interface and never change per consumer.
 | `RENDER_API_KEY` | Render execution is enabled | Render API credential, read only by the render executor. It is a different credential from `TAP_PAT`, with no fallback; the controller fails explicitly when it is unset. |
 | `CHILD_RUNTIME_TOKEN` | Direct parent reusable-workflow invocation | Delegated child access. Installed parent callers map it from the parent's own `TAP_PAT`. |
 | `CHILD_RUNTIME_REPOSITORIES` | Legacy parent configuration only | Optional compatibility path for pre-variable child relationships. |
+| `CONTINUUM_VERIFICATION_ATTESTATION_KEY` | Resumed verification evidence must be reusable | Optional HMAC-SHA256 key passed into the verification step's environment. Without it a resumed run rebuilds the baseline and re-resolves the contract instead of trusting attestation. |
 
 No paid provider key is part of the contract: **no workflow reads
 `OPENCODE_API_KEY`, `ANTHROPIC_API_KEY`, `GROQ_API_KEY`, or `GROQ.KEY`.** Core

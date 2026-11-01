@@ -251,6 +251,14 @@ _TIMEOUT_INFRA_QUALIFIERS = (
     "provider",
 )
 
+# A qualifier must sit adjacent to the timeout mention. The evidence is one
+# serialized string, so matching a qualifier anywhere let an incidental
+# substring ("read" in "thread", "api" in "rapid") qualify an unrelated
+# timeout and route real repository evidence to blind transient retries.
+_QUALIFIED_TIMEOUT_RE = re.compile(
+    r"\b(?:" + "|".join(_TIMEOUT_INFRA_QUALIFIERS) + r")[\s_-]+(?:timeout|timed out)\b"
+)
+
 _PROVIDER_TOKENS = (
     "model overloaded",
     "model unavailable",
@@ -470,7 +478,7 @@ def _has_transient_signature(text: str) -> bool:
         if token in text:
             return True
     if "timed out" in text or "timeout" in text:
-        return any(qual in text for qual in _TIMEOUT_INFRA_QUALIFIERS)
+        return _QUALIFIED_TIMEOUT_RE.search(text) is not None
     return False
 
 

@@ -285,7 +285,7 @@ def plan_snapshot(
                 conflict_lock=bool(per_pr.get("conflict_lock", False)),
                 dispatches_for_head=int(per_pr.get("dispatches_for_head", 0) or 0),
                 conflict_marker_age_seconds=per_pr.get("conflict_marker_age_seconds"),
-                retry_evidence=per_pr.get("retry_evidence") or RetryEvidence(),
+                retry_evidence=per_pr.get("ci_repair_retry_evidence") or RetryEvidence(),
                 max_executions=int(per_pr.get("max_executions", 10) or 10),
             )
         )
@@ -355,11 +355,15 @@ def plan_snapshot(
                     run_conclusion=per_pr.get("run_conclusion"),
                     status_age_seconds=per_pr.get("status_age_seconds"),
                     main_sync_required=bool(per_pr.get("main_sync_required", False)),
-                    evidence=per_pr.get("retry_evidence") or RetryEvidence(),
+                    evidence=per_pr.get("pr_agent_retry_evidence") or RetryEvidence(),
                     marker_newer_than_status=bool(per_pr.get("marker_newer_than_status", False)),
                     marker_age_seconds=per_pr.get("marker_age_seconds"),
                     not_before_epoch=per_pr.get("not_before_epoch"),
-                    now_epoch=per_pr.get("now_epoch"),
+                    now_epoch=(
+                        per_pr.get("now_epoch")
+                        if per_pr.get("now_epoch") is not None
+                        else int(state.now.timestamp())
+                    ),
                     retry_after_seconds=per_pr.get("retry_after_seconds"),
                     ratelimit_reset_epoch=per_pr.get("ratelimit_reset_epoch"),
                     provider_reset_epoch=per_pr.get("provider_reset_epoch"),
