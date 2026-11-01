@@ -132,6 +132,16 @@ class _CapturedText(str):
             self._offset += len(chunk)
         return chunk
 
+    @property
+    def buffer(self):
+        return self
+
+    def read1(self, size: int = -1) -> bytes:
+        return self.read(size).encode("utf-8")
+
+    def close(self) -> None:
+        pass
+
 
 class FakeProcess:
     """Popen-shaped subprocess double for the semantic probe seam."""
@@ -278,7 +288,7 @@ class ProbeTests(unittest.TestCase):
                 self.assertTrue((pathlib.Path(tmp) / "continuum-opencode-429").exists())
         # Early termination, not the generic timeout, is the observable outcome;
         # removing the stall detection makes this fail (RouteError "timeout").
-        self.assertEqual(str(caught.exception), route.QUOTA_EXHAUSTED)
+        self.assertEqual(str(caught.exception), "quota_exhausted")
         self.assertTrue(process.terminated)
         self.assertLess(elapsed, 2)
 
@@ -295,15 +305,48 @@ class ProbeTests(unittest.TestCase):
         self.assertTrue(process.terminated)
         self.assertLess(route.time.monotonic() - started, 3)
 
+    def test_retryable_rate_limit_message_does_not_kill_the_probe(self):
+        """A retried message alone is not hard evidence, so the probe runs on."""
+        event = ('{"type":"error","error":{"name":"APIError",'
+                 '"data":{"message":"rate limit exceeded, retrying"}}}')
+        process = FakeProcess(stdout=event, hang=True)
+        def runner(command, **kwargs):
+            return process
+        started = route.time.monotonic()
+        with self.assertRaisesRegex(route.RouteError, "^timeout$"):
+            route.semantic_probe(A, "review", 0.3, runner=runner)
+        self.assertTrue(process.terminated)
+        self.assertLess(route.time.monotonic() - started, 3)
+
+    def test_stalled_429_is_detected_across_reader_chunks(self):
+        """Chunked reads still see a signature split across read boundaries."""
+        event = ('unrelated line\n{"type":"error","error":'
+                 '{"name":"FreeUsageLimitError"}}')
+        process = FakeProcess(stdout=event, hang=True)
+        def runner(command, **kwargs):
+            return process
+        with patch.object(route, "PROBE_READ_CHUNK", 5):
+            with self.assertRaises(route.BurnedRunner) as caught:
+                route.semantic_probe(A, "review", 3, runner=runner)
+        self.assertEqual(str(caught.exception), "quota_exhausted")
+
     def test_stall_pattern_requires_a_structured_error_event(self):
         self.assertTrue(route.QUOTA_STALL.search(
             '{"type":"error","error":{"name":"FreeUsageLimitError"}}'))
         self.assertTrue(route.QUOTA_STALL.search(
             '{"type":"error","error":{"name":"APIError",'
             '"data":{"statusCode":429}}}'))
-        self.assertTrue(route.QUOTA_STALL.search(
+        # A bare message is not terminating evidence: the CLI may retry and
+        # succeed, and killing the probe would burn the whole selection.
+        for log in (
             '{"type":"error","error":{"name":"UsageLimitExceeded",'
-            '"data":{"message":"Too Many Requests"}}}'))
+            '"data":{"message":"Too Many Requests"}}}',
+            '{"type":"error","error":{"name":"APIError",'
+            '"data":{"message":"rate limit exceeded; retrying"}}}',
+            '{"type":"error","error":{"message":"usage limit reached"}}',
+        ):
+            with self.subTest(log=log):
+                self.assertFalse(route.QUOTA_STALL.search(log))
         # Partial line: the signature arrives before the object is complete.
         self.assertTrue(route.QUOTA_STALL.search(
             '{"type":"error","error":{"name":"APIError","statusCode":429'))
@@ -338,7 +381,7 @@ class ProbeTests(unittest.TestCase):
                         route.semantic_probe(A, "review", 5, runner=runner)
                     elapsed = route.time.monotonic() - started
                     self.assertTrue((pathlib.Path(tmp) / "continuum-opencode-429").exists())
-        self.assertEqual(str(caught.exception), route.QUOTA_EXHAUSTED)
+        self.assertEqual(str(caught.exception), "quota_exhausted")
         self.assertLess(elapsed, 4)
         self.assertEqual(len(spawned), 1)
         # SIGTERM was ignored, so -SIGKILL proves the escalation ran.

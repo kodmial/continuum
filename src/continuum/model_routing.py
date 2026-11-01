@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import codecs
 from dataclasses import dataclass
 from datetime import timezone
 import email.utils
@@ -263,9 +264,12 @@ def route_order(config: Configuration, state: dict, now: int) -> tuple[str, ...]
 
 # A stalled free-quota probe still prints this before `opencode run` hangs.
 # Only a `run --format json` error event is authoritative: text/tool events
-# and quoted "429" response prose are never evidence. The line may still be
-# partial (the child writes without a trailing newline), so the match stops
-# at the quota signature instead of requiring a complete JSON object;
+# and quoted "429" response prose are never evidence. Termination needs hard
+# evidence too — an HTTP 429 status or the `FreeUsageLimitError` identifier —
+# because a generic "rate limit" message may still be retried successfully by
+# the CLI, and killing the probe would burn the whole selection. The line may
+# still be partial (the child writes without a trailing newline), so the match
+# stops at the quota signature instead of requiring a complete JSON object;
 # `classify` keeps its cross-engine `quota_429` label.
 QUOTA_STALL = re.compile(
     r'^[ \t]*\{[^\n]*?"type"[ \t]*:[ \t]*"error"'
@@ -273,13 +277,16 @@ QUOTA_STALL = re.compile(
     r'(?:'
     r'"(?:statusCode|status)"[ \t]*:[ \t]*"?429\b'
     r'|freeusagelimiterror'
-    r'|"(?:name|message)"[ \t]*:[ \t]*"[^"\n]*'
-    r'(?:quota|usage.?limit|rate.?limit|too.?many.?requests)[^"\n]*"'
     r')',
     re.IGNORECASE | re.MULTILINE)
 QUOTA_EXHAUSTED = "quota_exhausted"
 PROBE_POLL_SECONDS = 0.1
 PROBE_STOP_SECONDS = 5
+PROBE_JOIN_SECONDS = 5
+PROBE_READ_CHUNK = 4096
+# A partial line is re-scanned as more arrives; cap it so one unterminated
+# line cannot make scanning quadratic.
+PROBE_LINE_TAIL = 65536
 
 
 def classify(output: str, rc: int) -> str:
@@ -342,16 +349,43 @@ def _probe_environment(home: str) -> dict:
 
 
 def _drain(stream, sink: list[str]) -> None:
-    # Read one character at a time: a stalled child may print its 429 without
-    # a trailing newline, and a line-buffered read would never yield it.
+    # Read whatever is available: a stalled child may print its 429 without a
+    # trailing newline, and a full-buffer ``read`` would block until it exits.
+    # ``read1`` returns as soon as any bytes arrive; the incremental decoder
+    # keeps a multi-byte character split across reads intact.
+    decoder = codecs.getincrementaldecoder("utf-8")("replace")
     try:
         while True:
-            chunk = stream.read(1)
+            chunk = stream.buffer.read1(PROBE_READ_CHUNK)
             if not chunk:
+                tail = decoder.decode(b"", final=True)
+                if tail:
+                    sink.append(tail)
                 return
-            sink.append(chunk)
+            text = decoder.decode(chunk)
+            if text:
+                sink.append(text)
     except (OSError, ValueError):
         pass
+
+
+def _unscanned(parts: list[str], state: list) -> str:
+    """Return only text appended since the previous call.
+
+    ``state`` holds the count of already-consumed chunks and the trailing
+    partial line, so a signature split across chunk boundaries is still seen
+    while complete lines are never re-scanned.
+    """
+    if state[0] == len(parts):
+        return ""
+    pending = state[1] + "".join(parts[state[0]:])
+    state[0] = len(parts)
+    boundary = pending.rfind("\n")
+    if boundary < 0:
+        state[1] = pending[-PROBE_LINE_TAIL:]
+    else:
+        state[1] = pending[boundary + 1:]
+    return pending
 
 
 def _stop_probe(process) -> None:
@@ -382,8 +416,6 @@ def semantic_probe(model: str, kind: str, timeout: int, *, runner=subprocess.Pop
         try:
             process = runner(command, cwd=scratch, env=_probe_environment(scratch),
                              stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-        except subprocess.TimeoutExpired:
-            raise RouteError("timeout") from None
         except OSError as error:
             raise RouteError("local_runtime: " + type(error).__name__) from None
         stdout: list[str] = []
@@ -394,12 +426,17 @@ def semantic_probe(model: str, kind: str, timeout: int, *, runner=subprocess.Pop
             reader.start()
         deadline = time.monotonic() + timeout
         quota = False
+        stdout_state = [0, ""]
+        stderr_state = [0, ""]
         try:
             # A provider 429 is printed within seconds but `opencode run` can
             # then hang forever. Read while it runs and stop on that signal
-            # instead of reporting a generic timeout for every route.
+            # instead of reporting a generic timeout for every route. Only
+            # newly appended text is scanned, so a long healthy run stays
+            # linear in the size of its output.
             while process.poll() is None:
-                if QUOTA_STALL.search("".join(stdout) + "\n" + "".join(stderr)):
+                if (QUOTA_STALL.search(_unscanned(stdout, stdout_state))
+                        or QUOTA_STALL.search(_unscanned(stderr, stderr_state))):
                     quota = True
                     break
                 if time.monotonic() >= deadline:
@@ -409,8 +446,15 @@ def semantic_probe(model: str, kind: str, timeout: int, *, runner=subprocess.Pop
         finally:
             if quota:
                 _stop_probe(process)
-        for reader in readers:
-            reader.join(timeout=PROBE_STOP_SECONDS)
+            # Every exit path joins the readers and releases the pipes; the
+            # join budget is separate from the terminate/kill grace period.
+            for reader in readers:
+                reader.join(timeout=PROBE_JOIN_SECONDS)
+            for stream in (process.stdout, process.stderr):
+                try:
+                    stream.close()
+                except (OSError, ValueError):
+                    pass
         raw_stdout = "".join(stdout)
         raw = raw_stdout + "\n" + "".join(stderr)
         # Refuse any second model request on a runner that received a 429,
