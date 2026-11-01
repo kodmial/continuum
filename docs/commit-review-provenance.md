@@ -67,4 +67,7 @@ App](https://docs.github.com/en/apps/creating-github-apps/authenticating-with-a-
 
 The baseline implementation needs no new consumer secret: only the
 pre-existing `TAP_PAT`, the Render key (Render API only), the delegated
-child runtime token, and the automatic `github.token` are used.
+child runtime token, the automatic `github.token`, and the optional
+`CONTINUUM_VERIFICATION_ATTESTATION_KEY` are used. The verification engine
+recognizes that last one in the environment, but no shipped workflow declares
+or passes it yet, so a consumer has nothing to configure today.

@@ -161,6 +161,26 @@ _TIMEOUT_INFRA_QUALIFIERS = (
     "provider",
 )
 
+# A qualifier must sit within a small window of the timeout mention, on either
+# side, and match as a whole word. The evidence is one serialized string, so
+# matching a qualifier anywhere let an incidental substring ("read" in
+# "thread"/"already", "request" in "requested") qualify a deterministic test
+# timeout and burn the transient budget; the same bounded whole-word rule is
+# used in :mod:`continuum.render_execution`.
+_TIMEOUT_QUALIFIER_WINDOW = 3
+_TIMEOUT_MENTION = r"(?<![a-z0-9])(?:timeout|timed[^a-z0-9]+out)(?![a-z0-9])"
+_TIMEOUT_QUALIFIER = (
+    r"(?<![a-z0-9])(?:" + "|".join(_TIMEOUT_INFRA_QUALIFIERS) + r")(?![a-z0-9])"
+)
+_TIMEOUT_WINDOW = (
+    r"(?:[^a-z0-9]+[a-z0-9]+){0,%d}[^a-z0-9]+" % _TIMEOUT_QUALIFIER_WINDOW
+)
+_QUALIFIED_TIMEOUT_RE = re.compile(
+    _TIMEOUT_QUALIFIER + _TIMEOUT_WINDOW + _TIMEOUT_MENTION
+    + r"|"
+    + _TIMEOUT_MENTION + _TIMEOUT_WINDOW + _TIMEOUT_QUALIFIER
+)
+
 
 def _has_transient_signature(message: str) -> bool:
     """Whether a lowercased message carries transient infrastructure evidence.
@@ -187,7 +207,7 @@ def _has_transient_signature(message: str) -> bool:
         # "operation timeout ... assertion failed" retry, so hold here.
         return False
     if "timed out" in message or "timeout" in message:
-        return any(qual in message for qual in _TIMEOUT_INFRA_QUALIFIERS)
+        return _QUALIFIED_TIMEOUT_RE.search(message) is not None
     return False
 
 

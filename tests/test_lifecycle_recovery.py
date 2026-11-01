@@ -174,6 +174,35 @@ class TransientClassificationTests(unittest.TestCase):
                     lifecycle.classify_infrastructure_failure(error=message).transient
                 )
 
+    def test_qualified_timeout_requires_a_whole_word_near_the_mention(self):
+        # Infrastructure formulations still retry: the qualifier is a whole
+        # word within a small window on either side of the timeout mention.
+        for message in (
+            "read timeout after 30s",
+            "network timeout while polling the runner",
+            "connection_timed out",
+            "timed out while calling the provider",
+            "the job timed out contacting the runner",
+        ):
+            with self.subTest(message=message):
+                self.assertTrue(
+                    lifecycle.classify_infrastructure_failure(error=message).transient
+                )
+        # A qualifier that only appears inside another word, or outside the
+        # window, never turns a deterministic timeout into a transient one.
+        for message in (
+            "job timed out while already running integration tests",
+            "tests timed out in thread pool",
+            "requested review timed out",
+            "timeout after a thread started",
+            "read the log, then the job timed out after 55 minutes",
+            "the job timed out after we archived all the provider responses",
+        ):
+            with self.subTest(message=message):
+                self.assertFalse(
+                    lifecycle.classify_infrastructure_failure(error=message).transient
+                )
+
 
 class ResetAwareBackoffTests(unittest.TestCase):
     def test_ten_execution_budget_with_canonical_schedule(self):

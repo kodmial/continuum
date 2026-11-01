@@ -11,9 +11,16 @@ events cannot start dispatch storms.
 
 from __future__ import annotations
 
+import os
+import subprocess
+import sys
 import unittest
+from pathlib import Path
 
 from continuum import qualification as gate
+
+ROOT = Path(__file__).resolve().parents[1]
+CLI = ROOT / ".github" / "scripts" / "qualification_gate.py"
 
 
 SHA_A = "a" * 40
@@ -342,6 +349,30 @@ class AutoCloseSafetyTests(unittest.TestCase):
         self.assertTrue(
             gate.contains_closing_keyword("Fixes #182", 182, repository="owner/repo")
         )
+
+    def test_repository_context_is_trimmed_before_matching(self):
+        self.assertFalse(
+            gate.contains_closing_keyword(
+                "Closes other/repository#182", 182, repository=" owner/repo "
+            )
+        )
+        self.assertTrue(
+            gate.contains_closing_keyword(
+                "Closes owner/repo#182", 182, repository=" owner/repo "
+            )
+        )
+
+    def test_malformed_repository_context_stays_conservative(self):
+        # A slug that is not exactly two non-empty parts, or not a string at
+        # all, must not be read as "the current repository" and silently drop
+        # a possible auto-close.
+        for repository in ("/", "a/b/c", "", 182, None, ["owner", "repo"]):
+            with self.subTest(repository=repository):
+                self.assertTrue(
+                    gate.contains_closing_keyword(
+                        "Closes other/repository#182", 182, repository=repository
+                    )
+                )
 
     def test_another_repository_short_form_does_not_close_the_local_issue(self):
         for text in (
@@ -943,6 +974,78 @@ class AaLifecycleAutonomyTests(unittest.TestCase):
                 gate.capability_status(True, refs, {qualification: final}, SHA_B),
                 gate.MAY_COMPLETE,
             )
+
+
+def run_gate(*args, env=None):
+    """Run the workflow-facing CLI with a caller-controlled environment."""
+
+    process_env = {
+        name: value
+        for name, value in os.environ.items()
+        if name != "GITHUB_REPOSITORY"
+    }
+    process_env.update(env or {})
+    return subprocess.run(
+        [sys.executable, str(CLI)] + list(args),
+        text=True,
+        capture_output=True,
+        env=process_env,
+        timeout=120,
+        check=False,
+    )
+
+
+class QualificationGateCliTests(unittest.TestCase):
+    """The workflow step's ``--repository`` flag scopes auto-close detection."""
+
+    def test_cross_repository_reference_prints_false(self):
+        result = run_gate(
+            "has-closing-keyword",
+            "--body",
+            "Closes other/repository#182",
+            "--issue",
+            "182",
+            "--repository",
+            "owner/repo",
+        )
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertEqual("false\n", result.stdout)
+
+    def test_current_repository_reference_prints_true(self):
+        result = run_gate(
+            "has-closing-keyword",
+            "--body",
+            "Closes owner/repo#182",
+            "--issue",
+            "182",
+            "--repository",
+            "owner/repo",
+        )
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertEqual("true\n", result.stdout)
+
+    def test_absent_github_repository_stays_conservative(self):
+        result = run_gate(
+            "has-closing-keyword",
+            "--body",
+            "Closes other/repository#182",
+            "--issue",
+            "182",
+        )
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertEqual("true\n", result.stdout)
+
+    def test_github_repository_environment_supplies_the_default(self):
+        result = run_gate(
+            "has-closing-keyword",
+            "--body",
+            "Closes other/repository#182",
+            "--issue",
+            "182",
+            env={"GITHUB_REPOSITORY": "owner/repo"},
+        )
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertEqual("false\n", result.stdout)
 
 
 if __name__ == "__main__":
