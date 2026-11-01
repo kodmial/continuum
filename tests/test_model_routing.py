@@ -384,7 +384,10 @@ class ProbeTests(unittest.TestCase):
             spawned.append(process)
             return process
         with patch.object(route, "PROBE_STOP_SECONDS", 0.2):
-            with patch.object(route, "PROBE_JOIN_SECONDS", 0.2):
+            # The join budget is also what the final assertion allows each
+            # reader to take; 0.2 s flakes a slow runner, while 2.0 s keeps the
+            # worst case at 2*0.2 + 2*2 = 4.4 s, below the 8 s bound.
+            with patch.object(route, "PROBE_JOIN_SECONDS", 2.0):
                 with tempfile.TemporaryDirectory() as tmp:
                     with patch.dict("os.environ", {"RUNNER_TEMP": tmp}, clear=True):
                         started = route.time.monotonic()
@@ -393,17 +396,17 @@ class ProbeTests(unittest.TestCase):
                         elapsed = route.time.monotonic() - started
                         self.assertTrue((pathlib.Path(tmp) / "continuum-opencode-429").exists())
         self.assertEqual(str(caught.exception), "quota_exhausted")
-        # Comfortably above the patched escalate/kill/join bound (well under a
-        # second here) yet far below the child's own 10-second sleep, so a
-        # probe that failed to escalate still fails this test.
+        # Above the patched escalate/kill/join worst case (at most 4.4 s here)
+        # yet far below the child's own 10-second sleep, so a probe that failed
+        # to escalate still fails this test.
         self.assertLess(elapsed, 8)
         self.assertEqual(len(spawned), 1)
         # SIGTERM was ignored, so -SIGKILL proves the escalation ran.
         self.assertEqual(spawned[0].returncode, -signal.SIGKILL)
-        # The probe joined its reader threads before returning. Drain readers
-        # left over from an earlier test are released but not joined in their
-        # own teardown, so the baseline keeps their slow shutdown from making
-        # this flake on a loaded runner.
+        # semantic_probe joins its readers in its own finally, so none of the
+        # threads it started outlive it. The baseline subtracts readers that
+        # already existed, keeping the assertion to this probe's own threads
+        # without depending on another test's thread finishing first.
         self.assertEqual(
             {thread for thread in threading.enumerate()
              if getattr(thread, "_target", None) is route._drain} - before,
