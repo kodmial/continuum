@@ -251,12 +251,24 @@ _TIMEOUT_INFRA_QUALIFIERS = (
     "provider",
 )
 
-# A qualifier must sit adjacent to the timeout mention. The evidence is one
-# serialized string, so matching a qualifier anywhere let an incidental
-# substring ("read" in "thread", "api" in "rapid") qualify an unrelated
-# timeout and route real repository evidence to blind transient retries.
+# A qualifier must sit within a small window of the timeout mention, on either
+# side: real evidence reads both "render job timed out" and "timed out while
+# calling the provider". The evidence is one serialized string, so matching a
+# qualifier anywhere let an incidental substring ("read" in "thread", "api" in
+# "rapid") qualify an unrelated timeout and route real repository evidence to
+# blind transient retries; matching is therefore whole-word and bounded.
+_TIMEOUT_QUALIFIER_WINDOW = 3
+_TIMEOUT_MENTION = r"(?<![a-z0-9])(?:timeout|timed[^a-z0-9]+out)(?![a-z0-9])"
+_TIMEOUT_QUALIFIER = (
+    r"(?<![a-z0-9])(?:" + "|".join(_TIMEOUT_INFRA_QUALIFIERS) + r")(?![a-z0-9])"
+)
+_TIMEOUT_WINDOW = (
+    r"(?:[^a-z0-9]+[a-z0-9]+){0,%d}[^a-z0-9]+" % _TIMEOUT_QUALIFIER_WINDOW
+)
 _QUALIFIED_TIMEOUT_RE = re.compile(
-    r"\b(?:" + "|".join(_TIMEOUT_INFRA_QUALIFIERS) + r")[\s_-]+(?:timeout|timed out)\b"
+    _TIMEOUT_QUALIFIER + _TIMEOUT_WINDOW + _TIMEOUT_MENTION
+    + r"|"
+    + _TIMEOUT_MENTION + _TIMEOUT_WINDOW + _TIMEOUT_QUALIFIER
 )
 
 _PROVIDER_TOKENS = (

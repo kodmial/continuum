@@ -222,14 +222,14 @@ class TransientRecoveryTests(unittest.TestCase):
         self.assertFalse(decision.create_repair)
         self.assertFalse(decision.allow_retry)
 
-    def test_timeout_qualifier_must_be_adjacent_to_the_timeout(self):
-        # A qualifier elsewhere in the evidence must not turn an unexplained
-        # timeout into an infrastructure transient: "read" in "read the log"
-        # used to match by substring and route the failure to blind retries.
+    def test_timeout_qualifier_substrings_do_not_qualify(self):
+        # Matching is whole-word, so "read" in "thread" and "api" in "rapid"
+        # are substrings rather than qualifiers on either side of the timeout.
         for evidence in (
-            "read the log, then the render job timed out after 55 minutes",
-            "the render job timed out during read",
-            "rapid timeout while polling the render",
+            "the thread timed out",
+            "timeout in a thread",
+            "rapid timeout",
+            "timeout after a rapid retry",
         ):
             with self.subTest(evidence=evidence):
                 classification = engine.classify_render_failure(
@@ -243,11 +243,36 @@ class TransientRecoveryTests(unittest.TestCase):
                     classification.classification, engine.TIMEOUT_UNKNOWN
                 )
 
-    def test_adjacent_timeout_qualifier_stays_transient(self):
+    def test_timeout_qualifier_outside_the_window_does_not_qualify(self):
+        # A qualifier beyond the small word window on either side must not turn
+        # an unexplained timeout into an infrastructure transient.
+        for evidence in (
+            "read the log, then the job timed out after 55 minutes",
+            "the job timed out after we archived all the api responses",
+        ):
+            with self.subTest(evidence=evidence):
+                classification = engine.classify_render_failure(
+                    execute_outcome="failure",
+                    cleanup_outcome="success",
+                    result={"error": evidence},
+                    memory_summary={},
+                    state={},
+                )
+                self.assertEqual(
+                    classification.classification, engine.TIMEOUT_UNKNOWN
+                )
+
+    def test_timeout_qualifier_on_either_side_stays_transient(self):
+        # Real evidence qualifies the timeout before or after the mention:
+        # "render job timed out" and "timed out while calling the provider"
+        # must keep routing through the bounded transient budget.
         for evidence in (
             "network timeout while polling the render",
             "read timeout",
             "connection_timed out",
+            "render job timed out during deploy",
+            "timed out while calling the provider",
+            "timeout contacting https://api.render.com",
         ):
             with self.subTest(evidence=evidence):
                 classification = engine.classify_render_failure(
