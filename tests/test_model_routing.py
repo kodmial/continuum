@@ -374,6 +374,8 @@ class ProbeTests(unittest.TestCase):
         event = ('{"type":"error","error":{"name":"FreeUsageLimitError",'
                  '"data":{"message":"free usage limit reached"}}}')
         spawned = []
+        before = {thread for thread in threading.enumerate()
+                  if getattr(thread, "_target", None) is route._drain}
         def runner(command, **kwargs):
             # Print the genuine error event, then ignore SIGTERM (the ignored
             # disposition survives exec) so only the kill escalation stops it.
@@ -382,29 +384,30 @@ class ProbeTests(unittest.TestCase):
             spawned.append(process)
             return process
         with patch.object(route, "PROBE_STOP_SECONDS", 0.2):
-            with tempfile.TemporaryDirectory() as tmp:
-                with patch.dict("os.environ", {"RUNNER_TEMP": tmp}, clear=True):
-                    started = route.time.monotonic()
-                    with self.assertRaises(route.BurnedRunner) as caught:
-                        route.semantic_probe(A, "review", 5, runner=runner)
-                    elapsed = route.time.monotonic() - started
-                    self.assertTrue((pathlib.Path(tmp) / "continuum-opencode-429").exists())
+            with patch.object(route, "PROBE_JOIN_SECONDS", 0.2):
+                with tempfile.TemporaryDirectory() as tmp:
+                    with patch.dict("os.environ", {"RUNNER_TEMP": tmp}, clear=True):
+                        started = route.time.monotonic()
+                        with self.assertRaises(route.BurnedRunner) as caught:
+                            route.semantic_probe(A, "review", 5, runner=runner)
+                        elapsed = route.time.monotonic() - started
+                        self.assertTrue((pathlib.Path(tmp) / "continuum-opencode-429").exists())
         self.assertEqual(str(caught.exception), "quota_exhausted")
-        # Well above the real escalate/kill/join bound (well under a second
-        # here) yet far below the child's own 10-second sleep, so a probe
-        # that failed to escalate still fails this test.
+        # Comfortably above the patched escalate/kill/join bound (well under a
+        # second here) yet far below the child's own 10-second sleep, so a
+        # probe that failed to escalate still fails this test.
         self.assertLess(elapsed, 8)
         self.assertEqual(len(spawned), 1)
         # SIGTERM was ignored, so -SIGKILL proves the escalation ran.
         self.assertEqual(spawned[0].returncode, -signal.SIGKILL)
-        # The probe joined its reader threads before returning. Only live
-        # drain readers are checked so unrelated background threads cannot
-        # make this flake on a loaded runner.
+        # The probe joined its reader threads before returning. Drain readers
+        # left over from an earlier test are released but not joined in their
+        # own teardown, so the baseline keeps their slow shutdown from making
+        # this flake on a loaded runner.
         self.assertEqual(
-            [thread for thread in threading.enumerate()
-             if thread.is_alive()
-             and getattr(thread, "_target", None) is route._drain],
-            [])
+            {thread for thread in threading.enumerate()
+             if getattr(thread, "_target", None) is route._drain} - before,
+            set())
         # The child was waited for: waitpid finds no zombie to reap.
         with self.assertRaises(ChildProcessError):
             os.waitpid(spawned[0].pid, os.WNOHANG)
