@@ -938,12 +938,15 @@ jobs:
               done <<<"$open_pr_tasks"
             fi
 
-            local_opencode_pr_tasks="$(
+            if ! local_opencode_pr_tasks="$(
               gh pr list --repo "$child_repo" --state open --limit 100 \
                 --json headRefName \
                 --jq '.[] | .headRefName | select(startswith("opencode/issue"))' \
                 | sed -nE 's#^opencode/issue([0-9]+)-.*#\1#p'
-            )"
+            )"; then
+              echo "::warning::Could not list open OpenCode PRs for $child_repo; treating its OpenCode WIP inventory as unknown for this pass."
+              local_opencode_pr_tasks=""
+            fi
             local_opencode_run_tasks="$(
               # The scheduler only needs recent active work. Bound this lookup to
               # the latest 300 runs instead of paginating the full Actions history.
@@ -1122,7 +1125,10 @@ jobs:
               fi
             fi
 
-            issues_json="$(gh api --paginate "repos/$child_repo/issues?state=open&per_page=100" 2>/dev/null)"
+            if ! issues_json="$(gh api --paginate "repos/$child_repo/issues?state=open&per_page=100" 2>/dev/null)"; then
+              echo "::warning::Could not read open issues for $child_repo; skipping this child for this pass instead of aborting every remaining child."
+              continue
+            fi
 
             while IFS= read -r paused_task; do
               [[ -n "$paused_task" ]] || continue

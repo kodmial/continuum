@@ -13,7 +13,6 @@ permissions:
 jobs:
   contract:
     uses: ./.github/workflows/continuum-validation.yml
-    secrets: inherit
     with:
       auto_detect: ${{ 'false' }}
       dispatch_repair: ${{ 'false' }}

@@ -86,8 +86,14 @@ permissions: {}
 
 jobs:
   call:
+    # A nested reusable workflow cannot restore scopes removed here, and the
+    # generic validation engine publishes statuses and may dispatch repair.
+    permissions:
+      actions: write
+      contents: read
+      pull-requests: read
+      statuses: write
     uses: ./.github/workflows/continuum-validation.yml
-    secrets: inherit
     with:
       continuum_ref: ${{ inputs.continuum_ref }}
       runner: ${{ inputs.runner || vars.CONTINUUM_SWIFT_RUNNER || 'macos-latest' }}

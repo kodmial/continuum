@@ -19,6 +19,10 @@ concurrency:
 jobs:
   call:
     uses: kodmial/continuum/.github/workflows/continuum-tech-swift-ci.yml@main
-    secrets: inherit
     with:
       continuum_ref: main
+      # A fork pull request receives a read-only GITHUB_TOKEN. Disable the
+      # status and repair writes for that run so validation still executes;
+      # same-repository runs keep the repository-variable defaults.
+      publish_status: ${{ github.event.pull_request.head.repo.fork && 'false' || '' }}
+      dispatch_repair: ${{ github.event.pull_request.head.repo.fork && 'false' || '' }}

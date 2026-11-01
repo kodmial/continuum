@@ -16,7 +16,7 @@ class ContinuumTest < Minitest::Test
   # Project-owned entry workflows used only by the Continuum repository itself.
   # They deliberately stay outside the `continuum-` namespace so installer
   # ownership and reusable-engine ownership remain unambiguous.
-  PROJECT_ENTRY_WORKFLOWS = %w[add-review-label.yml automation.yml ci.yml coderabbit-retry.yml coderabbit-unresolved.yml contract-gate.yml contract-qualification.yml opencode.yml pr-agent.yml pr-agent-recovery.yml pr-agent-router.yml remove-review-label.yml].freeze
+  PROJECT_ENTRY_WORKFLOWS = %w[add-review-label.yml automation.yml ci.yml coderabbit-retry.yml coderabbit-unresolved.yml contract-gate.yml contract-qualification.yml contract-qualification-canary.yml opencode.yml pr-agent.yml pr-agent-recovery.yml pr-agent-router.yml remove-review-label.yml].freeze
   # Every caller stub in every layer, for the checks that must not care which
   # layer a file belongs to.
   ALL_STUBS = (CORE_STUBS + TECH_STUBS + PARENT_STUBS).sort
@@ -447,7 +447,26 @@ class ContinuumTest < Minitest::Test
       end
       job.fetch('with').each_key { |key| assert call.fetch('inputs').key?(key) }
       assert_equal 'main', job.fetch('with').fetch('continuum_ref')
-      assert_equal 'inherit', job['secrets']
+      # `secrets: inherit` forwards everything the caller holds. A stub may
+      # instead map only the secrets its callee declares, which is stricter
+      # than inherit; any other mapping shape silently drops a credential.
+      job_secrets = job['secrets']
+      declared = call.fetch('secrets', {}) || {}
+      if job_secrets.nil?
+        assert_empty declared.keys,
+                     "#{File.basename(path)}: a caller that forwards no secrets cannot satisfy a callee secret"
+        next
+      end
+      if job_secrets == 'inherit'
+        next
+      end
+      assert job_secrets.is_a?(Hash), "#{File.basename(path)}: job secrets must be inherit or an explicit map"
+      assert_equal declared.keys.sort, job_secrets.keys.sort,
+                   "#{File.basename(path)}: explicit secret map must cover exactly the declared secrets"
+      job_secrets.each do |name, value|
+        assert_equal "${{ secrets.#{name} }}", value,
+                     "#{File.basename(path)}: #{name} must forward the caller's own secret"
+      end
     end
   end
 
@@ -1558,8 +1577,33 @@ class ContinuumTest < Minitest::Test
                     'the tech caller concurrency group must identify the consumer repository'
   end
 
-  def test_tech_stubs_reference_only_continuum_itself
-    own_repo = 'kodmial/continuum'
+  # A reusable workflow call cannot restore token scopes that its caller
+  # removed, and `secrets: inherit` forwards every consumer secret to a
+  # workflow that declares none. The Swift profile therefore keeps the scopes
+  # the generic validation engine needs and forwards no secrets, while a fork
+  # pull request disables the write-only status/repair paths.
+  def test_tech_swift_profile_preserves_scopes_and_fences_fork_writes
+    base = 'continuum-tech-swift-ci.yml'
+    callee = yaml(File.join(ROOT, '.github/workflows', base))
+    call = callee.fetch('jobs').fetch('call')
+    refute call.key?('secrets'), "#{base}: the callee declares no workflow-call secrets"
+    assert_equal({ 'actions' => 'write', 'contents' => 'read',
+                   'pull-requests' => 'read', 'statuses' => 'write' },
+                 call.fetch('permissions'),
+                 "#{base}: nested validation needs its caller's token scopes")
+
+    stub = yaml(File.join(ROOT, '.github/caller-stubs/tech', base))
+    stub_call = stub.fetch('jobs').fetch('call')
+    refute stub_call.key?('secrets'), "#{base}: the stub must not forward every secret"
+    with = stub_call.fetch('with')
+    %w[publish_status dispatch_repair].each do |name|
+      assert_equal "${{ github.event.pull_request.head.repo.fork && 'false' || '' }}",
+                   with.fetch(name),
+                   "#{base}: fork runs must disable #{name} without changing trusted defaults"
+    end
+  end
+
+  def test_tech_stubs_reference_only_continuum_itself    own_repo = 'kodmial/continuum'
     # `github.com/owner/repo`, matched case-insensitively because GitHub owners
     # are not case-sensitive and a template may spell one any way. This is
     # stripped before the bare-literal scan so the two never overlap.
@@ -1653,6 +1697,22 @@ class ContinuumTest < Minitest::Test
     assert_equal '${{ inputs.repository }}', with.fetch('repository')
   end
 
+  # `secrets: inherit` stops at organization/enterprise boundaries, so an
+  # installed consumer outside Continuum's own organization must be able to
+  # pass the PAT by name. Both sides of that contract are asserted here: the
+  # reusable workflow declares the secret, and the installed stub maps it.
+  def test_bootstrap_runtime_secret_passes_the_pat_by_name
+    stub = yaml(File.join(ROOT, '.github/caller-stubs/continuum-bootstrap-runtime-secret.yml'))
+    callee = events(yaml(File.join(ROOT, '.github/workflows/continuum-bootstrap-runtime-secret.yml')))
+                 .fetch('workflow_call')
+    secrets = callee.fetch('secrets')
+    assert_equal true, secrets.fetch('TAP_PAT').fetch('required'),
+                 'continuum-bootstrap-runtime-secret.yml: TAP_PAT must be declared required'
+    call = stub.fetch('jobs').fetch('call')
+    assert_equal({ 'TAP_PAT' => '${{ secrets.TAP_PAT }}' }, call.fetch('secrets'),
+                 'the installed stub must map TAP_PAT explicitly for external consumers')
+  end
+
 
   def test_fallback_preserves_existing_scripts_and_copies_missing_files
     fixture do |dir|
@@ -1701,6 +1761,7 @@ class ContinuumTest < Minitest::Test
     coderabbit-unresolved.yml
     contract-gate.yml
     contract-qualification.yml
+    contract-qualification-canary.yml
     opencode.yml
     pr-agent.yml
     pr-agent-recovery.yml
@@ -2812,10 +2873,10 @@ class ContinuumTest < Minitest::Test
       homebrew-nanodictate
     }ix
 
-    violations = paths.filter_map do |path|
+    violations = paths.map do |path|
       next unless File.read(path).match?(banned)
       path.delete_prefix(ROOT + '/')
-    end
+    end.compact
     assert_empty violations,
                  "Continuum generic workflows/templates contain consumer-specific identifiers: #{violations.join(', ')}"
 
@@ -4546,7 +4607,8 @@ class ContinuumTest < Minitest::Test
       secrets_read_by(stubs).reject { |name| name == 'GITHUB_TOKEN' }
     end
 
-    assert_equal %w[RENDER_API_KEY TAP_PAT], consumer_defined.call(CORE_STUBS)
+    assert_equal %w[CONTINUUM_VERIFICATION_ATTESTATION_KEY RENDER_API_KEY TAP_PAT],
+                 consumer_defined.call(CORE_STUBS)
     assert_equal %w[CHILD_RUNTIME_REPOSITORIES CHILD_RUNTIME_TOKEN TAP_PAT],
                  consumer_defined.call(PARENT_STUBS)
     assert_empty consumer_defined.call(TECH_STUBS),
@@ -4623,10 +4685,10 @@ class ContinuumTest < Minitest::Test
       end
     end
     # The table may mention them only to say they are not read.
-    table.scan(/`([A-Z][A-Z0-9_]*)`/).flatten.uniq.each do |name|
+    table.scan(/^\|\s*`([A-Z][A-Z0-9_]*)`\s*\|/).flatten.uniq.each do |name|
       next if readable.call(name)
 
-      refute_match(/^\|.*`#{Regexp.escape(name)}`.*\|$/, table,
+      refute_match(/^\|\s*`#{Regexp.escape(name)}`\s*\|/, table,
                    "the README secrets table lists #{name} as a secret to define, but no workflow reads it")
     end
     assert_match(/no workflow reads/i, table,
@@ -5022,7 +5084,7 @@ class ContinuumTest < Minitest::Test
     ],
     'continuum-pr-agent-repair.yml' => %w[
       continuum_ref pr_number target_child_id head_sha repair_batch_comment_id review_json improve_jsonl
-      retry_attempt retry_workflow
+      retry_attempt retry_workflow mode
     ],
     'continuum-pr-agent-auto-merge.yml' => %w[
       continuum_ref pr_number target_child_id head_sha ci_run_id ci_workflow_name gate_verified review_json improve_jsonl persistent_state_json
@@ -6151,6 +6213,33 @@ class ContinuumTest < Minitest::Test
     assert_includes job, 'any older no-progress marker is superseded.'
     assert_includes job, 'github-token: ${{ github.token }}',
                     'the classifier must stay within the existing caller permission contract'
+  end
+
+  # The reusable engine is workflow_call-only, so dispatch must resolve a
+  # repository-local caller that declares workflow_dispatch. Continuum keeps
+  # that caller only on a PR branch while main has none, so resolution must
+  # inspect the default branch, the caller ref, and the PR head branch before
+  # refusing. A hard-coded default-branch-only lookup strands Continuum's own
+  # CodeRabbit repair path.
+  def test_coderabbit_dispatch_resolves_a_dispatchable_caller_ref
+    body = workflow_body('continuum-opencode.yml')
+    job = body[/^  dispatch-coderabbit-fix:\n(.*?)(?=^  opencode:)/m, 1]
+    refute_nil job, 'dispatch-coderabbit-fix job is missing'
+
+    assert_includes job, 'HEAD_REF: ${{ github.event.pull_request.head.ref }}'
+    assert_includes job, 'OPENCODE_CALLER_WORKFLOW: ${{ github.workflow_ref }}'
+    assert_includes job, 'async function resolveDispatchCaller()'
+    assert_includes job, 'defaultBranch'
+    assert_includes job, 'dispatchRefFromWorkflowRef(process.env.OPENCODE_CALLER_WORKFLOW)'
+    assert_includes job, 'normalizeBranchRef(process.env.HEAD_REF)'
+    assert_includes job, 'const candidateRefs = [...new Set(['
+    assert_includes job, 'ref,'
+    assert_includes job, 'workflow_dispatch:'
+    assert_includes job, 'ref: dispatchTarget.ref',
+                    'the dispatch must target the ref that actually declares workflow_dispatch'
+    assert_includes job, 'refusing to dispatch the reusable workflow-call engine.'
+    refute_match(/const defaultBranch = [\s\S]{0,200}createWorkflowDispatch/, job,
+                 'resolution must not dispatch before checking every candidate ref')
   end
 
   def test_coderabbit_retry_splits_read_actor_from_command_lock_actor
@@ -7366,14 +7455,14 @@ class ContinuumTest < Minitest::Test
   # A quoted automation/... path in a reusable workflow writes into or executes
   # from the consumer checkout and therefore couples core to one repository layout.
   def test_core_workflows_embed_no_consumer_automation_paths
-    offenders = WORKFLOWS.filter_map do |path|
-      hits = File.readlines(path, chomp: true).each_with_index.filter_map do |line, index|
+    offenders = WORKFLOWS.map do |path|
+      hits = File.readlines(path, chomp: true).each_with_index.map do |line, index|
         next unless line.match?(/["']automation\//)
 
         "#{File.basename(path)}:#{index + 1}: #{line.strip}"
-      end
+      end.compact
       hits unless hits.empty?
-    end.flatten
+    end.compact.flatten
 
     assert_empty offenders,
                  "consumer-owned automation/ paths must arrive through configuration/hooks:\n#{offenders.join("\n")}"
@@ -9004,6 +9093,24 @@ class ContinuumTest < Minitest::Test
       .fetch('workflow_call').fetch('inputs')
     assert repair_inputs.key?('target_child_id'),
            'continuum-pr-agent-repair.yml must declare target_child_id or delegated repair dispatch is unreachable'
+    assert repair_inputs.key?('mode'),
+           'continuum-pr-agent-repair.yml must declare mode so delegated conflict repair can resolve conflicts'
+    assert_equal 'repair', repair_inputs.fetch('mode').fetch('default'),
+                 'the repair mode default must preserve the review-finding path'
+
+    repair_body = File.read(File.join(ROOT, '.github/workflows/continuum-pr-agent-repair.yml'))
+    assert_includes repair_body, "MODE: ${{ inputs.mode || 'repair' }}",
+                    'repair steps must read the mode input'
+    assert_includes repair_body, 'does not consume review findings',
+                    'conflict mode must bypass the PR-Agent review payload batch'
+    assert_includes repair_body, 'Merge the default branch into the current branch and resolve every conflict.',
+                    'conflict mode must prompt conflict resolution, not finding repair'
+
+    stub = File.read(File.join(ROOT, '.github/caller-stubs/continuum-pr-agent-repair.yml'))
+    assert_includes stub, 'mode: "${{ inputs.mode }}"',
+                    'the repair caller stub must forward the mode input'
+    assert_includes stub, "inputs.mode == 'conflict'",
+                    'the repair caller stub must admit conflict mode without PR-Agent'
 
     merge = File.read(File.join(ROOT, '.github/workflows/continuum-pr-agent-auto-merge.yml'))
     repair_window = merge[merge.index('async function dispatchConflictRepair')..]
@@ -9011,6 +9118,8 @@ class ContinuumTest < Minitest::Test
                     'delegated conflict repair must dispatch the repair reusable'
     assert_includes repair_window, 'target_child_id: targetChildId',
                     'delegated conflict repair must forward the opaque child id'
+    assert_includes repair_window, "mode: 'conflict'",
+                    'delegated conflict repair must dispatch the conflict mode, not the review-finding mode'
     assert_includes repair_window, 'isMissingTargetInput',
                     'delegated conflict-repair dispatch must detect 422 input rejection like recovery/wakeup'
     assert_includes repair_window, '/target_child_id/i.test(dispatchMessage)',
@@ -9330,7 +9439,9 @@ class ContinuumTest < Minitest::Test
        continuum-consumer-child-review.yml continuum-consumer-child-pr-review.yml].each do |file|
       body = File.read(File.join(ROOT, '.github/workflows', file))
       body.scan(/secrets\.([A-Za-z0-9_]+)/).flatten.uniq.each do |secret|
-        assert_includes %w[TAP_PAT RENDER_API_KEY CHILD_RUNTIME_TOKEN CHILD_RUNTIME_REPOSITORIES CONTINUUM_CHILD_REPOSITORIES GITHUB_TOKEN],
+        # The attestation key is an optional, documented consumer secret; the
+        # provenance paths themselves still require no paid provider key.
+        assert_includes %w[TAP_PAT RENDER_API_KEY CHILD_RUNTIME_TOKEN CHILD_RUNTIME_REPOSITORIES CONTINUUM_CHILD_REPOSITORIES CONTINUUM_VERIFICATION_ATTESTATION_KEY GITHUB_TOKEN],
                         secret,
                         "#{file}: baseline provenance must not require a new secret secrets.#{secret}"
       end
@@ -9385,6 +9496,57 @@ class ContinuumTest < Minitest::Test
     docs = File.read(File.join(ROOT, 'docs/contract-qualification.md'))
     assert_includes docs, 'Contract qualification'
     assert_includes docs, 'branch protection'
+  end
+
+  # Layer 3 must observe a real canary task. A canary job that constructs its
+  # own state proves nothing, so the scheduled project-owned caller drives the
+  # reusable canary mode and the reusable fails closed when no live issue is
+  # configured.
+  def test_contract_qualification_canary_observes_a_live_task
+    entry_path = File.join(ROOT, '.github/workflows/contract-qualification-canary.yml')
+    assert File.exist?(entry_path), 'the scheduled live-canary entry is missing'
+    entry = yaml(entry_path)
+    assert_includes PROJECT_ENTRY_WORKFLOWS, 'contract-qualification-canary.yml'
+    assert_includes REPO_OWNED_WORKFLOWS, 'contract-qualification-canary.yml'
+    entry_events = events(entry)
+    assert_equal ['43 */6 * * *'], entry_events.fetch('schedule').map { |item| item.fetch('cron') },
+                 'the live canary must run on a bounded schedule'
+    assert entry_events.key?('workflow_dispatch'),
+           'the live canary must stay manually dispatchable'
+    assert_equal({}, entry.fetch('permissions'),
+                 'the project-owned canary entry must grant nothing itself')
+    call = entry.fetch('jobs').fetch('canary')
+    assert_equal './.github/workflows/continuum-contract-qualification.yml', call.fetch('uses')
+    assert_equal 'canary', call.fetch('with').fetch('mode'),
+                 'the live canary entry must request canary mode, not verification'
+    assert_equal 'inherit', call.fetch('secrets')
+    assert_equal %w[actions contents issues pull-requests statuses].sort,
+                 call.fetch('permissions').keys.sort,
+                 'the canary job must request only the permissions its observation needs'
+
+    body = File.read(File.join(ROOT, '.github/workflows/continuum-contract-qualification.yml'))
+    canary = body[body.index('  canary:')..]
+    assert_includes canary, "if: inputs.mode == 'canary'"
+    assert_includes canary, 'CONTINUUM_CANARY_ISSUE',
+                    'the live canary must observe a configured real issue'
+    assert_includes canary, 'observe_canary',
+                    'the live canary stage must be derived from real GitHub state'
+    assert_includes canary, 'gh issue view "$CANARY_ISSUE"'
+    assert_includes canary, "jq -s 'add // []'",
+                    'paginated comment pages must be merged into one JSON array'
+    assert_includes canary, '"workflow", "run"',
+                    'a stalled canary must dispatch bounded autonomous recovery'
+    assert_includes canary, 'continuum-canary-recovery',
+                    'each bounded recovery attempt must be recorded on the issue'
+    assert_includes canary, 'PUBLISH_STATUS',
+                    'the canary status must honour the publish-status knob'
+    refute_includes body[/\A.*?^  canary:/m], 'observe_canary',
+                    'constructed verification mode must not claim live-canary observation'
+
+    assert File.exist?(File.join(ROOT, 'src/continuum/contract_observation.py')),
+           'the observation helpers must exist in the engine'
+    assert File.exist?(File.join(ROOT, 'tests/test_contract_observation.py')),
+           'the observation helpers need deterministic unit tests'
   end
 
   def test_every_continuum_merge_path_requires_exact_head_contract_evidence

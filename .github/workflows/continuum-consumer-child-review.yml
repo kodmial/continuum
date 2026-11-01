@@ -420,13 +420,19 @@ jobs:
             exit 30
           fi
 
-          if git diff --no-ext-diff -- . | grep -Eiq '(github_pat_[A-Za-z0-9_]+|ghp_[A-Za-z0-9]+|rnd_[A-Za-z0-9]+)'; then
+          # Stage before scanning: `git diff` sees tracked files only, so a
+          # newly created file carrying token material would otherwise pass
+          # and be committed next.
+          if [[ -n "$(git status --porcelain)" ]]; then
+            git add -A
+          fi
+          secret_pattern='(github_pat_[A-Za-z0-9_]+|ghp_[A-Za-z0-9]+|rnd_[A-Za-z0-9]+|-----BEGIN [A-Z ]*PRIVATE KEY-----)'
+          if git diff --cached --no-ext-diff -- . | grep -Eiq "$secret_pattern" || git diff --no-ext-diff "origin/$head_ref"...HEAD -- . | grep -Eiq "$secret_pattern"; then
             gh issue comment "$TASK_NUMBER" --repo "$child_repo"               --body "$(printf '%s\n%s\n%s\n%s' '<!-- continuum-child-review-security -->' '⚡ **Continuum · delegation-review**' '<!-- continuum-origin role=continuum component=delegation-review -->' 'Review detected token-like material; merge was blocked.')"               >/dev/null 2>&1 || true
             exit 31
           fi
 
           if [[ -n "$(git status --porcelain)" ]]; then
-            git add -A
             # kodmial/continuum#260: bot identity plus component trailer.
             git commit -m "task #$TASK_NUMBER: delegated independent review" -m "Continuum-Component: delegation-review" >/dev/null 2>&1
           fi
@@ -436,6 +442,10 @@ jobs:
             continuum_assert_safe_push "$head_ref" "$child_repo" || exit 1
             git push origin "HEAD:$head_ref" >/dev/null 2>&1
           fi
+          # The merge may only land the exact HEAD this review accepted. The
+          # live PR head is re-read on every attempt; `--match-head-commit`
+          # makes GitHub itself refuse a merge whose head moved after review.
+          reviewed_head="$(git rev-parse HEAD)"
 
           merge_ok=false
           for merge_attempt in 1 2 3; do
@@ -451,18 +461,22 @@ jobs:
             if [[ "$live_state" != "OPEN" ]]; then
               gh pr reopen "$PR_NUMBER" --repo "$child_repo" >/dev/null 2>&1 || true
             fi
+            live_head="$(jq -r '.headRefOid // ""' <<<"$live_pr" 2>/dev/null || true)"
+            if [[ -n "$live_head" && "$live_head" != "$reviewed_head" ]]; then
+              echo "::notice::PR #$PR_NUMBER head moved ($reviewed_head -> $live_head) after review; deferring merge to the next reviewed cycle."
+              break
+            fi
 
             set +e
             # kodmial/continuum#302: the squash merge below is the single
             # allowed updater of the child default branch (after exact-HEAD
             # gates and delegated review). Direct pushes to the default
             # branch remain prohibited by continuum_assert_safe_push above.
-            gh pr merge "$PR_NUMBER" --repo "$child_repo" --squash --delete-branch >/dev/null 2>&1
+            # No `--admin` fallback: an admin bypass would merge around the
+            # branch-protection checks this review depends on.
+            gh pr merge "$PR_NUMBER" --repo "$child_repo" --squash --delete-branch \
+              --match-head-commit "$reviewed_head" >/dev/null 2>&1
             merge_rc=$?
-            if [[ "$merge_rc" -ne 0 ]]; then
-              gh pr merge "$PR_NUMBER" --repo "$child_repo" --squash --delete-branch --admin >/dev/null 2>&1
-              merge_rc=$?
-            fi
             set -e
             if [[ "$merge_rc" -eq 0 ]]; then
               merge_ok=true
@@ -477,6 +491,10 @@ jobs:
               gh api --method PUT \
                 "repos/$child_repo/pulls/$PR_NUMBER/update-branch" \
                 -f "expected_head_sha=$live_head" >/dev/null 2>&1 || true
+              # update-branch advances the PR head. That new head has not been
+              # reviewed, so this cycle must stop and let the next reviewed
+              # pass merge it rather than retrying against a stale approval.
+              break
             fi
             sleep $((merge_attempt * 2))
           done

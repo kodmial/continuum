@@ -335,11 +335,17 @@ jobs:
           # checkpoint ref until the agent passes real acceptance. A new runner
           # must resume it rather than silently restarting from clean main.
           source "$CONTINUUM_ENGINE_ROOT/.github/scripts/delegated_checkpoint.sh"
+          # The child default branch is consumer-owned and need not be `main`.
+          # Resolve it once and use it for the base SHA, the publication base
+          # and the committed-diff scan, so a repository with another default
+          # branch neither fails to resolve a base nor opens the PR against a
+          # hardcoded branch.
+          child_default_branch="$(continuum_checkpoint_default_branch)" || exit 4
           checkpoint_spec="$(jq -r '.spec_sha256 // ""' "$CHILD_SNAPSHOT_RECORD")"
           checkpoint_generation="$(jq -r '.generation // ""' "$CHILD_SNAPSHOT_RECORD")"
           checkpoint_ref="$(continuum_checkpoint_ref "$TASK_NUMBER" "$checkpoint_generation" "$checkpoint_spec")" || exit 4
           branch="continuum-child/task-${TASK_NUMBER}-${GITHUB_RUN_ID}"
-          base_sha="$(git rev-parse origin/main)"
+          base_sha="$(git rev-parse "origin/$child_default_branch")"
           continuum_checkpoint_restore "$checkpoint_ref" "$branch" "$checkpoint_spec" || exit 4
 
           # Work Lock #67: the trusted composite-action step above restored a
@@ -512,13 +518,20 @@ jobs:
             exit "$run_rc"
           fi
 
-          if git diff --no-ext-diff -- . | grep -Eiq '(github_pat_[A-Za-z0-9_]+|ghp_[A-Za-z0-9]+|rnd_[A-Za-z0-9]+|-----BEGIN [A-Z ]*PRIVATE KEY-----)' || git diff --no-ext-diff "origin/main"...HEAD -- . | grep -Eiq '(github_pat_[A-Za-z0-9_]+|ghp_[A-Za-z0-9]+|rnd_[A-Za-z0-9]+|-----BEGIN [A-Z ]*PRIVATE KEY-----)'; then
+          # Stage first: `git diff` only inspects tracked files, so an agent
+          # that created a new file carrying token material would pass a
+          # pre-stage scan. The committed range and the staged index together
+          # cover every byte this run could publish.
+          if [[ -n "$(git status --porcelain)" ]]; then
+            git add -A
+          fi
+          secret_pattern='(github_pat_[A-Za-z0-9_]+|ghp_[A-Za-z0-9]+|rnd_[A-Za-z0-9]+|-----BEGIN [A-Z ]*PRIVATE KEY-----)'
+          if git diff --cached --no-ext-diff -- . | grep -Eiq "$secret_pattern" || git diff --no-ext-diff "origin/$child_default_branch"...HEAD -- . | grep -Eiq "$secret_pattern"; then
             gh issue comment "$TASK_NUMBER" --repo "$child_repo"               --body "$(printf '%s\n%s\n%s\n%s' '<!-- continuum-child-security -->' '⚡ **Continuum · delegation-worker**' '<!-- continuum-origin role=continuum component=delegation-worker -->' "Child task #$TASK_NUMBER produced token-like material; publication was blocked.")"               >/dev/null 2>&1 || true
             exit 31
           fi
 
           if [[ -n "$(git status --porcelain)" ]]; then
-            git add -A
             # kodmial/continuum#260: workflow-owned delegated commit uses the
             # bot identity plus the component trailer (never the child repo).
             git commit -m "task #$TASK_NUMBER: delegated implementation" -m "Continuum-Component: delegation-worker" >/dev/null 2>&1
@@ -552,7 +565,7 @@ jobs:
           EOF
           )"
           pr_url="$(
-            gh pr create --repo "$child_repo" --base main --head "$branch"               --title "$issue_title" --body "$pr_body" 2>/dev/null
+            gh pr create --repo "$child_repo" --base "$child_default_branch" --head "$branch"               --title "$issue_title" --body "$pr_body" 2>/dev/null
           )"
           if [[ "$CONTINUUM_CHECKPOINT_RESTORED" == true || "$checkpoint_state" == "saved" ]]; then
             continuum_checkpoint_cleanup "$checkpoint_ref" "$child_repo" || true

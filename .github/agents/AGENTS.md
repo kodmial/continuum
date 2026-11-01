@@ -50,7 +50,10 @@ repository decides what the work must satisfy.
   user input.
 - Keep agent-created temporary files and fixtures inside the repository worktree.
   Do not use `/tmp`, `/var/tmp`, the runner home directory, or any other path
-  outside it. Remove them before finishing and never commit them.
+  outside it, except an exact path that the invoking workflow names for a
+  result, report, transcript, or diagnostics file. Remove temporary files and
+  fixtures before finishing, but preserve workflow-named files until the
+  invoking workflow consumes them. Never commit them.
 - If a command is refused because it would read or write an external directory,
   rewrite it to operate entirely inside the worktree and carry on. Do not retry
   the blocked path.

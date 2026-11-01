@@ -246,6 +246,20 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
+      - name: Checkout Continuum classification engine
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          # The controller checkout above is the consumer repository this
+          # workflow runs in; it has no `src/continuum`. The authoritative
+          # classifier always comes from Continuum at the pinned revision.
+          repository: kodmial/continuum
+          ref: ${{ inputs.continuum_ref || 'main' }}
+          path: .continuum-render-engine
+          fetch-depth: 1
+          persist-credentials: false
+          sparse-checkout: |
+            src/continuum
+
       - name: Execute Render lifecycle
         id: execute
         continue-on-error: true
@@ -412,7 +426,7 @@ jobs:
           # becomes a repository repair; repository repair requires positive
           # defect evidence; anything else holds without guessing.
           ENGINE_OUT="$RUNNER_TEMP/continuum-render-engine-classification.json"
-          PYTHONPATH="$GITHUB_WORKSPACE/src" python3 -m continuum.render_execution \
+          PYTHONPATH="$GITHUB_WORKSPACE/.continuum-render-engine/src" python3 -m continuum.render_execution \
             --result "$RENDER_RESULT_FILE" \
             --memory "$RENDER_MEMORY_SUMMARY_FILE" \
             --state "$RENDER_STATE_FILE" \

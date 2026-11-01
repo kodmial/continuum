@@ -315,13 +315,18 @@ jobs:
             exit 30
           fi
 
-          if git diff --no-ext-diff "origin/$base_ref"...HEAD -- . |              grep -Eiq '(github_pat_[A-Za-z0-9_]+|ghp_[A-Za-z0-9]+|rnd_[A-Za-z0-9]+)'; then
+          # Stage before scanning so newly created files are inspected too:
+          # `git diff` alone sees tracked paths only.
+          if [[ -n "$(git status --porcelain)" ]]; then
+            git add -A
+          fi
+          secret_pattern='(github_pat_[A-Za-z0-9_]+|ghp_[A-Za-z0-9]+|rnd_[A-Za-z0-9]+|-----BEGIN [A-Z ]*PRIVATE KEY-----)'
+          if git diff --cached --no-ext-diff -- . | grep -Eiq "$secret_pattern" || git diff --no-ext-diff "origin/$base_ref"...HEAD -- . | grep -Eiq "$secret_pattern"; then
             gh pr comment "$PR_NUMBER" --repo "$child_repo"               --body "$(printf '%s\n%s\n%s\n%s' '<!-- continuum-child-pr-review-security -->' '⚡ **Continuum · delegation-pr-review**' '<!-- continuum-origin role=continuum component=delegation-pr-review -->' 'Token-like material detected; merge blocked.')"               >/dev/null 2>&1 || true
             exit 31
           fi
 
           if [[ -n "$(git status --porcelain)" ]]; then
-            git add -A
             # kodmial/continuum#260: bot identity plus component trailer.
             git commit -m "fix: repair PR #$PR_NUMBER after independent review" -m "Continuum-Component: delegation-pr-review" >/dev/null 2>&1
           fi
@@ -331,6 +336,8 @@ jobs:
             continuum_assert_safe_push "$head_ref" "$child_repo" || exit 1
             git push origin "HEAD:$head_ref" >/dev/null 2>&1
           fi
+          # Merge only the exact HEAD this review accepted.
+          reviewed_head="$(git rev-parse HEAD)"
 
           merge_ok=false
           for merge_attempt in 1 2 3; do
@@ -343,30 +350,36 @@ jobs:
               echo "PR #$PR_NUMBER closed before merge; stopping."
               exit 0
             }
+            live_head="$(jq -r '.headRefOid // ""' <<<"$live_pr" 2>/dev/null || true)"
+            if [[ -n "$live_head" && "$live_head" != "$reviewed_head" ]]; then
+              echo "::notice::PR #$PR_NUMBER head moved ($reviewed_head -> $live_head) after review; deferring merge to the next reviewed cycle."
+              break
+            fi
 
             set +e
             # kodmial/continuum#302: the squash merge below is the single
             # allowed updater of the child default branch (after exact-HEAD
             # gates and independent review). Direct pushes to the default
             # branch remain prohibited by continuum_assert_safe_push above.
-            gh pr merge "$PR_NUMBER" --repo "$child_repo" --squash --delete-branch >/dev/null 2>&1
+            # No `--admin` fallback: bypassing branch protection would merge
+            # around the checks this review depends on.
+            gh pr merge "$PR_NUMBER" --repo "$child_repo" --squash --delete-branch \
+              --match-head-commit "$reviewed_head" >/dev/null 2>&1
             merge_rc=$?
-            if [[ "$merge_rc" -ne 0 ]]; then
-              gh pr merge "$PR_NUMBER" --repo "$child_repo" --squash --delete-branch --admin >/dev/null 2>&1
-              merge_rc=$?
-            fi
             set -e
             if [[ "$merge_rc" -eq 0 ]]; then
               merge_ok=true
               break
             fi
 
-            live_head="$(jq -r '.headRefOid // ""' <<<"$live_pr")"
             if [[ -n "$live_head" ]]; then
               # kodmial/continuum#302: main-sync targets the PR branch, never
               # the default branch; the guarded head above still applies.
               continuum_assert_safe_push "$head_ref" "$child_repo" || exit 1
               gh api --method PUT "repos/$child_repo/pulls/$PR_NUMBER/update-branch"                 -f "expected_head_sha=$live_head" >/dev/null 2>&1 || true
+              # The new head has not been reviewed; stop this cycle and let
+              # the next reviewed pass merge it.
+              break
             fi
             sleep $((merge_attempt * 2))
           done

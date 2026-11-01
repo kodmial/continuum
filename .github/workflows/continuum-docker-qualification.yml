@@ -255,9 +255,17 @@ jobs:
           ISSUE_BODY="$EVIDENCE_DIR/issue.md"
           gh issue view "$ISSUE_NUMBER" --repo "$GITHUB_REPOSITORY" --json body --jq '.body // ""' > "$ISSUE_BODY"
 
+          # Match the label as a literal prefix: labels such as
+          # `Source/head SHA` contain sed's delimiter and regex metacharacters,
+          # so a `sed "s/^- $label: //p"` expression both fails to match and
+          # can be reinterpreted as a different pattern. awk compares the
+          # literal prefix, keeps the last occurrence, and strips backticks.
           value() {
             local label="$1"
-            sed -n "s/^- $label: //p" "$ISSUE_BODY" | tail -n 1 | tr -d '\`'
+            awk -v prefix="- $label: " '
+              index($0, prefix) == 1 { value = substr($0, length(prefix) + 1) }
+              END { print value }
+            ' "$ISSUE_BODY" | tr -d '\`'
           }
 
           ARTIFACT_ID="$(value 'Artifact ID')"
@@ -275,6 +283,11 @@ jobs:
           [[ -n "$VERSION" ]]
 
           gh api "repos/$ARTIFACT_REPOSITORY/actions/artifacts/$ARTIFACT_ID/zip" > "$EVIDENCE_DIR/artifact.zip"
+          # Drop the credential before any host-run consumer code: the binary
+          # version probe, the correctness module import and the git diff below
+          # execute code from the downloaded artifact with this step's
+          # environment. Every authenticated GitHub call has already finished.
+          unset GH_TOKEN GITHUB_TOKEN
           echo "$ARCHIVE  $EVIDENCE_DIR/artifact.zip" | sha256sum -c -
           unzip -q "$EVIDENCE_DIR/artifact.zip" -d "$EVIDENCE_DIR/artifact"
           BIN="$EVIDENCE_DIR/artifact/$BINARY_NAME"
@@ -401,7 +414,13 @@ jobs:
                   events[name] = num(r"^%s\s+(\d+)$" % name, 0)
               peak = num(r"^memory_peak=(\d+)$", 0)
               current = num(r"^memory_current=(\d+)$", 0)
-              agent_exit = num(r"^agent_exit=(-?\d+)$", 127)
+              # A missing agent_exit means the in-container harness never
+              # reached its own reporting line: docker itself failed (image
+              # pull, mount, cgroup setup) or the container was killed before
+              # the agent could run. That is infrastructure, not a
+              # correctness verdict about the binary.
+              agent_exit = num(r"^agent_exit=(-?\d+)$", None)
+              docker_exit = num(r"^docker_exit=(-?\d+)$", None)
               wall = num(r"^wall_seconds=(\d+)$", 0)
               correctness = "pass" if re.search(r"^correctness=pass$", text, re.M) else "fail"
               trials.append({
@@ -415,14 +434,17 @@ jobs:
                   "swap_current_bytes": num(r"^swap_current=(\d+)$", 0),
                   "swap_max_bytes": num(r"^swap_max=(\d+)$", 0),
                   "wall_seconds": wall,
-                  "exit_code": agent_exit,
+                  "exit_code": agent_exit if agent_exit is not None else 127,
+                  "agent_exit": agent_exit,
+                  "docker_exit": docker_exit,
                   "correctness": correctness,
                   "headroom_bytes": limit - peak if peak else None,
               })
 
           passes = [
               t for t in trials
-              if t["exit_code"] == 0
+              if t["agent_exit"] == 0
+              and t["docker_exit"] == 0
               and t["correctness"] == "pass"
               and t["peak_bytes"] > 0
               and t["peak_bytes"] <= max_peak_allowed
@@ -434,7 +456,18 @@ jobs:
               t["memory_events"]["oom"] > 0
               or t["memory_events"]["oom_kill"] > 0
               or (t["peak_bytes"] and t["peak_bytes"] > max_peak_allowed)
-              or t["exit_code"] in (137, -9)
+              or t["agent_exit"] in (137, -9)
+              or t["docker_exit"] in (137, -9)
+              for t in trials
+          )
+          # A container that never ran the harness, or whose runtime exited
+          # non-zero, is an infrastructure failure. Classify it before
+          # correctness so a broken image or mount is never recorded as the
+          # binary failing the coding task.
+          any_infrastructure = any(
+              t["docker_exit"] is None
+              or t["docker_exit"] != 0
+              or t["agent_exit"] is None
               for t in trials
           )
           any_correctness = any(t["correctness"] != "pass" for t in trials)
@@ -445,6 +478,9 @@ jobs:
           elif any_memory:
               classification = "memory"
               reason = "one or more trials violated the %d MiB/%d MiB-headroom memory contract" % (int(sys.argv[8]), int(sys.argv[9]))
+          elif any_infrastructure:
+              classification = "infrastructure"
+              reason = "the docker harness did not complete every trial (container or agent launch failed); the binary was not evaluated"
           elif any_correctness:
               classification = "correctness"
               reason = "agent run did not leave the deterministic coding task in a verified passing state"
