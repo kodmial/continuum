@@ -138,7 +138,10 @@ class CheckpointIntegrationTest(unittest.TestCase):
             "continuum-child/task-42-run3", self.run_cmd(work, "git", "branch").stdout
         )
 
-    def test_moved_default_branch_rejects_a_stale_checkpoint(self):
+    def test_moved_default_branch_resumes_a_shared_history_checkpoint(self):
+        # A checkpoint created before the default branch advanced still shares
+        # history with it. Resuming from the checkpoint is valid; only
+        # unrelated history is refused.
         first = self.clone("stale-first")
         self.shell(first, """
             ref="$(continuum_checkpoint_ref 42 1 "$SPEC")"
@@ -146,6 +149,7 @@ class CheckpointIntegrationTest(unittest.TestCase):
             printf 'stale work\n' > stale.txt
             continuum_checkpoint_save "$ref" "$SPEC" child/example 42
         """)
+        checkpoint_sha = self.run_cmd(first, "git", "rev-parse", "HEAD").stdout.strip()
         advance = self.clone("advance-main")
         (advance / "later.txt").write_text("new main\n", encoding="utf-8")
         self.run_cmd(advance, "git", "add", "later.txt")
@@ -156,11 +160,38 @@ class CheckpointIntegrationTest(unittest.TestCase):
             ref="$(continuum_checkpoint_ref 42 1 "$SPEC")"
             continuum_checkpoint_restore "$ref" continuum-child/task-42-run6 "$SPEC"
         """, check=False)
-        self.assertNotEqual(result.returncode, 0)
-        self.assertNotIn(
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(
             "continuum-child/task-42-run6", self.run_cmd(second, "git", "branch").stdout
         )
-        self.assertFalse((second / "stale.txt").exists())
+        self.assertTrue((second / "stale.txt").exists())
+        self.assertEqual(
+            self.run_cmd(second, "git", "rev-parse", "HEAD").stdout.strip(),
+            checkpoint_sha,
+        )
+
+    def test_unrelated_history_checkpoint_fails_closed(self):
+        work = self.clone("unrelated")
+        self.shell(work, """
+            ref="$(continuum_checkpoint_ref 42 1 "$SPEC")"
+            git switch --orphan orphan-checkpoint
+            printf 'unrelated\\n' > orphan.txt
+            git add orphan.txt
+            git commit -m "checkpoint task #42: unaccepted work" \
+              -m "Continuum-Checkpoint: $SPEC"
+            git push origin "HEAD:refs/heads/$ref"
+        """)
+        second = self.clone("unrelated-restore")
+        result = self.shell(second, """
+            ref="$(continuum_checkpoint_ref 42 1 "$SPEC")"
+            continuum_checkpoint_restore "$ref" continuum-child/task-42-unrelated "$SPEC"
+        """, check=False)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("unrelated to the target default branch", result.stderr)
+        self.assertNotIn(
+            "continuum-child/task-42-unrelated",
+            self.run_cmd(second, "git", "branch").stdout,
+        )
 
     def test_failed_checkpoint_push_fails_closed(self):
         work = self.clone("reject-push")

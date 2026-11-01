@@ -97,8 +97,11 @@ continuum_checkpoint_restore() {
     return 4
   fi
   continuum_checkpoint_ensure_history || return 4
-  if ! git merge-base --is-ancestor "$default_ref" "$checkpoint_sha" >/dev/null 2>&1; then
-    echo "::error::Delegated checkpoint is stale relative to the target default branch." >&2
+  # A checkpoint only has to share history with the target branch: it may
+  # legitimately lag behind an advanced default branch, so requiring the
+  # default branch to be its ancestor would discard valid resumed work.
+  if ! git merge-base "$default_ref" "$checkpoint_sha" >/dev/null 2>&1; then
+    echo "::error::Delegated checkpoint history is unrelated to the target default branch." >&2
     return 4
   fi
   if git diff --no-ext-diff "$default_ref...$checkpoint_sha" -- . | grep -Eiq '(github_pat_[A-Za-z0-9_]+|ghp_[A-Za-z0-9]+|rnd_[A-Za-z0-9]+|-----BEGIN [A-Z ]*PRIVATE KEY-----)'; then
@@ -161,8 +164,10 @@ continuum_checkpoint_save() {
       return 4
     fi
     continuum_checkpoint_ensure_history || return 4
-    if ! git merge-base --is-ancestor "$default_ref" "$checkpoint_sha" >/dev/null 2>&1; then
-      echo "::error::Delegated checkpoint is stale relative to the target default branch." >&2
+    # Same shared-history rule as restore: the concurrent winner may lag
+    # behind an advanced default branch and is still safe to rebase onto.
+    if ! git merge-base "$default_ref" "$checkpoint_sha" >/dev/null 2>&1; then
+      echo "::error::Delegated checkpoint history is unrelated to the target default branch." >&2
       return 4
     fi
     if ! git rebase "$checkpoint_sha" >/dev/null 2>&1; then
