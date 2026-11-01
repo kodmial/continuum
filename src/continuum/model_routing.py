@@ -262,13 +262,21 @@ def route_order(config: Configuration, state: dict, now: int) -> tuple[str, ...]
 
 
 # A stalled free-quota probe still prints this before `opencode run` hangs.
-# Match only corroborated 429 signals so JSON token counters cannot abort a
-# healthy probe; `classify` keeps its cross-engine `quota_429` label.
+# Only a `run --format json` error event is authoritative: text/tool events
+# and quoted "429" response prose are never evidence. The line may still be
+# partial (the child writes without a trailing newline), so the match stops
+# at the quota signature instead of requiring a complete JSON object;
+# `classify` keeps its cross-engine `quota_429` label.
 QUOTA_STALL = re.compile(
-    r"freeusagelimiterror"
-    r"|(?:http|status|statuscode|code|error)[^\n]{0,20}?\b429\b"
-    r"|\b429\b[^\n]{0,40}(?:too many|rate[ -]?limit|quota)",
-    re.IGNORECASE)
+    r'^[ \t]*\{[^\n]*?"type"[ \t]*:[ \t]*"error"'
+    r'[^\n]*?'
+    r'(?:'
+    r'"(?:statusCode|status)"[ \t]*:[ \t]*"?429\b'
+    r'|freeusagelimiterror'
+    r'|"(?:name|message)"[ \t]*:[ \t]*"[^"\n]*'
+    r'(?:quota|usage.?limit|rate.?limit|too.?many.?requests)[^"\n]*"'
+    r')',
+    re.IGNORECASE | re.MULTILINE)
 QUOTA_EXHAUSTED = "quota_exhausted"
 PROBE_POLL_SECONDS = 0.1
 PROBE_STOP_SECONDS = 5
@@ -854,8 +862,14 @@ def run() -> int:
 def main() -> int:
     try:
         return run()
-    except BurnedRunner:
-        print("::error::OpenCode 429: retire this runner without another LLM request", file=sys.stderr)
+    except BurnedRunner as error:
+        notice = "OpenCode 429: retire this runner without another LLM request"
+        reason = str(error).strip()
+        # Surface the actual cause (e.g. exhausted free quota) without
+        # changing the stable notice for the generic pre-burned marker.
+        if reason and reason != "runner already burned":
+            notice = f"{notice} ({reason})"
+        print("::error::" + notice, file=sys.stderr)
         return 75
     except GitHubStateUnavailable as error:
         publish_state_failure(error)

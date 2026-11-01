@@ -2,9 +2,14 @@
 from __future__ import annotations
 import importlib.util
 import io
+import os
 import pathlib
+import shutil
+import signal
+import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 from unittest.mock import patch
 
@@ -104,26 +109,55 @@ class ConfigurationTests(unittest.TestCase):
             self.assertEqual(route.classify(raw, 1), expected)
 
 
-class FakeProcess:
-    """Minimal subprocess.Popen surface for the semantic probe seam."""
+class _CapturedText(str):
+    """Captured text that also supports the stream ``read`` the probe uses.
 
-    def __init__(self, stdout: str = "", stderr: str = "", returncode: int = 0,
-                 hang: bool = False):
-        self.stdout = io.StringIO(stdout)
-        self.stderr = io.StringIO(stderr)
+    The fake must fit both seams: a Popen seam that reads ``stdout``/``stderr``
+    incrementally, and a ``subprocess.run`` seam that consumes completed
+    strings. Without both, a regression check could fail on a ``TypeError``
+    instead of on the behavior under test.
+    """
+
+    def __new__(cls, text: str = ""):
+        value = super().__new__(cls, text)
+        value._offset = 0
+        return value
+
+    def read(self, size: int = 1) -> str:
+        text = str(self)
+        if size < 0:
+            chunk, self._offset = text[self._offset:], len(text)
+        else:
+            chunk = text[self._offset:self._offset + size]
+            self._offset += len(chunk)
+        return chunk
+
+
+class FakeProcess:
+    """Popen-shaped subprocess double for the semantic probe seam."""
+
+    def __init__(self, *command, stdout: str = "", stderr: str = "",
+                 returncode: int = 0, hang: bool = False, **options):
+        # Accept and ignore the Popen(command, cwd=..., env=...,
+        # stdout=PIPE, stderr=PIPE, text=True) call shape.
+        self.command = command
+        self.options = options
+        self.stdout = _CapturedText(stdout)
+        self.stderr = _CapturedText(stderr)
         self.returncode = None if hang else returncode
         self.terminated = False
+        self.killed = False
 
     def poll(self):
         return self.returncode
 
     def terminate(self):
         self.terminated = True
-        self.returncode = -15
+        self.returncode = -signal.SIGTERM
 
     def kill(self):
-        self.terminated = True
-        self.returncode = -9
+        self.killed = True
+        self.returncode = -signal.SIGKILL
 
     def wait(self, timeout=None):
         if self.returncode is None:
@@ -228,21 +262,94 @@ class ProbeTests(unittest.TestCase):
 
     def test_stalled_429_is_terminated_early_and_reported_as_quota_exhausted(self):
         """The provider answers 429 but `opencode run` never exits: do not wait."""
-        # No trailing newline: the stalled child may leave a partial line.
-        process = FakeProcess(stderr="FreeUsageLimitError: HTTP 429 too many requests",
-                              hang=True)
+        # A genuine CLI error event with no trailing newline: the stalled child
+        # may leave a partial line, and the probe must still see the 429.
+        event = ('{"type":"error","error":{"name":"FreeUsageLimitError",'
+                 '"data":{"message":"free usage limit reached"}}}')
+        process = FakeProcess(stdout=event, hang=True)
         def runner(command, **kwargs):
             return process
         with tempfile.TemporaryDirectory() as tmp:
             with patch.dict("os.environ", {"RUNNER_TEMP": tmp}, clear=True):
                 started = route.time.monotonic()
                 with self.assertRaises(route.BurnedRunner) as caught:
-                    route.semantic_probe(A, "review", 30, runner=runner)
+                    route.semantic_probe(A, "review", 3, runner=runner)
                 elapsed = route.time.monotonic() - started
                 self.assertTrue((pathlib.Path(tmp) / "continuum-opencode-429").exists())
+        # Early termination, not the generic timeout, is the observable outcome;
+        # removing the stall detection makes this fail (RouteError "timeout").
         self.assertEqual(str(caught.exception), route.QUOTA_EXHAUSTED)
         self.assertTrue(process.terminated)
-        self.assertLess(elapsed, 5)
+        self.assertLess(elapsed, 2)
+
+    def test_response_prose_mentioning_429_does_not_stall_a_healthy_probe(self):
+        """A JSON text event is model prose, never provider-error evidence."""
+        prose = ('{"type":"text","part":{"type":"text",'
+                 '"text":"error HTTP 429 too many requests rate limit quota"}}')
+        process = FakeProcess(stdout=prose, hang=True)
+        def runner(command, **kwargs):
+            return process
+        started = route.time.monotonic()
+        with self.assertRaisesRegex(route.RouteError, "^timeout$"):
+            route.semantic_probe(A, "review", 0.3, runner=runner)
+        self.assertTrue(process.terminated)
+        self.assertLess(route.time.monotonic() - started, 3)
+
+    def test_stall_pattern_requires_a_structured_error_event(self):
+        self.assertTrue(route.QUOTA_STALL.search(
+            '{"type":"error","error":{"name":"FreeUsageLimitError"}}'))
+        self.assertTrue(route.QUOTA_STALL.search(
+            '{"type":"error","error":{"name":"APIError",'
+            '"data":{"statusCode":429}}}'))
+        self.assertTrue(route.QUOTA_STALL.search(
+            '{"type":"error","error":{"name":"UsageLimitExceeded",'
+            '"data":{"message":"Too Many Requests"}}}'))
+        # Partial line: the signature arrives before the object is complete.
+        self.assertTrue(route.QUOTA_STALL.search(
+            '{"type":"error","error":{"name":"APIError","statusCode":429'))
+        # Prose, tool output, and token counters are never provider evidence.
+        for log in ('{"type":"text","part":{"type":"text",'
+                    '"text":"error HTTP 429 quota"}}',
+                    '{"type":"tool_use","part":{"state":{"output":"429 error"}}}',
+                    '{"type":"step_finish","part":{"tokens":{"input":429}}}'):
+            with self.subTest(log=log):
+                self.assertFalse(route.QUOTA_STALL.search(log))
+
+    @unittest.skipUnless(os.name == "posix", "requires POSIX signals and a sh")
+    @unittest.skipUnless(shutil.which("sh"), "requires a POSIX sh")
+    def test_real_stalled_probe_escalates_and_reaps_the_child(self):
+        """A real child ignoring SIGTERM needs terminate->wait->kill and reaping."""
+        event = ('{"type":"error","error":{"name":"FreeUsageLimitError",'
+                 '"data":{"message":"free usage limit reached"}}}')
+        spawned = []
+        def runner(command, **kwargs):
+            # Print the genuine error event, then ignore SIGTERM (the ignored
+            # disposition survives exec) so only the kill escalation stops it.
+            script = ("trap '' TERM; printf '%s' '" + event + "'; exec sleep 10")
+            process = subprocess.Popen(["sh", "-c", script], **kwargs)
+            spawned.append(process)
+            return process
+        before = set(threading.enumerate())
+        with patch.object(route, "PROBE_STOP_SECONDS", 0.2):
+            with tempfile.TemporaryDirectory() as tmp:
+                with patch.dict("os.environ", {"RUNNER_TEMP": tmp}, clear=True):
+                    started = route.time.monotonic()
+                    with self.assertRaises(route.BurnedRunner) as caught:
+                        route.semantic_probe(A, "review", 5, runner=runner)
+                    elapsed = route.time.monotonic() - started
+                    self.assertTrue((pathlib.Path(tmp) / "continuum-opencode-429").exists())
+        self.assertEqual(str(caught.exception), route.QUOTA_EXHAUSTED)
+        self.assertLess(elapsed, 4)
+        self.assertEqual(len(spawned), 1)
+        # SIGTERM was ignored, so -SIGKILL proves the escalation ran.
+        self.assertEqual(spawned[0].returncode, -signal.SIGKILL)
+        # The probe joined the reader threads before returning.
+        self.assertEqual(set(threading.enumerate()) - before, set())
+        # The child was waited for: waitpid finds no zombie to reap.
+        with self.assertRaises(ChildProcessError):
+            os.waitpid(spawned[0].pid, os.WNOHANG)
+        for stream in (spawned[0].stdout, spawned[0].stderr):
+            stream.close()
 
     def test_stalled_probe_without_quota_still_reports_timeout(self):
         process = FakeProcess(hang=True)
@@ -254,6 +361,28 @@ class ProbeTests(unittest.TestCase):
         elapsed = route.time.monotonic() - started
         self.assertTrue(process.terminated)
         self.assertLess(elapsed, 3)
+
+
+class MainBurnedRunnerTests(unittest.TestCase):
+    def _main_with(self, error):
+        stderr = io.StringIO()
+        with patch.object(route, "run", side_effect=error):
+            with patch("sys.stderr", stderr):
+                code = route.main()
+        return code, stderr.getvalue()
+
+    def test_exhausted_quota_reason_is_surfaced_in_the_error_annotation(self):
+        code, message = self._main_with(route.BurnedRunner(route.QUOTA_EXHAUSTED))
+        self.assertEqual(code, 75)
+        self.assertIn("retire this runner without another LLM request", message)
+        self.assertIn(route.QUOTA_EXHAUSTED, message)
+
+    def test_generic_pre_burned_notice_stays_stable(self):
+        code, message = self._main_with(route.BurnedRunner("runner already burned"))
+        self.assertEqual(code, 75)
+        self.assertEqual(
+            message.strip(),
+            "::error::OpenCode 429: retire this runner without another LLM request")
 
 
 class CompletionTicketTests(unittest.TestCase):
