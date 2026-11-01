@@ -1,0 +1,9 @@
+{
+  "schema": 1,
+  "description": "Work Lock 66: approved anonymous models for live integration-only fixtures",
+  "ordered_models": [
+    "opencode/deepseek-v4.1-flash-free",
+    "opencode/glm-5.3-flash-free",
+    "opencode/nemotron-3-ultra-free"
+  ]
+}

@@ -1,0 +1,61 @@
+{
+  "name": "continuum-self-dogfood",
+  "description": "An unrelated issue-comment wake-up (A) must not narrow the plan: runnable issue B and open PR C are still enumerated from state.",
+  "event": {
+    "event": "issue_comment",
+    "action": "created",
+    "issue": {"number": 101},
+    "comment": {"body": "unrelated discussion", "user": {"login": "someone"}}
+  },
+  "issues": [
+    {
+      "number": 101,
+      "title": "P1: issue already has an implementation PR",
+      "state": "open",
+      "labels": ["P1", "automation:in-progress"],
+      "body": "Implementation is in review."
+    },
+    {
+      "number": 102,
+      "title": "P1: runnable successor task",
+      "state": "open",
+      "labels": ["P1"],
+      "body": "No blockers."
+    }
+  ],
+  "pull_requests": [
+    {
+      "number": 201,
+      "title": "fix: implementation for issue 101",
+      "state": "open",
+      "draft": false,
+      "labels": [],
+      "head_sha": "1111111111111111111111111111111111111111",
+      "head_repo": "kodmial/continuum",
+      "base_repo": "kodmial/continuum",
+      "mergeable": true,
+      "mergeable_state": "clean"
+    }
+  ],
+  "context": {
+    "review_provider": "pr-agent",
+    "repository": "kodmial/continuum",
+    "open_pr_issue_numbers": [101],
+    "active_run_issue_numbers": [],
+    "ci_runs": {
+      "201": {"status": "completed", "conclusion": "success"}
+    },
+    "pull_request_state": {
+      "201": {
+        "provider": "pr-agent",
+        "ci_green": true,
+        "operation_state": "success"
+      }
+    }
+  },
+  "expect": {
+    "issue:102": "ACTION",
+    "issue:101": "WAIT",
+    "pull_request:201 domains": ["review-ready", "ci-repair", "pr-agent-merge", "pr-agent-review", "pr-agent-recovery"]
+  }
+}
