@@ -4,6 +4,6 @@
   "ordered_models": [
     "opencode/deepseek-v4.1-flash-free",
     "opencode/glm-5.3-flash-free",
-    "opencode/nemotron-3-ultra-free"
+    "opencode/nemotron-3.5-lightning-free"
   ]
 }
