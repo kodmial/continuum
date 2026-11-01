@@ -64,13 +64,16 @@ ATTESTATION_KEY_ENV = "CONTINUUM_VERIFICATION_ATTESTATION_KEY"
 #: fails closed with a clear error when the file is absent.
 ATTESTATION_KEY_FILE_ENV = "CONTINUUM_VERIFICATION_ATTESTATION_KEY_FILE"
 
-#: Keys already read from a file in this process, keyed by resolved path. The
-#: file is removed as soon as it is read, so later signing within the same
+#: Keys already read from a file in this process, keyed by the configured path.
+#: The configured path is stable across reads even when the file is a symbolic
+#: link: once the link is unlinked, resolving it again yields the link path, so
+#: a resolved-path key would miss the cache and try to read the removed link.
+#: The file is removed as soon as it is read, so later signing within the same
 #: invocation uses this cache instead of re-reading a file that is gone.
 _ATTESTATION_KEY_CACHE: Dict[str, bytes] = {}
 
-#: Resolved key-file paths already removed by this process. Reading removes the
-#: file; this set makes the removal idempotent and lets the command-set path
+#: Configured key-file paths already removed by this process. Reading removes
+#: the file; this set makes the removal idempotent and lets the command-set path
 #: re-check after an in-process re-provisioning.
 _ATTESTATION_KEY_CONSUMED: Set[str] = set()
 
@@ -750,10 +753,13 @@ def _attestation_key_paths(
 ) -> Optional[Tuple[Path, Path]]:
     """The configured and resolved key-file paths, or ``None`` when unset.
 
-    The configured path is what gets read, removed, and re-provisioned; the
-    resolved path is the worktree-boundary and cache identity. The path must
-    live outside the task worktree: a repository-controlled command can read
-    anything inside the worktree it can otherwise reach.
+    The configured path is what gets read, removed, re-provisioned, and used as
+    the cache identity; the resolved path is only the worktree-boundary check
+    and the second unlink target (a symbolic link's target). The configured
+    path stays constant across reads, while a symbolic link no longer resolves
+    to its target once the link is removed. The path must live outside the task
+    worktree: a repository-controlled command can read anything inside the
+    worktree it can otherwise reach.
     """
 
     raw_path = _attestation_key_path(environ)
@@ -831,7 +837,7 @@ def _attestation_key(
     if location is None:
         return None
     path, resolved = location
-    marker = str(resolved)
+    marker = str(path)
     cached = _ATTESTATION_KEY_CACHE.get(marker)
     if cached is not None:
         return cached
@@ -846,8 +852,11 @@ def _attestation_key(
     if not raw:
         raise VerificationError("the verification attestation key file is empty")
     key = raw.encode("utf-8")
-    _ATTESTATION_KEY_CACHE[marker] = key
+    # Cache only after the on-disk copies are gone: if removal raises, the
+    # attempt must not leave a cached value that a retry would silently return
+    # while the file is still readable.
     _remove_attestation_key_files(path, resolved)
+    _ATTESTATION_KEY_CACHE[marker] = key
     _ATTESTATION_KEY_CONSUMED.add(marker)
     return key
 
@@ -877,7 +886,7 @@ def _consume_attestation_key(
     if location is None:  # pragma: no cover - guarded by _attestation_key
         return
     path, resolved = location
-    marker = str(resolved)
+    marker = str(path)
     if marker in _ATTESTATION_KEY_CONSUMED:
         # A previous read in this process already removed the file; the cached
         # value remains authoritative.
@@ -911,7 +920,7 @@ def provision_attestation_key(
                 ATTESTATION_KEY_FILE_ENV
             )
         )
-    path, resolved = location
+    path, _ = location
     if isinstance(data, str):
         key = data.strip().encode("utf-8")
     else:
@@ -935,8 +944,8 @@ def provision_attestation_key(
                 "refusing to replace a different verification attestation key "
                 "at {}".format(path)
             )
-        _ATTESTATION_KEY_CACHE[str(resolved)] = key
-        _ATTESTATION_KEY_CONSUMED.discard(str(resolved))
+        _ATTESTATION_KEY_CACHE[str(path)] = key
+        _ATTESTATION_KEY_CONSUMED.discard(str(path))
         return path
     temporary = ""
     try:
@@ -977,8 +986,8 @@ def provision_attestation_key(
                 Path(temporary).unlink()
             except OSError:
                 pass
-    _ATTESTATION_KEY_CACHE[str(resolved)] = key
-    _ATTESTATION_KEY_CONSUMED.discard(str(resolved))
+    _ATTESTATION_KEY_CACHE[str(path)] = key
+    _ATTESTATION_KEY_CONSUMED.discard(str(path))
     return path
 
 

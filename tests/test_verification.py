@@ -287,9 +287,9 @@ class ChildEnvironmentTests(unittest.TestCase):
                 raise PermissionError("permission denied")
             return original_unlink(path, *args, **kwargs)
 
-        # The key is cached before removal is attempted, so a fresh path in the
-        # cache is not needed; run_command_set must stop rather than run a
-        # repository-controlled command while the key is still readable.
+        # Removal fails, so the read raises before caching anything and
+        # run_command_set must stop rather than run a repository-controlled
+        # command while the key is still readable.
         with mock.patch.object(Path, "unlink", deny_unlink):
             with self.assertRaises(verification.VerificationError) as caught:
                 verification.run_command_set(
@@ -816,6 +816,68 @@ class KeyConsumptionTests(unittest.TestCase):
                 verification._load_evidence(self.path, self.key_env)
         self.assertIn("cannot be removed", str(caught.exception))
         self.assertTrue(key_path.exists())
+
+    def _symlinked_key_env(self) -> tuple[Path, Path]:
+        target = self.key_directory / "real.key"
+        target.write_text(KEY_VALUE, encoding="utf-8")
+        link = self.key_directory / "linked.key"
+        os.symlink(target, link)
+        return link, target
+
+    def _assert_symlink_and_target_removed(self, link: Path, target: Path) -> None:
+        self.assertFalse(link.is_symlink())
+        self.assertFalse(target.exists())
+
+    def test_needs_verifier_with_a_symlinked_key_consumes_both_files(self):
+        # verifier_required reads the key twice: once in _load_evidence and
+        # once in the attestation check. With a symbolic link the second read
+        # only works when the cache is keyed by the configured path, because
+        # the link no longer resolves to its target after the first read.
+        data = self._write_signed_evidence()
+        data["verifier"] = {
+            "state": "passed",
+            "contract_fingerprint": data["baseline"]["contract"]["fingerprint"],
+        }
+        verification._sign_evidence(data, KEY_VALUE.encode("utf-8"))
+        self.path.write_text(json.dumps(data), encoding="utf-8")
+        link, target = self._symlinked_key_env()
+        self.assertFalse(
+            verification.verifier_required(self.path, {KEY_FILE_ENV: str(link)})
+        )
+        self._assert_symlink_and_target_removed(link, target)
+
+    def test_record_verifier_with_a_symlinked_key_consumes_both_files(self):
+        # record_verifier reads the key twice: once in _load_evidence and once
+        # in _save_evidence. The configured-path cache identity keeps the
+        # second read from reopening the removed link.
+        self._write_signed_evidence()
+        link, target = self._symlinked_key_env()
+        verifier = verification.record_verifier(
+            self.root, self.path, 0, environ={KEY_FILE_ENV: str(link)}
+        )
+        self.assertEqual(verifier["state"], "passed")
+        self._assert_symlink_and_target_removed(link, target)
+
+    def test_a_failed_removal_is_retried_on_the_next_read(self):
+        # A failed unlink must not cache the key: otherwise a retry in the same
+        # process returns the cached value and leaves the file readable.
+        key_path = self._key_path()
+        original_unlink = Path.unlink
+
+        def deny_unlink(path, *args, **kwargs):
+            if path == key_path:
+                raise PermissionError("permission denied")
+            return original_unlink(path, *args, **kwargs)
+
+        with mock.patch.object(Path, "unlink", deny_unlink):
+            with self.assertRaises(verification.VerificationError) as caught:
+                verification._attestation_key(self.key_env)
+        self.assertIn("cannot be removed", str(caught.exception))
+        self.assertTrue(key_path.exists())
+        self.assertEqual(
+            verification._attestation_key(self.key_env), KEY_VALUE.encode("utf-8")
+        )
+        self.assertFalse(key_path.exists())
 
     def test_read_path_removes_a_symlinked_key_target(self):
         target = self.key_directory / "real.key"
