@@ -264,6 +264,54 @@ class CheckpointHistoryTests(unittest.TestCase):
             ).stdout.strip()
             self.assertEqual(main_ref, "")
 
+    def test_stale_origin_head_with_missing_tracking_ref_is_refreshed(self):
+        # A clone can keep a stale origin/HEAD and lose the resolved
+        # remote-tracking ref. Resume must refresh origin/HEAD, then fetch
+        # the resolved default branch before switching to it.
+        self._git(self.tmp.name, "clone", "-q", self.origin, self.work)
+        self._config(self.work)
+        self._git(self.work, "branch", "stale")
+        self._git(
+            self.work, "symbolic-ref", "refs/remotes/origin/HEAD",
+            "refs/remotes/origin/stale",
+        )
+        self._git(
+            self.work, "update-ref", "-d",
+            "refs/remotes/origin/" + self.DEFAULT_BRANCH,
+        )
+        ref = "continuum-child/checkpoint-task-8-g1-" + SPEC
+        driver = (
+            'source "$CHECKPOINT"\n'
+            'if continuum_checkpoint_restore "$REF" "continuum-child/task-8" "$SPEC"; then\n'
+            '  printf "rc=0\\n"\n'
+            'else\n'
+            '  printf "rc=%s\\n" "$?"\n'
+            'fi\n'
+        )
+        result = subprocess.run(
+            ["bash", "-c", driver],
+            cwd=self.work,
+            capture_output=True,
+            text=True,
+            env={**os.environ, "CHECKPOINT": CHECKPOINT, "REF": ref, "SPEC": SPEC},
+            timeout=120,
+        )
+        self.assertIn("rc=0", result.stdout, result.stderr)
+        branch = subprocess.run(
+            ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+            cwd=self.work, capture_output=True, text=True, timeout=60,
+        ).stdout.strip()
+        self.assertEqual(branch, "continuum-child/task-8")
+        head = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=self.work, capture_output=True, text=True, timeout=60,
+        ).stdout.strip()
+        default_head = subprocess.run(
+            ["git", "rev-parse", self.DEFAULT_BRANCH],
+            cwd=self.seed, capture_output=True, text=True, timeout=60,
+        ).stdout.strip()
+        self.assertEqual(head, default_head)
+
     def test_undiscoverable_default_branch_fails_closed(self):
         self._git(self.tmp.name, "clone", "-q", self.origin, self.work)
         self._config(self.work)

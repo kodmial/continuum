@@ -32,7 +32,14 @@ continuum_checkpoint_ref() {
 # symref a clone records, then ask the remote; never guess a branch name.
 continuum_checkpoint_default_branch() {
   local remote_head target
-  remote_head="$(git symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null)" || remote_head=""
+  # The local origin/HEAD symref can be stale (a clone records it once and
+  # never refreshes it). Refresh it from the remote before trusting it; when
+  # the refresh fails, fall back to the explicit remote lookup below.
+  if git remote set-head origin --auto >/dev/null 2>&1; then
+    remote_head="$(git symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null)" || remote_head=""
+  else
+    remote_head=""
+  fi
   if [[ -n "$remote_head" ]]; then
     printf '%s\n' "${remote_head#origin/}"
     return 0
@@ -68,6 +75,9 @@ continuum_checkpoint_restore() {
   CONTINUUM_CHECKPOINT_RESTORED=false
   default_branch="$(continuum_checkpoint_default_branch)" || return 4
   default_ref="refs/remotes/origin/$default_branch"
+  # The remote lookup returns only a branch name and creates no local
+  # remote-tracking ref, so fetch the resolved branch before using it.
+  git fetch --quiet origin "+refs/heads/$default_branch:$default_ref" >/dev/null 2>&1 || return 4
   if ! remote_line="$(git ls-remote --heads origin "refs/heads/$checkpoint_ref" 2>/dev/null)"; then
     echo "::error::Delegated checkpoint lookup unavailable; refusing a fresh start." >&2
     return 4
@@ -118,6 +128,7 @@ continuum_checkpoint_save() {
   fi
   default_branch="$(continuum_checkpoint_default_branch)" || return 4
   default_ref="refs/remotes/origin/$default_branch"
+  git fetch --quiet origin "+refs/heads/$default_branch:$default_ref" >/dev/null 2>&1 || return 4
   continuum_stage_checkpoint || return 4
   if git diff --cached --no-ext-diff | grep -Eiq '(github_pat_[A-Za-z0-9_]+|ghp_[A-Za-z0-9]+|rnd_[A-Za-z0-9]+|-----BEGIN [A-Z ]*PRIVATE KEY-----)'; then
     echo "::error::Token-like content detected; checkpoint publication refused." >&2
