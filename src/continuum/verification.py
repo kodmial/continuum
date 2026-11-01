@@ -661,9 +661,12 @@ def _is_workflow_owned(path: str) -> bool:
 
 
 def _child_environment(environ: Mapping[str, str]) -> Dict[str, str]:
-    """Remove the engine import path from commands run for the consumer."""
+    """Remove engine-only secrets and import paths from consumer commands."""
 
     env = dict(environ)
+    # Repository-controlled verification commands must never receive the
+    # runner-held HMAC key; otherwise changed tests/scripts can forge evidence.
+    env.pop(ATTESTATION_KEY_ENV, None)
     raw = str(env.get("PYTHONPATH", "") or "")
     kept: List[str] = []
     for entry in raw.split(os.pathsep):

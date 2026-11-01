@@ -66,6 +66,17 @@ class EvidenceAttestationTests(unittest.TestCase):
             verification.ATTESTATION_ALGORITHM,
         )
 
+    def test_verification_commands_do_not_receive_attestation_key(self):
+        command = "printf '%s' \"${CONTINUUM_VERIFICATION_ATTESTATION_KEY-}\""
+        result = verification.run_command_set(
+            _contract(command), self.root, environ=KEY_ENV_VALUES
+        )
+        self.assertEqual(result["state"], "passed")
+        self.assertEqual(result["commands"][0]["output_tail"], "")
+        self.assertNotIn("runner-controlled-secret", json.dumps(result))
+        self.assertNotIn(
+            KEY_ENV, verification._child_environment(KEY_ENV_VALUES)
+        )
     def test_tampered_contract_is_rejected(self):
         verification._save_evidence(self.path, self._evidence(), KEY_ENV_VALUES)
         raw = json.loads(self.path.read_text(encoding="utf-8"))
