@@ -461,6 +461,27 @@ class SelectionLoopClosureBindingTests(unittest.TestCase):
         self.assertIn(A, writes[0]["cooldowns"])
         self.assertNotIn(B, writes[0]["cooldowns"])
 
+    def test_burned_runner_pause_mutator_binds_the_probed_model(self):
+        fingerprint = route.Configuration.parse(
+            f"{A},{B}").fingerprint("d", "anonymous")
+        state = {"fingerprint": fingerprint}
+        store, deferred = self._store(state, apply=False)
+
+        def probe(model, *args, **kwargs):
+            self.assertEqual(model, A)
+            raise route.BurnedRunner("429")
+
+        self.assertEqual(self._run(store, probe), 75)
+        self.assertEqual(len(deferred), 1)
+        # The loop aborts on the burned iteration, so replaying the applied
+        # write cannot expose a late-bound `model`. Assert the binding on the
+        # captured mutator itself: a plain `def pause(current)` revert must
+        # fail here.
+        self.assertEqual(deferred[0].__kwdefaults__, {"selected_model": A})
+        saved = deferred[0](dict(state))
+        self.assertIn(A, saved["cooldowns"])
+        self.assertNotIn(B, saved["cooldowns"])
+
     def test_plain_route_error_cools_failed_model_and_selects_the_next(self):
         fingerprint = route.Configuration.parse(
             f"{A},{B}").fingerprint("d", "anonymous")
@@ -489,9 +510,15 @@ class SelectionLoopClosureBindingTests(unittest.TestCase):
 
         self.assertEqual(self._run(store, probe), 0)
         self.assertEqual(len(deferred), 2)
+        # The loop returns on B, so replaying the mutators after `run()` would
+        # still see the final `model` value even without a per-iteration
+        # binding. Assert the binding directly: each mutator's keyword default
+        # must name the model of its own iteration, so reverting either
+        # `def save(current)` or `def pause(current)` fails here.
+        self.assertEqual(deferred[0].__kwdefaults__, {"selected_model": A})
+        self.assertEqual(deferred[1].__kwdefaults__, {"selected_model": B})
         # Replay the captured mutators after the loop has finished, i.e.
-        # after `model` would have moved on. The save mutator must still
-        # record the model selected for its own iteration.
+        # after `model` has moved on. Each must still act on its own model.
         saved = dict(state)
         for mutator in deferred:
             saved = mutator(saved)

@@ -58,14 +58,18 @@ Branch safety (#302) underpins S4/S5/S8/S9 in both paths
 
 The executable `.github/scripts/` and `.github/actions/` checks for S4
 ship in the shared `.github/scripts/merge_lifecycle.js` mirror and the
-Python canonical owner. The two workflow inline
-`isNonMergeCriticalMainPath` copies are updated to match in the
-`pr/part-2` change; until that lands they only recognize the
+Python canonical owner. At `pr/part-2` HEAD `4a289956` the two workflow
+inline `isNonMergeCriticalMainPath` copies still recognize only the
 `.github/workflows/continuum-*` prefix and fall through to the generic
-`.github/` rule. This `pr/part-1` partial tree intentionally carries no
-workflow-parity test: that test ships with the workflow copies in the
-`pr/part-2` change, so the gap is tracked here instead of a test passing
-by the workflows' absence.
+`.github/` rule, and that branch's
+`test_both_workflows_share_the_same_path_table` does not yet assert the
+`.github/scripts/` / `.github/actions/` checks. The executable-surface
+parity for those two inline copies, and the matching parity assertion,
+are required in the `pr/part-2` change and are not present there yet.
+This `pr/part-1` partial tree intentionally carries no workflow-parity
+test: that test ships with the workflow copies in the `pr/part-2`
+change, so the gap is tracked here instead of a test passing by the
+workflows' absence.
 
 ## 2. Provider-specific semantics (not equivalent — stay in adapters)
 

@@ -15,12 +15,13 @@ secret, variable, label, permission, or workflow-name changes.
 Partial-tree boundary: the two workflow inline copies
 (``.github/workflows/continuum-auto-merge.yml`` and
 ``.github/workflows/continuum-pr-agent-auto-merge.yml``) are ``pr/part-2``
-files. The parity test for their inline ``isNonMergeCriticalMainPath``
-copies ships with them in the ``pr/part-2`` change. This module therefore
-asserts only the classifiers this branch ships
-(``.github/scripts/merge_lifecycle.js`` and
-``src/continuum/merge_lifecycle.py``) and never passes a workflow-parity
-check by observing that the workflows are absent.
+files. This branch carries no workflow-parity assertion for them: the
+parity test for their inline ``isNonMergeCriticalMainPath`` copies ships
+with them in the ``pr/part-2`` change, and is not asserted here so it
+never passes by observing that the workflows are absent. Other tests in
+this module read those workflow files directly; they are exercised once
+``pr/part-2`` lands the files, and are not a claim about this partial
+tree.
 """
 
 import os
