@@ -226,7 +226,14 @@ def _parse_sequence(lines: List[_Line], start: int, indent: int) -> Tuple[List[A
             key, value_text = _split_key(rest, line.number)
             inner_indent = line.indent + (len(line.text) - len(line.text[1:].lstrip()))
             mapping: dict = {}
-            _assign(mapping, key, value_text, line.number)
+            if value_text == "":
+                if index < len(lines) and lines[index].indent > inner_indent:
+                    first_value, index = _parse_block(lines, index, lines[index].indent)
+                else:
+                    first_value = None
+                _set(mapping, key, first_value, line.number)
+            else:
+                _assign(mapping, key, value_text, line.number)
             while index < len(lines) and lines[index].indent > indent:
                 inner = lines[index]
                 if inner.indent != inner_indent:

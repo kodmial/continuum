@@ -63,7 +63,7 @@ class IssueAdmissionTests(unittest.TestCase):
         comments = {
             2: [
                 {
-                    "body": "/oc please implement",
+                    "body": "/oc",
                     "author_association": "OWNER",
                     "created_at": NOW - timedelta(minutes=1),
                 }
@@ -72,6 +72,22 @@ class IssueAdmissionTests(unittest.TestCase):
         decision = adapters.decide_issue_admission(issue(2), now=NOW, comments=comments)
         self.assertEqual(decision.kind, adapters.WAIT)
         self.assertIn("race window", decision.reason)
+
+    def test_prose_mentioning_the_token_is_not_a_race_command(self):
+        # The scheduler race guard uses the canonical first-significant-line
+        # rule: an explanatory comment that only mentions /oc must not hold
+        # the reservation lease or block an eligible issue.
+        comments = {
+            2: [
+                {
+                    "body": "The earlier dispatch /oc was retried after the timeout.",
+                    "author_association": "OWNER",
+                    "created_at": NOW - timedelta(minutes=1),
+                }
+            ]
+        }
+        decision = adapters.decide_issue_admission(issue(2), now=NOW, comments=comments)
+        self.assertEqual(decision.kind, adapters.ACTION)
 
     def test_declared_blocker_waits(self):
         decision = adapters.decide_issue_admission(

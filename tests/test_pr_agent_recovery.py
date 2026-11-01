@@ -233,6 +233,39 @@ class DurableEvidenceTests(unittest.TestCase):
         self.assertEqual(deferred.action, "wait")
         self.assertIsNone(deferred.attempt)
 
+    def test_dispatch_carries_the_attempt_backoff(self):
+        # A retry dispatch returns the scheduled not-before so the caller
+        # cannot run the bounded budget out faster than the retry schedule.
+        initial = recovery.decide_recovery(ci_green=True, operation_state=None)
+        self.assertEqual(initial.action, "dispatch")
+        self.assertEqual(initial.attempt, 0)
+        self.assertIsNone(initial.not_before_epoch)
+        self.assertFalse(initial.defer_dispatch)
+
+        short = recovery.decide_recovery(
+            ci_green=True,
+            operation_state="pending",
+            run_conclusion="cancelled",
+            evidence=recovery.RetryEvidence(latest_attempt=0),
+            now_epoch=1000,
+        )
+        self.assertEqual(short.action, "dispatch")
+        self.assertEqual(short.attempt, 1)
+        self.assertEqual(short.not_before_epoch, 1000 + recovery.backoff_seconds(1))
+        self.assertFalse(short.defer_dispatch)
+
+        long = recovery.decide_recovery(
+            ci_green=True,
+            operation_state="pending",
+            run_conclusion="cancelled",
+            evidence=recovery.RetryEvidence(latest_attempt=3),
+            now_epoch=1000,
+        )
+        self.assertEqual(long.action, "dispatch")
+        self.assertEqual(long.attempt, 4)
+        self.assertEqual(long.not_before_epoch, 1000 + recovery.backoff_seconds(4))
+        self.assertTrue(long.defer_dispatch)
+
 
 class RecoveryDecisionTests(unittest.TestCase):
     def test_lost_ci_wakeup_dispatches_initial_exact_head_review(self):

@@ -210,6 +210,30 @@ class ExactShaEvidenceTests(unittest.TestCase):
             gate.EVIDENCE_PASS,
         )
 
+    def test_docker_payload_with_trailing_prose_still_counts(self):
+        import json
+
+        payload = json.dumps({"head_sha": SHA_A, "classification": "pass"})
+        comments = [
+            gate.DOCKER_RESULT_MARKER + "\n" + payload + "\n\nAll good."
+        ]
+        self.assertEqual(
+            gate.qualification_evidence_state(comments, 184, SHA_A),
+            gate.EVIDENCE_PASS,
+        )
+
+    def test_docker_payload_inside_a_fenced_block_counts(self):
+        import json
+
+        payload = json.dumps({"head_sha": SHA_A, "classification": "pass"})
+        comments = [
+            gate.DOCKER_RESULT_MARKER + "\n```json\n" + payload + "\n```"
+        ]
+        self.assertEqual(
+            gate.qualification_evidence_state(comments, 184, SHA_A),
+            gate.EVIDENCE_PASS,
+        )
+
     def test_docker_payload_for_older_sha_is_stale(self):
         import json
 

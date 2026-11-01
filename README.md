@@ -41,7 +41,7 @@ scenario. Parent/child delegated execution is an advanced, optional layer.
 
 ## Status and limitations
 
-- This is open-source automation under active development. There is no uptime,
+- This is source-available automation under active development. There is no uptime,
   latency, reliability, or cost SLA.
 - Core workflows target free anonymous OpenCode models. Free routes can be
   rate-limited, unavailable, or changed by their provider; they are not a

@@ -173,11 +173,22 @@ def decide_main_sync(
     a sync rather than silently bypassing integration validation.
     """
 
-    try:
-        behind = int(behind_by or 0)
-    except (TypeError, ValueError):
-        behind = 0
     names = [str(item) for item in (files or [])]
+    try:
+        behind = int(behind_by)
+    except (TypeError, ValueError):
+        # ``None``, an empty string, or non-numeric prose means the compare
+        # call did not yield a delta. Treat it as unknown and require a sync
+        # rather than reporting up-to-date.
+        return {
+            "required": True,
+            "reason": "unknown-main-delta",
+            "files": names,
+            "critical_files": [
+                item for item in names
+                if not is_non_merge_critical_main_path(item)
+            ],
+        }
     if behind <= 0:
         return {
             "required": False,

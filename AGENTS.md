@@ -5,13 +5,16 @@ Continuum is a reusable GitHub Actions control plane, not an application. It shi
 `.github/caller-stubs/`, an installer (`install.sh`), and a dependency-free Python
 engine under `src/continuum/` and `.github/scripts/`. Consumers install the thin
 callers; they never copy engine code into their repository. The naming rule is
-uniform: **every** workflow file and **every** caller stub is named
-`continuum-<name>.yml`, and the installer writes each stub's stored file name
-verbatim — it never adds a prefix at install time. The layers differ only in
-their marker: a **core** workflow is `continuum-<name>.yml`, and a **technology
-library** workflow is `continuum-tech-<tech>-<name>.yml`, where the
+uniform for Continuum-owned files: **every** Continuum workflow file and
+**every** caller stub is named `continuum-<name>.yml`, and the installer writes
+each stub's stored file name verbatim — it never adds a prefix at install time.
+A project-owned workflow such as a consumer's `ci.yml` is not a Continuum file
+and keeps its own name; the prefix rule does not apply to it. The layers differ
+only in their marker: a **core** workflow is `continuum-<name>.yml`, and a
+**technology library** workflow is `continuum-tech-<tech>-<name>.yml`, where the
 `continuum-tech-<tech>-` prefix marks an opt-in library that Continuum never
-triggers itself. There is no unprefixed file and no exception list.
+triggers itself. Among Continuum-owned files there is no unprefixed file and no
+exception list.
 
 ## Source of truth
 
@@ -25,7 +28,8 @@ These are public interfaces and must not change silently:
 
 - the reusable-workflow file names and their `workflow_call` inputs, defaults, and
   secrets;
-- the `continuum-` prefix on every workflow file and every caller stub, and the
+- the `continuum-` prefix on every Continuum-owned workflow file and every caller
+  stub (project-owned workflows such as `ci.yml` keep their own names), and the
   installer's verbatim copy of each stored stub name (a `continuum-*.yml` file in
   a consumer repository is Continuum-owned and is never hand-edited there);
 - the `TAP_PAT` repository secret name (classic PAT, `repo` + `workflow` scopes)

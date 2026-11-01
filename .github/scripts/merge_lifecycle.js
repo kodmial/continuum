@@ -87,9 +87,26 @@ function isNonMergeCriticalMainPath(path) {
 }
 
 function decideMainSync(behindBy, files) {
-  const behind = Number(behindBy || 0);
   const names = Array.from(files || []).map((item) => String(item));
-  if (!(behind > 0)) {
+  const numericBehind =
+    typeof behindBy === 'number'
+      ? behindBy
+      : typeof behindBy === 'string' && behindBy.trim() !== ''
+        ? Number(behindBy)
+        : NaN;
+  if (!Number.isFinite(numericBehind)) {
+    // ``null``/``undefined``, an empty string, or non-numeric prose means the
+    // compare call did not yield a delta. Treat it as unknown and require a
+    // sync rather than reporting up-to-date.
+    return {
+      required: true,
+      reason: 'unknown-main-delta',
+      files: names,
+      criticalFiles: names.filter((item) => !isNonMergeCriticalMainPath(item)),
+    };
+  }
+  const behind = numericBehind;
+  if (behind <= 0) {
     return { required: false, reason: 'up-to-date', files: names, criticalFiles: [] };
   }
   const critical = names.filter((item) => !isNonMergeCriticalMainPath(item));

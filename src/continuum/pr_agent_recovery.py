@@ -770,10 +770,16 @@ def decide_recovery(
         return RecoveryDecision(
             "wait", None, "retry backoff requires a clock; deferring"
         )
+    delay = backoff_seconds(attempt)
+    not_before: Optional[int] = None
+    if now_epoch is not None and attempt > 0:
+        not_before = int(now_epoch) + delay
     return RecoveryDecision(
         "dispatch",
         attempt,
         "lost/missing operation" if state is None else "transient/stale operation",
+        not_before_epoch=not_before,
+        defer_dispatch=delay > 60,
     )
 
 

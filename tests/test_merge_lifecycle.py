@@ -140,6 +140,24 @@ class MainSyncTests(unittest.TestCase):
             (decision["required"], decision["reason"]), (True, "unknown-main-delta")
         )
 
+    def test_unknown_behind_by_requires_sync(self):
+        for value in (None, "", "  ", "not-a-count"):
+            with self.subTest(value=value):
+                decision = life.decide_main_sync(value, ["docs/guide.md"])
+                self.assertEqual(
+                    (decision["required"], decision["reason"]),
+                    (True, "unknown-main-delta"),
+                )
+                self.assertEqual(decision["critical_files"], [])
+
+    def test_unknown_behind_by_keeps_merge_critical_files(self):
+        decision = life.decide_main_sync(
+            None, ["src/continuum/x.py", "docs/guide.md"]
+        )
+        self.assertTrue(decision["required"])
+        self.assertEqual(decision["reason"], "unknown-main-delta")
+        self.assertEqual(decision["critical_files"], ["src/continuum/x.py"])
+
     def test_both_workflows_share_the_same_path_table(self):
         for path in (GENERIC_MERGE, PR_AGENT_MERGE):
             body = read_repo(path)
@@ -556,6 +574,12 @@ class SharedJsMirrorTests(unittest.TestCase):
             "assert.strictEqual(m.isNonMergeCriticalMainPath('src/x.py'),false);"
             "assert.strictEqual(m.validateExactHead('abc','abc').ok,true);"
             "assert.strictEqual(m.validateExactHead('abc','def').ok,false);"
+            "assert.strictEqual(m.decideMainSync(0,[]).reason,'up-to-date');"
+            "assert.strictEqual(m.decideMainSync(2,['src/x.py']).reason,'merge-critical-main-delta');"
+            "assert.strictEqual(m.decideMainSync(null,[]).reason,'unknown-main-delta');"
+            "assert.strictEqual(m.decideMainSync('',[]).required,true);"
+            "assert.strictEqual(m.decideMainSync('not-a-count',[]).reason,'unknown-main-delta');"
+            "assert.deepStrictEqual(m.decideMainSync(null,['src/x.py','docs/y.md']).criticalFiles,['src/x.py']);"
             "console.log('js-mirror-ok');"
             % script
         )

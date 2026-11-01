@@ -120,6 +120,34 @@ class YamlSubsetTests(unittest.TestCase):
         with self.assertRaises(yamlmini.YamlSubsetError):
             yamlmini.loads("a:\n    b: 1\n  c: 2\n")
 
+    def test_empty_first_key_in_sequence_item_is_none(self):
+        # The first key of a sequence-item mapping follows the same
+        # empty-value rule as every other mapping key.
+        parsed = yamlmini.loads(
+            textwrap.dedent(
+                """
+            - name:
+            - name: b
+                """
+            )
+        )
+        self.assertEqual(parsed, [{"name": None}, {"name": "b"}])
+
+    def test_nested_block_under_first_key_in_sequence_item(self):
+        parsed = yamlmini.loads(
+            textwrap.dedent(
+                """
+            records:
+              - name:
+                  sub: 1
+                value: 2
+                """
+            )
+        )
+        self.assertEqual(
+            parsed["records"], [{"name": {"sub": 1}, "value": 2}]
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -35,10 +35,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
-import re
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 from .delegation_priority import effective_priority
+from . import opencode_commands
 from . import owner_resume
 
 
@@ -96,20 +96,14 @@ class ReconcileResult:
     failed_message: str = ""
 
 
-# An owner command is a command token at the start of a line (up to three
-# leading spaces, mirroring the canonical manual-command rule), followed by
-# whitespace or end of input. Trailing prose on the same line (``/oc please``)
-# still counts as owner intent for the scheduler race guard, but substrings
-# such as ``/ocean`` or ``/ock``, mid-line prose mentions, quoted/inline-code
-# examples, and ``/oc-cancel`` (physical cancellation, not a launch) must not
-# stall an otherwise eligible issue.
-_OWNER_COMMAND_RE = re.compile(r"^[ ]{0,3}/(?:opencode|oc)(?=\s|$)", re.MULTILINE)
-
-
+# An owner command is any comment whose first significant line is exactly
+# ``/oc`` or ``/opencode``. The scheduler race guard delegates to the
+# canonical parser (:mod:`continuum.opencode_commands`) so a comment that
+# merely mentions the token in prose never refreshes the reservation lease
+# or blocks dispatch, while the scheduler's own ``/oc`` dispatch body still
+# matches.
 def _is_owner_command(body: str) -> bool:
-    if not isinstance(body, str) or not body:
-        return False
-    return _OWNER_COMMAND_RE.search(body) is not None
+    return opencode_commands.is_manual_command(body)
 
 
 def _scheduler_dispatch_comments(

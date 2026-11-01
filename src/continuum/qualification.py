@@ -865,11 +865,15 @@ def parse_evidence_entries(comment_body: object) -> List[Dict[str, object]]:
     ):
         index = comment_body.find(marker)
         while index != -1:
-            tail = comment_body[index + len(marker):].strip()
+            tail = comment_body[index + len(marker):].lstrip()
+            if tail.startswith("```"):
+                tail = tail.split("\n", 1)[1] if "\n" in tail else ""
             payload: Optional[dict] = None
             try:
-                payload = json.loads(tail.split("-->", 1)[0].strip() or tail)
-            except (ValueError, AttributeError):
+                # Read the first JSON document and ignore any trailing prose,
+                # Markdown section, or closing code fence.
+                payload, _end = json.JSONDecoder().raw_decode(tail)
+            except ValueError:
                 payload = None
             if isinstance(payload, dict):
                 sha = _normalize_sha(

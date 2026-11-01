@@ -220,7 +220,9 @@ The installer has three explicit sets:
 # Core task-domain callers: scheduling, review, repair, auto-merge.
 bash install.sh /path/to/myapp main core
 
-# Opt-in technology library: CI, release, release PR, packaging smoke.
+# Opt-in technology library: the Swift validation profile only
+# (`continuum-tech-swift-ci.yml`). It does not install release,
+# release-PR, or packaging-smoke callers.
 bash install.sh /path/to/myapp main tech
 
 # Parent scheduling is the ordinary core scheduler; parent adds worker/review entry points.
