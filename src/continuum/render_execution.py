@@ -109,6 +109,12 @@ MAX_TRANSIENT_RECOVERY_ATTEMPTS = 10
 
 _BYTE_RE = re.compile(r"^\s*(\d+(?:\.\d+)?)\s*([kmgt]?i?b?)?\s*$", re.IGNORECASE)
 
+#: A shell exit status of exactly 1 can signal a test/harness defect, but any
+#: other status (124 timeout, 137 OOM kill, 143 termination) is infrastructure
+#: and must never select repository repair. Matched as a whole number so
+#: "exit code 127" cannot masquerade as "exit code 1".
+_EXIT_CODE_1_RE = re.compile(r"\bexit[ _]code 1\b")
+
 _LIMIT_KEYS = (
     "limit_bytes",
     "memory_limit_bytes",
@@ -276,8 +282,6 @@ _REPOSITORY_TOKENS = (
     "test defect",
     "failing test",
     "pytest",
-    "exit code 1",
-    "exit_code 1",
     "traceback",
     "typeerror",
     "referenceerror",
@@ -479,7 +483,9 @@ def _has_provider_signature(text: str) -> bool:
 def _has_repository_signature(text: str) -> bool:
     if not text:
         return False
-    return any(token in text for token in _REPOSITORY_TOKENS)
+    return bool(_EXIT_CODE_1_RE.search(text)) or any(
+        token in text for token in _REPOSITORY_TOKENS
+    )
 
 
 def _has_timeout_mention(text: str) -> bool:

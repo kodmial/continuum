@@ -343,6 +343,45 @@ class ReadAfterWriteReceiptTests(unittest.TestCase):
         self.assertEqual(seen[0].get_header("Pragma"), "no-cache")
 
 
+class StateStoreFailureIsolationTests(unittest.TestCase):
+    def test_state_failure_does_not_cool_down_a_qualified_route(self):
+        import os
+        config = route.Configuration.parse(A)
+        fingerprint = config.fingerprint("d", "anonymous")
+        state = {
+            "fingerprint": fingerprint,
+            "last_successful_probe": {"model": A, "at": int(route.time.time())},
+        }
+        calls = {"probe": 0, "update": 0}
+        store = type("Store", (), {})()
+        store.read = lambda key: (state, None, None)
+
+        def conflict_update(key, mutator):
+            calls["update"] += 1
+            raise route.Conflict("state CAS budget exhausted")
+        store.update = conflict_update
+
+        env = {
+            "OPENCODE_MODELS": A,
+            "CONTINUUM_MODEL_STATE_TOKEN": "t",
+            "GITHUB_REPOSITORY": "owner/parent",
+            "GITHUB_RUN_ID": "703",
+            "GITHUB_RUN_ATTEMPT": "1",
+        }
+        with patch.object(route, "binary_provenance", lambda: ("1.2.3", "d")), \
+             patch.object(route, "GitRefStore", lambda owner, token: store), \
+             patch.object(route, "semantic_probe",
+                          lambda *a, **k: calls.__setitem__("probe", calls["probe"] + 1)), \
+             patch.object(route.sys, "argv", ["model_routing.py", "select"]), \
+             patch.dict(os.environ, env, clear=True):
+            with self.assertRaises(route.Conflict):
+                route.run()
+        # One CAS attempt, no cooldown write, and no failover probe: a state
+        # failure is not a model-provider failure.
+        self.assertEqual(calls["update"], 1)
+        self.assertEqual(calls["probe"], 0)
+
+
 class GitRefStoreTests(unittest.TestCase):
     def test_first_write_creates_orphan_ref_not_main(self):
         store = route.GitRefStore("example/private", "fake-token")

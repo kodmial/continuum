@@ -39,6 +39,29 @@ class CanaryGateTests(unittest.TestCase):
         result = canary.resolve_live_config({})
         self.assertEqual(result["outcome"], "DISABLED")
 
+    def test_live_config_rejects_global_enable(self):
+        env = {
+            "CONTINUUM_PR_AGENT_CANARY_ENABLED": "true",
+            "CONTINUUM_PR_AGENT_ENABLED": "true",
+            "PR_AGENT_ENABLED_INPUT": "true",
+        }
+        with self.assertRaises(CanaryError):
+            canary.resolve_live_config(env)
+
+    def test_live_config_requires_disposable_enabled_input(self):
+        env = {"CONTINUUM_PR_AGENT_CANARY_ENABLED": "true"}
+        with self.assertRaises(CanaryError):
+            canary.resolve_live_config(env)
+
+    def test_live_config_accepts_disposable_enable_only(self):
+        env = {
+            "CONTINUUM_PR_AGENT_CANARY_ENABLED": "true",
+            "PR_AGENT_ENABLED_INPUT": "true",
+        }
+        result = canary.resolve_live_config(env)
+        self.assertEqual(result["outcome"], "READY")
+        self.assertFalse(result["runtime"]["enabled"])
+
     def test_no_paid_secret_fails_closed(self):
         for var in ("OPENCODE_API_KEY", "ANTHROPIC_API_KEY", "GROQ_API_KEY"):
             with self.subTest(var=var):
@@ -83,6 +106,35 @@ class CommandPathTests(unittest.TestCase):
 
 
 class FlowTests(unittest.TestCase):
+    def test_parsed_rule_token_defines_the_verified_finding(self):
+        blocking = phase(
+            "blocking", "sha-1", canary.blocking_review_text(rule="missing-guard")
+        )
+        corrected = phase("corrected", "sha-2", canary.clean_review_text())
+        clean = phase("clean", "sha-3", canary.clean_review_text())
+        result = canary.run_canary_flow(blocking, corrected, clean, bridge_ok=True)
+        self.assertEqual(
+            result.finding_id,
+            pr_agent.finding_id(
+                canary.CANARY_DEFECT_PATH,
+                canary.CANARY_DEFECT_LINE,
+                "missing-guard",
+            ),
+        )
+
+    def test_missing_reviewer_snapshot_fails_closed(self):
+        blocking = CanaryPhase(
+            name="blocking",
+            reviewed_sha="sha-1",
+            head_sha="sha-1",
+            review_text=canary.blocking_review_text(),
+            coverage=Coverage(reviewed=1, total=1),
+        )
+        corrected = phase("corrected", "sha-2", canary.clean_review_text())
+        clean = phase("clean", "sha-3", canary.clean_review_text())
+        with self.assertRaises(CanaryError):
+            canary.run_canary_flow(blocking, corrected, clean, bridge_ok=True)
+
     def test_blocking_to_clean_passes(self):
         result = canary.self_check()
         self.assertEqual(result.outcome, "CANARY_PASS")
@@ -181,7 +233,7 @@ class EvidenceTests(unittest.TestCase):
             "finding_id": canary.canary_finding_id(),
             "verify_verdict": "RESOLVED",
             "final_outcome": "APPROVED",
-            "cleanup": "pr closed, branch deleted",
+            "cleanup": "complete: pr closed, branch deleted",
         }
         base.update(overrides)
         return canary.build_evidence(**base)
@@ -193,6 +245,16 @@ class EvidenceTests(unittest.TestCase):
     def test_incomplete_evidence_fails_closed(self):
         with self.assertRaises(CanaryError):
             canary.require_evidence(self._evidence(main_sha=""))
+
+    def test_unsuccessful_evidence_fails_closed(self):
+        for overrides in (
+            {"verify_verdict": "UNRESOLVED"},
+            {"final_outcome": "CHANGES_REQUESTED"},
+            {"cleanup": "not done"},
+        ):
+            with self.subTest(overrides=overrides):
+                with self.assertRaises(CanaryError):
+                    canary.require_evidence(self._evidence(**overrides))
 
     def test_cleanup_lists_disposable_artifacts(self):
         items = canary.cleanup_checklist()

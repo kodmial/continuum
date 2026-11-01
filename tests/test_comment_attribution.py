@@ -491,6 +491,15 @@ class ContractInsertionTests(unittest.TestCase):
         )
         self.assertEqual(commands.classify_issue_comment(body), "run")
 
+    def test_command_token_with_arguments_stays_first(self):
+        for body in ("/verify abc123", "/review -i", "/oc implement X"):
+            with self.subTest(body=body):
+                attributed = attribution.with_attribution(
+                    body, "continuum", "pr-agent-canary"
+                )
+                self.assertEqual(attributed.split("\n")[0], body)
+                self.assertIn("continuum-origin", attributed)
+
     def test_review_command_still_recognized(self):
         body = attribution.with_attribution("/review", "continuum", "pr-agent-canary")
         self.assertTrue(pr_agent.is_review_command(body))

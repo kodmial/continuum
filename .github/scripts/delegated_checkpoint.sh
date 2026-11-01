@@ -11,6 +11,18 @@ continuum_checkpoint_ref() {
   printf 'continuum-child/checkpoint-task-%s-g%s-%s\n' "$task" "$generation" "$spec"
 }
 
+# A shallow clone does not contain the common ancestor, so a shared-history
+# check would reject a valid checkpoint. Deepen the checkout once, only when
+# it actually is shallow.
+continuum_checkpoint_ensure_history() {
+  if [[ "$(git rev-parse --is-shallow-repository 2>/dev/null)" != "true" ]]; then
+    return 0
+  fi
+  git fetch --quiet --unshallow origin >/dev/null 2>&1 \
+    || git fetch --quiet --deepen=100 origin >/dev/null 2>&1 \
+    || return 4
+}
+
 # A remote lookup failure is NOT evidence of a missing checkpoint: fail closed,
 # rather than discarding work after rate limits or a transport interruption.
 continuum_checkpoint_restore() {
@@ -31,7 +43,8 @@ continuum_checkpoint_restore() {
     echo "::error::Delegated checkpoint has no matching frozen task specification." >&2
     return 4
   fi
-  if ! git merge-base --is-ancestor origin/main FETCH_HEAD >/dev/null 2>&1; then
+  continuum_checkpoint_ensure_history || return 4
+  if ! git merge-base origin/main FETCH_HEAD >/dev/null 2>&1; then
     echo "::error::Delegated checkpoint history is unrelated to the target default branch." >&2
     return 4
   fi
@@ -81,7 +94,8 @@ continuum_checkpoint_save() {
       echo "::error::Delegated checkpoint changed to an untrusted revision; refusing to overwrite." >&2
       return 4
     fi
-    if ! git merge-base --is-ancestor origin/main FETCH_HEAD >/dev/null 2>&1; then
+    continuum_checkpoint_ensure_history || return 4
+    if ! git merge-base origin/main FETCH_HEAD >/dev/null 2>&1; then
       echo "::error::Delegated checkpoint history is unrelated to the target default branch." >&2
       return 4
     fi

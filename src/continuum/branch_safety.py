@@ -192,6 +192,10 @@ def validate_push_destination(
         return False, "push destination is empty"
     if is_ambiguous_ref(dest):
         return False, "push destination is ambiguous: {!r}".format(destination)
+    if dest.startswith(("refs/", "heads/", "tags/", "remotes/")):
+        return False, "push destination uses a ref namespace prefix: {!r}".format(
+            destination
+        )
     try:
         default = resolve_default_branch(default_branch)
     except BranchSafetyError:

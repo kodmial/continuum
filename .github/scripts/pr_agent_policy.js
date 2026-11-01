@@ -1079,8 +1079,12 @@ function reviewDisposition(reviewPayload, improveJsonl, threshold = IMPROVE_REPA
         qualifying.length + ' auxiliary improve suggestion(s)',
     };
   }
+  const structurallyClean =
+    !hasBlockingSecuritySignal(review) &&
+    !hasToolErrorSignal(review) &&
+    !hasIncompleteCoverageSignal(review);
   if (
-    recommendation === 'safe_to_merge' ||
+    (recommendation === 'safe_to_merge' && structurallyClean) ||
     (recommendation === 'merge_with_caution' && nonActionableCautionIsMergeable(review))
   ) {
     return {

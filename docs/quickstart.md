@@ -39,7 +39,7 @@ test repository and copy only the sample project files:
 
 ```sh
 export CONTINUUM_DIR=/path/to/continuum
-export TEST_REPO=<owner>/continuum-quickstart-test
+export TEST_REPO="YOUR_GITHUB_OWNER/continuum-quickstart-test"
 
 gh repo create "$TEST_REPO" --private --clone
 cd continuum-quickstart-test

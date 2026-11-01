@@ -277,13 +277,15 @@ def reconcile(
         marker_waiting = (
             marker_baseline is not None and config.pause_label in labels
         )
-        baseline = None if marker_waiting else marker_baseline
+        # The marker scopes a fresh budget in every state: historic
+        # dispatches from the previous generation must not re-pause the
+        # target or release its reservation while the resume waits.
         counted_dispatches = scheduler_dispatches
-        if baseline is not None:
+        if marker_baseline is not None:
             counted_dispatches = [
                 comment
                 for comment in scheduler_dispatches
-                if comment.created_at > baseline
+                if comment.created_at > marker_baseline
             ]
         if latest is None:
             labels.discard(in_progress)
@@ -294,6 +296,14 @@ def reconcile(
             continue
         if now - latest.created_at < lease:
             active.add(number)
+            continue
+        if marker_waiting and not (
+            len(counted_dispatches) >= config.max_dispatch_attempts
+            and config.pause_on_failure
+        ):
+            result.skip_reasons[number] = (
+                "owner-armed resume is waiting for predecessor completion"
+            )
             continue
         labels.discard(in_progress)
         result.reservations_removed.append(number)
@@ -306,10 +316,6 @@ def reconcile(
             result.skip_reasons[number] = (
                 "paused after %d scheduler dispatch attempt(s) with no "
                 "OpenCode PR" % len(counted_dispatches)
-            )
-        elif marker_waiting:
-            result.skip_reasons[number] = (
-                "owner-armed resume is waiting for predecessor completion"
             )
         else:
             labels.discard(config.pause_label)

@@ -122,6 +122,34 @@ class RepositoryRepairTests(unittest.TestCase):
         decision = engine.decide_render_recovery(classification, cleanup_ok=True)
         self.assertFalse(decision.create_repair)
 
+    def test_exit_code_one_remains_repository_evidence(self):
+        classification = engine.classify_render_failure(
+            execute_outcome="failure",
+            cleanup_outcome="success",
+            result={"error": "script exited with exit code 1"},
+            memory_summary={},
+            state={},
+        )
+        self.assertEqual(classification.classification, engine.REPOSITORY)
+
+    def test_other_exit_codes_are_not_repository_evidence(self):
+        # A prefix match on "exit code 1" used to classify timeout/OOM/termination
+        # statuses as fixable repository defects.
+        for error in (
+            "process exited with exit code 124 (timeout)",
+            "container exit code 137 (OOM killed)",
+            "script exit_code 143 (terminated)",
+        ):
+            with self.subTest(error=error):
+                classification = engine.classify_render_failure(
+                    execute_outcome="failure",
+                    cleanup_outcome="success",
+                    result={"error": error},
+                    memory_summary={},
+                    state={},
+                )
+                self.assertNotEqual(classification.classification, engine.REPOSITORY)
+
     def test_open_repair_is_never_duplicated(self):
         classification = engine.classify_render_failure(
             execute_outcome="failure",

@@ -103,7 +103,7 @@ _SECRET_RES = (
 #: Lines that may lead a body before the attribution block: hidden HTML
 #: markers, automation command tokens, and the blank lines between them.
 _COMMAND_LINE_RE = re.compile(
-    r"^(?:/oc(?:-cancel)?|/opencode|/review\b|/verify\b|@coderabbitai\b.*|.*@coderabbitai.*)$"
+    r"^(?:(?:/oc(?:-cancel)?|/opencode|/review|/verify)\b.*|.*@coderabbitai.*)$"
 )
 _HIDDEN_MARKER_LINE_RE = re.compile(r"^<!--.*?-->$")
 
@@ -210,7 +210,9 @@ def with_attribution(
     head, rest = split_leading_machine_lines(text)
     block = header + "\n" + marker
     if head:
-        return head + block + "\n" + rest if rest else head + block
+        # The block always starts on its own line: a command head without
+        # trailing prose must not merge with the attribution header.
+        return head + "\n" + block + ("\n" + rest if rest else "")
     return block + "\n" + text if text else block
 
 

@@ -98,7 +98,10 @@ _SNAPSHOT_REF_RE = re.compile(
     r"spec-sha256=([0-9a-fA-F]{64})\s*-->"
 )
 
-_JSON_BLOCK_RE = re.compile(r"```json\s+(.*?)\s+```", re.DOTALL)
+# The snapshot comment always ends with the closing fence. A greedy match
+# to that final fence keeps backtick runs inside the JSON strings (for
+# example indented code fences in the issue body) from ending the block.
+_JSON_BLOCK_RE = re.compile(r"```json\s+(\{.*\})\s+```\s*\Z", re.DOTALL)
 
 
 class TaskSnapshotError(ValueError):

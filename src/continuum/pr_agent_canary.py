@@ -249,8 +249,10 @@ class CanaryPhase:
     review_text: str
     coverage: Coverage
     reviewer_status_porcelain: str = ""
-    reviewer_before_sha: str = ""
-    reviewer_after_sha: str = ""
+    # ``None`` means the snapshot was never observed. It must stay
+    # distinguishable from an observed empty status (a clean checkout).
+    reviewer_before_sha: Optional[str] = None
+    reviewer_after_sha: Optional[str] = None
 
 
 @dataclass
@@ -296,7 +298,6 @@ def run_canary_flow(
 
     if not bridge_ok:
         raise CanaryError("bridge/OpenCode inference failed: failing closed")
-    expected_finding = canary_finding_id()
 
     for phase in (blocking, corrected, clean):
         if not pr_agent.is_current_head(phase.reviewed_sha, phase.head_sha):
@@ -305,17 +306,34 @@ def run_canary_flow(
                 f"is not current {phase.head_sha!r}"
             )
         pr_agent.check_coverage(phase.coverage)
+        if not phase.reviewer_before_sha or not phase.reviewer_after_sha:
+            raise CanaryError(
+                f"reviewer HEAD snapshot is missing in {phase.name}: the canary "
+                "must observe the checkout before and after the review"
+            )
         assert_reviewer_clean(
             phase.reviewer_status_porcelain,
-            phase.reviewer_before_sha or phase.reviewed_sha,
-            phase.reviewer_after_sha or phase.head_sha,
+            phase.reviewer_before_sha,
+            phase.reviewer_after_sha,
         )
 
     blocking_findings = pr_agent.parse_findings(blocking.review_text)
-    if expected_finding not in {finding.id for finding in blocking_findings}:
+    matched = [
+        finding
+        for finding in blocking_findings
+        if finding.path == CANARY_DEFECT_PATH
+        and finding.line == CANARY_DEFECT_LINE
+        and finding.severity.lower() in pr_agent.BLOCKING_SEVERITIES
+        and finding.status == "open"
+    ]
+    if not matched:
         raise CanaryError(
-            f"canary blocking defect not reported: expected finding {expected_finding!r}"
+            "canary blocking defect not reported: expected a blocking finding at "
+            f"{CANARY_DEFECT_PATH}:{CANARY_DEFECT_LINE}"
         )
+    # The live review owns the rule token, so the id must come from the
+    # parsed finding rather than a hardcoded rule name.
+    expected_finding = matched[0].id
     blocking_report = pr_agent.review_report(
         blocking_findings, blocking.reviewed_sha, blocking.head_sha, blocking.coverage
     )
@@ -406,7 +424,12 @@ def build_evidence(
 
 
 def require_evidence(evidence: Mapping[str, Any]) -> Dict[str, Any]:
-    """Fail closed when any live-proof evidence field is missing."""
+    """Fail closed when the live proof is missing or unsuccessful.
+
+    Every field must be present, ``/verify`` must have resolved the
+    blocking finding, the clean HEAD must be approved, and cleanup must
+    explicitly confirm completion (``complete...``).
+    """
 
     missing = [
         name
@@ -416,6 +439,22 @@ def require_evidence(evidence: Mapping[str, Any]) -> Dict[str, Any]:
     if missing:
         raise CanaryError(
             "incomplete canary evidence: missing " + ", ".join(sorted(missing))
+        )
+    verdict = str(evidence.get("verify_verdict") or "").strip()
+    if verdict != pr_agent.VERIFY_RESOLVED:
+        raise CanaryError(
+            f"canary evidence must prove a resolved finding, got {verdict!r}"
+        )
+    outcome = str(evidence.get("final_outcome") or "").strip()
+    if outcome != "APPROVED":
+        raise CanaryError(
+            f"canary evidence must prove an approved final outcome, got {outcome!r}"
+        )
+    cleanup = str(evidence.get("cleanup") or "").strip()
+    if not cleanup.lower().startswith("complete"):
+        raise CanaryError(
+            "canary evidence must confirm cleanup completion, got "
+            f"{cleanup!r} (expected text starting with 'complete')"
         )
     return dict(evidence)
 
@@ -484,7 +523,12 @@ def resolve_live_config(env: Mapping[str, Any]) -> Dict[str, Any]:
     assert_free_route(request_model, opencode_model)
     assert_coderabbit_untouched(str(env.get("CODERABBIT_STATUS_CONTEXT", CODERABBIT_STATUS_CONTEXT)))
     runtime = pr_agent.resolve_runtime(env)  # type: ignore[arg-type]
-    if not runtime.enabled and str(env.get("PR_AGENT_ENABLED_INPUT", "") or "").strip().lower() not in (
+    if runtime.enabled:
+        raise CanaryError(
+            "live canary requires the repository-wide PR-Agent setting to stay "
+            "disabled; enable it only through the disposable workflow `enabled` input"
+        )
+    if str(env.get("PR_AGENT_ENABLED_INPUT", "") or "").strip().lower() not in (
         "1",
         "true",
         "yes",

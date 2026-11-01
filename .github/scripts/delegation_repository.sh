@@ -112,8 +112,8 @@ parent_child_ids() {
 assert_parent_allows_child() {
   local child_id="$1"
   local child_ids lookup_rc=0
-  if ! child_ids="$(parent_child_ids)"; then
-    lookup_rc=$?
+  child_ids="$(parent_child_ids)" || lookup_rc=$?
+  if [[ "$lookup_rc" -ne 0 ]]; then
     return "$lookup_rc"
   fi
   if grep -Fxq "$child_id" <<<"$child_ids"; then

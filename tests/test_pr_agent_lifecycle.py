@@ -5625,6 +5625,19 @@ class ReviewDispositionIntegrationTests(unittest.TestCase):
             "merge",
         )
 
+    def test_safe_to_merge_requires_structural_cleanliness(self):
+        for extra in (
+            {"security_concerns": "SQL injection risk"},
+            {"tool_errors": ["reviewer crashed"]},
+            {"coverage_complete": False},
+        ):
+            with self.subTest(extra=extra):
+                review = make_review([], extra=extra)
+                self.assertEqual(
+                    run_policy("disposition", {"review": review}).get("action"),
+                    "rereview",
+                )
+
     def test_route_and_merge_gate_share_the_same_policy(self):
         review = read_repo(".github/workflows/continuum-pr-agent.yml")
         merge = read_repo(".github/workflows/continuum-pr-agent-auto-merge.yml")

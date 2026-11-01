@@ -472,6 +472,22 @@ class RenderParseTests(unittest.TestCase):
         # Machine provenance stays separate from human comments.
         self.assertNotIn("DoD", ref)
 
+    def test_indented_fence_in_issue_body_is_not_tampered(self):
+        # An indented code fence (and inline backticks) inside the issue body
+        # used to terminate the non-greedy JSON block early.
+        tricky_body = (
+            "- step\n"
+            "  ```sh\n"
+            "  echo hi\n"
+            "  ```\n"
+            "Inline ``` run and a closing ``` later.\n"
+        )
+        snapshot = build_snapshot(REPO, ISSUE, TITLE, tricky_body)
+        parsed = parse_snapshot_comment(render_snapshot_comment(snapshot))
+        self.assertIsNotNone(parsed)
+        self.assertFalse(parsed.tampered)
+        self.assertEqual(parsed.record["body"], normalize_spec_text(tricky_body))
+
     def test_digests_match_rejects_malformed(self):
         self.assertFalse(digests_match("xyz", "xyz"))
         self.assertTrue(digests_match("A" * 64, "a" * 64))

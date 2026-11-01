@@ -1069,8 +1069,46 @@ class SchedulerResumeBudgetTests(unittest.TestCase):
                     repository_owner=OWNER,
                 )
                 self.assertIn(PAUSE, issues[373].labels)
-                self.assertIn(373, result.reservations_removed)
+                # The waiting reservation is kept: lease expiry must not
+                # release it while the owner-armed resume is still gated.
+                self.assertNotIn(373, result.reservations_removed)
+                self.assertIn("automation:in-progress", issues[373].labels)
                 self.assertNotIn(373, result.dispatched)
+
+    def test_marker_wait_keeps_reservation_without_pause_on_failure(self):
+        # pause_on_failure=False must not turn lease expiry into an early
+        # dispatch before the predecessor completes.
+        config = SchedulerConfig(
+            ready_label=READY,
+            pause_label=PAUSE,
+            in_progress_label="automation:in-progress",
+            max_dispatch_attempts=2,
+            pause_on_failure=False,
+            lease_minutes=45,
+            wip_limit=2,
+        )
+        comments = self.records(
+            (marker(374)["body"], True, NOW - timedelta(hours=2)),
+            ("<!-- issue-scheduler-dispatch -->", True, NOW - timedelta(minutes=90)),
+            ("<!-- issue-scheduler-dispatch -->", True, NOW - timedelta(minutes=60)),
+        )
+        issues = self.scheduler_issue({READY, PAUSE, "automation:in-progress"})
+        result = reconcile(
+            NOW,
+            issues,
+            set(),
+            set(),
+            {373: comments},
+            {},
+            {},
+            set(),
+            config,
+            repository_owner=OWNER,
+        )
+        self.assertIn(PAUSE, issues[373].labels)
+        self.assertNotIn(373, result.reservations_removed)
+        self.assertIn("automation:in-progress", issues[373].labels)
+        self.assertNotIn(373, result.dispatched)
 
     def test_post_marker_attempts_remain_bounded(self):
         comments = self.records(

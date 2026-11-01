@@ -120,6 +120,14 @@ class CanonicalModuleTests(unittest.TestCase):
         ok, _ = safety.validate_push_destination("main", "refs/heads/main")
         self.assertFalse(ok)
 
+    def test_ref_namespace_alias_of_default_is_rejected(self):
+        # Git resolves short push destinations through ref_rev_parse_rules,
+        # so "heads/main" is the same ref as "refs/heads/main".
+        for dest in ("heads/main", "refs/tags/main", "remotes/origin/main"):
+            ok, reason = safety.validate_push_destination(dest, "main")
+            self.assertFalse(ok, dest)
+            self.assertIn("namespace", reason.lower())
+
     def test_undiscoverable_default_fails_closed(self):
         for missing in ("", "  ", None):
             ok, reason = safety.validate_push_destination(
@@ -276,6 +284,7 @@ continuum_assert_safe_push() {
   case "$dest" in HEAD|@|FETCH_HEAD|ORIG_HEAD|MERGE_HEAD) echo "refusing ambiguous push destination: $dest" >&2; return 1;; esac
   case "$dest" in *".."*|*"~"*|*"^"*|*"?"*|*"*"*|*"["*|*" "*|"-"*|"//"*|"*.lock"|*"@{"*) echo "refusing ambiguous push destination: $dest" >&2; return 1;; esac
   case "$dest" in -*|/*|*/|*.lock) echo "refusing ambiguous push destination: $dest" >&2; return 1;; esac
+  case "$dest" in refs/*|heads/*|tags/*|remotes/*) echo "refusing ref namespace push destination: $dest" >&2; return 1;; esac
   local default_branch="${CONTINUUM_TEST_DEFAULT_BRANCH:-}"
   default_branch="${default_branch#refs/heads/}"
   if [[ -z "$default_branch" ]]; then echo "refusing push: default branch is undiscoverable" >&2; return 1; fi
@@ -311,6 +320,10 @@ continuum_assert_safe_push() {
         code, _ = self._run_guard("HEAD", "main")
         self.assertNotEqual(code, 0)
         code, _ = self._run_guard("opencode/issue1-2", "")
+        self.assertNotEqual(code, 0)
+        code, _ = self._run_guard("heads/main", "main")
+        self.assertNotEqual(code, 0)
+        code, _ = self._run_guard("refs/tags/v1", "main")
         self.assertNotEqual(code, 0)
 
     def test_shell_guard_permits_task_and_checkpoint_branches(self):
