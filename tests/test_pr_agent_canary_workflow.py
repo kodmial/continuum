@@ -106,7 +106,7 @@ class ExecutableCanaryContractTests(unittest.TestCase):
         lookup_start = body.index("const findDispatchedRun = async")
         lookup = body[lookup_start:body.index("const reviewComment =", lookup_start)]
         self.assertIn("event: 'workflow_dispatch'", lookup)
-        self.assertIn("run.display_title", lookup)
+        self.assertIn("candidate.display_title", lookup)
         self.assertIn("runTitlePrefix", lookup)
         self.assertIn("runTitleSuffix", lookup)
         self.assertIn("github.rest.actions.getWorkflowRun", lookup)
