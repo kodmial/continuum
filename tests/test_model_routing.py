@@ -1426,5 +1426,16 @@ class AttestationRecoveryContractTests(unittest.TestCase):
             "&& secrets.TAP_PAT", attestation)
 
 
+class ModelRoutingE2EWorkflowIsolationTests(unittest.TestCase):
+    """Keep persisted route state isolated between live E2E attempts."""
+
+    def test_profile_is_unique_per_attempt_and_shared_across_both_runners(self):
+        workflow = (PATH.parents[2] /
+                    ".github/workflows/continuum-model-routing-e2e.yml").read_text()
+        profile = "work-lock-66-e2e-${{ github.run_id }}-${{ github.run_attempt }}"
+        self.assertEqual(workflow.count("profile: " + profile), 3)
+        self.assertNotIn("profile: work-lock-66-e2e\n", workflow)
+
+
 if __name__ == "__main__":
     unittest.main()
