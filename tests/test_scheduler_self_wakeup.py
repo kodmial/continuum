@@ -704,6 +704,10 @@ class InstallUpgradeTests(unittest.TestCase):
          github.event.comment.body == '/opencode' ||
          startsWith(github.event.comment.body, '/oc ') ||
          startsWith(github.event.comment.body, '/opencode ') ||
+         startsWith(github.event.comment.body, fromJSON('"/oc\\t"')) ||
+         startsWith(github.event.comment.body, fromJSON('"/opencode\\t"')) ||
+         startsWith(github.event.comment.body, fromJSON('"/oc\\r\\n"')) ||
+         startsWith(github.event.comment.body, fromJSON('"/opencode\\r\\n"')) ||
          startsWith(github.event.comment.body, fromJSON('"/oc\\n"')) ||
          startsWith(github.event.comment.body, fromJSON('"/opencode\\n"'))) &&
         !contains(github.event.comment.body, '<!-- issue-scheduler-dispatch -->') &&

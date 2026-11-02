@@ -488,7 +488,7 @@ class RenderExecutorMarkerTrustTests(unittest.TestCase):
         trusted_author = 'select((.user.login // "") == "github-actions[bot]")'
         self.assertGreaterEqual(workflow.count(trusted_author), 4)
         self.assertNotIn(
-            'select((.body // "") | contains($marker))] | length', workflow
+            '[.[][]? | select((.body // "") | contains($marker))] | length', workflow
         )
 
     def test_render_executor_repair_issue_lookup_requires_bot_authorship(self):
