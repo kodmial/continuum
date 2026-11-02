@@ -346,9 +346,14 @@ jobs:
           - os: ubuntu-latest
             with:
               cache: enabled
+            run: |
+              echo "with: a repeated key inside a literal block"
+              echo "matrix: include"
           - os: macos-latest
             with:
               cache: disabled
+            run: |
+              echo "steps: still inside the sequence item"
     steps:
       - uses: actions/checkout@v4
         with:
