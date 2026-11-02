@@ -1405,7 +1405,8 @@ jobs:
                       pr_number: String(prNumber),
                       head_ref: fresh.head.ref,
                       conflict_strategy: 'merge',
-                      timeout_minutes: '60',
+                    // The installed caller stub does not declare timeout_minutes;
+                    // let the reusable engine apply its configured/default runtime.
                     },
                   }
                 );
