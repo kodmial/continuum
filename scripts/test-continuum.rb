@@ -5141,6 +5141,7 @@ class ContinuumTest < Minitest::Test
       knowledge_records_dir issue_commit_prefix
       pause_marker max_dispatch_attempts pause_on_failure ci_repair_label
       packaging_repair_label capability_number qualification_number required_sha
+      timeout_minutes
       recovery_operation_id recovery_checkpoint_ref recovery_checkpoint_sha
       recovery_stage recovery_generation
     ],
@@ -5149,7 +5150,7 @@ class ContinuumTest < Minitest::Test
       head_ref_pattern auto_merge_workflow opencode_workflow ci_repair_workflows
     ],
     'continuum-coderabbit-unresolved.yml' => %w[
-      continuum_ref review_provider opencode_workflow
+      continuum_ref review_provider pr_number opencode_workflow
     ],
     'continuum-pr-agent-recovery.yml' => %w[continuum_ref target_child_id max_executions],
     'continuum-pr-agent-canary.yml' => %w[
@@ -5174,6 +5175,21 @@ class ContinuumTest < Minitest::Test
     ],
     'continuum-remove-review-label.yml' => %w[continuum_ref]
   }.freeze
+
+  def test_opencode_stub_declares_and_forwards_timeout_minutes_within_dispatch_limit
+    stub = yaml(File.join(ROOT, '.github/caller-stubs/continuum-opencode.yml'))
+    dispatch_inputs = events(stub).fetch('workflow_dispatch').fetch('inputs')
+    assert_equal 25, dispatch_inputs.size,
+                 'the OpenCode caller must stay within GitHub workflow_dispatch input limit'
+    timeout = dispatch_inputs.fetch('timeout_minutes')
+    assert_equal false, timeout.fetch('required')
+    assert_equal 'string', timeout.fetch('type')
+    call = stub.fetch('jobs').fetch('call').fetch('with')
+    assert_equal '${{ inputs.timeout_minutes }}', call.fetch('timeout_minutes')
+    engine = yaml(File.join(ROOT, '.github/workflows/continuum-opencode.yml'))
+    engine_inputs = events(engine).fetch('workflow_call').fetch('inputs')
+    assert_equal '', engine_inputs.fetch('timeout_minutes').fetch('default')
+  end
 
   # A stub that pins an input to a literal overrides the consumer's own
   # `vars.AUTOMATION_*` / `vars.CONTINUUM_*` value for every installed caller:

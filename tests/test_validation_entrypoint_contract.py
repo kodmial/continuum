@@ -8,6 +8,7 @@ GATE = ROOT / ".github/workflows/contract-gate.yml"
 QUALIFICATION = ROOT / ".github/workflows/continuum-contract-qualification.yml"
 VALIDATE = ROOT / "scripts/validate-continuum.sh"
 ENTRYPOINT = "bash scripts/validate-continuum.sh"
+SAMPLE_CI = ROOT / "examples/minimal-consumer/.github/workflows/ci.yml"
 ACTIONLINT_INSTALLER_SHA256 = (
     "72fa3e45ac20f3c3a512d6747b4fcf719e21f890e8c43e78d48a41fdfb900c4e"
 )
@@ -57,6 +58,21 @@ class ValidationEntrypointContractTest(unittest.TestCase):
             body.index('bash "$actionlint_installer"'),
             "the checksum must be verified before the installer runs",
         )
+
+    def test_minimal_consumer_uses_current_main_and_skips_writes_for_read_only_prs(self):
+        body = SAMPLE_CI.read_text(encoding="utf-8")
+        self.assertIn(
+            "uses: kodmial/continuum/.github/workflows/continuum-validation.yml@main",
+            body,
+        )
+        self.assertIn("continuum_ref: main", body)
+        read_only_expression = (
+            "${{ github.event_name == 'pull_request' && "
+            "(github.event.pull_request.head.repo.fork || github.actor == 'dependabot[bot]') "
+            "&& 'false' || 'true' }}"
+        )
+        self.assertIn(f"publish_status: {read_only_expression}", body)
+        self.assertIn(f"dispatch_repair: {read_only_expression}", body)
 
     def test_contract_gate_does_not_inherit_unused_secrets(self):
         body = GATE.read_text(encoding="utf-8")

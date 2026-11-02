@@ -668,6 +668,7 @@ jobs:
           REQUIRED_WORKFLOW_GATE_LABEL: ${{ inputs.required_workflow_gate_label || vars.CONTINUUM_REQUIRED_WORKFLOW_GATE_LABEL || '' }}
           REQUIRED_WORKFLOW_GATE_NAME: ${{ inputs.required_workflow_gate_name || vars.CONTINUUM_REQUIRED_WORKFLOW_GATE_NAME || '' }}
           TARGET_CHILD_ID: ${{ inputs.target_child_id }}
+          OPENCODE_WORKFLOW: ${{ vars.CONTINUUM_OPENCODE_WORKFLOW || 'continuum-opencode.yml' }}
         with:
           github-token: ${{ secrets.TAP_PAT }}
           script: |
@@ -1386,12 +1387,18 @@ jobs:
                   );
                   return;
                 }
+                const opencodeWorkflow = String(
+                  process.env.OPENCODE_WORKFLOW || 'continuum-opencode.yml'
+                ).trim();
+                if (!/^[A-Za-z0-9_.-]+\.ya?ml$/i.test(opencodeWorkflow)) {
+                  throw new Error('Invalid configured OpenCode caller workflow: ' + opencodeWorkflow);
+                }
                 await github.request(
                   'POST /repos/{owner}/{repo}/actions/workflows/{workflow_id}/dispatches',
                   {
                     owner,
                     repo,
-                    workflow_id: 'continuum-opencode.yml',
+                    workflow_id: opencodeWorkflow,
                     ref: defaultBranch,
                     inputs: {
                       mode: 'resolve-conflict',

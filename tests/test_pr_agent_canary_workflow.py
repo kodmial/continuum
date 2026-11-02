@@ -101,6 +101,18 @@ class ExecutableCanaryContractTests(unittest.TestCase):
         self.assertNotIn("coderabbit", body.lower())
         self.assertIn("correct disposable", body)
 
+    def test_review_run_lookup_uses_exact_dispatch_title_and_pre_command_baseline(self):
+        body = WORKFLOW.read_text(encoding="utf-8")
+        lookup = body.split("const prAgentRuns = async", 1)[1].split(";", 1)[0]
+        self.assertIn("event: 'workflow_dispatch'", lookup)
+        self.assertIn("run.display_title", lookup)
+        self.assertIn("runTitlePrefix", lookup)
+        self.assertIn("runTitleSuffix", lookup)
+        self.assertNotIn("branch,", lookup)
+        before = body.index("const before = new Set((await prAgentRuns()).map((run) => run.id));")
+        comment = body.index("const reviewComment = await github.rest.issues.createComment")
+        self.assertLess(before, comment)
+
     def test_cleanup_and_evidence(self):
         body = WORKFLOW.read_text(encoding="utf-8")
         self.assertIn("state: 'closed'", body)

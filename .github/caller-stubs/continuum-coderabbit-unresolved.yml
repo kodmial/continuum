@@ -9,6 +9,11 @@ on:
   # than pinning one on every installed caller.
   workflow_dispatch:
     inputs:
+      pr_number:
+        description: "Pull request number to reconcile"
+        required: false
+        default: ''
+        type: string
       opencode_workflow:
         description: >-
           OpenCode caller workflow that receives the batched repair. Empty
@@ -32,4 +37,5 @@ jobs:
     secrets: inherit
     with:
       continuum_ref: main
+      pr_number: "${{ inputs.pr_number }}"
       opencode_workflow: "${{ inputs.opencode_workflow }}"

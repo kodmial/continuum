@@ -335,9 +335,15 @@ jobs:
             // one page (no full-history pagination) answers every poll.
             // Each waitFor poll below therefore costs one request instead
             // of a history-sized scan.
+            const runTitlePrefix = `PR-Agent PR #${prNumber} [review:`;
+            const runTitleSuffix = `head=${head}`;
             const prAgentRuns = async () => (await github.rest.actions.listWorkflowRunsForRepo({
-              owner, repo, per_page: 50, page: 1, branch,
-            })).data.workflow_runs.filter((run) => run.name === 'PR Agent (OpenCode backend)');
+              owner, repo, per_page: 50, page: 1, event: 'workflow_dispatch',
+            })).data.workflow_runs.filter((run) =>
+              run.name === 'PR Agent (OpenCode backend)' &&
+              String(run.display_title || '').startsWith(runTitlePrefix) &&
+              String(run.display_title || '').endsWith(runTitleSuffix)
+            );
 
             try {
               sh(`git checkout -b "${branch}"`);
@@ -368,6 +374,9 @@ jobs:
               let head = pr.data.head.sha;
               core.setOutput('blocking_sha', head);
 
+              // Snapshot existing runs before /review can dispatch a new one;
+              // the caller runs on the default branch, not the disposable PR branch.
+              const before = new Set((await prAgentRuns()).map((run) => run.id));
               const reviewComment = await github.rest.issues.createComment({
                 owner, repo, issue_number: prNumber,
                 // Continuum comment attribution (kodmial/continuum#258): the
@@ -384,8 +393,7 @@ jobs:
               core.setOutput('review_command_id', String(reviewCommandId));
 
               // The /review comment fans out into the event-driven review
-              // provider. Wait for its run, then for its GitHub output.
-              const before = new Set((await prAgentRuns()).map((run) => run.id));
+              // provider. Wait for the exact PR/head dispatch, then its GitHub output.
               await waitFor(async () => {
                 const runs = (await prAgentRuns()).filter((run) => !before.has(run.id));
                 return runs.find((run) => run.status === 'completed') || null;

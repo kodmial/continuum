@@ -61,6 +61,7 @@ jobs:
       OPENCODE_MODEL_COOLDOWN: ${{ vars.OPENCODE_MODEL_COOLDOWN || '900' }}
       OPENCODE_PROBE_TIMEOUT: ${{ vars.OPENCODE_PROBE_TIMEOUT || '90' }}
       MAX_REVIEW_PASSES: ${{ inputs.max_review_passes }}
+      OPENCODE_CONFIG_CONTENT: '{"permission":{"bash":{"*":"allow","git *":"allow","git push *":"deny"}}}'
     steps:
       - name: Checkout parent control plane
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262

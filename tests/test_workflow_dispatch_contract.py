@@ -19,6 +19,9 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 TMP_PARENT = ROOT / ".opencode-tmp"
 WORKFLOW = ROOT / ".github/workflows/continuum-auto-merge.yml"
+PR_AGENT_AUTO_MERGE = ROOT / ".github/workflows/continuum-pr-agent-auto-merge.yml"
+OPENCODE_STUB = ROOT / ".github/caller-stubs/continuum-opencode.yml"
+OPENCODE_ENGINE = ROOT / ".github/workflows/continuum-opencode.yml"
 
 FUNCTION = re.compile(
     r"(?ms)^(?P<indent>[ \t]*)function parseWorkflowDispatchContract"
@@ -190,6 +193,27 @@ permissions: {}
             [{"name": "crlf", "text": text, "requiredInputs": ["pr_number"]}]
         )
         self.assertTrue(result["crlf"]["ok"], result["crlf"])
+
+    def test_conflict_repair_uses_configured_caller_and_declared_timeout(self):
+        workflow = PR_AGENT_AUTO_MERGE.read_text(encoding="utf-8")
+        self.assertIn(
+            "OPENCODE_WORKFLOW: ${{ vars.CONTINUUM_OPENCODE_WORKFLOW || 'continuum-opencode.yml' }}",
+            workflow,
+        )
+        self.assertIn("const opencodeWorkflow = String(", workflow)
+        self.assertIn("workflow_id: opencodeWorkflow", workflow)
+        self.assertIn("timeout_minutes: '60'", workflow)
+
+        stub = OPENCODE_STUB.read_text(encoding="utf-8")
+        dispatch = stub.split("workflow_dispatch:", 1)[1].split("\npermissions:", 1)[0]
+        inputs = re.findall(r"^      ([A-Za-z0-9_]+):\s*$", dispatch, re.M)
+        self.assertLessEqual(len(inputs), 25)
+        self.assertIn("timeout_minutes", inputs)
+        self.assertIn('timeout_minutes: "${{ inputs.timeout_minutes }}"', stub)
+
+        engine = OPENCODE_ENGINE.read_text(encoding="utf-8")
+        workflow_call = engine.split("workflow_call:", 1)[1].split("\njobs:", 1)[0]
+        self.assertIn("timeout_minutes:", workflow_call)
 
     def test_all_reconciliation_dispatches_use_one_gate(self):
         text = WORKFLOW.read_text(encoding="utf-8")

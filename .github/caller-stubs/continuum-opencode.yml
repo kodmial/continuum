@@ -120,6 +120,10 @@ on:
         description: "Packaging repair in-flight lock label"
         required: false
         type: string
+      timeout_minutes:
+        description: "Maximum OpenCode job runtime in minutes"
+        required: false
+        type: string
       capability_number:
         description: "Capability issue number for qualification mode"
         required: false
@@ -163,6 +167,7 @@ jobs:
       unresolved_items_json: "${{ inputs.unresolved_items_json }}"
       run_id: "${{ inputs.run_id }}"
       ci_workflow_id: "${{ inputs.ci_workflow_id }}"
+      timeout_minutes: "${{ inputs.timeout_minutes }}"
       base_ref: "${{ inputs.base_ref }}"
       knowledge_protocol_path: "${{ inputs.knowledge_protocol_path }}"
       knowledge_records_dir: "${{ inputs.knowledge_records_dir }}"

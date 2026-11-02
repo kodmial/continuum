@@ -15,6 +15,7 @@ OPENCODE = ROOT / ".github/workflows/continuum-opencode.yml"
 LEGACY = ROOT / ".github/workflows/continuum-opencode-unresolved.yml"
 INSTALLER = ROOT / "install.sh"
 STUB = ROOT / ".github/caller-stubs/continuum-opencode.yml"
+CALLER_STUB = ROOT / ".github/caller-stubs/continuum-coderabbit-unresolved.yml"
 
 
 def js_for_step(workflow, step_name):
@@ -49,6 +50,13 @@ class CodeRabbitBatchContractTests(unittest.TestCase):
         self.assertIn("Ask CodeRabbit to verify every original finding", canonical)
         self.assertIn("UNRESOLVED_ITEMS_JSON", canonical)
         self.assertIn("unresolved_items_json:", STUB.read_text(encoding="utf-8"))
+
+    def test_installed_caller_declares_and_forwards_pr_number_for_reconciliation(self):
+        caller = CALLER_STUB.read_text(encoding="utf-8")
+        dispatch = caller.split("workflow_dispatch:", 1)[1].split("\npermissions:", 1)[0]
+        self.assertIn("      pr_number:", dispatch)
+        self.assertIn('      pr_number: "${{ inputs.pr_number }}"', caller)
+        self.assertIn("      pr_number:", BATCHER.read_text(encoding="utf-8"))
 
     def test_old_handler_is_a_migration_shim_not_a_competing_owner(self):
         legacy = LEGACY.read_text(encoding="utf-8")
