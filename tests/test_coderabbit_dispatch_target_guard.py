@@ -23,6 +23,8 @@ WORKFLOWS = {
     "continuum-auto-merge.yml": ROOT / ".github/workflows/continuum-auto-merge.yml",
     "continuum-add-review-label.yml":
         ROOT / ".github/workflows/continuum-add-review-label.yml",
+    "continuum-pr-agent-auto-merge.yml":
+        ROOT / ".github/workflows/continuum-pr-agent-auto-merge.yml",
 }
 
 FUNCTION = re.compile(
@@ -216,6 +218,53 @@ class DispatchTargetGuardTests(unittest.TestCase):
         self.assertEqual(
             "continuum-auto-merge.yml", result["auto-merge"]["value"]
         )
+
+    def test_pr_agent_conflict_repair_targets_share_the_guard(self):
+        cases = [
+            {
+                "name": "local-default",
+                "configured": "",
+                "fallback": "continuum-opencode.yml",
+                "label": "OpenCode",
+            },
+            {
+                "name": "delegated-default",
+                "configured": "",
+                "fallback": "continuum-pr-agent-repair.yml",
+                "label": "PR-Agent repair",
+            },
+            {
+                "name": "configured",
+                "configured": "opencode.yml",
+                "fallback": "continuum-opencode.yml",
+                "label": "OpenCode",
+            },
+            {
+                "name": "slash",
+                "configured": "nested/opencode.yml",
+                "fallback": "continuum-opencode.yml",
+                "label": "OpenCode",
+            },
+            {
+                "name": "traversal",
+                "configured": "opencode..repair.yml",
+                "fallback": "continuum-pr-agent-repair.yml",
+                "label": "PR-Agent repair",
+            },
+        ]
+        result = self.resolve(
+            WORKFLOWS["continuum-pr-agent-auto-merge.yml"], cases
+        )
+        self.assertEqual(
+            "continuum-opencode.yml", result["local-default"]["value"]
+        )
+        self.assertEqual(
+            "continuum-pr-agent-repair.yml",
+            result["delegated-default"]["value"],
+        )
+        self.assertEqual("opencode.yml", result["configured"]["value"])
+        self.assert_rejected(result, "slash", "OpenCode")
+        self.assert_rejected(result, "traversal", "PR-Agent repair")
 
     def test_a_valid_configured_name_is_used(self):
         cases = [

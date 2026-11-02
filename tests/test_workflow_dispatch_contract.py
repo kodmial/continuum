@@ -19,13 +19,56 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 TMP_PARENT = ROOT / ".opencode-tmp"
 WORKFLOW = ROOT / ".github/workflows/continuum-auto-merge.yml"
-PR_AGENT_AUTO_MERGE = ROOT / ".github/workflows/continuum-pr-agent-auto-merge.yml"
+PR_AGENT_WORKFLOW = (
+    ROOT / ".github/workflows/continuum-pr-agent-auto-merge.yml"
+)
 OPENCODE_STUB = ROOT / ".github/caller-stubs/continuum-opencode.yml"
+PR_AGENT_REPAIR_STUB = (
+    ROOT / ".github/caller-stubs/continuum-pr-agent-repair.yml"
+)
 
 FUNCTION = re.compile(
     r"(?ms)^(?P<indent>[ \t]*)function parseWorkflowDispatchContract"
     r"\(text, label, requiredInputs = \[\]\) \{\n.*?^(?P=indent)\}\n"
 )
+
+SUPPORT = re.compile(
+    r"(?ms)^(?P<indent>[ \t]*)async function reconciliationDispatchSupport"
+    r"\(.*?^(?P=indent)\}\n"
+)
+
+SUPPORT_HARNESS = r"""
+const fs = require('fs');
+const source = fs.readFileSync(process.argv[2], 'utf8');
+const payload = JSON.parse(process.argv[3]);
+const github = {
+  rest: {
+    repos: {
+      getContent: async () => {
+        if (payload.error) {
+          const err = new Error(payload.error.message);
+          err.status = payload.error.status;
+          throw err;
+        }
+        return { data: payload.data };
+      },
+    },
+  },
+};
+const support = new Function(
+  'github',
+  source + '\nreturn reconciliationDispatchSupport;'
+)(github);
+support('owner', 'repo', payload.workflow, 'main', payload.required)
+  .then(value => {
+    process.stdout.write(JSON.stringify({ ok: true, value }));
+  })
+  .catch(err => {
+    process.stdout.write(
+      JSON.stringify({ ok: false, error: String(err.message || err) })
+    );
+  });
+"""
 
 HARNESS = r"""
 const fs = require('fs');
@@ -193,24 +236,49 @@ permissions: {}
         )
         self.assertTrue(result["crlf"]["ok"], result["crlf"])
 
-    def test_conflict_repair_uses_configured_caller_without_undeclared_inputs(self):
-        workflow = PR_AGENT_AUTO_MERGE.read_text(encoding="utf-8")
+    def test_conflict_repair_uses_configured_callers_without_undeclared_inputs(self):
+        workflow = PR_AGENT_WORKFLOW.read_text(encoding="utf-8")
         self.assertIn(
-            "OPENCODE_WORKFLOW: ${{ vars.CONTINUUM_OPENCODE_WORKFLOW || 'continuum-opencode.yml' }}",
+            "OPENCODE_WORKFLOW: ${{ inputs.opencode_workflow || "
+            "vars.CONTINUUM_OPENCODE_WORKFLOW || 'continuum-opencode.yml' }}",
             workflow,
         )
-        self.assertIn("const opencodeWorkflow = String(", workflow)
-        self.assertIn("workflow_id: opencodeWorkflow", workflow)
-        self.assertIn("if (opencodeWorkflow === 'opencode.yml')", workflow)
+        self.assertIn(
+            "PR_AGENT_REPAIR_WORKFLOW: ${{ inputs.repair_workflow || "
+            "vars.CONTINUUM_PR_AGENT_REPAIR_WORKFLOW || "
+            "'continuum-pr-agent-repair.yml' }}",
+            workflow,
+        )
+        self.assertIn("resolveDispatchWorkflow(", workflow)
+        self.assertEqual(2, workflow.count("workflow_id: repairWorkflow"))
+        self.assertIn("if (repairWorkflow === 'opencode.yml')", workflow)
+        self.assertIn(
+            "? ['mode', 'pr_number', 'head_ref', 'conflict_strategy', "
+            "'timeout_minutes']",
+            workflow,
+            'the dogfood timeout input must be part of the dispatch contract',
+        )
         self.assertIn("dispatchInputs.timeout_minutes = '60'", workflow)
         self.assertIn("inputs: dispatchInputs", workflow)
-        self.assertNotIn("timeout_minutes:", workflow.split("inputs: dispatchInputs", 1)[0].split("const dispatchInputs", 1)[1])
+        dispatch_payload = workflow.split("const dispatchInputs", 1)[1].split(
+            "inputs: dispatchInputs", 1
+        )[0]
+        self.assertNotIn("timeout_minutes:", dispatch_payload.split(
+            "if (repairWorkflow === 'opencode.yml')", 1
+        )[0])
 
-        stub = OPENCODE_STUB.read_text(encoding="utf-8")
-        dispatch = stub.split("workflow_dispatch:", 1)[1].split("\npermissions:", 1)[0]
-        inputs = re.findall(r"^      ([A-Za-z0-9_]+):\s*$", dispatch, re.M)
-        self.assertEqual(24, len(inputs))
-        self.assertNotIn("timeout_minutes", inputs)
+        for stub_path, expected_inputs in (
+            (OPENCODE_STUB, 24),
+            (PR_AGENT_REPAIR_STUB, None),
+        ):
+            stub = stub_path.read_text(encoding="utf-8")
+            dispatch = stub.split("workflow_dispatch:", 1)[1].split(
+                "\npermissions:", 1
+            )[0]
+            inputs = re.findall(r"^      ([A-Za-z0-9_]+):\s*$", dispatch, re.M)
+            if expected_inputs is not None:
+                self.assertEqual(expected_inputs, len(inputs))
+            self.assertNotIn("timeout_minutes", inputs)
 
     def test_all_reconciliation_dispatches_use_one_gate(self):
         text = WORKFLOW.read_text(encoding="utf-8")
@@ -218,6 +286,105 @@ permissions: {}
         self.assertEqual(text.count("async function reconciliationDispatchSupport("), 1)
         self.assertEqual(text.count("await reconciliationDispatchSupport("), 4)
         self.assertIn("return parseWorkflowDispatchContract(", text)
+
+        pr_agent = PR_AGENT_WORKFLOW.read_text(encoding="utf-8")
+        self.assertEqual(
+            pr_agent.count("function parseWorkflowDispatchContract("), 1
+        )
+        self.assertEqual(
+            pr_agent.count("async function reconciliationDispatchSupport("), 1
+        )
+        self.assertEqual(
+            pr_agent.count("await reconciliationDispatchSupport("), 1
+        )
+        self.assertIn("return parseWorkflowDispatchContract(", pr_agent)
+
+    def support(self, workflow, payload):
+        text = workflow.read_text(encoding="utf-8")
+        parser = FUNCTION.findall(text)
+        support = SUPPORT.findall(text)
+        self.assertEqual(len(parser), 1, "expected one parse function")
+        self.assertEqual(len(support), 1, "expected one support function")
+        source = self.workdir / "support.js"
+        source.write_text(
+            FUNCTION.search(text).group(0) + "\n" + SUPPORT.search(text).group(0),
+            encoding="utf-8",
+        )
+        harness = self.workdir / "support-harness.js"
+        harness.write_text(SUPPORT_HARNESS, encoding="utf-8")
+        completed = subprocess.run(
+            ["node", str(harness), str(source), json.dumps(payload)],
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        return json.loads(completed.stdout)
+
+    def test_dispatch_support_skips_a_missing_caller(self):
+        result = self.support(
+            PR_AGENT_WORKFLOW,
+            {
+                "workflow": "continuum-opencode.yml",
+                "required": ["mode"],
+                "error": {"status": 404, "message": "Not Found"},
+            },
+        )
+        self.assertTrue(result["ok"], result)
+        self.assertFalse(result["value"]["ok"])
+        self.assertIn("is not present on the dispatch ref", result["value"]["reason"])
+
+    def test_dispatch_support_skips_an_unreadable_entry(self):
+        result = self.support(
+            PR_AGENT_WORKFLOW,
+            {
+                "workflow": "continuum-opencode.yml",
+                "required": ["mode"],
+                "data": {"type": "dir", "content": ""},
+            },
+        )
+        self.assertFalse(result["value"]["ok"])
+        self.assertIn("is not a readable workflow file", result["value"]["reason"])
+
+    def test_dispatch_support_rethrows_non_404_read_errors(self):
+        result = self.support(
+            PR_AGENT_WORKFLOW,
+            {
+                "workflow": "continuum-opencode.yml",
+                "required": ["mode"],
+                "error": {"status": 500, "message": "server error"},
+            },
+        )
+        self.assertFalse(result["ok"], result)
+        self.assertIn("server error", result["error"])
+
+    def test_dispatch_support_requires_declared_inputs(self):
+        import base64
+
+        body = (
+            "on:\n  workflow_dispatch:\n    inputs:\n"
+            "      mode:\n        type: string\npermissions: {}\n"
+        )
+        encoded = base64.b64encode(body.encode("utf-8")).decode("ascii")
+        missing = self.support(
+            PR_AGENT_WORKFLOW,
+            {
+                "workflow": "continuum-opencode.yml",
+                "required": ["mode", "pr_number"],
+                "data": {"type": "file", "content": encoded},
+            },
+        )
+        self.assertFalse(missing["value"]["ok"])
+        self.assertIn("pr_number", missing["value"]["reason"])
+        present = self.support(
+            PR_AGENT_WORKFLOW,
+            {
+                "workflow": "continuum-opencode.yml",
+                "required": ["mode"],
+                "data": {"type": "file", "content": encoded},
+            },
+        )
+        self.assertTrue(present["value"]["ok"], present)
 
 
 if __name__ == "__main__":

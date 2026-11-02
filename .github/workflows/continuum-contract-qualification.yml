@@ -197,6 +197,8 @@ jobs:
           PY
           PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=src python3 - <<'PY'
           import os
+          from datetime import datetime, timezone
+          from continuum import contract_observation as observation
           from continuum import contract_qualification as contract
           # A deliberately broken lifecycle change is rejected: red/stale
           # evidence on the exact HEAD never passes Layer 1.
@@ -234,6 +236,62 @@ jobs:
           for provider in ("none", "coderabbit", "pr-agent"):
               allowed, _ = contract.merge_path_allowed(head, [], provider)
               assert not allowed, provider
+          # Reservation lifecycle contract. Qualification cannot create real
+          # issues (that would mutate the target repository), so this is the
+          # equivalent probe: the same observe_reservation -> liveness path
+          # that production uses, driven by deterministic state snapshots for
+          # create, release, expire, terminal-worker and stranded phases.
+          now = datetime(2030, 1, 1, tzinfo=timezone.utc)
+          reserved_issue = {
+              "number": 1,
+              "state": "open",
+              "labels": [{"name": contract.IN_PROGRESS_LABEL}],
+              "created_at": "2029-12-31T23:00:00Z",
+              "updated_at": "2029-12-31T23:59:00Z",
+          }
+          live_run = {
+              "databaseId": 9,
+              "status": "in_progress",
+              "created_at": "2029-12-31T23:59:00Z",
+              "head_branch": "opencode/issue1-fix",
+          }
+          expired_run = dict(live_run, created_at="2029-12-31T20:00:00Z")
+          terminal_run = {
+              "databaseId": 10,
+              "status": "completed",
+              "conclusion": "failure",
+              "name": "OpenCode worker",
+              "created_at": "2029-12-31T23:59:00Z",
+              "head_branch": "opencode/issue1-fix",
+          }
+          merged_pr = {
+              "number": 5,
+              "state": "closed",
+              "merged_at": "2029-12-31T23:59:00Z",
+              "body": "Closes #1",
+          }
+
+          def lifecycle_outcome(issue_state, runs=(), pulls=()):
+              return contract.evaluate_reservation_liveness(
+                  observation.observe_reservation(
+                      issue_state, runs, pulls, now=now
+                  )
+              ).outcome
+
+          assert lifecycle_outcome(reserved_issue, [live_run]) == "progress", "create"
+          released = dict(reserved_issue, labels=[])
+          assert lifecycle_outcome(released, []) == "progress", "release"
+          assert lifecycle_outcome(reserved_issue, [expired_run]) == "recover", "expire"
+          assert lifecycle_outcome(reserved_issue, [terminal_run]) == "recover", "terminal"
+          assert lifecycle_outcome(reserved_issue, []) == "error", "stranded"
+          assert lifecycle_outcome(reserved_issue, [], [merged_pr]) == "error", "merged-pr"
+          stages = contract.lifecycle_path_stages()
+          assert contract.progress_events_cover_lifecycle(
+              {stage: True for stage in stages}
+          )[0], "full lifecycle must be covered"
+          assert not contract.progress_events_cover_lifecycle(
+              {stages[0]: True}
+          )[0], "a partial lifecycle must be rejected"
           print("Layer 2 lifecycle probe passed for HEAD", head)
           PY
 

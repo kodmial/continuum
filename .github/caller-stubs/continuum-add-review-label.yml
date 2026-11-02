@@ -24,6 +24,13 @@ on:
         required: false
         default: ''
         type: string
+      head_sha:
+        description: >-
+          Commit to reconcile when this stub is run manually. The workflow_run
+          trigger supplies it automatically; a manual run must pass it.
+        required: false
+        default: ''
+        type: string
 
 permissions:
   actions: write
@@ -44,3 +51,4 @@ jobs:
       continuum_ref: main
       coderabbit_retry_workflow: "${{ inputs.coderabbit_retry_workflow }}"
       auto_merge_workflow: "${{ inputs.auto_merge_workflow }}"
+      head_sha: "${{ inputs.head_sha }}"

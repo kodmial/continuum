@@ -320,7 +320,8 @@ class PrAgentTargetWorkflowContractTests(unittest.TestCase):
         # Delegated conflicts dispatch target-aware repair in the parent
         # execution repository with the opaque child id; the repair
         # workflow resolves the child target runner-local.
-        self.assertIn("workflow_id: 'continuum-pr-agent-repair.yml'", body)
+        self.assertIn("workflow_id: repairWorkflow", body)
+        self.assertIn("'continuum-pr-agent-repair.yml'", body)
         self.assertIn("target_child_id: targetChildId", body)
 
     def test_recovery_reads_target_but_dispatches_parent_workflow(self):
@@ -623,7 +624,8 @@ class PrAgentTargetWorkflowContractTests(unittest.TestCase):
         start = body.index("async function dispatchConflictRepair")
         end = body.index("async function syncFromMain", start)
         window = body[start:end]
-        self.assertIn("workflow_id: 'continuum-pr-agent-repair.yml'", window)
+        self.assertIn("workflow_id: repairWorkflow", window)
+        self.assertIn("'continuum-pr-agent-repair.yml'", window)
         self.assertIn("target_child_id: targetChildId", window)
         # Like recovery/wakeup: a 422 naming the opaque input fails closed
         # explicitly; any other dispatch error rethrows transiently so the
@@ -678,7 +680,8 @@ class PrAgentTargetWorkflowContractTests(unittest.TestCase):
         # Privacy: delegated conflict repair dispatches target-aware in the
         # parent execution repository with the opaque child id, never a
         # target-local run in the child.
-        self.assertIn("workflow_id: 'continuum-pr-agent-repair.yml'", body)
+        self.assertIn("workflow_id: repairWorkflow", body)
+        self.assertIn("'continuum-pr-agent-repair.yml'", body)
         self.assertIn("target_child_id: targetChildId", body)
         self.assertIn("dispatched delegated conflict repair via parent", body)
 

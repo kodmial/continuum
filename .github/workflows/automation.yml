@@ -54,8 +54,12 @@ jobs:
       github.event_name == 'issues' ||
       (github.event_name == 'issue_comment' &&
        github.actor == github.repository_owner &&
-       (startsWith(github.event.comment.body, '/oc') ||
-        startsWith(github.event.comment.body, '/opencode')) &&
+       (github.event.comment.body == '/oc' ||
+        github.event.comment.body == '/opencode' ||
+        startsWith(github.event.comment.body, '/oc ') ||
+        startsWith(github.event.comment.body, '/opencode ') ||
+        startsWith(github.event.comment.body, fromJSON('"/oc\n"')) ||
+        startsWith(github.event.comment.body, fromJSON('"/opencode\n"'))) &&
        !contains(github.event.comment.body, '<!-- issue-scheduler-dispatch -->') &&
        !contains(github.event.comment.body, '<!-- continuum-origin role=continuum component=opencode-watchdog -->')) ||
       (github.event_name == 'pull_request_target' && github.event.action == 'closed') ||
@@ -120,9 +124,12 @@ jobs:
   # CI, merge, or retry semantics. Reuses the existing 17,47 safety-net slot
   # and manual dispatch; no new cron. Consumer names never reach logs.
   global-pr-watchdog:
+    # A manual dispatch is not automatically a periodic wake: only the
+    # explicit `periodic_wake=true` signal (or the 17,47 cron slot) may spend
+    # the cross-repository TAP_PAT on the global watchdog.
     if: >-
-      github.event_name == 'workflow_dispatch' ||
-      (github.event_name == 'schedule' && github.event.schedule == '17,47 * * * *')
+      (github.event_name == 'schedule' && github.event.schedule == '17,47 * * * *') ||
+      (github.event_name == 'workflow_dispatch' && inputs.periodic_wake == 'true')
     runs-on: ubuntu-latest
     timeout-minutes: 15
     concurrency:

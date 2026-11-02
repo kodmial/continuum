@@ -9,6 +9,7 @@ tests never mirror a hand-written approximation of the decision.
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import subprocess
@@ -231,6 +232,13 @@ class GitHubExpression:
             if name == "startsWith":
                 return haystack.startswith(needle)
             return needle in haystack
+        if name == "fromJSON" and len(args) == 1:
+            try:
+                return json.loads(args[0])
+            except (TypeError, ValueError) as error:
+                raise ExpressionError(
+                    "fromJSON argument is not valid JSON: {!r}".format(args[0])
+                ) from error
         raise ExpressionError("unsupported function {!r}".format(name))
 
     @staticmethod
@@ -357,6 +365,20 @@ class ActualSchedulerConditionTests(unittest.TestCase):
                 event_context(
                     "issue_comment",
                     comment=comment("/opencode\n\n" + DISPATCH_MARKER),
+                ),
+                False,
+            ),
+            (
+                "lookalike command /ocfoo",
+                event_context(
+                    "issue_comment", comment=comment("/ocfoo please")
+                ),
+                False,
+            ),
+            (
+                "lookalike command /opencodefoo",
+                event_context(
+                    "issue_comment", comment=comment("/opencodefoo")
                 ),
                 False,
             ),
@@ -515,6 +537,20 @@ class ActualSchedulerConditionTests(unittest.TestCase):
                 False,
             ),
             (
+                "lookalike command /ocfoo",
+                event_context(
+                    "issue_comment", comment=comment("/ocfoo please")
+                ),
+                False,
+            ),
+            (
+                "lookalike command /opencodefoo",
+                event_context(
+                    "issue_comment", comment=comment("/opencodefoo")
+                ),
+                False,
+            ),
+            (
                 "non-owner forged /oc with dispatch marker",
                 event_context(
                     "issue_comment",
@@ -664,14 +700,22 @@ class InstallUpgradeTests(unittest.TestCase):
             canonical = CONSUMER_SCHEDULER.read_text(encoding="utf-8")
             old_body = canonical.replace(
                 """       (github.actor == github.repository_owner &&
-        (startsWith(github.event.comment.body, '/oc') ||
-         startsWith(github.event.comment.body, '/opencode')) &&
+        (github.event.comment.body == '/oc' ||
+         github.event.comment.body == '/opencode' ||
+         startsWith(github.event.comment.body, '/oc ') ||
+         startsWith(github.event.comment.body, '/opencode ') ||
+         startsWith(github.event.comment.body, fromJSON('"/oc\\n"')) ||
+         startsWith(github.event.comment.body, fromJSON('"/opencode\\n"'))) &&
         !contains(github.event.comment.body, '<!-- issue-scheduler-dispatch -->') &&
         !contains(github.event.comment.body, '<!-- continuum-origin role=continuum component=opencode-watchdog -->')) ||
 """,
                 """       (github.actor == github.repository_owner &&
-        (startsWith(github.event.comment.body, '/oc') ||
-         startsWith(github.event.comment.body, '/opencode'))) ||
+        (github.event.comment.body == '/oc' ||
+         github.event.comment.body == '/opencode' ||
+         startsWith(github.event.comment.body, '/oc ') ||
+         startsWith(github.event.comment.body, '/opencode ') ||
+         startsWith(github.event.comment.body, fromJSON('"/oc\\n"')) ||
+         startsWith(github.event.comment.body, fromJSON('"/opencode\\n"')))) ||
 """,
             )
             old_document = yaml.safe_load(old_body)

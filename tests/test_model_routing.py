@@ -444,6 +444,32 @@ class ProbeTests(unittest.TestCase):
         self.assertTrue(process.terminated)
         self.assertLess(elapsed, 3)
 
+    def test_timeout_after_quota_evidence_burns_the_runner(self):
+        """Quota printed without the structured error event still wins.
+
+        The probe deadline can end a child that only wrote a plain HTTP 429.
+        The generic timeout must not be reported before that evidence is
+        classified, otherwise failover would touch another model.
+        """
+        # The runtime diagnostic block is authoritative but starts with
+        # `Agent error:`, so the live stall scanner cannot see it. It must
+        # still win over the generic timeout after the child is stopped.
+        process = FakeProcess(
+            stderr=(
+                'Agent error: {\n'
+                '  "name": "FreeUsageLimitError",\n'
+                '  "data": {"message": "free usage limit reached"}\n'
+                '}'
+            ),
+            hang=True,
+        )
+        def runner(command, **kwargs):
+            return process
+        with self.assertRaises(route.BurnedRunner) as caught:
+            route.semantic_probe(A, "review", 0.3, runner=runner)
+        self.assertEqual(route.QUOTA_EXHAUSTED, str(caught.exception))
+        self.assertTrue(process.terminated)
+
     def test_drain_reassembles_a_multibyte_character_split_across_chunks(self):
         sink = []
         route._drain(_ChunkedStream([b"\xf0\x9f", b"\x98\x80"]), sink)

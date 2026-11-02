@@ -372,6 +372,27 @@ jobs:
               const before = new Set(baseline.data.workflow_runs.map((run) => run.id));
               const runTitlePrefix = `PR-Agent PR #${prNumber} [review:`;
               const runTitleSuffix = `head=${head}`;
+              // List every attributed run inside the bounded dispatch window.
+              // The final evidence pass uses this, while the review wait
+              // below retains the first exact run ID and polls it directly.
+              const prAgentRuns = async (pullNumber, headSha) => {
+                const matches = [];
+                for (let page = 1; page <= 5; page += 1) {
+                  const { data } = await github.rest.actions.listWorkflowRunsForRepo({
+                    owner, repo, per_page: 100, page, event: 'workflow_dispatch',
+                    created: `>=${dispatchCreatedAfter}`,
+                  });
+                  matches.push(...data.workflow_runs.filter((run) =>
+                    run.name === 'PR Agent (OpenCode backend)' &&
+                    String(run.display_title || '').startsWith(
+                      `PR-Agent PR #${pullNumber} [review:`
+                    ) &&
+                    String(run.display_title || '').endsWith(`head=${headSha}`)
+                  ));
+                  if (data.workflow_runs.length < 100) break;
+                }
+                return matches;
+              };
               let targetRunId = null;
               const findDispatchedRun = async () => {
                 if (targetRunId !== null) {
@@ -536,7 +557,7 @@ jobs:
               if (verifyVerdict !== 'RESOLVED') {
                 throw new Error(`post-fix verification did not resolve finding ${findingId}: ${verifyVerdict}`);
               }
-              for (const run of (await prAgentRuns()).filter((run) => !workflowRunIds.includes(String(run.id)))) {
+              for (const run of (await prAgentRuns(prNumber, head)).filter((run) => !workflowRunIds.includes(String(run.id)))) {
                 workflowRunIds.push(String(run.id));
               }
 

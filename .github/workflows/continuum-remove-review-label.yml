@@ -20,8 +20,12 @@ permissions:
 jobs:
   remove-label:
     # Verified child PR lifecycle runs in the public parent. Duplicate label
-    # housekeeping is parent-owned work.
-    if: vars.CONTINUUM_ROLE != 'child'
+    # housekeeping is parent-owned work. A fork PR has no write permission for
+    # the label mutation, so it is never attempted.
+    if: >-
+      vars.CONTINUUM_ROLE != 'child' &&
+      (github.event_name != 'pull_request' ||
+       github.event.pull_request.head.repo.full_name == github.repository)
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:

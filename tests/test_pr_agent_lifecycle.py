@@ -3937,7 +3937,7 @@ class RepairWiringRegressionTests(unittest.TestCase):
         self.assertNotIn('"...main"', merge)
         # Bounded merge-scope repair: explicit strategy plus a timeout.
         self.assertIn("conflict_strategy: 'merge'", merge)
-        self.assertIn("if (opencodeWorkflow === 'opencode.yml')", merge)
+        self.assertIn("if (repairWorkflow === 'opencode.yml')", merge)
         self.assertIn("dispatchInputs.timeout_minutes = '60'", merge)
         self.assertNotIn("timeout_minutes: '60'", merge)
         # Isolation is per PR/per HEAD: a repository-global active-run probe

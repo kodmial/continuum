@@ -110,11 +110,16 @@ sign a forged `verifier` or `final` record, which a resumed `tests-passed` or
 `publish-pr` run would accept when the HMAC verifies. If the file is absent
 when it is needed, or if the on-disk copy cannot be removed after it was read,
 the engine fails closed with an explicit `::error::` instead of continuing
-without an attestation. The shipped OpenCode workflow accepts the optional
-`CONTINUUM_VERIFICATION_ATTESTATION_KEY` secret and sets this path internally
-only for verification CLI invocations. Consumers need not set the secret;
-when supplied, the key is used only by the runner-local verifier and is never
-exposed to agent commands or consumer verification commands. If supplied, it signs the recorded
+without an attestation. The shipped `continuum-opencode.yml` workflow declares
+the optional `CONTINUUM_VERIFICATION_ATTESTATION_KEY` secret and, when a
+consumer sets it, provisions the private key file immediately before each
+verification CLI call. It is therefore an optional consumer secret, not a
+hidden internal knob: leaving it unset is fully supported and disables
+attestation (a resumed run then rebuilds and re-resolves instead of trusting
+recorded evidence), and the workflow then does not export
+`CONTINUUM_VERIFICATION_ATTESTATION_KEY_FILE` at all. When supplied, the key is used only by the runner-local
+verifier and is never exposed to agent commands or consumer verification
+commands. If supplied, it signs the recorded
 contract, baseline, verifier result, and accepted final record, and a resumed
 run reuses those records only when the signature verifies. Without the key, an
 existing baseline is never trusted. If a resumed checkout has advanced beyond

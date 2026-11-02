@@ -38,6 +38,14 @@ on:
         type: string
         default: ''
         required: false
+      head_sha:
+        description: >-
+          Commit to reconcile on a manual workflow_dispatch run. A
+          workflow_run event supplies this automatically; a manual run must
+          pass it explicitly. Empty means the event payload.
+        type: string
+        default: ''
+        required: false
 
 permissions:
   actions: write
@@ -64,6 +72,7 @@ jobs:
           # workflows.
           CONTINUUM_CODERABBIT_RETRY_WORKFLOW: ${{ inputs.coderabbit_retry_workflow || vars.CONTINUUM_CODERABBIT_RETRY_WORKFLOW || 'continuum-coderabbit-retry.yml' }}
           CONTINUUM_AUTO_MERGE_WORKFLOW: ${{ inputs.auto_merge_workflow || vars.CONTINUUM_AUTO_MERGE_WORKFLOW || 'continuum-auto-merge.yml' }}
+          CONTINUUM_HEAD_SHA: ${{ inputs.head_sha || '' }}
           TAP_PAT: ${{ secrets.TAP_PAT }}
           READ_GITHUB_TOKEN: ${{ github.token }}
         with:
@@ -77,7 +86,23 @@ jobs:
             const owner = context.repo.owner;
             const repo = context.repo.repo;
             const repoFullName = `${owner}/${repo}`;
-            const run = context.payload.workflow_run;
+            // A workflow_run event carries the head and conclusion. A manual
+            // workflow_dispatch carries neither, so it must name the commit
+            // explicitly and is treated as a ready head; without that seam it
+            // dereferenced undefined and failed before any label write.
+            const eventRun = context.payload.workflow_run || {};
+            const requestedHeadSha = String(process.env.CONTINUUM_HEAD_SHA || '').trim();
+            const run = {
+              ...eventRun,
+              head_sha: eventRun.head_sha || requestedHeadSha,
+              conclusion: eventRun.conclusion || 'success',
+              id: eventRun.id || 'manual',
+            };
+            if (!run.head_sha) {
+              throw new Error(
+                'A workflow_run event or an explicit head_sha input is required.'
+              );
+            }
             const REQUESTED_LABEL = 'coderabbit-review-requested';
             // Request-budget observability (#254): counts only, no secrets.
             // Mutations use the default GITHUB_TOKEN client

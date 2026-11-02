@@ -10,7 +10,9 @@ on:
   workflow_dispatch:
     inputs:
       pr_number:
-        description: "Pull request number to reconcile"
+        description: >-
+          Pull request to reconcile when a latest-state caller wakes the
+          batcher. Required by the engine's workflow_dispatch admission.
         required: false
         default: ''
         type: string

@@ -104,6 +104,58 @@ class ReservationObservationTest(unittest.TestCase):
             "progress",
         )
 
+    def test_closed_pr_is_not_live_work(self):
+        reservation = observation.observe_reservation(
+            issue(),
+            pull_requests=[{
+                "number": 21,
+                "state": "closed",
+                "merged_at": None,
+                "body": "Closes #7",
+                "headRefName": "opencode/issue7-fix",
+            }],
+            now=NOW,
+        )
+        self.assertIsNone(reservation.live_pr_number)
+        self.assertEqual(
+            contract.evaluate_reservation_liveness(reservation).outcome,
+            contract.ERROR,
+        )
+
+    def test_merged_pr_is_stranded_not_live_work(self):
+        for pr in (
+            {
+                "number": 21,
+                "state": "closed",
+                "merged_at": iso(30),
+                "body": "Closes #7",
+                "headRefName": "opencode/issue7-fix",
+            },
+            {
+                "number": 21,
+                "state": "merged",
+                "merged": True,
+                "body": "Closes #7",
+                "headRefName": "opencode/issue7-fix",
+            },
+            {
+                "number": 21,
+                "state": "open",
+                "merged": True,
+                "body": "Closes #7",
+                "headRefName": "opencode/issue7-fix",
+            },
+        ):
+            with self.subTest(pr=pr):
+                reservation = observation.observe_reservation(
+                    issue(), pull_requests=[pr], now=NOW
+                )
+                self.assertIsNone(reservation.live_pr_number)
+                self.assertEqual(
+                    contract.evaluate_reservation_liveness(reservation).outcome,
+                    contract.ERROR,
+                )
+
     def test_select_observations_keeps_only_reserved_issues(self):
         selected = observation.select_observations(
             [issue(), issue(number=8, labels=())]

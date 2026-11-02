@@ -82,7 +82,7 @@ jobs:
             # Non-completed run statuses only: `pending` is not a workflow-run
             # status, while `action_required` (e.g. waiting for approval) is
             # and must read as active so it never dispatches twice.
-            gh run list --repo "$GITHUB_REPOSITORY" --limit 100               --json status,displayTitle               --jq '.[] | select(.status == "queued" or .status == "in_progress" or .status == "waiting" or .status == "action_required") | .displayTitle'               2>/dev/null || true
+            gh run list --repo "$GITHUB_REPOSITORY" --limit 100               --json status,displayTitle               --jq '.[] | select(.status == "queued" or .status == "in_progress" or .status == "waiting" or .status == "action_required") | .displayTitle'
           )"
 
           task_active() {

@@ -55,6 +55,14 @@ on:
         description: "Required workflow name when the gate label is present."
         required: false
         type: string
+      opencode_workflow:
+        description: "Dispatchable OpenCode caller for local conflict repair."
+        required: false
+        type: string
+      repair_workflow:
+        description: "Dispatchable PR-Agent repair caller for delegated conflicts."
+        required: false
+        type: string
 
 permissions:
   contents: write
@@ -82,3 +90,5 @@ jobs:
       post_merge_wakeup_ref: "${{ inputs.post_merge_wakeup_ref }}"
       required_workflow_gate_label: "${{ inputs.required_workflow_gate_label }}"
       required_workflow_gate_name: "${{ inputs.required_workflow_gate_name }}"
+      opencode_workflow: "${{ inputs.opencode_workflow }}"
+      repair_workflow: "${{ inputs.repair_workflow }}"

@@ -45,7 +45,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     concurrency:
-      group: continuum-subtask-pr-review-${{ inputs.pr_number }}
+      group: continuum-subtask-pr-review-${{ inputs.child_id }}-${{ inputs.pr_number }}
       cancel-in-progress: false
     env:
       GH_TOKEN: ${{ secrets.CHILD_RUNTIME_TOKEN }}
@@ -61,6 +61,9 @@ jobs:
       OPENCODE_MODEL_COOLDOWN: ${{ vars.OPENCODE_MODEL_COOLDOWN || '900' }}
       OPENCODE_PROBE_TIMEOUT: ${{ vars.OPENCODE_PROBE_TIMEOUT || '90' }}
       MAX_REVIEW_PASSES: ${{ inputs.max_review_passes }}
+      # Delegated PR review runs with the same deny-push policy as the other
+      # child agents: the agent may use git, but never push around the
+      # exact-head publication, secret scan and merge gates.
       OPENCODE_CONFIG_CONTENT: '{"permission":{"bash":{"*":"allow","git *":"allow","git push *":"deny"}}}'
     steps:
       - name: Checkout parent control plane

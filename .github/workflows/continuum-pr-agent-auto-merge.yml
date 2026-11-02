@@ -94,6 +94,22 @@ on:
         type: string
         default: ''
         required: false
+      opencode_workflow:
+        description: >-
+          Dispatchable OpenCode caller that receives a local conflict repair.
+          Empty falls back to vars.CONTINUUM_OPENCODE_WORKFLOW, then to
+          continuum-opencode.yml.
+        type: string
+        default: ''
+        required: false
+      repair_workflow:
+        description: >-
+          Dispatchable PR-Agent repair caller woken for a delegated conflict.
+          Empty falls back to vars.CONTINUUM_PR_AGENT_REPAIR_WORKFLOW, then to
+          continuum-pr-agent-repair.yml.
+        type: string
+        default: ''
+        required: false
 
 permissions: {}
 
@@ -667,8 +683,9 @@ jobs:
           POST_MERGE_WAKEUP_REF: ${{ inputs.post_merge_wakeup_ref || vars.CONTINUUM_POST_MERGE_WAKEUP_REF || github.event.repository.default_branch || 'main' }}
           REQUIRED_WORKFLOW_GATE_LABEL: ${{ inputs.required_workflow_gate_label || vars.CONTINUUM_REQUIRED_WORKFLOW_GATE_LABEL || '' }}
           REQUIRED_WORKFLOW_GATE_NAME: ${{ inputs.required_workflow_gate_name || vars.CONTINUUM_REQUIRED_WORKFLOW_GATE_NAME || '' }}
+          OPENCODE_WORKFLOW: ${{ inputs.opencode_workflow || vars.CONTINUUM_OPENCODE_WORKFLOW || 'continuum-opencode.yml' }}
+          PR_AGENT_REPAIR_WORKFLOW: ${{ inputs.repair_workflow || vars.CONTINUUM_PR_AGENT_REPAIR_WORKFLOW || 'continuum-pr-agent-repair.yml' }}
           TARGET_CHILD_ID: ${{ inputs.target_child_id }}
-          OPENCODE_WORKFLOW: ${{ vars.CONTINUUM_OPENCODE_WORKFLOW || 'continuum-opencode.yml' }}
         with:
           github-token: ${{ secrets.TAP_PAT }}
           script: |
@@ -1141,6 +1158,131 @@ jobs:
                 return '';
               }
             }
+            // Conflict-repair dispatch targets are dispatchable entry
+            // workflows in the repository that owns the run, never the
+            // reusable engine (which declares no workflow_dispatch trigger).
+            // A configured value is validated as a bare file name so it can
+            // never be spliced into a different path.
+            function resolveDispatchWorkflow(configuredValue, fallback, label) {
+              const configured = String(configuredValue || fallback).trim();
+              if (
+                !configured.endsWith('.yml') ||
+                configured.includes('/') ||
+                configured.includes('\\') ||
+                configured.includes('..')
+              ) {
+                throw new Error(
+                  `Invalid ${label} workflow: ${configured}. ` +
+                  'Expected a bare workflow file name such as continuum-opencode.yml.'
+                );
+              }
+              return configured;
+            }
+
+            // Parse the workflow_dispatch contract from a caller file body.
+            // Returns the declared input names so a dispatch never sends an
+            // input the caller does not accept.
+            function parseWorkflowDispatchContract(text, label, requiredInputs = []) {
+              const body = String(text || '').replace(/\r\n/g, '\n');
+              const trigger = body.match(
+                /^  workflow_dispatch:[ \t]*(?:#.*)?$/m
+              );
+              if (!trigger) {
+                return {
+                  ok: false,
+                  reason: `${label} does not declare workflow_dispatch`,
+                  inputs: [],
+                };
+              }
+              const declared = new Set();
+              let inInputs = false;
+              const lines = body
+                .slice(trigger.index + trigger[0].length)
+                .split('\n');
+              for (const line of lines) {
+                if (!line.trim() || line.trimStart().startsWith('#')) continue;
+                const indent = line.length - line.trimStart().length;
+                if (indent <= 2) break; // next top-level trigger key
+                if (/^    inputs:[ \t]*(?:#.*)?$/.test(line)) {
+                  inInputs = true;
+                  continue;
+                }
+                if (!inInputs) continue;
+                const input = line.match(/^      ([A-Za-z0-9_-]+):/);
+                if (input) declared.add(input[1]);
+              }
+              const missing = requiredInputs.filter(
+                name => !declared.has(name)
+              );
+              if (missing.length > 0) {
+                return {
+                  ok: false,
+                  reason:
+                    `${label} does not declare required input(s): ` +
+                    missing.join(', '),
+                  inputs: [...declared],
+                };
+              }
+              return { ok: true, inputs: [...declared] };
+            }
+
+            // Shared conflict-repair dispatch gate. A workflow file accepts a
+            // dispatch only when the exact target ref declares
+            // workflow_dispatch and every input the dispatch supplies. An
+            // older installed consumer or a bootstrap pull request (the
+            // caller is not on the default branch yet) skips that dispatch
+            // with an explicit message instead of turning the compatibility
+            // gap into a red run. Non-404 read failures surface so the next
+            // wakeup can retry them.
+            async function reconciliationDispatchSupport(
+              readOwner,
+              readRepo,
+              workflowFile,
+              ref,
+              requiredInputs
+            ) {
+              const label = `.github/workflows/${workflowFile}@${ref}`;
+              let source;
+              try {
+                source = await github.rest.repos.getContent({
+                  owner: readOwner,
+                  repo: readRepo,
+                  path: `.github/workflows/${workflowFile}`,
+                  ref,
+                });
+              } catch (err) {
+                const status = err
+                  ? (err.status ?? err.response?.status)
+                  : undefined;
+                if (status === 404) {
+                  return {
+                    ok: false,
+                    reason: `${label} is not present on the dispatch ref`,
+                    inputs: [],
+                  };
+                }
+                throw err;
+              }
+              const data = source?.data;
+              if (
+                !data ||
+                data.type !== 'file' ||
+                typeof data.content !== 'string'
+              ) {
+                return {
+                  ok: false,
+                  reason: `${label} is not a readable workflow file`,
+                  inputs: [],
+                };
+              }
+              const text = Buffer.from(data.content, 'base64').toString('utf8');
+              return parseWorkflowDispatchContract(
+                text,
+                label,
+                requiredInputs
+              );
+            }
+
             // kodmial/continuum#302: canonical fail-closed branch safety
             // for the main-sync mutation below. The PR head must be a proven
             // non-default ref; only the PR merge operation may update the
@@ -1234,6 +1376,41 @@ jobs:
                 'One automatic OpenCode conflict-repair attempt per conflict episode.'
               );
               const defaultBranch = await getDefaultBranch();
+              // Both branches below dispatch a repository-local caller. The
+              // reusable engines declare no workflow_dispatch trigger, so the
+              // target must be discovered through the consumer configuration
+              // and verified against the exact ref before any marker or lock
+              // is written. A missing or incompatible caller is a skip, not a
+              // red run.
+              const repairWorkflow = delegated
+                ? resolveDispatchWorkflow(
+                    process.env.PR_AGENT_REPAIR_WORKFLOW,
+                    'continuum-pr-agent-repair.yml',
+                    'PR-Agent repair'
+                  )
+                : resolveDispatchWorkflow(
+                    process.env.OPENCODE_WORKFLOW,
+                    'continuum-opencode.yml',
+                    'OpenCode'
+                  );
+              const repairSupport = await reconciliationDispatchSupport(
+                delegated ? executionOwner : owner,
+                delegated ? executionRepo : repo,
+                repairWorkflow,
+                defaultBranch,
+                delegated
+                  ? ['pr_number', 'mode', 'head_sha', 'target_child_id']
+                  : (repairWorkflow === 'opencode.yml'
+                      ? ['mode', 'pr_number', 'head_ref', 'conflict_strategy', 'timeout_minutes']
+                      : ['mode', 'pr_number', 'head_ref', 'conflict_strategy'])
+              );
+              if (!repairSupport.ok) {
+                core.notice(
+                  'PR #' + prNumber + ': conflict repair dispatch skipped: ' +
+                  repairSupport.reason
+                );
+                return;
+              }
               let fresh = await getPull();
               if (hasLabel(fresh, CONFLICT_LOCK_LABEL)) {
                 // This merge workflow is serialized per PR. A bare label is
@@ -1349,7 +1526,7 @@ jobs:
                       {
                         owner: executionOwner,
                         repo: executionRepo,
-                        workflow_id: 'continuum-pr-agent-repair.yml',
+                        workflow_id: repairWorkflow,
                         ref: defaultBranch,
                         inputs: {
                           pr_number: String(prNumber),
@@ -1387,12 +1564,6 @@ jobs:
                   );
                   return;
                 }
-                const opencodeWorkflow = String(
-                  process.env.OPENCODE_WORKFLOW || 'continuum-opencode.yml'
-                ).trim();
-                if (!/^[A-Za-z0-9_.-]+\.ya?ml$/i.test(opencodeWorkflow)) {
-                  throw new Error('Invalid configured OpenCode caller workflow: ' + opencodeWorkflow);
-                }
                 const dispatchInputs = {
                   mode: 'resolve-conflict',
                   pr_number: String(prNumber),
@@ -1400,8 +1571,10 @@ jobs:
                   conflict_strategy: 'merge',
                 };
                 // The dogfood caller declares timeout_minutes; the installed
-                // consumer stub does not, so never send that undeclared input.
-                if (opencodeWorkflow === 'opencode.yml') {
+                // consumer stub does not. The dispatch contract above only
+                // proves the four common inputs are accepted, so the dogfood
+                // timeout is added only for the dogfood caller.
+                if (repairWorkflow === 'opencode.yml') {
                   dispatchInputs.timeout_minutes = '60';
                 }
                 await github.request(
@@ -1409,7 +1582,7 @@ jobs:
                   {
                     owner,
                     repo,
-                    workflow_id: opencodeWorkflow,
+                    workflow_id: repairWorkflow,
                     ref: defaultBranch,
                     inputs: dispatchInputs,
                   }

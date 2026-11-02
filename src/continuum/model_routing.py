@@ -437,6 +437,7 @@ def semantic_probe(model: str, kind: str, timeout: int, *, runner=subprocess.Pop
             reader.start()
         deadline = time.monotonic() + timeout
         quota = False
+        timed_out = False
         stdout_state = [0, ""]
         stderr_state = [0, ""]
         try:
@@ -452,7 +453,8 @@ def semantic_probe(model: str, kind: str, timeout: int, *, runner=subprocess.Pop
                     break
                 if time.monotonic() >= deadline:
                     _stop_probe(process)
-                    raise RouteError("timeout")
+                    timed_out = True
+                    break
                 time.sleep(PROBE_POLL_SECONDS)
         finally:
             if quota:
@@ -476,11 +478,20 @@ def semantic_probe(model: str, kind: str, timeout: int, *, runner=subprocess.Pop
         raw = raw_stdout + "\n" + "".join(stderr)
         # Refuse any second model request on a runner that received a 429,
         # including one that had to be terminated because it never exited.
-        # A structured provider error event is authoritative even when the
-        # CLI exited 0, so consult the shared classifier before parsing the
-        # response (and before any failover can touch another model).
-        if quota or classify(raw, process.returncode) == "quota_429" or is_opencode_429(
-                raw, process.returncode):
+        # Only the shared structured provider classifier may turn a stopped
+        # child into quota death here: the child now exits with the signal
+        # status, so the looser cross-engine classifier would also read prose
+        # such as `"text":"HTTP 429"` as provider evidence.
+        quota_evidence = quota or is_opencode_429(raw, process.returncode)
+        if quota_evidence:
+            marker = Path(os.environ.get("RUNNER_TEMP", scratch)) / "continuum-opencode-429"
+            marker.touch()
+            raise BurnedRunner(QUOTA_EXHAUSTED)
+        if timed_out:
+            # The deadline ended the probe without authoritative quota
+            # evidence; fail over normally.
+            raise RouteError("timeout")
+        if classify(raw, process.returncode) == "quota_429":
             marker = Path(os.environ.get("RUNNER_TEMP", scratch)) / "continuum-opencode-429"
             marker.touch()
             raise BurnedRunner(QUOTA_EXHAUSTED)

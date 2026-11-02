@@ -204,10 +204,12 @@ def observe_reservation(
     """Build a :class:`Reservation` from real GitHub state.
 
     ``runs`` are the workflow runs that reference this issue (newest first)
-    and ``pull_requests`` are the open or recently merged PRs that reference
-    it. A label is only evidence of live work when a run, PR or fresh lease
-    is attributable; otherwise the liveness evaluator reports the stranded
-    reservation as an error.
+    and ``pull_requests`` are the PRs that reference it. Only an open,
+    unmerged PR is evidence of live work: a closed or merged PR is a terminal
+    outcome, not a reservation that still owns the issue. A label is only
+    evidence of live work when a run, open PR or fresh lease is attributable;
+    otherwise the liveness evaluator reports the stranded reservation as an
+    error.
     """
     number = _issue_number(issue)
     has_label = IN_PROGRESS_LABEL in _labels(issue)
@@ -216,7 +218,9 @@ def observe_reservation(
     live_run_id = _run_id(active[0]) if active else None
     live_pr_number = None
     for pr in pull_requests or []:
-        if str(pr.get("state") or "").strip().lower() == "closed":
+        state = str(pr.get("state") or "").strip().lower()
+        merged = bool(pr.get("merged")) or bool(pr.get("merged_at") or pr.get("mergedAt"))
+        if state != "open" or merged:
             continue
         if _pr_matches_issue(pr, number):
             live_pr_number = _pr_number(pr)

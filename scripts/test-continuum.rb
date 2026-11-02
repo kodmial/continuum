@@ -966,6 +966,31 @@ class ContinuumTest < Minitest::Test
     end
   end
 
+  # A caller stub may only forward inputs its callee declares. The same rule
+  # covers the reverse direction: every workflow_call input the callee marks
+  # required must be supplied by the installed stub, otherwise a real
+  # invocation fails schema validation before any step runs.
+  def test_every_stub_supplies_its_callee_required_inputs
+    Dir[File.join(ROOT, '.github/caller-stubs/**/*.yml')].each do |path|
+      stub = yaml(path)
+      job = stub.fetch('jobs').values.find { |value| value.is_a?(Hash) && value['uses'] }
+      next unless job
+      uses = job.fetch('uses').to_s
+      next unless uses.include?('kodmial/continuum/.github/workflows/')
+      name = uses.split('@').first.split('/').last
+      callee_path = File.join(ROOT, '.github/workflows', name)
+      flunk "#{path}: callee #{name} is not shipped" unless File.exist?(callee_path)
+      call = events(yaml(callee_path)).fetch('workflow_call')
+      required = (call['inputs'] || {}).select do |_key, definition|
+        definition.is_a?(Hash) && definition['required'] == true
+      end.keys
+      forwarded = job.fetch('with') || {}
+      missing = required - forwarded.keys
+      assert_empty missing,
+                   "#{File.basename(path)} must forward required inputs for #{name}: #{missing.join(', ')}"
+    end
+  end
+
   # install.sh installs the stored stub name verbatim. A prefix computed at
   # install time is what this repository removed: it makes the name a consumer
   # ends up with differ from the name Continuum ships, so a renamed stub keeps
@@ -5099,7 +5124,7 @@ class ContinuumTest < Minitest::Test
   # Continuum makes on every consumer's behalf and needs a test edit.
   STUB_INPUT_WHITELIST = {
     'continuum-add-review-label.yml' => %w[
-      continuum_ref coderabbit_retry_workflow auto_merge_workflow
+      continuum_ref coderabbit_retry_workflow auto_merge_workflow head_sha
     ],
     'continuum-auto-merge.yml' => %w[
       continuum_ref post_merge_wakeups post_merge_wakeup_ref
@@ -5171,6 +5196,7 @@ class ContinuumTest < Minitest::Test
       continuum_ref pr_number target_child_id head_sha ci_run_id ci_workflow_name gate_verified review_json improve_jsonl persistent_state_json
       post_merge_wakeups post_merge_wakeup_ref
       required_workflow_gate_label required_workflow_gate_name
+      opencode_workflow repair_workflow
     ],
     'continuum-remove-review-label.yml' => %w[continuum_ref]
   }.freeze
@@ -5775,8 +5801,12 @@ class ContinuumTest < Minitest::Test
     gate = stub.fetch('jobs').fetch('call').fetch('if')
     assert_includes gate, "github.event_name != 'issue_comment'"
     assert_includes gate, 'github.actor == github.repository_owner'
-    assert_includes gate, "startsWith(github.event.comment.body, '/oc')",
+    assert_includes gate, "github.event.comment.body == '/oc'",
                     'the stub may only cheap-prefilter; the reusable scheduler parses exactly'
+    assert_includes gate, "startsWith(github.event.comment.body, '/oc ')",
+                    'a lookalike token such as /ocfoo must not wake the scheduler'
+    refute_includes gate, "startsWith(github.event.comment.body, '/oc')",
+                    'an unbounded prefix gate would wake the scheduler on /ocfoo'
     refute_includes gate, "contains(github.event.comment.body, '/oc')",
                     'a substring gate would wake the scheduler on internal prose'
   end
@@ -5944,6 +5974,34 @@ class ContinuumTest < Minitest::Test
   # never asked for CodeRabbit would get `review-ready` and
   # `coderabbit-review-requested` on every green PR, and a 404 from a
   # `continuum-coderabbit-retry.yml` it does not have.
+  # The workflow listens to workflow_run, but its installed caller also exposes
+  # workflow_dispatch. A manual run has no `context.payload.workflow_run`, so
+  # the head must come from a declared, forwarded input instead of dereferencing
+  # undefined before the first label write.
+  def test_add_review_label_manual_dispatch_resolves_an_explicit_head
+    reusable = yaml(File.join(ROOT, '.github/workflows/continuum-add-review-label.yml'))
+    head = events(reusable).fetch('workflow_call').fetch('inputs').fetch('head_sha')
+    assert_equal '', head.fetch('default')
+    assert_equal false, head.fetch('required')
+    assert_equal 'string', head.fetch('type')
+
+    stub = yaml(File.join(ROOT, '.github/caller-stubs/continuum-add-review-label.yml'))
+    stub_head = events(stub).fetch('workflow_dispatch').fetch('inputs').fetch('head_sha')
+    assert_equal '', stub_head.fetch('default')
+    assert_equal false, stub_head.fetch('required')
+    assert_equal 'string', stub_head.fetch('type')
+    assert_equal "${{ inputs.head_sha }}",
+                 stub.fetch('jobs').fetch('call').fetch('with').fetch('head_sha')
+
+    body = add_review_label_body
+    assert_includes body, 'const eventRun = context.payload.workflow_run || {};'
+    assert_includes body, "const requestedHeadSha = String(process.env.CONTINUUM_HEAD_SHA || '').trim();"
+    assert_includes body, 'head_sha: eventRun.head_sha || requestedHeadSha,'
+    assert_includes body, 'conclusion: eventRun.conclusion || \'success\','
+    assert_includes body,
+                    "throw new Error(\n                'A workflow_run event or an explicit head_sha input is required.'"
+  end
+
   def test_add_review_label_gates_the_coderabbit_path_behind_the_provider
     inputs = events(yaml(File.join(ROOT, '.github/workflows/continuum-add-review-label.yml')))
              .fetch('workflow_call').fetch('inputs')
@@ -7577,6 +7635,58 @@ class ContinuumTest < Minitest::Test
     assert_includes body, 'No Render qualification hook configured'
   end
 
+  # A non-numeric issue number would be reinterpreted by the GitHub API and
+  # `gh issue`, so it fails closed before the first use.
+  def test_render_executor_rejects_a_non_numeric_issue_number
+    body = workflow_body('continuum-render-executor.yml')
+    step = step_body(body, 'Execute Render lifecycle')
+    refute_nil step, 'the Render execution step is missing'
+    required = step.index('issue_number is required: no issue to execute')
+    numeric = step.index('[[ "$ISSUE_NUMBER" =~ ^[0-9]+$ ]]')
+    body_numeric = body.index('[[ "$ISSUE_NUMBER" =~ ^[0-9]+$ ]]')
+    first_api = body.index('gh issue view')
+    refute_nil numeric, 'the Render executor must validate issue_number numerically'
+    assert_operator required, :<, numeric,
+                    'the empty check must run before the numeric check'
+    assert_operator body_numeric, :<, first_api,
+                    'numeric validation must precede the first issue API use'
+  end
+
+  # Concurrent identical task numbers from different children must never
+  # share a concurrency group, and every child agent must have the same
+  # deny-push policy.
+  def test_child_agent_groups_include_child_id_and_deny_push
+    deny_push = %q({"permission":{"bash":{"*":"allow","git *":"allow","git push *":"deny"}}})
+    {
+      'continuum-consumer-child-worker.yml' => 'continuum-subtask-',
+      'continuum-consumer-child-review.yml' => 'continuum-subtask-review-',
+      'continuum-consumer-child-pr-review.yml' => 'continuum-subtask-pr-review-'
+    }.each do |name, prefix|
+      workflow = yaml(File.join(ROOT, '.github/workflows', name))
+      group = workflow.fetch('jobs').values.first.fetch('concurrency').fetch('group')
+      assert_includes group, prefix
+      assert_includes group, '${{ inputs.child_id }}',
+                      "#{name}: different children must never share a concurrency group"
+      env = workflow.fetch('jobs').values.first.fetch('env')
+      assert_equal deny_push, env.fetch('OPENCODE_CONFIG_CONTENT'),
+                   "#{name}: child agents must share the deny-push policy"
+    end
+  end
+
+  def test_remove_review_label_skips_fork_pull_requests
+    body = workflow_body('continuum-remove-review-label.yml')
+    assert_includes body, 'github.event.pull_request.head.repo.full_name == github.repository',
+                    'fork PRs have no label-write token and must be skipped'
+  end
+
+  def test_contract_gate_disables_status_publishing_for_fork_pull_requests
+    gate = yaml(File.join(ROOT, '.github/workflows/contract-gate.yml'))
+    value = gate.fetch('jobs').fetch('contract').fetch('with').fetch('publish_status')
+    assert_includes value, 'github.event.pull_request.head.repo.full_name == github.repository'
+    assert_includes value, "'true'"
+    assert_includes value, "'false'"
+  end
+
   def test_child_acceptance_sentinels_live_outside_consumer_checkout
     worker = workflow_body('continuum-consumer-child-worker.yml')
     review = workflow_body('continuum-consumer-child-review.yml')
@@ -8720,6 +8830,28 @@ class ContinuumTest < Minitest::Test
                     'canary finding polls must remain page-bounded'
   end
 
+  # The canary must attribute a PR-Agent run to its own disposable PR, and it
+  # must capture the baseline before the comment that starts the run. A run
+  # that starts while the comment is posted is otherwise invisible.
+  def test_pr_agent_canary_baseline_precedes_the_review_comment
+    body = workflow_body('continuum-pr-agent-canary.yml')
+    assert_includes body, "event: 'workflow_dispatch'",
+                    'the canary must ignore runs from other event sources'
+    assert_includes body, 'startsWith(runTitlePrefix)',
+                    'the canary must attribute a run to its disposable PR'
+    assert_includes body, 'endsWith(runTitleSuffix)',
+                    'the canary must attribute a run to the reviewed HEAD'
+    assert_includes body, 'await findDispatchedRun()',
+                    'the review wait must poll the retained exact run'
+    assert_includes body, 'await prAgentRuns(prNumber, head)',
+                    'the evidence loop must use the bounded attributed lookup'
+
+    baseline = body.index('const before = new Set(')
+    comment = body.index('const reviewComment = await github.rest.issues.createComment(')
+    assert baseline < comment,
+           'the run baseline must be captured before the /review comment is created'
+  end
+
   def test_api_budget_opencode_scans_deferred_to_protected_baseline
     # kodmial/continuum#254 inventory note: continuum-opencode.yml stays on
     # its protected baseline (#248 anti-recursion gate plus #258 attribution
@@ -8813,6 +8945,28 @@ class ContinuumTest < Minitest::Test
     assert_includes executor, 'Qualify current CodeRabbit unresolved batch'
   end
 
+  # The batcher's manual dispatch admission requires a PR number. The installed
+  # caller must therefore declare and forward it, otherwise the only manual
+  # path reaches the reusable job with an empty input and always skips.
+  def test_coderabbit_unresolved_manual_dispatch_forwards_pr_number
+    reusable = yaml(File.join(ROOT, '.github/workflows/continuum-coderabbit-unresolved.yml'))
+    inputs = events(reusable).fetch('workflow_call').fetch('inputs')
+    pr_number = inputs.fetch('pr_number')
+    assert_equal '', pr_number.fetch('default')
+    assert_equal false, pr_number.fetch('required')
+    assert_equal 'string', pr_number.fetch('type')
+    assert_includes reusable.fetch('jobs').fetch('retry-unresolved').fetch('if'),
+                    "github.event_name == 'workflow_dispatch' && inputs.pr_number != ''"
+
+    stub = yaml(File.join(ROOT, '.github/caller-stubs/continuum-coderabbit-unresolved.yml'))
+    declared = events(stub).fetch('workflow_dispatch').fetch('inputs').fetch('pr_number')
+    assert_equal '', declared.fetch('default')
+    assert_equal false, declared.fetch('required')
+    assert_equal 'string', declared.fetch('type')
+    assert_equal "${{ inputs.pr_number }}",
+                 stub.fetch('jobs').fetch('call').fetch('with').fetch('pr_number')
+  end
+
   # The historical direct OpenCode UNRESOLVED caller template is retired from
   # fresh installs. The canonical CodeRabbit caller owns the same event, while
   # the legacy reusable engine stays dispatchable for consumers that still have
@@ -8840,8 +8994,12 @@ class ContinuumTest < Minitest::Test
     event_driven = canonical_events.keys.reject { |name| name == 'workflow_dispatch' }
     assert_equal ['pull_request_review_comment'], event_driven,
                  'the canonical CodeRabbit caller must own the UNRESOLVED event path'
+    # The manual path is the safety net for a latest-state caller: it must
+    # carry the PR identity the reusable job requires on workflow_dispatch,
+    # plus the dispatch-target override.
     dispatch_inputs = canonical_events.fetch('workflow_dispatch').fetch('inputs')
-    assert_equal ['pr_number', 'opencode_workflow'], dispatch_inputs.keys
+    assert_equal ['pr_number', 'opencode_workflow'], dispatch_inputs.keys,
+                 'manual dispatch declares the PR identity and the dispatch target'
     pr_wake = dispatch_inputs.fetch('pr_number')
     assert_equal false, pr_wake.fetch('required')
     assert_equal '', pr_wake.fetch('default')
@@ -9231,8 +9389,10 @@ class ContinuumTest < Minitest::Test
 
     merge = File.read(File.join(ROOT, '.github/workflows/continuum-pr-agent-auto-merge.yml'))
     repair_window = merge[merge.index('async function dispatchConflictRepair')..]
-    assert_includes repair_window, "workflow_id: 'continuum-pr-agent-repair.yml'",
-                    'delegated conflict repair must dispatch the repair reusable'
+    assert_includes repair_window, "workflow_id: repairWorkflow",
+                    'delegated conflict repair must dispatch the resolved repair caller'
+    assert_includes repair_window, "'continuum-pr-agent-repair.yml'",
+                    'the resolver must default to the repair reusable caller'
     assert_includes repair_window, 'target_child_id: targetChildId',
                     'delegated conflict repair must forward the opaque child id'
     assert_includes repair_window, "mode: 'conflict'",
@@ -9674,6 +9834,52 @@ class ContinuumTest < Minitest::Test
            'the observation helpers need deterministic unit tests'
   end
 
+  # Conflict repair is a dispatch of a repository-local caller, never a
+  # hardcoded reusable engine (which has no workflow_dispatch trigger). Both
+  # dispatch branches resolve their target from consumer configuration, gate
+  # it through the shared dispatch contract, and send only declared inputs.
+  def test_pr_agent_conflict_repair_resolves_and_gates_its_dispatch_target
+    workflow = yaml(File.join(ROOT, '.github/workflows/continuum-pr-agent-auto-merge.yml'))
+    inputs = workflow.fetch(true).fetch('workflow_call').fetch('inputs')
+    %w[opencode_workflow repair_workflow].each do |name|
+      assert inputs.key?(name), "continuum-pr-agent-auto-merge.yml must declare #{name}"
+      assert_equal '', inputs.fetch(name).fetch('default')
+      assert_equal false, inputs.fetch(name).fetch('required')
+    end
+
+    stub_path = File.join(ROOT, '.github/caller-stubs/continuum-pr-agent-auto-merge.yml')
+    stub = yaml(stub_path)
+    dispatch_inputs = stub.fetch(true).fetch('workflow_dispatch').fetch('inputs')
+    %w[opencode_workflow repair_workflow].each do |name|
+      assert dispatch_inputs.key?(name), "the stub must declare #{name}"
+      assert_equal "\${{ inputs.#{name} }}",
+                   stub.fetch('jobs').fetch('call').fetch('with').fetch(name)
+    end
+
+    body = File.read(File.join(ROOT, '.github/workflows/continuum-pr-agent-auto-merge.yml'))
+    assert_equal 1, body.scan('function resolveDispatchWorkflow(').length
+    assert_equal 1, body.scan('async function reconciliationDispatchSupport(').length
+    assert_equal 1, body.scan('await reconciliationDispatchSupport(').length
+    assert_includes body, 'process.env.PR_AGENT_REPAIR_WORKFLOW'
+    assert_includes body, 'process.env.OPENCODE_WORKFLOW'
+    assert_includes body, 'workflow_id: repairWorkflow'
+    refute_includes body, "workflow_id: 'continuum-pr-agent-repair.yml'",
+                    'delegated repair must not hardcode the engine caller'
+    refute_includes body, "workflow_id: 'continuum-opencode.yml'",
+                    'local repair must not hardcode the engine caller'
+    refute_includes body, 'timeout_minutes:',
+                    'the OpenCode caller does not declare timeout_minutes'
+    assert_includes body, "['pr_number', 'mode', 'head_sha', 'target_child_id']"
+    assert_includes body, "['mode', 'pr_number', 'head_ref', 'conflict_strategy']"
+    assert_match(/if \(!repairSupport\.ok\) \{\n\s+core\.notice\(/, body,
+                 'an unsupported caller must skip with an explicit notice')
+
+    reconcile = step_body(body, 'Reconcile current PR state and merge only the exact reviewed HEAD')
+    refute_nil reconcile, 'auto-merge reconciliation step is missing'
+    assert_includes reconcile, 'OPENCODE_WORKFLOW:'
+    assert_includes reconcile, 'PR_AGENT_REPAIR_WORKFLOW:'
+  end
+
   def test_every_continuum_merge_path_requires_exact_head_contract_evidence
     %w[continuum-auto-merge.yml continuum-pr-agent-auto-merge.yml].each do |file|
       body = File.read(File.join(ROOT, '.github/workflows', file))
@@ -9691,6 +9897,27 @@ class ContinuumTest < Minitest::Test
     pr_agent = File.read(File.join(ROOT, '.github/workflows/continuum-pr-agent-auto-merge.yml'))
     assert_match(/Contract qualification is .*for the exact HEAD/m, pr_agent,
                  'PR-Agent merge must fail closed on absent/stale/red Continuum contract evidence')
+  end
+
+  # The runnable minimal consumer follows the current Continuum main for both
+  # the reusable workflow and its engine, matching the published quick start.
+  # Fork and Dependabot pull requests must not attempt writes their token
+  # cannot make.
+  def test_minimal_consumer_example_uses_current_main_and_skips_read_only_writes
+    path = File.join(ROOT, 'examples/minimal-consumer/.github/workflows/ci.yml')
+    assert File.exist?(path), 'the minimal consumer example is missing'
+    example = yaml(path)
+    call = example.fetch('jobs').fetch('validate')
+    uses = call.fetch('uses')
+    assert_equal 'kodmial/continuum/.github/workflows/continuum-validation.yml@main', uses
+    assert_equal 'main', call.fetch('with').fetch('continuum_ref')
+
+    %w[publish_status dispatch_repair].each do |input|
+      value = call.fetch('with').fetch(input)
+      assert_includes value, 'github.event.pull_request.head.repo.fork'
+      assert_includes value, "github.actor == 'dependabot[bot]'"
+      assert_includes value, "'false'"
+    end
   end
 
   # The Continuum repository's contract gate is intentionally project-owned,

@@ -121,6 +121,11 @@ class ExecutableCanaryContractTests(unittest.TestCase):
         self.assertLess(body.index("head = pr.data.head.sha;"), lookup_start)
         self.assertLess(before, comment)
         self.assertIn("workflowRunIds.push(String(reviewedRun.id));", body)
+        self.assertIn(
+            "const prAgentRuns = async (pullNumber, headSha)", body,
+            "the final evidence pass must use a defined bounded lookup",
+        )
+        self.assertIn("await prAgentRuns(prNumber, head)", body)
 
     def test_cleanup_and_evidence(self):
         body = WORKFLOW.read_text(encoding="utf-8")

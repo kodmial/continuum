@@ -12,14 +12,17 @@ on:
 # Persistent state is shared by both jobs in one attempt, but isolated across attempts.
 # PR-only integration fixture: no PAT, provider API key, paid-model discovery,
 # untrusted fork code, production rollout configuration or default-branch push.
-permissions:
-  contents: write
+# The durable model-state ref is written only by the recording job; the fresh
+# verification runner needs read-only contents.
+permissions: {}
 
 jobs:
   first-runner:
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    permissions:
+      contents: write
     outputs:
       selected_model: ${{ steps.select.outputs.model }}
     steps:
@@ -79,6 +82,8 @@ jobs:
     needs: first-runner
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    permissions:
+      contents: read
     steps:
       - name: Checkout exact test code
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
