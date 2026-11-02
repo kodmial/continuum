@@ -8909,8 +8909,13 @@ class ContinuumTest < Minitest::Test
                     'the canary must attribute a run to the reviewed HEAD'
     assert_includes body, 'await findDispatchedRun()',
                     'the review wait must poll the retained exact run'
-    assert_includes body, 'await prAgentRuns(prNumber, head)',
-                    'the evidence loop must use the bounded attributed lookup'
+    assert_includes body, 'await prAgentRuns(prNumber, cleanHead)',
+                    'the final evidence loop must use the bounded attributed lookup after clean-HEAD approval'
+    clean_approval = body.index('const clean = await waitFor(')
+    evidence_loop = body.index('await prAgentRuns(prNumber, cleanHead)')
+    evidence = body.index('const evidence = {')
+    assert clean_approval < evidence_loop < evidence,
+           'the final run-ID evidence pass must follow clean-HEAD approval'
 
     baseline = body.index('const before = new Set(')
     comment = body.index('const reviewComment = await github.rest.issues.createComment(')
