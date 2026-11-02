@@ -85,6 +85,19 @@ def check_inline_script_sizes(path: pathlib.Path, text: str) -> None:
             )
 
 
+def check_every_workflow_script_size() -> None:
+    """Apply the argv-safe limit to every workflow, not only the targets.
+
+    Any ``actions/github-script`` caller can overflow the Linux argv limit, so
+    a size regression outside the generated controllers must fail this
+    contract too instead of staying invisible until the run starts.
+    """
+    for workflow in sorted((ROOT / ".github" / "workflows").glob("*.yml")):
+        check_inline_script_sizes(
+            workflow, workflow.read_text(encoding="utf-8")
+        )
+
+
 def canonical_body() -> list[str]:
     lines = CANONICAL.read_text(encoding="utf-8").splitlines()
     try:
@@ -128,6 +141,7 @@ def main() -> int:
         raise SystemExit("usage: embed_workflow_dispatch_contract.py [--check]")
     body = canonical_body()
     stale = []
+    check_every_workflow_script_size()
     for target in TARGETS:
         current = target.read_text(encoding="utf-8")
         desired = updated(target, body)
