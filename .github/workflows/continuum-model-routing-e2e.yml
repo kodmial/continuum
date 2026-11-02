@@ -9,6 +9,7 @@ on:
       - 'tests/fixtures/opencode-models-66.json'
   workflow_dispatch:
 
+# Persistent state is shared by both jobs in one attempt, but isolated across attempts.
 # PR-only integration fixture: no PAT, provider API key, paid-model discovery,
 # untrusted fork code, production rollout configuration or default-branch push.
 permissions:
@@ -44,7 +45,7 @@ jobs:
         with:
           models: ${{ steps.fixture.outputs.models }}
           task-class: coder
-          profile: work-lock-66-e2e
+          profile: work-lock-66-e2e-${{ github.run_id }}-${{ github.run_attempt }}
           state-token: ${{ github.token }}
           runtime-version: ${{ steps.toolchain.outputs.runtime-version }}
       - name: Complete a real isolated coding task with selected route
@@ -70,7 +71,7 @@ jobs:
           models: ${{ steps.fixture.outputs.models }}
           selected-model: ${{ steps.select.outputs.model }}
           task-class: coder
-          profile: work-lock-66-e2e
+          profile: work-lock-66-e2e-${{ github.run_id }}-${{ github.run_attempt }}
           state-token: ${{ github.token }}
           runtime-version: ${{ steps.toolchain.outputs.runtime-version }}
 
@@ -102,7 +103,7 @@ jobs:
           operation: verify
           models: ${{ steps.fixture.outputs.models }}
           task-class: coder
-          profile: work-lock-66-e2e
+          profile: work-lock-66-e2e-${{ github.run_id }}-${{ github.run_attempt }}
           state-token: ${{ github.token }}
           runtime-version: ${{ steps.toolchain.outputs.runtime-version }}
           expected-model: ${{ needs.first-runner.outputs.selected_model }}
