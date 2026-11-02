@@ -125,13 +125,18 @@ APPROVED_423_OPENCODE_SHA256 = (
     "198c789f38625fe23880e341d3b78ce8912244cb0e1556bd52c4d25272538730"
 )
 
-# Wording cleanup: re-pin the exact protected workflow artifact after the
-# rate-limit/quota wording cleanup, which changes comments only. The #423 pin
-# above remains for historical audit; unrelated workflow drift still fails
-# closed. Ref-aware CodeRabbit dispatch resolution changes only the
-# dispatch-caller lookup, so the digest advances with that reviewed patch.
+# Historical wording-only protected-workflow digest retained for audit.
 APPROVED_WORDING_OPENCODE_SHA256 = (
     "5f00093e88d8e744bd0506f2a65d2048b6c313f9c90191c39bc27327e9e5e9c4"
+)
+
+# kodmial/continuum#433: the optional HMAC key path is now truly optional.
+# With no secret, verification receives no key-file environment variable and
+# runs explicitly unattested; with a secret, the key is provisioned and the
+# private path is supplied only to the runner-local verifier. The exact
+# workflow digest is advanced only alongside the branch-specific contract test.
+APPROVED_433_OPENCODE_SHA256 = (
+    "5ab7de33b1b4a1a94a8ea8a0c12cfb5d2ffe57728bc4c71e9accaa08b51f026d"
 )
 
 APPROVED_350_SELF_CALLER_SHA256 = (
@@ -2548,13 +2553,11 @@ class ProtectedBaselineTests(unittest.TestCase):
                     self.assertIn("CONTINUUM_OPENCODE_PUBLISH_RACE_RETRY_REQUIRED", original)
                     self.assertIn("steps.model_route.outputs.model", original)
                 if path == ".github/workflows/continuum-opencode.yml":
-                    # #168 brackets the reviewed #415 implementation with the
-                    # repository baseline, fresh verifier/fix session, and
-                    # identical final command set atop the #413 publish
-                    # isolation artifact.
+                    # #433 advances the protected artifact only for the
+                    # explicitly tested optional-attestation no-key branch.
                     self.assertEqual(
                         protected_file_digest(path),
-                        APPROVED_WORDING_OPENCODE_SHA256,
+                        APPROVED_433_OPENCODE_SHA256,
                         f"{path}: unexpected drift outside reviewed wording cleanup",
                     )
                 else:
@@ -2608,7 +2611,7 @@ class ProtectedBaselineTests(unittest.TestCase):
         # therefore be dirty in this pre-commit worktree; any unapproved byte
         # change still fails the exact digest assertions above.
         approved = {
-            ".github/workflows/continuum-opencode.yml": APPROVED_WORDING_OPENCODE_SHA256,
+            ".github/workflows/continuum-opencode.yml": APPROVED_433_OPENCODE_SHA256,
             ".github/workflows/opencode.yml": APPROVED_350_SELF_CALLER_SHA256,
         }
         for path in PROTECTED_FILES:
