@@ -196,10 +196,12 @@ No paid provider key is required by core.
 In the repository settings, add a branch protection rule or ruleset for `main`:
 
 - require a pull request before merging;
-- require status checks by the exact names the runs publish. Validation comes
-  from the reusable workflow's `Validate` job (plus the `continuum/validation`
-  commit-status context); no check run is literally named `CI`. Copy the real
-  names from the first pull-request run before saving the rule;
+- require the reusable workflow's `Validate` check run; no check run is
+  literally named `CI`. The optional `continuum/validation` commit-status
+  context is intentionally suppressed for fork and Dependabot PRs because
+  those runs cannot publish commit statuses with their read-only token. Do not
+  require that optional context unless a trusted publisher covers those PRs.
+  Copy the exact check name from the first pull-request run before saving the rule;
 - require branches to be up to date before merging;
 - block force pushes and deletion;
 - do not grant routine bypass permissions.
