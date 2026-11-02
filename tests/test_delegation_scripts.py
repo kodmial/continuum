@@ -223,6 +223,11 @@ class CheckpointHistoryTests(unittest.TestCase):
             timeout=120,
         )
         self.assertIn("rc=4", result.stdout, result.stderr)
+        # The rejection must come from the shared-history guard, not from an
+        # incidental failure such as the spec marker check.
+        self.assertIn(
+            "unrelated to the target default branch", result.stderr, result.stderr
+        )
 
     def test_fresh_start_uses_the_discovered_default_branch(self):
         # A child whose default branch is not main has no origin/main at all,
@@ -263,6 +268,73 @@ class CheckpointHistoryTests(unittest.TestCase):
                 cwd=self.work, capture_output=True, text=True, timeout=60,
             ).stdout.strip()
             self.assertEqual(main_ref, "")
+
+    def test_shallow_history_is_reported_as_inconclusive(self):
+        # A shallow checkout can hide a real common ancestor behind the
+        # shallow boundary, and merge-base then exits 1 exactly like genuinely
+        # unrelated history. The guard must say the answer is inconclusive
+        # instead of claiming the checkpoint is unrelated. The bounded
+        # deepening fallback cannot be forced to stop short against a local
+        # file:// remote (``--unshallow`` always succeeds there), so this test
+        # exercises the shared-history seam directly on a genuinely shallow
+        # clone whose fetched refs stop one commit above the shared ancestor.
+        ref = "continuum-child/checkpoint-task-9-g1-" + SPEC
+        self._checkpoint(ref)
+        self._advance_main()
+        self._git(
+            self.tmp.name,
+            "clone", "-q", "--depth=1", "file://" + self.origin, self.work,
+        )
+        self._config(self.work)
+        self._git(
+            self.work,
+            "fetch", "-q", "--depth=1", "origin",
+            ref + ":refs/remotes/origin/" + ref,
+        )
+        checkpoint_sha = subprocess.run(
+            ["git", "rev-parse", "origin/" + ref],
+            cwd=self.work, capture_output=True, text=True, timeout=60,
+        ).stdout.strip()
+        # The fixture must actually reproduce the ambiguous case: shallow
+        # repository plus merge-base exit 1. Fail loudly if git ever stops
+        # behaving that way instead of silently testing a different branch.
+        shallow = subprocess.run(
+            ["git", "rev-parse", "--is-shallow-repository"],
+            cwd=self.work, capture_output=True, text=True, timeout=60,
+        ).stdout.strip()
+        self.assertEqual(shallow, "true")
+        probe = subprocess.run(
+            ["git", "merge-base", "origin/" + self.DEFAULT_BRANCH, checkpoint_sha],
+            cwd=self.work, capture_output=True, text=True, timeout=60,
+        )
+        self.assertEqual(probe.returncode, 1, probe.stderr)
+        driver = (
+            'source "$CHECKPOINT"\n'
+            'if continuum_checkpoint_assert_shared_history "origin/$BRANCH" "$SHA"; then\n'
+            '  printf "rc=0\\n"\n'
+            'else\n'
+            '  printf "rc=%s\\n" "$?"\n'
+            'fi\n'
+        )
+        result = subprocess.run(
+            ["bash", "-c", driver],
+            cwd=self.work,
+            capture_output=True,
+            text=True,
+            env={
+                **os.environ,
+                "CHECKPOINT": CHECKPOINT,
+                "SHA": checkpoint_sha,
+                "BRANCH": self.DEFAULT_BRANCH,
+            },
+            timeout=120,
+        )
+        self.assertIn("rc=4", result.stdout, result.stderr)
+        self.assertIn("shallow", result.stderr, result.stderr)
+        self.assertIn("deeper history", result.stderr, result.stderr)
+        self.assertNotIn(
+            "unrelated to the target default branch", result.stderr, result.stderr
+        )
 
     def test_stale_origin_head_with_missing_tracking_ref_is_refreshed(self):
         # A clone can keep a stale origin/HEAD and lose the resolved
@@ -340,6 +412,51 @@ class CheckpointHistoryTests(unittest.TestCase):
         )
         self.assertIn("rc=4", result.stdout, result.stderr)
         self.assertIn("default branch", result.stderr)
+
+    def test_missing_default_branch_ref_is_reported_as_a_git_error(self):
+        # Only exit 1 from merge-base means "no common ancestor". A missing
+        # default-branch ref is infrastructure damage and must not be
+        # disguised as an unrelated checkpoint. The guard is exercised
+        # directly because a restore first fetches the resolved default
+        # branch, which recreates origin/main before the check runs.
+        self._git(self.tmp.name, "clone", "-q", self.origin, self.work)
+        self._config(self.work)
+        missing = "refs/remotes/origin/does-not-exist"
+        probe = subprocess.run(
+            ["git", "merge-base", missing, "origin/" + self.DEFAULT_BRANCH],
+            cwd=self.work, capture_output=True, text=True, timeout=60,
+        )
+        # The environment must actually reproduce a git error. If a future or
+        # different git reported the missing ref as "unrelated" (exit 1), this
+        # test would stop exercising the infrastructure branch and must fail
+        # loudly instead of skipping.
+        self.assertNotIn(probe.returncode, (0, 1), probe.stderr)
+        driver = (
+            'source "$CHECKPOINT"\n'
+            'if continuum_checkpoint_assert_shared_history "$REF" "origin/$BRANCH"; then\n'
+            '  printf "rc=0\\n"\n'
+            'else\n'
+            '  printf "rc=%s\\n" "$?"\n'
+            'fi\n'
+        )
+        result = subprocess.run(
+            ["bash", "-c", driver],
+            cwd=self.work,
+            capture_output=True,
+            text=True,
+            env={
+                **os.environ,
+                "CHECKPOINT": CHECKPOINT,
+                "REF": missing,
+                "BRANCH": self.DEFAULT_BRANCH,
+            },
+            timeout=120,
+        )
+        self.assertIn("rc=4", result.stdout, result.stderr)
+        self.assertIn("git merge-base exited with status", result.stderr, result.stderr)
+        self.assertNotIn(
+            "unrelated to the target default branch", result.stderr, result.stderr
+        )
 
     def _dirty_clone(self):
         self._git(self.tmp.name, "clone", "-q", self.origin, self.work)
@@ -430,6 +547,81 @@ class CheckpointHistoryTests(unittest.TestCase):
         ).stdout
         self.assertIn("delta.txt", tracked)
         self.assertNotIn(".continuum-cancel-engine", tracked)
+
+    def test_save_rebases_onto_a_concurrent_winner_behind_an_advanced_default_branch(self):
+        # A concurrent winner created before the default branch advanced is
+        # still shared history: save must rebase onto it instead of treating
+        # the lag as an unrelated or stale checkpoint.
+        self.ref = "continuum-child/checkpoint-task-6-g1-" + SPEC
+        self._checkpoint(self.ref)
+        winner = subprocess.run(
+            ["git", "rev-parse", self.ref], cwd=self.seed,
+            capture_output=True, text=True, timeout=60,
+        ).stdout.strip()
+        self._advance_main()
+        self._dirty_clone()
+        result = self._save(
+            'source "$CHECKPOINT"\n'
+            'continuum_assert_safe_push() { return 0; }\n'
+            'if continuum_checkpoint_save "$REF" "$SPEC" kodmial/continuum 6; then\n'
+            '  printf "rc=0\\n"\n'
+            'else\n'
+            '  printf "rc=%s\\n" "$?"\n'
+            'fi\n'
+        )
+        self.assertIn("rc=0", result.stdout, result.stderr)
+        head = subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=self.work,
+            capture_output=True, text=True, timeout=60,
+        ).stdout.strip()
+        ancestry = subprocess.run(
+            ["git", "merge-base", "--is-ancestor", winner, head], cwd=self.work,
+            capture_output=True, text=True, timeout=60,
+        )
+        self.assertEqual(ancestry.returncode, 0, result.stderr)
+        tracked = subprocess.run(
+            ["git", "ls-tree", "--name-only", "HEAD"], cwd=self.work,
+            capture_output=True, text=True, timeout=60,
+        ).stdout
+        self.assertIn("delta.txt", tracked)
+        self._git(self.work, "fetch", "-q", "origin", self.ref)
+        published = subprocess.run(
+            ["git", "rev-parse", "FETCH_HEAD"], cwd=self.work,
+            capture_output=True, text=True, timeout=60,
+        ).stdout.strip()
+        self.assertEqual(published, head)
+
+    def test_save_with_an_unrelated_concurrent_checkpoint_fails_closed(self):
+        # The competing checkpoint carries the frozen spec marker but shares no
+        # ancestor with the default branch, so save must reject it through the
+        # shared-history guard instead of rebasing onto it.
+        self.ref = "continuum-child/checkpoint-task-8-g1-" + SPEC
+        self._checkpoint(self.ref, orphan=True)
+        winner = subprocess.run(
+            ["git", "rev-parse", self.ref], cwd=self.seed,
+            capture_output=True, text=True, timeout=60,
+        ).stdout.strip()
+        self._dirty_clone()
+        result = self._save(
+            'source "$CHECKPOINT"\n'
+            'continuum_assert_safe_push() { return 0; }\n'
+            'if continuum_checkpoint_save "$REF" "$SPEC" kodmial/continuum 8; then\n'
+            '  printf "rc=0\\n"\n'
+            'else\n'
+            '  printf "rc=%s\\n" "$?"\n'
+            'fi\n'
+        )
+        self.assertIn("rc=4", result.stdout, result.stderr)
+        self.assertIn(
+            "unrelated to the target default branch", result.stderr, result.stderr
+        )
+        # Refusing must leave the unrelated winner untouched rather than
+        # overwriting it with local work.
+        remote = subprocess.run(
+            ["git", "ls-remote", "origin", "refs/heads/" + self.ref],
+            cwd=self.work, capture_output=True, text=True, timeout=60,
+        ).stdout.split()
+        self.assertEqual(remote[0] if remote else None, winner)
 
 
 class CheckpointNonMainDefaultBranchTests(CheckpointHistoryTests):

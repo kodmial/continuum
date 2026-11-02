@@ -1,0 +1,40 @@
+name: CodeRabbit unresolved repair
+
+# Self-dogfood entry for the unresolved-thread batcher. The reusable engine is
+# workflow_call-only, so this file owns the triggers and calls the engine
+# locally. Installed consumers keep using the
+# continuum-coderabbit-unresolved.yml caller stub instead.
+
+on:
+  # A CodeRabbit reply verdict on an exact head wakes the batcher immediately.
+  pull_request_review_comment:
+    types: [created]
+
+  # Manual reconciliation for a missed review reply. The PR identity is
+  # required because a dispatch carries no pull_request payload.
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: "Pull request number to reconcile"
+        required: true
+        type: string
+
+permissions:
+  actions: write
+  contents: read
+  issues: write
+  pull-requests: read
+
+jobs:
+  call:
+    if: >-
+      vars.CONTINUUM_ROLE != 'child' &&
+      (vars.CONTINUUM_REVIEW_PROVIDER || 'none') == 'coderabbit'
+    uses: ./.github/workflows/continuum-coderabbit-unresolved.yml
+    secrets: inherit
+    with:
+      continuum_ref: main
+      pr_number: "${{ inputs.pr_number }}"
+      # The batcher dispatches a caller workflow, not the workflow_call-only
+      # engine, so point it at this repository's dispatchable OpenCode entry.
+      opencode_workflow: 'opencode.yml'

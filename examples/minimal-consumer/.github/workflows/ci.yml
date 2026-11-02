@@ -1,0 +1,24 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  actions: write
+  contents: read
+  pull-requests: read
+  statuses: write
+
+jobs:
+  validate:
+    uses: kodmial/continuum/.github/workflows/continuum-validation.yml@main
+    with:
+      continuum_ref: main
+      auto_detect: 'false'
+      publish_status: ${{ github.event_name == 'pull_request' && (github.event.pull_request.head.repo.fork || github.actor == 'dependabot[bot]') && 'false' || 'true' }}
+      dispatch_repair: ${{ github.event_name == 'pull_request' && (github.event.pull_request.head.repo.fork || github.actor == 'dependabot[bot]') && 'false' || 'true' }}
+      build_command: python3 -m compileall -q app.py tests
+      test_command: python3 -m unittest discover -s tests -v

@@ -1,0 +1,77 @@
+name: Bug report
+description: Report a reproducible defect in a Continuum workflow, caller, installer, engine, or documentation.
+title: "[Bug]: "
+labels:
+  - bug
+  - automation:blocked
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thank you for reporting a problem. Include enough detail to reproduce it
+        without sharing secrets or consumer data.
+
+        This form applies the `automation:blocked` admission hold. A maintainer
+        must explicitly admit the report before automatic implementation can
+        pick it up. Form labels are intake convenience, not scheduler policy:
+        maintainers and API users can still create blank issues.
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      description: Which part of Continuum is affected?
+      options:
+        - Reusable workflow
+        - Caller template or installer
+        - Python engine
+        - Documentation
+        - Other
+    validations:
+      required: true
+  - type: input
+    id: ref
+    attributes:
+      label: Continuum ref
+      description: Branch, tag, or full commit SHA you used, plus the installed caller ref if relevant. Do not paste a token.
+      placeholder: main, v1.2.3, or a full commit SHA
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction
+      description: Exact steps, commands, workflow inputs, and configuration needed to reproduce the problem. Redact secrets and private repository names.
+      placeholder: |
+        1. Install the core set with ...
+        2. Run ...
+        3. Observe ...
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+      description: What should have happened?
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+      description: What happened instead? Include relevant error text with secrets and consumer data removed.
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment (optional)
+      description: Runner OS, Ruby, Python, and actionlint versions, or any other context that may matter.
+    validations:
+      required: false
+  - type: checkboxes
+    id: confirmations
+    attributes:
+      label: Confirmations
+      options:
+        - label: I removed secrets, tokens, and consumer data from this report.
+          required: true

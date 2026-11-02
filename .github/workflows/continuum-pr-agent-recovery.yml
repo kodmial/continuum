@@ -1,0 +1,2463 @@
+name: PR-Agent recovery
+
+on:
+  workflow_call:
+    inputs:
+      continuum_ref:
+        description: Continuum revision supplying the recovery engine.
+        type: string
+        default: main
+        required: false
+      review_provider:
+        description: Review provider selector; empty falls back to CONTINUUM_REVIEW_PROVIDER.
+        type: string
+        default: ''
+        required: false
+      review_workflow:
+        description: PR-Agent caller workflow file to dispatch.
+        type: string
+        default: continuum-pr-agent.yml
+        required: false
+      ci_workflow_name:
+        description: >-
+          Exact workflow name that proves current-head CI. Empty falls back to
+          vars.CONTINUUM_CI_WORKFLOW_NAME, then to 'CI'.
+        type: string
+        default: ''
+        required: false
+      stale_minutes:
+        description: Pending operation age after which missing liveness becomes recoverable.
+        type: string
+        default: ''
+        required: false
+      dispatch_grace_seconds:
+        description: Grace after a durable dispatch marker before a missing run may be replayed.
+        type: string
+        default: ''
+        required: false
+      target_child_id:
+        description: >-
+          Opaque verified child id for delegated recovery. Empty targets the
+          caller repository, unless vars.CONTINUUM_PR_AGENT_TARGET_CHILD_ID
+          selects a child.
+        type: string
+        default: ''
+        required: false
+      max_executions:
+        description: >-
+          Total transient executions per exact PR/HEAD/operation (default 10,
+          clamped to 1..10). Empty falls back to
+          vars.PR_AGENT_RECOVERY_MAX_EXECUTIONS, then to 10. Success or a new
+          HEAD resets the episode; deterministic failures never consume it.
+        type: string
+        default: ''
+        required: false
+
+permissions: {}
+
+concurrency:
+  group: ${{ (inputs.target_child_id || vars.CONTINUUM_PR_AGENT_TARGET_CHILD_ID) && format('pr-agent-recovery-child-{0}-{1}', inputs.target_child_id || vars.CONTINUUM_PR_AGENT_TARGET_CHILD_ID, github.repository) || format('pr-agent-recovery-{0}', github.repository) }}
+  cancel-in-progress: false
+
+jobs:
+  reconcile:
+    # Child-local automatic recovery is suppressed in verified child mode
+    # (issue #244): the parent is the only automatic execution plane for
+    # child PR-Agent. Local/non-child behavior is unchanged.
+    if: >-
+      (inputs.review_provider || vars.CONTINUUM_REVIEW_PROVIDER || 'none') == 'pr-agent' &&
+      vars.CONTINUUM_ROLE != 'child'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    permissions:
+      actions: read
+      contents: read
+      issues: write
+      pull-requests: read
+      statuses: read
+
+    steps:
+      - name: Resolve PR-Agent target context
+        env:
+          GH_TOKEN: ${{ secrets.TAP_PAT }}
+          READ_GITHUB_TOKEN: ${{ github.token }}
+          TARGET_CHILD_ID: ${{ inputs.target_child_id || vars.CONTINUUM_PR_AGENT_TARGET_CHILD_ID }}
+          CONTINUUM_REF: ${{ inputs.continuum_ref }}
+        run: |
+          set -euo pipefail
+          continuum_b64_decode() {
+            if printf '' | base64 --decode >/dev/null 2>&1; then
+              base64 --decode
+            elif printf '' | base64 -d >/dev/null 2>&1; then
+              base64 -d
+            elif printf '' | base64 -D >/dev/null 2>&1; then
+              base64 -D
+            elif command -v python3 >/dev/null 2>&1; then
+              python3 -c 'import sys,base64; sys.stdout.buffer.write(base64.b64decode(sys.stdin.read()))'
+            else
+              openssl base64 -d
+            fi
+          }
+          CONTINUUM_SOURCE_REPO="kodmial/continuum"
+          if [[ -z "${TARGET_CHILD_ID:-}" ]]; then
+            if ! [[ "$GITHUB_REPOSITORY" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || [[ "${GITHUB_REPOSITORY%%/*}" =~ ^\.+$ ]] || [[ "${GITHUB_REPOSITORY#*/}" =~ ^\.+$ ]]; then
+              echo "::error::PR-Agent target repository identity is invalid."
+              exit 2
+            fi
+            {
+              printf 'CONTINUUM_PR_AGENT_TARGET_REPOSITORY=%s\n' "$GITHUB_REPOSITORY"
+              printf 'CONTINUUM_PR_AGENT_TARGET_OWNER=%s\n' "${GITHUB_REPOSITORY%%/*}"
+              printf 'CONTINUUM_PR_AGENT_TARGET_REPO=%s\n' "${GITHUB_REPOSITORY#*/}"
+              printf 'CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED=%s\n' "false"
+            } >> "$GITHUB_ENV"
+            echo "PR-Agent target context resolved locally."
+            exit 0
+          fi
+          : "${CONTINUUM_REF:?CONTINUUM_REF is required for pinned target resolution}"
+          RUNTIME_ROOT="$RUNNER_TEMP/continuum-pr-agent-target-runtime"
+          mkdir -p "$RUNTIME_ROOT/.github/scripts" "$RUNTIME_ROOT/src/continuum"
+          fetch_runtime_file() {
+            local path="$1" dest="$2"
+            if ! GH_TOKEN="$READ_GITHUB_TOKEN" gh api --method GET "repos/$CONTINUUM_SOURCE_REPO/contents/$path" -f ref="$CONTINUUM_REF" --jq .content 2>/dev/null \
+              | tr -d '\n' | continuum_b64_decode > "$dest" 2>/dev/null; then
+              echo "::error::Unable to load the Continuum PR-Agent target resolver."
+              exit 1
+            fi
+            if [[ ! -s "$dest" ]]; then
+              echo "::error::Unable to load the Continuum PR-Agent target resolver."
+              exit 1
+            fi
+          }
+          fetch_runtime_file ".github/scripts/pr_agent_target.sh" "$RUNTIME_ROOT/.github/scripts/pr_agent_target.sh"
+          fetch_runtime_file ".github/scripts/delegation_repository.sh" "$RUNTIME_ROOT/.github/scripts/delegation_repository.sh"
+          fetch_runtime_file ".github/scripts/delegation_runtime.py" "$RUNTIME_ROOT/.github/scripts/delegation_runtime.py"
+          fetch_runtime_file "src/continuum/__init__.py" "$RUNTIME_ROOT/src/continuum/__init__.py"
+          fetch_runtime_file "src/continuum/config.py" "$RUNTIME_ROOT/src/continuum/config.py"
+          fetch_runtime_file "src/continuum/yamlmini.py" "$RUNTIME_ROOT/src/continuum/yamlmini.py"
+          fetch_runtime_file "src/continuum/api_budget.py" "$RUNTIME_ROOT/src/continuum/api_budget.py"
+          fetch_runtime_file "src/continuum/delegation_discovery.py" "$RUNTIME_ROOT/src/continuum/delegation_discovery.py"
+          PARENT_CONFIG_FILE="$RUNTIME_ROOT/parent.continuum.yml"
+          # The parent config lives in the execution repository: fetch its
+          # default branch, never the Continuum engine pin (which may not
+          # exist in the execution repository).
+          if ! GH_TOKEN="$READ_GITHUB_TOKEN" gh api --method GET "repos/$GITHUB_REPOSITORY/contents/.continuum.yml" --jq .content 2>/dev/null \
+            | tr -d '\n' | continuum_b64_decode > "$PARENT_CONFIG_FILE" 2>/dev/null || [[ ! -s "$PARENT_CONFIG_FILE" ]]; then
+            echo "::error::Unable to load the parent Continuum configuration for delegated target resolution; refusing to guess."
+            exit 1
+          fi
+          CONTINUUM_ENGINE_ROOT="$RUNTIME_ROOT" PARENT_CONFIG="$PARENT_CONFIG_FILE" \
+            bash "$RUNTIME_ROOT/.github/scripts/pr_agent_target.sh" "$TARGET_CHILD_ID"
+
+      - name: Reconcile PR-Agent latest state
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
+        env:
+          REVIEW_WORKFLOW: ${{ inputs.review_workflow }}
+          CI_WORKFLOW_NAME: ${{ inputs.ci_workflow_name || vars.CONTINUUM_CI_WORKFLOW_NAME || 'CI' }}
+          STALE_MINUTES: ${{ inputs.stale_minutes || vars.PR_AGENT_RECOVERY_STALE_MINUTES || '70' }}
+          DISPATCH_GRACE_SECONDS: ${{ inputs.dispatch_grace_seconds || vars.PR_AGENT_RECOVERY_DISPATCH_GRACE_SECONDS || '90' }}
+          TARGET_CHILD_ID: ${{ inputs.target_child_id || vars.CONTINUUM_PR_AGENT_TARGET_CHILD_ID }}
+          MAX_EXECUTIONS_RAW: ${{ inputs.max_executions }}
+          MAX_EXECUTIONS_FALLBACK: ${{ vars.PR_AGENT_RECOVERY_MAX_EXECUTIONS || '10' }}
+          # Item 1 of Work Lock #58: same-repo reads use the repository-scoped
+          # installation token. PAT remains the mutation/dispatch identity.
+          # For delegated recovery, cross-repository target reads fall back
+          # to the PAT client via withReadFallback when github.token cannot
+          # see the child.
+          READ_GITHUB_TOKEN: ${{ github.token }}
+        with:
+          github-token: ${{ secrets.TAP_PAT }}
+          script: |
+            const executionOwner = context.repo.owner;
+            const executionRepo = context.repo.repo;
+            const owner = process.env.CONTINUUM_PR_AGENT_TARGET_OWNER;
+            const repo = process.env.CONTINUUM_PR_AGENT_TARGET_REPO;
+            const repoFullName = process.env.CONTINUUM_PR_AGENT_TARGET_REPOSITORY;
+            const reviewWorkflow = String(process.env.REVIEW_WORKFLOW || 'continuum-pr-agent.yml').trim();
+            const ciWorkflowName = String(process.env.CI_WORKFLOW_NAME || 'CI').trim();
+            const delegatedTarget =
+              process.env.CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED === 'true';
+            // Canonical exact-HEAD CI proof shared with admission,
+            // pre-review revalidation, and the merge gate (issue #368). The
+            // newest matching pull_request run decides, so a stale/partial
+            // snapshot can neither hide a green run nor authorize a merge
+            // when a newer red or pending run exists.
+            function ciRunCreatedAt(run) {
+              const parsed = Date.parse(String((run && run.created_at) || ''));
+              return Number.isFinite(parsed) ? parsed : 0;
+            }
+            function ciRunUpdatedAt(run) {
+              const parsed = Date.parse(String((run && run.updated_at) || ''));
+              return Number.isFinite(parsed) ? parsed : 0;
+            }
+            function ciRunMatchesExactHead(run, workflowName, head) {
+              return Boolean(
+                run &&
+                String(run.name || '') === String(workflowName || '') &&
+                String(run.head_sha || '').trim().toLowerCase() ===
+                  String(head || '').trim().toLowerCase() &&
+                String(run.event || '') === 'pull_request'
+              );
+            }
+            function decideExactHeadCi({ proofRun = null, runs = [], workflowName, headSha: head, delegated = false }) {
+              // Deduplicate by immutable run id while keeping the freshest
+              // observed state of that run: the proof run fetched by id and
+              // the filtered listing may describe the same run at different
+              // moments (pending -> completed), so the newer snapshot wins.
+              const byKey = new Map();
+              for (const run of [proofRun, ...(runs || [])]) {
+                if (!ciRunMatchesExactHead(run, workflowName, head)) continue;
+                const key = run.id !== undefined && run.id !== null
+                  ? 'id:' + String(run.id)
+                  : [
+                      String(run.name || ''),
+                      String(run.head_sha || '').toLowerCase(),
+                      String(run.created_at || ''),
+                      String(run.status || ''),
+                      String(run.conclusion || ''),
+                    ].join('|');
+                const previous = byKey.get(key);
+                if (!previous) {
+                  byKey.set(key, run);
+                  continue;
+                }
+                const previousUpdated = ciRunUpdatedAt(previous);
+                const currentUpdated = ciRunUpdatedAt(run);
+                if (
+                  currentUpdated > previousUpdated ||
+                  (
+                    currentUpdated === previousUpdated &&
+                    previous.status !== 'completed' &&
+                    run.status === 'completed'
+                  )
+                ) {
+                  byKey.set(key, run);
+                }
+              }
+              const candidates = [...byKey.values()];
+              const newest = candidates.sort((a, b) => {
+                const at = ciRunCreatedAt(a);
+                const bt = ciRunCreatedAt(b);
+                if (bt !== at) return bt - at;
+                return Number(b.id || 0) - Number(a.id || 0);
+              })[0] || null;
+              if (!newest) return { state: 'unavailable', run: null, runId: null };
+              const state =
+                newest.status === 'completed'
+                  ? (
+                      newest.conclusion === 'success' ||
+                      (delegated && newest.conclusion === 'skipped')
+                        ? 'green'
+                        : 'red'
+                    )
+                  : 'pending';
+              return { state, run: newest, runId: Number(newest.id) || null };
+            }
+            // Single 10-execution transient budget (#224): default 10 total
+            // executions per exact PR/HEAD/operation, configurable through a
+            // safe bounded Continuum variable and always clamped to 1..10 so
+            // a misconfigured value can neither silence recovery nor grant
+            // an unbounded budget. Success or a new HEAD resets the episode.
+            const MAX_TRANSIENT_EXECUTIONS = 10;
+            const MIN_TRANSIENT_EXECUTIONS = 1;
+            function resolveMaxExecutions(raw, fallback = MAX_TRANSIENT_EXECUTIONS) {
+              const toBounded = (value) => {
+                const parsed = Number.parseInt(String(value ?? '').trim(), 10);
+                if (!Number.isFinite(parsed)) return MAX_TRANSIENT_EXECUTIONS;
+                return Math.min(
+                  MAX_TRANSIENT_EXECUTIONS,
+                  Math.max(MIN_TRANSIENT_EXECUTIONS, parsed)
+                );
+              };
+              if (raw === undefined || raw === null || String(raw).trim() === '') {
+                return toBounded(fallback);
+              }
+              // A non-numeric override must honor the operator fallback (vars),
+              // not silently widen to 10 executions beyond operator intent.
+              if (!Number.isFinite(Number.parseInt(String(raw).trim(), 10))) {
+                return toBounded(fallback);
+              }
+              return toBounded(raw);
+            }
+            const maxExecutions = resolveMaxExecutions(
+              process.env.MAX_EXECUTIONS_RAW,
+              process.env.MAX_EXECUTIONS_FALLBACK
+            );
+            const staleMs = Number.parseInt(process.env.STALE_MINUTES || '70', 10) * 60_000;
+            const dispatchGraceMs =
+              Number.parseInt(process.env.DISPATCH_GRACE_SECONDS || '90', 10) * 1_000;
+            const trustedAssociations = new Set(['OWNER', 'MEMBER', 'COLLABORATOR']);
+            // A completed failed run with a still-pending lifecycle status
+            // means the producer terminated before it could publish its final
+            // deterministic/transient verdict. That is an incomplete
+            // control-plane lifecycle, so bounded recovery retries it
+            // immediately instead of waiting the full stale timeout.
+            const retryableConclusions = new Set([
+              'failure',
+              'cancelled',
+              'timed_out',
+              'stale',
+              'startup_failure',
+            ]);
+            const activeStatuses = new Set([
+              'queued',
+              'in_progress',
+              'waiting',
+              'requested',
+              'pending',
+            ]);
+            const REVIEW_CONTEXT = 'continuum/pr-agent-review';
+            const REPAIR_CONTEXT = 'continuum/pr-agent-repair';
+            const CONTROLLER_STATE_MARKER = '<!-- continuum-pr-agent-controller-state:v1 -->';
+
+            // Keep the action client PAT-authenticated for mutations/dispatch.
+            // A distinct Octokit instance handles read-only same-repository calls
+            // with github.token, keeping those requests off TAP_PAT.
+            const readToken = String(process.env.READ_GITHUB_TOKEN || '').trim();
+            // github-script already supplies the plugin-composed Octokit class.
+            // Reuse its constructor instead of dynamically requiring
+            // @actions/github, which is not resolvable from the script sandbox.
+            // Preserve the enterprise base URL so GitHub Enterprise reads keep working.
+            const readBaseUrl = (
+              (github && github.request && github.request.endpoint &&
+                github.request.endpoint.DEFAULTS && github.request.endpoint.DEFAULTS.baseUrl) ||
+              process.env.GITHUB_API_URL || 'https://api.github.com'
+            );
+            if (!readToken) {
+              core.setFailed('READ_GITHUB_TOKEN is empty; same-repository reads require GITHUB_TOKEN and must not fall back to TAP_PAT.');
+              return;
+            }
+            const readGithub = new github.constructor({ auth: readToken, baseUrl: readBaseUrl });
+            let readTokenUnavailable = false;
+            function isRateLimitError(err, status) {
+              if (status === 429) return true;
+              if (status !== 403) return false;
+              const headers = (err && ((err.response && err.response.headers) || err.headers)) || {};
+              const lowered = {};
+              for (const [key, value] of Object.entries(headers)) {
+                lowered[String(key).toLowerCase()] = value;
+              }
+              if (lowered['retry-after'] !== undefined && String(lowered['retry-after']).trim() !== '') return true;
+              if (lowered['x-ratelimit-reset'] !== undefined && String(lowered['x-ratelimit-reset']).trim() !== '') return true;
+              if (lowered['x-ratelimit-remaining'] !== undefined && String(lowered['x-ratelimit-remaining']).trim() === '0') return true;
+              return /rate limit|rate-limit|ratelimit|quota exhaustion|secondary rate limit|retry after/i.test(
+                String((err && err.message) || '')
+              );
+            }
+            async function withReadFallback(fn) {
+              // Per-call fallback only: one per-PR auth gap falls back for
+              // that call alone and never flips the rest of the scan to PAT.
+              // (readTokenUnavailable is retained for shape; never set sticky.)
+              if (readTokenUnavailable || readGithub === github) {
+                return await fn(github);
+              }
+              try {
+                return await fn(readGithub);
+              } catch (err) {
+                const status = err ? (err.status ?? err.response?.status) : undefined;
+                // A 429 or rate-limited 403 read is deferred to the next wakeup and does not retry inline:
+                // the error surfaces so the caller defers instead of
+                // re-issuing the scan on the PAT client. Only
+                // authentication/permission gaps
+                // (401, non-rate-limit 403) fall back, one call at a time.
+                // Cross-repository target reads with github.token scoped
+                // to the execution repository conventionally surface as
+                // 404 (the documented inaccessible-repo response), so those
+                // also fall back to TAP_PAT alongside 401/non-rate-limit 403.
+                if (status === 401 || (status === 403 && !isRateLimitError(err, status)) || status === 404) {
+                  core.warning('Repository-token read failed (' + status + '); retrying with PAT client: ' + err.message);
+                  return await fn(github);
+                }
+                throw err;
+              }
+            }
+
+            if (!['continuum-pr-agent.yml', 'pr-agent.yml'].includes(reviewWorkflow)) {
+              core.setFailed(
+                'Invalid PR-Agent review workflow: ' + reviewWorkflow +
+                '. Expected continuum-pr-agent.yml or pr-agent.yml.'
+              );
+              return;
+            }
+            if (!Number.isFinite(staleMs) || staleMs < 60_000) {
+              core.setFailed('PR_AGENT_RECOVERY_STALE_MINUTES must be at least 1.');
+              return;
+            }
+            if (!Number.isFinite(dispatchGraceMs) || dispatchGraceMs < 0) {
+              core.setFailed('PR_AGENT_RECOVERY_DISPATCH_GRACE_SECONDS must be non-negative.');
+              return;
+            }
+
+            function nowMs() {
+              return Date.now();
+            }
+
+            function ageMs(value) {
+              const parsed = Date.parse(String(value || ''));
+              return Number.isFinite(parsed) ? Math.max(0, nowMs() - parsed) : Number.MAX_SAFE_INTEGER;
+            }
+
+            // Canonical durable marker contract (#224): exactly one marker
+            // shape carries retry state, with not-before INSIDE the trailing
+            // --> so a single parseable comment holds the whole record.
+            // Legacy full-SHA continuum-pr-agent-retry markers remain
+            // readable so existing durable state survives; all new writes
+            // use the continuum-lifecycle-retry prefix. Legacy short-SHA
+            // (7-39 hex) markers are intentionally never matched:
+            // short-SHA markers are ignored entirely -- they neither
+            // authorize retries nor preserve exhaustion -- because two
+            // distinct commits can share a 7-char prefix.
+            const LIFECYCLE_RETRY_PREFIX = 'continuum-lifecycle-retry';
+            const LIFECYCLE_EXHAUSTED_PREFIX = 'continuum-lifecycle-retry-exhausted';
+            // Exact-HEAD producer contract (#224): every durable marker
+            // carries a full commit id (40-hex SHA-1 or 64-hex SHA-256).
+            // Short SHAs fail loudly here at write/parse time so a short
+            // marker can never be silently ignored (which would reset the
+            // bounded budget) and can never split budget/exhaustion across
+            // identities. All producers pass the full `pr.head.sha`.
+            const FULL_HEAD_RE = /^[0-9a-f]{40,64}$/i;
+            function requireFullHead(head, what) {
+              if (!FULL_HEAD_RE.test(String(head || '').trim())) {
+                throw new Error(
+                  'Refusing ' + what + ' with a non-full commit id; ' +
+                  'producers must pass the full 40-hex (or 64-hex) HEAD.'
+                );
+              }
+              return String(head).toLowerCase();
+            }
+            function retryMarker(head, kind, attempt, notBefore) {
+              const fullHead = requireFullHead(head, 'retry marker');
+              const suffix = Number.isFinite(Number(notBefore)) && Number(notBefore) > 0
+                ? ' not-before=' + Number(notBefore)
+                : '';
+              return '<!-- ' + LIFECYCLE_RETRY_PREFIX + ' head=' +
+                fullHead + ' kind=' + kind +
+                ' attempt=' + String(attempt) + suffix + ' -->';
+            }
+
+            function exhaustedMarker(head, kind) {
+              const fullHead = requireFullHead(head, 'exhaustion marker');
+              return '<!-- ' + LIFECYCLE_EXHAUSTED_PREFIX + ' head=' +
+                fullHead + ' kind=' + kind +
+                ' attempts=' + String(maxExecutions) + ' -->';
+            }
+
+            function controllerStateBody(stateMarker, summary) {
+              // Continuum comment attribution (kodmial/continuum#258): the
+              // legacy hidden marker lines stay first so positional
+              // upsert/election matching is unchanged (HTML comments do not
+              // render, so the attribution header is still the first
+              // rendered line). Mirrors src/continuum/comment_attribution.py
+              // and .github/scripts/pr_agent_policy.js byte-for-byte.
+              return [
+                CONTROLLER_STATE_MARKER,
+                String(stateMarker || '').trim(),
+                '⚡ **Continuum · pr-agent-recovery**',
+                '<!-- continuum-origin role=continuum component=pr-agent-recovery -->',
+                '<details>',
+                '<summary>Continuum PR-Agent controller state</summary>',
+                '',
+                String(summary || '').trim(),
+                '',
+                '</details>',
+              ].join('\n');
+            }
+
+            // Bounded collection (#254): caps every list scan at maxPages
+            // instead of walking full history. Workflow-run and status
+            // listings are newest-first, so a capped window preserves the
+            // deciding records. Issue comments and pull reviews are
+            // oldest-first, so a capped window may hide the newest markers:
+            // the collected array carries a `truncated` flag plus the
+            // `lastPage` anchor, and truncated comment scans recover a
+            // bounded newest window (see recoverNewestComments) so a PR
+            // with sustained high activity is still serviced instead of
+            // deferred on every pass while the same truncation recurs.
+            const MAX_COMMENT_PAGES = 10;
+            const MAX_QUEUE_PAGES = 5;
+            const MAX_GATE_PAGES = 2;
+            async function boundedCollect(client, request, params, maxPages) {
+              const items = [];
+              let truncated = false;
+              // Newest-window anchor: paginated REST responses carry an
+              // RFC5988 Link header whose rel="last" page lets a truncated
+              // oldest-first window re-anchor at the newest end with a
+              // bounded number of reads instead of walking history.
+              let lastPage = 0;
+              for (let page = 1; page <= maxPages; page += 1) {
+                const response = await request({ ...params, page });
+                const link = response && response.headers && response.headers.link;
+                if (typeof link === 'string') {
+                  const match = link.match(/[?&]page=(\d+)[^>]*>;\s*rel="last"/);
+                  if (match) lastPage = Math.max(lastPage, Number(match[1]));
+                }
+                const data = response && response.data;
+                const batch = Array.isArray(data) ? data : ((data && data.workflow_runs) || []);
+                if (batch.length === 0) break;
+                items.push(...batch);
+                if (batch.length < (params.per_page || 100)) break;
+                if (page === maxPages) truncated = true;
+              }
+              items.truncated = truncated;
+              items.lastPage = lastPage;
+              return items;
+            }
+            // Bounded newest-window recovery: merges up to MAX_COMMENT_PAGES
+            // newest records into a truncated oldest-first comment scan so
+            // the PR can still be serviced on this pass. Deciding markers
+            // (retry/exhausted/controller state) are written by recent
+            // activity, which the merged newest window always keeps. When the
+            // thread spans more than twice the page budget the merged
+            // oldest+newest window still leaves an unseen middle, so the
+            // recovery throws and callers defer/skip instead of deciding as
+            // if complete. Only a complete merged window clears truncated.
+            // Runs on the caller's already-resolved read client so the
+            // per-PR auth fallback is resolved once per scan, not once per
+            // recovery page.
+            async function recoverNewestComments(client, prNumber, items) {
+              let lastPage = Number(items.lastPage || 0);
+              if (!lastPage) {
+                const meta = await client.rest.issues.get({ owner, repo, issue_number: prNumber });
+                const total = Number(meta && meta.data && meta.data.comments || 0);
+                if (total > 0) lastPage = Math.max(1, Math.ceil(total / 100));
+              }
+              if (!lastPage) {
+                throw new Error('cannot anchor newest comments window');
+              }
+              // Oldest MAX_COMMENT_PAGES cover 1..MAX and newest MAX cover
+              // lastPage-(MAX-1)..lastPage. Beyond twice the budget the
+              // middle stays unseen where a deciding marker would be missed.
+              if (lastPage > MAX_COMMENT_PAGES * 2) {
+                throw new Error(
+                  'comment scan spans more than the bounded oldest+newest window (pages=' + lastPage + '); holding instead of deciding with an unseen middle window'
+                );
+              }
+              const seen = new Set(items.map(entry => entry && entry.id));
+              for (let page = 1; page <= MAX_COMMENT_PAGES; page += 1) {
+                const targetPage = lastPage - (page - 1);
+                if (targetPage < 1) break;
+                const { data } = await client.rest.issues.listComments(
+                  { owner, repo, issue_number: prNumber, per_page: 100, page: targetPage }
+                );
+                if (!Array.isArray(data) || data.length === 0) continue;
+                for (const entry of data) {
+                  if (!entry || seen.has(entry.id)) continue;
+                  seen.add(entry.id);
+                  items.push(entry);
+                }
+              }
+              items.truncated = false;
+            }
+
+            // Bounded newest-window recovery for the open-PR queue: the
+            // 5-page queue cap silently drops overflow PRs past ~500 open
+            // PRs on every pass. Merge up to MAX_QUEUE_PAGES newest
+            // records (anchored at lastPage) so overflow PRs are still
+            // serviced on this pass. Beyond twice the budget the middle
+            // stays unseen, so recovery throws and the caller warns
+            // loudly and decides on the partial oldest window instead of
+            // silently ignoring overflow. Runs on the caller's
+            // already-resolved read client so the per-scan auth fallback
+            // is resolved once, not once per recovery page.
+            async function recoverNewestQueue(client, items) {
+              const lastPage = Number(items.lastPage || 0);
+              if (!lastPage) {
+                throw new Error('cannot anchor newest queue window');
+              }
+              // Oldest MAX_QUEUE_PAGES cover 1..MAX and newest MAX cover
+              // lastPage-(MAX-1)..lastPage. Beyond twice the budget the
+              // middle stays unseen.
+              if (lastPage > MAX_QUEUE_PAGES * 2) {
+                throw new Error(
+                  'open-PR scan spans more than the bounded oldest+newest window (pages=' + lastPage + '); deciding on a partial window with an unseen middle'
+                );
+              }
+              const seen = new Set(items.map(pr => pr && (pr.id ?? pr.number)));
+              for (let page = 1; page <= MAX_QUEUE_PAGES; page += 1) {
+                const targetPage = lastPage - (page - 1);
+                if (targetPage <= MAX_QUEUE_PAGES) break;
+                const response = await client.rest.pulls.list(
+                  { owner, repo, state: 'open', per_page: 100, page: targetPage }
+                );
+                const batch = response && response.data;
+                if (!Array.isArray(batch) || batch.length === 0) continue;
+                for (const entry of batch) {
+                  if (!entry) continue;
+                  const key = entry.id ?? entry.number;
+                  if (seen.has(key)) continue;
+                  seen.add(key);
+                  items.push(entry);
+                }
+              }
+              items.truncated = false;
+            }
+
+            async function upsertControllerState(prNumber, stateMarker, summary) {
+              const comments = await withReadFallback(async (client) => {
+                const items = await boundedCollect(
+                  client,
+                  (params) => client.rest.issues.listComments(params),
+                  { owner, repo, issue_number: prNumber, per_page: 100 },
+                  MAX_COMMENT_PAGES
+                );
+                // Truncated oldest-first windows hide the newest controller
+                // marker, so recover the bounded newest window before
+                // deciding. Only a newest-recovery failure holds the
+                // controller write; a middle window may stay unseen on very
+                // large threads.
+                if (items.truncated) {
+                  try {
+                    await recoverNewestComments(client, prNumber, items);
+                    core.warning(
+                      'CONTINUUM_COMMENT_BUDGET_EXCEEDED pr=' + prNumber +
+                      ': comment scan hit the ' + MAX_COMMENT_PAGES + '-page budget; deciding on the merged oldest+newest window.'
+                    );
+                  } catch (recoveryErr) {
+                    throw new Error(
+                      'CONTINUUM_COMMENT_BUDGET_EXCEEDED pr=' + prNumber +
+                      ': comment scan hit the ' + MAX_COMMENT_PAGES + '-page budget and newest-window recovery failed; holding controller write instead of deciding on a truncated window.'
+                    );
+                  }
+                }
+                return items;
+              });
+              const controller = comments
+                .filter(comment => String(comment.body || '').includes(CONTROLLER_STATE_MARKER))
+                .sort((a, b) => Number(a.id) - Number(b.id));
+              const latest = controller.at(-1);
+              // Presentation-only liveness touch. The durable retry identity
+              // is the stateMarker line alone (parseEvidence matches only
+              // continuum-pr-agent-retry markers). This summary line only
+              // forces a body change so GitHub advances updated_at on every
+              // committed dispatch; it is never parsed as retry state and its
+              // literal prefix cannot match the retry/exhausted regexes.
+              // The summary is coerced null-safe: a missing/non-string
+              // summary must render as empty, never as "undefined"/"null".
+              const body = controllerStateBody(
+                stateMarker,
+                String(summary || '').trim() + '\n\nController dispatch run: ' + String(context.runId)
+              );
+              let result;
+              if (latest) {
+                const { data } = await github.rest.issues.updateComment({
+                  owner,
+                  repo,
+                  comment_id: latest.id,
+                  body,
+                });
+                result = {
+                  comment: data,
+                  created: false,
+                  previousBody: String(latest.body || ''),
+                };
+              } else {
+                const { data } = await github.rest.issues.createComment({
+                  owner,
+                  repo,
+                  issue_number: prNumber,
+                  body,
+                });
+                result = { comment: data, created: true, previousBody: '' };
+              }
+              for (const stale of controller.slice(0, -1)) {
+                await github.rest.issues.deleteComment({
+                  owner,
+                  repo,
+                  comment_id: stale.id,
+                });
+              }
+              return result;
+            }
+
+            // Retained for the single-comment coalescing contract: every
+            // controller-state change goes through upsertControllerState
+            // (update latest, prune stale). Dispatch records a pre-dispatch
+            // claim via a fresh createComment (never an update, so the
+            // existing comment's updated_at is untouched), deletes that
+            // claim via rollbackControllerState when the dispatch throws,
+            // and coalesces via upsertControllerState after success.
+            async function rollbackControllerState(stateWrite) {
+              if (!stateWrite || !stateWrite.comment) return;
+              if (stateWrite.created) {
+                await github.rest.issues.deleteComment({
+                  owner,
+                  repo,
+                  comment_id: stateWrite.comment.id,
+                });
+                return;
+              }
+              await github.rest.issues.updateComment({
+                owner,
+                repo,
+                comment_id: stateWrite.comment.id,
+                body: stateWrite.previousBody,
+              });
+            }
+
+            // not-before lives inside the canonical marker only; a stray
+            // not-before= outside any marker is ignored so producers cannot
+            // diverge. Legacy markers predate durable not-before and carry none.
+            function markerNotBefore(match) {
+              const raw = match && match[4] !== undefined ? match[4] : null;
+              const parsed = Number.parseInt(String(raw ?? ''), 10);
+              return Number.isFinite(parsed) && parsed > 0 ? parsed : null;
+            }
+            function parseEvidence(comments, head, kind) {
+              // Fail closed on short SHAs: every producer writes the full
+              // HEAD, so a short identity here is a programming error, not
+              // a retry marker worth prefix-matching (two commits can share
+              // a 7-char prefix, which would let old-HEAD evidence authorize
+              // a new HEAD and silently reset the budget). short-SHA markers
+              // are ignored entirely: short retry markers never advance
+              // latestAttempt and short exhausted markers never preserve
+              // exhaustion.
+              const exactHead = requireFullHead(head, 'retry evidence read');
+              // Exact-HEAD identity only: prefix matching is rejected
+              // because two distinct commits can share a 7-char prefix,
+              // which would let old-HEAD evidence authorize a new HEAD.
+              // Markers always carry a full commit id.
+              function sameHead(markerHead, currentHead) {
+                const marker = String(markerHead || '').toLowerCase();
+                const current = String(currentHead || '').toLowerCase();
+                return marker.length > 0 && marker === current;
+              }
+              const retryRe =
+                /<!--\s*continuum-lifecycle-retry\s+head=([0-9a-f]{40,64})\s+kind=(review|repair)\s+attempt=(\d+)(?:\s+not-before=(\d+))?[^>]*-->/ig;
+              const legacyRetryRe =
+                /<!--\s*continuum-pr-agent-retry\s+head=([0-9a-f]{40,64})\s+kind=(review|repair)\s+attempt=(\d+)[^>]*-->/ig;
+              const exhaustedRe =
+                /<!--\s*continuum-lifecycle-retry-exhausted\s+head=([0-9a-f]{40,64})\s+kind=(review|repair)\s+attempts=(\d+)\s*-->/ig;
+              const legacyExhaustedRe =
+                /<!--\s*continuum-pr-agent-retry-exhausted\s+head=([0-9a-f]{40,64})\s+kind=(review|repair)\s+attempts=(\d+)\s*-->/ig;
+              // Legacy short-SHA (7-39 hex) markers are intentionally never
+              // matched: short-SHA markers are ignored entirely; exact-HEAD
+              // isolation requires full 40/64-hex identity only, so they
+              // neither authorize retries nor preserve exhaustion.
+              let latestAttempt = null;
+              let latestMarkerAt = null;
+              let notBeforeEpoch = null;
+              let exhausted = false;
+              const consider = (markerHead, markerKind, attemptText, markerNotBeforeEpoch, createdAt) => {
+                if (markerKind !== kind || !sameHead(markerHead, exactHead)) return;
+                const attempt = Number.parseInt(attemptText, 10);
+                if (latestAttempt === null || attempt > latestAttempt) {
+                  latestAttempt = attempt;
+                  latestMarkerAt = Number.isFinite(createdAt) ? createdAt : null;
+                  notBeforeEpoch = markerNotBeforeEpoch;
+                } else if (
+                  attempt === latestAttempt &&
+                  Number.isFinite(createdAt) &&
+                  (latestMarkerAt === null || createdAt > latestMarkerAt)
+                ) {
+                  latestMarkerAt = Number.isFinite(createdAt) ? createdAt : null;
+                  // Latest write wins, including clearing: a newer
+                  // same-attempt marker without not-before lifts the older
+                  // reset-aware wait instead of waiting past the clearing.
+                  notBeforeEpoch = markerNotBeforeEpoch;
+                }
+              };
+              for (const comment of comments) {
+                const rawUser = (comment.user && typeof comment.user === 'object') ? comment.user : {};
+                const login = String(rawUser.login || comment.user_login || comment.author || '').trim().toLowerCase();
+                if (!trustedAssociations.has(String(comment.author_association || '').toUpperCase()) && login !== 'github-actions[bot]') {
+                  continue;
+                }
+                const body = String(comment.body || '');
+                const createdAt = Date.parse(String(comment.updated_at || comment.created_at || ''));
+                retryRe.lastIndex = 0;
+                legacyRetryRe.lastIndex = 0;
+                exhaustedRe.lastIndex = 0;
+                legacyExhaustedRe.lastIndex = 0;
+                for (const match of body.matchAll(retryRe)) {
+                  consider(match[1], match[2], match[3], markerNotBefore(match), createdAt);
+                }
+                for (const match of body.matchAll(legacyRetryRe)) {
+                  consider(match[1], match[2], match[3], null, createdAt);
+                }
+                for (const match of body.matchAll(exhaustedRe)) {
+                  if (
+                    sameHead(match[1], exactHead) &&
+                    match[2] === kind &&
+                    Number.parseInt(match[3], 10) >= maxExecutions
+                  ) {
+                    exhausted = true;
+                  }
+                }
+                for (const match of body.matchAll(legacyExhaustedRe)) {
+                  if (
+                    sameHead(match[1], exactHead) &&
+                    match[2] === kind &&
+                    Number.parseInt(match[3], 10) >= maxExecutions
+                  ) {
+                    exhausted = true;
+                  }
+                }
+                // short-SHA markers are ignored entirely: two distinct
+                // commits can share a 7-char prefix, so prefix matching
+                // would let old-HEAD evidence strand an unrelated healthy
+                // HEAD with no expiry path. Exact-HEAD isolation requires
+                // full-commit identity only.
+              }
+              return { latestAttempt, latestMarkerAt, notBeforeEpoch, exhausted };
+            }
+
+            function latestContext(statuses, name) {
+              return statuses
+                .filter(status => status.context === name)
+                .sort((a, b) =>
+                  Date.parse(b.updated_at || b.created_at || 0) -
+                  Date.parse(a.updated_at || a.created_at || 0)
+                )[0] || null;
+            }
+
+            // Bounded active review-run snapshot (Work-Lock #58 item 6
+            // B1). The recovery decision only needs active/relevant runs,
+            // so query active statuses only (at most 3 pages per status)
+            // instead of paginating complete workflow history. Any active
+            // exact PR/HEAD/kind operation carries one of these statuses,
+            // so exactActiveRun still reliably prevents duplicate dispatch.
+            // After a dispatch the caller re-invokes this bounded snapshot
+            // to refresh only active state for later PRs in the same pass.
+            const ACTIVE_REVIEW_RUN_STATUSES = ['queued', 'in_progress', 'waiting', 'pending', 'requested', 'action_required'];
+            const MAX_REVIEW_PAGES_PER_STATUS = 3;
+            async function listReviewRuns() {
+              try {
+                // Bounded active review-run snapshot (#254 + Work-Lock #58 item 6
+                // B1): active statuses only — any active exact PR/HEAD/kind
+                // operation carries one of these, so exactActiveRun still
+                // reliably prevents duplicate dispatch — collected through
+                // the shared bounded helper so full history is never walked.
+                // Execution-scoped: review controller runs live in the
+                // execution repository while PR reads use the target.
+                const seen = new Map();
+                for (const status of ACTIVE_REVIEW_RUN_STATUSES) {
+                  const batch = await withReadFallback(client =>
+                    boundedCollect(
+                      client,
+                      (params) => client.rest.actions.listWorkflowRuns({ ...params }),
+                      {
+                        owner: executionOwner,
+                        repo: executionRepo,
+                        workflow_id: reviewWorkflow,
+                        per_page: 100,
+                        status,
+                      },
+                      MAX_REVIEW_PAGES_PER_STATUS
+                    )
+                  );
+                  for (const run of batch) {
+                    if (run && run.id !== undefined && run.id !== null) {
+                      const key = Number(run.id);
+                      if (!seen.has(key)) seen.set(key, run);
+                    }
+                  }
+                }
+                return [...seen.values()];
+              } catch (err) {
+                // A transient/rate-limit read must never fail the run here:
+                // callers defer green to the next wakeup instead of retrying
+                // inline. Only deterministic errors fail loudly.
+                if (isTransientApiError(err)) throw err;
+                core.setFailed(
+                  'Could not inspect PR-Agent caller runs for ' + reviewWorkflow +
+                  ': ' + (err.message || err)
+                );
+                throw err;
+              }
+            }
+            // Run-ID metadata index (Work-Lock #58 item 6 B2), built from
+            // the already-fetched review-run snapshot so status target URLs
+            // that point at a snapshot run need no extra GET. Misses fall
+            // back to the exact getWorkflowRun below with 404 semantics
+            // unchanged.
+            let runMetadataById = new Map();
+            function rememberReviewRuns(runs) {
+              runMetadataById = new Map(
+                (runs || []).map(run => [Number(run && run.id), run])
+              );
+            }
+            function snapshotRunMetadata(runId) {
+              const run = runMetadataById.get(Number(runId));
+              if (!run) return null;
+              const title = String(run.display_title || '');
+              const identity = title.match(/\[(review|repair):\d+\]/);
+              const recoveryKind = identity ? identity[1] : null;
+              if (activeStatuses.has(String(run.status || '').toLowerCase())) {
+                return {
+                  conclusion: String(run.status || '').toLowerCase(),
+                  recoveryKind,
+                };
+              }
+              return {
+                conclusion:
+                  String(run.conclusion || run.status || '').toLowerCase() || null,
+                recoveryKind,
+              };
+            }
+
+            function exactActiveRun(runs, prNumber, kind, head) {
+              const prefix = 'PR-Agent PR #' + prNumber + ' [' + kind + ':';
+              const suffix = '] head=' + String(head).toLowerCase();
+              return runs.find(run =>
+                String(run.display_title || '').startsWith(prefix) &&
+                String(run.display_title || '').endsWith(suffix) &&
+                activeStatuses.has(String(run.status || '').toLowerCase())
+              ) || null;
+            }
+
+            function hasNoAutoMergeHold(candidate) {
+              return (candidate?.labels || []).some(label =>
+                String(label?.name || label || '') === 'no-auto-merge'
+              );
+            }
+
+            // Mirrors the merge gate's REST/GraphQL-compatible conflict check.
+            // A successful review only proves the review operation; it never
+            // proves the merge lifecycle. A conflicted mergeability state is
+            // therefore a deterministic hold, not fresh work to replay.
+            function isConflictedMergeability(mergeable, mergeableState) {
+              const state = String(mergeableState || '').trim().toLowerCase();
+              if (state === 'dirty') return true;
+              if (typeof mergeable === 'boolean') return !mergeable;
+              if (mergeable === null || mergeable === undefined) {
+                return state === '' || state === 'unknown' ? null : false;
+              }
+              const text = String(mergeable).trim().toLowerCase();
+              if (
+                text === 'false' ||
+                text === 'conflicting' ||
+                text === 'conflicted' ||
+                text === 'dirty'
+              ) {
+                return true;
+              }
+              if (
+                text === 'true' ||
+                text === 'mergeable' ||
+                text === 'clean' ||
+                text === 'stable' ||
+                text === 'blocked' ||
+                text === 'behind'
+              ) {
+                return false;
+              }
+              return null;
+            }
+
+            // Admission for the clean-review -> merge-lifecycle transition.
+            // A successful review status is not proof that the open PR has
+            // finished its merge lifecycle: an explicit no-auto-merge hold or
+            // an earlier skipped merge leaves the PR open with clean evidence.
+            // Only a still-open, non-draft, same-repository PR with no current
+            // hold, no retryable/incomplete review run and no deterministic
+            // merge blocker may resume through the full PR-Agent
+            // review/merge orchestration. Reviewer-policy decisions are
+            // handled before this function and are never treated as approval.
+            function assessCleanReviewLifecycle({
+              reviewStatus,
+              runConclusionRetryable = false,
+              pr,
+              freshPr,
+              head,
+              repoFullName,
+            }) {
+              const state = String(reviewStatus?.state || '').toLowerCase();
+              const description = String(reviewStatus?.description || '');
+              if (state !== 'success') {
+                return { decision: 'not-clean-review', reason: 'review operation has not succeeded' };
+              }
+              if (/actionable/i.test(description) || /blocking; recovery eligible/i.test(description)) {
+                return { decision: 'not-clean-review', reason: 'reviewer policy requires repair or re-review' };
+              }
+              // Cheap NOOP while the owner holds automatic merge: no merge
+              // and no repeated reviewer/model execution.
+              if (hasNoAutoMergeHold(pr)) {
+                return { decision: 'hold', reason: 'review is clean under explicit no-auto-merge hold' };
+              }
+              if (!freshPr) {
+                return { decision: 'defer', reason: 'current PR state is unavailable' };
+              }
+              const freshHead = String(freshPr.head?.sha || '').toLowerCase();
+              if (freshHead !== String(head || '').toLowerCase()) {
+                return {
+                  decision: 'hold',
+                  reason: 'PR moved from ' + head + ' to ' + (freshHead || '<missing>'),
+                };
+              }
+              if (String(freshPr.state || '').toLowerCase() !== 'open' || freshPr.merged) {
+                return { decision: 'settled', reason: 'PR is already merged or closed' };
+              }
+              if (freshPr.draft) {
+                return { decision: 'hold', reason: 'PR is a draft' };
+              }
+              if (!freshPr.head?.repo || freshPr.head.repo.full_name !== repoFullName) {
+                return { decision: 'hold', reason: 'PR is not same-repository' };
+              }
+              if (hasNoAutoMergeHold(freshPr)) {
+                return { decision: 'hold', reason: 'review is clean under explicit no-auto-merge hold' };
+              }
+              if (runConclusionRetryable) {
+                return {
+                  decision: 'replay',
+                  reason: 'clean review belongs to an incomplete orchestration run',
+                };
+              }
+              if (isConflictedMergeability(freshPr.mergeable, freshPr.mergeable_state) === true) {
+                return {
+                  decision: 'hold',
+                  reason: 'merge conflict/stale base blocks the merge lifecycle',
+                };
+              }
+              return {
+                decision: 'resume',
+                reason: 'clean exact-HEAD review completed but the merge lifecycle is unfinished',
+              };
+            }
+
+            async function operationIsActive(prNumber, head, kind) {
+              // Re-read immediately before dispatch-grace coalescing. A fresh
+              // controller marker is only proof of a live dispatch while the
+              // exact PR/HEAD/operation run is still active; if that run was
+              // lost or already terminated, recovery must replay the same
+              // bounded attempt instead of waiting out the grace window.
+              const runs = await listReviewRuns();
+              return Boolean(exactActiveRun(runs, prNumber, kind, head));
+            }
+
+            async function statusRunMetadata(status) {
+              const target = String(status?.target_url || '');
+              const match = target.match(/\/actions\/runs\/(\d+)(?:$|[/?#])/);
+              if (!match) return { conclusion: null, recoveryKind: null };
+              const snapshotHit = snapshotRunMetadata(match[1]);
+              if (snapshotHit) return snapshotHit;
+              try {
+                const { data: run } = await withReadFallback(client =>
+                  client.rest.actions.getWorkflowRun({
+                    owner: executionOwner,
+                    repo: executionRepo,
+                    run_id: Number(match[1]),
+                  })
+                );
+                const title = String(run.display_title || '');
+                const identity = title.match(/\[(review|repair):\d+\]/);
+                const recoveryKind = identity ? identity[1] : null;
+                if (activeStatuses.has(String(run.status || '').toLowerCase())) {
+                  return {
+                    conclusion: String(run.status || '').toLowerCase(),
+                    recoveryKind,
+                  };
+                }
+                return {
+                  conclusion:
+                    String(run.conclusion || run.status || '').toLowerCase() || null,
+                  recoveryKind,
+                };
+              } catch (err) {
+                if (err.status === 404) {
+                  return { conclusion: null, recoveryKind: null };
+                }
+                throw err;
+              }
+            }
+
+                async function exactHeadCiGreen(head) {
+                  // Head-filtered server-side; only the newest matching run
+                  // decides, so two pages bound the cost.
+                  const runs = await withReadFallback(client =>
+                    boundedCollect(
+                      client,
+                      (params) => client.rest.actions.listWorkflowRunsForRepo(params),
+                      {
+                        owner,
+                        repo,
+                        event: 'pull_request',
+                        head_sha: head,
+                        per_page: 100,
+                      },
+                      MAX_GATE_PAGES
+                    )
+                  );
+              const decision = decideExactHeadCi({
+                runs,
+                workflowName: ciWorkflowName,
+                headSha: head,
+                delegated: delegatedTarget,
+              });
+              return decision.state === 'green';
+            }
+
+            // Bounded CI snapshot for the non-mutating initial scan
+            // (Work-Lock #58 item 6 B3): one bounded recent run listing
+            // (at most 3 pages) indexed by exact HEAD SHA. PRs represented
+            // in the snapshot need no per-HEAD CI-run-list request; a HEAD
+            // missing from the snapshot falls back to exactHeadCiGreen
+            // above instead of assuming red/green. The fresh exact-HEAD
+            // query inside dispatch() below is unchanged and still gates
+            // every mutation, so a stale green snapshot can never
+            // authorize a dispatch.
+            let ciSnapshotByHead = null;
+            async function fetchCiSnapshot() {
+              if (ciSnapshotByHead) return ciSnapshotByHead;
+              const byHead = new Map();
+              for (let page = 1; page <= 3; page += 1) {
+                const response = await withReadFallback(client =>
+                  client.rest.actions.listWorkflowRunsForRepo({
+                    owner,
+                    repo,
+                    event: 'pull_request',
+                    per_page: 100,
+                    page,
+                  })
+                );
+                const batch = (response && response.data && response.data.workflow_runs) || [];
+                for (const run of batch) {
+                  if (run.name !== ciWorkflowName) continue;
+                  const sha = String(run.head_sha || '').toLowerCase();
+                  if (!sha) continue;
+                  const prev = byHead.get(sha);
+                  const newer =
+                    !prev ||
+                    ciRunCreatedAt(run) > ciRunCreatedAt(prev) ||
+                    (
+                      ciRunCreatedAt(run) === ciRunCreatedAt(prev) &&
+                      Number(run.id || 0) > Number(prev.id || 0)
+                    );
+                  if (newer) {
+                    byHead.set(sha, run);
+                  }
+                }
+                if (batch.length < 100) break;
+              }
+              ciSnapshotByHead = byHead;
+              return byHead;
+            }
+            function ciSnapshotGreen(head) {
+              if (!ciSnapshotByHead) return null;
+              const key = String(head || '').toLowerCase();
+              if (!ciSnapshotByHead.has(key)) return null;
+              const decision = decideExactHeadCi({
+                runs: [ciSnapshotByHead.get(key)],
+                workflowName: ciWorkflowName,
+                headSha: head,
+                delegated: delegatedTarget,
+              });
+              // Pending snapshot evidence falls back to a fresh exact-HEAD
+              // read instead of being treated as permanently red.
+              if (decision.state === 'green') return true;
+              if (decision.state === 'red') return false;
+              return null;
+            }
+            async function scanCiGreen(head) {
+              const snapshotVerdict = ciSnapshotGreen(head);
+              if (snapshotVerdict !== null) return snapshotVerdict;
+              return await exactHeadCiGreen(head);
+            }
+
+            // Canonical 10-execution schedule (#224): execution index 0 runs
+            // immediately; retries 1..9 wait ~10s, 30s, 60s, 3m, 5m, 10m,
+            // 20m, 40m, 60m. Bounded deterministic jitter keeps concurrent
+            // PRs from dispatching in lockstep.
+            const RETRY_DELAY_SCHEDULE = [0, 10, 30, 60, 180, 300, 600, 1200, 2400, 3600];
+            const JITTER_CAP_SECONDS = 5;
+            function backoffSeconds(attempt) {
+              if (attempt <= 0) return 0;
+              if (attempt < RETRY_DELAY_SCHEDULE.length) return RETRY_DELAY_SCHEDULE[attempt];
+              return RETRY_DELAY_SCHEDULE[RETRY_DELAY_SCHEDULE.length - 1];
+            }
+            function jitterSeconds(key, attempt, cap = JITTER_CAP_SECONDS) {
+              let hash = 2166136261;
+              const text = String(key || 'lifecycle') + ':' + String(attempt);
+              for (let i = 0; i < text.length; i += 1) {
+                hash ^= text.charCodeAt(i);
+                hash = Math.imul(hash, 16777619);
+              }
+              return cap > 0 ? (hash >>> 0) % (cap + 1) : 0;
+            }
+
+            // Generic transient-failure classification for lifecycle
+            // self-healing (#224). Infrastructure gaps (GitHub 403 rate limit
+            // with an empty budget, 429/Retry-After, 5xx, network
+            // timeout/reset, runner cancellation/eviction, temporary
+            // provider/bootstrap outage) are retryable through the bounded
+            // budget. Deterministic policy outcomes (red CI, unresolved
+            // findings, merge conflict, malformed state, moved HEAD) never
+            // consume it and hold instead.
+            function isTransientApiError(err) {
+              // A truncated oldest-first comment window is a deferral, not a
+              // deterministic failure: the next wakeup retries from latest
+              // state instead of failing the run.
+              if (/CONTINUUM_COMMENT_BUDGET_EXCEEDED|CONTINUUM_THREAD_BUDGET_EXCEEDED/i.test(String((err && err.message) || ''))) return true;
+              const status = err ? (err.status ?? err.response?.status) : undefined;
+              if (status === 429) return true;
+              if (typeof status === 'number' && status >= 500 && status <= 599) return true;
+              if (status === 403) {
+                const headers = (err && ((err.response && err.response.headers) || err.headers)) || {};
+                const lowered = {};
+                for (const [key, value] of Object.entries(headers)) {
+                  lowered[String(key).toLowerCase()] = value;
+                }
+                if (lowered['retry-after'] !== undefined && String(lowered['retry-after']).trim() !== '') return true;
+                if (lowered['x-ratelimit-reset'] !== undefined && String(lowered['x-ratelimit-reset']).trim() !== '') return true;
+                if (lowered['x-ratelimit-remaining'] !== undefined && String(lowered['x-ratelimit-remaining']).trim() === '0') return true;
+                const message = String(err.message || '');
+                if (/rate limit|rate-limit|ratelimit|quota exhaustion|secondary rate limit|retry after/i.test(message)) return true;
+                return false;
+              }
+              // A cancelled/evicted-run error without runner/run phrasing is
+              // still transient: consume the bounded transient budget and
+              // retry from latest state instead of holding as deterministic.
+              // Mirrors continuum-auto-merge.yml.
+              const retryable = new Set(['cancelled', 'timed_out', 'stale', 'startup_failure']);
+              if (err && retryable.has(String(err.conclusion || '').toLowerCase())) return true;
+              // Bare timeout alone never proves infrastructure: deterministic
+              // current-head CI text such as `tests timed out: assertion
+              // failed` must hold. Only qualified infrastructure timeouts
+              // retry. Infrastructure evidence wins over an incidental
+              // `assert` substring; only when no infrastructure token
+              // matches does an assertion mention hold.
+              const message = String((err && err.message) || '').toLowerCase();
+              if (/econnreset|econnrefused|eai_again|epipe|socket hang up|network error|network failure|network timeout|network unreachable|dns error|dns failure|dns resolution|tls handshake|tls error|ssl error|connection reset|connection refused|connection aborted|temporarily unavailable|service unavailable|bad gateway|gateway timeout|bootstrap failed|bootstrap error|runner evicted|runner cancelled|runner timeout|runner lost|run evicted|run cancelled/i.test(
+                String((err && err.message) || '')
+              )) {
+                return true;
+              }
+              if (message.includes('assert')) return false;
+              if (/timed out|timeout/i.test(String((err && err.message) || ''))) {
+                return /read|connection|network|runner|socket|dns|tls|ssl|gateway|http|request|operation|bootstrap|provider/i.test(
+                  String((err && err.message) || '')
+                );
+              }
+              return false;
+            }
+
+            // Reset-aware scheduling (#224): Retry-After, X-RateLimit-Reset
+            // and any provider reset are a minimum next-attempt time. The
+            // schedule plus bounded jitter is the floor; a longer reset wait
+            // wins. A long wait exits the run: delays beyond the inline
+            // threshold persist not-before/next-attempt state and defer to
+            // the scheduled safety net, which redispatches when the window
+            // expires. Short backoffs are awaited inline.
+            const MAX_INLINE_WAIT_SECONDS = 60;
+            function resetAwareDelaySeconds({ attempt, retryAfterSeconds, ratelimitResetEpoch, providerResetEpoch, nowEpoch, operationKey }) {
+              let delay = backoffSeconds(attempt) + jitterSeconds(operationKey || 'lifecycle', attempt);
+              if (Number.isFinite(retryAfterSeconds) && retryAfterSeconds >= 0) {
+                delay = Math.max(delay, retryAfterSeconds);
+              }
+              for (const resetEpoch of [ratelimitResetEpoch, providerResetEpoch]) {
+                if (Number.isFinite(resetEpoch) && Number.isFinite(nowEpoch)) {
+                  delay = Math.max(delay, Math.max(0, resetEpoch - nowEpoch));
+                }
+              }
+              return delay;
+            }
+
+            // Reset-signal extraction (#224): server-provided Retry-After /
+            // X-RateLimit-Reset / provider reset minimums are read from the
+            // failed call's headers so a 429/403 does not fall back to
+            // schedule+jitter alone. Callers always pass the live clock, so a
+            // reset epoch is never silently dropped.
+            function extractRateLimitSignals(err) {
+              const headers = (err && ((err.response && err.response.headers) || err.headers)) || {};
+              const lowered = {};
+              for (const [key, value] of Object.entries(headers)) {
+                lowered[String(key).toLowerCase()] = value;
+              }
+              const retryAfterRaw = lowered['retry-after'];
+              let retryAfterSeconds;
+              if (retryAfterRaw !== undefined && retryAfterRaw !== null && String(retryAfterRaw).trim() !== '') {
+                const text = String(retryAfterRaw).trim();
+                const parsed = Number.parseInt(text, 10);
+                if (Number.isFinite(parsed) && parsed >= 0 && /^\d+/.test(text)) {
+                  retryAfterSeconds = parsed;
+                } else {
+                  // HTTP-date form (e.g. "Wed, 21 Oct 2015 07:28:00 GMT"):
+                  // honor the server-requested time instead of falling back
+                  // to schedule+jitter and retrying too early.
+                  const when = Date.parse(text);
+                  if (Number.isFinite(when)) {
+                    retryAfterSeconds = Math.max(0, Math.ceil((when - Date.now()) / 1000));
+                  }
+                }
+              }
+              const resetRaw = lowered['x-ratelimit-reset'] ?? lowered['ratelimit-reset'];
+              let ratelimitResetEpoch;
+              if (resetRaw !== undefined && resetRaw !== null && String(resetRaw).trim() !== '') {
+                const parsed = Number.parseInt(String(resetRaw).trim(), 10);
+                if (Number.isFinite(parsed) && parsed > 0) ratelimitResetEpoch = parsed;
+              }
+              const providerRaw = lowered['x-provider-reset'] ?? lowered['provider-reset'];
+              let providerResetEpoch;
+              if (providerRaw !== undefined && providerRaw !== null && String(providerRaw).trim() !== '') {
+                const parsed = Number.parseInt(String(providerRaw).trim(), 10);
+                if (Number.isFinite(parsed) && parsed > 0) providerResetEpoch = parsed;
+              }
+              return { retryAfterSeconds, ratelimitResetEpoch, providerResetEpoch };
+            }
+
+            // Per-PR/HEAD/operation lease (#224): the in-memory Set below only
+            // coalesces duplicate wakeups WITHIN a single run. Cross-run
+            // safety comes from three durable mechanisms, not from the Set:
+            // the repository-global concurrency group serializes reconciler
+            // runs (cancel-in-progress:false, so a queued run re-reconciles
+            // from latest state instead of racing), the durable dispatch
+            // marker inside its grace window coalesces a lost dispatch replay,
+            // and every dispatch re-reads the exact HEAD, CI, active runs and
+            // durable evidence immediately before mutating. A stale queued run
+            // therefore becomes a safe no-op instead of a concurrent writer,
+            // and independent PRs never starve each other.
+            const ownedLeases = new Set();
+            function leaseKey(prNumber, head, kind) {
+              return String(prNumber) + ':' + String(head || '').toLowerCase() + ':' + String(kind || '');
+            }
+            function tryAcquireLease(prNumber, head, kind) {
+              const key = leaseKey(prNumber, head, kind);
+              if (ownedLeases.has(key)) return false;
+              ownedLeases.add(key);
+              return true;
+            }
+
+            function decide({
+              ciGreen,
+              operationStatus,
+              activeRun,
+              runConclusion,
+              evidence,
+              failureTransient,
+              operationContext,
+              lifecycleComplete = true,
+            }) {
+              const state = String(operationStatus?.state || '').toLowerCase() || null;
+              const description = String(operationStatus?.description || '');
+              // Settled dominates every wait/hold below so a success clears
+              // obsolete durable state (exhaustion markers, stale leases,
+              // not-before waits) via the success path.
+              if (state === 'success' && lifecycleComplete) {
+                return { action: 'settled', reason: 'operation already settled' };
+              }
+              if (!ciGreen) return { action: 'wait', reason: 'exact HEAD CI is not green' };
+              if (evidence.exhausted) {
+                return { action: 'hold', reason: 'durable retry exhaustion marker exists' };
+              }
+              if (activeRun) {
+                return { action: 'wait', reason: 'exact PR/HEAD/operation already active' };
+              }
+              // Durable reset-aware not-before (#224): a deferred execution
+              // waits for the scheduled safety net to redispatch; it does not
+              // retry early and does not hold the run open.
+              if (
+                evidence.notBeforeEpoch !== null &&
+                evidence.notBeforeEpoch !== undefined &&
+                Number.isFinite(evidence.notBeforeEpoch) &&
+                Math.floor(nowMs() / 1000) < evidence.notBeforeEpoch
+              ) {
+                return { action: 'wait', reason: 'durable reset-aware not-before time has not arrived' };
+              }
+
+              const statusAt = operationStatus
+                ? Date.parse(String(operationStatus.updated_at || operationStatus.created_at || ''))
+                : null;
+              const markerNewer =
+                evidence.latestMarkerAt !== null &&
+                (!Number.isFinite(statusAt) || evidence.latestMarkerAt > statusAt);
+              const markerAge =
+                evidence.latestMarkerAt === null ? null : Math.max(0, nowMs() - evidence.latestMarkerAt);
+              // Dispatch grace with a staleness expiry: an unknown-age
+              // marker stays inside grace while status is fresh, but once
+              // the status itself is stale the wait expires instead of
+              // stranding a healthy PR forever on a marker that never ages.
+              const statusAgeMs = operationStatus
+                ? ageMs(operationStatus.updated_at || operationStatus.created_at)
+                : Number.MAX_SAFE_INTEGER;
+              const statusStale = statusAgeMs >= staleMs;
+              if (
+                markerNewer &&
+                evidence.latestAttempt !== null &&
+                (markerAge === null || markerAge < dispatchGraceMs) &&
+                !(markerAge === null && statusStale)
+              ) {
+                return {
+                  action: 'wait',
+                  reason: 'newer durable dispatch marker is inside grace window',
+                };
+              }
+              // Fail closed on unknown marker age (#224, single lifecycle
+              // contract): a durable marker without a parseable timestamp
+              // cannot prove grace expired, so it stays inside grace while
+              // status is fresh instead of dispatching a likely duplicate
+              // immediately. The status-staleness expiry bounds the wait:
+              // once status goes stale, reconciliation proceeds instead of
+              // stranding the PR forever. This check does not require
+              // markerNewer (which is false without a marker timestamp) so
+              // timestamp-less markers match the Python contract.
+              if (
+                evidence.latestAttempt !== null &&
+                evidence.latestMarkerAt === null &&
+                operationStatus &&
+                !statusStale
+              ) {
+                return {
+                  action: 'wait',
+                  reason: 'durable dispatch marker age is unknown; staying inside dispatch grace',
+                };
+              }
+
+              let recoverable = false;
+              const operationSeen = state !== null;
+              if (state === null) {
+                recoverable = true;
+              } else if (state === 'success') {
+                // The provider operation succeeded but the enclosing PR
+                // lifecycle is still incomplete (for example mergeability is
+                // still computing). Replay through the same bounded exact-HEAD
+                // recovery identity instead of silently settling the open PR.
+                recoverable = true;
+              } else if (state === 'failure') {
+                // Explicit classifier verdicts dominate the token gate,
+                // mirroring src/continuum/pr_agent_recovery.py: a proven
+                // transient dispatches even without the token (so real
+                // infrastructure gaps never strand for lack of a token), and
+                // a proven deterministic holds even with it.
+                if (failureTransient === true) {
+                  recoverable = true;
+                } else if (failureTransient === false) {
+                  return {
+                    action: 'hold',
+                    reason: 'deterministic failure is not automatically retried',
+                  };
+                } else {
+                // Only the explicit reconciler-synthesized token from a
+                // trusted commit-status context authorizes a retry without
+                // classifier input (parity with decide_recovery in
+                // src/continuum/pr_agent_recovery.py). Every shipped
+                // producer emits the token from continuum/pr-agent-review
+                // or continuum/pr-agent-repair, so PR-visible text carrying
+                // the token can never spend the budget. A bare "transient"
+                // substring is never sufficient: deterministic messages such
+                // as "non-transient policy failure" contain it and must never
+                // burn the transient budget. Negated forms (not/no/non/never
+                // plus any space/hyphen/underscore separator, including
+                // concatenated "nonrecovery eligible") hold, matching the
+                // single lifecycle contract. A deterministic policy hint
+                // alongside the token still holds: only an explicit
+                // transient classifier verdict overrides it, so PR-visible
+                // output containing the token can never spend the budget.
+                const lowered = description.toLowerCase();
+                const trustedContexts = new Set([REVIEW_CONTEXT, REPAIR_CONTEXT]);
+                const contextValue = String(operationContext || operationStatus?.context || '').trim();
+                // Narrowed deterministic hints, mirroring
+                // src/continuum/pr_agent_recovery.py: bare "unresolved"
+                // alone never holds (transient "unresolved host"/DNS text
+                // must retry), and bare "conflict" matches at any position
+                // except inside "conflict-free"/"conflicting".
+                const hasDeterministicHint = /test failure|tests failed|unresolved\s+(findings?|reviews?|threads?|comments?|conversations?)|merge conflict|malformed|stale head|moved head|invalid state|(?:^|[^a-z])conflict(?!\s*-\s*free\b)(?!ing\b)/.test(lowered);
+                if (
+                  /\brecovery eligible\b/.test(lowered) &&
+                  !/\b(?:not|no|non|never)[\s\-_]*recovery[\s\-_]+eligible\b/.test(lowered) &&
+                  !hasDeterministicHint &&
+                  trustedContexts.has(contextValue)
+                ) {
+                  recoverable = true;
+                } else {
+                  return {
+                    action: 'hold',
+                    reason: contextValue && !trustedContexts.has(contextValue)
+                      ? 'recovery token from untrusted context is not automatically retried'
+                      : 'deterministic failure is not automatically retried',
+                  };
+                }
+                }
+              } else if (state === 'pending') {
+                // An explicit deterministic verdict dominates staleness; an
+                // explicit transient verdict dispatches without waiting for
+                // staleness. Stale alone never proves transient: only a
+                // retryable conclusion (or no conclusion) recovers, so a
+                // stale deterministic failure waits instead of consuming the
+                // retry budget.
+                if (failureTransient === false) {
+                  return {
+                    action: 'hold',
+                    reason: 'deterministic failure is not automatically retried',
+                  };
+                } else if (failureTransient === true) {
+                  recoverable = true;
+                } else if (retryableConclusions.has(String(runConclusion || '').toLowerCase())) {
+                  recoverable = true;
+                } else if (
+                  ageMs(operationStatus.updated_at || operationStatus.created_at) >= staleMs &&
+                  (runConclusion === null || runConclusion === undefined || String(runConclusion || '').trim() === '' ||
+                    retryableConclusions.has(String(runConclusion || '').toLowerCase()))
+                ) {
+                  recoverable = true;
+                } else {
+                  return { action: 'wait', reason: 'pending operation is not stale' };
+                }
+              } else {
+                return { action: 'hold', reason: 'unknown operation state ' + state };
+              }
+
+              if (!recoverable) {
+                return { action: 'hold', reason: 'operation is not recoverable' };
+              }
+
+              // Always advance to the next index: the dispatch-grace wait
+              // above already handles an unobserved dispatch, and replaying
+              // the same index would keep attempt >= budget from ever firing.
+              // First execution is always index 0 with no durable marker, whether or
+              // not operation state was seen, so every path dispatches 0..budget-1.
+              // `operationSeen` is retained for signature compatibility only.
+              const attempt = evidence.latestAttempt === null ? 0 : evidence.latestAttempt + 1;
+
+              if (attempt >= maxExecutions) {
+                // Return the budget count (not undefined) so callers can
+                // persist it in the durable exhaustion marker via
+                // exhaustedMarker(head, kind), matching
+                // decide_recovery in src/continuum/pr_agent_recovery.py.
+                // Callers must branch on action === 'exhaust', never on
+                // attempt == null, to detect exhaustion.
+                return { action: 'exhaust', attempt: maxExecutions, reason: 'automatic execution budget exhausted' };
+              }
+              return {
+                action: 'dispatch',
+                attempt,
+                reason: state === null ? 'lost/missing operation' : 'transient/stale operation',
+              };
+            }
+
+            async function defaultBranch() {
+              const { data } = await withReadFallback(client =>
+                client.rest.repos.get({ owner: executionOwner, repo: executionRepo })
+              );
+              return String(data.default_branch || 'main');
+            }
+
+            async function dispatch(pr, kind, head, attempt, status, signals = {}) {
+              requireFullHead(head, 'recovery dispatch');
+              const delaySeconds = resetAwareDelaySeconds({
+                attempt,
+                retryAfterSeconds: signals.retryAfterSeconds,
+                ratelimitResetEpoch: signals.ratelimitResetEpoch,
+                providerResetEpoch: signals.providerResetEpoch,
+                nowEpoch: Math.floor(nowMs() / 1000),
+                operationKey: repoFullName + '#' + pr.number + ':' + head + ':' + kind,
+              });
+              const statusTime = status
+                ? Date.parse(String(status.updated_at || status.created_at || ''))
+                : null;
+              // Schedule discount applies only to the schedule+jitter
+              // portion: an old status must never discount the absolute
+              // server reset floor (Retry-After / rate-limit / provider
+              // reset), otherwise quota is re-hammered.
+              const elapsedSeconds = Number.isFinite(statusTime)
+                ? Math.floor(Math.max(0, nowMs() - statusTime) / 1000)
+                : 0;
+              const nowEpoch = Math.floor(nowMs() / 1000);
+              const scheduleDelay = backoffSeconds(attempt) + jitterSeconds(repoFullName + '#' + pr.number + ':' + head + ':' + kind, attempt);
+              const scheduleRemaining = Math.max(0, scheduleDelay - elapsedSeconds);
+              let resetFloor = 0;
+              if (Number.isFinite(signals.retryAfterSeconds)) resetFloor = Math.max(resetFloor, signals.retryAfterSeconds);
+              for (const resetEpoch of [signals.ratelimitResetEpoch, signals.providerResetEpoch]) {
+                if (Number.isFinite(resetEpoch)) resetFloor = Math.max(resetFloor, Math.max(0, resetEpoch - nowEpoch));
+              }
+              const remaining = Math.max(scheduleRemaining, resetFloor);
+              if (remaining > MAX_INLINE_WAIT_SECONDS) {
+                // The run exits on a long rate-limit or quota wait. Record
+                // the reset-aware not-before time so the scheduled safety
+                // net redispatches when the window expires.
+                // The deferral performs no execution, so it must never
+                // advance the budget: persist attempt-1 so the next wakeup
+                // re-derives the same pending attempt index instead of
+                // advancing to latest+1 without any execution. Attempt 0 has
+                // no predecessor, so persist attempt 0 itself with the same
+                // not-before: the next wakeup waits inside the window instead
+                // of re-deriving a fresh attempt 0 without the original
+                // Retry-After/RateLimit-Reset signals and re-hammering quota.
+                const notBefore = Math.floor(nowMs() / 1000) + remaining;
+                await upsertControllerState(
+                  pr.number,
+                  retryMarker(head, kind, attempt > 0 ? attempt - 1 : 0, notBefore),
+                  'Deferred PR-Agent ' + kind + ' recovery for exact HEAD ' + head +
+                    ' until ' + new Date(notBefore * 1000).toISOString() +
+                    ' (reset-aware backoff ' + remaining + 's).'
+                );
+                core.notice(
+                  'PR #' + pr.number + ' ' + kind +
+                  ': deferring execution index ' + attempt + ' for ' + remaining +
+                  's; the scheduled safety net will redispatch. The run exits.'
+                );
+                return false;
+              }
+              if (remaining > 0) {
+                core.info(
+                  'PR #' + pr.number + ' ' + kind +
+                  ': bounded backoff ' + remaining + 's before execution index ' + attempt + '.'
+                );
+                await new Promise(resolve => setTimeout(resolve, remaining * 1000));
+              }
+
+              const { data: fresh } = await withReadFallback(client =>
+                client.rest.pulls.get({
+                  owner,
+                  repo,
+                  pull_number: pr.number,
+                })
+              );
+              if (
+                fresh.state !== 'open' ||
+                fresh.draft ||
+                !fresh.head.repo ||
+                fresh.head.repo.full_name !== repoFullName ||
+                fresh.head.sha !== head
+              ) {
+                core.info(
+                  'PR #' + pr.number + ' moved/closed during recovery backoff; stale dispatch cancelled.'
+                );
+                return false;
+              }
+              // Re-read the current hold immediately before dispatch so a
+              // re-added no-auto-merge label never pays for another reviewer/
+              // model execution. The merge gate re-checks the hold as well.
+              if (hasNoAutoMergeHold(fresh)) {
+                core.info(
+                  'PR #' + pr.number + ' HEAD ' + head +
+                  ': explicit no-auto-merge hold is present; recovery dispatch cancelled.'
+                );
+                return false;
+              }
+              if (isConflictedMergeability(fresh.mergeable, fresh.mergeable_state) === true) {
+                core.info(
+                  'PR #' + pr.number + ' HEAD ' + head +
+                  ': merge conflict/stale base blocks the merge lifecycle; recovery dispatch cancelled.'
+                );
+                return false;
+              }
+              if (!(await exactHeadCiGreen(head))) {
+                core.info(
+                  'PR #' + pr.number + ' HEAD ' + head +
+                  ': CI is no longer green; recovery dispatch cancelled.'
+                );
+                return false;
+              }
+
+              const refreshedRuns = await listReviewRuns();
+              if (exactActiveRun(refreshedRuns, pr.number, kind, head)) {
+                core.info(
+                  'PR #' + pr.number + ' ' + kind +
+                  ': another exact operation became active; duplicate wakeup coalesced.'
+                );
+                return false;
+              }
+
+                  const refreshedComments = await withReadFallback(async (client) => {
+                    const items = await boundedCollect(
+                      client,
+                      (params) => client.rest.issues.listComments(params),
+                      { owner, repo, issue_number: pr.number, per_page: 100 },
+                      MAX_COMMENT_PAGES
+                    );
+              // Recover on truncation: the listing is oldest-first, so a
+              // truncated window hides the newest retry/exhausted markers.
+              // Merge the bounded newest window and decide on the merged
+              // set; only a newest-recovery failure holds the dispatch.
+              if (items.truncated) {
+                try {
+                  await recoverNewestComments(client, pr.number, items);
+                  core.warning(
+                    'PR #' + pr.number + ' ' + kind +
+                    ': comment scan hit the ' + MAX_COMMENT_PAGES + '-page budget; deciding on the merged oldest+newest window.'
+                  );
+                } catch {
+                  core.warning(
+                    'PR #' + pr.number + ' ' + kind +
+                    ': comment scan hit the ' + MAX_COMMENT_PAGES + '-page budget and newest-window recovery failed; holding dispatch instead of deciding on a truncated window.'
+                  );
+                }
+              }
+                    return items;
+                  });
+              if (refreshedComments.truncated) {
+                return false;
+              }
+              const refreshedEvidence = parseEvidence(refreshedComments, head, kind);
+              if (refreshedEvidence.exhausted) {
+                core.info('PR #' + pr.number + ' ' + kind + ': retry budget is already exhausted.');
+                return false;
+              }
+              // Exact-HEAD revalidation immediately before mutation: a
+              // reset-aware not-before written by a concurrent reconciler (or
+              // an earlier deferred dispatch) wins over this stale wakeup.
+              if (
+                Number.isFinite(refreshedEvidence.notBeforeEpoch) &&
+                Math.floor(nowMs() / 1000) < refreshedEvidence.notBeforeEpoch
+              ) {
+                core.info(
+                  'PR #' + pr.number + ' ' + kind +
+                  ': durable not-before has not arrived; stale dispatch cancelled.'
+                );
+                return false;
+              }
+              if (
+                refreshedEvidence.latestAttempt !== null &&
+                refreshedEvidence.latestAttempt > attempt
+              ) {
+                core.info(
+                  'PR #' + pr.number + ' ' + kind +
+                  ': a newer retry attempt already exists; stale dispatch cancelled.'
+                );
+                return false;
+              }
+              if (
+                refreshedEvidence.latestAttempt === attempt &&
+                refreshedEvidence.latestMarkerAt !== null &&
+                nowMs() - refreshedEvidence.latestMarkerAt < dispatchGraceMs &&
+                await operationIsActive(pr.number, head, kind)
+              ) {
+                // The claim from the successful dispatch is already durable
+                // evidence, but a prior coalescing failure can leave it plus
+                // an older controller comment behind. Re-read fresh before
+                // pruning so an interleaved controller write after the
+                // pre-dispatch snapshot is never invisible: pruning the stale
+                // snapshot could delete pre-existing comments while leaving
+                // both the local claim and a concurrent claim (breaking the
+                // bounded-at-one invariant), and the generic controller
+                // marker alone cannot distinguish another head/kind. Keeping
+                // the fresh latest preserves a concurrent writer's state;
+                // the next successful upsert finishes coalescing.
+                    try {
+                      const graceComments = await withReadFallback(async (client) => {
+                        const items = await boundedCollect(
+                          client,
+                          (params) => client.rest.issues.listComments(params),
+                          { owner, repo, issue_number: pr.number, per_page: 100 },
+                          MAX_COMMENT_PAGES
+                        );
+                  // Recover on truncation: the listing is oldest-first,
+                  // so a truncated window may hide a concurrent controller
+                  // write. Merge the bounded newest window before pruning;
+                  // only a newest-recovery failure skips the prune (the next
+                  // upsert still finishes cleanup).
+                  if (items.truncated) {
+                    try {
+                      await recoverNewestComments(client, pr.number, items);
+                      core.warning(
+                        'PR #' + pr.number + ' ' + kind +
+                        ': comment scan hit the ' + MAX_COMMENT_PAGES + '-page budget; pruning on the merged oldest+newest window.'
+                      );
+                    } catch {
+                      core.warning(
+                        'PR #' + pr.number + ' ' + kind +
+                        ': comment scan hit the ' + MAX_COMMENT_PAGES + '-page budget and newest-window recovery failed; skipping dispatch-grace prune on a truncated window.'
+                      );
+                    }
+                  }
+                        return items;
+                      });
+                  if (!graceComments.truncated) {
+                  const controllerDupes = graceComments
+                    .filter(comment => String(comment.body || '').includes(CONTROLLER_STATE_MARKER))
+                    .sort((a, b) => Number(a.id) - Number(b.id));
+                  for (const stale of controllerDupes.slice(0, -1)) {
+                    try {
+                      await github.rest.issues.deleteComment({
+                        owner,
+                        repo,
+                        comment_id: stale.id,
+                      });
+                    } catch (deleteErr) {
+                      if (deleteErr.status !== 404) throw deleteErr;
+                    }
+                  }
+                  }
+                } catch (pruneErr) {
+                  core.warning(
+                    'PR #' + pr.number + ' ' + kind +
+                    ': dispatch-grace duplicate prune failed: ' +
+                    (pruneErr.message || pruneErr)
+                  );
+                }
+                core.info(
+                  'PR #' + pr.number + ' ' + kind +
+                  ': matching retry marker is inside dispatch grace; duplicate wakeup coalesced.'
+                );
+                return false;
+              }
+
+              const marker = retryMarker(head, kind, attempt);
+              const stateSummary =
+                'Automatic PR-Agent ' + kind + ' recovery for exact HEAD ' + head +
+                  ' (execution ' + (attempt + 1) + '/' + maxExecutions + ').';
+              // Exactly-once claim: the durable retry marker is recorded
+              // BEFORE createWorkflowDispatch via a fresh createComment, so a
+              // runner crash after a successful dispatch can never leave the
+              // next wakeup without marker evidence inside grace (which would
+              // dispatch the same attempt again: duplicate recovery
+              // executions, attempt-count drift). A fresh create never touches
+              // the existing controller comment's updated_at; on dispatch
+              // failure the claim is deleted, so a retry that never
+              // dispatched leaves timestamps untouched and is never
+              // coalesced as fresh. A crash between claim and dispatch only
+              // delays the replay until grace expires, then replays the same
+              // bounded attempt instead of duplicating or consuming a slot.
+              const claimBody = controllerStateBody(
+                marker,
+                String(stateSummary || '').trim() + '\n\nController dispatch run: ' + String(context.runId)
+              );
+              let claim = null;
+              try {
+                const { data } = await github.rest.issues.createComment({
+                  owner,
+                  repo,
+                  issue_number: pr.number,
+                  body: claimBody,
+                });
+                claim = data;
+              } catch (err) {
+                throw err;
+              }
+              try {
+                const ref = await defaultBranch();
+                // Local runs dispatch bare: a custom reviewWorkflow without
+                // the target_child_id workflow_dispatch input would reject
+                // an empty value, breaking local recovery. Delegated runs
+                // preserve the opaque child selection.
+                const recoveryInputs = {
+                  pr_number: String(pr.number),
+                  expected_head_sha: head,
+                  retry_attempt: String(attempt),
+                  retry_workflow: reviewWorkflow,
+                  recovery_kind: kind,
+                };
+                const recoveryChildId = String(process.env.TARGET_CHILD_ID || '');
+                if (recoveryChildId) {
+                  recoveryInputs.target_child_id = recoveryChildId;
+                }
+                try {
+                  await github.rest.actions.createWorkflowDispatch({
+                    owner: executionOwner,
+                    repo: executionRepo,
+                    workflow_id: reviewWorkflow,
+                    ref,
+                    inputs: recoveryInputs,
+                  });
+                } catch (dispatchErr) {
+                  const dispatchMessage = String(dispatchErr.message || dispatchErr);
+                  const dispatchStatus = Number(dispatchErr.status || 0);
+                  // Narrow input-rejection detection: only a 422 whose
+                  // message names the opaque target_child_id input means
+                  // the review workflow lacks the delegated selector. Any
+                  // other 422 (invalid pr_number/expected_head_sha, ref, or
+                  // payload validation) or any message merely containing
+                  // the word "input" is rethrown verbatim so the operator
+                  // fixes the true remediation path.
+                  const isMissingTargetInput =
+                    dispatchStatus === 422 &&
+                    /target_child_id/i.test(dispatchMessage);
+                  if (recoveryChildId && isMissingTargetInput) {
+                    throw new Error(
+                      'Delegated recovery requires reviewWorkflow ' + reviewWorkflow +
+                      ' to declare a target_child_id workflow_dispatch input; ' +
+                      'refusing bare retry to preserve the delegated target: ' +
+                      dispatchMessage
+                    );
+                  }
+                  throw dispatchErr;
+                }
+                core.notice(
+                  'PR #' + pr.number + ' HEAD ' + head + ': dispatched ' +
+                  kind + ' recovery execution ' + (attempt + 1) + '/' + maxExecutions + '.'
+                );
+              } catch (err) {
+                try {
+                  await rollbackControllerState(
+                    claim ? { comment: claim, created: true, previousBody: '' } : null
+                  );
+                } catch (cleanupErr) {
+                  core.warning(
+                    'PR #' + pr.number + ' ' + kind +
+                    ': pre-dispatch claim cleanup failed: ' +
+                    (cleanupErr.message || cleanupErr)
+                  );
+                }
+                // Reset-aware deferral (#224): when the dispatch itself is
+                // transiently rate-limited or fails on dispatch transport
+                // (5xx/network without Retry-After/Reset headers), persist a
+                // durable attempt marker so the next wakeup advances toward
+                // the bounded exhaustion/hold instead of re-deriving the same
+                // attempt index forever. The runner still exits; nothing sleeps.
+                if (isTransientApiError(err)) {
+                  const signals = extractRateLimitSignals(err);
+                  const delaySeconds = resetAwareDelaySeconds({
+                    attempt,
+                    retryAfterSeconds: signals.retryAfterSeconds,
+                    ratelimitResetEpoch: signals.ratelimitResetEpoch,
+                    providerResetEpoch: signals.providerResetEpoch,
+                    nowEpoch: Math.floor(nowMs() / 1000),
+                    operationKey: repoFullName + '#' + pr.number + ':' + head + ':' + kind,
+                  });
+                  const notBefore = Math.floor(nowMs() / 1000) + delaySeconds;
+                  const hasResetSignal =
+                    signals.retryAfterSeconds !== undefined ||
+                    signals.ratelimitResetEpoch !== undefined ||
+                    signals.providerResetEpoch !== undefined;
+                  if (hasResetSignal) {
+                    await upsertControllerState(
+                      pr.number,
+                      retryMarker(head, kind, attempt, notBefore),
+                      'Deferred PR-Agent ' + kind + ' recovery for exact HEAD ' + head +
+                        ' until ' + new Date(notBefore * 1000).toISOString() +
+                        ' (dispatch was rate-limited; reset-aware backoff ' + delaySeconds + 's).'
+                    );
+                    core.warning(
+                      'PR #' + pr.number + ' ' + kind +
+                      ': dispatch was rate-limited; deferred to ' +
+                      new Date(notBefore * 1000).toISOString() +
+                      ' for the scheduled safety net to redispatch.'
+                    );
+                  } else {
+                    await upsertControllerState(
+                      pr.number,
+                      retryMarker(head, kind, attempt, notBefore),
+                      'Deferred PR-Agent ' + kind + ' recovery for exact HEAD ' + head +
+                        ' until ' + new Date(notBefore * 1000).toISOString() +
+                        ' (dispatch was transiently unreachable; reset-aware backoff ' + delaySeconds + 's).'
+                    );
+                    core.warning(
+                      'PR #' + pr.number + ' ' + kind +
+                      ': dispatch was transiently unreachable; deferred to ' +
+                      new Date(notBefore * 1000).toISOString() +
+                      ' for the scheduled safety net to redispatch.'
+                    );
+                  }
+                }
+                throw err;
+              }
+              // Coalesce the pre-dispatch claim (plus any stale controller
+              // comments) into the single controller comment. The claim is a
+              // fresh controller-state comment, so on persistent upsert
+              // failure delete only pre-existing snapshot comments older
+              // than the claim and keep both the claim and any concurrent
+              // write: exactly-once evidence for both attempts survives and
+              // the next wakeup coalesces via grace. The dispatch already
+              // succeeded, so this path warns and returns true instead of
+              // throwing: a red run for a dispatched recovery would invite a
+              // manual retry that duplicates the same attempt once grace
+              // expires, and callers expect boolean dispatch() success.
+              let stateError = null;
+              for (let stateAttempt = 1; stateAttempt <= 3; stateAttempt++) {
+                try {
+                  await upsertControllerState(pr.number, marker, stateSummary);
+                  stateError = null;
+                  break;
+                } catch (err) {
+                  stateError = err;
+                  core.warning(
+                    'PR #' + pr.number + ' ' + kind +
+                    ': controller state coalescing ' + stateAttempt + '/3 failed after a successful dispatch: ' +
+                    (err.message || err)
+                  );
+                  if (stateAttempt < 3) {
+                    await new Promise(resolve => setTimeout(resolve, 2000 * stateAttempt));
+                  }
+                }
+              }
+                  if (stateError) {
+                    try {
+                      const freshController = await withReadFallback(async (client) => {
+                        const items = await boundedCollect(
+                          client,
+                          (params) => client.rest.issues.listComments(params),
+                          { owner, repo, issue_number: pr.number, per_page: 100 },
+                          MAX_COMMENT_PAGES
+                        );
+                  // Recover on truncation: the listing is oldest-first,
+                  // so a truncated window may hide controller comments.
+                  // Merge the bounded newest window before pruning; only a
+                  // newest-recovery failure skips the prune (the next wakeup
+                  // still coalesces via dispatch grace).
+                  if (items.truncated) {
+                    try {
+                      await recoverNewestComments(client, pr.number, items);
+                      core.warning(
+                        'PR #' + pr.number + ' ' + kind +
+                        ': comment scan hit the ' + MAX_COMMENT_PAGES + '-page budget; pruning on the merged oldest+newest window.'
+                      );
+                    } catch {
+                      core.warning(
+                        'PR #' + pr.number + ' ' + kind +
+                        ': comment scan hit the ' + MAX_COMMENT_PAGES + '-page budget and newest-window recovery failed; skipping post-dispatch prune on a truncated window.'
+                      );
+                    }
+                  }
+                        return items;
+                      });
+                  if (!freshController.truncated) {
+                  const snapshotIds = new Set(
+                    refreshedComments.map(comment => Number(comment.id))
+                  );
+                  const claimId = Number(claim && claim.id);
+                  const priorController = freshController
+                    .filter(comment => String(comment.body || '').includes(CONTROLLER_STATE_MARKER))
+                    .filter(comment => snapshotIds.has(Number(comment.id)))
+                    .filter(comment => Number(comment.id) !== claimId && Number(comment.id) < claimId)
+                    .sort((a, b) => Number(a.id) - Number(b.id));
+                  for (const stale of priorController) {
+                    try {
+                      await github.rest.issues.deleteComment({
+                        owner,
+                        repo,
+                        comment_id: stale.id,
+                      });
+                    } catch (deleteErr) {
+                      if (deleteErr.status !== 404) throw deleteErr;
+                    }
+                  }
+                  }
+                } catch (pruneErr) {
+                  core.warning(
+                    'PR #' + pr.number + ' ' + kind +
+                    ': post-dispatch duplicate prune failed: ' +
+                    (pruneErr.message || pruneErr)
+                  );
+                }
+                core.warning(
+                  'PR #' + pr.number + ' ' + kind +
+                  ': dispatched recovery execution ' + (attempt + 1) + '/' + maxExecutions +
+                  ' but coalescing into one controller comment failed; ' +
+                  'kept the pre-dispatch claim plus any concurrent controller write. ' +
+                  'The next wakeup coalesces via dispatch grace; no duplicate dispatch was issued. ' +
+                  (stateError.message || stateError)
+                );
+                return true;
+              }
+              return true;
+            }
+
+            async function exhaust(pr, head, kind, comments) {
+              const marker = exhaustedMarker(head, kind);
+              // Fail-closed and observable: the exhausted marker is the
+              // durable record. An existing marker only counts as
+              // already-exhausted when it matches this exact HEAD/kind and
+              // its attempts meet the current budget (same rule as
+              // parseEvidence): a legacy attempts=3 marker from an older
+              // budget must not suppress the canonical attempts=10 write.
+              const exactHead = String(head).toLowerCase();
+              const exhaustedRes = [
+                /<!--\s*continuum-lifecycle-retry-exhausted\s+head=([0-9a-f]{40,64})\s+kind=(review|repair)\s+attempts=(\d+)\s*-->/gi,
+                /<!--\s*continuum-pr-agent-retry-exhausted\s+head=([0-9a-f]{40,64})\s+kind=(review|repair)\s+attempts=(\d+)\s*-->/gi,
+              ];
+              const already = comments.some(comment => {
+                const rawUser = (comment.user && typeof comment.user === 'object') ? comment.user : {};
+                const login = String(rawUser.login || comment.user_login || comment.author || '').trim().toLowerCase();
+                if (!trustedAssociations.has(String(comment.author_association || '').toUpperCase()) && login !== 'github-actions[bot]') {
+                  return false;
+                }
+                const body = String(comment.body || '');
+                if (body.includes(marker)) return true;
+                for (const re of exhaustedRes) {
+                  re.lastIndex = 0;
+                  for (const match of body.matchAll(re)) {
+                    if (
+                      String(match[1] || '').toLowerCase() === exactHead &&
+                      match[2] === kind &&
+                      Number.parseInt(match[3], 10) >= maxExecutions
+                    ) {
+                      return true;
+                    }
+                  }
+                }
+                return false;
+              });
+              if (already) return;
+              await upsertControllerState(
+                pr.number,
+                marker,
+                'PR-Agent ' + kind + ' recovery exhausted the bounded ' +
+                  maxExecutions + '-execution budget for exact HEAD ' + head +
+                  '. A changed HEAD starts a new recovery identity.'
+              );
+            }
+
+            // Bounded open-PR scan (#254): five pages instead of full
+            // history; recovery only needs currently open PRs. Transient
+            // discovery errors defer to the next wakeup without an inline
+            // retry; deterministic errors fail loudly.
+            let openPrs;
+            try {
+              openPrs = await withReadFallback(async (client) => {
+                const items = await boundedCollect(
+                  client,
+                  (params) => client.rest.pulls.list(params),
+                  { owner, repo, state: 'open', per_page: 100 },
+                  MAX_QUEUE_PAGES
+                );
+                // Queue truncation hides overflow PRs past ~500 open PRs
+                // on every pass. Merge the bounded newest window so
+                // overflow PRs are still serviced; only a
+                // newest-recovery failure falls back to the partial
+                // oldest window with a loud warning instead of silence.
+                if (items.truncated) {
+                  try {
+                    await recoverNewestQueue(client, items);
+                    core.warning(
+                      'CONTINUUM_QUEUE_BUDGET_EXCEEDED: open-PR scan hit the ' + MAX_QUEUE_PAGES + '-page budget; deciding on the merged oldest+newest window.'
+                    );
+                  } catch (recoveryErr) {
+                    core.warning(
+                      'CONTINUUM_QUEUE_BUDGET_EXCEEDED: open-PR scan hit the ' + MAX_QUEUE_PAGES + '-page budget and newest-window recovery failed; deciding on a partial oldest window with unseen overflow: ' +
+                      (recoveryErr.message || recoveryErr)
+                    );
+                  }
+                }
+                return items;
+              });
+            } catch (err) {
+              // Top-level discovery sits outside the per-PR loop, so a
+              // 429/rate-limited 403 here must defer green to the next
+              // wakeup (the read is deferred to the next wakeup and does
+              // not retry inline) instead of failing the whole watchdog run
+              // red. Deterministic errors still throw and fail loudly.
+              if (isTransientApiError(err)) {
+                core.warning(
+                  'Open-PR discovery hit a transient/rate-limit read; ' +
+                  'deferring the whole scan to the next wakeup: ' +
+                  (err.message || err)
+                );
+                return;
+              }
+              throw err;
+            }
+            let reviewRuns;
+            try {
+              reviewRuns = await listReviewRuns();
+              rememberReviewRuns(reviewRuns);
+            } catch (err) {
+              if (isTransientApiError(err)) {
+                core.warning(
+                  'Review-run discovery hit a transient/rate-limit read; ' +
+                  'deferring the whole scan to the next wakeup: ' +
+                  (err.message || err)
+                );
+                return;
+              }
+              throw err;
+            }
+            // One bounded CI snapshot for the non-mutating initial scan
+            // (B3). A snapshot failure never fails the scan: per-PR exact
+            // lookups remain as fallback, and dispatch() always re-reads
+            // fresh exact-HEAD CI before mutating.
+            try {
+              await fetchCiSnapshot();
+            } catch (err) {
+              if (isTransientApiError(err)) {
+                core.warning(
+                  'CI snapshot hit a transient/rate-limit read; ' +
+                  'falling back to per-PR exact HEAD CI: ' +
+                  (err.message || err)
+                );
+                ciSnapshotByHead = null;
+              } else {
+                throw err;
+              }
+            }
+            // Deterministic per-PR failures must not strand healthy PRs
+            // behind one bad PR in the same run: record loudly and continue.
+            let deterministicFailure = null;
+
+            for (const pr of openPrs) {
+              if (
+                pr.draft ||
+                !pr.head.repo ||
+                pr.head.repo.full_name !== repoFullName
+              ) {
+                continue;
+              }
+              const head = String(pr.head.sha || '').toLowerCase();
+              if (!head) continue;
+              // One bad fetch must not abort the loop: a non-full HEAD is a
+              // per-PR programming/fetch error, so skip loudly and continue
+              // with healthy PRs behind it instead of throwing out of the
+              // repository-global scan.
+              if (!FULL_HEAD_RE.test(head)) {
+                core.warning(
+                  'PR #' + pr.number + ': skipping recovery for non-full HEAD; ' +
+                  'producers must pass the full 40-hex (or 64-hex) commit id.'
+                );
+                continue;
+              }
+
+              // Per-PR/HEAD/operation lease (#224): duplicate wakeups for the
+              // same transition coalesce; independent PRs never starve each
+              // other behind a repository-global lock.
+              if (!tryAcquireLease(pr.number, head, 'reconciler')) {
+                core.info(
+                  'PR #' + pr.number + ' HEAD ' + head +
+                  ': already owned by this reconciliation; coalescing duplicate wakeup.'
+                );
+                continue;
+              }
+              try {
+                // Latest-state reconciliation body (flat inside the loop so
+                // per-PR skip stays a plain `continue`). The initial CI
+                // verdict comes from the bounded snapshot with exact
+                // fallback; dispatch() still re-reads fresh exact-HEAD CI
+                // before mutating.
+                const ciGreen = await scanCiGreen(head);
+              if (!ciGreen) {
+                core.info('PR #' + pr.number + ' HEAD ' + head + ': exact-head CI not green; skip.');
+                continue;
+              }
+
+              // Read-side evaluation order (#254 + B4): statuses first through
+              // a capped scan, so an already-clean reviewed PR stops here
+              // with no durable retry-comment scan and no status
+              // run-metadata GET.
+              const statuses = await withReadFallback(client =>
+                boundedCollect(
+                  client,
+                  (params) => client.rest.repos.listCommitStatusesForRef(params),
+                  { owner, repo, ref: head, per_page: 100 },
+                  MAX_GATE_PAGES
+                )
+              );
+
+              const reviewStatus = latestContext(statuses, REVIEW_CONTEXT);
+              // A clean review operation is not the same as a completed merge
+              // lifecycle. Even when the orchestration run that published the
+              // status succeeded, the open PR can still be waiting for an
+              // explicit no-auto-merge hold to be lifted, for mergeability to
+              // finish, or for a skipped merge to be retried. Only a
+              // merged/closed PR, a currently held/draft/conflicted PR, or a
+              // genuinely settled lifecycle is a NOOP; otherwise resume the
+              // bounded full orchestration so the current merge path gets
+              // fresh, runner-local evidence instead of stranding a clean PR.
+              let cleanReviewRun = null;
+              let cleanLifecycleIncomplete = false;
+              if (reviewStatus?.state === 'success') {
+                const cleanDescription = String(reviewStatus.description || '');
+                if (!/actionable/i.test(cleanDescription) && !/blocking; recovery eligible/i.test(cleanDescription)) {
+                  cleanReviewRun = await statusRunMetadata(reviewStatus);
+                  const cleanRunConclusion =
+                    String(cleanReviewRun.conclusion || '').toLowerCase();
+                  const cleanRunRetryable =
+                    retryableConclusions.has(cleanRunConclusion);
+                  // Re-read the live PR before deciding: the owner may have
+                  // re-added the hold, moved the HEAD, merged/closed the PR,
+                  // or made it a draft since the open-PR snapshot.
+                  let freshPr = null;
+                  if (!hasNoAutoMergeHold(pr)) {
+                    freshPr = await withReadFallback(async client => (
+                      await client.rest.pulls.get({
+                        owner,
+                        repo,
+                        pull_number: pr.number,
+                      })
+                    ).data);
+                  }
+                  const assessment = assessCleanReviewLifecycle({
+                    reviewStatus,
+                    runConclusionRetryable: cleanRunRetryable,
+                    pr,
+                    freshPr,
+                    head,
+                    repoFullName,
+                  });
+                  if (assessment.decision === 'not-clean-review') {
+                    core.info(
+                      'PR #' + pr.number + ' HEAD ' + head +
+                      ': ' + assessment.reason + '; reviewer policy remains authoritative.'
+                    );
+                  } else if (assessment.decision !== 'resume' && assessment.decision !== 'replay') {
+                    core.info(
+                      'PR #' + pr.number + ' HEAD ' + head +
+                      ': ' + assessment.reason + '; recovery has nothing to do.'
+                    );
+                    continue;
+                  } else if (assessment.decision === 'resume') {
+                    // The review operation is clean for this exact HEAD, but
+                    // the open PR proves the enclosing merge lifecycle did not
+                    // finish (for example an explicit hold skipped the merge).
+                    // Resume through the same bounded full orchestration.
+                    cleanLifecycleIncomplete = true;
+                    core.info(
+                      'PR #' + pr.number + ' HEAD ' + head +
+                      ': ' + assessment.reason +
+                      '; bounded recovery will resume the full PR-Agent review/merge lifecycle.'
+                    );
+                  } else {
+                    core.warning(
+                      'PR #' + pr.number + ' HEAD ' + head +
+                      ': ' + assessment.reason + ' (' +
+                      (cleanRunConclusion || 'unknown') +
+                      '); bounded recovery will replay the review/merge lifecycle.'
+                    );
+                  }
+                }
+              }
+              const comments = await withReadFallback(async (client) => {
+                const items = await boundedCollect(
+                  client,
+                  (params) => client.rest.issues.listComments(params),
+                  { owner, repo, issue_number: pr.number, per_page: 100 },
+                  MAX_COMMENT_PAGES
+                );
+              // Recover on truncation: the listing is oldest-first, so a
+              // truncated window hides the newest retry/exhausted markers.
+              // Merge the bounded newest window and decide on the merged
+              // set; only a newest-recovery failure defers this PR to the
+              // next wakeup.
+              if (items.truncated) {
+                try {
+                  await recoverNewestComments(client, pr.number, items);
+                  core.warning(
+                    'PR #' + pr.number + ' HEAD ' + head +
+                    ': comment scan hit the ' + MAX_COMMENT_PAGES + '-page budget; deciding on the merged oldest+newest window.'
+                  );
+                } catch {
+                  core.warning(
+                    'PR #' + pr.number + ' HEAD ' + head +
+                    ': comment scan hit the ' + MAX_COMMENT_PAGES + '-page budget and newest-window recovery failed; deferring recovery instead of deciding on a truncated window.'
+                  );
+                }
+              }
+                return items;
+              });
+              if (comments.truncated) {
+                continue;
+              }
+              const reviewRun = reviewStatus
+                ? (cleanReviewRun || await statusRunMetadata(reviewStatus))
+                : { conclusion: null, recoveryKind: null };
+              let kind = 'review';
+              let operationStatus = reviewStatus;
+              let operationRun = reviewRun;
+
+              if (reviewStatus?.state === 'success') {
+                const reviewDescription = String(reviewStatus.description || '');
+                if (/actionable/i.test(reviewDescription)) {
+                  kind = 'repair';
+                  operationStatus = latestContext(statuses, REPAIR_CONTEXT);
+                  operationRun = operationStatus
+                    ? await statusRunMetadata(operationStatus)
+                    : { conclusion: null, recoveryKind: null };
+                } else if (/blocking; recovery eligible/i.test(reviewDescription)) {
+                  kind = 'review';
+                  operationStatus = {
+                    ...reviewStatus,
+                    state: 'failure',
+                    description: 'PR-Agent blocking review: recovery eligible',
+                  };
+                  operationRun = reviewRun;
+                } else if (
+                  retryableConclusions.has(
+                    String(reviewRun.conclusion || '').toLowerCase()
+                  )
+                ) {
+                  kind = 'review';
+                  operationStatus = {
+                    ...reviewStatus,
+                    state: 'failure',
+                    description:
+                      'PR-Agent clean review lifecycle incomplete: recovery eligible',
+                  };
+                  operationRun = reviewRun;
+                } else if (cleanLifecycleIncomplete) {
+                  // The review run succeeded, but the PR is still open and
+                  // eligible for the merge lifecycle to resume. Keep the
+                  // success state and let decide() treat the lifecycle as
+                  // incomplete instead of silently settling the PR.
+                  kind = 'review';
+                  operationStatus = {
+                    ...reviewStatus,
+                    state: 'success',
+                    description:
+                      'PR-Agent clean review lifecycle incomplete: merge not completed',
+                  };
+                  operationRun = reviewRun;
+                } else {
+                  core.info(
+                    'PR #' + pr.number + ' HEAD ' + head +
+                    ': review is settled clean; recovery has nothing to do.'
+                  );
+                  continue;
+                }
+              } else if (
+                reviewRun.recoveryKind === 'repair' &&
+                ['pending', 'failure'].includes(
+                  String(reviewStatus?.state || '').toLowerCase()
+                )
+              ) {
+                // A repair recovery must first reconstruct canonical review/
+                // improve payloads. If that prerequisite review is cancelled,
+                // stale, or fails, it still belongs to the durable repair
+                // operation and must consume/replay the repair budget.
+                kind = 'repair';
+              }
+
+              const evidence = parseEvidence(comments, head, kind);
+              const activeRun = exactActiveRun(reviewRuns, pr.number, kind, head);
+              // Trusted-context parity with the Python contract: every
+              // shipped producer emits the token from
+              // continuum/pr-agent-review or continuum/pr-agent-repair, and
+              // the synthesized blocking-review status below reuses the
+              // review status object (already scoped to REVIEW_CONTEXT).
+              const decision = decide({
+                ciGreen,
+                operationStatus,
+                activeRun,
+                runConclusion: operationRun.conclusion,
+                evidence,
+                operationContext: String(operationStatus?.context || ''),
+                lifecycleComplete: !cleanLifecycleIncomplete,
+              });
+
+              core.info(
+                'PR #' + pr.number + ' HEAD ' + head + ' ' + kind +
+                ': recovery decision=' + decision.action +
+                ' reason=' + decision.reason +
+                (decision.attempt === undefined ? '' : ' attempt=' + decision.attempt)
+              );
+
+              if (decision.action === 'exhaust') {
+                await exhaust(pr, head, kind, comments);
+                continue;
+              }
+              if (decision.action !== 'dispatch') continue;
+
+              const dispatched = await dispatch(
+                pr,
+                kind,
+                head,
+                decision.attempt,
+                operationStatus
+              );
+              if (dispatched) {
+                reviewRuns = await listReviewRuns();
+                rememberReviewRuns(reviewRuns);
+              }
+              } catch (err) {
+                // Generic transient classification (#224): infrastructure
+                // gaps retry via the next event/scheduled wakeup from latest
+                // state. A deterministic per-PR failure is loud but never
+                // aborts the repository-global loop: one malformed PR must
+                // not strand healthy PRs behind it.
+                if (isTransientApiError(err)) {
+                  core.warning(
+                    'PR #' + pr.number + ' HEAD ' + head +
+                    ': transient reconciliation error; a later wakeup retries from latest state: ' +
+                    (err.message || err)
+                  );
+                } else {
+                  core.error(
+                    'PR #' + pr.number + ' HEAD ' + head +
+                    ': deterministic reconciliation error; skipping PR but continuing run: ' +
+                    (err.stack || err.message || err)
+                  );
+                  if (!deterministicFailure) deterministicFailure = err;
+                }
+              }
+            }
+            if (deterministicFailure) {
+              core.setFailed(
+                'Deterministic PR-Agent reconciliation failure(s) held loudly: ' +
+                (deterministicFailure.message || deterministicFailure)
+              );
+            }

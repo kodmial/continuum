@@ -1,0 +1,41 @@
+name: Question / support
+description: Ask a usage or integration question about Continuum.
+title: "[Question]: "
+labels:
+  - question
+  - automation:blocked
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Use this form for usage and integration questions that are not a bug
+        report or a feature request. For bugs, use the bug report form. For a
+        security vulnerability, stop and follow the
+        [security policy](https://github.com/kodmial/continuum/security/policy)
+        instead of opening a public issue.
+
+        This form applies the `automation:blocked` admission hold. A maintainer
+        must explicitly admit the question before automatic implementation can
+        pick it up. Form labels are intake convenience, not scheduler policy:
+        maintainers and API users can still create blank issues.
+  - type: textarea
+    id: question
+    attributes:
+      label: Question
+      description: What are you trying to do, and where are you stuck? Include the Continuum ref and relevant configuration with secrets removed.
+    validations:
+      required: true
+  - type: textarea
+    id: context
+    attributes:
+      label: Additional context (optional)
+      description: Links to public documentation or sanitized logs that help explain the question.
+    validations:
+      required: false
+  - type: checkboxes
+    id: confirmations
+    attributes:
+      label: Confirmations
+      options:
+        - label: I removed secrets, tokens, and consumer data from this question.
+          required: true

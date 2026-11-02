@@ -1,0 +1,33 @@
+name: CodeRabbit review-ready label
+
+# Self-dogfood entry for the review-ready label controller. The reusable engine
+# is workflow_call-only, so this file owns the trigger and calls the engine
+# locally. Installed consumers keep using the continuum-add-review-label.yml
+# caller stub instead.
+
+on:
+  workflow_run:
+    workflows: ["CI"]
+    types: [completed]
+
+permissions:
+  actions: write
+  contents: read
+  issues: write
+  pull-requests: write
+
+jobs:
+  call:
+    uses: ./.github/workflows/continuum-add-review-label.yml
+    secrets: inherit
+    # `require_coderabbit` is deliberately NOT pinned here. CodeRabbit is an
+    # optional integration whose enabling value lives in the repository's
+    # `vars.CONTINUUM_REVIEW_PROVIDER`; a literal here would override that
+    # variable and silently re-enable CodeRabbit for a repository that never
+    # asked for it.
+    with:
+      continuum_ref: main
+      # The engines are workflow_call-only, so their dispatch targets must be
+      # dispatchable entries in this repository.
+      coderabbit_retry_workflow: 'coderabbit-retry.yml'
+      auto_merge_workflow: 'automation.yml'

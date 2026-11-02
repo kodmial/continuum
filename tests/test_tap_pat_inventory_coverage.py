@@ -11,6 +11,11 @@ import unittest
 from continuum import credential_matrix
 from continuum import tap_pat_inventory
 
+try:
+    from tests.scheduler_workflow import read_workflow
+except ModuleNotFoundError:
+    from scheduler_workflow import read_workflow
+
 
 class ExactStepCoverageTest(unittest.TestCase):
     def setUp(self):
@@ -51,11 +56,27 @@ class ExactStepCoverageTest(unittest.TestCase):
             )
         )
 
-    def test_attestation_key_is_not_a_workflow_secret(self):
-        # The hook is a private key file, never a repository/workflow secret.
-        self.assertNotIn(
+    def test_attestation_key_is_scoped_to_the_file_based_contract(self):
+        # The optional key is a permitted workflow secret, but it must only be
+        # read into a non-exported shell variable and provisioned as a private
+        # key file; the value form is rejected by the verification engine.
+        self.assertIn(
             "CONTINUUM_VERIFICATION_ATTESTATION_KEY",
-            tap_pat_inventory.ALLOWED_SECRETS,
+            credential_matrix.ALLOWED_SECRETS,
+        )
+        body = read_workflow("continuum-opencode.yml")
+        self.assertIn(
+            'CONTINUUM_ATTESTATION_KEY_VALUE="${CONTINUUM_VERIFICATION_ATTESTATION_KEY:-}"',
+            body,
+        )
+        self.assertIn("unset CONTINUUM_VERIFICATION_ATTESTATION_KEY", body)
+        self.assertIn(
+            "python3 -m continuum.verification provision-key --repo \"$GITHUB_WORKSPACE\"",
+            body,
+        )
+        self.assertNotIn(
+            'CONTINUUM_VERIFICATION_ATTESTATION_KEY="$CONTINUUM_ATTESTATION_KEY_VALUE"',
+            body,
         )
 
     def test_allowlist_derives_from_the_credential_matrix(self):

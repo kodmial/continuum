@@ -44,11 +44,16 @@ The probe explicitly verifies:
 
 ## Layer 3 — live canary (scheduled)
 
-- The project-owned `contract-qualification.yml` caller in the Continuum
-  repository runs on a daily schedule (`23 5 * * *`) plus
-  `workflow_dispatch` with `mode: canary`. It is intentionally not installed
-  into consumers because its regression layer executes Continuum's own test
-  suite.
+- The project-owned `contract-qualification-canary.yml` entry in the Continuum
+  repository runs on a bounded schedule (`43 */6 * * *`) plus
+  `workflow_dispatch`. It is intentionally not installed into consumers because
+  its regression layer executes Continuum's own test suite.
+- The canary runs in a dedicated reusable-workflow job that holds issue and
+  action writes for bounded recovery; the pull-request qualification caller
+  stays verify-only so untrusted PR code never shares those permissions.
+- The canary observes the live task named by the `CONTINUUM_CANARY_ISSUE`
+  repository variable, derives its stage from real issue, run, and pull-request
+  state, and fails closed when the variable is absent.
 - The canary probe checks forward progress against bounded per-stage
   lifecycle deadlines (see `CANARY_STAGE_DEADLINES`).
 - A stage past its deadline records the exact canary/issue/PR/run IDs and

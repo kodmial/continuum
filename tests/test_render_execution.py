@@ -11,8 +11,11 @@ runtime/profile may explicitly re-arm the source.
 from __future__ import annotations
 
 import unittest
+from pathlib import Path
 
 from continuum import render_execution as engine
+
+ROOT = Path(__file__).resolve().parents[1]
 
 
 LIMIT_512 = 512 * 1024 * 1024
@@ -475,6 +478,39 @@ class RearmTests(unittest.TestCase):
         allowed, reason = engine.may_rearm_capacity_hold("abc123", "abc123")
         self.assertFalse(allowed)
         self.assertEqual(reason, "identical-fingerprint-coalesces")
+
+
+class RenderExecutorMarkerTrustTests(unittest.TestCase):
+    def test_render_executor_counts_only_github_actions_authored_markers(self):
+        workflow = (ROOT / ".github/workflows/continuum-render-executor.yml").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn('RENDER_AUTOMATION_AUTHOR="github-actions[bot]"', workflow)
+        self.assertIn(
+            'RENDER_AUTOMATION_ORIGIN="<!-- continuum-origin role=continuum component=render-executor -->"',
+            workflow,
+        )
+        trusted_author = 'select((.user.login // "") == $author)'
+        trusted_origin = 'select((.body // "") | contains($origin))'
+        self.assertGreaterEqual(workflow.count(trusted_author), 4)
+        self.assertGreaterEqual(workflow.count(trusted_origin), 4)
+        self.assertNotIn(
+            '[.[][]? | select((.body // "") | contains($marker))] | length',
+            workflow,
+            'the marker count must never run without the author and origin filters',
+        )
+
+    def test_render_executor_repair_issue_lookup_requires_bot_authorship_and_origin(self):
+        workflow = (ROOT / ".github/workflows/continuum-render-executor.yml").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn('select((.pull_request // null) == null)', workflow)
+        self.assertIn(
+            'select((.user.login // "") == $author)\n'
+            '                    | select((.body // "") | contains($origin))\n'
+            '                    | select((.body // "") | contains($marker)) | .number',
+            workflow,
+        )
 
 
 if __name__ == "__main__":

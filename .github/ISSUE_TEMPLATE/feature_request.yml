@@ -1,0 +1,58 @@
+name: Feature request
+description: Suggest a consumer-neutral improvement to Continuum.
+title: "[Feature]: "
+labels:
+  - enhancement
+  - automation:blocked
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Describe the problem first, then the change you want. Keep the proposal
+        consumer-neutral; Continuum does not carry product-specific code.
+
+        This form applies the `automation:blocked` admission hold. A maintainer
+        must explicitly admit the request before automatic implementation can
+        pick it up. Form labels are intake convenience, not scheduler policy:
+        maintainers and API users can still create blank issues.
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      description: Which layer would change?
+      options:
+        - Reusable workflow
+        - Caller template or installer
+        - Python engine
+        - Documentation
+        - Other
+    validations:
+      required: true
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem or use case
+      description: What cannot be done today, and who is affected? Explain the use case without naming a private consumer.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed behavior
+      description: Describe the change you would like to see and how it fits the existing caller/reusable boundaries.
+    validations:
+      required: true
+  - type: textarea
+    id: compatibility
+    attributes:
+      label: Compatibility and alternatives (optional)
+      description: Note any workflow name, input, default, secret, caller name, installer set, or CONTINUUM_* variable that would change, plus migration or alternatives you considered.
+    validations:
+      required: false
+  - type: checkboxes
+    id: confirmations
+    attributes:
+      label: Confirmations
+      options:
+        - label: I removed secrets, tokens, and consumer data from this request.
+          required: true

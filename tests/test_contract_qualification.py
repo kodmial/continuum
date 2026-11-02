@@ -14,7 +14,9 @@ Proves the three-layer merge-blocking contract deterministically:
 """
 
 import unittest
+from datetime import datetime, timezone
 
+from continuum import contract_observation as observation
 from continuum import contract_qualification as contract
 
 SHA_A = "a" * 40
@@ -200,6 +202,69 @@ class LifecycleLivenessTest(unittest.TestCase):
         ok, reason = contract.progress_events_cover_lifecycle({"worker": True})
         self.assertFalse(ok)
         self.assertIn("missing-stages", reason)
+
+
+class ReservationLifecycleProbeTest(unittest.TestCase):
+    """Layer 2 drives the real observation path through every phase."""
+
+    NOW = datetime(2030, 1, 1, tzinfo=timezone.utc)
+
+    def setUp(self):
+        self.issue = {
+            "number": 1,
+            "state": "open",
+            "labels": [{"name": contract.IN_PROGRESS_LABEL}],
+            "created_at": "2029-12-31T23:00:00Z",
+            "updated_at": "2029-12-31T23:59:00Z",
+        }
+        self.live_run = {
+            "databaseId": 9,
+            "status": "in_progress",
+            "created_at": "2029-12-31T23:59:00Z",
+            "head_branch": "opencode/issue1-fix",
+        }
+
+    def outcome(self, issue, runs=(), pulls=()):
+        return contract.evaluate_reservation_liveness(
+            observation.observe_reservation(issue, runs, pulls, now=self.NOW)
+        ).outcome
+
+    def test_create_release_expire_terminal_and_stranded_phases(self):
+        self.assertEqual(self.outcome(self.issue, [self.live_run]), "progress")
+        released = dict(self.issue, labels=[])
+        self.assertEqual(self.outcome(released, []), "progress")
+        expired = dict(self.live_run, created_at="2029-12-31T20:00:00Z")
+        self.assertEqual(self.outcome(self.issue, [expired]), "recover")
+        terminal = {
+            "databaseId": 10,
+            "status": "completed",
+            "conclusion": "failure",
+            "name": "OpenCode worker",
+            "created_at": "2029-12-31T23:59:00Z",
+            "head_branch": "opencode/issue1-fix",
+        }
+        self.assertEqual(self.outcome(self.issue, [terminal]), "recover")
+        self.assertEqual(self.outcome(self.issue, []), "error")
+
+    def test_merged_pr_never_holds_the_reservation(self):
+        merged = {
+            "number": 5,
+            "state": "closed",
+            "merged_at": "2029-12-31T23:59:00Z",
+            "body": "Closes #1",
+        }
+        self.assertEqual(self.outcome(self.issue, [], [merged]), "error")
+
+    def test_probe_covers_the_whole_lifecycle(self):
+        stages = contract.lifecycle_path_stages()
+        self.assertTrue(
+            contract.progress_events_cover_lifecycle(
+                {stage: True for stage in stages}
+            )[0]
+        )
+        self.assertFalse(
+            contract.progress_events_cover_lifecycle({stages[0]: True})[0]
+        )
 
 
 class LiveCanaryTest(unittest.TestCase):

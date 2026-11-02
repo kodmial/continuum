@@ -89,7 +89,7 @@ MUTATION_COUNTS = {
     "continuum-pr-agent-recovery.yml": 4,
     "continuum-pr-agent-repair.yml": 6,
     "continuum-pr-agent.yml": 3,
-    "continuum-render-executor.yml": 17,
+    "continuum-render-executor.yml": 18,  # fail-closed incomplete bounded scan
 }
 
 #: (role, component) pairs each workflow's comment bodies must use.
@@ -239,6 +239,7 @@ FUNCTIONAL_ANCHORS = {
         "continuum-render-transient-attempt",
         "Render transient infrastructure failures repeated",
         "repository failure fingerprint repeated",
+        "bounded open-issue scan did not complete",
         "continuum-render-repair-attempt",
         "already open, so no duplicate repair",
         "Automatic recovery limit",

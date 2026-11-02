@@ -1,0 +1,28 @@
+name: Swift CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  actions: write
+  contents: read
+  pull-requests: read
+  statuses: write
+
+concurrency:
+  group: continuum-tech-swift-ci-${{ github.repository }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref || github.run_id }}
+  cancel-in-progress: true
+
+jobs:
+  call:
+    uses: kodmial/continuum/.github/workflows/continuum-tech-swift-ci.yml@main
+    with:
+      continuum_ref: main
+      # A fork pull request receives a read-only GITHUB_TOKEN. Disable the
+      # status and repair writes for that run so validation still executes;
+      # same-repository runs keep the repository-variable defaults.
+      publish_status: ${{ github.event.pull_request.head.repo.fork && 'false' || '' }}
+      dispatch_repair: ${{ github.event.pull_request.head.repo.fork && 'false' || '' }}
