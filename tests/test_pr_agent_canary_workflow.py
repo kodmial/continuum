@@ -125,16 +125,35 @@ class ExecutableCanaryContractTests(unittest.TestCase):
             "const prAgentRuns = async (pullNumber, headSha)", body,
             "the final evidence pass must use a defined bounded lookup",
         )
-        self.assertIn("const prAgentRunNames = new Set([", body)
+        self.assertIn("await prAgentRuns(prNumber, cleanHead)", body)
+
+    def test_run_lookup_accepts_the_router_and_legacy_workflow_names(self):
+        body = WORKFLOW.read_text(encoding="utf-8")
+        router_name = name_of(ROOT / ".github" / "workflows" / "pr-agent.yml")
+        self.assertEqual("PR Agent (OpenCode-backed)", router_name)
+        self.assertIn(f"'{router_name}'", body)
         self.assertIn("'PR Agent (OpenCode backend)'", body)
-        self.assertIn("'PR Agent (OpenCode-backed)'", body)
+        self.assertIn("const prAgentRunNames = new Set([", body)
         self.assertIn("prAgentRunNames.has(run.name)", body)
         self.assertIn("prAgentRunNames.has(candidate.name)", body)
-        clean_wait = body.index("const clean = await waitFor")
-        final_runs = body.index("await prAgentRuns(prNumber, cleanHead)")
-        evidence = body.index("const evidence = {")
-        self.assertGreater(final_runs, clean_wait)
-        self.assertLess(final_runs, evidence)
+        self.assertNotIn(
+            "run.name === 'PR Agent (OpenCode backend)'", body,
+            "a single legacy name misses the router-installed workflow",
+        )
+
+    def test_evidence_pass_runs_after_clean_head_approval(self):
+        body = WORKFLOW.read_text(encoding="utf-8")
+        approval = body.index("what: 'the clean-HEAD approval'")
+        evidence = body.index("for (const run of (await prAgentRuns(prNumber, cleanHead))")
+        record = body.index("const evidence = {")
+        self.assertLess(
+            approval, evidence,
+            "the evidence pass must observe the run that produced the approval",
+        )
+        self.assertLess(
+            evidence, record,
+            "the evidence bundle must be recorded after the run-ID pass",
+        )
 
     def test_cleanup_and_evidence(self):
         body = WORKFLOW.read_text(encoding="utf-8")

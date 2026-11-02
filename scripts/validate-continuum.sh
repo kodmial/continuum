@@ -56,6 +56,9 @@ except subprocess.CalledProcessError as error:
         "fetch the full history (actions/checkout fetch-depth: 0)"
         + (f": {error.stderr.strip()}" if error.stderr else "")
     )
+# Diff the merge base against the working tree, not HEAD: validation runs on
+# uncommitted changes too, and a HEAD-only diff would silently measure the
+# committed engine instead of the code coverage actually executed below.
 diff = subprocess.check_output(
     ["git", "diff", "-U0", merge_base, "--", "src"], text=True
 )

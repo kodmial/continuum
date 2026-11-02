@@ -60,12 +60,21 @@ class SchedulerWorkflowPayloadTests(unittest.TestCase):
                     self.assertIn(f'fromJSON(\'"/{token}\\r\\n"\')', body)
 
     def test_child_worker_and_review_concurrency_groups_are_disjoint(self):
-        worker = CHILD_WORKER.read_text(encoding="utf-8")
-        review = CHILD_REVIEW.read_text(encoding="utf-8")
-        pr_review = CHILD_PR_REVIEW.read_text(encoding="utf-8")
-        self.assertIn("group: continuum-child-worker-", worker)
-        self.assertIn("group: continuum-subtask-review-", review)
-        self.assertIn("group: continuum-subtask-pr-review-", pr_review)
+        prefixes = {
+            CHILD_WORKER: "continuum-worker-",
+            CHILD_REVIEW: "continuum-review-",
+            CHILD_PR_REVIEW: "continuum-pr-review-",
+        }
+        for path, prefix in prefixes.items():
+            with self.subTest(path=path.name):
+                self.assertIn(f"group: {prefix}", path.read_text(encoding="utf-8"))
+        for prefix in prefixes.values():
+            for other in prefixes.values():
+                if prefix != other:
+                    self.assertFalse(
+                        prefix.startswith(other),
+                        f"{prefix!r} collides with {other!r}",
+                    )
 
     def test_extracted_scheduler_is_valid_node_source(self):
         node = shutil.which("node")

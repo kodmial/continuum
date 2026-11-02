@@ -485,20 +485,33 @@ class RenderExecutorMarkerTrustTests(unittest.TestCase):
         workflow = (ROOT / ".github/workflows/continuum-render-executor.yml").read_text(
             encoding="utf-8"
         )
-        trusted_author = 'select((.user.login // "") == "github-actions[bot]")'
+        self.assertIn('RENDER_AUTOMATION_AUTHOR="github-actions[bot]"', workflow)
+        self.assertIn(
+            'RENDER_AUTOMATION_ORIGIN="<!-- continuum-origin role=continuum component=render-executor -->"',
+            workflow,
+        )
+        trusted_author = 'select((.user.login // "") == $author)'
+        trusted_origin = 'select((.body // "") | contains($origin))'
         self.assertGreaterEqual(workflow.count(trusted_author), 4)
+        self.assertGreaterEqual(workflow.count(trusted_origin), 4)
         self.assertNotIn(
-            '[.[][]? | select((.body // "") | contains($marker))] | length', workflow
+            '[.[][]? | select((.body // "") | contains($marker))] | length',
+            workflow,
+            'the marker count must never run without the author and origin filters',
         )
 
-    def test_render_executor_repair_issue_lookup_requires_bot_authorship(self):
+    def test_render_executor_repair_issue_lookup_requires_bot_authorship_and_origin(self):
         workflow = (ROOT / ".github/workflows/continuum-render-executor.yml").read_text(
             encoding="utf-8"
         )
+        self.assertIn('select((.pull_request // null) == null)', workflow)
         self.assertIn(
-            'select((.user.login // "") == "github-actions[bot]") | select((.body // "") | contains($marker)) | .number',
+            'select((.user.login // "") == $author)\n'
+            '                    | select((.body // "") | contains($origin))\n'
+            '                    | select((.body // "") | contains($marker)) | .number',
             workflow,
         )
+
 
 if __name__ == "__main__":
     unittest.main()

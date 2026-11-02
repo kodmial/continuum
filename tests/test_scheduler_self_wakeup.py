@@ -369,6 +369,26 @@ class ActualSchedulerConditionTests(unittest.TestCase):
                 False,
             ),
             (
+                "manual /oc after a leading blank line",
+                event_context("issue_comment", comment=comment("\n/oc")),
+                True,
+            ),
+            (
+                "manual /oc with two leading spaces",
+                event_context("issue_comment", comment=comment("  /oc")),
+                True,
+            ),
+            (
+                "manual /oc followed by a tab",
+                event_context("issue_comment", comment=comment("/oc\t")),
+                True,
+            ),
+            (
+                "manual /oc followed by CRLF",
+                event_context("issue_comment", comment=comment("/oc\r\n")),
+                True,
+            ),
+            (
                 "lookalike command /ocfoo",
                 event_context(
                     "issue_comment", comment=comment("/ocfoo please")
@@ -537,6 +557,26 @@ class ActualSchedulerConditionTests(unittest.TestCase):
                 False,
             ),
             (
+                "manual /oc after a leading blank line",
+                event_context("issue_comment", comment=comment("\n/oc")),
+                True,
+            ),
+            (
+                "manual /oc with two leading spaces",
+                event_context("issue_comment", comment=comment("  /oc")),
+                True,
+            ),
+            (
+                "manual /oc followed by a tab",
+                event_context("issue_comment", comment=comment("/oc\t")),
+                True,
+            ),
+            (
+                "manual /oc followed by CRLF",
+                event_context("issue_comment", comment=comment("/oc\r\n")),
+                True,
+            ),
+            (
                 "lookalike command /ocfoo",
                 event_context(
                     "issue_comment", comment=comment("/ocfoo please")
@@ -698,29 +738,17 @@ class InstallUpgradeTests(unittest.TestCase):
             self.assertEqual(0, status, output)
 
             canonical = CONSUMER_SCHEDULER.read_text(encoding="utf-8")
-            old_body = canonical.replace(
-                """       (github.actor == github.repository_owner &&
-        (github.event.comment.body == '/oc' ||
-         github.event.comment.body == '/opencode' ||
-         startsWith(github.event.comment.body, '/oc ') ||
-         startsWith(github.event.comment.body, '/opencode ') ||
-         startsWith(github.event.comment.body, fromJSON('"/oc\\t"')) ||
-         startsWith(github.event.comment.body, fromJSON('"/opencode\\t"')) ||
-         startsWith(github.event.comment.body, fromJSON('"/oc\\r\\n"')) ||
-         startsWith(github.event.comment.body, fromJSON('"/opencode\\r\\n"')) ||
-         startsWith(github.event.comment.body, fromJSON('"/oc\\n"')) ||
-         startsWith(github.event.comment.body, fromJSON('"/opencode\\n"'))) &&
-        !contains(github.event.comment.body, '<!-- issue-scheduler-dispatch -->') &&
-        !contains(github.event.comment.body, '<!-- continuum-origin role=continuum component=opencode-watchdog -->')) ||
-""",
-                """       (github.actor == github.repository_owner &&
-        (github.event.comment.body == '/oc' ||
-         github.event.comment.body == '/opencode' ||
-         startsWith(github.event.comment.body, '/oc ') ||
-         startsWith(github.event.comment.body, '/opencode ') ||
-         startsWith(github.event.comment.body, fromJSON('"/oc\\n"')) ||
-         startsWith(github.event.comment.body, fromJSON('"/opencode\\n"')))) ||
-""",
+            # Drop only the machine-origin suppression clauses to simulate the
+            # pre-upgrade caller; the command prefilter itself is shared so the
+            # replay cannot drift from the real stub.
+            marker_clauses = (
+                " &&\n"
+                "        !contains(github.event.comment.body, '<!-- issue-scheduler-dispatch -->') &&\n"
+                "        !contains(github.event.comment.body, '<!-- continuum-origin role=continuum component=opencode-watchdog -->')"
+            )
+            old_body = canonical.replace(marker_clauses, "")
+            self.assertNotEqual(
+                canonical, old_body, "the simulated caller must differ in the condition"
             )
             old_document = yaml.safe_load(old_body)
             new_document = yaml.safe_load(canonical)

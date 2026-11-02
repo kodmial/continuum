@@ -1187,7 +1187,9 @@ jobs:
             // matching fixed indentation with regular expressions, this parses the YAML
             // subset a workflow file uses: block mappings at any indentation, flow maps
             // and lists, quoted scalars, comments, CRLF, folded/literal block scalars,
-            // and block sequences (skipped because they never carry dispatch metadata).
+            // block sequences (parsed as lists so an `on:` sequence works; their nested
+            // continuation lines never read as mapping siblings), and the document
+            // marker rules GitHub applies (exactly one document).
             // The embedded copies in the controller workflows are generated from this
             // file by scripts/embed_workflow_dispatch_contract.py; tests fail if they
             // drift.
@@ -1418,6 +1420,8 @@ jobs:
                 const document = Object.create(null);
                 const stack = [{ indent: -1, value: document, kind: 'map' }];
                 const lines = source.split('\n');
+                let sawContent = false;
+                let documentEnded = false;
                 for (let lineIndex = 0; lineIndex < lines.length; lineIndex += 1) {
                   const raw = lines[lineIndex];
                   if (raw.trim() === '') continue;
@@ -1429,16 +1433,71 @@ jobs:
                   const indent = indentText.length;
                   const content = raw.slice(indent);
                   if (content.startsWith('#')) continue;
-                  if (/^(---|\.\.\.)(?:\s|$)/.test(content)) continue;
+                  // GitHub rejects multi-document workflow files, so content after a
+                  // document-end marker or a second document-start marker is invalid even
+                  // when a later document would declare workflow_dispatch.
+                  const documentStart = /^---(?:\s|$)/.test(content);
+                  const documentEnd = /^\.\.\.(?:\s|$)/.test(content);
+                  if ((documentStart || documentEnd) && indent === 0) {
+                    if (documentEnd) {
+                      if (documentEnded) {
+                        throw new Error(`line ${lineNumber}: duplicate document end`);
+                      }
+                      documentEnded = true;
+                      continue;
+                    }
+                    if (sawContent || documentEnded) {
+                      throw new Error(
+                        `line ${lineNumber}: multi-document YAML is not allowed`
+                      );
+                    }
+                    continue;
+                  }
+                  if (documentEnded) {
+                    throw new Error(
+                      `line ${lineNumber}: multi-document YAML is not allowed ` +
+                      `(content after the document end)`
+                    );
+                  }
+                  sawContent = true;
+                  const item = content === '-' || content.startsWith('- ');
+                  if (item) {
+                    // A block sequence may sit at its key's indentation or deeper. The
+                    // placeholder created for the empty value is still empty, so turn it
+                    // into an array before the generic unwind pops it.
+                    const current = stack[stack.length - 1];
+                    if (current && current.kind === 'map' && current.parentMap &&
+                        Object.keys(current.value).length === 0 &&
+                        indent >= current.indent) {
+                      const values = [];
+                      current.parentMap[current.key] = values;
+                      current.kind = 'seq';
+                      current.value = values;
+                      // Items define the sequence's own indentation; a key may introduce
+                      // a sequence either at its indentation or one level deeper.
+                      current.indent = indent;
+                    }
+                  }
                   while (stack.length > 1 &&
                          indent <= stack[stack.length - 1].indent) {
+                    const top = stack[stack.length - 1];
+                    if (item && top.kind === 'seq' && indent === top.indent) break;
                     stack.pop();
                   }
                   const parent = stack[stack.length - 1];
-                  // Block sequence items never carry the workflow_dispatch input metadata
-                  // this gate reads (options, labels). Their nested key/value pairs are
-                  // not part of the mapping contract.
-                  if (content === '-' || content.startsWith('- ')) continue;
+                  if (parent && parent.kind === 'seq') {
+                    // Only an item at the sequence's own indentation is a new element.
+                    // Continuation lines belong to the current item; tracking them as
+                    // mapping siblings would invent duplicate keys in valid workflows
+                    // such as strategy.matrix.include or repeated step `with:` blocks.
+                    if (!item || indent !== parent.indent) continue;
+                    const itemText = content === '-' ? '' : content.slice(2).trim();
+                    parent.value.push(
+                      itemText === '' ? null : parseValueText(itemText, lineNumber)
+                    );
+                    continue;
+                  }
+                  if (item) continue;
                   if (!parent || parent.kind !== 'map') continue;
                   const entry = splitMapping(content, lineNumber);
                   const key = unquote(entry.key);
@@ -1463,7 +1522,13 @@ jobs:
                   if (valueText === '') {
                     const child = Object.create(null);
                     parent.value[key] = child;
-                    stack.push({ indent, value: child, kind: 'map' });
+                    stack.push({
+                      indent,
+                      value: child,
+                      kind: 'map',
+                      parentMap: parent.value,
+                      key,
+                    });
                     continue;
                   }
                   parent.value[key] = parseValueText(valueText, lineNumber);

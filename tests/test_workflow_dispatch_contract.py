@@ -332,6 +332,99 @@ permissions: {}
         )
         self.assertTrue(result["optional"]["ok"], result["optional"])
 
+    def test_block_sequence_continuations_do_not_create_duplicate_keys(self):
+        text = """on:
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        type: string
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            with:
+              cache: enabled
+          - os: macos-latest
+            with:
+              cache: disabled
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+permissions: {}
+"""
+        result = self.parse(
+            [{"name": "sequences", "text": text, "requiredInputs": ["pr_number"]}]
+        )
+        self.assertTrue(result["sequences"]["ok"], result["sequences"])
+
+    def test_accepts_on_as_a_block_sequence(self):
+        text = """on:
+  - push
+  - workflow_dispatch
+permissions: {}
+"""
+        result = self.parse(
+            [
+                {"name": "sequence", "text": text, "requiredInputs": []},
+                {
+                    "name": "missing-input",
+                    "text": text,
+                    "requiredInputs": ["pr_number"],
+                },
+            ]
+        )
+        self.assertTrue(result["sequence"]["ok"], result["sequence"])
+        self.assertFalse(result["missing-input"]["ok"])
+        self.assertIn(
+            "required input(s): pr_number", result["missing-input"]["reason"]
+        )
+
+    def test_rejects_multi_document_yaml(self):
+        first = """on:
+  workflow_dispatch:
+permissions: {}
+---
+on:
+  workflow_dispatch:
+permissions: {}
+"""
+        no_trigger = """permissions: {}
+---
+on:
+  workflow_dispatch:
+permissions: {}
+"""
+        explicit_end = """on:
+  workflow_dispatch:
+permissions: {}
+...
+on:
+  workflow_dispatch:
+"""
+        single_with_end = """on:
+  workflow_dispatch:
+permissions: {}
+...
+"""
+        result = self.parse(
+            [
+                {"name": "two-documents", "text": first},
+                {"name": "trigger-in-second", "text": no_trigger},
+                {"name": "content-after-end", "text": explicit_end},
+                {"name": "single-document", "text": single_with_end},
+            ]
+        )
+        for name in ("two-documents", "trigger-in-second", "content-after-end"):
+            self.assertFalse(result[name]["ok"], result[name])
+            self.assertIn("multi-document", result[name]["reason"])
+        self.assertTrue(result["single-document"]["ok"], result["single-document"])
+
     def test_rejects_a_non_boolean_required_marker(self):
         text = """on:
   workflow_dispatch:

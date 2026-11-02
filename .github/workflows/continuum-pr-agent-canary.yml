@@ -372,9 +372,12 @@ jobs:
               const before = new Set(baseline.data.workflow_runs.map((run) => run.id));
               const runTitlePrefix = `PR-Agent PR #${prNumber} [review:`;
               const runTitleSuffix = `head=${head}`;
+              // The router-installed workflow is `PR Agent (OpenCode-backed)`;
+              // accept the legacy `PR Agent (OpenCode backend)` spelling too so
+              // the canary does not wait out the timeout on an older consumer.
               const prAgentRunNames = new Set([
-                'PR Agent (OpenCode backend)',
                 'PR Agent (OpenCode-backed)',
+                'PR Agent (OpenCode backend)',
               ]);
               // List every attributed run inside the bounded dispatch window.
               // The final evidence pass uses this, while the review wait
@@ -561,6 +564,7 @@ jobs:
               if (verifyVerdict !== 'RESOLVED') {
                 throw new Error(`post-fix verification did not resolve finding ${findingId}: ${verifyVerdict}`);
               }
+
               // Clean-HEAD proof: one more owner /review must approve the
               // exact current HEAD with no blocking findings left.
               const cleanComment = await github.rest.issues.createComment({
@@ -593,9 +597,10 @@ jobs:
               finalOutcome = 'APPROVED';
               core.setOutput('final_outcome', finalOutcome);
               void clean;
-              // Include the run that approved the exact clean HEAD in the final evidence.
-              for (const run of (await prAgentRuns(prNumber, cleanHead))
-                .filter((run) => !workflowRunIds.includes(String(run.id)))) {
+
+              // Evidence is captured only after the clean-HEAD approval, so the
+              // bundle includes the run that produced the approving review.
+              for (const run of (await prAgentRuns(prNumber, cleanHead)).filter((run) => !workflowRunIds.includes(String(run.id)))) {
                 workflowRunIds.push(String(run.id));
               }
 

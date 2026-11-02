@@ -509,25 +509,45 @@ jobs:
           # Bounded slurp-compatible page walk: keeps the array-of-pages
           # shape callers already parse with `.[][]?`, capped at
           # CONTINUUM_MAX_PAGES instead of full-history pagination.
+          # Fail closed: a fetch/parse gap or a full last allowed page (which
+          # may hide more results) returns failure, so callers never treat a
+          # partial scan as authoritative.
           continuum_bounded_slurp() {
-            local url="$1" page=1 pages_out="" sep="?"
+            local url="$1" page=1 pages_out="" sep="?" complete=0
             [[ "$url" == *"?"* ]] && sep="&"
             while [[ "$page" -le "$CONTINUUM_MAX_PAGES" ]]; do
               local page_json count
               if ! page_json="$(continuum_api_get "${url}${sep}per_page=100&page=${page}" 2>/dev/null)"; then
+                echo "::error::Bounded scan page ${page} could not be retrieved; failing closed." >&2
+                return 1
+              fi
+              if ! count="$(jq 'length' <<<"$page_json" 2>/dev/null)"; then
+                echo "::error::Bounded scan page ${page} could not be parsed; failing closed." >&2
+                return 1
+              fi
+              [[ "$count" =~ ^[0-9]+$ ]] || {
+                echo "::error::Bounded scan page ${page} could not be parsed; failing closed." >&2
+                return 1
+              }
+              if [[ "$count" -eq 0 ]]; then
+                complete=1
                 break
               fi
-              count="$(jq 'length' <<<"$page_json" 2>/dev/null || echo 0)"
-              [[ "$count" =~ ^[0-9]+$ ]] || break
-              [[ "$count" -gt 0 ]] || break
               pages_out+="$page_json"$'\n'
-              [[ "$count" -lt 100 ]] && break
+              if [[ "$count" -lt 100 ]]; then
+                complete=1
+                break
+              fi
               page=$((page + 1))
             done
+            if [[ "$complete" -ne 1 ]]; then
+              echo "::error::Bounded scan reached the page limit with a full page; failing closed." >&2
+              return 1
+            fi
             if [[ -z "$pages_out" ]]; then
               echo "[]"
             else
-              jq -s '.' <<<"$(grep -v '^$' <<<"$pages_out" || true)"
+              jq -s '.' <<<"$pages_out" || return 1
             fi
           }
 
@@ -658,6 +678,14 @@ jobs:
           ENGINE_FINGERPRINT="${ENGINE_FINGERPRINT:-}"
           ENGINE_REASON="${ENGINE_REASON:-no engine reason recorded}"
 
+          # State markers are trusted only when this automation wrote them:
+          # every comment and issue below is authored through github.token as
+          # github-actions[bot] and carries the render-executor origin marker.
+          # Matching body text alone would let a user copy a marker into their
+          # own comment or issue and fabricate a budget or deduplication state.
+          RENDER_AUTOMATION_AUTHOR="github-actions[bot]"
+          RENDER_AUTOMATION_ORIGIN="<!-- continuum-origin role=continuum component=render-executor -->"
+
           # Bounded comment scan (#254): newest-first window keeping the
           # array-of-pages shape the fingerprint helpers parse with
           # `.[][]?`, capped at CONTINUUM_MAX_PAGES instead of full-history
@@ -677,8 +705,12 @@ jobs:
             local marker="$1"
             local count
             count="$(jq --arg marker "$marker" \
-              '[.[][]? | select((.user.login // "") == "github-actions[bot]") | select((.body // "") | contains($marker))] | length' \
-              <<<"$COMMENTS_JSON" 2>/dev/null || echo 0)"
+              --arg author "$RENDER_AUTOMATION_AUTHOR" \
+              --arg origin "$RENDER_AUTOMATION_ORIGIN" \
+              '[.[][]? | select((.user.login // "") == $author)
+                | select((.body // "") | contains($origin))
+                | select((.body // "") | contains($marker))] | length' \
+              <<<"$COMMENTS_JSON" 2>/dev/null || echo 1)"
             [[ "${count:-0}" -ge 1 ]]
           }
 
@@ -740,7 +772,11 @@ jobs:
               if [[ "$COMMENTS_UNKNOWN" -eq 1 ]]; then
                 TRANSIENT_COUNT="$MAX_RENDER_REPAIR_ATTEMPTS"
               else
-                TRANSIENT_COUNT="$(jq '[.[][]? | select((.user.login // "") == "github-actions[bot]") | select((.body // "") | contains("<!-- continuum-render-transient-attempt -->"))] | length' \
+                TRANSIENT_COUNT="$(jq --arg author "$RENDER_AUTOMATION_AUTHOR" \
+                  --arg origin "$RENDER_AUTOMATION_ORIGIN" \
+                  '[.[][]? | select((.user.login // "") == $author)
+                    | select((.body // "") | contains($origin))
+                    | select((.body // "") | contains("<!-- continuum-render-transient-attempt -->"))] | length' \
                   <<<"$COMMENTS_JSON" 2>/dev/null || echo "$MAX_RENDER_REPAIR_ATTEMPTS")"
               fi
               if [[ "${TRANSIENT_COUNT:-0}" -ge "$MAX_RENDER_REPAIR_ATTEMPTS" ]]; then
@@ -782,7 +818,11 @@ jobs:
               if [[ "$COMMENTS_UNKNOWN" -eq 1 ]]; then
                 REPAIR_COUNT="$MAX_RENDER_REPAIR_ATTEMPTS"
               else
-                REPAIR_COUNT="$(jq '[.[][]? | select((.user.login // "") == "github-actions[bot]") | select((.body // "") | contains("<!-- continuum-render-repair-attempt -->"))] | length' \
+                REPAIR_COUNT="$(jq --arg author "$RENDER_AUTOMATION_AUTHOR" \
+                  --arg origin "$RENDER_AUTOMATION_ORIGIN" \
+                  '[.[][]? | select((.user.login // "") == $author)
+                    | select((.body // "") | contains($origin))
+                    | select((.body // "") | contains("<!-- continuum-render-repair-attempt -->"))] | length' \
                   <<<"$COMMENTS_JSON" 2>/dev/null || echo "$MAX_RENDER_REPAIR_ATTEMPTS")"
               fi
               if [[ "${REPAIR_COUNT:-0}" -lt "$MAX_RENDER_REPAIR_ATTEMPTS" ]]; then
@@ -793,9 +833,23 @@ jobs:
                 # issue ordering keeps the oldest-first pages, which would
                 # miss a recent repair beyond the first ~500 open issues.
                 ALL_ISSUES_JSON="$(continuum_bounded_slurp \
-                  "repos/$GITHUB_REPOSITORY/issues?state=open&sort=created&direction=desc" 2>/dev/null || echo "[]")"
+                  "repos/$GITHUB_REPOSITORY/issues?state=open&sort=created&direction=desc")" || {
+                  if ! gh issue edit "$ISSUE_NUMBER" --repo "$GITHUB_REPOSITORY" \
+                    --add-label "$PAUSE_LABEL" >/dev/null 2>&1; then
+                    echo "::warning::Could not add the pause label while failing closed." >&2
+                  fi
+                  gh issue comment "$ISSUE_NUMBER" --repo "$GITHUB_REPOSITORY" \
+                      --body "$(printf '%s\n%s\n%s' '⚡ **Continuum · render-executor**' '<!-- continuum-origin role=continuum component=render-executor -->' "Render execution failed in run $GITHUB_RUN_ID, but the bounded open-issue scan did not complete. Failing closed: the source is held paused and no repository repair was created.")"
+                  echo "::error::Bounded open-issue scan did not complete; failing closed without repair"
+                  exit 1
+                }
                 EXISTING_REPAIR="$(jq -r --arg marker "$SOURCE_MARKER" \
-                  '.[][]? | select((.user.login // "") == "github-actions[bot]") | select((.body // "") | contains($marker)) | .number' \
+                  --arg author "$RENDER_AUTOMATION_AUTHOR" \
+                  --arg origin "$RENDER_AUTOMATION_ORIGIN" \
+                  '.[][]? | select((.pull_request // null) == null)
+                    | select((.user.login // "") == $author)
+                    | select((.body // "") | contains($origin))
+                    | select((.body // "") | contains($marker)) | .number' \
                   <<<"$ALL_ISSUES_JSON" | head -n 1)"
 
                 if [[ -z "$EXISTING_REPAIR" ]]; then
@@ -803,6 +857,7 @@ jobs:
           $SOURCE_MARKER
           <!-- continuum-render-failed-run=$GITHUB_RUN_ID -->
           <!-- continuum-render-failure-classification=$ENGINE_CLASSIFICATION -->
+          $RENDER_AUTOMATION_ORIGIN
 
           ## Goal
 

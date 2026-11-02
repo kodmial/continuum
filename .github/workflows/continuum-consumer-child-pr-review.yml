@@ -45,7 +45,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     concurrency:
-      group: continuum-subtask-pr-review-${{ inputs.child_id }}-${{ inputs.pr_number }}
+      group: continuum-pr-review-${{ inputs.child_id }}-${{ inputs.pr_number }}
       cancel-in-progress: false
     env:
       GH_TOKEN: ${{ secrets.CHILD_RUNTIME_TOKEN }}

@@ -1,6 +1,8 @@
 import pathlib
 import unittest
 
+import yaml
+
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 CI = ROOT / ".github/workflows/ci.yml"
@@ -44,6 +46,64 @@ class ValidationEntrypointContractTest(unittest.TestCase):
                         f"{name} duplicates validation command {command!r}",
                     )
 
+    def test_entrypoint_is_wired_through_steps_and_calls(self):
+        def load(path):
+            return yaml.safe_load(path.read_text(encoding="utf-8"))
+
+        for path, job_name in ((CI, "validate"), (GATE, "contract")):
+            with self.subTest(workflow=str(path)):
+                job = load(path)["jobs"][job_name]
+                self.assertEqual(
+                    ENTRYPOINT,
+                    job["with"]["validation_command"],
+                    "the caller must pass the canonical entrypoint to the reusable workflow",
+                )
+                self.assertTrue(
+                    job["uses"].endswith(
+                        "/.github/workflows/continuum-validation.yml"
+                    )
+                )
+
+        qualification = load(QUALIFICATION)
+        steps = [
+            step
+            for job in qualification["jobs"].values()
+            for step in job.get("steps", [])
+        ]
+        executing = [step for step in steps if ENTRYPOINT in (step.get("run") or "")]
+        self.assertEqual(1, len(executing), "qualification must run the entrypoint once")
+        self.assertIn("set -euo pipefail", executing[0]["run"])
+        self.assertNotEqual(True, executing[0].get("continue-on-error"))
+        self.assertNotIn("if", executing[0], "the entrypoint step must not be skipped")
+
+        validation = load(ROOT / ".github/workflows/continuum-validation.yml")
+        trigger = validation.get(True) or validation.get("on")
+        inputs = trigger["workflow_call"]["inputs"]
+        self.assertIn("validation_command", inputs)
+        hook_steps = [
+            step
+            for job in validation["jobs"].values()
+            for step in job.get("steps", [])
+            if 'run_hook validation "$VALIDATION_COMMAND"' in (step.get("run") or "")
+        ]
+        self.assertEqual(1, len(hook_steps), "the reusable workflow must run the command")
+        self.assertIn('eval "$command"', hook_steps[0]["run"])
+        self.assertIn("set -euo pipefail", hook_steps[0]["run"])
+        self.assertNotEqual(True, hook_steps[0].get("continue-on-error"))
+
+    def test_coverage_gate_measures_uncommitted_engine_changes(self):
+        body = VALIDATE.read_text(encoding="utf-8")
+        self.assertIn(
+            '["git", "diff", "-U0", merge_base, "--", "src"]',
+            body,
+            "the coverage gate must diff the working tree, not only HEAD",
+        )
+        self.assertNotIn(
+            '["git", "diff", "-U0", merge_base, "HEAD", "--", "src"]',
+            body,
+            "a HEAD-only diff silently ignores uncommitted engine changes",
+        )
+
     def test_actionlint_installer_is_pinned_and_checksum_verified(self):
         body = VALIDATE.read_text(encoding="utf-8")
         self.assertIn(ACTIONLINT_INSTALLER_COMMIT, body)
@@ -73,8 +133,6 @@ class ValidationEntrypointContractTest(unittest.TestCase):
             body,
         )
         self.assertIn("coverage.py is required for the changed-line gate", body)
-        self.assertIn('["git", "diff", "-U0", merge_base, "--", "src"]', body)
-        self.assertNotIn('merge_base, "HEAD", "--", "src"', body)
 
         workflow = (ROOT / ".github/workflows/continuum-validation.yml").read_text(
             encoding="utf-8"

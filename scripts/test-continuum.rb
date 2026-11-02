@@ -5078,6 +5078,69 @@ class ContinuumTest < Minitest::Test
     assert_includes body, 'Mandatory Render cleanup failed'
   end
 
+  # A bounded scan that silently returns a partial page set makes repair
+  # deduplication fail open. The helper must report failure for a fetch gap
+  # and for a full last allowed page, and the repository branch must stop
+  # instead of treating that result as "no repair exists".
+  def test_render_executor_bounded_scan_fails_closed
+    body = render_body
+    slurp = body[/^          continuum_bounded_slurp\(\) \{\n.*?^          \}\n/m]
+    refute_nil slurp, 'continuum_bounded_slurp is missing'
+    assert_includes slurp, 'complete=1'
+    assert_includes slurp, 'Bounded scan reached the page limit with a full page'
+    assert_includes slurp, 'return 1'
+
+    assert_includes body, 'Bounded open-issue scan did not complete; failing closed without repair'
+    refute_match(/state=open&sort=created&direction=desc" 2>\/dev\/null \|\| echo "\[\]"/, body,
+                 'the repair scan must not swallow a bounded-scan failure')
+
+    script = <<~BASH
+      set -euo pipefail
+      CONTINUUM_MAX_PAGES=2
+      continuum_api_get() {
+        case "$MODE" in
+          fetch-fail) return 22 ;;
+          parse-fail) echo 'not-json'; return 0 ;;
+          full) jq -n '[range(100)]' ;;
+          ok) [[ "$1" == *page=1 ]] && jq -n '[range(2)]' || jq -n '[]' ;;
+        esac
+      }
+      #{slurp}
+      if continuum_bounded_slurp "repos/o/r/issues?state=open"; then
+        echo complete
+      else
+        echo incomplete
+      fi
+    BASH
+    {
+      'fetch-fail' => 'incomplete',
+      'parse-fail' => 'incomplete',
+      'full' => 'incomplete',
+      'ok' => 'complete',
+    }.each do |mode, expected|
+      output, status = Open3.capture2e({ 'MODE' => mode }, 'bash', '-c', script)
+      assert status.success?, "#{mode}: harness failed: #{output}"
+      assert_includes output, expected, "#{mode}: wrong completeness verdict"
+    end
+  end
+
+  # Marker text alone is untrusted: a user can paste it. Only comments and
+  # issues authored by this automation with the render-executor origin marker
+  # may count as fingerprint, transient, repair-budget, or duplicate-repair
+  # state.
+  def test_render_executor_trusts_only_its_own_authored_markers
+    body = render_body
+    assert_includes body, 'RENDER_AUTOMATION_AUTHOR="github-actions[bot]"'
+    assert_includes body, 'RENDER_AUTOMATION_ORIGIN="<!-- continuum-origin role=continuum component=render-executor -->"'
+    assert_operator body.scan('select((.user.login // "") == $author)').size, :>=, 4,
+                    'every marker count must require the automation author'
+    assert_operator body.scan('select((.body // "") | contains($origin))').size, :>=, 4,
+                    'every marker count must require the render-executor origin'
+    assert_includes body, 'select((.pull_request // null) == null)',
+                    'the open-repair lookup must not match pull requests'
+    assert_includes body, '$RENDER_AUTOMATION_ORIGIN', 'repair issues must carry the origin marker'
+  end
+
   # ------------------------------------------------- docker qualification controller
 
   # The artifact store, the memory ceiling and the payload schema were all
@@ -5871,6 +5934,12 @@ class ContinuumTest < Minitest::Test
                     'the stub may only cheap-prefilter; the reusable scheduler parses exactly'
     assert_includes gate, "startsWith(github.event.comment.body, '/oc ')",
                     'a lookalike token such as /ocfoo must not wake the scheduler'
+    assert_includes gate, "fromJSON('\"/oc\\t\"')",
+                    'a tab after the command must still wake the scheduler'
+    assert_includes gate, "fromJSON('\"/oc\\r\"')",
+                    'a CRLF after the command must still wake the scheduler'
+    assert_includes gate, "fromJSON('\"\\n/oc\"')",
+                    'a command on a later line must still wake the scheduler'
     refute_includes gate, "startsWith(github.event.comment.body, '/oc')",
                     'an unbounded prefix gate would wake the scheduler on /ocfoo'
     refute_includes gate, "contains(github.event.comment.body, '/oc')",
@@ -7723,11 +7792,20 @@ class ContinuumTest < Minitest::Test
   # deny-push policy.
   def test_child_agent_groups_include_child_id_and_deny_push
     deny_push = %q({"permission":{"bash":{"*":"allow","git *":"allow","git push *":"deny"}}})
-    {
-      'continuum-consumer-child-worker.yml' => 'continuum-child-worker-',
-      'continuum-consumer-child-review.yml' => 'continuum-subtask-review-',
-      'continuum-consumer-child-pr-review.yml' => 'continuum-subtask-pr-review-'
-    }.each do |name, prefix|
+    prefixes = {
+      'continuum-consumer-child-worker.yml' => 'continuum-worker-',
+      'continuum-consumer-child-review.yml' => 'continuum-review-',
+      'continuum-consumer-child-pr-review.yml' => 'continuum-pr-review-'
+    }
+    prefixes.each_value do |prefix|
+      prefixes.each_value do |other|
+        next if prefix == other
+
+        refute prefix.start_with?(other),
+               "concurrency prefix #{prefix.inspect} collides with #{other.inspect}"
+      end
+    end
+    prefixes.each do |name, prefix|
       workflow = yaml(File.join(ROOT, '.github/workflows', name))
       group = workflow.fetch('jobs').values.first.fetch('concurrency').fetch('group')
       assert_includes group, prefix
@@ -7745,12 +7823,12 @@ class ContinuumTest < Minitest::Test
                     'fork PRs have no label-write token and must be skipped'
   end
 
-  def test_contract_gate_disables_status_publishing_for_fork_pull_requests
+  def test_contract_gate_disables_status_publishing_for_fork_and_dependabot_pull_requests
     gate = yaml(File.join(ROOT, '.github/workflows/contract-gate.yml'))
     value = gate.fetch('jobs').fetch('contract').fetch('with').fetch('publish_status')
     assert_includes value, 'github.event.pull_request.head.repo.full_name == github.repository'
     assert_includes value, "github.actor != 'dependabot[bot]'",
-                    'Dependabot same-repository PRs also receive a read-only token'
+                    'Dependabot PRs get a read-only token and must not publish status'
     assert_includes value, "'true'"
     assert_includes value, "'false'"
   end

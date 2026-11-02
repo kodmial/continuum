@@ -45,7 +45,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     concurrency:
-      group: continuum-child-worker-${{ inputs.child_id }}-${{ inputs.task_number }}
+      group: continuum-worker-${{ inputs.child_id }}-${{ inputs.task_number }}
       cancel-in-progress: false
     env:
       GH_TOKEN: ${{ secrets.CHILD_RUNTIME_TOKEN }}
