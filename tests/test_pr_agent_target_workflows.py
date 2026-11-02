@@ -411,6 +411,23 @@ class PrAgentTargetWorkflowContractTests(unittest.TestCase):
         self.assertIn("default: main", dispatch)
         self.assertIn("continuum_ref: main", body)
 
+    def test_dogfood_pr_agent_caller_accepts_forwarded_continuum_ref(self):
+        # The repair engine dispatches this leaf with `-f continuum_ref=...`
+        # when target_child_id is set; an undeclared input makes GitHub reject
+        # the whole dispatch with HTTP 422 and loses the bounded retry.
+        body = read(".github/workflows/pr-agent.yml")
+        dispatch = body.split("workflow_dispatch:", 1)[1].split("\npermissions:", 1)[0]
+        self.assertIn("continuum_ref:", dispatch)
+        self.assertIn("default: main", dispatch)
+        # Declaring the input is not enough: the delegated retry must reach
+        # the pinned ref, otherwise a non-main continuum_ref silently falls
+        # back to main downstream.
+        self.assertIn(
+            'continuum_ref: "${{ inputs.continuum_ref || \'main\' }}"', body
+        )
+        repair = read(".github/workflows/continuum-pr-agent-repair.yml")
+        self.assertIn('continuum_ref="$CONTINUUM_REF_INPUT"', repair)
+
     def test_delegated_identity_is_masked_and_target_checkout_is_quiet(self):
         helper = read(".github/scripts/pr_agent_target.sh")
         # Resolver stderr is suppressed so delegated identity cannot leak

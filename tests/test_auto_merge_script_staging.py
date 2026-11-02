@@ -97,20 +97,52 @@ class AutoMergeScriptStagingTests(unittest.TestCase):
     def tearDown(self):
         shutil.rmtree(self.workdir, ignore_errors=True)
 
-    def test_both_controllers_keep_inline_scripts_below_the_argv_limit(self):
+    def test_every_workflow_keeps_inline_scripts_below_the_argv_limit(self):
         embedder = load_embedder()
-        for target in (AUTO_MERGE, PR_AGENT_MERGE):
+        workflows = sorted((ROOT / ".github" / "workflows").glob("*.yml"))
+        self.assertTrue(workflows, "expected workflow files")
+        for target in workflows:
             with self.subTest(workflow=target.name):
                 sizes = embedder.inline_script_sizes(
                     target.read_text(encoding="utf-8")
                 )
-                self.assertTrue(sizes, "expected at least one script: block")
                 for line_number, size in sizes:
                     self.assertLessEqual(
                         size,
                         embedder.MAX_INLINE_SCRIPT_BYTES,
                         f"{target.name}:{line_number} would overflow argv",
                     )
+        # The generated controllers are the reason the limit exists, so keep
+        # proving they still carry an inline script block at all.
+        for target in (AUTO_MERGE, PR_AGENT_MERGE):
+            with self.subTest(generated=target.name):
+                self.assertTrue(
+                    embedder.inline_script_sizes(
+                        target.read_text(encoding="utf-8")
+                    ),
+                    "expected at least one script: block",
+                )
+
+    def test_checker_scans_workflows_outside_the_generator_targets(self):
+        embedder = load_embedder()
+        workflows = self.workdir / ".github" / "workflows"
+        workflows.mkdir(parents=True)
+        (workflows / "unrelated.yml").write_text(
+            "jobs:\n  x:\n    steps:\n"
+            "      - uses: actions/github-script@v7\n"
+            "        with:\n"
+            "          script: |\n"
+            "            // " + "x" * (embedder.MAX_INLINE_SCRIPT_BYTES + 1) + "\n",
+            encoding="utf-8",
+        )
+        original_root = embedder.ROOT
+        embedder.ROOT = self.workdir
+        try:
+            with self.assertRaises(SystemExit) as caught:
+                embedder.check_every_workflow_script_size()
+        finally:
+            embedder.ROOT = original_root
+        self.assertIn("argv-safe limit", str(caught.exception))
 
     def test_checker_rejects_an_oversized_inline_script(self):
         embedder = load_embedder()

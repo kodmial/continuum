@@ -31,6 +31,10 @@ jobs:
     steps:
       - uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
         env:
+          # The repair engine resolves its per-head lock label from
+          # INPUT || CONTINUUM_CI_REPAIR_LABEL || this default. A consumer that
+          # configures the label must have it reset here too, otherwise a stale
+          # lock from the previous head suppresses the next repair attempt.
           CI_REPAIR_LABEL: ${{ vars.CONTINUUM_CI_REPAIR_LABEL || 'opencode-ci-repair' }}
         with:
           script: |
@@ -40,11 +44,14 @@ jobs:
             // opportunity. The review-request lock is also reset here; after
             // green CI, continuum-add-review-label.yml recreates it either by requesting
             // CodeRabbit or by proving a safe clean-main-sync carry-forward.
-            for (const name of [
+            const ciRepairLabel =
+              String(process.env.CI_REPAIR_LABEL || 'opencode-ci-repair').trim();
+            for (const name of new Set([
               'review-ready',
               'coderabbit-review-requested',
-              process.env.CI_REPAIR_LABEL,
-            ]) {
+              'opencode-ci-repair',
+              ciRepairLabel,
+            ])) {
               try {
                 await github.rest.issues.removeLabel({
                   owner,
