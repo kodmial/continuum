@@ -321,6 +321,7 @@ jobs:
             ].join('\n');
 
             let prNumber = 0;
+            let head = '';
             let reviewCommandId = 0;
             let verifyCommandId = 0;
             let reviewId = 0;
@@ -330,20 +331,6 @@ jobs:
             const workflowRunIds = [];
             let bridgeEvidence = '';
             let opencodeEvidence = '';
-            // Bounded run lookup (#254): the canary watches for its own
-            // freshly-dispatched runs, which are always the most recent, so
-            // one page (no full-history pagination) answers every poll.
-            // Each waitFor poll below therefore costs one request instead
-            // of a history-sized scan.
-            const runTitlePrefix = `PR-Agent PR #${prNumber} [review:`;
-            const runTitleSuffix = `head=${head}`;
-            const prAgentRuns = async () => (await github.rest.actions.listWorkflowRunsForRepo({
-              owner, repo, per_page: 50, page: 1, event: 'workflow_dispatch',
-            })).data.workflow_runs.filter((run) =>
-              run.name === 'PR Agent (OpenCode backend)' &&
-              String(run.display_title || '').startsWith(runTitlePrefix) &&
-              String(run.display_title || '').endsWith(runTitleSuffix)
-            );
 
             try {
               sh(`git checkout -b "${branch}"`);
@@ -371,12 +358,50 @@ jobs:
               core.setOutput('canary_pr', String(prNumber));
               // The create response already carries the fresh HEAD (#254):
               // no extra pulls.get is needed here.
-              let head = pr.data.head.sha;
+              head = pr.data.head.sha;
               core.setOutput('blocking_sha', head);
 
-              // Snapshot existing runs before /review can dispatch a new one;
-              // the caller runs on the default branch, not the disposable PR branch.
-              const before = new Set((await prAgentRuns()).map((run) => run.id));
+              // Capture a recent-run baseline after the PR identity is known but
+              // before /review can dispatch. The exact PR/head title identifies
+              // this caller even though its workflow_dispatch runs on defaultBranch.
+              const dispatchCreatedAfter = new Date(Date.now() - 60_000).toISOString();
+              const baseline = await github.rest.actions.listWorkflowRunsForRepo({
+                owner, repo, per_page: 100, page: 1, event: 'workflow_dispatch',
+                created: `>=${dispatchCreatedAfter}`,
+              });
+              const before = new Set(baseline.data.workflow_runs.map((run) => run.id));
+              const runTitlePrefix = `PR-Agent PR #${prNumber} [review:`;
+              const runTitleSuffix = `head=${head}`;
+              let targetRunId = null;
+              const findDispatchedRun = async () => {
+                if (targetRunId !== null) {
+                  const { data: run } = await github.rest.actions.getWorkflowRun({
+                    owner, repo, run_id: targetRunId,
+                  });
+                  return run;
+                }
+                // Bound the initial discovery to recent dispatches. Once found,
+                // poll the exact run ID directly so newer runs cannot evict it.
+                for (let page = 1; page <= 5; page += 1) {
+                  const { data } = await github.rest.actions.listWorkflowRunsForRepo({
+                    owner, repo, per_page: 100, page, event: 'workflow_dispatch',
+                    created: `>=${dispatchCreatedAfter}`,
+                  });
+                  const run = data.workflow_runs.find((candidate) =>
+                    !before.has(candidate.id) &&
+                    candidate.name === 'PR Agent (OpenCode backend)' &&
+                    String(candidate.display_title || '').startsWith(runTitlePrefix) &&
+                    String(candidate.display_title || '').endsWith(runTitleSuffix)
+                  );
+                  if (run) {
+                    targetRunId = run.id;
+                    return run;
+                  }
+                  if (data.workflow_runs.length < 100) break;
+                }
+                return null;
+              };
+
               const reviewComment = await github.rest.issues.createComment({
                 owner, repo, issue_number: prNumber,
                 // Continuum comment attribution (kodmial/continuum#258): the
@@ -395,22 +420,24 @@ jobs:
               // The /review comment fans out into the event-driven review
               // provider. Wait for the exact PR/head dispatch, then its GitHub output.
               await waitFor(async () => {
-                const runs = (await prAgentRuns()).filter((run) => !before.has(run.id));
-                return runs.find((run) => run.status === 'completed') || null;
+                const run = await findDispatchedRun();
+                return run && run.status === 'completed' ? run : null;
               }, { timeoutMs: 25 * 60 * 1000, intervalMs: 30000, what: 'the PR-Agent /review run' });
-              for (const run of (await prAgentRuns()).filter((run) => !before.has(run.id))) {
-                workflowRunIds.push(String(run.id));
-                if (run.conclusion !== 'success') {
-                  throw new Error(`PR-Agent /review run ${run.id} concluded ${run.conclusion}`);
-                }
-                try {
-                  const logs = await github.rest.actions.downloadWorkflowRunLogs({
-                    owner, repo, run_id: run.id,
-                  });
-                  void logs;
-                } catch (err) {
-                  core.warning(`Could not fetch logs for run ${run.id}: ${err.message}`);
-                }
+              const reviewedRun = await findDispatchedRun();
+              if (!reviewedRun || reviewedRun.status !== 'completed') {
+                throw new Error('PR-Agent /review run disappeared before its final status could be read.');
+              }
+              workflowRunIds.push(String(reviewedRun.id));
+              if (reviewedRun.conclusion !== 'success') {
+                throw new Error(`PR-Agent /review run ${reviewedRun.id} concluded ${reviewedRun.conclusion}`);
+              }
+              try {
+                const logs = await github.rest.actions.downloadWorkflowRunLogs({
+                  owner, repo, run_id: reviewedRun.id,
+                });
+                void logs;
+              } catch (err) {
+                core.warning(`Could not fetch logs for run ${reviewedRun.id}: ${err.message}`);
               }
               // Bridge/OpenCode proof comes from the completed run's logs.
               // Log download is a binary zip; record the run conclusion plus
