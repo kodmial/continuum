@@ -30,6 +30,8 @@ jobs:
     timeout-minutes: 5
     steps:
       - uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
+        env:
+          CI_REPAIR_LABEL: ${{ vars.CONTINUUM_CI_REPAIR_LABEL || 'opencode-ci-repair' }}
         with:
           script: |
             const { owner, repo, number } = context.issue;
@@ -41,7 +43,7 @@ jobs:
             for (const name of [
               'review-ready',
               'coderabbit-review-requested',
-              'opencode-ci-repair',
+              process.env.CI_REPAIR_LABEL,
             ]) {
               try {
                 await github.rest.issues.removeLabel({
