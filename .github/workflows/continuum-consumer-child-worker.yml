@@ -1,0 +1,577 @@
+name: Continuum reusable child worker
+
+on:
+  workflow_call:
+    inputs:
+      child_id:
+        type: string
+        required: true
+      task_number:
+        type: string
+        required: true
+      model:
+        type: string
+        required: false
+        default: ''
+      max_agent_passes:
+        type: number
+        required: false
+        default: 4
+      python_version:
+        description: Python version available to the child validation gate
+        type: string
+        required: false
+        default: '3.12'
+      engine_ref:
+        type: string
+        required: false
+        default: main
+      image_digest:
+        description: Per-profile prepared-image digest for this worker's runtime profile. Takes precedence over the vars.CONTINUUM_IMAGE_DIGEST repository variable when set; multi-profile consumers pass one digest per profile job.
+        type: string
+        required: false
+        default: ''
+    secrets:
+      CHILD_RUNTIME_TOKEN:
+        required: true
+      CHILD_RUNTIME_REPOSITORIES:
+        required: false
+
+permissions:
+  contents: read
+
+jobs:
+  execute:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    concurrency:
+      group: continuum-subtask-${{ inputs.task_number }}
+      cancel-in-progress: false
+    env:
+      GH_TOKEN: ${{ secrets.CHILD_RUNTIME_TOKEN }}
+      GITHUB_TOKEN: ${{ secrets.CHILD_RUNTIME_TOKEN }}
+      CHILD_REPOSITORIES: ${{ secrets.CHILD_RUNTIME_REPOSITORIES }}
+      CHILD_ID: ${{ inputs.child_id }}
+      TASK_NUMBER: ${{ inputs.task_number }}
+      OPENCODE_MODEL: ${{ inputs.model }}
+      LEGACY_OPENCODE_MODEL: ${{ vars.OPENCODE_MODEL }}
+      OPENCODE_MODELS: ${{ vars.OPENCODE_MODELS }}
+      OPENCODE_MODEL_STRATEGY: ${{ vars.OPENCODE_MODEL_STRATEGY || 'sticky-failover' }}
+      OPENCODE_PROBE_TTL: ${{ vars.OPENCODE_PROBE_TTL || '3600' }}
+      OPENCODE_MODEL_COOLDOWN: ${{ vars.OPENCODE_MODEL_COOLDOWN || '900' }}
+      OPENCODE_PROBE_TIMEOUT: ${{ vars.OPENCODE_PROBE_TIMEOUT || '90' }}
+      MAX_AGENT_PASSES: ${{ inputs.max_agent_passes }}
+      OPENCODE_CONFIG_CONTENT: '{"permission":{"bash":{"*":"allow","git *":"allow","git push *":"deny"}}}'
+    steps:
+      # The job's immutable 45-minute timeout starts here, before checkout and
+      # toolchain setup. Capture that anchor so the inner agent deadline is
+      # derived from real remaining time instead of a fixed per-pass budget.
+      - name: Record delegated job deadline anchor
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "CONTINUUM_JOB_STARTED_EPOCH=$(date +%s)" >> "$GITHUB_ENV"
+
+      - name: Checkout parent control plane
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Checkout Continuum engine
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: kodmial/continuum
+          ref: ${{ inputs.engine_ref }}
+          path: .continuum-engine
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Set up child Python
+        uses: actions/setup-python@82c7e631bb3cdc910f68e0081d67478d79c6982d
+        with:
+          python-version: ${{ inputs.python_version }}
+
+      - name: Export Continuum engine root
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "CONTINUUM_ENGINE_ROOT=$GITHUB_WORKSPACE/.continuum-engine" >> "$GITHUB_ENV"
+
+      # Shared Continuum release action; never restore mutable Child worktrees or auth.
+      - name: Restore verified cached OpenCode for delegated agent
+        id: cached_opencode
+        uses: kodmial/continuum/.github/actions/agent-toolchain@main
+        with:
+          components: opencode
+          opencode-version: ${{ vars.CONTINUUM_OPENCODE_VERSION || '' }}
+
+      # Preserve the delegated failure attribution contract even when the
+      # new cached bootstrap fails before the main task script starts.
+      - name: Report delegated OpenCode bootstrap failure
+        if: failure() && steps.cached_opencode.outcome == 'failure'
+        shell: bash
+        # Explicit trusted-job context: this step is before the main task
+        # script and must not rely on variables scoped only to that step.
+        env:
+          CHILD_ID: ${{ inputs.child_id }}
+          TASK_NUMBER: ${{ inputs.task_number }}
+          CHILD_REPOSITORIES: ${{ secrets.CHILD_RUNTIME_REPOSITORIES }}
+          GH_TOKEN: ${{ secrets.CHILD_RUNTIME_TOKEN }}
+          CONTINUUM_ENGINE_ROOT: ${{ github.workspace }}/.continuum-engine
+        run: |
+          set -uo pipefail
+          resolver="$CONTINUUM_ENGINE_ROOT/.github/scripts/delegation_repository.sh"
+          child_repo="$(PARENT_CONFIG=.continuum.yml CHILD_REPOSITORIES="$CHILD_REPOSITORIES" bash "$resolver" resolve "$CHILD_ID")" || exit 0
+          gh issue comment "$TASK_NUMBER" --repo "$child_repo" --body "$(printf '%s\n%s\n%s\n%s' '<!-- continuum-child-infra -->' '⚡ **Continuum · delegation-worker**' '<!-- continuum-origin role=continuum component=delegation-worker -->' "child task #$TASK_NUMBER could not install the verified agent runtime.")" >/dev/null 2>&1 || true
+
+      - name: Execute child task
+        shell: bash
+        env:
+          CONTINUUM_IMAGE_DIGEST: ${{ inputs.image_digest || vars.CONTINUUM_IMAGE_DIGEST }}
+          CONTINUUM_EXPECTED_OPENCODE_VERSION: ${{ steps.cached_opencode.outputs.runtime-version }}
+        run: |
+          set -euo pipefail
+          [[ "$TASK_NUMBER" =~ ^[0-9]+$ ]] || { echo "::error::Invalid task number."; exit 2; }
+          export PYTHONPATH="$CONTINUUM_ENGINE_ROOT/src"
+          resolver="$CONTINUUM_ENGINE_ROOT/.github/scripts/delegation_repository.sh"
+          child_repo="$(
+            PARENT_CONFIG=.continuum.yml CHILD_REPOSITORIES="$CHILD_REPOSITORIES"               bash "$resolver" resolve "$CHILD_ID"
+          )"
+
+          PARENT_CONFIG=.continuum.yml CHILD_REPOSITORIES="$CHILD_REPOSITORIES" \
+            bash "$resolver" verify "$CHILD_ID" "$child_repo" >/dev/null
+
+          # Route policy comes from trusted Parent vars; persist only to the
+          # resolved private Child. Issue/PR text cannot influence the pool.
+          export CONTINUUM_MODEL_STATE_REPOSITORY="$child_repo"
+          export CONTINUUM_MODEL_STATE_TOKEN="$GH_TOKEN"
+          export CONTINUUM_MODEL_TASK_CLASS=coder
+          export CONTINUUM_MODEL_PROFILE=child-worker
+          export CONTINUUM_EXPLICIT_MODEL="$OPENCODE_MODEL"
+          export OPENCODE_MODEL="$LEGACY_OPENCODE_MODEL"
+          OPENCODE_MODEL="$(python3 "$CONTINUUM_ENGINE_ROOT/src/continuum/model_routing.py" select)"
+          unset CONTINUUM_MODEL_STATE_TOKEN
+          export OPENCODE_MODEL
+
+
+          # kodmial/continuum#302: canonical fail-closed branch safety.
+          # The delegated task branch must be a proven non-default ref of
+          # the resolved child repository; the child default is discovered
+          # from child metadata, never hardcoded. Only the child PR merge
+          # operation may update it.
+          continuum_assert_safe_push() {
+            local dest="${1:-}"
+            local repo="${2:-$child_repo}"
+            dest="${dest#refs/heads/}"
+            dest="$(printf '%s' "$dest" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+            if [[ -z "$dest" ]]; then echo "::error::Continuum branch safety: refusing code push with an empty destination." >&2; return 1; fi
+            case "$dest" in HEAD|@|FETCH_HEAD|ORIG_HEAD|MERGE_HEAD) echo "::error::Continuum branch safety: refusing ambiguous push destination '$dest'." >&2; return 1;; esac
+            case "$dest" in *".."*|*"~"*|*"^"*|*"?"*|*"*"*|*"["*|*" "*|*"@{"*) echo "::error::Continuum branch safety: refusing ambiguous push destination '$dest'." >&2; return 1;; esac
+            case "$dest" in -*|/*|*/|*.lock) echo "::error::Continuum branch safety: refusing ambiguous push destination '$dest'." >&2; return 1;; esac
+            if [[ "$dest" == *"//"* ]]; then echo "::error::Continuum branch safety: refusing ambiguous push destination '$dest'." >&2; return 1; fi
+            local default_branch=""
+            default_branch="$(gh api "repos/$repo" --jq .default_branch 2>/dev/null || true)"
+            default_branch="${default_branch#refs/heads/}"
+            default_branch="$(printf '%s' "$default_branch" | tr -d '[:space:]')"
+            if [[ -z "$default_branch" ]]; then echo "::error::Continuum branch safety: repository default branch is undiscoverable for '$repo'; refusing code push to '$dest'." >&2; return 1; fi
+            if [[ "$dest" == "$default_branch" ]]; then echo "::error::Continuum branch safety: refusing code push to the default branch '$dest'. Recovery resumes the same PR branch; only the PR merge operation may update the default branch." >&2; return 1; fi
+          }
+
+          # One issue fetch serves the open-gate below and the prompt
+          # context later (#254): title/body are prompt context only, while
+          # the open gate is re-checked by the dispatcher/review passes.
+          CHILD_ISSUE_JSON="$RUNNER_TEMP/continuum-child-issue.json"
+          gh api "repos/$child_repo/issues/$TASK_NUMBER" > "$CHILD_ISSUE_JSON" 2>/dev/null || true
+          issue_state="$(jq -r '.state // ""' <"$CHILD_ISSUE_JSON" 2>/dev/null || echo "")"
+          [[ "$issue_state" == "open" ]] || exit 0
+          issue_title="$(jq -r '.title // ""' <"$CHILD_ISSUE_JSON" 2>/dev/null || echo "")"
+          issue_body="$(jq -r '.body // ""' <"$CHILD_ISSUE_JSON" 2>/dev/null || echo "")"
+
+          # kodmial/continuum#295: freeze the child task specification at
+          # admission with the canonical engine
+          # (.github/scripts/task_snapshot_admission.py over
+          # src/continuum/task_snapshot.py), so digests match every other
+          # entry point byte-for-byte. The earliest trusted snapshot wins
+          # and is never overwritten; drift stops the worker with a
+          # deduplicated diagnostic before any agent work, and the exact
+          # pinned record (never a later live body) feeds the prompt below.
+          CHILD_OWNER="${child_repo%%/*}"
+          CHILD_COMMENTS_PAGES="$RUNNER_TEMP/continuum-child-snapshot-pages.jsonl"
+          CHILD_COMMENTS_JSON="$RUNNER_TEMP/continuum-child-snapshot-comments.json"
+          CHILD_SNAPSHOT_RECORD="$RUNNER_TEMP/continuum-child-snapshot-record.json"
+          CHILD_SNAPSHOT_DECISION="$RUNNER_TEMP/continuum-child-snapshot-decision.json"
+          SNAPSHOT_ADMISSION="$CONTINUUM_ENGINE_ROOT/.github/scripts/task_snapshot_admission.py"
+          fetch_snapshot_comments() {
+            : > "$CHILD_COMMENTS_PAGES"
+            for snapshot_page in 1 2 3; do
+              if ! snapshot_page_json="$(gh api "repos/$child_repo/issues/$TASK_NUMBER/comments?per_page=100&page=$snapshot_page" 2>/dev/null)"; then
+                echo "::error::Could not list child task #$TASK_NUMBER comments for snapshot verification; refusing delegated work."
+                return 4
+              fi
+              echo "$snapshot_page_json" >> "$CHILD_COMMENTS_PAGES"
+              snapshot_count="$(jq 'length' <<<"$snapshot_page_json" 2>/dev/null || echo 0)"
+              [[ "$snapshot_count" == "100" ]] || break
+            done
+            jq -s 'add' "$CHILD_COMMENTS_PAGES" > "$CHILD_COMMENTS_JSON"
+          }
+          fetch_snapshot_comments || exit 4
+          # kodmial/continuum#309: terminal generation-stop gate. A
+          # stopped generation holds here without agent work and without
+          # another comment; only an explicit owner recovery marker, a
+          # successor issue, or an explicit new generation re-arms it.
+          if [[ "$(python3 "$SNAPSHOT_ADMISSION" has-stop --comments-json "$CHILD_COMMENTS_JSON" --repo "$child_repo" --issue "$TASK_NUMBER" --owner "$CHILD_OWNER" --generation 1 2>/dev/null || echo active)" == "stopped" ]]; then
+            echo "::notice::Child task $child_repo#$TASK_NUMBER generation 1 is terminally stopped; holding without agent work or further comments."
+            exit 0
+          fi
+          if ! snapshot_action="$(python3 "$SNAPSHOT_ADMISSION" decide --issue-json "$CHILD_ISSUE_JSON" --comments-json "$CHILD_COMMENTS_JSON" --repo "$child_repo" --issue "$TASK_NUMBER" --owner "$CHILD_OWNER" --record-out "$CHILD_SNAPSHOT_RECORD" --decision-out "$CHILD_SNAPSHOT_DECISION")"; then
+            echo "::error::Child task snapshot admission failed; refusing delegated work."
+            exit 4
+          fi
+          if [[ "$snapshot_action" == "pin" ]]; then
+            # The snapshot comment body is composed here (not in the driver)
+            # so the attribution header/marker literals stay next to the
+            # mutation call per the comment-attribution contract (#258).
+            # The marker line and exact record come from the canonical
+            # engine; only the presentation wrapper is inline.
+            if ! snapshot_marker_line="$(python3 "$SNAPSHOT_ADMISSION" render-marker --record-file "$CHILD_SNAPSHOT_RECORD")"; then
+              echo "::error::Could not render child task snapshot; refusing delegated work."
+              exit 4
+            fi
+            snapshot_record_json="$(cat "$CHILD_SNAPSHOT_RECORD")"
+            snapshot_comment="$(printf '%s\n%s\n%s\n%s\n%s\n%s\n%s' "$snapshot_marker_line" '⚡ **Continuum · delegation-worker**' '<!-- continuum-origin role=continuum component=delegation-worker -->' 'Continuum task snapshot (machine-owned, do not edit or delete). This comment pins the exact issue title/body accepted for this implementation generation. Later issue edits never change it; they belong in a new follow-up issue.' '```json' "$snapshot_record_json" '```')"
+            if ! gh api --method POST "repos/$child_repo/issues/$TASK_NUMBER/comments" -f body="$snapshot_comment" >/dev/null 2>&1; then
+              echo "::error::Could not pin child task snapshot for $child_repo#$TASK_NUMBER; refusing to implement live mutable text."
+              exit 4
+            fi
+            echo "Pinned child task snapshot for $child_repo#$TASK_NUMBER."
+            # Re-verify after pinning so simultaneous wakeups converge on
+            # the earliest writer instead of overwriting it. Re-read the
+            # live issue (not just comments) so a title/body edit between
+            # the first live read and the pin is observed by the second
+            # decide call.
+            if ! gh api "repos/$child_repo/issues/$TASK_NUMBER" > "$CHILD_ISSUE_JSON" 2>/dev/null; then
+              echo "::error::Could not re-read child task #$TASK_NUMBER for snapshot re-verification; refusing delegated work."
+              exit 4
+            fi
+            fetch_snapshot_comments || exit 4
+            if ! snapshot_action="$(python3 "$SNAPSHOT_ADMISSION" decide --issue-json "$CHILD_ISSUE_JSON" --comments-json "$CHILD_COMMENTS_JSON" --repo "$child_repo" --issue "$TASK_NUMBER" --owner "$CHILD_OWNER" --record-out "$CHILD_SNAPSHOT_RECORD" --decision-out "$CHILD_SNAPSHOT_DECISION")"; then
+              echo "::error::Child task snapshot re-verification failed; refusing delegated work."
+              exit 4
+            fi
+          fi
+          if [[ "$snapshot_action" == "drift_blocked" || "$snapshot_action" == "tampered_fail_closed" ]]; then
+            snapshot_diagnostic="$(jq -r '.diagnostic // "Task snapshot verification failed."' "$CHILD_SNAPSHOT_DECISION" 2>/dev/null || echo "Task snapshot verification failed.")"
+            if ! jq -r '.[].body' "$CHILD_COMMENTS_JSON" 2>/dev/null | grep -Fq '<!-- continuum-child-task-snapshot-drift -->'; then
+              gh issue comment "$TASK_NUMBER" --repo "$child_repo" \
+                --body "$(printf '%s\n%s\n%s\n%s' '<!-- continuum-child-task-snapshot-drift -->' '⚡ **Continuum · delegation-worker**' '<!-- continuum-origin role=continuum component=delegation-worker -->' "$snapshot_diagnostic")" \
+                >/dev/null 2>&1 || true
+            fi
+            # kodmial/continuum#309: one deterministic terminal
+            # generation-stop (continuum-task-generation-stop marker with
+            # digests only, never task text) so later scheduler ticks,
+            # event wakeups, and lease reclaims hold silently instead of
+            # posting endless drift pairs. Later runs converge on the
+            # first stop via first-writer-wins selection; the pinned
+            # snapshot is never rewritten and a successor issue stays
+            # schedulable. A fresh re-read immediately before
+            # publication narrows the concurrent-admission race so the
+            # second writer observes the first stop and skips its own.
+            if [[ "$(python3 "$SNAPSHOT_ADMISSION" has-stop --comments-json "$CHILD_COMMENTS_JSON" --repo "$child_repo" --issue "$TASK_NUMBER" --owner "$CHILD_OWNER" --generation 1 2>/dev/null || echo active)" != "stopped" ]]; then
+              stop_pinned="$(jq -r '.pinned_spec_sha256 // ""' "$CHILD_SNAPSHOT_DECISION" 2>/dev/null || echo "")"
+              stop_live="$(jq -r '.live_spec_sha256 // ""' "$CHILD_SNAPSHOT_DECISION" 2>/dev/null || echo "")"
+              stop_reason="$(jq -r '.stop_reason // "drift"' "$CHILD_SNAPSHOT_DECISION" 2>/dev/null || echo drift)"
+              [[ "$stop_reason" == "drift" || "$stop_reason" == "tampered" ]] || stop_reason="drift"
+              if [[ "$stop_pinned" =~ ^[0-9a-f]{64}$ && "$stop_live" =~ ^[0-9a-f]{64}$ ]]; then
+                stop_marker=""
+                if fetch_snapshot_comments 2>/dev/null; then
+                  if [[ "$(python3 "$SNAPSHOT_ADMISSION" has-stop --comments-json "$CHILD_COMMENTS_JSON" --repo "$child_repo" --issue "$TASK_NUMBER" --owner "$CHILD_OWNER" --generation 1 2>/dev/null || echo active)" == "stopped" ]]; then
+                    echo "::notice::Child task $child_repo#$TASK_NUMBER converges on the earlier terminal generation stop; skipping duplicate publication."
+                  else
+                    stop_marker="$(python3 "$SNAPSHOT_ADMISSION" render-stop --repo "$child_repo" --issue "$TASK_NUMBER" --pinned-spec "$stop_pinned" --live-spec "$stop_live" --reason "$stop_reason" 2>/dev/null || echo "")"
+                  fi
+                else
+                  stop_marker="$(python3 "$SNAPSHOT_ADMISSION" render-stop --repo "$child_repo" --issue "$TASK_NUMBER" --pinned-spec "$stop_pinned" --live-spec "$stop_live" --reason "$stop_reason" 2>/dev/null || echo "")"
+                fi
+                if [[ -n "$stop_marker" ]]; then
+                  gh issue comment "$TASK_NUMBER" --repo "$child_repo" \
+                    --body "$(printf '%s\n%s\n%s' "$stop_marker" '⚡ **Continuum · delegation-worker**' '<!-- continuum-origin role=continuum component=delegation-worker -->')" \
+                    >/dev/null 2>&1 || true
+                  echo "::notice::Child task $child_repo#$TASK_NUMBER terminal generation stop published ($stop_reason; pinned $stop_pinned, live $stop_live)."
+                fi
+              fi
+            fi
+            # Deterministic hold, not a failure: scheduler passes keep
+            # holding cheaply (no agent work started) until a human opens a
+            # follow-up issue. Never a blind agent retry loop.
+            echo "::notice::Child task $child_repo#$TASK_NUMBER snapshot guard held this generation ($snapshot_action); no agent work started."
+            exit 0
+          fi
+          if [[ "$snapshot_action" != "proceed" ]]; then
+            echo "::error::Unexpected child task snapshot action '$snapshot_action'; refusing delegated work."
+            exit 4
+          fi
+          echo "Child task snapshot verified for $child_repo#$TASK_NUMBER."
+          # kodmial/continuum#295: the agent prompt below consumes the frozen
+          # snapshot record, never a later live body. The live read above
+          # stays the single coalesced API fetch for the open gate.
+          issue_title="$(jq -r '.title' "$CHILD_SNAPSHOT_RECORD" 2>/dev/null || echo "")"
+          issue_body="$(jq -r '.body' "$CHILD_SNAPSHOT_RECORD" 2>/dev/null || echo "")"
+          [[ -n "$issue_title" ]] || { echo "::error::Pinned child task snapshot has no title; refusing delegated work."; exit 4; }
+
+          workdir="$RUNNER_TEMP/continuum-child-target"
+          transcript="$RUNNER_TEMP/continuum-child-agent.log"
+          result_file="$RUNNER_TEMP/continuum-child-task-${TASK_NUMBER}.md"
+
+          gh auth setup-git >/dev/null 2>&1
+          rm -rf "$workdir"
+          gh repo clone "$child_repo" "$workdir" -- --quiet >/dev/null 2>&1
+          cd "$workdir"
+          git fetch --all --tags --prune --quiet >/dev/null 2>&1
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          # Work is committed only on a private, generation-and-snapshot-scoped
+          # checkpoint ref until the agent passes real acceptance. A new runner
+          # must resume it rather than silently restarting from clean main.
+          source "$CONTINUUM_ENGINE_ROOT/.github/scripts/delegated_checkpoint.sh"
+          # The child default branch is consumer-owned and need not be `main`.
+          # Resolve it once and use it for the base SHA, the publication base
+          # and the committed-diff scan, so a repository with another default
+          # branch neither fails to resolve a base nor opens the PR against a
+          # hardcoded branch.
+          child_default_branch="$(continuum_checkpoint_default_branch)" || exit 4
+          checkpoint_spec="$(jq -r '.spec_sha256 // ""' "$CHILD_SNAPSHOT_RECORD")"
+          checkpoint_generation="$(jq -r '.generation // ""' "$CHILD_SNAPSHOT_RECORD")"
+          checkpoint_ref="$(continuum_checkpoint_ref "$TASK_NUMBER" "$checkpoint_generation" "$checkpoint_spec")" || exit 4
+          branch="continuum-child/task-${TASK_NUMBER}-${GITHUB_RUN_ID}"
+          base_sha="$(git rev-parse "origin/$child_default_branch")"
+          continuum_checkpoint_restore "$checkpoint_ref" "$branch" "$checkpoint_spec" || exit 4
+
+          # Work Lock #67: the trusted composite-action step above restored a
+          # verified OpenCode binary (or deterministically installed on cache miss).
+          # SHA/version verification is performed in the shared action for both
+          # fresh installs and restored binaries before this task starts.
+          # Do not duplicate the action's formatting-dependent version parser.
+          command -v opencode >/dev/null 2>&1
+          opencode --version
+
+          # Continuum's global OpenCode instructions, before the first pass.
+          # The delegated worktree is a different repository from the parent,
+          # and it is cloned here, so its own AGENTS.md is whatever that
+          # repository ships -- which this must not replace. The installer only
+          # writes to a resolved global configuration directory and refuses any
+          # target inside the worktree.
+          #
+          # The script path is spelled out rather than held in a variable, so
+          # the audit in .github/tests/test_opencode_instructions.py can see the
+          # install and the verify statically instead of inferring them from a
+          # shell variable assignment.
+          python3 "$CONTINUUM_ENGINE_ROOT/.github/scripts/opencode_instructions.py" install \
+            --source "$CONTINUUM_ENGINE_ROOT/.github/agents/AGENTS.md"
+
+          mkdir -p "$(dirname "$result_file")"
+          prompt="$RUNNER_TEMP/continuum-child-task.txt"
+          cat >"$prompt" <<EOF
+          Execute delegated child repository task #$TASK_NUMBER to completion.
+          
+          Rules:
+          - Work only in the child repository in the current directory.
+          - Treat the full child issue body below as the authoritative specification.
+          - Inspect current main before changing anything.
+          - Continue through diagnose -> implement -> test -> repair until acceptance is genuinely satisfied.
+          - Run relevant tests and any live/integration verification required by the issue.
+          - Never print, persist, or expose credentials or secret values.
+          - Do not upload child source, diffs, issue text, logs, or agent transcripts to the parent repository.
+          - You may use local git reads; do not commit or push. Leave changes in the working tree; the outer worker publishes one bot-identity commit.
+          - Before finishing, create or update exactly: $result_file
+          - Record scope, files/areas changed, verification executed, observed results, remaining risks.
+          - End with a standalone line exactly: Acceptance: PASS
+          - Write Acceptance: PASS only when mandatory acceptance conditions are satisfied.
+          
+          --- CHILD ISSUE TITLE ---
+          $issue_title
+          
+          --- CHILD ISSUE BODY ---
+          $issue_body
+          EOF
+
+          # BEGIN continuum-delegated-deadline-config
+          job_timeout_seconds=2700
+          checkpoint_reserve_seconds=300
+          min_agent_pass_seconds=480
+          max_subpass_seconds=900
+          subpass_grace_seconds=30
+          job_started_epoch="${CONTINUUM_JOB_STARTED_EPOCH:-$(date +%s)}"
+          deadline_epoch=$(( job_started_epoch + job_timeout_seconds - checkpoint_reserve_seconds ))
+          # END continuum-delegated-deadline-config
+
+          # BEGIN continuum-delegated-deadline-functions
+          continuum_seconds_remaining() {
+            printf '%s' "$(( deadline_epoch - $(date +%s) ))"
+          }
+
+          continuum_pass_timeout() {
+            local remaining="$1" bounded="$max_subpass_seconds"
+            if (( remaining < bounded )); then
+              bounded="$remaining"
+            fi
+            printf '%s' "$bounded"
+          }
+
+          continuum_persist_incomplete_work() {
+            if [[ -n "$(git status --porcelain)" ]]; then
+              # Save partial code only to the private child repository and
+              # only after the same token and branch-safety guards as PR push.
+              # Never claim acceptance or open a PR for a checkpoint.
+              continuum_checkpoint_save "$checkpoint_ref" "$checkpoint_spec" "$child_repo" "$TASK_NUMBER" || return $?
+              checkpoint_state="saved"
+            elif [[ "$CONTINUUM_CHECKPOINT_RESTORED" == true ]]; then
+              checkpoint_state="resumed-no-new-delta"
+            fi
+            return 0
+          }
+
+          continuum_run_delegated_passes() {
+            accepted=false
+            pass_count=0
+            rc=0
+            budget_exhausted=false
+            checkpoint_state="no-code-delta"
+            for pass in $(seq 1 "$MAX_AGENT_PASSES"); do
+              local remaining pass_timeout
+              remaining="$(continuum_seconds_remaining)"
+              # Do not start work that cannot finish plus persist inside the
+              # remaining inner budget. Finishing normally here preserves the
+              # supported retry marker instead of racing the hard job timeout.
+              if (( remaining < min_agent_pass_seconds )); then
+                echo "::notice::Child task #$TASK_NUMBER deadline budget exhausted before pass $pass (${remaining}s remaining, ${min_agent_pass_seconds}s minimum); persisting work for a fresh run."
+                budget_exhausted=true
+                break
+              fi
+              pass_timeout="$(continuum_pass_timeout "$remaining")"
+              pass_prompt="$RUNNER_TEMP/continuum-child-pass-$pass.txt"
+              cp "$prompt" "$pass_prompt"
+              if [[ "$pass" -gt 1 ]]; then
+                cat >>"$pass_prompt" <<EOF
+
+          Continuation pass $pass:
+          - Continue from the existing working tree and prior transcript at $transcript.
+          - Resolve the concrete remaining blocker, rerun verification, and update $result_file.
+          EOF
+              fi
+              # The point-of-use gate sits outside the failure-tolerant block on
+              # purpose. A missing or altered global instructions file is a
+              # Continuum defect, not an agent failure to retry, so it stops the
+              # pass instead of using the remaining ones under no policy.
+              python3 "$CONTINUUM_ENGINE_ROOT/.github/scripts/opencode_instructions.py" verify \
+                --source "$CONTINUUM_ENGINE_ROOT/.github/agents/AGENTS.md"
+              # Each pass must produce fresh evidence; a prior pass's PASS line
+              # can never satisfy a later, timed-out invocation.
+              rm -f "$result_file"
+              set +e
+              timeout --signal=TERM --kill-after="${subpass_grace_seconds}s" "${pass_timeout}s" \
+                opencode run --auto --model "$OPENCODE_MODEL" "$(cat "$pass_prompt")" >"$transcript" 2>&1
+              rc=$?
+              set -e
+              pass_count="$pass"
+              # A timed-out or failed process is never trustworthy evidence,
+              # even if it wrote a PASS line before the deadline fired.
+              if [[ "$rc" -eq 0 && -f "$result_file" ]] && grep -qx 'Acceptance: PASS' "$result_file"; then
+                accepted=true
+                break
+              fi
+              # Persist every incomplete pass before spending more budget on
+              # another agent call. A failed checkpoint push is fatal and never
+              # falls through to a blind retry that could lose this delta.
+              continuum_persist_incomplete_work || return $?
+              echo "Child task #$TASK_NUMBER pass $pass incomplete (agent rc=$rc; timeout=${pass_timeout}s); checkpoint=$checkpoint_state."
+            done
+
+            if [[ "$accepted" == true ]]; then
+              return 0
+            fi
+            # The loop already persisted after the last incomplete pass. This
+            # final idempotent save covers a zero-pass invocation without
+            # inventing a checkpoint when the worktree is unchanged.
+            continuum_persist_incomplete_work || return $?
+            result_state="missing"
+            [[ -f "$result_file" ]] && result_state="present-without-PASS"
+            budget_state="passes-exhausted"
+            [[ "$budget_exhausted" == true ]] && budget_state="exhausted"
+            # Only bounded structural telemetry is exposed. The private source,
+            # the agent transcript and the issue snapshot remain off the public
+            # parent logs and out of this machine-readable child issue comment.
+            gh issue comment "$TASK_NUMBER" --repo "$child_repo" \
+              --body "$(printf '%s\n%s\n%s\n%s' '<!-- continuum-child-needs-retry -->' '⚡ **Continuum · delegation-worker**' '<!-- continuum-origin role=continuum component=delegation-worker -->' "Child task #$TASK_NUMBER: acceptance not verified after $pass_count/$MAX_AGENT_PASSES passes; budget=$budget_state; last agent exit=$rc; result=$result_state; checkpoint=$checkpoint_state; run=$GITHUB_RUN_ID. Next run must resume the same frozen generation if a checkpoint was saved.")" \
+              >/dev/null 2>&1 || true
+            return 30
+          }
+          # END continuum-delegated-deadline-functions
+
+          run_rc=0
+          continuum_run_delegated_passes || run_rc=$?
+          if [[ "$run_rc" -eq 30 ]]; then
+            exit 30
+          fi
+          if [[ "$run_rc" -ne 0 ]]; then
+            exit "$run_rc"
+          fi
+
+          # Stage first: `git diff` only inspects tracked files, so an agent
+          # that created a new file carrying token material would pass a
+          # pre-stage scan. The committed range and the staged index together
+          # cover every byte this run could publish.
+          if [[ -n "$(git status --porcelain)" ]]; then
+            git add -A
+          fi
+          secret_pattern='(github_pat_[A-Za-z0-9_]+|ghp_[A-Za-z0-9]+|rnd_[A-Za-z0-9]+|-----BEGIN [A-Z ]*PRIVATE KEY-----)'
+          if git diff --cached --no-ext-diff -- . | grep -Eiq "$secret_pattern" || git diff --no-ext-diff "origin/$child_default_branch"...HEAD -- . | grep -Eiq "$secret_pattern"; then
+            gh issue comment "$TASK_NUMBER" --repo "$child_repo"               --body "$(printf '%s\n%s\n%s\n%s' '<!-- continuum-child-security -->' '⚡ **Continuum · delegation-worker**' '<!-- continuum-origin role=continuum component=delegation-worker -->' "Child task #$TASK_NUMBER produced token-like material; publication was blocked.")"               >/dev/null 2>&1 || true
+            exit 31
+          fi
+
+          if [[ -n "$(git status --porcelain)" ]]; then
+            # kodmial/continuum#260: workflow-owned delegated commit uses the
+            # bot identity plus the component trailer (never the child repo).
+            git commit -m "task #$TASK_NUMBER: delegated implementation" -m "Continuum-Component: delegation-worker" >/dev/null 2>&1
+          fi
+          [[ "$(git rev-list --count "$base_sha"..HEAD)" -gt 0 ]] || exit 32
+
+          # kodmial/continuum#302: fail closed before mutation when the
+          # delegated branch is empty, ambiguous, or the child default.
+          continuum_assert_safe_push "$branch" "$child_repo" || exit 1
+          git push -u origin "HEAD:$branch" >/dev/null 2>&1
+          # kodmial/continuum#295: carry the pinned snapshot reference in
+          # the child PR body so review and merge gates validate the same
+          # frozen contract. Fail closed: an empty or unreadable reference
+          # must never become a legacy_unpinned PR that proceeds unprotected.
+          if ! child_snapshot_ref="$(python3 "$SNAPSHOT_ADMISSION" render-pr-ref --record-file "$CHILD_SNAPSHOT_RECORD" 2>/dev/null)"; then
+            echo "::error::Could not render the task snapshot reference for child task #$TASK_NUMBER; refusing to open an unprotected PR." >&2
+            exit 1
+          fi
+          if [[ -z "$child_snapshot_ref" || "$child_snapshot_ref" != *"continuum-task-snapshot-ref"* ]]; then
+            echo "::error::Task snapshot reference is missing for child task #$TASK_NUMBER; refusing to open an unprotected PR." >&2
+            exit 1
+          fi
+          pr_body="$(cat <<EOF
+          Delegated implementation for #$TASK_NUMBER executed by the configured Continuum parent.
+
+          Child source, issue text, test logs, and agent transcript were not uploaded to the parent repository.
+
+          $child_snapshot_ref
+          <!-- continuum-child-accepted -->
+          Closes #$TASK_NUMBER
+          EOF
+          )"
+          pr_url="$(
+            gh pr create --repo "$child_repo" --base "$child_default_branch" --head "$branch"               --title "$issue_title" --body "$pr_body" 2>/dev/null
+          )"
+          if [[ "$CONTINUUM_CHECKPOINT_RESTORED" == true || "$checkpoint_state" == "saved" ]]; then
+            continuum_checkpoint_cleanup "$checkpoint_ref" "$child_repo" || true
+          fi
+          gh issue comment "$TASK_NUMBER" --repo "$child_repo"             --body "$(printf '%s\n%s\n%s\n%s' '<!-- continuum-child-pr -->' '🦾 **Agent Coder · delegation-worker**' '<!-- continuum-origin role=agent-coder component=delegation-worker -->' "Child task #$TASK_NUMBER produced an accepted implementation PR: $pr_url")"             >/dev/null 2>&1 || true
+          # Promote the route only after an accepted real operation.
+          export CONTINUUM_SELECTED_MODEL="$OPENCODE_MODEL"
+          CONTINUUM_MODEL_STATE_TOKEN="$GH_TOKEN" python3 "$CONTINUUM_ENGINE_ROOT/src/continuum/model_routing.py" record
+          echo "SubTask #$TASK_NUMBER produced an implementation PR."

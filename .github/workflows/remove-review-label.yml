@@ -1,0 +1,21 @@
+name: CodeRabbit review label reset
+
+# Self-dogfood entry for the review-ready label reset on a new head. The
+# reusable engine is workflow_call-only, so this file owns the trigger and
+# calls the engine locally. Installed consumers keep using the
+# continuum-remove-review-label.yml caller stub instead.
+
+on:
+  pull_request:
+    types: [synchronize]
+
+permissions:
+  issues: write
+  pull-requests: write
+
+jobs:
+  call:
+    uses: ./.github/workflows/continuum-remove-review-label.yml
+    secrets: inherit
+    with:
+      continuum_ref: main

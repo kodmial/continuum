@@ -1,0 +1,113 @@
+# Optional consumer-neutral Swift profile over the generic validation contract.
+# Product packaging, signing and release policy belong to the consumer.
+
+name: Swift CI
+
+on:
+  workflow_call:
+    inputs:
+      runner:
+        description: Optional Swift runner override
+        required: false
+        type: string
+        default: ''
+      timeout_minutes:
+        description: Optional validation timeout
+        required: false
+        type: string
+        default: ''
+      prepare_command:
+        description: Optional consumer preparation hook
+        required: false
+        type: string
+        default: ''
+      build_command:
+        description: Optional Swift build command
+        required: false
+        type: string
+        default: ''
+      test_command:
+        description: Optional Swift test command
+        required: false
+        type: string
+        default: ''
+      validation_command:
+        description: Optional additional validation hook
+        required: false
+        type: string
+        default: ''
+      artifact_paths:
+        description: Optional newline-separated artifacts
+        required: false
+        type: string
+        default: ''
+      artifact_name:
+        description: Optional artifact bundle name
+        required: false
+        type: string
+        default: ''
+      status_context:
+        description: Optional commit-status context
+        required: false
+        type: string
+        default: ''
+      publish_status:
+        description: Optional status publication override
+        required: false
+        type: string
+        default: ''
+      dispatch_repair:
+        description: Optional repair dispatch override
+        required: false
+        type: string
+        default: ''
+      repair_workflow:
+        description: Optional repair workflow file
+        required: false
+        type: string
+        default: ''
+      pr_number:
+        description: Optional pull request number for manual validation
+        required: false
+        type: string
+        default: ''
+      skip_opencode_pull_request:
+        description: Optional duplicate OpenCode PR suppression
+        required: false
+        type: string
+        default: ''
+      continuum_ref:
+        description: Continuum revision supplying the generic validation engine
+        required: false
+        type: string
+        default: main
+
+permissions: {}
+
+jobs:
+  call:
+    # A nested reusable workflow cannot restore scopes removed here, and the
+    # generic validation engine publishes statuses and may dispatch repair.
+    permissions:
+      actions: write
+      contents: read
+      pull-requests: read
+      statuses: write
+    uses: ./.github/workflows/continuum-validation.yml
+    with:
+      continuum_ref: ${{ inputs.continuum_ref }}
+      runner: ${{ inputs.runner || vars.CONTINUUM_SWIFT_RUNNER || 'macos-latest' }}
+      timeout_minutes: ${{ inputs.timeout_minutes }}
+      prepare_command: ${{ inputs.prepare_command || vars.CONTINUUM_PREPARE_COMMAND || '' }}
+      build_command: ${{ inputs.build_command || vars.CONTINUUM_SWIFT_BUILD_COMMAND || 'swift build' }}
+      test_command: ${{ inputs.test_command || vars.CONTINUUM_SWIFT_TEST_COMMAND || 'swift test' }}
+      validation_command: ${{ inputs.validation_command || vars.CONTINUUM_VALIDATION_COMMAND || '' }}
+      auto_detect: ${{ 'false' }}
+      artifact_paths: ${{ inputs.artifact_paths || vars.CONTINUUM_ARTIFACT_PATHS || '' }}
+      artifact_name: ${{ inputs.artifact_name || vars.CONTINUUM_ARTIFACT_NAME || '' }}
+      status_context: ${{ inputs.status_context || vars.CONTINUUM_STATUS_CONTEXT || '' }}
+      publish_status: ${{ inputs.publish_status || vars.CONTINUUM_PUBLISH_STATUS || '' }}
+      dispatch_repair: ${{ inputs.dispatch_repair || vars.CONTINUUM_DISPATCH_REPAIR || '' }}
+      repair_workflow: ${{ inputs.repair_workflow || vars.CONTINUUM_REPAIR_WORKFLOW || '' }}
+      pr_number: ${{ inputs.pr_number }}
+      skip_opencode_pull_request: ${{ inputs.skip_opencode_pull_request || vars.CONTINUUM_SKIP_OPENCODE_PR || '' }}

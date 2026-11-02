@@ -457,7 +457,7 @@
         "pull_request.head.sha",
         "workflow_run.path"
       ],
-      "fallback_owner": "Contract qualification schedule 23 5 * * *",
+      "fallback_owner": "Contract qualification canary schedule 43 */6 * * *",
       "mutates": true,
       "phase_a_adapter": null
     },
@@ -1581,6 +1581,24 @@
       "event_payload_dependent": false
     },
     {
+      "path": ".github/workflows/continuum-contract-canary.yml",
+      "name": "Contract canary",
+      "layer": "reusable-engine",
+      "installer_set": "not-installed",
+      "triggers": [
+        {
+          "event": "workflow_call"
+        }
+      ],
+      "jobs": [
+        "canary"
+      ],
+      "owners": [
+        "contract-qualification"
+      ],
+      "event_payload_dependent": false
+    },
+    {
       "path": ".github/workflows/continuum-docker-qualification.yml",
       "name": "Docker qualification",
       "layer": "reusable-engine",
@@ -1934,12 +1952,6 @@
           ]
         },
         {
-          "event": "schedule",
-          "crons": [
-            "23 5 * * *"
-          ]
-        },
-        {
           "event": "workflow_dispatch"
         }
       ],
@@ -2069,6 +2081,31 @@
       ],
       "owners": [
         "pr-agent-review"
+      ],
+      "event_payload_dependent": false
+    },
+    {
+      "path": ".github/workflows/contract-qualification-canary.yml",
+      "name": "Contract qualification canary",
+      "layer": "self-dogfood",
+      "installer_set": "not-installed",
+      "triggers": [
+        {
+          "event": "schedule",
+          "crons": [
+            "43 */6 * * *"
+          ]
+        },
+        {
+          "event": "workflow_dispatch"
+        }
+      ],
+      "jobs": [
+        "qualify",
+        "canary"
+      ],
+      "owners": [
+        "contract-qualification"
       ],
       "event_payload_dependent": false
     }

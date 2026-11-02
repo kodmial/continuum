@@ -1,0 +1,283 @@
+name: Retry OpenCode on CodeRabbit unresolved
+
+on:
+  workflow_call:
+    inputs:
+      continuum_ref:
+        description: Continuum revision supplying fallback scripts
+        type: string
+        default: main
+        required: false
+      opencode_workflow:
+        description: >-
+          OpenCode caller workflow that receives the repair dispatch. Empty
+          falls back to vars.CONTINUUM_OPENCODE_WORKFLOW, then to
+          continuum-opencode.yml. Continuum dogfood overrides this to
+          opencode.yml.
+        type: string
+        default: ''
+        required: false
+
+permissions: {}
+
+jobs:
+  dispatch-unresolved-fix:
+    if: >-
+      (vars.CONTINUUM_REVIEW_PROVIDER || 'none') == 'coderabbit' &&
+      vars.CONTINUUM_ROLE != 'child' &&
+      github.event.comment.user.login == 'coderabbitai[bot]' &&
+      github.event.comment.in_reply_to_id != null &&
+      contains(github.event.comment.body, '**UNRESOLVED**') &&
+      github.event.pull_request.state == 'open' &&
+      github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    permissions:
+      actions: write
+      contents: read
+      pull-requests: read
+
+    steps:
+      - name: Match unresolved reply to the current verification request
+        id: context
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          FINDING_ID: ${{ github.event.comment.in_reply_to_id }}
+          UNRESOLVED_COMMENT_ID: ${{ github.event.comment.id }}
+          HEAD_REF: ${{ github.event.pull_request.head.ref }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          REPO_OWNER: ${{ github.repository_owner }}
+        run: |
+          set -euo pipefail
+          # During compatible migration, old consumers may still have this
+          # historical caller installed. A canonical CodeRabbit caller owns
+          # all UNRESOLVED events when present; never dispatch twice.
+          DEFAULT_BRANCH="$(gh api "repos/${GITHUB_REPOSITORY}" --jq '.default_branch')"
+          CANONICAL_CALLER="$(gh api \
+            "repos/${GITHUB_REPOSITORY}/contents/.github/workflows/continuum-coderabbit-unresolved.yml?ref=${DEFAULT_BRANCH}" \
+            --jq '.content' 2>/dev/null | base64 -d 2>/dev/null || true)"
+          if grep -qE '^[[:space:]]*uses:[[:space:]]*kodmial/continuum/.github/workflows/continuum-coderabbit-unresolved.yml@' <<<"$CANONICAL_CALLER"; then
+            echo "Canonical CodeRabbit batching owns this event; legacy dispatcher disabled."
+            echo "dispatch=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # CodeRabbit replies to the original finding. Accept verification
+          # requests from the canonical OpenCode repair and the Continuum
+          # auto-merge reconciler; only a verified ancestor of the live PR
+          # HEAD can trigger a follow-up repair after a clean main-sync.
+          #
+          # Bounded newest-first page walk (#254): review comments list
+          # oldest-first and may ignore sort/direction, so pages 1..N would
+          # scan only the oldest window and miss the current-HEAD
+          # verification marker. Anchor at the newest end via the paginated
+          # Link header's rel="last" page and walk the newest
+          # CONTINUUM_MAX_COMMENT_PAGES pages instead, enforcing
+          # newest-first client-side. A truncated or unanchorable window
+          # fails closed (dispatch=false) and never fires a stale retry.
+          MAX_PAGES_RAW="${CONTINUUM_MAX_COMMENT_PAGES:-5}"
+          if [[ "$MAX_PAGES_RAW" =~ ^[0-9]+$ ]] && [[ "$MAX_PAGES_RAW" -ge 1 ]]; then
+            MAX_PAGES="$MAX_PAGES_RAW"
+          else
+            MAX_PAGES=5
+          fi
+          if [[ "$MAX_PAGES" -gt 5 ]]; then MAX_PAGES=5; fi
+          INCLUDE="$(gh api --include "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}/comments?per_page=100&page=1" 2>/dev/null || true)"
+          if [[ -z "$INCLUDE" ]]; then
+            echo "Could not determine the newest review-comment page; ignoring UNRESOLVED reply."
+            echo "dispatch=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          HEADERS="$(tr -d '\r' <<<"$INCLUDE" | sed -n '1,/^$/p')"
+          # Reuse the probe body for page 1 below instead of refetching it.
+          PROBE_BODY="$(tr -d '\r' <<<"$INCLUDE" | sed -n '/^$/,$p' | tail -n +2)"
+          LINK_LAST="$(grep -i '^link:' <<<"$HEADERS" | tr '[:upper:]' '[:lower:]' | sed -nE 's/.*<[^>]*[?&]page=([0-9]+)[^>]*>[[:space:]]*;[[:space:]]*rel="last".*/\1/p' | tail -n 1 || true)"
+          if [[ -n "$LINK_LAST" ]]; then
+            if [[ "$LINK_LAST" =~ ^[0-9]+$ ]] && [[ "$LINK_LAST" -ge 1 ]]; then
+              LAST_PAGE="$LINK_LAST"
+            else
+              echo "Could not parse the newest review-comment page; ignoring UNRESOLVED reply."
+              echo "dispatch=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          elif grep -qi '^link:' <<<"$HEADERS"; then
+            echo "Could not parse the newest review-comment page; ignoring UNRESOLVED reply."
+            echo "dispatch=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          else
+            # No Link header means the thread fits in a single page.
+            LAST_PAGE=1
+          fi
+          FIRST_PAGE=$(( LAST_PAGE - MAX_PAGES + 1 ))
+          [[ "$FIRST_PAGE" -ge 1 ]] || FIRST_PAGE=1
+          # The page-1 probe above costs one request even when the newest
+          # window starts after page 1 (its body is then never reused).
+          # Keep the worst case at MAX_PAGES total requests by shrinking
+          # the window one page (dropping the oldest, keeping the newest)
+          # when the probe falls outside it.
+          PROBE_EXTRA=0
+          if [[ "$FIRST_PAGE" -gt 1 ]]; then
+            PROBE_EXTRA=1
+            FIRST_PAGE=$(( FIRST_PAGE + 1 ))
+          fi
+          COMMENT_PAGES=""
+          page="$FIRST_PAGE"
+          while [[ "$page" -le "$LAST_PAGE" ]]; do
+            if [[ "$page" -eq 1 ]]; then
+              page_json="$PROBE_BODY"
+            else
+              page_json="$(gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}/comments?per_page=100&page=${page}" 2>/dev/null || true)"
+            fi
+            if ! jq -e 'type == "array"' <<<"$page_json" >/dev/null 2>&1; then page=$((page + 1)); continue; fi
+            count="$(jq 'length' <<<"$page_json" 2>/dev/null || echo 0)"
+            [[ "$count" =~ ^[0-9]+$ ]] && [[ "$count" -gt 0 ]] || { page=$((page + 1)); continue; }
+            COMMENT_PAGES+="$page_json"$'\n'
+            page=$((page + 1))
+          done
+          if [[ -z "$COMMENT_PAGES" ]]; then
+            COMMENTS="[]"
+          elif ! COMMENTS="$(jq -s 'add // []' <<<"$(grep -v '^$' <<<"$COMMENT_PAGES" || true)")"; then
+            echo "Could not aggregate review-comment pages; ignoring UNRESOLVED reply."
+            echo "dispatch=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          VERIFICATION=$(jq -c \
+            --argjson finding "$FINDING_ID" \
+            --argjson unresolved "$UNRESOLVED_COMMENT_ID" \
+            --arg owner "$REPO_OWNER" '
+              [ .[]
+                | select(.in_reply_to_id == $finding)
+                | select(.id < $unresolved)
+                | select(.user.login == $owner)
+                | select(
+                    (.body | contains("<!-- opencode-coderabbit-verification ")) or
+                    (.body | contains("<!-- auto-merge-coderabbit-verification "))
+                  )
+                | select(.body | contains("finding=" + ($finding | tostring) + " "))
+              ]
+              | sort_by(.id)
+              | last // empty
+            ' <<<"$COMMENTS")
+
+          if [[ -z "$VERIFICATION" ]]; then
+            echo "No matching verification request for finding $FINDING_ID at HEAD $HEAD_SHA; ignoring stale or unrelated UNRESOLVED reply."
+            echo "dispatch=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          BODY=$(jq -r '.body' <<<"$VERIFICATION")
+          VERIFIED_HEAD=""
+          REVIEW_ID=""
+          if [[ "$BODY" == *"<!-- opencode-coderabbit-verification "* ]]; then
+            REVIEW_ID=$(sed -nE \
+              's/.*opencode-coderabbit-verification review=([0-9]+) finding=.*/\1/p' \
+              <<<"$BODY" | head -n 1)
+            VERIFIED_HEAD=$(sed -nE \
+              's/.*opencode-coderabbit-verification review=[0-9]+ finding=[0-9]+ head=([0-9a-f]{40}).*/\1/p' \
+              <<<"$BODY" | head -n 1)
+          elif [[ "$BODY" == *"<!-- auto-merge-coderabbit-verification "* ]]; then
+            VERIFIED_HEAD=$(sed -nE \
+              's/.*auto-merge-coderabbit-verification finding=[0-9]+ head=([0-9a-f]{40}).*/\1/p' \
+              <<<"$BODY" | head -n 1)
+            # Auto-merge's marker has no review id. Fetch the original inline
+            # finding, not a guessed review, and bind it to this PR and bot.
+            ROOT_COMMENT="$(gh api "repos/${GITHUB_REPOSITORY}/pulls/comments/${FINDING_ID}")"
+            ROOT_AUTHOR="$(jq -r '.user.login // ""' <<<"$ROOT_COMMENT")"
+            ROOT_PR="$(jq -r '.pull_request_url // ""' <<<"$ROOT_COMMENT")"
+            ROOT_PARENT="$(jq -r '.in_reply_to_id // ""' <<<"$ROOT_COMMENT")"
+            REVIEW_ID="$(jq -r '.pull_request_review_id // ""' <<<"$ROOT_COMMENT")"
+            if [[ "$ROOT_AUTHOR" != "coderabbitai[bot]" ]] ||
+               [[ "$ROOT_PR" != "https://api.github.com/repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}" ]] ||
+               [[ -n "$ROOT_PARENT" ]]; then
+              echo "::error::Auto-merge verification does not belong to an original CodeRabbit finding on this PR."
+              exit 1
+            fi
+          fi
+
+          if [[ ! "$REVIEW_ID" =~ ^[0-9]+$ ]] || [[ "$REVIEW_ID" == "0" ]] ||
+             [[ ! "$VERIFIED_HEAD" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::Malformed source review id or verified HEAD in CodeRabbit verification marker."
+            exit 1
+          fi
+
+          # A stale webhook must not restart a repair after a newer CodeRabbit
+          # verdict (for example a later RESOLVED on the same finding).
+          LATEST_RABBIT_REPLY_ID="$(jq -r --argjson finding "$FINDING_ID" '
+            [ .[]
+              | select(.in_reply_to_id == $finding)
+              | select(.user.login == "coderabbitai[bot]")
+            ] | sort_by(.id) | last | .id // 0
+          ' <<<"$COMMENTS")"
+          if [[ "$LATEST_RABBIT_REPLY_ID" != "$UNRESOLVED_COMMENT_ID" ]]; then
+            echo "CodeRabbit reply $UNRESOLVED_COMMENT_ID was superseded; no repair dispatched."
+            echo "dispatch=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Use live PR state, not only the historical webhook payload.
+          LIVE_PR="$(gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}")"
+          LIVE_HEAD="$(jq -r '.head.sha' <<<"$LIVE_PR")"
+          LIVE_REPO="$(jq -r '.head.repo.full_name' <<<"$LIVE_PR")"
+          LIVE_STATE="$(jq -r '.state' <<<"$LIVE_PR")"
+          if [[ "$LIVE_REPO" != "$GITHUB_REPOSITORY" ]] ||
+             [[ "$LIVE_STATE" != "open" ]] ||
+             [[ ! "$LIVE_HEAD" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "PR is not an open same-repository branch; no repair dispatched."
+            echo "dispatch=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if [[ "$VERIFIED_HEAD" != "$LIVE_HEAD" ]]; then
+            # Only a proven descendant may carry an unresolved finding forward.
+            COMPARE_STATUS="$(gh api \
+              "repos/${GITHUB_REPOSITORY}/compare/${VERIFIED_HEAD}...${LIVE_HEAD}" \
+              --jq '.status')"
+            if [[ "$COMPARE_STATUS" != "ahead" ]]; then
+              echo "Verified HEAD $VERIFIED_HEAD is not an ancestor of $LIVE_HEAD ($COMPARE_STATUS); no repair dispatched."
+              echo "dispatch=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          fi
+
+          echo "dispatch=true" >> "$GITHUB_OUTPUT"
+          echo "review_id=$REVIEW_ID" >> "$GITHUB_OUTPUT"
+          echo "Matched UNRESOLVED comment $UNRESOLVED_COMMENT_ID for finding $FINDING_ID, review $REVIEW_ID; verified HEAD $VERIFIED_HEAD, live descendant $LIVE_HEAD."
+          echo "continuum-api-budget: comment_pages=$(( LAST_PAGE - FIRST_PAGE + 1 + PROBE_EXTRA )) max_pages=${MAX_PAGES} raw_CONTINUUM_MAX_COMMENT_PAGES=${CONTINUUM_MAX_COMMENT_PAGES:-5}"
+
+      - name: Dispatch OpenCode retry
+        if: steps.context.outputs.dispatch == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          HEAD_REF: ${{ github.event.pull_request.head.ref }}
+          REVIEW_ID: ${{ steps.context.outputs.review_id }}
+          OPENCODE_WORKFLOW: ${{ inputs.opencode_workflow || vars.CONTINUUM_OPENCODE_WORKFLOW || 'continuum-opencode.yml' }}
+        run: |
+          set -euo pipefail
+          # Same bare-file-name guard as the other dispatch engines. A
+          # configured value that is not a workflow file name would be spliced
+          # into the dispatch URL, so it falls back to the legacy literal
+          # instead of failing the step.
+          resolve_dispatch_workflow() {
+            local configured="$1" fallback="$2" label="$3"
+            configured="${configured:-$fallback}"
+            if [[ "$configured" != *.yml ||
+                  "$configured" == *"/"* ||
+                  "$configured" == *"\\"* ||
+                  "$configured" == *".."* ]]; then
+              echo "Invalid ${label} workflow: ${configured}. Expected a bare workflow file name such as ${fallback}." >&2
+              configured="$fallback"
+            fi
+            printf '%s\n' "$configured"
+          }
+          OPENCODE_WORKFLOW="$(resolve_dispatch_workflow \
+            "${OPENCODE_WORKFLOW:-}" 'continuum-opencode.yml' 'OpenCode caller')"
+          gh api --method POST \
+            "repos/${GITHUB_REPOSITORY}/actions/workflows/${OPENCODE_WORKFLOW}/dispatches" \
+            -f ref=main \
+            -f "inputs[mode]=coderabbit-fix" \
+            -f "inputs[pr_number]=${PR_NUMBER}" \
+            -f "inputs[head_ref]=${HEAD_REF}" \
+            -f "inputs[review_id]=${REVIEW_ID}"

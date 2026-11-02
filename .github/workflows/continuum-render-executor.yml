@@ -1,0 +1,914 @@
+name: Render execution controller
+
+on:
+  workflow_call:
+    inputs:
+      continuum_ref:
+        description: Continuum revision supplying fallback scripts
+        type: string
+        default: main
+        required: false
+      # ----------------------------------------------------------------
+      # What to execute. Both are required on the caller stub and optional
+      # (empty) here, because the engine re-checks them: a reusable workflow
+      # can also be called by another workflow that supplies neither, and a
+      # run with no target would otherwise act on an empty issue number.
+      # ----------------------------------------------------------------
+      issue_number:
+        description: >-
+          Issue whose execution is being driven. Empty unless the caller was
+          dispatched; an empty value fails this job explicitly.
+        type: string
+        default: ''
+        required: false
+      mode:
+        description: >-
+          Execution mode, `smoke` or `e2e`. Empty unless the caller was
+          dispatched; any other value fails this job explicitly.
+        type: string
+        default: ''
+        required: false
+      # ----------------------------------------------------------------
+      # Execution knobs. Every value the consumer's fork used to hardcode is
+      # an input with a `vars.` fallback carrying the fork's own default, so
+      # a consumer that sets nothing keeps the behaviour it had.
+      # ----------------------------------------------------------------
+      render_region:
+        description: Render region the ephemeral worker is created in.
+          Empty falls back to RENDER_REGION.
+        type: string
+        default: ''
+        required: false
+      model:
+        description: >-
+          OpenCode model the Render lifecycle runs on. Empty falls back to
+          OPENCODE_MODEL; it has no literal default, because a worker started
+          without a model cannot execute anything and must fail explicitly
+          rather than run a silent no-op.
+        type: string
+        default: ''
+        required: false
+      state_file:
+        description: Path of the Render lifecycle state file cleanup reads.
+          Empty falls back to RENDER_STATE_FILE.
+        type: string
+        default: ''
+        required: false
+      result_file:
+        description: Path of the Render run result file. Empty falls back to
+          RENDER_RESULT_FILE.
+        type: string
+        default: ''
+        required: false
+      memory_summary_file:
+        description: Path of the Render memory summary file. Empty falls back
+          to RENDER_MEMORY_SUMMARY_FILE.
+        type: string
+        default: ''
+        required: false
+      qualification_result_file:
+        description: Path of the classification record written from the run
+          evidence. Empty falls back to RENDER_QUALIFICATION_RESULT_FILE.
+        type: string
+        default: ''
+        required: false
+      max_repair_attempts:
+        description: >-
+          Automatic recovery issues this controller creates for one source
+          issue before it stops creating repairs. Empty falls back to
+          MAX_RENDER_REPAIR_ATTEMPTS.
+        type: string
+        default: ''
+        required: false
+      qualification_label:
+        description: >-
+          Issue label marking a durable qualification run. Empty falls back to
+          RENDER_QUALIFICATION_LABEL.
+        type: string
+        default: ''
+        required: false
+      qualification_marker:
+        description: >-
+          Hidden HTML marker prefixed to the recorded qualification result
+          comment. Empty falls back to RENDER_QUALIFICATION_MARKER.
+        type: string
+        default: ''
+        required: false
+      artifact_prefix:
+        description: Prefix of the uploaded evidence artifact name. Empty
+          falls back to RENDER_ARTIFACT_PREFIX.
+        type: string
+        default: ''
+        required: false
+      dispatch_ref:
+        description: >-
+          Revision this controller checks out and dispatches subsequent
+          workflows at. Empty falls back to RENDER_DISPATCH_REF.
+        type: string
+        default: ''
+        required: false
+      job_script:
+        description: Consumer script driving the Render lifecycle. Empty
+          falls back to RENDER_JOB_SCRIPT.
+        type: string
+        default: ''
+        required: false
+      cleanup_script:
+        description: Consumer script deleting the ephemeral Render service.
+          Empty falls back to RENDER_CLEANUP_SCRIPT.
+        type: string
+        default: ''
+        required: false
+      qualification_script:
+        description: >-
+          Consumer script turning the measured run evidence into the
+          qualification payload. Empty falls back to
+          RENDER_QUALIFICATION_SCRIPT.
+        type: string
+        default: ''
+        required: false
+      in_progress_label:
+        description: Reservation label. Empty falls back to
+          AUTOMATION_IN_PROGRESS_LABEL. Must match the scheduler's
+          in_progress_label.
+        type: string
+        default: ''
+        required: false
+      pause_label:
+        description: Label that pauses automation. Empty falls back to
+          AUTOMATION_PAUSE_LABEL. Must match the scheduler's pause_marker.
+        type: string
+        default: ''
+        required: false
+      repair_label:
+        description: Label applied to an automatic recovery issue. Empty
+          falls back to AUTOMATION_REPAIR_LABEL.
+        type: string
+        default: ''
+        required: false
+      e2e_branch_prefix:
+        description: >-
+          Branch-head prefix the e2e mode requires a result PR to carry.
+          Empty falls back to RENDER_E2E_BRANCH_PREFIX.
+        type: string
+        default: ''
+        required: false
+      chain_workflow:
+        description: >-
+          Workflow woken when a qualification result needs a follow-up step.
+          Empty falls back to RENDER_CHAIN_WORKFLOW and, still empty, skips
+          the wake instead of dispatching a file the consumer may not have.
+        type: string
+        default: ''
+        required: false
+      capacity_workflow:
+        description: >-
+          Dedicated optimization/profile/capacity decision workflow woken
+          when the authoritative engine classifies a failure as worker
+          capacity. Empty falls back to RENDER_CAPACITY_WORKFLOW and, still
+          empty, holds the source safely instead of dispatching a file the
+          consumer may not have.
+        type: string
+        default: ''
+        required: false
+      scheduler_workflow:
+        description: Scheduler woken after this controller resolves an issue.
+          Empty falls back to RENDER_SCHEDULER_WORKFLOW.
+        type: string
+        default: ''
+        required: false
+      concurrency_group:
+        description: >-
+          Concurrency group serialising this controller's runs. Empty falls
+          back to RENDER_CONCURRENCY_GROUP.
+        type: string
+        default: ''
+        required: false
+      timeout_minutes:
+        description: Job timeout. Empty falls back to
+          AUTOMATION_RENDER_TIMEOUT_MINUTES.
+        type: string
+        default: ''
+        required: false
+
+permissions: {}
+
+concurrency:
+  # Only one automation-owned ephemeral Render worker may exist at a time, or a
+  # repair created for a previous run would tear down the run that replaced it.
+  group: ${{ inputs.concurrency_group || vars.RENDER_CONCURRENCY_GROUP || 'continuum-render-single-service' }}
+  cancel-in-progress: false
+
+jobs:
+  execute:
+    runs-on: ubuntu-latest
+    timeout-minutes: ${{ fromJSON(inputs.timeout_minutes || vars.AUTOMATION_RENDER_TIMEOUT_MINUTES || '55') }}
+
+    permissions:
+      actions: write
+      contents: write
+      issues: write
+      pull-requests: write
+      statuses: write
+
+    env:
+      ISSUE_NUMBER: ${{ inputs.issue_number }}
+      EXECUTION_MODE: ${{ inputs.mode }}
+      RENDER_REGION: ${{ inputs.render_region || vars.RENDER_REGION || 'oregon' }}
+      # No literal default: a Render worker with no model executes nothing, so
+      # the guard below fails the run instead of reporting a green no-op.
+      OPENCODE_MODEL: ${{ inputs.model || vars.OPENCODE_MODEL }}
+      RENDER_STATE_FILE: ${{ inputs.state_file || vars.RENDER_STATE_FILE || '/tmp/continuum-render-state.json' }}
+      RENDER_RESULT_FILE: ${{ inputs.result_file || vars.RENDER_RESULT_FILE || '/tmp/continuum-render-result.json' }}
+      RENDER_MEMORY_SUMMARY_FILE: ${{ inputs.memory_summary_file || vars.RENDER_MEMORY_SUMMARY_FILE || '/tmp/continuum-render-memory-summary.json' }}
+      RENDER_QUAL_RESULT_FILE: ${{ inputs.qualification_result_file || vars.RENDER_QUALIFICATION_RESULT_FILE || '/tmp/continuum-render-qualification.json' }}
+      MAX_RENDER_REPAIR_ATTEMPTS: ${{ inputs.max_repair_attempts || vars.MAX_RENDER_REPAIR_ATTEMPTS || '10' }}
+      QUALIFICATION_LABEL: ${{ inputs.qualification_label || vars.RENDER_QUALIFICATION_LABEL || 'qualification:render' }}
+      QUALIFICATION_MARKER: ${{ inputs.qualification_marker || vars.RENDER_QUALIFICATION_MARKER || '<!-- continuum-render-qualification-result -->' }}
+      ARTIFACT_PREFIX: ${{ inputs.artifact_prefix || vars.RENDER_ARTIFACT_PREFIX || 'render-qualification' }}
+      DISPATCH_REF: ${{ inputs.dispatch_ref || vars.RENDER_DISPATCH_REF || 'main' }}
+      JOB_SCRIPT: ${{ inputs.job_script || vars.RENDER_JOB_SCRIPT }}
+      CLEANUP_SCRIPT: ${{ inputs.cleanup_script || vars.RENDER_CLEANUP_SCRIPT }}
+      QUALIFICATION_SCRIPT: ${{ inputs.qualification_script || vars.RENDER_QUALIFICATION_SCRIPT }}
+      IN_PROGRESS_LABEL: ${{ inputs.in_progress_label || vars.AUTOMATION_IN_PROGRESS_LABEL || 'automation:in-progress' }}
+      PAUSE_LABEL: ${{ inputs.pause_label || vars.AUTOMATION_PAUSE_LABEL || 'automation:paused' }}
+      REPAIR_LABEL: ${{ inputs.repair_label || vars.AUTOMATION_REPAIR_LABEL || 'priority:p0' }}
+      E2E_BRANCH_PREFIX: ${{ inputs.e2e_branch_prefix || vars.RENDER_E2E_BRANCH_PREFIX || 'opencode/issue' }}
+      CHAIN_WORKFLOW: ${{ inputs.chain_workflow || vars.RENDER_CHAIN_WORKFLOW }}
+      CAPACITY_WORKFLOW: ${{ inputs.capacity_workflow || vars.RENDER_CAPACITY_WORKFLOW }}
+      SCHEDULER_WORKFLOW: ${{ inputs.scheduler_workflow || vars.RENDER_SCHEDULER_WORKFLOW || 'continuum-issue-scheduler.yml' }}
+
+    steps:
+      - name: Checkout trusted controller
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ env.DISPATCH_REF }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Checkout Continuum classification engine
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          # The controller checkout above is the consumer repository this
+          # workflow runs in; it has no `src/continuum`. The authoritative
+          # classifier always comes from Continuum at the pinned revision.
+          repository: kodmial/continuum
+          ref: ${{ inputs.continuum_ref || 'main' }}
+          path: .continuum-render-engine
+          fetch-depth: 1
+          persist-credentials: false
+          sparse-checkout: |
+            src/continuum
+
+      - name: Execute Render lifecycle
+        id: execute
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GITHUB_TOKEN: ${{ github.token }}
+          # Two distinct credentials, never interchangeable: TAP_PAT is the
+          # classic GitHub PAT and reaches the GitHub API only, while
+          # RENDER_API_KEY is the Render API key and is the only credential the
+          # Render API accepts. Sending one in place of the other gets the run
+          # rejected, so the key is checked explicitly below rather than
+          # defaulted to any GitHub token.
+          RENDER_API_KEY: ${{ secrets.RENDER_API_KEY }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # Every precondition the fork checked is still checked here, and each
+          # one is an explicit failure: `continue-on-error` keeps the mandatory
+          # cleanup step running, it does not make a broken run look healthy.
+          [[ -n "$ISSUE_NUMBER" ]] || {
+            echo "::error::issue_number is required: no issue to execute"
+            exit 2
+          }
+          [[ "$EXECUTION_MODE" == "smoke" || "$EXECUTION_MODE" == "e2e" ]] || {
+            echo "::error::Unsupported execution mode: $EXECUTION_MODE"
+            exit 2
+          }
+          # The Render API key is a real credential, not an optional knob: with
+          # none, the Render calls below are unauthenticated and the run fails
+          # instead of reporting a green no-op. No fallback to TAP_PAT or to
+          # github.token, because neither is a Render API key.
+          [[ -n "$RENDER_API_KEY" ]] || {
+            echo "::error::No Render API key configured: set the RENDER_API_KEY secret."
+            echo "::error::RENDER_API_KEY is the Render API key and is distinct from TAP_PAT; a GitHub token is not accepted by the Render API."
+            exit 2
+          }
+          [[ -n "$OPENCODE_MODEL" ]] || {
+            echo "::error::No OpenCode model configured: set vars.OPENCODE_MODEL or pass the model input."
+            echo "::error::A Render worker started without a model executes nothing, so this run fails instead of reporting a green no-op."
+            exit 2
+          }
+          [[ -n "$JOB_SCRIPT" ]] || {
+            echo "::error::No Render job hook configured: pass job_script or set vars.RENDER_JOB_SCRIPT."
+            exit 2
+          }
+          [[ -n "$CLEANUP_SCRIPT" ]] || {
+            echo "::error::No Render cleanup hook configured: pass cleanup_script or set vars.RENDER_CLEANUP_SCRIPT."
+            exit 2
+          }
+          [[ -f "$JOB_SCRIPT" ]] || {
+            echo "::error::Configured Render job hook does not exist: $JOB_SCRIPT"
+            exit 2
+          }
+          [[ -f "$CLEANUP_SCRIPT" ]] || {
+            echo "::error::Configured Render cleanup hook does not exist: $CLEANUP_SCRIPT"
+            exit 2
+          }
+          bash "$JOB_SCRIPT"
+
+      - name: Delete ephemeral Render service
+        id: cleanup
+        if: always()
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GITHUB_TOKEN: ${{ github.token }}
+          RENDER_API_KEY: ${{ secrets.RENDER_API_KEY }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          [[ -n "$CLEANUP_SCRIPT" ]] || {
+            echo "::error::No Render cleanup hook configured: pass cleanup_script or set vars.RENDER_CLEANUP_SCRIPT."
+            exit 2
+          }
+
+          if [[ -f "$CLEANUP_SCRIPT" ]]; then
+            # Deleting the ephemeral worker is a real Render API call, so a
+            # missing key must fail the step rather than let it report success
+            # while the worker keeps running.
+            [[ -n "$RENDER_API_KEY" ]] || {
+              echo "::error::No Render API key configured: set the RENDER_API_KEY secret; the ephemeral Render service cannot be deleted without it."
+              exit 2
+            }
+            bash "$CLEANUP_SCRIPT"
+            exit 0
+          fi
+
+          if [[ -s "$RENDER_STATE_FILE" ]]; then
+            echo "::error::Render state exists but $CLEANUP_SCRIPT is missing"
+            exit 1
+          fi
+
+          echo "No Render state was created; cleanup has nothing to delete."
+
+      - name: Classify and persist qualification evidence
+        id: qualification
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.TAP_PAT || github.token }}
+          EXECUTE_OUTCOME: ${{ steps.execute.outcome }}
+          CLEANUP_OUTCOME: ${{ steps.cleanup.outcome }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          ISSUE_JSON="$(gh issue view "$ISSUE_NUMBER" --repo "$GITHUB_REPOSITORY" --json body,labels)"
+          IS_QUALIFICATION="$(jq -r --arg label "$QUALIFICATION_LABEL" '[.labels[].name] | index($label) != null' <<<"$ISSUE_JSON")"
+          # Coalesce the follow-up label read: the finalize step reuses this
+          # output instead of re-fetching the same issue (#254).
+          echo "issue_labels=$(jq -c '[.labels[].name]' <<<"$ISSUE_JSON")" >> "$GITHUB_OUTPUT"
+
+          if [[ "$IS_QUALIFICATION" == "true" ]]; then
+            ISSUE_BODY="$(jq -r '.body // ""' <<<"$ISSUE_JSON")"
+            ARTIFACT_ID="$(sed -n 's/^- Artifact ID: //p' <<<"$ISSUE_BODY" | tail -n1 | tr -d '`')"
+            BINARY_SHA="$(sed -n 's/^- Expected binary SHA-256: //p' <<<"$ISSUE_BODY" | tail -n1 | tr -d '`')"
+            [[ "$ARTIFACT_ID" =~ ^[0-9]+$ ]] || ARTIFACT_ID=0
+            [[ "$BINARY_SHA" =~ ^[0-9a-f]{64}$ ]] || BINARY_SHA="unknown"
+
+            [[ -n "$QUALIFICATION_SCRIPT" ]] || {
+              echo "::error::No Render qualification hook configured: pass qualification_script or set vars.RENDER_QUALIFICATION_SCRIPT."
+              exit 2
+            }
+            [[ -f "$QUALIFICATION_SCRIPT" ]] || {
+              echo "::error::Configured Render qualification hook does not exist: $QUALIFICATION_SCRIPT"
+              exit 1
+            }
+            python3 "$QUALIFICATION_SCRIPT" \
+              --result "$RENDER_RESULT_FILE" \
+              --memory "$RENDER_MEMORY_SUMMARY_FILE" \
+              --artifact-id "$ARTIFACT_ID" \
+              --binary-sha256 "$BINARY_SHA" \
+              --execute-outcome "$EXECUTE_OUTCOME" \
+              --cleanup-outcome "$CLEANUP_OUTCOME" \
+              --output "$RENDER_QUAL_RESULT_FILE"
+
+            BODY="$(jq -c . "$RENDER_QUAL_RESULT_FILE")"
+            gh issue comment "$ISSUE_NUMBER" --repo "$GITHUB_REPOSITORY" \
+              --body "$(printf '%s\n%s\n%s\n%s' "🛰️ **Project · ${GITHUB_REPOSITORY##*/}**" "<!-- continuum-origin role=project component=qualification -->" "$QUALIFICATION_MARKER" "$BODY")"
+            echo "classification=$(jq -r .classification "$RENDER_QUAL_RESULT_FILE")" >> "$GITHUB_OUTPUT"
+            echo "subtype=$(jq -r .subtype "$RENDER_QUAL_RESULT_FILE")" >> "$GITHUB_OUTPUT"
+            echo "fingerprint=$(jq -r .fingerprint "$RENDER_QUAL_RESULT_FILE")" >> "$GITHUB_OUTPUT"
+          else
+            echo "classification=not-chain" >> "$GITHUB_OUTPUT"
+            echo "subtype=not-chain" >> "$GITHUB_OUTPUT"
+            echo "fingerprint=" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Classify Render failure with the authoritative engine
+        id: engine
+        if: always()
+        env:
+          EXECUTE_OUTCOME: ${{ steps.execute.outcome }}
+          CLEANUP_OUTCOME: ${{ steps.cleanup.outcome }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Authoritative failure classification (kodmial/continuum#263): the
+          # engine reads the durable machine evidence the Render harness
+          # already produced (run result, cgroup memory summary, lifecycle
+          # state with worker replacement/restart evidence, consumer
+          # qualification payload) and classifies before any recovery route
+          # is chosen. A proven capacity/memory-envelope failure never
+          # becomes a repository repair; repository repair requires positive
+          # defect evidence; anything else holds without guessing.
+          ENGINE_OUT="$RUNNER_TEMP/continuum-render-engine-classification.json"
+          PYTHONPATH="$GITHUB_WORKSPACE/.continuum-render-engine/src" python3 -m continuum.render_execution \
+            --result "$RENDER_RESULT_FILE" \
+            --memory "$RENDER_MEMORY_SUMMARY_FILE" \
+            --state "$RENDER_STATE_FILE" \
+            --qualification "$RENDER_QUAL_RESULT_FILE" \
+            --execute-outcome "$EXECUTE_OUTCOME" \
+            --cleanup-outcome "$CLEANUP_OUTCOME" \
+            --output "$ENGINE_OUT" || {
+            echo "::error::Authoritative engine classification failed; failing closed to hold without repository repair."
+            jq -n \
+              --arg classification "unknown" \
+              --arg subtype "engine-error" \
+              --arg reason "engine classification failed; holding without repository repair" \
+              --arg fingerprint "engine-error" \
+              '{classification:$classification,subtype:$subtype,reason:$reason,fingerprint:$fingerprint,limit_bytes:null,peak_bytes:null,restarts:0,hold_marker:null,failure_marker:""}' \
+              > "$ENGINE_OUT"
+          }
+          echo "classification=$(jq -r .classification "$ENGINE_OUT")" >> "$GITHUB_OUTPUT"
+          echo "subtype=$(jq -r .subtype "$ENGINE_OUT")" >> "$GITHUB_OUTPUT"
+          echo "fingerprint=$(jq -r .fingerprint "$ENGINE_OUT")" >> "$GITHUB_OUTPUT"
+          echo "reason=$(jq -r .reason "$ENGINE_OUT")" >> "$GITHUB_OUTPUT"
+
+      - name: Upload durable Render qualification evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: ${{ env.ARTIFACT_PREFIX }}-${{ inputs.issue_number }}-${{ github.run_id }}
+          path: |
+            ${{ inputs.result_file || vars.RENDER_RESULT_FILE || '/tmp/continuum-render-result.json' }}
+            ${{ inputs.memory_summary_file || vars.RENDER_MEMORY_SUMMARY_FILE || '/tmp/continuum-render-memory-summary.json' }}
+            ${{ inputs.qualification_result_file || vars.RENDER_QUALIFICATION_RESULT_FILE || '/tmp/continuum-render-qualification.json' }}
+            ${{ inputs.state_file || vars.RENDER_STATE_FILE || '/tmp/continuum-render-state.json' }}
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Finalize execution
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EXECUTE_OUTCOME: ${{ steps.execute.outcome }}
+          CLEANUP_OUTCOME: ${{ steps.cleanup.outcome }}
+          QUALIFICATION_CLASSIFICATION: ${{ steps.qualification.outputs.classification }}
+          QUALIFICATION_SUBTYPE: ${{ steps.qualification.outputs.subtype }}
+          QUALIFICATION_FINGERPRINT: ${{ steps.qualification.outputs.fingerprint }}
+          ISSUE_LABELS_JSON: ${{ steps.qualification.outputs.issue_labels }}
+          ENGINE_CLASSIFICATION: ${{ steps.engine.outputs.classification }}
+          ENGINE_SUBTYPE: ${{ steps.engine.outputs.subtype }}
+          ENGINE_FINGERPRINT: ${{ steps.engine.outputs.fingerprint }}
+          ENGINE_REASON: ${{ steps.engine.outputs.reason }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # Request budget (#254): no listing below walks more than
+          # CONTINUUM_MAX_PAGES pages; counts are reported at the end.
+          CONTINUUM_MAX_PAGES=5
+          CONTINUUM_API_CALLS=0
+          # File-backed counter: continuum_api_get runs inside command
+          # substitution (a subshell), so a shell variable increment would
+          # be lost to the parent. A temp file survives subshells.
+          CONTINUUM_API_COUNT_FILE="${RUNNER_TEMP:-${TMPDIR:-/tmp}}/continuum-api-calls.$$"
+          echo 0 > "$CONTINUUM_API_COUNT_FILE"
+          continuum_api_count_bump() {
+            local cur=0
+            cur="$(cat "$CONTINUUM_API_COUNT_FILE" 2>/dev/null || echo 0)"
+            [[ "$cur" =~ ^[0-9]+$ ]] || cur=0
+            echo $((cur + 1)) > "$CONTINUUM_API_COUNT_FILE"
+          }
+          continuum_api_get() {
+            local rc=0
+            gh api "$@" || rc=$?
+            continuum_api_count_bump
+            return $rc
+          }
+          # Bounded slurp-compatible page walk: keeps the array-of-pages
+          # shape callers already parse with `.[][]?`, capped at
+          # CONTINUUM_MAX_PAGES instead of full-history pagination.
+          continuum_bounded_slurp() {
+            local url="$1" page=1 pages_out="" sep="?"
+            [[ "$url" == *"?"* ]] && sep="&"
+            while [[ "$page" -le "$CONTINUUM_MAX_PAGES" ]]; do
+              local page_json count
+              if ! page_json="$(continuum_api_get "${url}${sep}per_page=100&page=${page}" 2>/dev/null)"; then
+                break
+              fi
+              count="$(jq 'length' <<<"$page_json" 2>/dev/null || echo 0)"
+              [[ "$count" =~ ^[0-9]+$ ]] || break
+              [[ "$count" -gt 0 ]] || break
+              pages_out+="$page_json"$'\n'
+              [[ "$count" -lt 100 ]] && break
+              page=$((page + 1))
+            done
+            if [[ -z "$pages_out" ]]; then
+              echo "[]"
+            else
+              jq -s '.' <<<"$(grep -v '^$' <<<"$pages_out" || true)"
+            fi
+          }
+
+          # Newest-first comment window: issue comments list oldest-first
+          # and ignore sort/direction, so pages 1..N would miss a recent
+          # repair marker on a long thread. Derive the last page from the
+          # issue total (like child-dispatcher) and walk the newest
+          # CONTINUUM_MAX_PAGES pages instead, keeping the array-of-pages
+          # shape callers parse with `.[][]?`.
+          continuum_newest_comments_slurp() {
+            local repo="$1" issue="$2"
+            local total last first page page_json count pages_out=""
+            # Fail closed: an unknown comment total cannot anchor the
+            # newest window, so return failure instead of scanning only
+            # the oldest page and missing a recent repair marker (which
+            # would undercount the budget and permit an extra repair).
+            if ! total="$(continuum_api_get "repos/$repo/issues/$issue" --jq '.comments // 0' 2>/dev/null)"; then
+              echo "::error::Could not determine the newest comment page; failing closed without repair." >&2
+              return 1
+            fi
+            [[ "$total" =~ ^[0-9]+$ ]] || {
+              echo "::error::Could not parse the newest comment page; failing closed without repair." >&2
+              return 1
+            }
+            last=$(( (total + 99) / 100 ))
+            [[ "$last" -ge 1 ]] || last=1
+            first=$(( last - CONTINUUM_MAX_PAGES + 1 ))
+            [[ "$first" -ge 1 ]] || first=1
+            page="$first"
+            while [[ "$page" -le "$last" ]]; do
+              # Fail closed: a missed page may hold a repair/transient
+              # marker, so a fetch/parse gap must exhaust the budget
+              # instead of returning the remaining pages as authoritative
+              # (which would undercount and permit an extra repair/retry).
+              if ! page_json="$(continuum_api_get "repos/$repo/issues/$issue/comments?per_page=100&page=${page}" 2>/dev/null)"; then
+                echo "::error::Newest comment page ${page} could not be retrieved; failing closed without repair." >&2
+                return 1
+              fi
+              if ! count="$(jq 'length' <<<"$page_json" 2>/dev/null)"; then
+                echo "::error::Newest comment page ${page} could not be parsed; failing closed without repair." >&2
+                return 1
+              fi
+              [[ "$count" =~ ^[0-9]+$ ]] || {
+                echo "::error::Newest comment page ${page} could not be parsed; failing closed without repair." >&2
+                return 1
+              }
+              if [[ "$count" -eq 0 ]]; then
+                if [[ "$total" -gt 0 ]]; then
+                  echo "::error::Newest comment page ${page} is unexpectedly empty; failing closed without repair." >&2
+                  return 1
+                fi
+                page=$((page + 1))
+                continue
+              fi
+              pages_out+="$page_json"$'\n'
+              page=$((page + 1))
+            done
+            if [[ -z "$pages_out" ]]; then
+              # Empty is authoritative only when the issue truly has no
+              # comments; otherwise the window is unretrieved, so fail
+              # closed instead of reporting a zero budget count.
+              if [[ "$total" -gt 0 ]]; then
+                echo "::error::Newest comment window could not be retrieved; failing closed without repair." >&2
+                return 1
+              fi
+              echo "[]"
+            else
+              jq -s '.' <<<"$(grep -v '^$' <<<"$pages_out" || true)" || return 1
+            fi
+          }
+
+          # A follow-up chain is optional: without one the controller still
+          # classifies and still fails, it simply does not dispatch a workflow
+          # the consumer may not have installed.
+          wake_chain() {
+            if [[ -z "$CHAIN_WORKFLOW" ]]; then
+              echo "No follow-up chain workflow is configured; skipping the wake."
+              return 0
+            fi
+            gh workflow run "$CHAIN_WORKFLOW" --repo "$GITHUB_REPOSITORY" --ref "$DISPATCH_REF"
+          }
+
+          # Dedicated optimization/profile/capacity decision route. Empty
+          # holds the source safely instead of dispatching a file the
+          # consumer may not have.
+          wake_capacity() {
+            if [[ -z "$CAPACITY_WORKFLOW" ]]; then
+              echo "No capacity workflow is configured; holding the source safely without dispatching."
+              return 0
+            fi
+            gh workflow run "$CAPACITY_WORKFLOW" --repo "$GITHUB_REPOSITORY" --ref "$DISPATCH_REF"
+          }
+
+          # WIP release happens first on every path, including holds: a held
+          # capacity failure must never permanently consume an active WIP
+          # slot, so the reservation label is always removed here.
+          gh issue edit "$ISSUE_NUMBER" --repo "$GITHUB_REPOSITORY" \
+            --remove-label "$IN_PROGRESS_LABEL" >/dev/null 2>&1 || true
+
+          # Reuse the qualification step's label snapshot when present
+          # instead of re-reading the same issue (#254).
+          if [[ -n "${ISSUE_LABELS_JSON:-}" ]]; then
+            ISSUE_LABELS="$ISSUE_LABELS_JSON"
+          else
+            ISSUE_LABELS="$(gh issue view "$ISSUE_NUMBER" --repo "$GITHUB_REPOSITORY" --json labels --jq '[.labels[].name]')"
+            continuum_api_count_bump
+          fi
+          if jq -e --arg label "$QUALIFICATION_LABEL" 'index($label) != null' <<<"$ISSUE_LABELS" >/dev/null; then
+            CHAIN_QUALIFICATION="yes"
+          else
+            CHAIN_QUALIFICATION="no"
+          fi
+
+          QUALIFICATION_FAILED="no"
+          if [[ "$CHAIN_QUALIFICATION" == "yes" && "$QUALIFICATION_CLASSIFICATION" != "pass" ]]; then
+            QUALIFICATION_FAILED="yes"
+          fi
+
+          # Authoritative routing (kodmial/continuum#263): the engine
+          # classified the run from durable machine evidence before any
+          # recovery route is chosen. A proven capacity/memory-envelope
+          # failure never creates or keeps a repository-code repair task;
+          # repository repair requires positive defect evidence; transient
+          # infrastructure retries automatically through a bounded budget;
+          # everything else holds safely with a machine-readable reason.
+          # An empty engine verdict fails closed to hold, never to repair.
+          ENGINE_CLASSIFICATION="${ENGINE_CLASSIFICATION:-unknown}"
+          ENGINE_FINGERPRINT="${ENGINE_FINGERPRINT:-}"
+          ENGINE_REASON="${ENGINE_REASON:-no engine reason recorded}"
+
+          # Bounded comment scan (#254): newest-first window keeping the
+          # array-of-pages shape the fingerprint helpers parse with
+          # `.[][]?`, capped at CONTINUUM_MAX_PAGES instead of full-history
+          # pagination. Comments list oldest-first, so the oldest pages
+          # would miss a recent repair marker and undercount the budget.
+          COMMENTS_UNKNOWN=0
+          if ! COMMENTS_JSON="$(continuum_newest_comments_slurp "$GITHUB_REPOSITORY" "$ISSUE_NUMBER" 2>/dev/null)"; then
+            echo "::warning::Comment scan could not anchor the newest window; failing closed with an exhausted repair budget." >&2
+            COMMENTS_UNKNOWN=1
+            COMMENTS_JSON="[]"
+          fi
+
+          fingerprint_seen() {
+            # Fail closed: unknown comment state may hide a marker, so
+            # report it as seen and coalesce instead of duplicating work.
+            [[ "$COMMENTS_UNKNOWN" -eq 1 ]] && return 0
+            local marker="$1"
+            local count
+            count="$(jq --arg marker "$marker" \
+              '[.[][]? | select((.body // "") | contains($marker))] | length' \
+              <<<"$COMMENTS_JSON" 2>/dev/null || echo 0)"
+            [[ "${count:-0}" -ge 1 ]]
+          }
+
+          if [[ "$CLEANUP_OUTCOME" != "success" ]]; then
+            # Mandatory cleanup is independently verified on every path and
+            # a cleanup failure is never a repository defect, so it holds
+            # without creating a repair issue.
+            gh issue edit "$ISSUE_NUMBER" --repo "$GITHUB_REPOSITORY" \
+              --add-label "$PAUSE_LABEL" >/dev/null 2>&1 || true
+            gh issue comment "$ISSUE_NUMBER" --repo "$GITHUB_REPOSITORY" \
+                --body "$(printf '%s\n%s\n%s' '⚡ **Continuum · render-executor**' '<!-- continuum-origin role=continuum component=render-executor -->' "Mandatory Render cleanup failed in run $GITHUB_RUN_ID (execute=$EXECUTE_OUTCOME, cleanup=$CLEANUP_OUTCOME). Cleanup is verified independently on every path; the source is held paused for inspection and no repository repair was created.")"
+            echo "::error::Mandatory Render cleanup failed"
+            exit 1
+          fi
+
+          # Authoritative routing (kodmial/continuum#263): the engine
+          # classified the run from durable machine evidence before any
+          # recovery route is chosen below. The legacy qualification-only
+          # repair path from #254 is superseded here: qualification verdicts
+          # still gate success via QUALIFICATION_FAILED, while the engine
+          # decides between terminal hold, bounded retry, and
+          # evidence-driven repair.
+          case "$ENGINE_CLASSIFICATION" in
+            capacity|provider|timeout_unknown|unknown)
+              # Terminal hold: no repository repair, no blind rerun, WIP
+              # already released above. Identical fingerprints coalesce
+              # instead of spawning repeated tasks; a materially changed
+              # runtime artifact/profile produces a new fingerprint and may
+              # explicitly re-arm the source.
+              gh issue edit "$ISSUE_NUMBER" --repo "$GITHUB_REPOSITORY" \
+                --add-label "$PAUSE_LABEL" >/dev/null 2>&1 || true
+              FAILURE_MARKER="<!-- continuum-render-failure-fingerprint=$ENGINE_FINGERPRINT -->"
+              if [[ -n "$ENGINE_FINGERPRINT" ]] && fingerprint_seen "$FAILURE_MARKER"; then
+                gh issue comment "$ISSUE_NUMBER" --repo "$GITHUB_REPOSITORY" \
+                    --body "$(printf '%s\n%s\n%s' '⚡ **Continuum · render-executor**' '<!-- continuum-origin role=continuum component=render-executor -->' "Identical Render $ENGINE_CLASSIFICATION failure fingerprint repeated ($ENGINE_FINGERPRINT). Automation remains paused instead of creating another identical task; a materially changed runtime artifact/profile or memory configuration may explicitly re-arm the source.")"
+                echo "::error::Repeated identical Render failure fingerprint: $ENGINE_FINGERPRINT"
+                exit 1
+              fi
+              HOLD_MARKER="<!-- continuum-render-capacity-hold fingerprint=$ENGINE_FINGERPRINT -->"
+              gh issue comment "$ISSUE_NUMBER" --repo "$GITHUB_REPOSITORY" \
+                --body "$(printf '%s\n%s' "$FAILURE_MARKER" "<!-- continuum-origin role=continuum component=render-executor -->")"
+              gh issue comment "$ISSUE_NUMBER" --repo "$GITHUB_REPOSITORY" \
+                  --body "$(printf '%s\n%s\n%s\n%s' "$HOLD_MARKER" '⚡ **Continuum · render-executor**' '<!-- continuum-origin role=continuum component=render-executor -->' "Render $ENGINE_CLASSIFICATION failure in run $GITHUB_RUN_ID ($ENGINE_SUBTYPE): $ENGINE_REASON. No repository repair was created and the workload was not blindly rerun.")"
+              if [[ "$ENGINE_CLASSIFICATION" == "capacity" && "$CHAIN_QUALIFICATION" == "yes" ]]; then
+                wake_chain
+              fi
+              if [[ "$ENGINE_CLASSIFICATION" == "capacity" ]]; then
+                wake_capacity
+              fi
+              echo "::error::Render execution held after $ENGINE_CLASSIFICATION classification ($ENGINE_SUBTYPE)"
+              exit 1
+              ;;
+            transient)
+              # Bounded automatic infrastructure recovery without a
+              # repository repair issue. The source stays eligible for an
+              # automatic retry; the marker budget stops an endless loop.
+              # Fail closed: unknown comment state may hide markers, so
+              # treat the budget as exhausted instead of retrying blindly.
+              if [[ "$COMMENTS_UNKNOWN" -eq 1 ]]; then
+                TRANSIENT_COUNT="$MAX_RENDER_REPAIR_ATTEMPTS"
+              else
+                TRANSIENT_COUNT="$(jq '[.[][]? | select((.body // "") | contains("<!-- continuum-render-transient-attempt -->"))] | length' \
+                  <<<"$COMMENTS_JSON" 2>/dev/null || echo "$MAX_RENDER_REPAIR_ATTEMPTS")"
+              fi
+              if [[ "${TRANSIENT_COUNT:-0}" -ge "$MAX_RENDER_REPAIR_ATTEMPTS" ]]; then
+                gh issue edit "$ISSUE_NUMBER" --repo "$GITHUB_REPOSITORY" \
+                  --add-label "$PAUSE_LABEL" >/dev/null 2>&1 || true
+                gh issue comment "$ISSUE_NUMBER" --repo "$GITHUB_REPOSITORY" \
+                    --body "$(printf '%s\n%s\n%s' '⚡ **Continuum · render-executor**' '<!-- continuum-origin role=continuum component=render-executor -->' "Render transient infrastructure failures repeated $TRANSIENT_COUNT time(s); automatic recovery limit ($MAX_RENDER_REPAIR_ATTEMPTS) is exhausted. Issue remains paused for inspection and no repository repair was created.")"
+                echo "::error::Transient Render recovery budget exhausted"
+                exit 1
+              fi
+              gh issue comment "$ISSUE_NUMBER" --repo "$GITHUB_REPOSITORY" \
+                  --body "$(printf '%s\n%s\n%s\n%s' '<!-- continuum-render-transient-attempt -->' '⚡ **Continuum · render-executor**' '<!-- continuum-origin role=continuum component=render-executor -->' "Transient Render infrastructure failure in run $GITHUB_RUN_ID ($ENGINE_SUBTYPE): $ENGINE_REASON. Bounded automatic recovery attempt $((TRANSIENT_COUNT + 1))/$MAX_RENDER_REPAIR_ATTEMPTS; no repository repair was created.")"
+              gh issue edit "$ISSUE_NUMBER" --repo "$GITHUB_REPOSITORY" \
+                --remove-label "$PAUSE_LABEL" >/dev/null 2>&1 || true
+              gh workflow run "$SCHEDULER_WORKFLOW" --repo "$GITHUB_REPOSITORY" --ref "$DISPATCH_REF"
+              echo "::error::Transient Render infrastructure failure; automatic recovery scheduled"
+              exit 1
+              ;;
+            repository)
+              # Evidence-driven repository repair only: the engine found a
+              # code/harness defect with healthy memory. Deduplicated per
+              # source and coalesced per identical fingerprint.
+              gh issue edit "$ISSUE_NUMBER" --repo "$GITHUB_REPOSITORY" \
+                --add-label "$PAUSE_LABEL" >/dev/null 2>&1 || true
+              FAILURE_MARKER="<!-- continuum-render-failure-fingerprint=$ENGINE_FINGERPRINT -->"
+              if [[ -n "$ENGINE_FINGERPRINT" ]] && fingerprint_seen "$FAILURE_MARKER"; then
+                gh issue comment "$ISSUE_NUMBER" --repo "$GITHUB_REPOSITORY" \
+                    --body "$(printf '%s\n%s\n%s' '⚡ **Continuum · render-executor**' '<!-- continuum-origin role=continuum component=render-executor -->' "Identical Render repository failure fingerprint repeated ($ENGINE_FINGERPRINT). Automation remains paused instead of creating another identical repair; a materially changed runtime artifact/profile may explicitly re-arm the source.")"
+                echo "::error::Repeated identical Render repository failure fingerprint: $ENGINE_FINGERPRINT"
+                exit 1
+              fi
+              if [[ -n "$ENGINE_FINGERPRINT" ]]; then
+                gh issue comment "$ISSUE_NUMBER" --repo "$GITHUB_REPOSITORY" \
+                  --body "$(printf '%s\n%s' "$FAILURE_MARKER" "<!-- continuum-origin role=continuum component=render-executor -->")"
+              fi
+              # Fail closed: unknown comment state may hide repair markers,
+              # so treat the budget as exhausted instead of permitting an
+              # extra repair behind an undercount.
+              if [[ "$COMMENTS_UNKNOWN" -eq 1 ]]; then
+                REPAIR_COUNT="$MAX_RENDER_REPAIR_ATTEMPTS"
+              else
+                REPAIR_COUNT="$(jq '[.[][]? | select((.body // "") | contains("<!-- continuum-render-repair-attempt -->"))] | length' \
+                  <<<"$COMMENTS_JSON" 2>/dev/null || echo "$MAX_RENDER_REPAIR_ATTEMPTS")"
+              fi
+              if [[ "${REPAIR_COUNT:-0}" -lt "$MAX_RENDER_REPAIR_ATTEMPTS" ]]; then
+                SOURCE_MARKER="<!-- continuum-render-repair source=$ISSUE_NUMBER -->"
+                # Bounded open-issue scan (#254): repair issues are recent, so
+                # a capped newest-first window finds them without walking
+                # full history. sort/direction are explicit: the default
+                # issue ordering keeps the oldest-first pages, which would
+                # miss a recent repair beyond the first ~500 open issues.
+                ALL_ISSUES_JSON="$(continuum_bounded_slurp \
+                  "repos/$GITHUB_REPOSITORY/issues?state=open&sort=created&direction=desc" 2>/dev/null || echo "[]")"
+                EXISTING_REPAIR="$(jq -r --arg marker "$SOURCE_MARKER" \
+                  '.[][]? | select((.body // "") | contains($marker)) | .number' \
+                  <<<"$ALL_ISSUES_JSON" | head -n 1)"
+
+                if [[ -z "$EXISTING_REPAIR" ]]; then
+                  REPAIR_BODY="$(cat <<EOF
+          $SOURCE_MARKER
+          <!-- continuum-render-failed-run=$GITHUB_RUN_ID -->
+          <!-- continuum-render-failure-classification=$ENGINE_CLASSIFICATION -->
+
+          ## Goal
+
+          Repair the concrete repository defect that caused Render execution for source issue #$ISSUE_NUMBER to fail in workflow run $GITHUB_RUN_ID.
+
+          ## Required investigation
+
+          - Inspect the failed run using: gh run view $GITHUB_RUN_ID --repo $GITHUB_REPOSITORY --log-failed.
+          - Identify the root cause from evidence; do not guess or mask the failure.
+          - For external API behavior, verify the contract against current official vendor documentation.
+          - Fix the reusable implementation, not only this single run.
+          - Add or strengthen regression tests for the discovered failure mode.
+          - Run the relevant test suite and keep the change scoped.
+          - Do not close or modify source issue #$ISSUE_NUMBER. It stays paused until this repair PR is merged.
+
+          ## Failure context
+
+          - Source issue: #$ISSUE_NUMBER
+          - Failed run: $GITHUB_RUN_ID
+          - Engine classification: $ENGINE_CLASSIFICATION ($ENGINE_SUBTYPE)
+          - Engine reason: $ENGINE_REASON
+          - Execute outcome: $EXECUTE_OUTCOME
+          - Cleanup outcome: $CLEANUP_OUTCOME
+          - Execution mode: $EXECUTION_MODE
+          EOF
+                  )"
+                  REPAIR_URL="$(gh issue create --repo "$GITHUB_REPOSITORY" \
+                    --title "P0: Repair Render execution failure for #$ISSUE_NUMBER (run $GITHUB_RUN_ID)" \
+                    --label "$REPAIR_LABEL" --body "$REPAIR_BODY")"
+                  gh issue comment "$ISSUE_NUMBER" --repo "$GITHUB_REPOSITORY" --body "$(cat <<EOF
+          <!-- continuum-render-repair-attempt -->
+          ⚡ **Continuum · render-executor**
+          <!-- continuum-origin role=continuum component=render-executor -->
+          Render execution failed with engine classification $ENGINE_CLASSIFICATION ($ENGINE_SUBTYPE, run=$GITHUB_RUN_ID).
+          Created automatic recovery issue: $REPAIR_URL
+          The source issue remains paused until the recovery PR merges.
+          EOF
+                  )"
+                  gh workflow run "$SCHEDULER_WORKFLOW" --repo "$GITHUB_REPOSITORY" --ref "$DISPATCH_REF"
+                else
+                  gh issue comment "$ISSUE_NUMBER" --repo "$GITHUB_REPOSITORY" \
+                      --body "$(printf '%s\n%s\n%s' '⚡ **Continuum · render-executor**' '<!-- continuum-origin role=continuum component=render-executor -->' "Render execution failed in run $GITHUB_RUN_ID; recovery issue #$EXISTING_REPAIR is already open, so no duplicate repair was created.")"
+                fi
+              else
+                gh issue comment "$ISSUE_NUMBER" --repo "$GITHUB_REPOSITORY" \
+                      --body "$(printf '%s\n%s\n%s' '⚡ **Continuum · render-executor**' '<!-- continuum-origin role=continuum component=render-executor -->' "Render execution failed in run $GITHUB_RUN_ID. Automatic recovery limit ($MAX_RENDER_REPAIR_ATTEMPTS) is exhausted; issue remains paused for inspection.")"
+              fi
+
+              echo "::error::Render execution failed with repository classification"
+              exit 1
+              ;;
+            pass)
+              # Engine confirms success; fall through to the mode branches
+              # below, which still require a successful execute and (for
+              # qualification runs) a passing qualification verdict.
+              ;;
+            *)
+              gh issue edit "$ISSUE_NUMBER" --repo "$GITHUB_REPOSITORY" \
+                --add-label "$PAUSE_LABEL" >/dev/null 2>&1 || true
+              gh issue comment "$ISSUE_NUMBER" --repo "$GITHUB_REPOSITORY" \
+                  --body "$(printf '%s\n%s\n%s' '⚡ **Continuum · render-executor**' '<!-- continuum-origin role=continuum component=render-executor -->' "Render execution produced an unrecognized engine classification ($ENGINE_CLASSIFICATION) in run $GITHUB_RUN_ID. Failing closed: the source is held paused and no repository repair was created.")"
+              echo "::error::Unrecognized Render engine classification: $ENGINE_CLASSIFICATION"
+              exit 1
+              ;;
+          esac
+
+          if [[ "$EXECUTE_OUTCOME" != "success" || "$QUALIFICATION_FAILED" == "yes" ]]; then
+            # Fail closed: the engine did not route this failure to a
+            # terminal hold, a bounded retry, or an evidence-driven repair,
+            # so hold without creating a repository repair rather than
+            # guessing a repository defect.
+            gh issue edit "$ISSUE_NUMBER" --repo "$GITHUB_REPOSITORY" \
+              --add-label "$PAUSE_LABEL" >/dev/null 2>&1 || true
+            gh issue comment "$ISSUE_NUMBER" --repo "$GITHUB_REPOSITORY" \
+                --body "$(printf '%s\n%s\n%s' '⚡ **Continuum · render-executor**' '<!-- continuum-origin role=continuum component=render-executor -->' "Render execution failed in run $GITHUB_RUN_ID (execute=$EXECUTE_OUTCOME, engine=$ENGINE_CLASSIFICATION) without a matching recovery route. Failing closed: the source is held paused and no repository repair was created.")"
+            echo "::error::Render execution failed without a matching recovery route"
+            exit 1
+          fi
+
+          if [[ "$EXECUTION_MODE" == "smoke" ]]; then
+            gh issue close "$ISSUE_NUMBER" --repo "$GITHUB_REPOSITORY" \
+              --reason completed \
+                --comment "$(printf '%s\n%s\n%s' '⚡ **Continuum · render-executor**' '<!-- continuum-origin role=continuum component=render-executor -->' "Real Render smoke execution and mandatory cleanup completed successfully in workflow run $GITHUB_RUN_ID.")"
+            if [[ "$CHAIN_QUALIFICATION" == "yes" ]]; then
+              wake_chain
+            fi
+            gh workflow run "$SCHEDULER_WORKFLOW" --repo "$GITHUB_REPOSITORY" --ref "$DISPATCH_REF"
+          else
+            PR_JSON="$(gh pr list --repo "$GITHUB_REPOSITORY" --state all --limit 100 \
+              --json number,headRefName,state)"
+            PR_NUMBER="$(jq -r --arg prefix "${E2E_BRANCH_PREFIX}${ISSUE_NUMBER}-" \
+              '[.[] | select(.headRefName | startswith($prefix))][0].number // empty' \
+              <<<"$PR_JSON")"
+
+            if [[ -z "$PR_NUMBER" ]]; then
+              gh issue edit "$ISSUE_NUMBER" --repo "$GITHUB_REPOSITORY" \
+                --add-label "$PAUSE_LABEL" >/dev/null 2>&1 || true
+              gh issue comment "$ISSUE_NUMBER" --repo "$GITHUB_REPOSITORY" \
+                  --body "$(printf '%s\n%s\n%s' '⚡ **Continuum · render-executor**' '<!-- continuum-origin role=continuum component=render-executor -->' "Render E2E execution and cleanup succeeded in workflow run $GITHUB_RUN_ID, but no compatible ${E2E_BRANCH_PREFIX}${ISSUE_NUMBER}-... PR was found.")"
+              echo "::error::E2E mode completed without the required PR"
+              exit 1
+            fi
+
+            gh issue edit "$ISSUE_NUMBER" --repo "$GITHUB_REPOSITORY" \
+              --add-label "$IN_PROGRESS_LABEL" >/dev/null 2>&1 || true
+            gh issue comment "$ISSUE_NUMBER" --repo "$GITHUB_REPOSITORY" \
+                --body "$(printf '%s\n%s\n%s' '⚡ **Continuum · render-executor**' '<!-- continuum-origin role=continuum component=render-executor -->' "Render E2E execution and cleanup succeeded in workflow run $GITHUB_RUN_ID; PR #$PR_NUMBER is now in the CI/merge chain.")"
+          fi
+
+          # Drain the file-backed counter (bounded reads ran in subshells)
+          # so the budget line reflects every bounded-list call.
+          CONTINUUM_API_CALLS="$(cat "$CONTINUUM_API_COUNT_FILE" 2>/dev/null || echo 0)"
+          [[ "$CONTINUUM_API_CALLS" =~ ^[0-9]+$ ]] || CONTINUUM_API_CALLS=0
+          rm -f "$CONTINUUM_API_COUNT_FILE"
+          echo "continuum-api-budget: bounded_list_calls=$CONTINUUM_API_CALLS max_pages=$CONTINUUM_MAX_PAGES"

@@ -128,9 +128,10 @@ APPROVED_423_OPENCODE_SHA256 = (
 # Wording cleanup: re-pin the exact protected workflow artifact after the
 # rate-limit/quota wording cleanup, which changes comments only. The #423 pin
 # above remains for historical audit; unrelated workflow drift still fails
-# closed.
+# closed. Ref-aware CodeRabbit dispatch resolution changes only the
+# dispatch-caller lookup, so the digest advances with that reviewed patch.
 APPROVED_WORDING_OPENCODE_SHA256 = (
-    "e996e7e5558c98730511a45dc76f8d4777dc3435817d92d426d732edb829362d"
+    "5f00093e88d8e744bd0506f2a65d2048b6c313f9c90191c39bc27327e9e5e9c4"
 )
 
 APPROVED_350_SELF_CALLER_SHA256 = (

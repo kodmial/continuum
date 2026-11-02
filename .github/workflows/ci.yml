@@ -1,0 +1,44 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  actions: write
+  contents: read
+  pull-requests: read
+  statuses: write
+
+jobs:
+  validate:
+    uses: ./.github/workflows/continuum-validation.yml
+    secrets: inherit
+    with:
+      auto_detect: ${{ 'false' }}
+      dispatch_repair: ${{ 'false' }}
+      validation_command: bash scripts/validate-continuum.sh
+
+  # Main-push warmer and Work Lock #68 PR proof, without a consumer caller.
+  toolchain_cache_qualification:
+    if: github.event_name == 'push' || (github.event_name == 'pull_request' && startsWith(github.head_ref, 'work-lock-68-'))
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Verified cached OpenCode / PR-Agent runtime
+        id: toolchain
+        uses: ./.github/actions/agent-toolchain
+        with:
+          components: both
+      - name: Verify CLI and cache telemetry
+        shell: bash
+        run: |
+          set -euo pipefail
+          opencode --version
+          pr-agent --version
+          echo "verified_cache_hit=${{ steps.toolchain.outputs.cache-hit }}"
+          echo "opencode_version=${{ steps.toolchain.outputs.runtime-version }}"

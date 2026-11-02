@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import codecs
 from dataclasses import dataclass
 from datetime import timezone
 import email.utils
@@ -20,6 +21,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -260,6 +262,33 @@ def route_order(config: Configuration, state: dict, now: int) -> tuple[str, ...]
     return tuple(allowed)
 
 
+# A stalled free-quota probe still prints this before `opencode run` hangs.
+# Only a `run --format json` error event is authoritative: text/tool events
+# and quoted "429" response prose are never evidence. Termination needs hard
+# evidence too — an HTTP 429 status or the `FreeUsageLimitError` identifier —
+# because a generic "rate limit" message may still be retried successfully by
+# the CLI, and killing the probe would burn the whole selection. The line may
+# still be partial (the child writes without a trailing newline), so the match
+# stops at the quota signature instead of requiring a complete JSON object;
+# `classify` keeps its cross-engine `quota_429` label.
+QUOTA_STALL = re.compile(
+    r'^[ \t]*\{[^\n]*?"type"[ \t]*:[ \t]*"error"'
+    r'[^\n]*?'
+    r'(?:'
+    r'"(?:statusCode|status)"[ \t]*:[ \t]*"?429\b'
+    r'|freeusagelimiterror'
+    r')',
+    re.IGNORECASE | re.MULTILINE)
+QUOTA_EXHAUSTED = "quota_exhausted"
+PROBE_POLL_SECONDS = 0.1
+PROBE_STOP_SECONDS = 5
+PROBE_JOIN_SECONDS = 5
+PROBE_READ_CHUNK = 4096
+# A partial line is re-scanned as more arrives; cap it so one unterminated
+# line cannot make scanning quadratic.
+PROBE_LINE_TAIL = 65536
+
+
 def classify(output: str, rc: int) -> str:
     text = output.lower()
     if "freeusagelimiterror" in text or (rc != 0 and re.search(r"\b429\b|rate.limit|quota", text)):
@@ -319,7 +348,72 @@ def _probe_environment(home: str) -> dict:
     return env
 
 
-def semantic_probe(model: str, kind: str, timeout: int, *, runner=subprocess.run) -> None:
+def _drain(stream, sink: list[str]) -> None:
+    # Read whatever is available: a stalled child may print its 429 without a
+    # trailing newline, and a full-buffer ``read`` would block until it exits.
+    # ``read1`` returns as soon as any bytes arrive; the incremental decoder
+    # keeps a multi-byte character split across reads intact.
+    decoder = codecs.getincrementaldecoder("utf-8")("replace")
+    try:
+        while True:
+            chunk = stream.buffer.read1(PROBE_READ_CHUNK)
+            if not chunk:
+                tail = decoder.decode(b"", final=True)
+                if tail:
+                    sink.append(tail)
+                return
+            text = decoder.decode(chunk)
+            if text:
+                sink.append(text)
+    except (OSError, ValueError):
+        pass
+
+
+def _unscanned(parts: list[str], state: list) -> str:
+    """Return only text appended since the previous call.
+
+    ``state`` holds the count of already-consumed chunks and the trailing
+    partial line, so a signature split across chunk boundaries is still seen
+    while complete lines are never re-scanned.
+    """
+    end = len(parts)
+    if state[0] == end:
+        return ""
+    pending = state[1] + "".join(parts[state[0]:end])
+    state[0] = end
+    boundary = pending.rfind("\n")
+    if boundary < 0:
+        state[1] = pending[-PROBE_LINE_TAIL:]
+    else:
+        state[1] = pending[boundary + 1:]
+    return pending
+
+
+def _stop_probe(process) -> None:
+    try:
+        process.terminate()
+        process.wait(timeout=PROBE_STOP_SECONDS)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        try:
+            process.wait(timeout=PROBE_STOP_SECONDS)
+        except subprocess.TimeoutExpired:
+            pass
+    except OSError:
+        pass
+
+
+def semantic_probe(model: str, kind: str, timeout: int, *, runner=subprocess.Popen) -> None:
+    """Run one anonymous qualification probe of ``model`` and classify it.
+
+    ``timeout`` is only the nominal budget: a stalled child can outlive it,
+    because stopping costs up to two ``PROBE_STOP_SECONDS`` waits (terminate,
+    then kill) and joining the two pipe readers costs up to two
+    ``PROBE_JOIN_SECONDS`` budgets (plus one poll interval of granularity),
+    so the real worst case is roughly
+    ``timeout + 2 * PROBE_STOP_SECONDS + 2 * PROBE_JOIN_SECONDS``. Any outer
+    timeout that must contain a probe has to budget for that overhead.
+    """
     with tempfile.TemporaryDirectory(prefix="continuum-route-probe-") as scratch:
         if kind == "review":
             prompt = ("Read only: this function must accept age 18: "
@@ -331,25 +425,68 @@ def semantic_probe(model: str, kind: str, timeout: int, *, runner=subprocess.run
                       "the contents ROUTE_PROOF_OK. Report when complete.")
         command = ["opencode", "run", "--auto", "--format", "json", "--model", model, prompt]
         try:
-            finished = runner(command, cwd=scratch, env=_probe_environment(scratch),
-                              capture_output=True, text=True, timeout=timeout, check=False)
-        except subprocess.TimeoutExpired:
-            raise RouteError("timeout") from None
+            process = runner(command, cwd=scratch, env=_probe_environment(scratch),
+                             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         except OSError as error:
             raise RouteError("local_runtime: " + type(error).__name__) from None
-        raw = (finished.stdout or "") + "\n" + (finished.stderr or "")
-        # Refuse any second model request on a runner that received a 429.
+        stdout: list[str] = []
+        stderr: list[str] = []
+        readers = [threading.Thread(target=_drain, args=(process.stdout, stdout), daemon=True),
+                   threading.Thread(target=_drain, args=(process.stderr, stderr), daemon=True)]
+        for reader in readers:
+            reader.start()
+        deadline = time.monotonic() + timeout
+        quota = False
+        stdout_state = [0, ""]
+        stderr_state = [0, ""]
+        try:
+            # A provider 429 is printed within seconds but `opencode run` can
+            # then hang forever. Read while it runs and stop on that signal
+            # instead of reporting a generic timeout for every route. Only
+            # newly appended text is scanned, so a long healthy run stays
+            # linear in the size of its output.
+            while process.poll() is None:
+                if (QUOTA_STALL.search(_unscanned(stdout, stdout_state))
+                        or QUOTA_STALL.search(_unscanned(stderr, stderr_state))):
+                    quota = True
+                    break
+                if time.monotonic() >= deadline:
+                    _stop_probe(process)
+                    raise RouteError("timeout")
+                time.sleep(PROBE_POLL_SECONDS)
+        finally:
+            if quota:
+                _stop_probe(process)
+            # Every exit path joins the readers and releases the pipes; the
+            # join budget is separate from the terminate/kill grace period.
+            for reader in readers:
+                reader.join(timeout=PROBE_JOIN_SECONDS)
+            # Close only pipes whose reader already returned. A reader still
+            # blocked in ``read1`` holds the buffer lock (a child or grandchild
+            # can keep the pipe open after terminate/kill), and ``close`` would
+            # then wait on that lock forever, past the probe's own timeout.
+            for stream, reader in zip((process.stdout, process.stderr), readers):
+                if reader.is_alive():
+                    continue
+                try:
+                    stream.close()
+                except (OSError, ValueError):
+                    pass
+        raw_stdout = "".join(stdout)
+        raw = raw_stdout + "\n" + "".join(stderr)
+        # Refuse any second model request on a runner that received a 429,
+        # including one that had to be terminated because it never exited.
         # A structured provider error event is authoritative even when the
         # CLI exited 0, so consult the shared classifier before parsing the
         # response (and before any failover can touch another model).
-        if classify(raw, finished.returncode) == "quota_429" or is_opencode_429(
-                raw, finished.returncode):
+        if quota or classify(raw, process.returncode) == "quota_429" or is_opencode_429(
+                raw, process.returncode):
             marker = Path(os.environ.get("RUNNER_TEMP", scratch)) / "continuum-opencode-429"
             marker.touch()
-            raise BurnedRunner("quota_429")
-        if finished.returncode != 0:
-            raise RouteError(classify(raw, finished.returncode))
-        answer = extract_response(finished.stdout or "", model)
+            raise BurnedRunner(QUOTA_EXHAUSTED)
+        if process.returncode != 0:
+            raise RouteError(classify(raw, process.returncode))
+        answer = extract_response(raw_stdout, model)
         if kind == "review":
             if ">=" not in answer and "greater than or equal" not in answer.lower():
                 raise RouteError("review_capability")
@@ -786,8 +923,14 @@ def run() -> int:
 def main() -> int:
     try:
         return run()
-    except BurnedRunner:
-        print("::error::OpenCode 429: retire this runner without another LLM request", file=sys.stderr)
+    except BurnedRunner as error:
+        notice = "OpenCode 429: retire this runner without another LLM request"
+        reason = str(error).strip()
+        # Surface the actual cause (e.g. exhausted free quota) without
+        # changing the stable notice for the generic pre-burned marker.
+        if reason and reason != "runner already burned":
+            notice = f"{notice} ({reason})"
+        print("::error::" + notice, file=sys.stderr)
         return 75
     except GitHubStateUnavailable as error:
         publish_state_failure(error)

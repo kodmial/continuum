@@ -461,6 +461,14 @@ ENTRIES = (
     },
     {
         "workflow": "continuum-coderabbit-unresolved.yml",
+        "step": "Collect all unresolved findings",
+        "capability": SPLIT_ACTOR,
+        "same_repo": True,
+        "reason": "Split actor: collection reads use github.token so the run is attributed to github-actions[bot]; TAP_PAT is read once only to resolve the authenticated login that authors verification markers, so a forged marker from an arbitrary commenter cannot suppress a finding.",
+        "evidence": ("COMMENT_PAT: ${{ secrets.TAP_PAT }}", "github-token: ${{ github.token }}"),
+    },
+    {
+        "workflow": "continuum-coderabbit-unresolved.yml",
         "step": "Dispatch one batched repair to canonical OpenCode",
         "capability": DISPATCH,
         "same_repo": True,
@@ -468,6 +476,14 @@ ENTRIES = (
         "evidence": ("github-token: ${{ secrets.TAP_PAT }}",),
     },
     # -- automation / router / bootstrap / render / docker ---------------
+    {
+        "workflow": "continuum-contract-canary.yml",
+        "step": "Observe the live canary task",
+        "capability": CHAINING,
+        "same_repo": True,
+        "reason": "Live canary observation and its bounded recovery share one actor: the recovery comment must emit issue_comment to wake the scheduler, and GITHUB_TOKEN comment writes are suppressed; observation reads are same-repository only.",
+        "evidence": ("GH_TOKEN: ${{ secrets.TAP_PAT }}",),
+    },
     {
         "workflow": "automation.yml",
         "step": "Wake repository-local reconcilers",

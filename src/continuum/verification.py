@@ -1215,9 +1215,9 @@ def ensure_baseline(
         raise VerificationError(contract.errors[0] if contract.errors else "unconfigured verification contract")
 
     existing = data.get("baseline")
-    # Worktree evidence is only reusable when it is attested by the
-    # runner-controlled key. An unattested baseline is rebuilt below instead of
-    # being trusted after the coding agent could have rewritten it.
+    # Worktree evidence is reusable only when attested by the
+    # runner-controlled key. An unattested baseline is never trusted after the
+    # coding agent could have rewritten it; an advanced checkout fails closed.
     if isinstance(existing, dict) and _attestation_key(env) is not None:
         recorded_contract = existing.get("contract")
         recorded_fingerprint = ""
