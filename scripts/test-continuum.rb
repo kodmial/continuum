@@ -7724,7 +7724,7 @@ class ContinuumTest < Minitest::Test
   def test_child_agent_groups_include_child_id_and_deny_push
     deny_push = %q({"permission":{"bash":{"*":"allow","git *":"allow","git push *":"deny"}}})
     {
-      'continuum-consumer-child-worker.yml' => 'continuum-subtask-',
+      'continuum-consumer-child-worker.yml' => 'continuum-child-worker-',
       'continuum-consumer-child-review.yml' => 'continuum-subtask-review-',
       'continuum-consumer-child-pr-review.yml' => 'continuum-subtask-pr-review-'
     }.each do |name, prefix|
@@ -7749,6 +7749,8 @@ class ContinuumTest < Minitest::Test
     gate = yaml(File.join(ROOT, '.github/workflows/contract-gate.yml'))
     value = gate.fetch('jobs').fetch('contract').fetch('with').fetch('publish_status')
     assert_includes value, 'github.event.pull_request.head.repo.full_name == github.repository'
+    assert_includes value, "github.actor != 'dependabot[bot]'",
+                    'Dependabot same-repository PRs also receive a read-only token'
     assert_includes value, "'true'"
     assert_includes value, "'false'"
   end
@@ -8914,8 +8916,10 @@ class ContinuumTest < Minitest::Test
     clean_approval = body.index('const clean = await waitFor(')
     evidence_loop = body.index('await prAgentRuns(prNumber, cleanHead)')
     evidence = body.index('const evidence = {')
-    assert clean_approval < evidence_loop < evidence,
-           'the final run-ID evidence pass must follow clean-HEAD approval'
+    assert_operator clean_approval, :<, evidence_loop,
+                    'the final run-ID evidence pass must follow clean-HEAD approval'
+    assert_operator evidence_loop, :<, evidence,
+                    'the final run-ID evidence must be recorded after the pass'
 
     baseline = body.index('const before = new Set(')
     comment = body.index('const reviewComment = await github.rest.issues.createComment(')
