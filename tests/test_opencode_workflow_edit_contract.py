@@ -56,18 +56,28 @@ class OpenCodeWorkflowEditContractTest(unittest.TestCase):
             step,
         )
         self.assertIn("unset CONTINUUM_VERIFICATION_ATTESTATION_KEY", step)
+        function = step.split("verification_python() {", 1)[1].split("\n          }", 1)[0]
         self.assertIn(
             'ATTESTATION_KEY_FILE="${RUNNER_TEMP:-/tmp}/continuum-attestation-key"',
             step,
         )
+        self.assertIn('local verification_pythonpath=', function)
+        self.assertIn('if [[ -n "${CONTINUUM_ATTESTATION_KEY_VALUE:-}" ]]; then', function)
         self.assertIn(
             "python3 -m continuum.verification provision-key --repo \"$GITHUB_WORKSPACE\"",
-            step,
+            function,
             "the key must be provisioned from stdin through the file-based contract",
         )
+        self.assertEqual(
+            function.count('CONTINUUM_VERIFICATION_ATTESTATION_KEY_FILE="$ATTESTATION_KEY_FILE"'),
+            2,
+            "the private path is supplied only for provisioning and key-backed verification",
+        )
+        no_key_branch = function.split("else", 1)[1]
+        self.assertNotIn("CONTINUUM_VERIFICATION_ATTESTATION_KEY_FILE", no_key_branch)
         self.assertIn(
-            'CONTINUUM_VERIFICATION_ATTESTATION_KEY_FILE="$ATTESTATION_KEY_FILE"',
-            step,
+            'PYTHONPATH="$verification_pythonpath" python3 -m continuum.verification "$@"',
+            no_key_branch,
         )
         self.assertNotIn(
             'CONTINUUM_VERIFICATION_ATTESTATION_KEY="$CONTINUUM_ATTESTATION_KEY_VALUE"',
