@@ -8832,15 +8832,19 @@ class ContinuumTest < Minitest::Test
     canonical_stub = yaml(File.join(ROOT, '.github/caller-stubs/continuum-coderabbit-unresolved.yml'))
     canonical_events = events(canonical_stub)
     # Manual safety-net dispatch is not a second owner of the UNRESOLVED event
-    # path: it carries no comment payload and the reusable job stays gated on
-    # `pr_number`. Exclude it from the event-ownership assertion, then check
-    # that it only declares the dispatch-target override.
+    # path: it carries only a diagnostic PR wake hint and the dispatch-target
+    # override, while the reusable job remains gated on an exact PR identity.
+    # Exclude it from the event-ownership assertion and verify both optional
+    # inputs explicitly.
     event_driven = canonical_events.keys.reject { |name| name == 'workflow_dispatch' }
     assert_equal ['pull_request_review_comment'], event_driven,
                  'the canonical CodeRabbit caller must own the UNRESOLVED event path'
-    assert_equal ['opencode_workflow'],
-                 canonical_events.fetch('workflow_dispatch').fetch('inputs').keys,
-                 'manual dispatch declares only the dispatch-target override'
+    dispatch_inputs = canonical_events.fetch('workflow_dispatch').fetch('inputs')
+    assert_equal ['pr_number', 'opencode_workflow'], dispatch_inputs.keys
+    pr_wake = dispatch_inputs.fetch('pr_number')
+    assert_equal false, pr_wake.fetch('required')
+    assert_equal '', pr_wake.fetch('default')
+    assert_equal 'string', pr_wake.fetch('type')
     assert_equal ['created'], canonical_events.fetch('pull_request_review_comment').fetch('types')
     canonical_engine = workflow_body('continuum-coderabbit-unresolved.yml')
     assert_includes canonical_engine, "github.event.comment.user.login == 'coderabbitai[bot]'"
