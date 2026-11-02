@@ -976,6 +976,11 @@ jobs:
             local_override_active() {
               local task_number="$1"
               local recent_command command_epoch now_epoch grace_since
+              # An unavailable PR or run inventory is not evidence of no local
+              # work. Block delegated admission for this child on this pass.
+              if [[ "$local_opencode_inventory_unknown" == "true" ]]; then
+                return 0
+              fi
               if grep -Fxq "$task_number" <<<"$local_opencode_pr_tasks" ||
                  printf '%s\n' "${local_opencode_run_tasks[@]}" | grep -Fxq "$task_number"; then
                 return 0
