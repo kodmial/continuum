@@ -1393,6 +1393,17 @@ jobs:
                 if (!/^[A-Za-z0-9_.-]+\.ya?ml$/i.test(opencodeWorkflow)) {
                   throw new Error('Invalid configured OpenCode caller workflow: ' + opencodeWorkflow);
                 }
+                const dispatchInputs = {
+                  mode: 'resolve-conflict',
+                  pr_number: String(prNumber),
+                  head_ref: fresh.head.ref,
+                  conflict_strategy: 'merge',
+                };
+                // The dogfood caller declares timeout_minutes; the installed
+                // consumer stub does not, so never send that undeclared input.
+                if (opencodeWorkflow === 'opencode.yml') {
+                  dispatchInputs.timeout_minutes = '60';
+                }
                 await github.request(
                   'POST /repos/{owner}/{repo}/actions/workflows/{workflow_id}/dispatches',
                   {
@@ -1400,14 +1411,7 @@ jobs:
                     repo,
                     workflow_id: opencodeWorkflow,
                     ref: defaultBranch,
-                    inputs: {
-                      mode: 'resolve-conflict',
-                      pr_number: String(prNumber),
-                      head_ref: fresh.head.ref,
-                      conflict_strategy: 'merge',
-                    // The installed caller stub does not declare timeout_minutes;
-                    // let the reusable engine apply its configured/default runtime.
-                    },
+                    inputs: dispatchInputs,
                   }
                 );
                 core.notice(

@@ -201,8 +201,10 @@ permissions: {}
         )
         self.assertIn("const opencodeWorkflow = String(", workflow)
         self.assertIn("workflow_id: opencodeWorkflow", workflow)
-        dispatch_payload = workflow.split("workflow_id: opencodeWorkflow", 1)[1].split("core.notice(", 1)[0]
-        self.assertNotIn("timeout_minutes:", dispatch_payload)
+        self.assertIn("if (opencodeWorkflow === 'opencode.yml')", workflow)
+        self.assertIn("dispatchInputs.timeout_minutes = '60'", workflow)
+        self.assertIn("inputs: dispatchInputs", workflow)
+        self.assertNotIn("timeout_minutes:", workflow.split("inputs: dispatchInputs", 1)[0].split("const dispatchInputs", 1)[1])
 
         stub = OPENCODE_STUB.read_text(encoding="utf-8")
         dispatch = stub.split("workflow_dispatch:", 1)[1].split("\npermissions:", 1)[0]
