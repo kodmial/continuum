@@ -3105,14 +3105,19 @@ jobs:
             # command can read /proc/$PPID/environ). Re-provision the private
             # key file from the non-exported shell value before each
             # invocation, then pass only its path; reading consumes the file.
+            local verification_pythonpath="$VERIFICATION_ENGINE_ROOT/src${PYTHONPATH:+:$PYTHONPATH}"
             if [[ -n "${CONTINUUM_ATTESTATION_KEY_VALUE:-}" ]]; then
               printf '%s' "$CONTINUUM_ATTESTATION_KEY_VALUE" | \
                 CONTINUUM_VERIFICATION_ATTESTATION_KEY_FILE="$ATTESTATION_KEY_FILE" \
-                PYTHONPATH="$VERIFICATION_ENGINE_ROOT/src${PYTHONPATH:+:$PYTHONPATH}" \
+                PYTHONPATH="$verification_pythonpath" \
                 python3 -m continuum.verification provision-key --repo "$GITHUB_WORKSPACE" || return 1
+              CONTINUUM_VERIFICATION_ATTESTATION_KEY_FILE="$ATTESTATION_KEY_FILE" \
+                PYTHONPATH="$verification_pythonpath" python3 -m continuum.verification "$@"
+            else
+              # No key means no attestation path at all; the documented
+              # unauthenticated baseline remains explicitly untrusted on resume.
+              PYTHONPATH="$verification_pythonpath" python3 -m continuum.verification "$@"
             fi
-            CONTINUUM_VERIFICATION_ATTESTATION_KEY_FILE="$ATTESTATION_KEY_FILE" \
-              PYTHONPATH="$VERIFICATION_ENGINE_ROOT/src${PYTHONPATH:+:$PYTHONPATH}" python3 -m continuum.verification "$@"
           }
           RECOVERY_STAGE_NOW="${RECOVERY_STAGE_IN:-implementation-incomplete}"
           SKIP_PRIMARY_IMPLEMENTATION=false
