@@ -15,6 +15,10 @@ jobs:
     uses: ./.github/workflows/continuum-contract-qualification.yml
     with:
       continuum_ref: main
+      # Keep the legacy `mode` input exercised: the scheduled/manual canary
+      # run proves the canary-deadline contract before the live canary job
+      # observes the real task.
+      mode: canary
     permissions:
       actions: read
       contents: read

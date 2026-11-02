@@ -12,16 +12,13 @@ semantics stay in ``src/continuum/coderabbit_adapter.py`` and
 Consumer contract freeze: these tests never require stub, input,
 secret, variable, label, permission, or workflow-name changes.
 
-Partial-tree boundary: the two workflow inline copies
+Partial-tree boundary: both auto-merge workflow inline copies
 (``.github/workflows/continuum-auto-merge.yml`` and
-``.github/workflows/continuum-pr-agent-auto-merge.yml``) are ``pr/part-2``
-files. This branch carries no workflow-parity assertion for them: the
-parity test for their inline ``isNonMergeCriticalMainPath`` copies ships
-with them in the ``pr/part-2`` change, and is not asserted here so it
-never passes by observing that the workflows are absent. Other tests in
-this module read those workflow files directly; they are exercised once
-``pr/part-2`` lands the files, and are not a claim about this partial
-tree.
+``.github/workflows/continuum-pr-agent-auto-merge.yml``) carry an inline
+``isNonMergeCriticalMainPath`` classifier. Parity with the canonical
+implementation is asserted here by extracting the classifier from each
+workflow and from ``.github/scripts/merge_lifecycle.js`` and requiring
+identical path tables.
 """
 
 import os
@@ -51,6 +48,81 @@ SHARED_JS = ".github/scripts/merge_lifecycle.js"
 def read_repo(path):
     with open(os.path.join(ROOT, path), "r", encoding="utf-8") as handle:
         return handle.read()
+
+
+CLASSIFIER_MARKER = "function isNonMergeCriticalMainPath(path) {"
+
+
+def _extract_js_classifier(source):
+    """Return the full ``isNonMergeCriticalMainPath`` function text.
+
+    Brace matching is sufficient here: the classifier body contains no
+    braces inside string literals (only path prefixes and literals).
+    """
+
+    start = source.index(CLASSIFIER_MARKER)
+    depth = 0
+    for index in range(start, len(source)):
+        char = source[index]
+        if char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                return source[start : index + 1]
+    raise AssertionError("unbalanced isNonMergeCriticalMainPath classifier")
+
+
+def _normalize(text):
+    return "\n".join(line.strip() for line in text.splitlines() if line.strip())
+
+
+def _js_classifier_table(body):
+    """Extract the ordered prefix/literal path table from a JS classifier."""
+
+    _, sep, tail = body.partition("return (")
+    if not sep:
+        raise AssertionError("classifier has no return expression")
+    prefixes = re.findall(r"text\.startsWith\('([^']*)'\)", body)
+    exact = re.findall(r"text === '([^']*)'", tail)
+    return prefixes, exact
+
+
+def _python_classifier_table():
+    """Extract the same path table from the canonical Python classifier."""
+
+    source = read_repo("src/continuum/merge_lifecycle.py")
+    start = source.index("def is_non_merge_critical_main_path")
+    end = source.index("\ndef ", start + 1)
+    body = source[start:end]
+    prefixes = re.findall(r'text\.startswith\("([^"]*)"\)', body)
+    exact = re.findall(r'text == "([^"]*)"', body)
+    return prefixes, exact
+
+
+def _eval_js_classifier(body, path):
+    """Interpret an extracted JS classifier so parity is behavioral.
+
+    The classifier shape is fixed: surface ``startsWith`` checks before
+    ``return (`` are rejections, and the final return lists ``===``
+    literals, an ``.md`` suffix, and non-surface ``startsWith`` prefixes.
+    """
+
+    head, sep, tail = body.partition("return (")
+    if not sep:
+        raise AssertionError("classifier has no return expression")
+    for prefix in re.findall(r"text\.startsWith\('([^']*)'\)", head):
+        if path.startswith(prefix):
+            return False
+    for literal in re.findall(r"text === '([^']*)'", tail):
+        if path == literal:
+            return True
+    for prefix in re.findall(r"text\.startsWith\('([^']*)'\)", tail):
+        if path.startswith(prefix):
+            return True
+    if "text.endsWith('.md')" in tail and path.endswith(".md"):
+        return True
+    return False
 
 
 HEAD = "abcdef1234567890abcdef1234567890abcdef12"
@@ -202,9 +274,76 @@ class MainSyncTests(unittest.TestCase):
             python_source,
         )
 
-    # The workflow inline `isNonMergeCriticalMainPath` copies and their
-    # parity test are `pr/part-2` files. This branch deliberately has no
-    # workflow-parity assertion, so it cannot pass by absence.
+    def test_both_workflows_share_the_same_path_table(self):
+        canon = _extract_js_classifier(read_repo(SHARED_JS))
+        canon_table = _js_classifier_table(canon)
+        self.assertEqual(
+            canon_table,
+            (
+                [
+                    ".github/workflows/",
+                    ".github/scripts/",
+                    ".github/actions/",
+                    "docs/",
+                    ".github/",
+                ],
+                [
+                    "LICENSE",
+                    ".gitignore",
+                    ".release-please-manifest.json",
+                    "CHANGELOG.md",
+                ],
+            ),
+        )
+        self.assertEqual(_python_classifier_table(), canon_table)
+        for path in (GENERIC_MERGE, PR_AGENT_MERGE):
+            with self.subTest(path=path):
+                inline = _extract_js_classifier(read_repo(path))
+                self.assertEqual(
+                    _js_classifier_table(inline),
+                    canon_table,
+                    f"{path} path table drifted from {SHARED_JS}",
+                )
+                self.assertEqual(
+                    _normalize(inline),
+                    _normalize(canon),
+                    f"{path} classifier body drifted from {SHARED_JS}",
+                )
+
+    def test_inline_copies_resync_on_consumer_executable_surfaces(self):
+        # A main advance in a consumer-owned workflow (``ci.yml`` or any
+        # other name), in ``.github/scripts/``, or in ``.github/actions/``
+        # must force a re-sync in both inline copies, exactly as the
+        # canonical Python/JS owners do.
+        critical = (
+            ".github/workflows/ci.yml",
+            ".github/workflows/ci.yaml",
+            ".github/workflows/custom-consumer.yml",
+            ".github/scripts/merge_lifecycle.js",
+            ".github/actions/agent-toolchain/action.yml",
+        )
+        non_critical = (
+            "docs/guide.md",
+            "README.md",
+            ".github/ISSUE_TEMPLATE.md",
+            "LICENSE",
+            ".gitignore",
+            ".release-please-manifest.json",
+            "CHANGELOG.md",
+        )
+        for path in (GENERIC_MERGE, PR_AGENT_MERGE):
+            body = _extract_js_classifier(read_repo(path))
+            for candidate in critical + non_critical:
+                with self.subTest(path=path, candidate=candidate):
+                    self.assertEqual(
+                        _eval_js_classifier(body, candidate),
+                        life.is_non_merge_critical_main_path(candidate),
+                    )
+            for candidate in critical:
+                with self.subTest(path=path, candidate=candidate):
+                    self.assertFalse(_eval_js_classifier(body, candidate))
+            # The superseded Continuum-only prefix must not survive.
+            self.assertNotIn(".github/workflows/continuum-", body)
 
 
 class ConflictPlumbingTests(unittest.TestCase):

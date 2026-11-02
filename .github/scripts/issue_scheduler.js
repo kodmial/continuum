@@ -742,22 +742,17 @@ module.exports = async function runIssueScheduler({ github, context, core }) {
   const ownerResumeCommentPageLimit = 5;
   const ownerResumeCiWorkflow =
     (process.env.OWNER_RESUME_CI_WORKFLOW || 'CI').trim();
-  // The scheduler workflow always forwards this knob, falling back to the
-  // Continuum default. A consumer repository opts in to the Contract Gate by
-  // setting CONTINUUM_CONTRACT_GATE_WORKFLOW_NAME to a non-default name; while
-  // the knob stays at the default the gate remains Continuum-only.
+  // The Contract Gate is mandatory for every repository, exactly as it was
+  // before the opt-in reinterpretation: a predecessor PR HEAD has to carry
+  // the exact-HEAD gate run. The scheduler workflow always forwards this
+  // knob, falling back to the Continuum default, so an explicit
+  // CONTINUUM_CONTRACT_GATE_WORKFLOW_NAME only renames the required gate.
   const ownerResumeContractGateDefaultWorkflow =
     'Continuum Contract Gate';
-  // A whitespace-only value is not an opt-in: trim first, then treat an
-  // empty result as the default and only a non-empty non-default name as
-  // a consumer override.
   const ownerResumeContractGateRequested =
     (process.env.OWNER_RESUME_CONTRACT_GATE_WORKFLOW || '').trim();
   const ownerResumeContractGateWorkflow =
     ownerResumeContractGateRequested || ownerResumeContractGateDefaultWorkflow;
-  const ownerResumeContractGateConfigured =
-    ownerResumeContractGateRequested !== '' &&
-    ownerResumeContractGateRequested !== ownerResumeContractGateDefaultWorkflow;
   const ownerResumeDefaultBranch = (
     process.env.DEFAULT_BRANCH ||
     context.payload.repository?.default_branch ||
@@ -1240,22 +1235,12 @@ module.exports = async function runIssueScheduler({ github, context, core }) {
         paths: ['.github/workflows/' + 'ci.yml'],
         label: 'CI',
       },
-    ];
-    // The Contract Gate workflow exists only in the Continuum control-plane
-    // repository by default; consumer repositories never run it, so requiring
-    // its run here would make owner-armed resume permanently NOOP there. An
-    // explicit non-default workflow-name override applies the gate in any
-    // repository.
-    if (
-      ownerResumeContractGateConfigured ||
-      String(repoFullName || '').toLowerCase() === 'kodmial/continuum'
-    ) {
-      ownerResumeRequiredRuns.push({
+      {
         names: [ownerResumeContractGateWorkflow],
         paths: ['.github/workflows/' + 'contract-gate.yml'],
         label: 'Contract Gate',
-      });
-    }
+      },
+    ];
     for (const required of ownerResumeRequiredRuns) {
       const run = newestOwnerResumeRun(
         exactHeadRuns, headSha, required.names, required.paths

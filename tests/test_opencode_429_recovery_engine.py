@@ -210,10 +210,10 @@ class Classify429Test(unittest.TestCase):
                 )
                 self.assertEqual(classify_opencode_events(log, 1), expected)
 
-    def test_plain_text_status_like_values_never_classify(self):
-        # The transcript is agent output, not provider evidence: a status
-        # token quoted in prose must not turn a normal task failure into a
-        # deterministic fail-closed verdict.
+    def test_plain_text_fail_closed_remains_fail_closed(self):
+        # A deterministic status token in an unstructured transcript is still
+        # fail-closed: it must stop the retry loop instead of being retried as
+        # an ordinary task failure. It must never be mistaken for quota.
         for log in (
             "request failed with status 400",
             "401 unauthorized: bad credentials",
@@ -223,7 +223,7 @@ class Classify429Test(unittest.TestCase):
         ):
             with self.subTest(log=log):
                 self.assertFalse(is_opencode_429(log, 1), log)
-                self.assertEqual(classify_agent_error(log, 1), "task-failure", log)
+                self.assertEqual(classify_agent_error(log, 1), "fail-closed", log)
 
     def test_transcript_words_without_status_are_not_fail_closed(self):
         # Only authenticated provider error objects may use the word tokens;

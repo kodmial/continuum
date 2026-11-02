@@ -32,7 +32,10 @@ FORBIDDEN_PROVIDER_SUBSTRINGS = ("groq", "anthropic", "openai_api_key")
 
 DEFAULT_MODEL = "openai/continuum-review"
 #: Matches the documented ``PR_AGENT_MAX_TOKENS`` / ``custom_model_max_tokens``
-#: default: the custom-model context cap used for prompt budgeting.
+#: default (docs/consumer-variables.md, docs/pr-agent-opencode.md) and the
+#: workflow fallback in continuum-pr-agent*.yml. This is the custom-model
+#: context cap used for prompt budgeting, not an output-token limit, so the
+#: 128000 value is intentional and must stay in sync with the documented knob.
 DEFAULT_MAX_TOKENS = 128000
 DEFAULT_TIMEOUT_SECONDS = 180
 DEFAULT_BRIDGE_PATH = "/v1"

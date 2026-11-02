@@ -920,7 +920,27 @@ def run() -> int:
             if not 0 <= now - at <= config.ttl:
                 raise RouteError("Selected probe expired before task start")
             return reserve_completion(current, ticket, selected_model, now, at)
-        store.update(key, save)
+        try:
+            store.update(key, save)
+        except (GitHubStateUnavailable, Conflict):
+            # A state-store Conflict/transport failure is never a
+            # model-provider failure: never cool down a healthy route for it.
+            raise
+        except RouteError as error:
+            # The route itself lost its qualification between probe and
+            # reservation (a concurrent writer replaced the proof). That is a
+            # route-level failure: cool down this model and keep failing over,
+            # exactly like a probe error.
+            errors[model] = str(error)
+            def pause(current, *, selected_model=model):
+                if current.get("fingerprint") != fingerprint:
+                    current = {"fingerprint": fingerprint, "cooldowns": {}}
+                current.setdefault("cooldowns", {})[selected_model] = now + config.cooldown
+                return current
+            store.update(key, pause)
+            if config.pinned:
+                break
+            continue
         write_outputs(env, {"model": model})
         print(model)
         return 0

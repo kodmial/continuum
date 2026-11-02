@@ -417,8 +417,9 @@ class OpenCode429EndToEndTest(unittest.TestCase):
             },
         })
         self.assertEqual(classify_agent_error(unauthorized, 1), "fail-closed")
-        # Transcript prose is not authoritative provider evidence.
-        self.assertEqual(classify_agent_error("401 unauthorized", 1), "task-failure")
+        # An unstructured deterministic status token is still fail-closed:
+        # it stops the retry loop rather than looking like a task failure.
+        self.assertEqual(classify_agent_error("401 unauthorized", 1), "fail-closed")
         self.assertEqual(classify_agent_error("tests failed", 1), "task-failure")
         self.assertTrue(consumes_task_budget(False))
 

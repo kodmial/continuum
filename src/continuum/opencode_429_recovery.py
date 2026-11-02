@@ -221,6 +221,12 @@ _FAIL_CLOSED_RE = re.compile(
     r"|missing scope",
     re.IGNORECASE,
 )
+#: Exact status tokens only. This is the plain-text fallback for invocations
+#: whose transcript carries no structured provider event: a deterministic
+#: 400/401/403/404/422 must stop the retry loop instead of looking like an
+#: ordinary task failure. Matching auth words alone would make harmless agent
+#: prose fail closed, so words are not part of this pattern.
+_FAIL_CLOSED_STATUS_RE = re.compile(r"\b(?:400|401|403|404|422)\b", re.IGNORECASE)
 _QUOTA_STATUSES = frozenset({429})
 _UPSTREAM_STATUSES = frozenset({500, 502, 504})
 _UNAVAILABLE_STATUSES = frozenset({503})
@@ -506,9 +512,12 @@ def classify_agent_error(log_text: Any, exit_code: Any = 1) -> str:
     ``"infrastructure-unavailable"`` for a provider/transport failure,
     ``"fail-closed"`` for deterministic configuration/auth errors, and
     ``"task-failure"`` for every normal non-429 agent failure (which must
-    never be misclassified as runner replacement). Only structured provider
-    evidence can classify; status-like values in the agent transcript are
-    never authoritative.
+    never be misclassified as runner replacement).
+
+    Structured provider events take precedence. When they are absent, an
+    exact ``400/401/403/404/422`` token in plain transcript text still marks
+    a deterministic configuration/auth failure so the retry loop stops.
+    Quota classification always requires structured provider evidence.
     """
 
     classification = _combined_classification(log_text, exit_code)
@@ -517,6 +526,9 @@ def classify_agent_error(log_text: Any, exit_code: Any = 1) -> str:
     if classification in ("unavailable", "upstream", "timeout"):
         return "infrastructure-unavailable"
     if classification == "fail_closed":
+        return "fail-closed"
+    text = log_text if isinstance(log_text, str) else ""
+    if _FAIL_CLOSED_STATUS_RE.search(text):
         return "fail-closed"
     return "task-failure"
 
