@@ -18,6 +18,6 @@ jobs:
       dispatch_repair: ${{ 'false' }}
       # A fork pull request gets a read-only GITHUB_TOKEN; the status write
       # would fail before validation. Same-repository PRs keep publishing.
-      publish_status: ${{ github.event.pull_request.head.repo.full_name == github.repository && 'true' || 'false' }}
+      publish_status: ${{ github.event.pull_request.head.repo.full_name == github.repository && github.actor != 'dependabot[bot]' && 'true' || 'false' }}
       status_context: continuum/contract-gate
       validation_command: bash scripts/validate-continuum.sh

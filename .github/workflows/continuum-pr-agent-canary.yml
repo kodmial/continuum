@@ -372,6 +372,10 @@ jobs:
               const before = new Set(baseline.data.workflow_runs.map((run) => run.id));
               const runTitlePrefix = `PR-Agent PR #${prNumber} [review:`;
               const runTitleSuffix = `head=${head}`;
+              const prAgentRunNames = new Set([
+                'PR Agent (OpenCode backend)',
+                'PR Agent (OpenCode-backed)',
+              ]);
               // List every attributed run inside the bounded dispatch window.
               // The final evidence pass uses this, while the review wait
               // below retains the first exact run ID and polls it directly.
@@ -383,7 +387,7 @@ jobs:
                     created: `>=${dispatchCreatedAfter}`,
                   });
                   matches.push(...data.workflow_runs.filter((run) =>
-                    run.name === 'PR Agent (OpenCode backend)' &&
+                    prAgentRunNames.has(run.name) &&
                     String(run.display_title || '').startsWith(
                       `PR-Agent PR #${pullNumber} [review:`
                     ) &&
@@ -410,7 +414,7 @@ jobs:
                   });
                   const run = data.workflow_runs.find((candidate) =>
                     !before.has(candidate.id) &&
-                    candidate.name === 'PR Agent (OpenCode backend)' &&
+                    prAgentRunNames.has(candidate.name) &&
                     String(candidate.display_title || '').startsWith(runTitlePrefix) &&
                     String(candidate.display_title || '').endsWith(runTitleSuffix)
                   );
@@ -557,10 +561,6 @@ jobs:
               if (verifyVerdict !== 'RESOLVED') {
                 throw new Error(`post-fix verification did not resolve finding ${findingId}: ${verifyVerdict}`);
               }
-              for (const run of (await prAgentRuns(prNumber, head)).filter((run) => !workflowRunIds.includes(String(run.id)))) {
-                workflowRunIds.push(String(run.id));
-              }
-
               // Clean-HEAD proof: one more owner /review must approve the
               // exact current HEAD with no blocking findings left.
               const cleanComment = await github.rest.issues.createComment({
@@ -593,6 +593,11 @@ jobs:
               finalOutcome = 'APPROVED';
               core.setOutput('final_outcome', finalOutcome);
               void clean;
+              // Include the run that approved the exact clean HEAD in the final evidence.
+              for (const run of (await prAgentRuns(prNumber, cleanHead))
+                .filter((run) => !workflowRunIds.includes(String(run.id)))) {
+                workflowRunIds.push(String(run.id));
+              }
 
               const evidence = {
                 main_sha: mainSha,
