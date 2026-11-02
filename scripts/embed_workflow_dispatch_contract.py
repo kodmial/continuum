@@ -13,6 +13,7 @@ to fail when a workflow copy drifted; tests use the check mode.
 from __future__ import annotations
 
 import pathlib
+import re
 import sys
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -23,6 +24,65 @@ TARGETS = (
     ROOT / ".github/workflows/continuum-auto-merge.yml",
     ROOT / ".github/workflows/continuum-pr-agent-auto-merge.yml",
 )
+# actions/github-script passes the inline script as a command-line argument.
+# Linux caps a single argv entry at 128 KiB, so a larger payload fails before
+# the action starts. Keep a safety margin and make the limit a hard contract.
+MAX_INLINE_SCRIPT_BYTES = 100_000
+INLINE_SCRIPT = re.compile(r"^( *)(script):[ \t]*(.*)$")
+BLOCK_SCALAR = re.compile(r"^[|>][-+]?[0-9]*[ \t]*$")
+
+
+def inline_script_sizes(text: str) -> list[tuple[int, int]]:
+    """Return ``(line_number, utf8_bytes)`` for every inline script value."""
+    lines = text.splitlines(keepends=True)
+    sizes: list[tuple[int, int]] = []
+    index = 0
+    while index < len(lines):
+        match = INLINE_SCRIPT.match(lines[index])
+        if not match:
+            index += 1
+            continue
+        indent = len(match.group(1))
+        value = match.group(3).strip()
+        if not BLOCK_SCALAR.match(value):
+            if value and not value.startswith("#"):
+                sizes.append((index + 1, len(value.encode("utf-8"))))
+            index += 1
+            continue
+        body_start = index + 1
+        body_end = body_start
+        while body_end < len(lines):
+            candidate = lines[body_end]
+            if candidate.strip() and (
+                len(candidate) - len(candidate.lstrip(" ")) <= indent
+            ):
+                break
+            body_end += 1
+        block_indent = None
+        for line in lines[body_start:body_end]:
+            if line.strip():
+                current = len(line) - len(line.lstrip(" "))
+                block_indent = (
+                    current if block_indent is None
+                    else min(block_indent, current)
+                )
+        payload = "".join(
+            line[block_indent:] if block_indent is not None else line
+            for line in lines[body_start:body_end]
+        )
+        sizes.append((index + 1, len(payload.encode("utf-8"))))
+        index = body_end
+    return sizes
+
+
+def check_inline_script_sizes(path: pathlib.Path, text: str) -> None:
+    for line_number, size in inline_script_sizes(text):
+        if size > MAX_INLINE_SCRIPT_BYTES:
+            raise SystemExit(
+                f"{path}:{line_number}: inline script is {size} bytes, "
+                f"above the {MAX_INLINE_SCRIPT_BYTES}-byte argv-safe limit; "
+                "stage it in a run step and keep only a small loader in script:"
+            )
 
 
 def canonical_body() -> list[str]:
@@ -71,6 +131,7 @@ def main() -> int:
     for target in TARGETS:
         current = target.read_text(encoding="utf-8")
         desired = updated(target, body)
+        check_inline_script_sizes(target, desired)
         if current == desired:
             continue
         stale.append(target)

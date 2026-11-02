@@ -214,11 +214,14 @@ class ContinuumTest < Minitest::Test
     code.match?( /\b(cp|install|dd|mv)\b[^#\n]*(STAMP_FILE|image-digest)/ )
   end
 
-  # Only the embedded `script: |` block. Assertions about *engine* literals must
-  # not see the `workflow_call.inputs` defaults, which legitimately name the
-  # same values as the fallback chain.
+  # The executable controller body. Assertions about *engine* literals must not
+  # see the `workflow_call.inputs` defaults, which legitimately name the same
+  # values as the fallback chain. The auto-merger stages its body in a run step
+  # because actions/github-script passes an inline `script:` through argv, and
+  # the Linux limit is 128 KiB; test the staged source, not the small loader.
   def script_body(name)
     return scheduler_inline_body if name == 'continuum-issue-scheduler.yml'
+    return auto_merge_controller_body if name == 'continuum-auto-merge.yml'
 
     lines = workflow_body(name).lines
     start = lines.index { |line| line =~ /^\s*script: \|\s*$/ }
@@ -228,6 +231,19 @@ class ContinuumTest < Minitest::Test
     stop = rest.index { |line| !line.strip.empty? && line[/\A */].size < indent }
     block = stop ? rest[0...stop] : rest
     block.map { |line| line[/\A */].size >= indent ? line[indent..] : line }.join
+  end
+
+  def auto_merge_controller_body
+    lines = workflow_body('continuum-auto-merge.yml').lines
+    marker = "cat > \"$RUNNER_TEMP/continuum/controller.js\" <<'CONTINUUM_JS'"
+    start = lines.index { |line| line.strip == marker }
+    indent = lines[start][/\A */].size
+    rest = lines[(start + 1)..]
+    stop = rest.index { |line| line.strip == 'CONTINUUM_JS' }
+    refute_nil stop, 'continuum-auto-merge.yml: unterminated controller heredoc'
+    rest[0...stop].map do |line|
+      line[/\A */].size >= indent ? line[indent..] : line
+    end.join
   end
 
   # The parsed core workflow behind a caller stub of the same base name.
@@ -7472,7 +7488,7 @@ class ContinuumTest < Minitest::Test
     assert_includes loop_block, 'POST /repos/{owner}/{repo}/actions/workflows/{workflow_id}/dispatches'
     assert_includes loop_block, 'ref: postMergeWakeupRef'
 
-    catch_block = loop_block[/catch \(err\) \{.*?\n {16}\}/m]
+    catch_block = loop_block[/catch \(err\) \{.*?\n {14}\}/m]
     refute_nil catch_block,
                'a failed wake-up dispatch must be caught inside the loop, not left to reject the run'
     assert_includes catch_block, 'core.warning(',
