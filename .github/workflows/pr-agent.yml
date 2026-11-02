@@ -8,6 +8,11 @@ run-name: >-
 on:
   workflow_dispatch:
     inputs:
+      continuum_ref:
+        description: Continuum revision supplying reusable workflow
+        required: false
+        default: main
+        type: string
       pr_number:
         description: Pull request number for a bounded PR-Agent retry
         required: false
@@ -59,7 +64,7 @@ jobs:
     uses: kodmial/continuum/.github/workflows/continuum-pr-agent.yml@main
     secrets: inherit
     with:
-      continuum_ref: main
+      continuum_ref: "${{ inputs.continuum_ref || 'main' }}"
       pr_number: "${{ inputs.pr_number }}"
       # Consumed by the reusable workflow's Resolve PR-Agent target context
       # step (TARGET_CHILD_ID): the opaque id selects the delegated child
