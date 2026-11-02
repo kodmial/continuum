@@ -73,6 +73,8 @@ class ValidationEntrypointContractTest(unittest.TestCase):
             body,
         )
         self.assertIn("coverage.py is required for the changed-line gate", body)
+        self.assertIn('["git", "diff", "-U0", merge_base, "--", "src"]', body)
+        self.assertNotIn('merge_base, "HEAD", "--", "src"', body)
 
         workflow = (ROOT / ".github/workflows/continuum-validation.yml").read_text(
             encoding="utf-8"
@@ -95,6 +97,11 @@ class ValidationEntrypointContractTest(unittest.TestCase):
         )
         self.assertIn(f"publish_status: {read_only_expression}", body)
         self.assertIn(f"dispatch_repair: {read_only_expression}", body)
+
+    def test_contract_gate_skips_status_writes_for_dependabot(self):
+        body = GATE.read_text(encoding="utf-8")
+        self.assertIn("github.event.pull_request.head.repo.full_name == github.repository", body)
+        self.assertIn("github.actor != 'dependabot[bot]'", body)
 
     def test_contract_gate_does_not_inherit_unused_secrets(self):
         body = GATE.read_text(encoding="utf-8")

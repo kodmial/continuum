@@ -15,6 +15,11 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 WORKFLOW = ROOT / ".github" / "workflows" / "continuum-issue-scheduler.yml"
 SCHEDULER = ROOT / ".github" / "scripts" / "issue_scheduler.js"
+AUTOMATION = ROOT / ".github" / "workflows" / "automation.yml"
+SCHEDULER_STUB = ROOT / ".github" / "caller-stubs" / "continuum-issue-scheduler.yml"
+CHILD_WORKER = ROOT / ".github" / "workflows" / "continuum-consumer-child-worker.yml"
+CHILD_REVIEW = ROOT / ".github" / "workflows" / "continuum-consumer-child-review.yml"
+CHILD_PR_REVIEW = ROOT / ".github" / "workflows" / "continuum-consumer-child-pr-review.yml"
 LOADER_LIMIT_BYTES = 4 * 1024
 
 
@@ -45,6 +50,22 @@ class SchedulerWorkflowPayloadTests(unittest.TestCase):
         self.assertIn("issue_scheduler.js", loader)
         self.assertIn("await runScheduler({ github, context, core });", loader)
         self.assertTrue(SCHEDULER.is_file())
+
+    def test_owner_command_prefilters_accept_tab_and_crlf_delimiters(self):
+        for path in (AUTOMATION, SCHEDULER_STUB):
+            body = path.read_text(encoding="utf-8")
+            with self.subTest(path=path.name):
+                for token in ("oc", "opencode"):
+                    self.assertIn(f'fromJSON(\'"/{token}\\t"\')', body)
+                    self.assertIn(f'fromJSON(\'"/{token}\\r\\n"\')', body)
+
+    def test_child_worker_and_review_concurrency_groups_are_disjoint(self):
+        worker = CHILD_WORKER.read_text(encoding="utf-8")
+        review = CHILD_REVIEW.read_text(encoding="utf-8")
+        pr_review = CHILD_PR_REVIEW.read_text(encoding="utf-8")
+        self.assertIn("group: continuum-child-worker-", worker)
+        self.assertIn("group: continuum-subtask-review-", review)
+        self.assertIn("group: continuum-subtask-pr-review-", pr_review)
 
     def test_extracted_scheduler_is_valid_node_source(self):
         node = shutil.which("node")

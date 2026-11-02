@@ -57,7 +57,7 @@ except subprocess.CalledProcessError as error:
         + (f": {error.stderr.strip()}" if error.stderr else "")
     )
 diff = subprocess.check_output(
-    ["git", "diff", "-U0", merge_base, "HEAD", "--", "src"], text=True
+    ["git", "diff", "-U0", merge_base, "--", "src"], text=True
 )
 changed = {}
 current = None

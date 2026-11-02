@@ -125,7 +125,16 @@ class ExecutableCanaryContractTests(unittest.TestCase):
             "const prAgentRuns = async (pullNumber, headSha)", body,
             "the final evidence pass must use a defined bounded lookup",
         )
-        self.assertIn("await prAgentRuns(prNumber, head)", body)
+        self.assertIn("const prAgentRunNames = new Set([", body)
+        self.assertIn("'PR Agent (OpenCode backend)'", body)
+        self.assertIn("'PR Agent (OpenCode-backed)'", body)
+        self.assertIn("prAgentRunNames.has(run.name)", body)
+        self.assertIn("prAgentRunNames.has(candidate.name)", body)
+        clean_wait = body.index("const clean = await waitFor")
+        final_runs = body.index("await prAgentRuns(prNumber, cleanHead)")
+        evidence = body.index("const evidence = {")
+        self.assertGreater(final_runs, clean_wait)
+        self.assertLess(final_runs, evidence)
 
     def test_cleanup_and_evidence(self):
         body = WORKFLOW.read_text(encoding="utf-8")
