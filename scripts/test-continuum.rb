@@ -8691,17 +8691,33 @@ class ContinuumTest < Minitest::Test
                     'child run lookup must be page-bounded like the scheduler'
   end
 
-  def test_api_budget_canary_polls_are_single_page_and_reuse_create_state
+  def test_api_budget_canary_run_discovery_is_bounded_and_polls_by_id
     body = workflow_body('continuum-pr-agent-canary.yml')
 
-    assert_includes body, 'per_page: 50, page: 1',
-                    'canary run polls must read one recent page, not full history'
+    assert_includes body, 'per_page: 100, page: 1, event: \'workflow_dispatch\'',
+                    'canary baseline must use a bounded recent dispatch window'
+    assert_includes body, 'for (let page = 1; page <= 5; page += 1)',
+                    'initial exact-run discovery must have a bounded page limit'
+    assert_includes body, 'github.rest.actions.getWorkflowRun',
+                    'after discovery, poll the retained run ID directly'
+    assert_includes body, 'targetRunId = run.id',
+                    'the matching run ID must be retained across polls'
+    assert_includes body, 'created: `>=${dispatchCreatedAfter}`',
+                    'discovery must exclude older workflow history'
+    assert_includes body, 'head = pr.data.head.sha;',
+                    'the create response already carries the HEAD'
+    refute_includes body, 'let head = pr.data.head.sha;',
+                    'head must be assigned to the outer variable'
+    assert_operator body.index('prNumber = pr.data.number;'), :<, body.index('const runTitlePrefix')
+    assert_operator body.index('head = pr.data.head.sha;'), :<, body.index('const runTitlePrefix')
+    assert_operator body.index('const before = new Set(baseline.data.workflow_runs.map((run) => run.id));'),
+                    :<, body.index('const reviewComment = await github.rest.issues.createComment')
+    refute_includes body, 'per_page: 50, page: 1',
+                    'canary run lookup must not depend on a 50-run first page'
     refute_includes body, 'github.paginate(',
                     'canary polls must not paginate unbounded history'
-    assert_includes body, 'let head = pr.data.head.sha;',
-                    'the create response already carries the HEAD'
     assert_includes body, 'for (let page = 1; page <= 2; page += 1)',
-                    'canary finding polls must be page-bounded'
+                    'canary finding polls must remain page-bounded'
   end
 
   def test_api_budget_opencode_scans_deferred_to_protected_baseline
