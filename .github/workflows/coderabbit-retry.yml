@@ -25,8 +25,15 @@ on:
   schedule:
     - cron: "3,13,23,33,43,53 * * * *"
 
-  # Manual/safety-net reconciliation.
+  # Manual/safety-net reconciliation. The PR identity is a wake hint because
+  # the controller itself stays global.
   workflow_dispatch:
+    inputs:
+      pr_number:
+        description: "Pull request that woke the controller"
+        required: false
+        default: ''
+        type: string
 
 permissions:
   # The review queue only reads Actions state; exact-finding verification
@@ -48,3 +55,4 @@ jobs:
     secrets: inherit
     with:
       continuum_ref: main
+      pr_number: "${{ inputs.pr_number }}"

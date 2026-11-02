@@ -780,6 +780,13 @@ class ContinuumTest < Minitest::Test
                  retry_events.fetch('schedule').map { |item| item.fetch('cron') }
     assert retry_events.key?('workflow_dispatch'),
            'coderabbit-retry.yml: manual safety-net dispatch must stay available'
+    retry_dispatch = retry_events.fetch('workflow_dispatch').fetch('inputs').fetch('pr_number')
+    assert_equal false, retry_dispatch.fetch('required')
+    assert_equal 'string', retry_dispatch.fetch('type')
+    retry_with = yaml(File.join(ROOT, '.github/workflows/coderabbit-retry.yml'))
+                .fetch('jobs').fetch('call').fetch('with')
+    assert_equal '${{ inputs.pr_number }}', retry_with.fetch('pr_number'),
+                 'coderabbit-retry.yml: the dispatch PR identity must reach the engine'
 
     label_events = events(yaml(File.join(ROOT, '.github/workflows/add-review-label.yml')))
     assert_equal ['CI'], label_events.fetch('workflow_run').fetch('workflows')
@@ -882,6 +889,49 @@ class ContinuumTest < Minitest::Test
     assert_includes auto_merge_if, "github.event_name == 'pull_request_review_comment'"
     assert_includes events(automation).fetch('pull_request_review_comment').fetch('types'),
                     'created'
+  end
+
+  # A reconciliation dispatch must never target a caller that cannot receive
+  # it. The shared gate reads the exact dispatch ref, proves
+  # `workflow_dispatch` exists, and proves every supplied input is declared.
+  # A bootstrap pull request (caller not on the default branch yet) or an older
+  # installed consumer skips the dispatch with a message instead of failing.
+  def test_reconciliation_dispatches_require_a_dispatchable_caller
+    script = script_body('continuum-auto-merge.yml')
+
+    assert_equal 1, script.scan('function parseWorkflowDispatchContract(').size,
+                 'the workflow_dispatch contract parser must stay single-sourced'
+    assert_equal 1, script.scan('async function reconciliationDispatchSupport(').size,
+                 'every dispatch site must share one gate helper'
+    assert_includes script, 'return parseWorkflowDispatchContract(',
+                    'the gate must delegate parsing to the contract parser'
+    assert_includes script, "['mode', 'pr_number', 'head_ref']",
+                    'conflict repair must require its exact dispatch inputs'
+
+    %w[codeRabbitRetryWorkflow codeRabbitUnresolvedWorkflow].each do |target|
+      indices = script.lines.each_index.select do |index|
+        script.lines[index].include?("workflow_id: #{target}")
+      end
+      refute_empty indices, "#{target} dispatch is missing"
+      indices.each do |index|
+        window = script.lines[[index - 40, 0].max..index].join
+        assert_includes window, 'reconciliationDispatchSupport(',
+                        "the dispatch at line #{index + 1} is not gated by the shared helper"
+      end
+    end
+    assert_equal 2, script.scan('retryDispatchSupport.ok').size,
+                 'both CodeRabbit retry dispatches must consult the gate result'
+    assert_equal 1, script.scan('dispatchSupport.ok').size,
+                 'the unresolved reconciliation dispatch must consult the gate result'
+    assert_equal 3, script.scan('inputs: { pr_number: String(pr.number) }').size,
+                 'every CodeRabbit reconciliation dispatch must carry its PR identity'
+
+    conflict = js_block(script, 'async function dispatchConflictRepair(pr, reason)')
+    refute_nil conflict, 'the conflict-repair dispatcher is missing'
+    assert_includes conflict, 'reconciliationDispatchSupport('
+    assert_includes conflict, 'conflictDispatchSupport.ok'
+    assert_includes conflict, 'mode: \'resolve-conflict\''
+    assert_includes conflict, 'workflow_id: opencodeWorkflow'
   end
 
   # A consumer overrides a dispatch target either through a repository
@@ -5056,7 +5106,7 @@ class ContinuumTest < Minitest::Test
       coderabbit_retry_workflow coderabbit_unresolved_workflow
     ],
     'continuum-bootstrap-runtime-secret.yml' => %w[continuum_ref repository],
-    'continuum-coderabbit-retry.yml' => %w[continuum_ref],
+    'continuum-coderabbit-retry.yml' => %w[continuum_ref pr_number],
      'continuum-docker-qualification.yml' => %w[
       continuum_ref issue_number artifact_repository binary_name model
       docker_image memory_mib min_headroom_mib trials result_schema
@@ -6502,6 +6552,21 @@ class ContinuumTest < Minitest::Test
     assert_includes body, 'while (!selected)'
     assert_includes body, 'candidate.effectiveDueAt <= now'
     refute_includes body, "github.event_name == 'push'"
+
+    # A reconciliation dispatch carries the PR that woke the queue. The caller
+    # declares the input and forwards it; the engine accepts it without
+    # narrowing the global selection contract.
+    dispatch = events(stub).fetch('workflow_dispatch').fetch('inputs').fetch('pr_number')
+    assert_equal false, dispatch.fetch('required')
+    assert_equal '', dispatch.fetch('default')
+    assert_equal 'string', dispatch.fetch('type')
+    assert_equal '${{ inputs.pr_number }}',
+                 stub.fetch('jobs').fetch('call').fetch('with').fetch('pr_number')
+    callee_inputs = events(yaml(File.join(ROOT, '.github/workflows/continuum-coderabbit-retry.yml')))
+                    .fetch('workflow_call').fetch('inputs')
+    assert_equal '', callee_inputs.fetch('pr_number').fetch('default')
+    assert_equal false, callee_inputs.fetch('pr_number').fetch('required')
+    assert_includes body, 'process.env.DISPATCH_PR_NUMBER'
 
     # No new secret and no consumer repository literal may ride along.
     %w[OPENCODE_API_KEY ANTHROPIC_API_KEY GROQ_API_KEY].each do |secret|

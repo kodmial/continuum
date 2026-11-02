@@ -15,6 +15,13 @@ on:
         type: string
         default: ''
         required: false
+      pr_number:
+        description: >-
+          Pull request that woke the controller. The queue stays global; the
+          value is a diagnostic wake hint, not a selection restriction.
+        type: string
+        default: ''
+        required: false
   # Any new/edited CodeRabbit rate-limit response wakes the global controller.
 
 permissions: {}
@@ -68,6 +75,7 @@ jobs:
           REQUIRED_WORKFLOW_GATE_NAME: ${{ vars.CONTINUUM_REQUIRED_WORKFLOW_GATE_NAME || '' }}
           READ_GITHUB_TOKEN: ${{ github.token }}
           COMMENT_PAT: ${{ secrets.TAP_PAT }}
+          DISPATCH_PR_NUMBER: ${{ inputs.pr_number || '' }}
         with:
           # Same-repository discovery stays on the repository token. The
           # CodeRabbit command and its tiny exact-head lock mutation share the
@@ -79,6 +87,16 @@ jobs:
             const owner = context.repo.owner;
             const repo = context.repo.repo;
             const repoFullName = `${owner}/${repo}`;
+            // A workflow_dispatch may carry the PR that woke the queue.
+            // Selection stays global; the value is a diagnostic hint.
+            const dispatchPrNumber = String(
+              process.env.DISPATCH_PR_NUMBER || ''
+            ).trim();
+            if (dispatchPrNumber) {
+              core.notice(
+                `Dispatch wake hint for PR #${dispatchPrNumber}; queue selection remains global.`
+              );
+            }
             // One controller must release its global concurrency lease before
             // GitHub's 90-minute job timeout, even if quota state keeps moving.
             const controllerStartedAt = Date.now();

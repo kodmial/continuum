@@ -1711,21 +1711,23 @@ jobs:
                          Date.now() - batchAt < 10 * 60_000);
                       if (requireCodeRabbit && !recentBatchLease) {
                         // Older installed consumers may not yet support a
-                        // workflow_dispatch PR identity. Do not turn that
-                        // compatibility gap into an auto-merge failure.
-                        const source = await withReadFallback(client =>
-                          client.rest.repos.getContent({
-                            owner, repo,
-                            path: `.github/workflows/${codeRabbitUnresolvedWorkflow}`,
-                            ref: context.payload.repository?.default_branch || 'main',
-                          })
-                        );
-                        const callerText = source?.data?.type === 'file' &&
-                          typeof source.data.content === 'string'
-                          ? Buffer.from(source.data.content, 'base64').toString('utf8')
-                          : '';
-                        if (/^  workflow_dispatch:/m.test(callerText) &&
-                            /^      pr_number:/m.test(callerText)) {
+                        // workflow_dispatch PR identity. The shared gate reads
+                        // the exact dispatch ref and skips with an explicit
+                        // message instead of turning that compatibility gap
+                        // into an auto-merge failure.
+                        const dispatchRef =
+                          context.payload.repository?.default_branch || 'main';
+                        const dispatchSupport =
+                          await reconciliationDispatchSupport(
+                            codeRabbitUnresolvedWorkflow,
+                            dispatchRef,
+                            ['pr_number']
+                          );
+                        if (!dispatchSupport.ok) {
+                          core.notice(
+                            `PR #${pr.number}: skipped CodeRabbit unresolved reconciliation dispatch: ${dispatchSupport.reason}.`
+                          );
+                        } else {
                           const currentPr = await withReadFallback(client =>
                             client.rest.pulls.get({
                               owner, repo, pull_number: pr.number,
@@ -1736,7 +1738,7 @@ jobs:
                             await github.rest.actions.createWorkflowDispatch({
                               owner, repo,
                               workflow_id: codeRabbitUnresolvedWorkflow,
-                              ref: context.payload.repository?.default_branch || 'main',
+                              ref: dispatchRef,
                               inputs: { pr_number: String(pr.number) },
                             });
                             repairReconciliationDispatched = true;
@@ -2023,6 +2025,110 @@ jobs:
               return configured;
             }
 
+            // Parse the workflow_dispatch contract from a caller file body.
+            // Returns the declared input names so a dispatch never sends an
+            // input the caller does not accept.
+            function parseWorkflowDispatchContract(text, label, requiredInputs = []) {
+              const body = String(text || '').replace(/\r\n/g, '\n');
+              const trigger = body.match(
+                /^  workflow_dispatch:[ \t]*(?:#.*)?$/m
+              );
+              if (!trigger) {
+                return {
+                  ok: false,
+                  reason: `${label} does not declare workflow_dispatch`,
+                  inputs: [],
+                };
+              }
+              const declared = new Set();
+              let inInputs = false;
+              const lines = body
+                .slice(trigger.index + trigger[0].length)
+                .split('\n');
+              for (const line of lines) {
+                if (!line.trim() || line.trimStart().startsWith('#')) continue;
+                const indent = line.length - line.trimStart().length;
+                if (indent <= 2) break; // next top-level trigger key
+                if (/^    inputs:[ \t]*(?:#.*)?$/.test(line)) {
+                  inInputs = true;
+                  continue;
+                }
+                if (!inInputs) continue;
+                const input = line.match(/^      ([A-Za-z0-9_-]+):/);
+                if (input) declared.add(input[1]);
+              }
+              const missing = requiredInputs.filter(
+                name => !declared.has(name)
+              );
+              if (missing.length > 0) {
+                return {
+                  ok: false,
+                  reason:
+                    `${label} does not declare required input(s): ` +
+                    missing.join(', '),
+                  inputs: [...declared],
+                };
+              }
+              return { ok: true, inputs: [...declared] };
+            }
+
+            // Shared reconciliation-dispatch gate. A workflow file accepts a
+            // dispatch only when the exact target ref declares
+            // workflow_dispatch and every input the dispatch supplies. A
+            // bootstrap pull request (the caller is not on the default branch
+            // yet) or an older installed consumer must skip that dispatch with
+            // an explicit message instead of turning the compatibility gap
+            // into a red reconciliation run. Non-404 read failures surface so
+            // the next wakeup can retry them.
+            async function reconciliationDispatchSupport(
+              workflowFile,
+              ref,
+              requiredInputs
+            ) {
+              const label = `.github/workflows/${workflowFile}@${ref}`;
+              let source;
+              try {
+                source = await withReadFallback(client =>
+                  client.rest.repos.getContent({
+                    owner,
+                    repo,
+                    path: `.github/workflows/${workflowFile}`,
+                    ref,
+                  })
+                );
+              } catch (err) {
+                const status = err
+                  ? (err.status ?? err.response?.status)
+                  : undefined;
+                if (status === 404) {
+                  return {
+                    ok: false,
+                    reason: `${label} is not present on the dispatch ref`,
+                    inputs: [],
+                  };
+                }
+                throw err;
+              }
+              const data = source?.data;
+              if (
+                !data ||
+                data.type !== 'file' ||
+                typeof data.content !== 'string'
+              ) {
+                return {
+                  ok: false,
+                  reason: `${label} is not a readable workflow file`,
+                  inputs: [],
+                };
+              }
+              const text = Buffer.from(data.content, 'base64').toString('utf8');
+              return parseWorkflowDispatchContract(
+                text,
+                label,
+                requiredInputs
+              );
+            }
+
             const codeRabbitRetryWorkflow = resolveDispatchWorkflow(
               process.env.CONTINUUM_CODERABBIT_RETRY_WORKFLOW,
               'continuum-coderabbit-retry.yml',
@@ -2231,6 +2337,27 @@ jobs:
                 core.info(
                   `PR #${pr.number}: conflict repair run ${activeRun.id} (${activeRun.status}) is already active for this PR; waiting.`
                 );
+                return;
+              }
+
+              // The dispatch ref must expose a caller that accepts the exact
+              // repair contract. During a bootstrap pull request the caller is
+              // not on the default branch yet, and an older installed consumer
+              // may not have the caller at all: skip this dispatch explicitly
+              // instead of posting a claim and failing the reconciliation.
+              const conflictDispatchSupport =
+                await reconciliationDispatchSupport(
+                  opencodeWorkflow,
+                  'main',
+                  ['mode', 'pr_number', 'head_ref']
+                );
+              if (!conflictDispatchSupport.ok) {
+                core.notice(
+                  `PR #${pr.number}: skipped OpenCode conflict-repair dispatch: ${conflictDispatchSupport.reason}.`
+                );
+                if (hasLabel(pr, CONFLICT_LOCK_LABEL)) {
+                  await removeConflictLock(pr.number);
+                }
                 return;
               }
 
@@ -3168,16 +3295,30 @@ jobs:
               // wake, and a repository without `continuum-coderabbit-retry.yml`
               // would answer the dispatch with a 404.
               if (requireCodeRabbit && !reviewBasis && !codeRabbitRetryControllerDispatched) {
-                await github.rest.actions.createWorkflowDispatch({
-                  owner,
-                  repo,
-                  workflow_id: codeRabbitRetryWorkflow,
-                  ref: 'main',
-                });
-                codeRabbitRetryControllerDispatched = true;
-                core.notice(
-                  `PR #${pr.number}: missing a valid CodeRabbit approval; dispatched the global review controller.`
-                );
+                const retryDispatchSupport =
+                  await reconciliationDispatchSupport(
+                    codeRabbitRetryWorkflow,
+                    'main',
+                    ['pr_number']
+                  );
+                if (!retryDispatchSupport.ok) {
+                  codeRabbitRetryControllerDispatched = true;
+                  core.notice(
+                    `PR #${pr.number}: skipped CodeRabbit review-queue dispatch: ${retryDispatchSupport.reason}.`
+                  );
+                } else {
+                  await github.rest.actions.createWorkflowDispatch({
+                    owner,
+                    repo,
+                    workflow_id: codeRabbitRetryWorkflow,
+                    ref: 'main',
+                    inputs: { pr_number: String(pr.number) },
+                  });
+                  codeRabbitRetryControllerDispatched = true;
+                  core.notice(
+                    `PR #${pr.number}: missing a valid CodeRabbit approval; dispatched the global review controller.`
+                  );
+                }
               }
 
               // Rate-limit recovery applies only when this HEAD still needs its
@@ -3196,16 +3337,29 @@ jobs:
                 // source issues P0 -> P1 -> P2 and emits at most one review
                 // command for the next legal quota slot.
                 if (!codeRabbitRetryControllerDispatched) {
-                  await github.rest.actions.createWorkflowDispatch({
-                    owner,
-                    repo,
-                    workflow_id: codeRabbitRetryWorkflow,
-                    ref: 'main',
-                  });
-                  codeRabbitRetryControllerDispatched = true;
-                  core.notice(
-                    'Delegated rate-limited CodeRabbit reviews to the global priority controller.'
-                  );
+                  const retryDispatchSupport =
+                    await reconciliationDispatchSupport(
+                      codeRabbitRetryWorkflow,
+                      'main',
+                      ['pr_number']
+                    );
+                  if (!retryDispatchSupport.ok) {
+                    core.notice(
+                      `PR #${pr.number}: skipped rate-limited CodeRabbit review-queue dispatch: ${retryDispatchSupport.reason}.`
+                    );
+                  } else {
+                    await github.rest.actions.createWorkflowDispatch({
+                      owner,
+                      repo,
+                      workflow_id: codeRabbitRetryWorkflow,
+                      ref: 'main',
+                      inputs: { pr_number: String(pr.number) },
+                    });
+                    codeRabbitRetryControllerDispatched = true;
+                    core.notice(
+                      'Delegated rate-limited CodeRabbit reviews to the global priority controller.'
+                    );
+                  }
                 }
                 continue;
               }
