@@ -12,6 +12,7 @@ import json
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -235,6 +236,163 @@ permissions: {}
             [{"name": "crlf", "text": text, "requiredInputs": ["pr_number"]}]
         )
         self.assertTrue(result["crlf"]["ok"], result["crlf"])
+
+    def test_accepts_four_space_indentation(self):
+        text = """on:
+    workflow_dispatch:
+        inputs:
+            mode:
+                description: "Mode"
+                required: true
+                default: ci-fix
+                type: string
+            pr_number:
+                required: false
+                type: string
+permissions: {}
+"""
+        result = self.parse(
+            [
+                {
+                    "name": "four",
+                    "text": text,
+                    "requiredInputs": ["mode", "pr_number"],
+                }
+            ]
+        )
+        self.assertTrue(result["four"]["ok"], result["four"])
+        self.assertEqual(["mode", "pr_number"], result["four"]["inputs"])
+        self.assertEqual(["mode"], result["four"]["required"])
+
+    def test_accepts_flow_style_inputs_and_nested_keys(self):
+        text = (
+            "on: {workflow_dispatch: {inputs: {mode: {required: true, "
+            "default: 'resolve-conflict'}, pr_number: {description: "
+            "'Pull request', required: false, type: string}}}}\n"
+            "permissions: {}\n"
+        )
+        result = self.parse(
+            [
+                {
+                    "name": "flow",
+                    "text": text,
+                    "requiredInputs": ["mode", "pr_number"],
+                }
+            ]
+        )
+        self.assertTrue(result["flow"]["ok"], result["flow"])
+        self.assertEqual(["mode", "pr_number"], result["flow"]["inputs"])
+
+    def test_rejects_tab_indentation(self):
+        text = "on:\n\tworkflow_dispatch:\n"
+        result = self.parse([{"name": "tabs", "text": text}])
+        self.assertFalse(result["tabs"]["ok"])
+        self.assertIn("tab indentation is not YAML", result["tabs"]["reason"])
+
+    def test_required_input_without_default_must_be_supplied(self):
+        text = """on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "Mode"
+        required: true
+        type: string
+      pr_number:
+        required: true
+        default: ''
+        type: string
+"""
+        result = self.parse(
+            [
+                {"name": "missing", "text": text, "requiredInputs": ["pr_number"]},
+                {
+                    "name": "supplied",
+                    "text": text,
+                    "requiredInputs": ["mode", "pr_number"],
+                },
+            ]
+        )
+        self.assertTrue(result["supplied"]["ok"], result["supplied"])
+        self.assertFalse(result["missing"]["ok"])
+        self.assertIn(
+            "requires input(s) without a default", result["missing"]["reason"]
+        )
+        self.assertIn("mode", result["missing"]["reason"])
+
+    def test_optional_input_without_default_is_accepted(self):
+        text = """on:
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        required: false
+        type: string
+"""
+        result = self.parse(
+            [{"name": "optional", "text": text, "requiredInputs": []}]
+        )
+        self.assertTrue(result["optional"]["ok"], result["optional"])
+
+    def test_rejects_a_non_boolean_required_marker(self):
+        text = """on:
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        required: sometimes
+        type: string
+"""
+        result = self.parse(
+            [{"name": "bad", "text": text, "requiredInputs": ["pr_number"]}]
+        )
+        self.assertFalse(result["bad"]["ok"])
+        self.assertIn("non-boolean required value", result["bad"]["reason"])
+
+    def test_embedded_parsers_are_generated_from_one_source(self):
+        completed = subprocess.run(
+            [
+                sys.executable,
+                str(ROOT / "scripts/embed_workflow_dispatch_contract.py"),
+                "--check",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+
+    def test_real_callers_parse_with_their_actual_dispatch_inputs(self):
+        cases = []
+        for name, path, inputs in (
+            (
+                "opencode",
+                OPENCODE_STUB,
+                ["mode", "pr_number", "head_ref", "conflict_strategy"],
+            ),
+            (
+                "pr-agent-repair",
+                PR_AGENT_REPAIR_STUB,
+                ["pr_number", "mode", "head_sha", "target_child_id"],
+            ),
+            (
+                "coderabbit-retry",
+                ROOT / ".github/caller-stubs/continuum-coderabbit-retry.yml",
+                ["pr_number"],
+            ),
+            (
+                "coderabbit-unresolved",
+                ROOT / ".github/caller-stubs/continuum-coderabbit-unresolved.yml",
+                ["pr_number"],
+            ),
+        ):
+            cases.append(
+                {
+                    "name": name,
+                    "text": path.read_text(encoding="utf-8"),
+                    "requiredInputs": inputs,
+                }
+            )
+        result = self.parse(cases)
+        for name in (case["name"] for case in cases):
+            self.assertTrue(result[name]["ok"], result[name])
 
     def test_conflict_repair_uses_configured_callers_without_undeclared_inputs(self):
         workflow = PR_AGENT_WORKFLOW.read_text(encoding="utf-8")

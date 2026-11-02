@@ -6,6 +6,12 @@ on:
   pull_request:
 
 permissions:
+  # continuum-validation's validate job declares actions: write for its
+  # optional repair dispatch. GitHub validates the called workflow's job
+  # permissions against the caller before any job starts, so the grant is
+  # required even when dispatch_repair is false; omitting it rejects the
+  # whole workflow with startup_failure and zero jobs.
+  actions: write
   contents: read
   pull-requests: read
   statuses: write

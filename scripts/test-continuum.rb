@@ -27,9 +27,32 @@ class ContinuumTest < Minitest::Test
   # Primary CI is deliberately project-owned. The shared validation workflow is
   # an engine called by each consumer's ci.yml, not an install-managed caller.
   PROJECT_OWNED_WORKFLOW_NAMES = ['CI'].freeze
+  PERMISSION_RANK = {'none'=>0, 'read'=>1, 'write'=>2}.freeze
 
   def yaml(path)
     YAML.load_file(path)
+  end
+
+  # The reusable workflow filename behind a job-level `uses:`. Only local
+  # workflows and this repository's published workflows resolve to a file we
+  # can inspect; third-party actions and external repositories do not.
+  def reusable_workflow_reference(job)
+    uses = job['uses']
+    return nil unless uses.is_a?(String)
+
+    match = uses.match(%r{\A(?:\./|kodmial/continuum/)\.github/workflows/([^@]+)(?:@.+)?\z})
+    match && match[1]
+  end
+
+  # GitHub applies a job's permissions block over the workflow default.
+  def effective_permissions(document, job)
+    return job['permissions'] if job.key?('permissions')
+
+    document['permissions']
+  end
+
+  def permission_rank(value)
+    PERMISSION_RANK.fetch(value, -1)
   end
 
   # The scheduler implementation is the checked-in module; both the full
@@ -477,6 +500,49 @@ class ContinuumTest < Minitest::Test
       ([callee['permissions']] + callee['jobs'].values.map { |job| job['permissions'] }).compact.each do |required|
         required.each do |key, value|
           assert_operator rank.fetch(permissions.fetch(key, 'none')), :>=, rank.fetch(value), "#{caller['name']}: #{key}"
+        end
+      end
+    end
+  end
+
+  # A reusable workflow job may only request scopes its caller grants. GitHub
+  # validates this before any job starts, so a missing scope is a
+  # startup_failure with zero jobs, not a step-level error. Check every local
+  # caller: project entry workflows, reusable workflows that call another
+  # engine, installed stubs, and consumer examples. The effective caller
+  # permissions are the job's own block when present, otherwise the workflow
+  # default; a callee job inherits its workflow's default the same way.
+  def test_every_reusable_workflow_caller_grants_callee_job_permissions
+    callers = (WORKFLOWS + ALL_STUBS + Dir[File.join(ROOT, 'examples/**/*.yml')].sort).uniq
+    callers.each do |caller_path|
+      caller = yaml(caller_path)
+      next unless caller.is_a?(Hash) && caller['jobs'].is_a?(Hash)
+
+      caller['jobs'].each do |job_id, job|
+        next unless job.is_a?(Hash)
+        callee_name = reusable_workflow_reference(job)
+        next unless callee_name
+
+        caller_label = caller_path.sub("#{ROOT}/", '')
+        callee_path = File.join(ROOT, '.github/workflows', callee_name)
+        assert File.file?(callee_path),
+               "#{caller_label}:#{job_id}: referenced reusable workflow #{callee_name} is missing"
+        callee = yaml(callee_path)
+        granted = effective_permissions(caller, job)
+        refute_nil granted,
+                   "#{caller_label}:#{job_id}: a reusable-workflow call must declare permissions explicitly"
+        callee['jobs'].each do |callee_job_id, callee_job|
+          next unless callee_job.is_a?(Hash)
+          required = effective_permissions(callee, callee_job)
+          next if required.nil?
+
+          required.each do |scope, level|
+            granted_level = granted.fetch(scope, 'none')
+            assert_operator permission_rank(granted_level), :>=, permission_rank(level),
+                            "#{caller_label}:#{job_id} -> #{callee_name}:#{callee_job_id} " \
+                            "must grant #{scope}: #{level} (has #{granted_level}); " \
+                            'GitHub rejects the whole workflow at startup otherwise'
+          end
         end
       end
     end

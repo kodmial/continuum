@@ -59,6 +59,28 @@ class ValidationEntrypointContractTest(unittest.TestCase):
             "the checksum must be verified before the installer runs",
         )
 
+    def test_coverage_gate_cannot_silently_skip(self):
+        body = VALIDATE.read_text(encoding="utf-8")
+        self.assertNotIn("skipping changed-line gate", body)
+        self.assertIn("refusing to skip the changed-line gate", body)
+        self.assertIn("base '$coverage_base' is unavailable", body)
+        self.assertIn(
+            'git fetch --no-tags origin \\\n      "+refs/heads/${base_branch}:refs/remotes/origin/${base_branch}"',
+            body,
+        )
+        self.assertIn(
+            "coverage: cannot compute merge-base for {base} and HEAD",
+            body,
+        )
+        self.assertIn("coverage.py is required for the changed-line gate", body)
+
+        workflow = (ROOT / ".github/workflows/continuum-validation.yml").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("fetch-depth: 0", workflow)
+        qualification = QUALIFICATION.read_text(encoding="utf-8")
+        self.assertIn("fetch-depth: 0", qualification)
+
     def test_minimal_consumer_uses_current_main_and_skips_writes_for_read_only_prs(self):
         body = SAMPLE_CI.read_text(encoding="utf-8")
         self.assertIn(

@@ -7,28 +7,55 @@ PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=src python3 -m continuum.trigger_manifest -
 mkdir -p .opencode-tmp
 export TMPDIR="$PWD/.opencode-tmp"
 
-# Changed-line coverage gate for the Python engine. coverage.py is optional in
-# a consumer environment: when it is absent the suite still runs unchanged.
-# A missing base ref is reported explicitly instead of silently passing.
+# Changed-line coverage gate for the Python engine. The gate is mandatory: a
+# shallow checkout or a missing coverage.py must fail loudly instead of
+# turning the check into an inert skip.
 coverage_base="${CONTINUUM_COVERAGE_BASE:-origin/main}"
-if python3 -c 'import coverage' >/dev/null 2>&1; then
-  if git rev-parse --verify --quiet "${coverage_base}^{commit}" >/dev/null; then
-    coverage_file="$PWD/.opencode-tmp/.coverage"
-    rm -f "$coverage_file" "$PWD/.opencode-tmp/coverage.json"
-    COVERAGE_FILE="$coverage_file" PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=src \
-      python3 -m coverage run --source=src -m unittest discover -s tests
-    COVERAGE_FILE="$coverage_file" python3 -m coverage json \
-      -o "$PWD/.opencode-tmp/coverage.json" >/dev/null
-    python3 - "$coverage_base" "$PWD/.opencode-tmp/coverage.json" <<'COVERAGE_PY'
+if ! git rev-parse --verify --quiet "${coverage_base}^{commit}" >/dev/null; then
+  if [[ "$coverage_base" == origin/* ]]; then
+    base_branch="${coverage_base#origin/}"
+    echo "coverage: base '$coverage_base' is missing; fetching it from origin" >&2
+    if ! git fetch --no-tags origin \
+      "+refs/heads/${base_branch}:refs/remotes/origin/${base_branch}" >&2; then
+      echo "coverage: cannot fetch base '$coverage_base' from origin; refusing to skip the changed-line gate" >&2
+      exit 1
+    fi
+  fi
+fi
+if ! git rev-parse --verify --quiet "${coverage_base}^{commit}" >/dev/null; then
+  echo "coverage: base '$coverage_base' is unavailable; a shallow checkout cannot prove the changed-line gate. Fetch full history (actions/checkout fetch-depth: 0) or set CONTINUUM_COVERAGE_BASE to a reachable base commit." >&2
+  exit 1
+fi
+if ! python3 -c 'import coverage' >/dev/null 2>&1; then
+  echo "coverage: coverage.py is required for the changed-line gate; installing it" >&2
+  if ! python3 -m pip install --quiet --disable-pip-version-check 'coverage>=7' >&2; then
+    echo "coverage: cannot install coverage.py; refusing to skip the changed-line gate" >&2
+    exit 1
+  fi
+fi
+coverage_file="$PWD/.opencode-tmp/.coverage"
+rm -f "$coverage_file" "$PWD/.opencode-tmp/coverage.json"
+COVERAGE_FILE="$coverage_file" PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=src \
+  python3 -m coverage run --source=src -m unittest discover -s tests
+COVERAGE_FILE="$coverage_file" python3 -m coverage json \
+  -o "$PWD/.opencode-tmp/coverage.json" >/dev/null
+python3 - "$coverage_base" "$PWD/.opencode-tmp/coverage.json" <<'COVERAGE_PY'
 import json
 import re
 import subprocess
 import sys
 
 base, report_path = sys.argv[1], sys.argv[2]
-merge_base = subprocess.check_output(
-    ["git", "merge-base", base, "HEAD"], text=True
-).strip()
+try:
+    merge_base = subprocess.check_output(
+        ["git", "merge-base", base, "HEAD"], text=True, stderr=subprocess.PIPE
+    ).strip()
+except subprocess.CalledProcessError as error:
+    sys.exit(
+        f"coverage: cannot compute merge-base for {base} and HEAD; "
+        "fetch the full history (actions/checkout fetch-depth: 0)"
+        + (f": {error.stderr.strip()}" if error.stderr else "")
+    )
 diff = subprocess.check_output(
     ["git", "diff", "-U0", merge_base, "HEAD", "--", "src"], text=True
 )
@@ -65,13 +92,6 @@ else:
     if percent < 80.0:
         sys.exit("coverage: changed-line coverage below the 80% threshold")
 COVERAGE_PY
-  else
-    echo "coverage: base '$coverage_base' is unavailable; skipping changed-line gate" >&2
-    PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=src python3 -m unittest discover -s tests
-  fi
-else
-  PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=src python3 -m unittest discover -s tests
-fi
 PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s .github/scripts -p 'test_delegation_runtime.py'
 
 mkdir -p "$PWD/.opencode-tmp/bin"

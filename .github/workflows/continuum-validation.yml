@@ -194,6 +194,9 @@ jobs:
         with:
           ref: ${{ steps.target.outputs.sha }}
           persist-credentials: false
+          # The project validation command gates changed-line coverage
+          # against origin/main, so the full history must be present.
+          fetch-depth: 0
 
       - name: Detect project stack
         if: fromJSON(inputs.auto_detect || vars.CONTINUUM_AUTO_DETECT || 'true')

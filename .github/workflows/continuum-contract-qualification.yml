@@ -114,6 +114,9 @@ jobs:
         with:
           ref: ${{ steps.target.outputs.sha }}
           persist-credentials: false
+          # validate-continuum.sh gates changed-line coverage against
+          # origin/main, which requires the full history.
+          fetch-depth: 0
 
       - name: Set up Python
         uses: actions/setup-python@82c7e631bb3cdc910f68e0081d67478d79c6982d # v5
