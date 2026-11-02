@@ -103,15 +103,24 @@ class ExecutableCanaryContractTests(unittest.TestCase):
 
     def test_review_run_lookup_uses_exact_dispatch_title_and_pre_command_baseline(self):
         body = WORKFLOW.read_text(encoding="utf-8")
-        lookup = body.split("const prAgentRuns = async", 1)[1].split(";", 1)[0]
+        lookup_start = body.index("const findDispatchedRun = async")
+        lookup = body[lookup_start:body.index("const reviewComment =", lookup_start)]
         self.assertIn("event: 'workflow_dispatch'", lookup)
         self.assertIn("run.display_title", lookup)
         self.assertIn("runTitlePrefix", lookup)
         self.assertIn("runTitleSuffix", lookup)
+        self.assertIn("github.rest.actions.getWorkflowRun", lookup)
+        self.assertIn("targetRunId = run.id", lookup)
+        self.assertIn("created: `>=${dispatchCreatedAfter}`", lookup)
+        self.assertIn("page <= 5", lookup)
+        self.assertIn("per_page: 100", lookup)
         self.assertNotIn("branch,", lookup)
-        before = body.index("const before = new Set((await prAgentRuns()).map((run) => run.id));")
+        before = body.index("const before = new Set(baseline.data.workflow_runs.map((run) => run.id));")
         comment = body.index("const reviewComment = await github.rest.issues.createComment")
+        self.assertLess(body.index("prNumber = pr.data.number;"), lookup_start)
+        self.assertLess(body.index("head = pr.data.head.sha;"), lookup_start)
         self.assertLess(before, comment)
+        self.assertIn("workflowRunIds.push(String(reviewedRun.id));", body)
 
     def test_cleanup_and_evidence(self):
         body = WORKFLOW.read_text(encoding="utf-8")
