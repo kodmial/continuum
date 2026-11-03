@@ -2399,6 +2399,7 @@ class ContinuumTest < Minitest::Test
     steps = workflow.fetch('jobs').fetch('pr_agent').fetch('steps')
     resolver = steps.find { |step| step['name'] == 'Resolve durable PR-Agent retry state' }
     refute_nil resolver, 'manual/default PR-Agent dispatch must resolve durable retry state before any model route'
+    assert_includes resolver.fetch('if'), "steps.admit.outputs.admitted == 'true'"
     script = resolver.fetch('with').fetch('script')
 
     run_case = lambda do |comments:, head:, retry_attempt: '0', recovery_kind: 'review', expected_head: head|
