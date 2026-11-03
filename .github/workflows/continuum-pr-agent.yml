@@ -630,7 +630,7 @@ jobs:
 
       - name: Resolve durable PR-Agent retry state
         id: retry_state
-        if: steps.stack.outputs.enabled == 'true'
+        if: steps.stack.outputs.enabled == 'true' && steps.admit.outputs.admitted == 'true'
         uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
         env:
           PR_NUMBER: ${{ steps.stack.outputs.pr_number }}
