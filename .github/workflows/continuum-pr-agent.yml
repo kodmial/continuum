@@ -176,7 +176,7 @@ jobs:
       ready_to_merge: ${{ steps.route.outputs.ready_to_merge }}
       merge_gate_verified: ${{ steps.merge_evidence.outputs.green }}
       needs_rereview: ${{ steps.route.outputs.needs_rereview }}
-      retry_attempt: ${{ steps.stack.outputs.retry_attempt }}
+      retry_attempt: ${{ steps.retry_state.outputs.effective_attempt || steps.stack.outputs.retry_attempt }}
       retry_workflow: ${{ steps.stack.outputs.retry_workflow }}
       recovery_kind: ${{ steps.stack.outputs.recovery_kind }}
 
@@ -627,6 +627,136 @@ jobs:
                 context.serverUrl + '/' + context.repo.owner + '/' +
                 context.repo.repo + '/actions/runs/' + context.runId,
             });
+
+      - name: Resolve durable PR-Agent retry state
+        id: retry_state
+        if: steps.stack.outputs.enabled == 'true'
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
+        env:
+          PR_NUMBER: ${{ steps.stack.outputs.pr_number }}
+          EXPECTED_HEAD_SHA: ${{ steps.stack.outputs.expected_head }}
+          RETRY_ATTEMPT: ${{ steps.stack.outputs.retry_attempt }}
+          RECOVERY_KIND: ${{ steps.stack.outputs.recovery_kind }}
+          MAX_EXECUTIONS: ${{ vars.PR_AGENT_RECOVERY_MAX_EXECUTIONS || '10' }}
+        with:
+          github-token: ${{ env.CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED == 'true' && secrets.TAP_PAT || (env.CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED != 'true' && github.token || '') }}
+          script: |
+            const owner = String(process.env.CONTINUUM_PR_AGENT_TARGET_OWNER || '').trim();
+            const repo = String(process.env.CONTINUUM_PR_AGENT_TARGET_REPO || '').trim();
+            const prNumber = Number(process.env.PR_NUMBER);
+            const kind = String(process.env.RECOVERY_KIND || 'review').trim().toLowerCase();
+            const rawAttempt = String(process.env.RETRY_ATTEMPT || '0').trim();
+            const requestedAttempt = Number(rawAttempt);
+            const rawBudget = Number.parseInt(process.env.MAX_EXECUTIONS || '10', 10);
+            const budget = Number.isSafeInteger(rawBudget) ? Math.max(1, Math.min(10, rawBudget)) : 10;
+            if (!owner || !repo || !Number.isSafeInteger(prNumber) || prNumber < 1) {
+              core.setFailed('PR-Agent retry-state target is incomplete; refusing to run without durable budget evidence.');
+              return;
+            }
+            if (!['review', 'repair'].includes(kind)) {
+              core.setFailed('PR-Agent retry-state operation kind is invalid.');
+              return;
+            }
+            if (!/^\d+$/.test(rawAttempt) || !Number.isSafeInteger(requestedAttempt) || requestedAttempt < 0) {
+              core.setFailed('PR-Agent retry_attempt must be a non-negative safe integer.');
+              return;
+            }
+            const { data: pr } = await github.rest.pulls.get({ owner, repo, pull_number: prNumber });
+            const head = String(pr?.head?.sha || '').trim().toLowerCase();
+            const expectedHead = String(process.env.EXPECTED_HEAD_SHA || '').trim().toLowerCase();
+            if (!/^[0-9a-f]{40,64}$/.test(head)) {
+              core.setFailed('PR-Agent retry-state resolver received a non-full live HEAD.');
+              return;
+            }
+            if (expectedHead && expectedHead !== head) {
+              core.setFailed('PR-Agent retry-state HEAD moved before admission; waiting for fresh CI on the new HEAD.');
+              return;
+            }
+            const total = Number((await github.rest.issues.get({
+              owner, repo, issue_number: prNumber,
+            })).data.comments || 0);
+            const lastPage = Math.max(1, Math.ceil(total / 100));
+            if (lastPage > 20) {
+              core.setFailed('PR-Agent retry history exceeds the bounded 2000-comment proof window; refusing to reset or spend the budget.');
+              return;
+            }
+            const comments = [];
+            for (let page = 1; page <= lastPage; page += 1) {
+              const { data } = await github.rest.issues.listComments({
+                owner, repo, issue_number: prNumber, per_page: 100, page,
+              });
+              if (Array.isArray(data)) comments.push(...data);
+            }
+            const trustedAssociations = new Set(['OWNER', 'MEMBER', 'COLLABORATOR']);
+            const retryPatterns = [
+              /<!--\s*continuum-lifecycle-retry\s+head=([0-9a-fA-F]{40,64})\s+kind=(review|repair)\s+attempt=(\d+)(?:\s+not-before=(\d+))?[^>]*-->/g,
+              /<!--\s*continuum-pr-agent-retry\s+head=([0-9a-fA-F]{40,64})\s+kind=(review|repair)\s+attempt=(\d+)\s*-->/g,
+            ];
+            const exhaustedPatterns = [
+              /<!--\s*continuum-lifecycle-retry-exhausted\s+head=([0-9a-fA-F]{40,64})\s+kind=(review|repair)\s+attempts=(\d+)\s*-->/g,
+              /<!--\s*continuum-pr-agent-retry-exhausted\s+head=([0-9a-fA-F]{40,64})\s+kind=(review|repair)\s+attempts=(\d+)\s*-->/g,
+            ];
+            let latestAttempt = null;
+            let latestMarkerAt = null;
+            let notBefore = null;
+            let exhausted = false;
+            for (const comment of comments) {
+              const rawUser = comment?.user && typeof comment.user === 'object' ? comment.user : {};
+              const login = String(rawUser.login || comment?.user_login || comment?.author || '').trim().toLowerCase();
+              const association = String(comment?.author_association || '').toUpperCase();
+              if (!trustedAssociations.has(association) && login !== 'github-actions[bot]') continue;
+              const body = String(comment?.body || '');
+              const parsedTime = Date.parse(String(comment?.updated_at || comment?.created_at || ''));
+              const markerAt = Number.isFinite(parsedTime) ? parsedTime : null;
+              const consider = (markerHead, markerKind, attemptText, markerNotBefore) => {
+                if (String(markerHead || '').toLowerCase() !== head || markerKind !== kind) return;
+                const attempt = Number(attemptText);
+                if (!Number.isSafeInteger(attempt) || attempt < 0) return;
+                if (latestAttempt === null || attempt > latestAttempt) {
+                  latestAttempt = attempt;
+                  latestMarkerAt = markerAt;
+                  notBefore = markerNotBefore;
+                } else if (attempt === latestAttempt && markerAt !== null &&
+                           (latestMarkerAt === null || markerAt > latestMarkerAt)) {
+                  latestMarkerAt = markerAt;
+                  // A newer same-attempt marker wins, including clearing an older not-before.
+                  notBefore = markerNotBefore;
+                }
+              };
+              for (const pattern of retryPatterns) {
+                pattern.lastIndex = 0;
+                let match;
+                while ((match = pattern.exec(body)) !== null) {
+                  const markerNotBefore = match[4] ? Number(match[4]) : null;
+                  consider(match[1], match[2], match[3], markerNotBefore);
+                }
+              }
+              for (const pattern of exhaustedPatterns) {
+                pattern.lastIndex = 0;
+                let match;
+                while ((match = pattern.exec(body)) !== null) {
+                  if (String(match[1] || '').toLowerCase() === head && match[2] === kind &&
+                      Number(match[3]) >= budget) exhausted = true;
+                }
+              }
+            }
+            const effectiveAttempt = Math.max(requestedAttempt, latestAttempt === null ? 0 : latestAttempt);
+            core.setOutput('head_sha', head);
+            core.setOutput('effective_attempt', String(effectiveAttempt));
+            core.setOutput('durable_attempt', latestAttempt === null ? '' : String(latestAttempt));
+            core.setOutput('durable_not_before', notBefore === null ? '' : String(notBefore));
+            if (exhausted || effectiveAttempt >= budget) {
+              core.setFailed('Automatic PR-Agent retry budget is exhausted for exact HEAD ' + head + ' (' + kind + '); refusing manual/default retry reset.');
+              return;
+            }
+            const now = Math.floor(Date.now() / 1000);
+            if (notBefore !== null && notBefore > now) {
+              core.setFailed('Exact-HEAD PR-Agent cooldown remains active until ' + new Date(notBefore * 1000).toISOString() + '; refusing an early route probe.');
+              return;
+            }
+            core.notice('Resolved exact-HEAD PR-Agent retry state: requested=' + requestedAttempt +
+              ' durable=' + (latestAttempt === null ? 'none' : latestAttempt) +
+              ' effective=' + effectiveAttempt + ' kind=' + kind + '.');
 
       - name: Checkout the pull request head without exposing delegated repository metadata
         if: steps.stack.outputs.enabled == 'true' && steps.admit.outputs.admitted == 'true'
@@ -3029,10 +3159,12 @@ jobs:
           pkill -f "continuum-pr-agent-bridge.p[y]" || true
           pkill -f "pr_agent_bridge.p[y]" || true
       - name: Update persistent PR-Agent retry controller state
+        id: retry_state_update
         if: >-
           always() &&
           steps.stack.outputs.enabled == 'true' &&
           steps.admit.outputs.admitted == 'true' &&
+          steps.retry_state.outcome == 'success' &&
           steps.runtime.outcome == 'success' &&
           failure() &&
           (steps.model_route.outcome == 'failure' ||
@@ -3062,7 +3194,7 @@ jobs:
         env:
           PR_NUMBER: ${{ steps.stack.outputs.pr_number }}
           HEAD_SHA: ${{ steps.admit.outputs.head_sha }}
-          RETRY_ATTEMPT: ${{ steps.stack.outputs.retry_attempt }}
+          RETRY_ATTEMPT: ${{ steps.retry_state.outputs.effective_attempt || steps.stack.outputs.retry_attempt }}
           RECOVERY_KIND: ${{ steps.stack.outputs.recovery_kind }}
           POLICY_SCRIPT: ${{ steps.runtime.outputs.policy_script }}
           ROUTE_NOT_BEFORE: ${{ env.CONTINUUM_MODEL_STATE_NOT_BEFORE_EPOCH || env.CONTINUUM_MODEL_NOT_BEFORE_EPOCH }}
@@ -3096,6 +3228,7 @@ jobs:
             }
             const kind = String(process.env.RECOVERY_KIND || 'review').toLowerCase();
             const attempt = Number(process.env.RETRY_ATTEMPT || '0');
+            core.setOutput('effective_attempt', String(attempt));
             const notBefore = Number(process.env.ROUTE_NOT_BEFORE || '0');
             // The model selector publishes this only after confirming every
             // trusted route has a future durable cooldown. A preflight that
@@ -3174,6 +3307,8 @@ jobs:
           always() &&
           steps.stack.outputs.enabled == 'true' &&
           steps.admit.outputs.admitted == 'true' &&
+          steps.retry_state.outcome == 'success' &&
+          (steps.runtime.outcome != 'success' || steps.retry_state_update.outcome == 'success') &&
           failure() &&
           env.CONTINUUM_MODEL_NOT_BEFORE_EPOCH == '' &&
           env.CONTINUUM_MODEL_STATE_NOT_BEFORE_EPOCH == '' &&
@@ -3210,7 +3345,7 @@ jobs:
           PR_NUMBER: ${{ steps.stack.outputs.pr_number }}
           HEAD_SHA: ${{ steps.admit.outputs.head_sha }}
           ADMITTED_CI_RUN_ID: ${{ steps.admit.outputs.ci_run_id }}
-          RETRY_ATTEMPT: ${{ steps.stack.outputs.retry_attempt }}
+          RETRY_ATTEMPT: ${{ steps.retry_state_update.outputs.effective_attempt || steps.retry_state.outputs.effective_attempt || steps.stack.outputs.retry_attempt }}
           RETRY_WORKFLOW: ${{ steps.stack.outputs.retry_workflow }}
           CURRENT_RECOVERY_KIND: ${{ steps.stack.outputs.recovery_kind }}
           TARGET_CHILD_ID: ${{ inputs.target_child_id }}
