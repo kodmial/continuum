@@ -813,6 +813,7 @@ PR_AGENT_FAMILY = {
         "Fail closed when delegated without PAT",
         "Admit only a review-ready PR with green CI on the exact HEAD",
         "Mark PR-Agent review in flight",
+        "Resolve durable PR-Agent retry state",
         "Checkout the pull request head without exposing delegated repository metadata",
         "Revalidate the admitted exact HEAD immediately before review",
         "Resolve exact-HEAD original findings for targeted verification",
