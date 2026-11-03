@@ -2392,6 +2392,140 @@ class ContinuumTest < Minitest::Test
                     'a mid-repair draft transition must discard local repair changes'
   end
 
+  def test_pr_agent_manual_dispatch_cannot_reset_durable_exact_head_retry_state
+    workflow_path = File.join(ROOT, '.github/workflows/continuum-pr-agent.yml')
+    workflow = yaml(workflow_path)
+    workflow_text = File.read(workflow_path)
+    steps = workflow.fetch('jobs').fetch('pr_agent').fetch('steps')
+    resolver = steps.find { |step| step['name'] == 'Resolve durable PR-Agent retry state' }
+    refute_nil resolver, 'manual/default PR-Agent dispatch must resolve durable retry state before any model route'
+    script = resolver.fetch('with').fetch('script')
+
+    run_case = lambda do |comments:, head:, retry_attempt: '0', recovery_kind: 'review', expected_head: head|
+      env = {
+        'PR_NUMBER' => '499',
+        'EXPECTED_HEAD_SHA' => expected_head,
+        'RETRY_ATTEMPT' => retry_attempt,
+        'RECOVERY_KIND' => recovery_kind,
+        'MAX_EXECUTIONS' => '10',
+        'CONTINUUM_PR_AGENT_TARGET_OWNER' => 'kodmial',
+        'CONTINUUM_PR_AGENT_TARGET_REPO' => 'aa',
+      }
+      harness = <<~JS
+        const script = process.argv[1];
+        const comments = JSON.parse(process.argv[2]);
+        const liveHead = process.argv[3];
+        const env = JSON.parse(process.argv[4]);
+        Object.assign(process.env, env);
+        const outputs = {};
+        const failures = [];
+        const github = { rest: {
+          pulls: {
+            get: async () => ({ data: { head: { sha: liveHead } } }),
+          },
+          issues: {
+            get: async () => ({ data: { comments: comments.length } }),
+            listComments: async ({ page }) => ({ data: page === 1 ? comments : [] }),
+          },
+        }};
+        const core = {
+          setOutput: (key, value) => { outputs[key] = String(value); },
+          setFailed: (message) => { failures.push(String(message)); },
+          notice: () => {},
+          warning: () => {},
+        };
+        const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor;
+        (async () => {
+          await new AsyncFunction('github', 'core', 'context', script)(github, core, {});
+          process.stdout.write(JSON.stringify({ outputs, failures }));
+        })().catch((error) => {
+          console.error(error);
+          process.exit(1);
+        });
+      JS
+      stdout, stderr, status = Open3.capture3(
+        'node', '-e', harness, script, JSON.generate(comments), head, JSON.generate(env)
+      )
+      assert status.success?, stderr
+      JSON.parse(stdout)
+    end
+
+    head = 'a' * 40
+    other_head = 'b' * 40
+    marker = "<!-- continuum-lifecycle-retry head=#{head} kind=review attempt=2 not-before=1793746128 -->"
+    trusted = {
+      'id' => 1,
+      'author_association' => 'OWNER',
+      'user' => { 'login' => 'kodmial' },
+      'updated_at' => '2026-11-03T22:38:50Z',
+      'body' => marker,
+    }
+
+    manual = run_case.call(comments: [trusted], head: head, retry_attempt: '0')
+    assert_equal '2', manual.dig('outputs', 'effective_attempt'),
+                 'manual /review default 0 must not lower the durable same-HEAD attempt'
+    assert_empty manual.fetch('failures')
+
+    explicit = run_case.call(comments: [trusted], head: head, retry_attempt: '5')
+    assert_equal '5', explicit.dig('outputs', 'effective_attempt'),
+                 'an explicit recovery attempt may advance, but never lower, durable state'
+
+    new_head = run_case.call(comments: [trusted], head: other_head, retry_attempt: '0')
+    assert_equal '0', new_head.dig('outputs', 'effective_attempt'),
+                 'a different full HEAD starts an independent retry episode'
+
+    other_kind_comment = trusted.merge(
+      'body' => "<!-- continuum-lifecycle-retry head=#{head} kind=repair attempt=7 -->"
+    )
+    other_kind = run_case.call(
+      comments: [other_kind_comment], head: head, retry_attempt: '0', recovery_kind: 'review'
+    )
+    assert_equal '0', other_kind.dig('outputs', 'effective_attempt'),
+                 'review and repair budgets remain isolated'
+
+    untrusted = trusted.merge(
+      'author_association' => 'NONE',
+      'user' => { 'login' => 'external-contributor' },
+      'body' => "<!-- continuum-lifecycle-retry head=#{head} kind=review attempt=9 -->"
+    )
+    external = run_case.call(comments: [untrusted], head: head, retry_attempt: '0')
+    assert_equal '0', external.dig('outputs', 'effective_attempt'),
+                 'untrusted comments cannot spend or exhaust the retry budget'
+
+    future_epoch = Time.now.to_i + 3600
+    future_comment = trusted.merge(
+      'body' => "<!-- continuum-lifecycle-retry head=#{head} kind=review attempt=2 not-before=#{future_epoch} -->"
+    )
+    cooling = run_case.call(comments: [future_comment], head: head, retry_attempt: '0')
+    assert_equal '2', cooling.dig('outputs', 'effective_attempt')
+    assert_match(/cooldown remains active/, cooling.fetch('failures').join("\n"))
+
+    exhausted_comment = trusted.merge(
+      'body' => "<!-- continuum-lifecycle-retry-exhausted head=#{head} kind=review attempts=10 -->"
+    )
+    exhausted = run_case.call(comments: [exhausted_comment], head: head, retry_attempt: '0')
+    assert_match(/retry budget is exhausted/, exhausted.fetch('failures').join("\n"))
+
+    moved = run_case.call(
+      comments: [trusted], head: head, retry_attempt: '0', expected_head: other_head
+    )
+    assert_match(/HEAD moved before admission/, moved.fetch('failures').join("\n"))
+
+    retry_state_update = step_body(workflow_text, 'Update persistent PR-Agent retry controller state')
+    retry_dispatch = step_body(workflow_text, 'Schedule bounded retry for retryable PR-Agent review failure')
+    refute_nil retry_state_update
+    refute_nil retry_dispatch
+    assert_includes retry_state_update,
+                    'steps.retry_state.outputs.effective_attempt || steps.stack.outputs.retry_attempt'
+    assert_includes retry_dispatch,
+                    'steps.retry_state_update.outputs.effective_attempt || steps.retry_state.outputs.effective_attempt'
+    assert_includes retry_dispatch, "steps.retry_state_update.outcome == 'success'"
+    assert_includes workflow_text,
+                    'retry_attempt: ${{ steps.retry_state.outputs.effective_attempt || steps.stack.outputs.retry_attempt }}'
+    assert_operator workflow_text.index('Resolve durable PR-Agent retry state'),
+                    :<, workflow_text.index('Qualify trusted review-model route')
+  end
+
   # Work-Lock #58 item 4 (conservative subset): only the four verified-safe
   # pure same-repository read-only PR-Agent paths use the repository token.
   # Mixed read/write/dispatch and cross-repo paths stay PAT-backed so
