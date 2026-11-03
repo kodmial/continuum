@@ -100,8 +100,9 @@ class CoverageTests(unittest.TestCase):
         # standalone PAT sites disappeared and one PAT dispatch remains.
         # Physical /oc-cancel adds one delegated-parent cancellation binding.
         # Live canary observation adds one recovery-comment/chaining binding,
-        # and CodeRabbit collection reads the marker-author login once.
-        self.assertEqual(len(bindings), 124)
+        # CodeRabbit collection reads the marker-author login once, and the
+        # durable PR-Agent retry-state preflight adds one delegated-aware read.
+        self.assertEqual(len(bindings), 125)
         gaps = inventory.coverage_gaps(WORKFLOWS_DIR)
         self.assertEqual(gaps, [], f"uninventoried TAP_PAT bindings: {gaps}")
 
