@@ -674,7 +674,11 @@ jobs:
             }
             const total = Number((await github.rest.issues.get({
               owner, repo, issue_number: prNumber,
-            })).data.comments || 0);
+            })).data.comments);
+            if (!Number.isSafeInteger(total) || total < 0) {
+              core.setFailed('Could not prove the PR-Agent retry comment count; refusing to reset or spend the budget.');
+              return;
+            }
             const lastPage = Math.max(1, Math.ceil(total / 100));
             if (lastPage > 20) {
               core.setFailed('PR-Agent retry history exceeds the bounded 2000-comment proof window; refusing to reset or spend the budget.');
@@ -685,7 +689,11 @@ jobs:
               const { data } = await github.rest.issues.listComments({
                 owner, repo, issue_number: prNumber, per_page: 100, page,
               });
-              if (Array.isArray(data)) comments.push(...data);
+              if (!Array.isArray(data)) {
+                core.setFailed('Could not read the complete PR-Agent retry comment page; refusing to reset or spend the budget.');
+                return;
+              }
+              comments.push(...data);
             }
             const trustedAssociations = new Set(['OWNER', 'MEMBER', 'COLLABORATOR']);
             const retryPatterns = [
