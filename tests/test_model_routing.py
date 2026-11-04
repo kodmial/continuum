@@ -1422,6 +1422,8 @@ class AttestationRecoveryContractTests(unittest.TestCase):
         self.assertIn(
             "(steps.review_attestation.outcome == 'failure' &&\n"
             "            env.CONTINUUM_MODEL_STATE_TRANSIENT != '')", schedule)
+        self.assertIn("steps.model_route.outcome == 'failure'", schedule)
+        self.assertIn("env.CONTINUUM_MODEL_NOT_BEFORE_EPOCH == ''", schedule)
         self.assertIn("env.CONTINUUM_MODEL_STATE_NOT_BEFORE_EPOCH == ''", schedule)
         self.assertIn('CONTINUUM_MODEL_STATE_NOT_BEFORE_EPOCH:-', schedule)
         self.assertNotIn("operation: fail", schedule)
