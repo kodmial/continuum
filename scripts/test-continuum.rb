@@ -2499,19 +2499,41 @@ class ContinuumTest < Minitest::Test
     )
     cooling = run_case.call(comments: [future_comment], head: head, retry_attempt: '0')
     assert_equal '2', cooling.dig('outputs', 'effective_attempt')
+    assert_equal 'true', cooling.dig('outputs', 'cooldown_active')
     assert_match(/cooldown remains active/, cooling.fetch('failures').join("\n"))
 
-    exhausted_comment = trusted.merge(
-      'body' => "<!-- continuum-lifecycle-retry-exhausted head=#{head} kind=review attempts=10 -->"
+    current_exhausted_comment = trusted.merge(
+      'body' => "<!-- continuum-lifecycle-retry-exhausted head=#{head} kind=review attempts=3 -->"
     )
-    exhausted = run_case.call(comments: [exhausted_comment], head: head, retry_attempt: '0')
-    assert_match(/retry budget is exhausted/, exhausted.fetch('failures').join("\n"))
+    current_exhausted = run_case.call(
+      comments: [current_exhausted_comment], head: head, retry_attempt: '0'
+    )
+    assert_match(/retry budget is exhausted/, current_exhausted.fetch('failures').join("\n"))
+
+    legacy_three_attempt_comment = trusted.merge(
+      'body' => "<!-- continuum-pr-agent-retry-exhausted head=#{head} kind=review attempts=3 -->"
+    )
+    legacy_three_attempt = run_case.call(
+      comments: [legacy_three_attempt_comment], head: head, retry_attempt: '0'
+    )
+    assert_empty legacy_three_attempt.fetch('failures'),
+                 'legacy three-attempt exhaustion must be evaluated against the current budget'
+
+    legacy_budget_exhausted_comment = trusted.merge(
+      'body' => "<!-- continuum-pr-agent-retry-exhausted head=#{head} kind=review attempts=10 -->"
+    )
+    legacy_budget_exhausted = run_case.call(
+      comments: [legacy_budget_exhausted_comment], head: head, retry_attempt: '0'
+    )
+    assert_match(/retry budget is exhausted/, legacy_budget_exhausted.fetch('failures').join("\n"))
 
     moved = run_case.call(
       comments: [trusted], head: head, retry_attempt: '0', expected_head: other_head
     )
     assert_match(/HEAD moved before admission/, moved.fetch('failures').join("\n"))
 
+    assert_includes workflow_text, "steps.retry_state.outputs.cooldown_active == 'true'",
+                    'an active cooldown must remain eligible for deferred recovery'
     retry_state_update = step_body(workflow_text, 'Update persistent PR-Agent retry controller state')
     retry_dispatch = step_body(workflow_text, 'Schedule bounded retry for retryable PR-Agent review failure')
     refute_nil retry_state_update
