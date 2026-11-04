@@ -3332,7 +3332,8 @@ jobs:
           failure() &&
           env.CONTINUUM_MODEL_NOT_BEFORE_EPOCH == '' &&
           env.CONTINUUM_MODEL_STATE_NOT_BEFORE_EPOCH == '' &&
-          (steps.install_pragent.outcome == 'failure' ||
+          (steps.model_route.outcome == 'failure' ||
+           steps.install_pragent.outcome == 'failure' ||
            steps.install_opencode.outcome == 'failure' ||
            steps.start_opencode.outcome == 'failure' ||
            steps.runtime.outcome == 'failure' ||
