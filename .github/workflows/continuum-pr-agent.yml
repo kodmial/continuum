@@ -700,10 +700,14 @@ jobs:
               /<!--\s*continuum-lifecycle-retry\s+head=([0-9a-fA-F]{40,64})\s+kind=(review|repair)\s+attempt=(\d+)(?:\s+not-before=(\d+))?[^>]*-->/g,
               /<!--\s*continuum-pr-agent-retry\s+head=([0-9a-fA-F]{40,64})\s+kind=(review|repair)\s+attempt=(\d+)\s*-->/g,
             ];
-            const exhaustedPatterns = [
-              /<!--\s*continuum-lifecycle-retry-exhausted\s+head=([0-9a-fA-F]{40,64})\s+kind=(review|repair)\s+attempts=(\d+)\s*-->/g,
-              /<!--\s*continuum-pr-agent-retry-exhausted\s+head=([0-9a-fA-F]{40,64})\s+kind=(review|repair)\s+attempts=(\d+)\s*-->/g,
-            ];
+            // Current lifecycle exhaustion is an explicit terminal decision,
+            // independent of the persisted count. Legacy PR-Agent markers may
+            // encode the retired three-attempt budget, so compare those with
+            // the current canonical budget instead of treating them as terminal.
+            const currentExhaustedPattern =
+              /<!--\s*continuum-lifecycle-retry-exhausted\s+head=([0-9a-fA-F]{40,64})\s+kind=(review|repair)\s+attempts=(\d+)\s*-->/g;
+            const legacyExhaustedPattern =
+              /<!--\s*continuum-pr-agent-retry-exhausted\s+head=([0-9a-fA-F]{40,64})\s+kind=(review|repair)\s+attempts=(\d+)\s*-->/g;
             let latestAttempt = null;
             let latestMarkerAt = null;
             let notBefore = null;
@@ -739,13 +743,16 @@ jobs:
                   consider(match[1], match[2], match[3], markerNotBefore);
                 }
               }
-              for (const pattern of exhaustedPatterns) {
-                pattern.lastIndex = 0;
-                let match;
-                while ((match = pattern.exec(body)) !== null) {
-                  if (String(match[1] || '').toLowerCase() === head && match[2] === kind &&
-                      Number(match[3]) >= budget) exhausted = true;
+              currentExhaustedPattern.lastIndex = 0;
+              for (const match of body.matchAll(currentExhaustedPattern)) {
+                if (String(match[1] || '').toLowerCase() === head && match[2] === kind) {
+                  exhausted = true;
                 }
+              }
+              legacyExhaustedPattern.lastIndex = 0;
+              for (const match of body.matchAll(legacyExhaustedPattern)) {
+                if (String(match[1] || '').toLowerCase() === head && match[2] === kind &&
+                    Number(match[3]) >= budget) exhausted = true;
               }
             }
             const effectiveAttempt = Math.max(requestedAttempt, latestAttempt === null ? 0 : latestAttempt);
@@ -759,6 +766,11 @@ jobs:
             }
             const now = Math.floor(Date.now() / 1000);
             if (notBefore !== null && notBefore > now) {
+              // A cooldown is a retryable deferral, not a deterministic
+              // failure. Publish the signal before failing this admission so
+              // the downstream status remains recovery-eligible; the recovery
+              // controller still honors the durable not-before timestamp.
+              core.setOutput('cooldown_active', 'true');
               core.setFailed('Exact-HEAD PR-Agent cooldown remains active until ' + new Date(notBefore * 1000).toISOString() + '; refusing an early route probe.');
               return;
             }
@@ -3067,7 +3079,7 @@ jobs:
         env:
           HEAD_SHA: ${{ steps.admit.outputs.head_sha }}
           PR_NUMBER: ${{ steps.stack.outputs.pr_number }}
-          RETRYABLE_FAILURE: ${{ (steps.model_route.outcome == 'failure' || steps.install_pragent.outcome == 'failure' || steps.install_opencode.outcome == 'failure' || steps.start_opencode.outcome == 'failure' || steps.runtime.outcome == 'failure' || steps.start_bridge.outcome == 'failure' || steps.pragent.outcome == 'failure' || steps.before.outputs.transient == 'true' || steps.result.outcome == 'failure' || steps.persistent.outcome == 'failure' || steps.improve_gate.outcome == 'failure' || steps.improve.outcome == 'failure' || steps.improve_skipped.outcome == 'failure' || steps.post_improve.outcome == 'failure' || steps.improve_output.outcome == 'failure' || (steps.review_attestation.outcome == 'failure' && env.CONTINUUM_MODEL_STATE_TRANSIENT != '')) && steps.result.outputs.stale_head != 'true' && steps.persistent.outputs.stale_head != 'true' && steps.improve_gate.outputs.stale_head != 'true' && steps.improve.outputs.stale_head != 'true' && steps.improve_skipped.outputs.stale_head != 'true' && steps.post_improve.outputs.stale_head != 'true' && 'true' || 'false' }}
+          RETRYABLE_FAILURE: ${{ (steps.retry_state.outputs.cooldown_active == 'true' || steps.model_route.outcome == 'failure' || steps.install_pragent.outcome == 'failure' || steps.install_opencode.outcome == 'failure' || steps.start_opencode.outcome == 'failure' || steps.runtime.outcome == 'failure' || steps.start_bridge.outcome == 'failure' || steps.pragent.outcome == 'failure' || steps.before.outputs.transient == 'true' || steps.result.outcome == 'failure' || steps.persistent.outcome == 'failure' || steps.improve_gate.outcome == 'failure' || steps.improve.outcome == 'failure' || steps.improve_skipped.outcome == 'failure' || steps.post_improve.outcome == 'failure' || steps.improve_output.outcome == 'failure' || (steps.review_attestation.outcome == 'failure' && env.CONTINUUM_MODEL_STATE_TRANSIENT != '')) && steps.result.outputs.stale_head != 'true' && steps.persistent.outputs.stale_head != 'true' && steps.improve_gate.outputs.stale_head != 'true' && steps.improve.outputs.stale_head != 'true' && steps.improve_skipped.outputs.stale_head != 'true' && steps.post_improve.outputs.stale_head != 'true' && 'true' || 'false' }}
         with:
           github-token: ${{ env.CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED == 'true' && secrets.TAP_PAT || (env.CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED != 'true' && github.token || '') }}
           script: |
