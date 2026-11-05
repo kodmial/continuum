@@ -950,6 +950,147 @@ class SelectionLoopClosureBindingTests(unittest.TestCase):
         self.assertEqual(saved["last_successful_probe"]["model"], B)
 
 
+class SelectionSaveRouteErrorTests(unittest.TestCase):
+    """A RouteError from the save mutator must fail over, not abort selection.
+
+    The baseline (backup/pre-busl-main:src/continuum/model_routing.py:705-741)
+    kept ``store.update(key, save)`` inside the ``except RouteError`` handler,
+    so a route that lost its qualification cooled down alone and the loop
+    continued. These tests replay that concurrent-writer race: the initial
+    read still shows a fresh probe, while the write path observes a state
+    where the proof was replaced.
+    """
+
+    def _run(self, initial, later, probe_calls, *, models=f"{A},{B}"):
+        import os
+        with tempfile.TemporaryDirectory() as tmp, \
+             patch.object(route, "binary_provenance", lambda: ("1.2.3", "d")), \
+             patch.object(route, "GitRefStore", lambda owner, token: _RacyStore(initial, later)), \
+             patch.object(route, "semantic_probe",
+                          lambda model, *a, **k: probe_calls.append(model)), \
+             patch.object(route.sys, "argv", ["model_routing.py", "select"]), \
+             patch.dict(os.environ, {
+                 "OPENCODE_MODELS": models,
+                 "CONTINUUM_MODEL_STATE_TOKEN": "t",
+                 "GITHUB_REPOSITORY": "owner/parent",
+                 "GITHUB_RUN_ID": "703",
+                 "GITHUB_RUN_ATTEMPT": "1",
+                 "RUNNER_TEMP": tmp,
+             }, clear=True):
+            return route.main()
+
+    def test_no_qualification_cools_that_model_and_selects_the_next(self):
+        now = int(route.time.time())
+        fingerprint = route.Configuration.parse(
+            f"{A},{B}").fingerprint("d", "anonymous")
+        initial = {"fingerprint": fingerprint,
+                   "last_successful_probe": {"model": A, "at": now}}
+        # A concurrent writer replaced A's proof with B's before the save.
+        later = {"fingerprint": fingerprint,
+                 "last_successful_probe": {"model": B, "at": now}}
+        probes = []
+        self.assertEqual(self._run(initial, later, probes), 0)
+        # A was already qualified, so only B is probed; the save failure on A
+        # must not abort the pool and must not touch B.
+        self.assertEqual(probes, [B])
+        saved = _RacyStore._last.current
+        self.assertIn(A, saved["cooldowns"])
+        self.assertNotIn(B, saved["cooldowns"])
+        self.assertEqual(saved["last_successful_probe"]["model"], B)
+
+    def test_probe_expired_before_task_start_cools_that_model_and_fails_over(self):
+        now = int(route.time.time())
+        fingerprint = route.Configuration.parse(
+            f"{A},{B}").fingerprint("d", "anonymous")
+        initial = {"fingerprint": fingerprint,
+                   "last_successful_probe": {"model": A, "at": now}}
+        # The write path observes an A proof older than the TTL.
+        later = {"fingerprint": fingerprint,
+                 "last_successful_probe": {"model": A, "at": now - 3600 - 120}}
+        probes = []
+        self.assertEqual(self._run(initial, later, probes), 0)
+        self.assertEqual(probes, [B])
+        saved = _RacyStore._last.current
+        self.assertIn(A, saved["cooldowns"])
+        self.assertNotIn(B, saved["cooldowns"])
+        self.assertEqual(saved["last_successful_probe"]["model"], B)
+
+    def test_all_routes_unqualified_still_fails_closed_with_exit_2(self):
+        now = int(route.time.time())
+        fingerprint = route.Configuration.parse(A).fingerprint("d", "anonymous")
+        initial = {"fingerprint": fingerprint,
+                   "last_successful_probe": {"model": A, "at": now}}
+        later = {"fingerprint": fingerprint}
+        probes = []
+        self.assertEqual(self._run(initial, later, probes, models=A), 2)
+        # Already qualified in the initial read, so no probe is retried.
+        self.assertEqual(probes, [])
+        self.assertIn(A, _RacyStore._last.current["cooldowns"])
+
+    def test_save_route_error_resets_state_from_a_foreign_fingerprint(self):
+        now = int(route.time.time())
+        fingerprint = route.Configuration.parse(
+            f"{A},{B}").fingerprint("d", "anonymous")
+        initial = {"fingerprint": fingerprint,
+                   "last_successful_probe": {"model": A, "at": now}}
+        # A concurrent writer published state for a different configuration
+        # (binary/pool change) with a stale cooldown and proof. The save must
+        # not merge that foreign state into the current fingerprint.
+        later = {"fingerprint": "foreign-fingerprint",
+                 "cooldowns": {"stale/model": now + 86400},
+                 "last_successful_probe": {"model": A, "at": now}}
+        probes = []
+        self.assertEqual(self._run(initial, later, probes), 0)
+        # A's proof is discarded with the foreign state, so the save raises
+        # and the loop fails over to B.
+        self.assertEqual(probes, [B])
+        saved = _RacyStore._last.current
+        self.assertEqual(saved["fingerprint"], fingerprint)
+        self.assertEqual(set(saved["cooldowns"]), {A})
+        self.assertEqual(saved["last_successful_probe"]["model"], B)
+
+    def test_pinned_route_breaks_without_attempting_the_next_model(self):
+        now = int(route.time.time())
+        # Pinned configurations are single-model in production, so build the
+        # two-model pool directly to observe the loop's ``break``.
+        config = route.Configuration((A, B), True)
+        fingerprint = config.fingerprint("d", "anonymous")
+        initial = {"fingerprint": fingerprint,
+                   "last_successful_probe": {"model": A, "at": now}}
+        # A concurrent writer replaced A's proof before the save.
+        later = {"fingerprint": fingerprint}
+        probes = []
+        with patch.object(route.Configuration, "parse", lambda *a, **k: config):
+            self.assertEqual(self._run(initial, later, probes), 2)
+        # A pinned pool never attempts the next model, even after a
+        # route-level save failure: the break exits selection with code 2.
+        self.assertEqual(probes, [])
+        saved = _RacyStore._last.current
+        self.assertEqual(set(saved["cooldowns"]), {A})
+
+
+class _RacyStore:
+    """First read is the selection snapshot; later reads see a rewrite."""
+
+    _last = None
+
+    def __init__(self, initial, later):
+        self.initial = dict(initial)
+        self.current = dict(later)
+        self.reads = 0
+        _RacyStore._last = self
+
+    def read(self, key):
+        self.reads += 1
+        if self.reads == 1:
+            return dict(self.initial), None, None
+        return dict(self.current), None, None
+
+    def update(self, key, mutator):
+        self.current = mutator(dict(self.current))
+        return self.current
+
+
 class GitRefStoreTests(unittest.TestCase):
     def test_first_write_creates_orphan_ref_not_main(self):
         store = route.GitRefStore("example/private", "fake-token")

@@ -18,6 +18,14 @@ on:
         required: false
         type: string
         default: ''
+      mode:
+        description: >-
+          Qualification mode, verify for PR evidence or canary for the Layer 3
+          canary-deadline contract probe. The live, write-capable canary runs
+          only in continuum-contract-canary.yml.
+        required: false
+        type: string
+        default: verify
       timeout_minutes:
         description: Optional timeout override for the qualification job
         required: false
@@ -33,6 +41,7 @@ on:
         required: false
         type: string
         default: ''
+
 permissions: {}
 
 jobs:
@@ -55,8 +64,14 @@ jobs:
         env:
           MANUAL_PR_NUMBER: ${{ inputs.pr_number }}
           MANUAL_HEAD_SHA: ${{ inputs.head_sha }}
+          MODE: ${{ inputs.mode }}
         with:
           script: |
+            const mode = process.env.MODE || 'verify';
+            if (!['verify', 'canary'].includes(mode)) {
+              core.setFailed(`Unsupported contract qualification mode '${mode}'. Use verify or canary.`);
+              return;
+            }
             let sha = context.sha;
             let ref = context.ref;
             let prNumber = '';
@@ -298,6 +313,47 @@ jobs:
           print("Layer 2 lifecycle probe passed for HEAD", head)
           PY
 
+      - name: Run Layer 3 canary deadline contract probe
+        id: canary
+        # Compatibility for the public `mode` input. The live, write-capable
+        # canary lives in continuum-contract-canary.yml (a called workflow
+        # cannot elevate the caller's token, so it cannot run here without
+        # forcing the read-only PR caller to grant issue/action writes). This
+        # read-only step keeps `mode: canary` meaningful by exercising the same
+        # `evaluate_canary` deadline contract the live probe uses.
+        if: inputs.mode == 'canary'
+        shell: bash
+        run: |
+          set -euo pipefail
+          PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=src python3 - <<'PY'
+          from continuum import contract_qualification as contract
+          # A fresh stage progresses; a stage past its deadline is recoverable
+          # within the bounded budget and then fails loudly with exact IDs.
+          fresh = contract.evaluate_canary(
+              contract.CanaryState(canary_id="canary-main", issue_number=1, stage="worker", stage_elapsed_seconds=60)
+          )
+          assert fresh.outcome == contract.CANARY_PROGRESS, fresh
+          stalled = contract.evaluate_canary(
+              contract.CanaryState(
+                  canary_id="canary-main", issue_number=1, pr_number=2, run_id=3,
+                  stage="worker", stage_elapsed_seconds=10 * 3600, recovery_attempts=0,
+              )
+          )
+          assert stalled.outcome == contract.CANARY_STALLED_RECOVERABLE, stalled
+          failed = contract.evaluate_canary(
+              contract.CanaryState(
+                  canary_id="canary-main", issue_number=1, pr_number=2, run_id=3,
+                  stage="worker", stage_elapsed_seconds=10 * 3600,
+                  recovery_attempts=contract.MAX_CANARY_RECOVERY_ATTEMPTS,
+              )
+          )
+          assert failed.outcome == contract.CANARY_STALLED_FAILED, failed
+          for token in ("canary-main", "issue=1", "pr=2", "run=3", "stage=worker"):
+              assert token in failed.detail, (token, failed)
+          assert "review" not in failed.detail, failed
+          print("Layer 3 canary deadline contract probe passed")
+          PY
+
       - name: Publish contract qualification result
         if: always()
         uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
@@ -305,12 +361,13 @@ jobs:
           TARGET_SHA: ${{ steps.target.outputs.sha }}
           REGRESSION_OUTCOME: ${{ steps.regression.outcome }}
           LIFECYCLE_OUTCOME: ${{ steps.lifecycle.outcome }}
+          CANARY_OUTCOME: ${{ steps.canary.outcome }}
           STATUS_CONTEXT: ${{ inputs.status_context || vars.CONTINUUM_CONTRACT_STATUS_CONTEXT || 'continuum/contract-qualification' }}
           PUBLISH_STATUS: ${{ inputs.publish_status || vars.CONTINUUM_PUBLISH_STATUS || 'true' }}
           STATUS_ELIGIBLE: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
         with:
           script: |
-            const passed = process.env.REGRESSION_OUTCOME === 'success' && process.env.LIFECYCLE_OUTCOME === 'success';
+            const passed = process.env.REGRESSION_OUTCOME === 'success' && process.env.LIFECYCLE_OUTCOME === 'success' && (process.env.CANARY_OUTCOME === 'success' || process.env.CANARY_OUTCOME === 'skipped');
             const state = passed ? 'success' : 'failure';
             // Fork PRs are read-only; the qualification verdict still fails
             // the job, but no commit status can be written.

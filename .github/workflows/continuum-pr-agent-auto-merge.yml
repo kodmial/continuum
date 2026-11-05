@@ -1098,15 +1098,19 @@ jobs:
             }
 
             function isNonMergeCriticalMainPath(path) {
-              if (path.startsWith('.github/workflows/continuum-')) return false;
+              const text = String(path || '');
+              if (text.startsWith('.github/workflows/')) return false;
+              if (text.startsWith('.github/scripts/') || text.startsWith('.github/actions/')) {
+                return false;
+              }
               return (
-                path === 'LICENSE' ||
-                path === '.gitignore' ||
-                path === '.release-please-manifest.json' ||
-                path === 'CHANGELOG.md' ||
-                path.endsWith('.md') ||
-                path.startsWith('docs/') ||
-                path.startsWith('.github/')
+                text === 'LICENSE' ||
+                text === '.gitignore' ||
+                text === '.release-please-manifest.json' ||
+                text === 'CHANGELOG.md' ||
+                text.endsWith('.md') ||
+                text.startsWith('docs/') ||
+                text.startsWith('.github/')
               );
             }
 

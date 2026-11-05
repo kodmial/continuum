@@ -25,8 +25,8 @@ Predecessor completion requires all of the following trusted evidence:
   matching titles);
 * that PR is merged into the expected default branch with a real merge
   commit and exact HEAD;
-* the exact PR HEAD has completed/successful project CI runs and, in the
-  Continuum control-plane repository only, Contract Gate runs;
+* the exact PR HEAD has completed/successful project CI and Contract Gate
+  runs in every repository;
 * the exact PR HEAD carries independent clean-review evidence (the durable
   PR-Agent clean status or an approving review from a different actor).
 
@@ -62,10 +62,9 @@ RESUME_MARKER_LINE_RE = re.compile(
 )
 MARKER_SHAPE_RE = re.compile(r"continuum-resume-after(?::v1)?\b")
 DISPATCH_MARKER = "<!-- issue-scheduler-dispatch -->"
-# The Contract Gate workflow exists only in the Continuum control-plane
-# repository. Consumer repositories never run it, so requiring its run on a
-# predecessor PR HEAD would make owner-armed resume permanently NOOP there.
-CONTRACT_GATE_REPOSITORY = "kodmial/continuum"
+# The Contract Gate is a mandatory exact-HEAD requirement for every
+# repository. A repository may rename the workflow through its consumer
+# variable, but it cannot drop the gate.
 CONTRACT_GATE_WORKFLOW_NAMES = ("Continuum Contract Gate",)
 CONTRACT_GATE_WORKFLOW_PATHS = (".github/workflows/contract-gate.yml",)
 OWNER_COMMAND_RE = re.compile(
@@ -626,16 +625,6 @@ def independent_review_evidence(
     return False
 
 
-def contract_gate_is_required(repository: str) -> bool:
-    """Whether the Contract Gate workflow exists for this repository.
-
-    Only the Continuum control-plane repository runs the Contract Gate; a
-    consumer repository never does, so its absence is not missing evidence.
-    """
-
-    return str(repository or "").strip().lower() == CONTRACT_GATE_REPOSITORY
-
-
 def evaluate_predecessor_completion(
     *,
     predecessor_issue: Mapping[str, Any],
@@ -647,18 +636,17 @@ def evaluate_predecessor_completion(
     default_branch: str = "main",
     ci_workflow_names: Sequence[str] = ("CI",),
     ci_workflow_paths: Sequence[str] = (".github/workflows/ci.yml",),
-    contract_gate_names: Optional[Sequence[str]] = None,
-    contract_gate_paths: Optional[Sequence[str]] = None,
+    contract_gate_names: Sequence[str] = CONTRACT_GATE_WORKFLOW_NAMES,
+    contract_gate_paths: Sequence[str] = CONTRACT_GATE_WORKFLOW_PATHS,
     predecessor_comments: Optional[Sequence[Any]] = None,
     owner_login: str = "",
 ) -> Tuple[bool, str, Optional[int], str]:
     """Evaluate the complete trusted completion chain for a predecessor.
 
-    The Contract Gate is required by default only in the repository that
-    runs it. A non-empty explicit ``contract_gate_names`` or
-    ``contract_gate_paths`` overrides the repository default for that
-    parameter; an explicit empty value for either parameter disables the
-    gate entirely.
+    The Contract Gate is mandatory for every repository. An explicit
+    non-default ``contract_gate_names`` or ``contract_gate_paths`` only
+    renames the required gate; an empty identity cannot satisfy the
+    requirement and therefore fails closed.
     """
 
     if predecessor_issue.get("pull_request"):
@@ -704,29 +692,10 @@ def evaluate_predecessor_completion(
     if not str(latest.get("merged_at") or "").strip():
         return False, "predecessor merge timestamp is missing", None, ""
 
-    names_explicit = contract_gate_names is not None
-    paths_explicit = contract_gate_paths is not None
-    required = contract_gate_is_required(repository)
-    if contract_gate_names is None:
-        contract_gate_names = (
-            CONTRACT_GATE_WORKFLOW_NAMES if required else ()
-        )
-    if contract_gate_paths is None:
-        contract_gate_paths = (
-            CONTRACT_GATE_WORKFLOW_PATHS if required else ()
-        )
-    # An explicitly empty override disables the gate outright; a non-empty
-    # explicit value replaces the repository default for that parameter.
-    if (names_explicit and not contract_gate_names) or (
-        paths_explicit and not contract_gate_paths
-    ):
-        contract_gate_names = ()
-        contract_gate_paths = ()
-    gates = [(ci_workflow_names, ci_workflow_paths, "CI")]
-    if contract_gate_names or contract_gate_paths:
-        gates.append(
-            (contract_gate_names, contract_gate_paths, "Contract Gate")
-        )
+    gates = [
+        (ci_workflow_names, ci_workflow_paths, "CI"),
+        (contract_gate_names, contract_gate_paths, "Contract Gate"),
+    ]
     for names, paths, label in gates:
         run = newest_exact_head_run(
             exact_head_runs,

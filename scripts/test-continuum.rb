@@ -10083,6 +10083,46 @@ class ContinuumTest < Minitest::Test
                     'continuum-contract-qualification.yml'
   end
 
+  # kodmial/continuum#286 regression: `mode` was a public `workflow_call`
+  # input (`default: verify`) before Layer 3 moved into
+  # continuum-contract-canary.yml. Dropping it makes an existing consumer
+  # caller that still passes `mode:` fail input validation, so the input stays
+  # accepted, rejects unknown values at runtime, and keeps `canary` meaningful
+  # by exercising the same `evaluate_canary` deadline contract the live probe
+  # uses. The live canary stays a single job in its own write-capable workflow:
+  # a called workflow cannot elevate the caller's token, so a write-capable
+  # canary job here would force the read-only PR caller to grant write scopes.
+  def test_contract_qualification_legacy_mode_input_stays_compatible
+    workflow_path = File.join(ROOT, '.github/workflows/continuum-contract-qualification.yml')
+    workflow = yaml(workflow_path)
+    call = workflow.fetch(true).fetch('workflow_call')
+    mode = call.fetch('inputs').fetch('mode')
+    assert_equal 'string', mode.fetch('type')
+    assert_equal 'verify', mode.fetch('default')
+    assert_equal false, mode.fetch('required')
+    assert_includes mode.fetch('description'), 'verify'
+    assert_includes mode.fetch('description'), 'canary'
+    refute call.fetch('secrets', {}).key?('TAP_PAT'),
+           'the read-only qualification workflow must not require the canary PAT'
+
+    body = File.read(workflow_path)
+    assert_includes body, "['verify', 'canary'].includes(mode)",
+                    'the legacy input must reject values other than verify|canary at runtime'
+    assert_includes body, 'Unsupported contract qualification mode'
+    assert_includes body, "if: inputs.mode == 'canary'",
+                    'the legacy canary mode must still select canary behavior'
+    assert_includes body, 'contract.evaluate_canary',
+                    'the legacy canary mode must exercise the shared canary deadline contract'
+
+    # The canary implementation must not be duplicated: the write-capable live
+    # probes stay in exactly one workflow job.
+    canary_jobs = workflow.fetch('jobs').values.select { |job| job['name'] == 'Live canary' }
+    assert_empty canary_jobs, 'the live canary job must not be duplicated into the qualification workflow'
+    live = yaml(File.join(ROOT, '.github/workflows/continuum-contract-canary.yml'))
+    assert_equal 1, live.fetch('jobs').values.count { |job| job['name'] == 'Live canary' },
+                 'the live canary must exist in exactly one job'
+  end
+
   def test_contract_qualification_gate_is_a_first_class_lifecycle
     body = File.read(File.join(ROOT, '.github/workflows/continuum-contract-qualification.yml'))
     assert_includes body, 'bash scripts/validate-continuum.sh', 'Layer 1 regression gate must use the canonical validation entrypoint'
@@ -10118,11 +10158,16 @@ class ContinuumTest < Minitest::Test
                  'the live canary must run on a bounded schedule'
     assert entry_events.key?('workflow_dispatch'),
            'the live canary must stay manually dispatchable'
+    assert_equal %w[canary qualify].sort, entry.fetch('jobs').keys.sort,
+                 'a manual canary dispatch must run the verify layer and the shared canary, ' \
+                 'which is the documented equivalent of the legacy `mode: canary` input'
     assert_equal({}, entry.fetch('permissions'),
                  'the project-owned canary entry must grant nothing itself')
 
     qualify = entry.fetch('jobs').fetch('qualify')
     assert_equal './.github/workflows/continuum-contract-qualification.yml', qualify.fetch('uses')
+    assert_equal 'canary', qualify.fetch('with').fetch('mode'),
+                 'the canary entry must keep the legacy mode input exercised'
     assert_equal %w[actions contents issues pull-requests statuses].sort,
                  qualify.fetch('permissions').keys.sort,
                  'the qualification job must request only read scopes and status writes'

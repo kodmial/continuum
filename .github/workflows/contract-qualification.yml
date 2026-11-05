@@ -3,6 +3,10 @@ name: Contract qualification
 on:
   pull_request:
     types: [opened, synchronize, reopened]
+  # The former `mode: canary` dispatch path moved with Layer 3: to run the
+  # live canary manually, dispatch contract-qualification-canary.yml, which
+  # runs this verify layer followed by the shared canary workflow. This entry
+  # stays verify-only so untrusted PR code never receives issue/action writes.
   workflow_dispatch:
     inputs:
       pr_number:
