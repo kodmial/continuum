@@ -433,6 +433,15 @@ class ProbeTests(unittest.TestCase):
         self.assertEqual(str(caught.exception), "execution_error")
         self.assertNotIsInstance(caught.exception, route.BurnedRunner)
 
+    def test_spawn_oserror_is_a_local_runtime_failure(self):
+        def runner(command, **kwargs):
+            raise PermissionError("local process denied")
+
+        with self.assertRaisesRegex(
+            route.LocalRuntimeError, "local_runtime: PermissionError"
+        ):
+            route.semantic_probe(A, "review", 30, runner=runner)
+
     def test_stalled_probe_without_quota_still_reports_timeout(self):
         process = FakeProcess(hang=True)
         def runner(command, **kwargs):
@@ -844,6 +853,22 @@ class SelectionLoopClosureBindingTests(unittest.TestCase):
             return writes[-1] if apply else dict(state)
         store.update = update
         return store, writes
+
+    def test_local_runtime_failure_does_not_quarantine_or_probe_next_route(self):
+        fingerprint = route.Configuration.parse(
+            f"{A},{B}").fingerprint("d", "anonymous")
+        state = {"fingerprint": fingerprint}
+        store, writes = self._store(state, apply=True)
+        calls = []
+
+        def probe(model, *args, **kwargs):
+            calls.append(model)
+            raise route.LocalRuntimeError("local_runtime: PermissionError")
+
+        self.assertEqual(self._run(store, probe), 2)
+        self.assertEqual(calls, [A])
+        self.assertEqual(writes, [])
+        self.assertNotIn("cooldowns", state)
 
     def test_burned_runner_cools_the_probed_model_not_a_later_one(self):
         fingerprint = route.Configuration.parse(
