@@ -231,6 +231,18 @@ the PR HEAD`) and the paused issue is never resumed.
 name: Continuum Contract Gate
 on:
   pull_request:
+
+permissions:
+  actions: write
+  contents: read
+  pull-requests: read
+  statuses: write
+
+jobs:
+  validate:
+    uses: kodmial/continuum/.github/workflows/continuum-validation.yml@main
+    with:
+      continuum_ref: main
 ```
 
 For a differently named gate workflow, set the override explicitly:

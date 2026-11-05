@@ -590,7 +590,9 @@ jobs:
           if [[ "${CALLER_EVENT_NAME,,}" == "schedule" ]]; then
             periodic=true
           fi
-          case "${PERIODIC_WAKE,,}" in
+          periodic_wake_trimmed="${PERIODIC_WAKE#"${PERIODIC_WAKE%%[![:space:]]*}"}"
+          periodic_wake_trimmed="${periodic_wake_trimmed%"${periodic_wake_trimmed##*[![:space:]]}"}"
+          case "${periodic_wake_trimmed,,}" in
             true) periodic=true ;;
           esac
           if [[ "$periodic" != "true" ]]; then

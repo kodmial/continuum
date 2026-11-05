@@ -416,8 +416,11 @@ class ExtractedGateScriptTests(unittest.TestCase):
                 self.assertEqual("true", outputs["run"])
                 self.assertEqual("non-periodic", outputs["reason"])
                 self.assertEqual("", calls)
-        for periodic in ("true", "TRUE", "True"):
+        for periodic in ("true", "TRUE", "True", " true", "true ", " TRUE "):
             with self.subTest(periodic=periodic):
+                # The canonical parser trims and lowercases, so the shell gate
+                # must agree for surrounding whitespace too.
+                self.assertTrue(parse_periodic_wake(periodic))
                 result, outputs, _ = self._run(
                     caller_event="workflow_dispatch", periodic=periodic, evidence="0"
                 )
