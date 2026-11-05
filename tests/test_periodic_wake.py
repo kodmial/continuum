@@ -404,6 +404,27 @@ class ExtractedGateScriptTests(unittest.TestCase):
                 self.assertEqual("non-periodic", outputs["reason"])
                 self.assertEqual("", calls)
 
+    def test_gate_accepts_only_the_literal_true(self):
+        # The canonical parser (parse_periodic_wake) trims and lowercases but
+        # accepts only "true"; 1/yes/on must stay non-periodic here too.
+        for periodic in ("1", "yes", "on", "Yes", "ON"):
+            with self.subTest(periodic=periodic):
+                result, outputs, calls = self._run(
+                    caller_event="workflow_dispatch", periodic=periodic
+                )
+                self.assertEqual(0, result.returncode, result.stderr)
+                self.assertEqual("true", outputs["run"])
+                self.assertEqual("non-periodic", outputs["reason"])
+                self.assertEqual("", calls)
+        for periodic in ("true", "TRUE", "True"):
+            with self.subTest(periodic=periodic):
+                result, outputs, _ = self._run(
+                    caller_event="workflow_dispatch", periodic=periodic, evidence="0"
+                )
+                self.assertEqual(0, result.returncode, result.stderr)
+                self.assertEqual("true", outputs["run"])
+                self.assertEqual("window-due", outputs["reason"])
+
     def test_duplicate_periodic_window_is_a_cheap_noop(self):
         result, outputs, calls = self._run(
             caller_event="workflow_dispatch", periodic="true", evidence="1"

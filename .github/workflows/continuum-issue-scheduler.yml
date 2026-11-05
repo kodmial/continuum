@@ -591,7 +591,7 @@ jobs:
             periodic=true
           fi
           case "${PERIODIC_WAKE,,}" in
-            true|1|yes|on) periodic=true ;;
+            true) periodic=true ;;
           esac
           if [[ "$periodic" != "true" ]]; then
             emit true "non-periodic"
