@@ -2337,14 +2337,11 @@ jobs:
 
             // A manually queued/restarted run may already exist. Never add a
             // second retry when another run for the same issue is active.
-            const runs = await readGithub.paginate(
-              readGithub.rest.actions.listWorkflowRunsForRepo,
-              {
-                owner,
-                repo,
-                per_page: 100,
-              }
-            );
+            // Only competing non-completed runs matter here. Scanning every
+            // historical Actions run is unbounded and can exhaust the shared
+            // installation REST core budget in high-churn consumer repos.
+            // Reuse the status-scoped inventory already used by durable recovery.
+            const runs = await listActiveOpenCodeRuns();
 
             const sameTitle = 'OpenCode issue #' + issueNumber;
             const legacyTitle = issue.title;
