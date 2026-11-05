@@ -51,6 +51,10 @@ class RouteError(RuntimeError):
     pass
 
 
+class LocalRuntimeError(RouteError):
+    """The local OpenCode process could not start; no provider was contacted."""
+
+
 class BurnedRunner(RouteError):
     pass
 
@@ -428,7 +432,7 @@ def semantic_probe(model: str, kind: str, timeout: int, *, runner=subprocess.Pop
             process = runner(command, cwd=scratch, env=_probe_environment(scratch),
                              stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         except OSError as error:
-            raise RouteError("local_runtime: " + type(error).__name__) from None
+            raise LocalRuntimeError("local_runtime: " + type(error).__name__) from None
         stdout: list[str] = []
         stderr: list[str] = []
         readers = [threading.Thread(target=_drain, args=(process.stdout, stdout), daemon=True),
@@ -869,6 +873,11 @@ def run() -> int:
             if not qualified:
                 semantic_probe(model, "review" if config.task_class == "review" else "coder",
                                config.timeout)
+        except LocalRuntimeError:
+            # Process creation failed locally, before the provider was contacted.
+            # This runner/runtime fault is shared by every route: do not quarantine
+            # the selected model or spend time probing the rest of the pool.
+            raise
         except GitHubStateUnavailable:
             # A GitHub state-store rate limit/transport failure is never a
             # model-provider failure: do not cool down an otherwise working
