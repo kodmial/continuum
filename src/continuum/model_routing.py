@@ -760,13 +760,17 @@ def binary_provenance() -> tuple[str, str]:
     if not executable:
         raise RouteError("Official OpenCode binary missing")
     binary = Path(executable).resolve()
-    version = subprocess.run([str(binary), "--version"], capture_output=True,
-                             text=True, timeout=15, check=True).stdout.strip()
+    version_output = subprocess.run([str(binary), "--version"], capture_output=True,
+                                    text=True, timeout=15, check=True).stdout.strip()
+    # OpenCode 2.x can include a prefix/build details in the version banner.
+    # Extract one exact SemVer; the downloaded executable is SHA256 verified.
+    matches = re.findall(r"(?<![0-9.])[0-9]+\\.[0-9]+\\.[0-9]+(?![0-9.])",
+                         version_output)
     expected = os.environ.get("CONTINUUM_EXPECTED_OPENCODE_VERSION", "")
-    if not SEMVER.fullmatch(version) or (expected and version != expected):
+    if len(matches) != 1 or (expected and matches[0] != expected):
         raise RouteError("OpenCode version differs from verified manifest/override")
     digest = hashlib.sha256(binary.read_bytes()).hexdigest()
-    return version, digest
+    return matches[0], digest
 
 
 def write_outputs(env, values: dict) -> None:

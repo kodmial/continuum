@@ -93,6 +93,22 @@ class ConfigurationTests(unittest.TestCase):
         with self.assertRaises(route.RouteError):
             route.route_key("org/x", "private/child", "anonymous", config, "x")
 
+    def test_binary_provenance_accepts_prefixed_2x_version_and_rejects_mismatch(self):
+        with tempfile.TemporaryDirectory() as directory:
+            binary = pathlib.Path(directory) / "opencode"
+            binary.write_bytes(b"verified-binary-fixture")
+            with patch.object(route.shutil, "which", return_value=str(binary)), \\
+                 patch.dict(os.environ, {"CONTINUUM_EXPECTED_OPENCODE_VERSION": "2.2.6"}):
+                with patch.object(route.subprocess, "run", return_value=subprocess.CompletedProcess(
+                        [str(binary), "--version"], 0, "opencode 2.2.6 (build info)\\n", "")):
+                    version, digest = route.binary_provenance()
+                    self.assertEqual(version, "2.2.6")
+                    self.assertEqual(len(digest), 64)
+                with patch.object(route.subprocess, "run", return_value=subprocess.CompletedProcess(
+                        [str(binary), "--version"], 0, "opencode 2.2.60\\n", "")):
+                    with self.assertRaisesRegex(route.RouteError, "version differs"):
+                        route.binary_provenance()
+
     def test_binary_or_pool_change_invalidates_state(self):
         c = route.Configuration.parse(f"{A},{B}")
         d = route.Configuration.parse(f"{B},{A}")

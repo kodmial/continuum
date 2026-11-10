@@ -1642,6 +1642,12 @@
       "installer_set": "not-installed",
       "triggers": [
         {
+          "event": "push",
+          "branches": [
+            "main"
+          ]
+        },
+        {
           "event": "pull_request"
         },
         {
