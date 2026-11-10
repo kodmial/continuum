@@ -97,15 +97,15 @@ class ConfigurationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             binary = pathlib.Path(directory) / "opencode"
             binary.write_bytes(b"verified-binary-fixture")
-            with patch.object(route.shutil, "which", return_value=str(binary)), \\
+            with patch.object(route.shutil, "which", return_value=str(binary)), \
                  patch.dict(os.environ, {"CONTINUUM_EXPECTED_OPENCODE_VERSION": "2.2.6"}):
                 with patch.object(route.subprocess, "run", return_value=subprocess.CompletedProcess(
-                        [str(binary), "--version"], 0, "opencode 2.2.6 (build info)\\n", "")):
+                        [str(binary), "--version"], 0, "opencode 2.2.6 (build info)\n", "")):
                     version, digest = route.binary_provenance()
                     self.assertEqual(version, "2.2.6")
                     self.assertEqual(len(digest), 64)
                 with patch.object(route.subprocess, "run", return_value=subprocess.CompletedProcess(
-                        [str(binary), "--version"], 0, "opencode 2.2.60\\n", "")):
+                        [str(binary), "--version"], 0, "opencode 2.2.60\n", "")):
                     with self.assertRaisesRegex(route.RouteError, "version differs"):
                         route.binary_provenance()
 

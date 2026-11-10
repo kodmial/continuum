@@ -764,7 +764,7 @@ def binary_provenance() -> tuple[str, str]:
                                     text=True, timeout=15, check=True).stdout.strip()
     # OpenCode 2.x can include a prefix/build details in the version banner.
     # Extract one exact SemVer; the downloaded executable is SHA256 verified.
-    matches = re.findall(r"(?<![0-9.])[0-9]+\\.[0-9]+\\.[0-9]+(?![0-9.])",
+    matches = re.findall(r"(?<![0-9.])[0-9]+\.[0-9]+\.[0-9]+(?![0-9.])",
                          version_output)
     expected = os.environ.get("CONTINUUM_EXPECTED_OPENCODE_VERSION", "")
     if len(matches) != 1 or (expected and matches[0] != expected):
