@@ -3206,6 +3206,16 @@ jobs:
             checkpoint_issue_progress "$OPENCODE_RUN_RC"
           fi
           trap - TERM INT HUP
+          # The provider can report exit 1 after the wrapper has already
+          # identified a 429/unavailable failure. Honor the durable marker:
+          # evacuate the dirty tree instead of losing completed agent edits.
+          if [[ "$OPENCODE_RUN_RC" -ne 0 ]]; then
+            if [[ -f "${RUNNER_TEMP:-/tmp}/continuum-opencode-upstream-unavailable" ]]; then
+              OPENCODE_RUN_RC=76
+            elif [[ -f "${RUNNER_TEMP:-/tmp}/continuum-opencode-429" ]]; then
+              OPENCODE_RUN_RC=75
+            fi
+          fi
           if [[ "$OPENCODE_RUN_RC" -eq 75 || "$OPENCODE_RUN_RC" -eq 76 ]]; then
             # kodmial/continuum#290: 429 burns this VM. Workflow-owned
             # evacuation persists working-tree changes, commits, SHAs,
@@ -3652,6 +3662,16 @@ jobs:
             OPENCODE_RUN_RC=${PIPESTATUS[0]}
             set -e
           fi
+          # The provider can report exit 1 after the wrapper has already
+          # identified a 429/unavailable failure. Honor the durable marker:
+          # evacuate the dirty tree instead of losing completed agent edits.
+          if [[ "$OPENCODE_RUN_RC" -ne 0 ]]; then
+            if [[ -f "${RUNNER_TEMP:-/tmp}/continuum-opencode-upstream-unavailable" ]]; then
+              OPENCODE_RUN_RC=76
+            elif [[ -f "${RUNNER_TEMP:-/tmp}/continuum-opencode-429" ]]; then
+              OPENCODE_RUN_RC=75
+            fi
+          fi
           if [[ "$OPENCODE_RUN_RC" -eq 75 || "$OPENCODE_RUN_RC" -eq 76 ]]; then
             # kodmial/continuum#290: 429 burns this VM. Workflow-owned
             # evacuation persists the exact required SHA, operation identity,
@@ -4069,6 +4089,16 @@ jobs:
           continuum-opencode run --auto --model "$OPENCODE_MODEL" "$PROMPT" 2>&1 | tee "$OPENCODE_RUN_LOG"
           OPENCODE_RUN_RC=${PIPESTATUS[0]}
           set -e
+          # The provider can report exit 1 after the wrapper has already
+          # identified a 429/unavailable failure. Honor the durable marker:
+          # evacuate the dirty tree instead of losing completed agent edits.
+          if [[ "$OPENCODE_RUN_RC" -ne 0 ]]; then
+            if [[ -f "${RUNNER_TEMP:-/tmp}/continuum-opencode-upstream-unavailable" ]]; then
+              OPENCODE_RUN_RC=76
+            elif [[ -f "${RUNNER_TEMP:-/tmp}/continuum-opencode-429" ]]; then
+              OPENCODE_RUN_RC=75
+            fi
+          fi
           if [[ "$OPENCODE_RUN_RC" -eq 75 || "$OPENCODE_RUN_RC" -eq 76 ]]; then
             # kodmial/continuum#290: 429 burns this VM. Workflow-owned
             # evacuation preserves the working tree, the exact PR HEAD
@@ -4555,6 +4585,16 @@ jobs:
           continuum-opencode run --auto --model "$OPENCODE_MODEL" "$PROMPT" 2>&1 | tee "$OPENCODE_RUN_LOG"
           OPENCODE_RUN_RC=${PIPESTATUS[0]}
           set -e
+          # The provider can report exit 1 after the wrapper has already
+          # identified a 429/unavailable failure. Honor the durable marker:
+          # evacuate the dirty tree instead of losing completed agent edits.
+          if [[ "$OPENCODE_RUN_RC" -ne 0 ]]; then
+            if [[ -f "${RUNNER_TEMP:-/tmp}/continuum-opencode-upstream-unavailable" ]]; then
+              OPENCODE_RUN_RC=76
+            elif [[ -f "${RUNNER_TEMP:-/tmp}/continuum-opencode-429" ]]; then
+              OPENCODE_RUN_RC=75
+            fi
+          fi
           if [[ "$OPENCODE_RUN_RC" -eq 75 || "$OPENCODE_RUN_RC" -eq 76 ]]; then
             # kodmial/continuum#290: 429 burns this VM. Workflow-owned
             # evacuation preserves the conflict-repair working tree, the exact
@@ -4766,6 +4806,16 @@ jobs:
           continuum-opencode run --auto --model "$OPENCODE_MODEL" "$PROMPT" 2>&1 | tee "$OPENCODE_RUN_LOG"
           OPENCODE_RUN_RC=${PIPESTATUS[0]}
           set -e
+          # The provider can report exit 1 after the wrapper has already
+          # identified a 429/unavailable failure. Honor the durable marker:
+          # evacuate the dirty tree instead of losing completed agent edits.
+          if [[ "$OPENCODE_RUN_RC" -ne 0 ]]; then
+            if [[ -f "${RUNNER_TEMP:-/tmp}/continuum-opencode-upstream-unavailable" ]]; then
+              OPENCODE_RUN_RC=76
+            elif [[ -f "${RUNNER_TEMP:-/tmp}/continuum-opencode-429" ]]; then
+              OPENCODE_RUN_RC=75
+            fi
+          fi
           if [[ "$OPENCODE_RUN_RC" -eq 75 || "$OPENCODE_RUN_RC" -eq 76 ]]; then
             # kodmial/continuum#290: 429 burns this VM. Workflow-owned
             # evacuation preserves the CI-repair working tree, the exact PR
