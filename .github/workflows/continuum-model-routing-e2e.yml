@@ -1,6 +1,15 @@
 name: Continuum model routing live E2E
 
 on:
+  push:
+    branches:
+      - main
+    paths:
+      - '.github/actions/agent-toolchain/**'
+      - '.github/workflows/continuum-model-routing-e2e.yml'
+      - 'src/continuum/model_routing.py'
+      - '.github/actions/model-route/**'
+      - 'tests/fixtures/opencode-models-66.json'
   pull_request:
     paths:
       - 'src/continuum/model_routing.py'
@@ -10,8 +19,8 @@ on:
   workflow_dispatch:
 
 # Persistent state is shared by both jobs in one attempt, but isolated across attempts.
-# PR-only integration fixture: no PAT, provider API key, paid-model discovery,
-# untrusted fork code, production rollout configuration or default-branch push.
+# Isolated integration fixture: no PAT, provider API key, paid-model discovery,
+# or untrusted fork code. Also runs on main after toolchain updates.
 # The durable model-state ref is written only by the recording job; the fresh
 # verification runner needs read-only contents.
 permissions: {}
