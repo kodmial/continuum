@@ -293,7 +293,7 @@ _PROVIDER_EVENT_TYPE_RE = re.compile(
     r"(?:^|[._-])(?:api|provider|rate.?limit|quota|authentication|permission|"
     r"timeout|connection|unavailable|http|status|badrequest|notfound|"
     r"freeusage|gousage)|(?:api|provider|quota|usage|limit|timeout|"
-    r"connection|authentication|permission|http|status|unavailable)error$",
+    r"connection|authentication|permission|http|status|unavailable|"\n    r"unprocessableentity|unauthorized|permissiondenied)error$",
     re.IGNORECASE,
 )
 
