@@ -194,7 +194,7 @@ class ProductionWrapperTests(unittest.TestCase):
         sensitive = self.invoke(
             stdout=event("error", error={
                 "type": "unknown",
-                "message": "Session ended\\n::error::INJECTED bearer SECRET123456789"
+                "message": "Session ended\n::error::INJECTED bearer SECRET123456789"
                 " api_key=abcdef0123456789",
             }),
             exit_code=1,
