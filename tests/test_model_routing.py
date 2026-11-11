@@ -1054,6 +1054,28 @@ class SelectionSaveRouteErrorTests(unittest.TestCase):
         self.assertEqual(saved.get("cooldowns", {}), {})
         self.assertEqual(saved["last_successful_probe"]["model"], B)
 
+    def test_selection_race_skips_fallback_cooled_by_another_run(self):
+        now = int(route.time.time())
+        fingerprint = route.Configuration.parse(
+            f"{A},{B}").fingerprint("d", "anonymous")
+        # A's save observes B's proof after another writer refreshed the state.
+        # B is also cooling down, so unpinned failover must skip it instead of
+        # probing (no proof) or reserving (fresh proof) that fallback.
+        for has_proof in (False, True):
+            with self.subTest(has_proof=has_proof):
+                initial = {"fingerprint": fingerprint,
+                           "last_successful_probe": {"model": A, "at": now}}
+                later = {"fingerprint": fingerprint,
+                         "cooldowns": {B: now + 3600}}
+                if has_proof:
+                    later["last_successful_probe"] = {"model": B, "at": now}
+                probes = []
+                self.assertEqual(self._run(initial, later, probes), 2)
+                self.assertEqual(probes, [])
+                saved = _RacyStore._last.current
+                self.assertIn(B, saved["cooldowns"])
+                self.assertNotIn("qualified_selections", saved)
+
     def test_probe_expired_before_task_start_cools_that_model_and_fails_over(self):
         now = int(route.time.time())
         fingerprint = route.Configuration.parse(

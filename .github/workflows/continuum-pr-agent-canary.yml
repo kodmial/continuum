@@ -40,7 +40,11 @@ on:
         default: ''
         required: false
       max_tokens:
-        description: Custom-model context cap used for PR-Agent prompt budgeting.
+        description: >-
+          Retained canary context-cap setting. The canary starts review through
+          a `/review` comment, so the resolved value is not passed to that run
+          and does not control its review budget. Empty falls back to
+          vars.PR_AGENT_MAX_TOKENS, then to '128000'.
         type: string
         default: ''
         required: false

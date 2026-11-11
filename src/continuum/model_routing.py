@@ -906,6 +906,13 @@ def run() -> int:
         stop = False
         race_attempts = 0
         while True:
+            # A concurrent run may cool this route after the snapshot (or after
+            # a race refresh); never probe or reserve a route in cooldown.
+            cooldowns = state.get("cooldowns") or {}
+            if now < int(cooldowns.get(model, 0)):
+                errors[model] = "Route is cooling down"
+                stop = config.pinned
+                break
             last_probe = state.get("last_successful_probe") or {}
             try:
                 probe_at = int(last_probe.get("at", 0))

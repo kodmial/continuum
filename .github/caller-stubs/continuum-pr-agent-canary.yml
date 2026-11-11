@@ -20,7 +20,7 @@ on:
         required: false
         type: string
       max_tokens:
-        description: "Custom-model context cap used for PR-Agent prompt budgeting"
+        description: "Canary max_tokens setting; resolved but not passed to the /review run, so it does not control review budgeting"
         required: false
         type: string
       api_base:
