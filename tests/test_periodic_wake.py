@@ -299,7 +299,10 @@ class WorkflowGateTests(unittest.TestCase):
         call_with = stub["jobs"]["call"]["with"]
         self.assertEqual("${{ inputs.periodic_wake }}", call_with["periodic_wake"])
         self.assertIn("[continuum-periodic]", stub["run-name"])
-        self.assertIn("github.event.inputs.periodic_wake == 'true'", stub["run-name"])
+        self.assertIn(
+            "contains(format(' {0} ', github.event.inputs.periodic_wake), ' true ')",
+            stub["run-name"],
+        )
 
     def test_child_runner_guard_unchanged(self):
         self.assertEqual("vars.CONTINUUM_ROLE != 'child'", self.schedule["if"])

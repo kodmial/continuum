@@ -40,7 +40,7 @@ on:
         default: ''
         required: false
       max_tokens:
-        description: Token/output limit forwarded as the custom-model cap.
+        description: Custom-model context cap used for PR-Agent prompt budgeting.
         type: string
         default: ''
         required: false

@@ -216,15 +216,28 @@ publication are not part of the Swift profile.
 
 ### Required Contract Gate workflow
 
-Owner-armed resume (`/oc` on a paused issue) requires the predecessor PR HEAD to
-carry a successful Contract Gate run. The scheduler matches that run by the
-workflow `name:` (or by the `.github/workflows/contract-gate.yml` path) and
-defaults the name to `Continuum Contract Gate` when
-`CONTINUUM_CONTRACT_GATE_WORKFLOW_NAME` is unset or empty. The consumer must
-therefore provide a gate workflow named `Continuum Contract Gate`, or set the
-variable to that workflow's exact non-empty `name:`. Otherwise every
-owner-armed resume decision is `NOOP` (`Contract Gate evidence is missing on
-the PR HEAD`) and the paused issue is never resumed.
+Owner-armed resume is authorized by an owner-authored API comment whose first
+line is exactly the marker below (the owner may append an explanation after
+it):
+
+```html
+<!-- continuum-resume-after:v1 predecessor=374 -->
+```
+
+`predecessor` is the issue number that must be closed as completed with a
+trusted merged implementation PR. A manual `/oc` on the paused issue is an
+OpenCode command, not this marker: it counts as activity that fences the marker
+and does not arm the transition.
+
+The predecessor PR HEAD must carry a successful Contract Gate run. The scheduler
+matches that run by the workflow `name:` (or by the
+`.github/workflows/contract-gate.yml` path) and defaults the name to
+`Continuum Contract Gate` when `CONTINUUM_CONTRACT_GATE_WORKFLOW_NAME` is unset
+or empty. The consumer must therefore provide a gate workflow named
+`Continuum Contract Gate`, or set the variable to that workflow's exact
+non-empty `name:`. Otherwise every owner-armed resume decision is `NOOP`
+(`Contract Gate evidence is missing on the PR HEAD`) and the paused issue is
+never resumed.
 
 ```yaml
 # .github/workflows/contract-gate.yml
@@ -243,6 +256,14 @@ jobs:
     uses: kodmial/continuum/.github/workflows/continuum-validation.yml@main
     with:
       continuum_ref: main
+      # Keep the gate's result distinct from the CI caller's
+      # continuum/validation context so the two cannot overwrite each other.
+      status_context: continuum/contract-gate
+      # Fork and Dependabot pull requests receive a read-only GITHUB_TOKEN, so
+      # they cannot publish a commit status or dispatch repair. Validation
+      # still runs; those PRs are gated by the job check instead.
+      publish_status: ${{ github.event_name == 'pull_request' && (github.event.pull_request.head.repo.fork || github.actor == 'dependabot[bot]') && 'false' || 'true' }}
+      dispatch_repair: ${{ github.event_name == 'pull_request' && (github.event.pull_request.head.repo.fork || github.actor == 'dependabot[bot]') && 'false' || 'true' }}
 ```
 
 For a differently named gate workflow, set the override explicitly:

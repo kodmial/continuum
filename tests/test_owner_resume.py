@@ -973,6 +973,27 @@ class NegativeEvidenceTests(unittest.TestCase):
             complete(REPOSITORY, ci_only + [custom_gate], **custom)
         )
 
+        # decide_owner_resume must forward the same custom identity; otherwise
+        # a renamed gate would still produce NOOP after evaluate accepts it.
+        custom_decision = decide(
+            repository=consumer,
+            predecessor_issue=evidence["issue"],
+            pull_requests=[pr(900, 374, head_repo=consumer)],
+            runs=ci_only + [custom_gate],
+            statuses=evidence["statuses"],
+            **custom,
+        )
+        self.assertEqual(custom_decision.state, RESUME)
+        default_decision = decide(
+            repository=consumer,
+            predecessor_issue=evidence["issue"],
+            pull_requests=[pr(900, 374, head_repo=consumer)],
+            runs=ci_only + [custom_gate],
+            statuses=evidence["statuses"],
+        )
+        self.assertEqual(default_decision.state, NOOP)
+        self.assertIn("Contract Gate", default_decision.reason)
+
         # An empty identity cannot disable the mandatory gate: with both
         # names and paths empty no run can prove the gate, so it fails closed.
         self.assertFalse(complete(

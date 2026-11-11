@@ -193,10 +193,12 @@ class RateLimitStopTests(unittest.TestCase):
         payload = json.loads(result.stdout)
         self.assertTrue(payload["stoppedRateLimited"])
 
-    def test_per_repository_403_fails_closed(self):
+    def test_per_repository_403_is_counted_and_the_pass_continues(self):
         result = run_probe(403, {"x-ratelimit-remaining": "4999"})
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn("credential lacks required access", result.stderr)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        payload = json.loads(result.stdout)
+        self.assertFalse(payload["stoppedRateLimited"])
+        self.assertEqual(payload["counters"]["request_failures_by_status"].get("403"), 1)
 
     def test_invalid_credential_remains_fatal(self):
         result = run_probe(401, {})

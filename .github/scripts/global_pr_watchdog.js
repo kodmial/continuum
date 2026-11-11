@@ -314,7 +314,9 @@ async function runScan(client, options) {
         stopOnExhaustion();
         return true;
       }
-      failCredential(error);
+      // Only a 401 invalidates the central credential for every repository.
+      // A per-repository 403 is counted and the pass continues.
+      if (isInvalidCredential(error)) failCredential(error);
       // A missing caller file means "not a core consumer": the normal
       // single-call negative path, not a failure.
       if (error && Number(error.status) === 404) return false;
@@ -333,7 +335,7 @@ async function runScan(client, options) {
         stopOnExhaustion();
         return true;
       }
-      failCredential(error);
+      if (isInvalidCredential(error)) failCredential(error);
       noteFailure(counters, error ? error.status : undefined);
       log.warn(`global-pr-watchdog repo=${key} op=${OPERATIONS.OPEN_PR_PROBE} status=${error ? error.status : 'unknown'}`);
       return false;
@@ -351,7 +353,7 @@ async function runScan(client, options) {
           stopOnExhaustion();
           return true;
         }
-        failCredential(error);
+        if (isInvalidCredential(error)) failCredential(error);
         // An older or incomplete installation may lack an optional
         // recovery caller. Count it and wake the remaining reconcilers.
         if (error && Number(error.status) === 404) {

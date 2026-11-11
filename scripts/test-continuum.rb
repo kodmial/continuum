@@ -3424,6 +3424,8 @@ class ContinuumTest < Minitest::Test
     crons = events(stub).fetch('schedule').map { |entry| entry.fetch('cron') }
     assert_equal ['7,17,27,37,47,57 * * * *'], crons
     assert_includes stub.fetch('run-name'), '[continuum-periodic]'
+    assert_includes stub.fetch('run-name'),
+                    "contains(format(' {0} ', github.event.inputs.periodic_wake), ' true ')"
     dispatch = events(stub).fetch('workflow_dispatch').fetch('inputs').fetch('periodic_wake')
     assert_equal 'string', dispatch.fetch('type')
     assert_equal 'false', dispatch.fetch('default')
@@ -5843,6 +5845,9 @@ class ContinuumTest < Minitest::Test
     assert_includes scheduler, 'await dispatchWorkflow(childWorkerWorkflow, {'
     assert_includes scheduler, 'local_opencode_pr_tasks'
     assert_includes scheduler, 'local_opencode_run_tasks'
+    assert_includes scheduler, '($runs | length) >= 100',
+                    'a full third Actions-run page must fail closed as unknown'
+    assert_includes scheduler, 'then "__unknown__" else empty end'
     assert_includes scheduler, 'local_override_active "$task_number"'
     assert_includes scheduler, 'sort_by(._rank, .number)'
     assert_includes scheduler, 'else 3'
@@ -10106,6 +10111,8 @@ class ContinuumTest < Minitest::Test
            'the read-only qualification workflow must not require the canary PAT'
 
     body = File.read(workflow_path)
+    refute_includes body, "process.env.MODE || 'verify'",
+                    'an explicitly empty mode must be rejected, not replaced with verify'
     assert_includes body, "['verify', 'canary'].includes(mode)",
                     'the legacy input must reject values other than verify|canary at runtime'
     assert_includes body, 'Unsupported contract qualification mode'

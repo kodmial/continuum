@@ -738,6 +738,8 @@ def decide_owner_resume(
     statuses: Sequence[Mapping[str, Any]] = (),
     reviews: Sequence[Mapping[str, Any]] = (),
     default_branch: str = "main",
+    contract_gate_names: Sequence[str] = CONTRACT_GATE_WORKFLOW_NAMES,
+    contract_gate_paths: Sequence[str] = CONTRACT_GATE_WORKFLOW_PATHS,
     pause_label: str = "automation:paused",
     ready_label: str = "automation:ready",
     blocked_label: str = "automation:blocked",
@@ -814,6 +816,8 @@ def decide_owner_resume(
         reviews=reviews,
         repository=repository,
         default_branch=default_branch,
+        contract_gate_names=contract_gate_names,
+        contract_gate_paths=contract_gate_paths,
         predecessor_comments=predecessor_comments,
         owner_login=repository_owner,
     )

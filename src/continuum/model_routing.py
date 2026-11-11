@@ -546,7 +546,7 @@ class GitRefStore:
                 raise failure from None
             raise RouteError(f"GitHub model state {method} failed ({err.code})") from None
         except ValueError:
-            raise RouteError("GitHub model state response malformed") from None
+            raise GitHubStateUnavailable("malformed response") from None
         except OSError:
             raise GitHubStateUnavailable("transient") from None
 

@@ -35,6 +35,7 @@ def _harness(gh_body: str, task_number: int = 42) -> str:
     return "\n".join(
         [
             "set -euo pipefail",
+            'child_id="opaque-child"',
             'child_repo="owner/child"',
             "gh() {",
             gh_body,
@@ -79,6 +80,16 @@ class LocalOpenCodeInventoryTests(unittest.TestCase):
     def test_failed_run_lookup_marks_inventory_unknown_on_any_page(self):
         result = _run(
             'if [[ "$1" == "api" ]]; then return 1; fi; return 0'
+        )
+        self.assertEqual(["__unknown__"], result["RUN"])
+        self.assertEqual("ACTIVE", result["decision"])
+
+    def test_full_third_page_marks_inventory_unknown(self):
+        # The workflow's jq query emits this sentinel when page 3 is full, so
+        # older active runs cannot be silently omitted from the bounded window.
+        result = _run(
+            'if [[ "$1" == "pr" ]]; then return 0; fi; '
+            '[[ "$*" == *"page=3"* ]] && echo "__unknown__"; return 0'
         )
         self.assertEqual(["__unknown__"], result["RUN"])
         self.assertEqual("ACTIVE", result["decision"])

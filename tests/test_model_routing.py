@@ -1436,7 +1436,7 @@ class GitHubStateFailureClassificationTests(unittest.TestCase):
         self.assertEqual(failure.classification, "transient")
         self.assertIsNone(failure.not_before)
 
-    def test_malformed_json_and_cas_conflict_remain_deterministic(self):
+    def test_malformed_json_is_state_unavailable_and_cas_conflict_stays_deterministic(self):
         class MalformedReply:
             def __enter__(self):
                 return self
@@ -1451,9 +1451,9 @@ class GitHubStateFailureClassificationTests(unittest.TestCase):
             return MalformedReply()
 
         with patch.object(route.urllib.request, "urlopen", malformed):
-            with self.assertRaises(route.RouteError) as caught:
+            with self.assertRaises(route.GitHubStateUnavailable) as caught:
                 self._store().api("GET", "git/ref/heads/continuum-model-state")
-        self.assertNotIsInstance(caught.exception, route.GitHubStateUnavailable)
+        self.assertEqual(caught.exception.classification, "malformed response")
 
         with self._raise(self._error(409)):
             with self.assertRaises(route.Conflict):

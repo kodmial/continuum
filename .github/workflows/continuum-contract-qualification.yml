@@ -67,7 +67,7 @@ jobs:
           MODE: ${{ inputs.mode }}
         with:
           script: |
-            const mode = process.env.MODE || 'verify';
+            const mode = process.env.MODE;
             if (!['verify', 'canary'].includes(mode)) {
               core.setFailed(`Unsupported contract qualification mode '${mode}'. Use verify or canary.`);
               return;
