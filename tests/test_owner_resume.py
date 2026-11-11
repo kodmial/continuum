@@ -959,6 +959,12 @@ class NegativeEvidenceTests(unittest.TestCase):
         self.assertFalse(complete(consumer, ci_only))
         self.assertTrue(complete(consumer, ci_only + default_gate))
 
+        # Explicit None is normalized to the mandatory default identity, not
+        # treated as an empty identity that could disable the gate.
+        self.assertTrue(complete(consumer, ci_only + default_gate,
+                                 contract_gate_names=None,
+                                 contract_gate_paths=None))
+
         # A non-empty explicit identity renames the required gate in every
         # repository: the default-named run no longer satisfies it.
         custom = {
@@ -993,6 +999,17 @@ class NegativeEvidenceTests(unittest.TestCase):
         )
         self.assertEqual(default_decision.state, NOOP)
         self.assertIn("Contract Gate", default_decision.reason)
+
+        none_decision = decide(
+            repository=consumer,
+            predecessor_issue=evidence["issue"],
+            pull_requests=[pr(900, 374, head_repo=consumer)],
+            runs=ci_only + default_gate,
+            statuses=evidence["statuses"],
+            contract_gate_names=None,
+            contract_gate_paths=None,
+        )
+        self.assertEqual(none_decision.state, RESUME)
 
         # An empty identity cannot disable the mandatory gate: with both
         # names and paths empty no run can prove the gate, so it fails closed.

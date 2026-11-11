@@ -636,8 +636,8 @@ def evaluate_predecessor_completion(
     default_branch: str = "main",
     ci_workflow_names: Sequence[str] = ("CI",),
     ci_workflow_paths: Sequence[str] = (".github/workflows/ci.yml",),
-    contract_gate_names: Sequence[str] = CONTRACT_GATE_WORKFLOW_NAMES,
-    contract_gate_paths: Sequence[str] = CONTRACT_GATE_WORKFLOW_PATHS,
+    contract_gate_names: Optional[Sequence[str]] = CONTRACT_GATE_WORKFLOW_NAMES,
+    contract_gate_paths: Optional[Sequence[str]] = CONTRACT_GATE_WORKFLOW_PATHS,
     predecessor_comments: Optional[Sequence[Any]] = None,
     owner_login: str = "",
 ) -> Tuple[bool, str, Optional[int], str]:
@@ -692,6 +692,13 @@ def evaluate_predecessor_completion(
     if not str(latest.get("merged_at") or "").strip():
         return False, "predecessor merge timestamp is missing", None, ""
 
+    # Older callers may pass None explicitly. Normalize it to the mandatory
+    # default identity, while keeping an explicitly empty sequence empty so it
+    # still fails closed.
+    if contract_gate_names is None:
+        contract_gate_names = CONTRACT_GATE_WORKFLOW_NAMES
+    if contract_gate_paths is None:
+        contract_gate_paths = CONTRACT_GATE_WORKFLOW_PATHS
     gates = [
         (ci_workflow_names, ci_workflow_paths, "CI"),
         (contract_gate_names, contract_gate_paths, "Contract Gate"),
@@ -738,8 +745,8 @@ def decide_owner_resume(
     statuses: Sequence[Mapping[str, Any]] = (),
     reviews: Sequence[Mapping[str, Any]] = (),
     default_branch: str = "main",
-    contract_gate_names: Sequence[str] = CONTRACT_GATE_WORKFLOW_NAMES,
-    contract_gate_paths: Sequence[str] = CONTRACT_GATE_WORKFLOW_PATHS,
+    contract_gate_names: Optional[Sequence[str]] = CONTRACT_GATE_WORKFLOW_NAMES,
+    contract_gate_paths: Optional[Sequence[str]] = CONTRACT_GATE_WORKFLOW_PATHS,
     pause_label: str = "automation:paused",
     ready_label: str = "automation:ready",
     blocked_label: str = "automation:blocked",

@@ -67,6 +67,14 @@ class SelectionNotVisible(RouteError):
     """The same-run selection receipt may lag a recent Git state ref write."""
 
 
+class StateValidationError(RouteError):
+    """Durable route state is structurally invalid; never a model failure."""
+
+
+class SelectionStateRace(RouteError):
+    """A concurrent writer replaced the selected route's qualification."""
+
+
 class GitHubStateUnavailable(RouteError):
     """Sanitized GitHub model-state transport/rate-limit failure.
 
@@ -264,6 +272,20 @@ def route_order(config: Configuration, state: dict, now: int) -> tuple[str, ...]
         allowed.remove(preferred)
         allowed.insert(0, preferred)
     return tuple(allowed)
+
+
+def record_cooldown(current: dict, model: str, deadline: int) -> dict:
+    """Record a cooldown without shortening a longer one from another run."""
+    cooldowns = current.get("cooldowns")
+    if not isinstance(cooldowns, dict):
+        cooldowns = {}
+        current["cooldowns"] = cooldowns
+    try:
+        existing = int(cooldowns.get(model, 0))
+    except (TypeError, ValueError):
+        existing = 0
+    cooldowns[model] = max(existing, int(deadline))
+    return current
 
 
 # A stalled free-quota probe still prints this before `opencode run` hangs.
@@ -616,7 +638,7 @@ def reserve_completion(state: dict, ticket: str, model: str, now: int,
         raise RouteError("Invalid qualification timestamp")
     pending = state.get("qualified_selections") or {}
     if not isinstance(pending, dict):
-        raise RouteError("Corrupt model selection state")
+        raise StateValidationError("Corrupt model selection state")
     active = {
         key: value for key, value in pending.items()
         if isinstance(value, dict) and isinstance(value.get("at"), int)
@@ -864,6 +886,11 @@ def run() -> int:
     state, _, _ = store.read(key)
     if state.get("fingerprint") != fingerprint:
         state = {}
+    pending = state.get("qualified_selections") or {}
+    if not isinstance(pending, dict):
+        # Corrupt durable state is a state failure, not a route qualification
+        # failure: reject it before probing or cooling down any model.
+        raise StateValidationError("Corrupt model selection state")
     order = route_order(config, state, now)
     if not order:
         publish_cooldown_not_before(config, state, now)
@@ -892,8 +919,7 @@ def run() -> int:
             def pause(current, *, selected_model=model):
                 if current.get("fingerprint") != fingerprint:
                     current = {"fingerprint": fingerprint, "cooldowns": {}}
-                current.setdefault("cooldowns", {})[selected_model] = now + config.cooldown
-                return current
+                return record_cooldown(current, selected_model, now + config.cooldown)
             try:
                 store.update(key, pause)
             except RouteError:
@@ -906,8 +932,7 @@ def run() -> int:
             def pause(current, *, selected_model=model):
                 if current.get("fingerprint") != fingerprint:
                     current = {"fingerprint": fingerprint, "cooldowns": {}}
-                current.setdefault("cooldowns", {})[selected_model] = now + config.cooldown
-                return current
+                return record_cooldown(current, selected_model, now + config.cooldown)
             store.update(key, pause)
             if config.pinned:
                 break
@@ -928,28 +953,39 @@ def run() -> int:
             # authoritative for a successful task receipt.
             chosen_probe = current.get("last_successful_probe") or {}
             if chosen_probe.get("model") != selected_model:
-                raise RouteError("Selected route has no qualification")
+                raise SelectionStateRace("Selected route has no qualification")
             at = int(chosen_probe.get("at", 0))
             if not 0 <= now - at <= config.ttl:
                 raise RouteError("Selected probe expired before task start")
             return reserve_completion(current, ticket, selected_model, now, at)
         try:
             store.update(key, save)
-        except (GitHubStateUnavailable, Conflict):
-            # A state-store Conflict/transport failure is never a
-            # model-provider failure: never cool down a healthy route for it.
+        except (GitHubStateUnavailable, Conflict, StateValidationError):
+            # A state-store Conflict/transport failure or corrupt durable state
+            # is never a model-provider failure: never cool down a healthy
+            # route for it.
             raise
+        except SelectionStateRace as error:
+            # A concurrent writer replaced this route's qualification between
+            # probe and reservation. The route itself is healthy, so refresh
+            # the snapshot and keep failing over without a cooldown.
+            errors[model] = str(error)
+            state, _, _ = store.read(key)
+            if state.get("fingerprint") != fingerprint:
+                state = {}
+            if config.pinned:
+                break
+            continue
         except RouteError as error:
-            # The route itself lost its qualification between probe and
-            # reservation (a concurrent writer replaced the proof). That is a
+            # The route lost its qualification for a non-concurrency reason
+            # (for example its proof expired before task start). That is a
             # route-level failure: cool down this model and keep failing over,
             # exactly like a probe error.
             errors[model] = str(error)
             def pause(current, *, selected_model=model):
                 if current.get("fingerprint") != fingerprint:
                     current = {"fingerprint": fingerprint, "cooldowns": {}}
-                current.setdefault("cooldowns", {})[selected_model] = now + config.cooldown
-                return current
+                return record_cooldown(current, selected_model, now + config.cooldown)
             store.update(key, pause)
             if config.pinned:
                 break
