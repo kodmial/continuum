@@ -3413,6 +3413,8 @@ class ContinuumTest < Minitest::Test
     assert_includes gate_run, '7 * 60'
     assert_includes gate_run, '10 * 60'
     assert_includes gate_run, '[continuum-periodic]'
+    assert_includes gate_run, '[continuum-wake:'
+    assert_includes gate_run, 'ascii_downcase'
     assert_includes gate_run, 'window-due'
     assert_includes gate_run, 'duplicate-window'
     assert_includes gate_run, 'lookup-unavailable'
@@ -3424,8 +3426,11 @@ class ContinuumTest < Minitest::Test
     crons = events(stub).fetch('schedule').map { |entry| entry.fetch('cron') }
     assert_equal ['7,17,27,37,47,57 * * * *'], crons
     assert_includes stub.fetch('run-name'), '[continuum-periodic]'
+    assert_includes stub.fetch('run-name'), '[continuum-wake:'
     assert_includes stub.fetch('run-name'),
                     "contains(format(' {0} ', github.event.inputs.periodic_wake), ' true ')"
+    assert_includes stub.fetch('run-name'),
+                    "format('[continuum-wake:{0}]', github.event.inputs.periodic_wake)"
     dispatch = events(stub).fetch('workflow_dispatch').fetch('inputs').fetch('periodic_wake')
     assert_equal 'string', dispatch.fetch('type')
     assert_equal 'false', dispatch.fetch('default')
@@ -3441,6 +3446,7 @@ class ContinuumTest < Minitest::Test
     assert_equal 'string', automation_dispatch.fetch('type')
     assert_equal 'false', automation_dispatch.fetch('default')
     assert_includes automation.fetch('run-name'), '[continuum-periodic]'
+    assert_includes automation.fetch('run-name'), '[continuum-wake:'
     assert_equal '${{ inputs.periodic_wake }}',
                  automation.fetch('jobs').fetch('scheduler').fetch('with').fetch('periodic_wake')
     doc = File.read(File.join(ROOT, 'docs/cron-job-org.md'))

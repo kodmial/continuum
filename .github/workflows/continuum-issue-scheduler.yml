@@ -618,12 +618,27 @@ jobs:
           fi
 
           created="$(date -u -d "@$window_start" +%Y-%m-%dT%H:%M:%SZ)"
-          filter='[.workflow_runs[]
+          # GitHub expressions cannot trim arbitrary whitespace in the caller's
+          # run-name, so a workflow_dispatch also stamps its raw periodic_wake
+          # value in `[continuum-wake:...]`. Prefer that token and normalize it
+          # exactly like the gate (trim + case-fold), then fall back to the
+          # legacy marker for runs created before the token existed.
+          filter='def periodic_run:
+              .event == "schedule"
+              or (.event == "workflow_dispatch" and
+                  ((.display_title // "") as $title
+                   | if ($title | test("\\[continuum-wake:")) then
+                       (($title | try capture("(?s)\\[continuum-wake:(?<wake>.*)\\]$").wake catch null)
+                        | if . == null then false
+                          else (gsub("^\\s+|\\s+$"; "") | ascii_downcase) == "true"
+                          end)
+                     else
+                       ($title | contains("[continuum-periodic]"))
+                     end));
+            [.workflow_runs[]
             | select(.id != '"$GITHUB_RUN_ID"')
             | select(.status == "completed" and .conclusion == "success")
-            | select(.event == "schedule" or
-                (.event == "workflow_dispatch" and
-                 ((.display_title // "") | contains("[continuum-periodic]"))))'
+            | select(periodic_run)'
           if [[ -n "${DEFAULT_BRANCH:-}" ]]; then
             filter="$filter"'
             | select((.head_branch // "") == "'"$DEFAULT_BRANCH"'")'

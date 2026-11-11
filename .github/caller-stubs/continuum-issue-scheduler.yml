@@ -2,9 +2,12 @@ name: Issue scheduler
 
 # An external periodic wake is marked for cross-source dedupe. Native schedule
 # runs are identified by their event, so only the opt-in dispatch needs the
-# token. The input is a mode selector, never an authorization override.
+# token. The raw input is stamped as an authoritative `[continuum-wake:...]`
+# token because GitHub expressions cannot trim arbitrary whitespace; the gate
+# normalizes that token exactly like the canonical parser. The input is a mode
+# selector, never an authorization override.
 run-name: >-
-  Issue scheduler ${{ contains(format(' {0} ', github.event.inputs.periodic_wake), ' true ') && '[continuum-periodic]' || github.event_name }}
+  Issue scheduler ${{ contains(format(' {0} ', github.event.inputs.periodic_wake), ' true ') && '[continuum-periodic]' || github.event_name }} ${{ github.event_name == 'workflow_dispatch' && format('[continuum-wake:{0}]', github.event.inputs.periodic_wake) || '' }}
 
 on:
   workflow_dispatch:

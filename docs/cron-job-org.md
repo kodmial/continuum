@@ -136,6 +136,9 @@ prevent duplicate domain side effects.
    dispatch event is accepted. `204` means accepted, not that the job finished.
 2. Open the target repository's Actions run list for **Issue scheduler**.
    A periodic dispatch has a run name containing `[continuum-periodic]`.
+   Workflow dispatches also carry `[continuum-wake:<input>]`; the gate trims
+   and case-folds that raw token, so padded or differently-cased `true` inputs
+   are deduplicated consistently with the caller marker.
 3. Open the run and read the **Admit periodic wake for this scheduling window**
    step:
    - `window-due` means the pass ran;

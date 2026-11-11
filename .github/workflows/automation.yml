@@ -1,6 +1,6 @@
 name: Continuum automation
 run-name: >-
-  Continuum automation ${{ contains(format(' {0} ', github.event.inputs.periodic_wake), ' true ') && '[continuum-periodic]' || github.event_name }}
+  Continuum automation ${{ contains(format(' {0} ', github.event.inputs.periodic_wake), ' true ') && '[continuum-periodic]' || github.event_name }} ${{ github.event_name == 'workflow_dispatch' && format('[continuum-wake:{0}]', github.event.inputs.periodic_wake) || '' }}
 
 on:
   workflow_dispatch:

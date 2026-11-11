@@ -10,8 +10,10 @@ keep their existing behavior.
 
 from __future__ import annotations
 
+import json
 import os
 import pathlib
+import shutil
 import stat
 import subprocess
 import tempfile
@@ -241,6 +243,38 @@ class DedupeDecisionTests(unittest.TestCase):
             )
         )
 
+    def test_wake_token_is_trimmed_and_case_folded(self):
+        cases = (
+            ("Issue scheduler [continuum-periodic] [continuum-wake: true ]", True),
+            ("Issue scheduler workflow_dispatch [continuum-wake:\ttrue\t]", True),
+            ("Issue scheduler [continuum-periodic] [continuum-wake:TRUE]", True),
+            ("Issue scheduler [continuum-periodic] [continuum-wake:true false]", False),
+            ("Issue scheduler [continuum-periodic] [continuum-wake:FALSE]", False),
+            (
+                "Issue scheduler [continuum-periodic] "
+                "[continuum-wake:true] [continuum-periodic]]",
+                False,
+            ),
+            # Legacy runs without the raw token still use the fixed marker.
+            ("Issue scheduler [continuum-periodic]", True),
+        )
+        for title, expected in cases:
+            with self.subTest(title=title):
+                evidence = run(
+                    12,
+                    event="workflow_dispatch",
+                    title=title,
+                    created_at=iso(self.start),
+                )
+                self.assertIs(
+                    expected,
+                    is_periodic_evidence(
+                        evidence,
+                        current_run_id=999,
+                        window_start_epoch=self.start,
+                    ),
+                )
+
 
 class WorkflowGateTests(unittest.TestCase):
     def setUp(self):
@@ -299,8 +333,13 @@ class WorkflowGateTests(unittest.TestCase):
         call_with = stub["jobs"]["call"]["with"]
         self.assertEqual("${{ inputs.periodic_wake }}", call_with["periodic_wake"])
         self.assertIn("[continuum-periodic]", stub["run-name"])
+        self.assertIn("[continuum-wake:", stub["run-name"])
         self.assertIn(
             "contains(format(' {0} ', github.event.inputs.periodic_wake), ' true ')",
+            stub["run-name"],
+        )
+        self.assertIn(
+            "format('[continuum-wake:{0}]', github.event.inputs.periodic_wake)",
             stub["run-name"],
         )
 
@@ -329,7 +368,16 @@ class ExtractedGateScriptTests(unittest.TestCase):
         workflow = yaml.safe_load(SCHEDULER.read_text(encoding="utf-8"))
         return workflow["jobs"]["schedule"]["steps"][0]["run"]
 
-    def _run(self, *, caller_event, periodic, evidence="0", mode="normal", branch="main"):
+    def _run(
+        self,
+        *,
+        caller_event,
+        periodic,
+        evidence="0",
+        mode="normal",
+        branch="main",
+        runs=None,
+    ):
         script = self._extract()
         fixtures = ROOT / ".opencode-tmp"
         fixtures.mkdir(exist_ok=True)
@@ -349,6 +397,10 @@ class ExtractedGateScriptTests(unittest.TestCase):
                 'esac\n'
                 'if [[ "$*" == *"/actions/workflows/"* ]]; then\n'
                 '  [[ "${FAKE_GH_MODE:-normal}" == "fail-evidence" ]] && exit 1\n'
+                '  if [[ -n "${FAKE_EVIDENCE_RUNS:-}" ]]; then\n'
+                '    jq_filter="${@: -1}"\n'
+                '    exec jq "$jq_filter" "$FAKE_EVIDENCE_RUNS"\n'
+                '  fi\n'
                 '  echo "${FAKE_EVIDENCE:-0}"\n'
                 '  exit 0\n'
                 "fi\n"
@@ -377,6 +429,10 @@ class ExtractedGateScriptTests(unittest.TestCase):
                 FAKE_GH_MODE=mode,
                 FAKE_GH_LOG=str(log),
             )
+            if runs is not None:
+                runs_file = temp_path / "runs.json"
+                runs_file.write_text(json.dumps(runs), encoding="utf-8")
+                env["FAKE_EVIDENCE_RUNS"] = str(runs_file)
             result = subprocess.run(
                 ["bash", "-c", script],
                 env=env,
@@ -440,6 +496,45 @@ class ExtractedGateScriptTests(unittest.TestCase):
         self.assertEqual("duplicate-window", outputs["reason"])
         self.assertIn("actions/workflows/42/runs", calls)
         self.assertIn("contains(\"[continuum-periodic]\")", calls)
+        self.assertIn("ascii_downcase", calls)
+
+    @unittest.skipUnless(shutil.which("jq"), "jq is required")
+    def test_gate_evidence_normalizes_the_same_wake_token_as_the_caller(self):
+        def evidence(title):
+            return {
+                "id": 1,
+                "event": "workflow_dispatch",
+                "status": "completed",
+                "conclusion": "success",
+                "display_title": title,
+                "head_branch": "main",
+            }
+
+        cases = (
+            ("Issue scheduler [continuum-periodic] [continuum-wake: true ]", "false"),
+            ("Issue scheduler workflow_dispatch [continuum-wake:\ttrue\t]", "false"),
+            ("Issue scheduler [continuum-periodic] [continuum-wake:TRUE]", "false"),
+            ("Issue scheduler [continuum-periodic] [continuum-wake:true false]", "true"),
+            ("Issue scheduler [continuum-periodic] [continuum-wake:FALSE]", "true"),
+            (
+                "Issue scheduler [continuum-periodic] "
+                "[continuum-wake:true] [continuum-periodic]]",
+                "true",
+            ),
+        )
+        for title, expected_run in cases:
+            with self.subTest(title=title):
+                result, outputs, _ = self._run(
+                    caller_event="workflow_dispatch",
+                    periodic="true",
+                    runs={"workflow_runs": [evidence(title)]},
+                )
+                self.assertEqual(0, result.returncode, result.stderr)
+                self.assertEqual(expected_run, outputs["run"])
+                self.assertEqual(
+                    "window-due" if expected_run == "true" else "duplicate-window",
+                    outputs["reason"],
+                )
 
     def test_due_native_and_external_windows_run(self):
         for caller, periodic in (("schedule", "false"), ("workflow_dispatch", "true")):
