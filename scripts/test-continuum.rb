@@ -3392,6 +3392,123 @@ class ContinuumTest < Minitest::Test
     assert_includes body, 'STRATEGY_BLOCK'
   end
 
+  # Execute the shipped periodic gate with a fake `gh` so a caller/gate
+  # divergence is observed behaviorally instead of only matching source text.
+  # The fake applies the gate's own `--jq` filter to a controlled run listing,
+  # so evidence matching is the real jq program as well.
+  def run_periodic_gate(dir, caller_event:, periodic:, evidence_titles: nil)
+    bin = File.join(dir, 'bin')
+    FileUtils.mkdir_p(bin)
+    runs_path = File.join(dir, 'runs.json')
+    File.write(runs_path, JSON.generate(
+      'workflow_runs' => Array(evidence_titles).each_with_index.map do |title, index|
+        {
+          'id' => index + 1,
+          'event' => 'workflow_dispatch',
+          'status' => 'completed',
+          'conclusion' => 'success',
+          'display_title' => title,
+          'head_branch' => 'main'
+        }
+      end
+    ))
+    File.write(File.join(bin, 'gh'), <<~SH)
+      #!/usr/bin/env bash
+      set -e
+      case "$*" in
+        *"/actions/workflows/"*)
+          if [[ "${FAKE_GATE_EVIDENCE:-0}" == "0" ]]; then
+            echo 0
+          else
+            exec jq "${@: -1}" "$FAKE_GATE_RUNS"
+          fi
+          ;;
+        *"/actions/runs/"*) echo 42 ;;
+        *) exit 1 ;;
+      esac
+    SH
+    FileUtils.chmod(0755, File.join(bin, 'gh'))
+
+    output_path = File.join(dir, 'github-output')
+    File.write(output_path, '')
+    workflow = yaml(File.join(ROOT, '.github/workflows/continuum-issue-scheduler.yml'))
+    script = workflow.fetch('jobs').fetch('schedule').fetch('steps').first.fetch('run')
+    stdout, status = Open3.capture2e(
+      {
+        'PATH' => "#{bin}:#{ENV['PATH']}",
+        'GITHUB_REPOSITORY' => 'owner/repo',
+        'GITHUB_RUN_ID' => '123',
+        'GITHUB_OUTPUT' => output_path,
+        'CALLER_EVENT_NAME' => caller_event,
+        'PERIODIC_WAKE' => periodic,
+        'DEFAULT_BRANCH' => 'main',
+        'FAKE_GATE_EVIDENCE' => evidence_titles.nil? ? '0' : '1',
+        'FAKE_GATE_RUNS' => runs_path
+      },
+      'bash', '-c', script
+    )
+    assert status.success?, "periodic gate failed: #{stdout}"
+    File.readlines(output_path).each_with_object({}) do |line, outputs|
+      key, value = line.strip.split('=', 2)
+      outputs[key] = value if value
+    end
+  end
+
+  # The caller stub cannot trim inside a GitHub expression, so it always stamps
+  # the raw input in `[continuum-wake:...]`; the fixed marker is best-effort
+  # legacy evidence. The stub contract above pins both expressions.
+  def periodic_caller_run_name(periodic_wake)
+    marker = " #{periodic_wake} ".include?(' true ') ? '[continuum-periodic]' : 'workflow_dispatch'
+    "Issue scheduler #{marker} [continuum-wake:#{periodic_wake}]"
+  end
+
+  def jq_available?
+    system('jq', '--version', out: File::NULL, err: File::NULL)
+  end
+
+  # Whitespace handling is the canonical parser's rule (trim + case-fold, then
+  # accept only the literal `true`). Source matching cannot catch a divergence
+  # from that rule, so exercise the real gate step.
+  def test_periodic_gate_trims_whitespace_like_the_canonical_parser
+    {
+      ' true ' => true,
+      "\ttrue\t" => true,
+      'true false' => false
+    }.each do |input, periodic|
+      fixture do |dir|
+        outputs = run_periodic_gate(dir, caller_event: 'workflow_dispatch', periodic: input)
+        assert_equal 'true', outputs.fetch('run')
+        assert_equal(periodic ? 'window-due' : 'non-periodic', outputs.fetch('reason'),
+                     "gate must classify #{input.inspect} as " \
+                     "#{periodic ? 'periodic' : 'non-periodic'}")
+      end
+    end
+  end
+
+  # A completed run's own caller-generated name must be evidence exactly when
+  # the gate would treat that input as periodic; otherwise a later periodic
+  # wake either repeats the pass or skips a pass that never ran.
+  def test_periodic_evidence_classifies_the_callers_raw_wake_token
+    skip 'jq is required for the periodic evidence filter' unless jq_available?
+
+    {
+      ' true ' => true,
+      "\ttrue\t" => true,
+      'true false' => false
+    }.each do |input, periodic|
+      title = periodic_caller_run_name(input)
+      fixture do |dir|
+        outputs = run_periodic_gate(
+          dir, caller_event: 'workflow_dispatch', periodic: 'true', evidence_titles: [title]
+        )
+        assert_equal(periodic ? 'false' : 'true', outputs.fetch('run'),
+                     "caller run name #{title.inspect} must be " \
+                     "#{periodic ? '' : 'non-'}periodic evidence")
+        assert_equal(periodic ? 'duplicate-window' : 'window-due', outputs.fetch('reason'))
+      end
+    end
+  end
+
   # An optional external periodic wake must not become a second scheduler or
   # change any ordinary event path. Both sources share the same domain pass and
   # the cheap window guard runs before checkout/pagination.
