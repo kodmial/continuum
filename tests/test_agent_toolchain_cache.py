@@ -60,7 +60,8 @@ class ToolchainCacheContractTests(unittest.TestCase):
     def test_version_config_and_cache_key(self):
         result, out = self.run_resolve()
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("opencode_version=1.19.3", out)
+        expected = json.loads((ACTION / "toolchain.json").read_text())["opencode_version"]
+        self.assertIn(f"opencode_version={expected}", out)
         self.assertIn("Linux-X64", out)
         self.assertIn("cache_key=", out)
 

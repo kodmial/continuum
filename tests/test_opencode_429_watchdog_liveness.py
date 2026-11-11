@@ -54,6 +54,7 @@ const state = {
   runErrors: new Map(Object.entries(scenario.runErrors || {})),
   runLookups: [],
   workflowRuns: (scenario.workflowRuns || []).map(run => ({ ...run })),
+  workflowRunListCalls: [],
   issues: (scenario.issues || []).map(issue => ({ ...issue })),
   scriptErrors: [],
   notices: [],
@@ -150,6 +151,11 @@ function makeRest() {
     actions: {
       listWorkflowRuns: async () => state.workflowRuns.map(run => ({ ...run })),
       listWorkflowRunsForRepo: async (params = {}) => {
+        state.workflowRunListCalls.push({
+          status: params.status || null,
+          page: Number(params.page || 1),
+          per_page: Number(params.per_page || 30),
+        });
         if (params.status && scenario.activeRunsError) {
           throw apiError(scenario.activeRunsError, 'active run listing failed');
         }
@@ -258,14 +264,26 @@ class MockGithub {
       endpoint: { DEFAULTS: { baseUrl: 'https://api.github.com' } },
     };
     this.paginate = async (method, params) => {
-      const result = await method(params);
+      if (typeof method === 'string') return [];
+      const first = await method(params);
       if (
-        result && result.data &&
-        Array.isArray(result.data.workflow_runs)
+        first && first.data &&
+        Array.isArray(first.data.workflow_runs)
       ) {
-        return result.data.workflow_runs;
+        const perPage = Number(params?.per_page || 30);
+        const items = [...first.data.workflow_runs];
+        let page = Number(params?.page || 1) + 1;
+        let previousPageLength = first.data.workflow_runs.length;
+        while (previousPageLength === perPage) {
+          const next = await method({ ...params, page });
+          const nextItems = next?.data?.workflow_runs || [];
+          items.push(...nextItems);
+          previousPageLength = nextItems.length;
+          page += 1;
+        }
+        return items;
       }
-      return result;
+      return first;
     };
   }
 }
@@ -328,6 +346,7 @@ async function runOnce() {
     comments: state.comments,
     notices: state.notices,
     runLookups: state.runLookups,
+    workflowRunListCalls: state.workflowRunListCalls,
     scriptErrors: state.scriptErrors,
   };
   fs.writeFileSync(resultPath, JSON.stringify(result, null, 2), 'utf8');
@@ -581,6 +600,72 @@ class WatchdogHarness(unittest.TestCase):
         ]
         result = self.run_scenario(scenario)
         self.assert_no_dispatch(result)
+
+    def test_failed_issue_run_checks_active_inventory_without_scanning_completed_history(self):
+        historical_runs = [
+            {
+                "id": index + 1,
+                "event": "workflow_dispatch",
+                "status": "completed",
+                "conclusion": "failure",
+                "path": ".github/workflows/opencode.yml",
+                "display_title": "OpenCode issue #382",
+                "created_at": "2026-10-23T09:20:00Z",
+            }
+            for index in range(1900)
+        ]
+        active_run = {
+            "id": 9001,
+            "event": "workflow_dispatch",
+            "status": "in_progress",
+            "conclusion": None,
+            "path": ".github/workflows/opencode.yml",
+            "name": "OpenCode agent",
+            "display_title": "OpenCode issue #382",
+            "created_at": "2026-11-05T12:00:00Z",
+        }
+        scenario = {
+            "owner": OWNER,
+            "repo": REPO,
+            "comments": [],
+            "runs": [],
+            "jobs": [],
+            "pulls": [],
+            "issues": [
+                {
+                    "number": 382,
+                    "state": "open",
+                    "title": "Watchdog inventory regression",
+                    "body": "",
+                    "labels": [],
+                }
+            ],
+            "triggerRun": {
+                "id": 9000,
+                "event": "workflow_dispatch",
+                "status": "completed",
+                "conclusion": "failure",
+                "path": ".github/workflows/opencode.yml",
+                "display_title": "OpenCode issue #382",
+                "created_at": "2026-11-05T11:59:00Z",
+            },
+            "workflowRuns": historical_runs + [active_run],
+        }
+
+        result = self.run_scenario(scenario)
+        self.assert_no_dispatch(result)
+        calls = result["workflowRunListCalls"]
+        self.assertEqual(
+            [call["status"] for call in calls],
+            ["in_progress", "queued", "requested", "waiting", "pending"],
+            calls,
+        )
+        self.assertTrue(all(call["page"] == 1 for call in calls), calls)
+        self.assertLessEqual(
+            len(calls),
+            5,
+            "the retry guard must not paginate the repository's completed history",
+        )
 
     def test_unchanged_checkpoint_is_not_redispatched(self):
         scenario = base_scenario()

@@ -71,8 +71,79 @@ PY
       exit 1
     fi
     chmod 755 "$exe"
-    "$exe" --version | grep -Fx "$CONTINUUM_OPENCODE_VERSION" >/dev/null || {
-      echo "::error::Installed OpenCode has unexpected version" >&2; exit 1;
+    # Match the exact release SemVer even if OpenCode 2.x prints build metadata.
+    # The binary itself is already SHA256-verified against the official release.
+    got="$("$exe" --version 2>&1)" || {
+      echo "::error::Installed OpenCode failed its --version check" >&2; exit 1;
+    }
+    safe="${CONTINUUM_OPENCODE_VERSION//./\\.}"
+    [[ "$got" =~ (^|[^0-9.])${safe}([^0-9.]|$) ]] || {
+      echo "::error::Installed OpenCode has unexpected version (expected $CONTINUUM_OPENCODE_VERSION; got ${got//
+    (cd "$location" && sha256sum opencode > opencode.sha256)
+  fi
+  echo "$location" >> "$GITHUB_PATH"
+  export PATH="$location:$PATH"
+fi
+if [[ "$CONTINUUM_COMPONENTS" == pr-agent || "$CONTINUUM_COMPONENTS" == both ]]; then
+  location="$root/pr-agent/$CONTINUUM_PR_AGENT_VERSION/venv"
+  exe="$location/bin/pr-agent"
+  stamp="$location/bin/pr-agent.sha256"
+  if valid_bin "$exe" "$stamp" "$CONTINUUM_PR_AGENT_VERSION"; then
+    echo "Continuum PR-Agent verified cache hit: $CONTINUUM_PR_AGENT_VERSION"
+  else
+    all_cached=false
+    rm -rf "$location"
+    python3 -m venv "$location"
+    # The top-level release wheel is explicitly trusted by its reviewed PyPI SHA256.
+    # Overrides require a reviewed wheel hash in the checked-in action manifest.
+    wheel_digest="$(python3 - "$GITHUB_ACTION_PATH/toolchain.json" "$CONTINUUM_PR_AGENT_VERSION" <<'PY'
+import json,re,sys
+pins=json.load(open(sys.argv[1])).get("pr_agent_wheel_sha256",{})
+digest=pins.get(sys.argv[2],"")
+if not re.fullmatch(r"[0-9a-f]{64}",digest):
+    raise SystemExit("PR-Agent release wheel SHA256 not pinned for version "+sys.argv[2])
+print(digest)
+PY
+)" || {
+      echo "::error::PR-Agent wheel digest is missing or invalid for pinned version" >&2
+      exit 2
+    }
+    wheel_dir="$(mktemp -d)"
+    if ! "$location/bin/python" -m pip download --disable-pip-version-check --quiet \
+      --no-deps --only-binary=:all: --dest "$wheel_dir" \
+      "pr-agent==$CONTINUUM_PR_AGENT_VERSION"; then
+      rm -rf "$wheel_dir"
+      echo "::error::Failed to download pinned PR-Agent release wheel" >&2
+      exit 1
+    fi
+    wheel="$wheel_dir/pr_agent-$CONTINUUM_PR_AGENT_VERSION-py3-none-any.whl"
+    if [[ ! -f "$wheel" ]] || ! echo "$wheel_digest  $wheel" | sha256sum -c - >/dev/null; then
+      rm -rf "$wheel_dir"
+      echo "::error::PR-Agent official PyPI wheel SHA256 mismatch" >&2
+      exit 1
+    fi
+    # Dependencies are installed by pip after top-level wheel verification.
+    "$location/bin/python" -m pip install --disable-pip-version-check --quiet "$wheel" || {
+      rm -rf "$wheel_dir"
+      echo "::error::PR-Agent dependency installation failed" >&2
+      exit 1
+    }
+    rm -rf "$wheel_dir"
+    "$exe" --version 2>&1 | grep -F "$CONTINUUM_PR_AGENT_VERSION" >/dev/null || {
+      echo "::error::PR-Agent installed executable version mismatch" >&2; exit 1;
+    }
+    (cd "$location/bin" && sha256sum pr-agent > pr-agent.sha256)
+  fi
+  echo "$location/bin" >> "$GITHUB_PATH"
+  export PATH="$location/bin:$PATH"
+fi
+if [[ "$all_cached" == true && "$CONTINUUM_CACHED_RESTORE" == true ]]; then
+  echo 'cache_hit=true' >> "$GITHUB_OUTPUT"
+else
+  echo 'cache_hit=false' >> "$GITHUB_OUTPUT"
+fi
+printf 'Continuum toolchain ready after %ss (restored=%s; network-install=%s).\n' "$((SECONDS-started))" "$CONTINUUM_CACHED_RESTORE" "$([[ "$all_cached" == true ]] && echo no || echo yes)"
+\\n'/ })" >&2; exit 1;
     }
     (cd "$location" && sha256sum opencode > opencode.sha256)
   fi

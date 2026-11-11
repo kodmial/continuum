@@ -689,10 +689,30 @@ class OpenCodeIngressTests(unittest.TestCase):
                 issue_comment = events.get("issue_comment") or {}
                 self.assertEqual(["created"], issue_comment.get("types"), path)
                 call = parsed["jobs"]["call"]
-                self.assertIsNone(
-                    call.get("if"),
-                    "the OpenCode caller must not copy the scheduler's machine-origin filter",
-                )
+                if path == SELF_OPENCODE:
+                    # The self-caller delegates only the explicit owner PR
+                    # repair command to its own guarded dispatch job.
+                    # Ordinary /oc issue and watchdog commands still reach
+                    # the canonical OpenCode executor unchanged.
+                    condition = " ".join(str(call.get("if") or "").split())
+                    self.assertEqual(
+                        "github.event_name != 'issue_comment' || "
+                        "!startsWith(github.event.comment.body, '/oc-repair ')",
+                        condition,
+                    )
+                    repair = parsed["jobs"]["owner-coderabbit-repair"]
+                    repair_gate = " ".join(str(repair.get("if") or "").split())
+                    for predicate in (
+                        "github.actor == github.repository_owner",
+                        "github.event.issue.pull_request",
+                        "startsWith(github.event.comment.body, '/oc-repair ')",
+                    ):
+                        self.assertIn(predicate, repair_gate)
+                else:
+                    self.assertIsNone(
+                        call.get("if"),
+                        "the consumer OpenCode caller must admit machine-origin /oc",
+                    )
 
     def test_exact_machine_commands_still_admit_opencode_runs(self):
         for body in (DISPATCH_COMMENT, WATCHDOG_COMMENT):

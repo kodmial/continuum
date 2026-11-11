@@ -139,8 +139,20 @@ APPROVED_433_OPENCODE_SHA256 = (
     "5ab7de33b1b4a1a94a8ea8a0c12cfb5d2ffe57728bc4c71e9accaa08b51f026d"
 )
 
+# 2026-11-10: keep the reviewed #433 pin above for audit. The new exact
+# protected artifact adds only five fail-closed 429/upstream-unavailable
+# recovery guards (commit c5a628c) so an exit-1 after provider classification
+# still evacuates uncommitted agent changes. The structural test below pins
+# all five guarded executor paths; unrelated workflow drift remains forbidden.
+APPROVED_PROVIDER_RECOVERY_OPENCODE_SHA256 = (
+    "bb2aef000e12b83f16f30b9ebc9c2d7e72987684e21a9be6b852b02d106f9ea2"
+)
+
+# Additional reviewed self-caller change: owner-only CodeRabbit repair dispatch
+# preserves the exact workflow_dispatch path and the no-auto-merge hold.
+# This pins the full file, not a permissive allowlist for workflow drift.
 APPROVED_350_SELF_CALLER_SHA256 = (
-    "f06cdcb9affc06f976aed97945ff9d31496e5954ca225971164f87ec4e1ca22c"
+    "f158c2e694fb77172c8955d301981d67bafaed4099c0a34f96f05cd9054c13c8"
 )
 APPROVED_350_CALLER_SHA256 = (
     "a595362c8353001d5f7af138ab848df8fac3a6c924d5d337f6819084f79b3938"
@@ -2557,7 +2569,7 @@ class ProtectedBaselineTests(unittest.TestCase):
                     # explicitly tested optional-attestation no-key branch.
                     self.assertEqual(
                         protected_file_digest(path),
-                        APPROVED_433_OPENCODE_SHA256,
+                        APPROVED_PROVIDER_RECOVERY_OPENCODE_SHA256,
                         f"{path}: unexpected drift outside reviewed wording cleanup",
                     )
                 else:
@@ -2567,7 +2579,7 @@ class ProtectedBaselineTests(unittest.TestCase):
                     self.assertEqual(
                         protected_file_digest(path),
                         APPROVED_350_SELF_CALLER_SHA256,
-                        f"{path}: unexpected drift outside reviewed #350 self-caller patch",
+                        f"{path}: unexpected drift outside reviewed owner-only repair caller",
                     )
                 if path == ".github/workflows/continuum-opencode.yml":
                     self.assertIn("Restore verified cached OpenCode for coder and repair", read_repo(path))
@@ -2587,6 +2599,23 @@ class ProtectedBaselineTests(unittest.TestCase):
             APPROVED_350_CALLER_SHA256,
             "consumer caller stub: unexpected drift outside reviewed #350 patch",
         )
+
+    def test_provider_error_exit_preserves_dirty_coding_work_across_all_modes(self):
+        # The five current executor modes must check the classified marker
+        # before treating OpenCode exit 1 as an ordinary task failure.
+        workflow = read_repo(".github/workflows/continuum-opencode.yml")
+        guard = (
+            'if [[ "$OPENCODE_RUN_RC" -ne 0 ]]; then\n'
+            '            if [[ -f "${RUNNER_TEMP:-/tmp}/continuum-opencode-upstream-unavailable" ]]; then\n'
+            '              OPENCODE_RUN_RC=76\n'
+            '            elif [[ -f "${RUNNER_TEMP:-/tmp}/continuum-opencode-429" ]]; then\n'
+            '              OPENCODE_RUN_RC=75\n'
+            '            fi\n'
+            '          fi\n'
+            '          if [[ "$OPENCODE_RUN_RC" -eq 75 || "$OPENCODE_RUN_RC" -eq 76 ]]; then'
+        )
+        self.assertEqual(workflow.count(guard), 5,
+                         "all five OpenCode paths must preserve classified provider failures")
 
     def test_worktree_probe_contract_without_baseline(self):
         # Independent of git history: only the reviewed SHA-pinned composite
@@ -2611,7 +2640,7 @@ class ProtectedBaselineTests(unittest.TestCase):
         # therefore be dirty in this pre-commit worktree; any unapproved byte
         # change still fails the exact digest assertions above.
         approved = {
-            ".github/workflows/continuum-opencode.yml": APPROVED_433_OPENCODE_SHA256,
+            ".github/workflows/continuum-opencode.yml": APPROVED_PROVIDER_RECOVERY_OPENCODE_SHA256,
             ".github/workflows/opencode.yml": APPROVED_350_SELF_CALLER_SHA256,
         }
         for path in PROTECTED_FILES:

@@ -102,6 +102,42 @@ def github_error_block(name="APIError", message="", status=None, prefix="Agent e
 
 
 class Classify429Test(unittest.TestCase):
+    def test_v2_session_outcomes_are_not_provider_errors(self):
+        for kind, message in (
+            ("unknown", "Session ended without a recorded outcome"),
+            ("unknown", "Prompt was not promoted"),
+            ("aborted", "Session interrupted"),
+            ("unknown", 'Session failed: mentioned "HTTP 429" in task output'),
+            ("aborted", "FreeUsageLimitError quoted by agent"),
+        ):
+            log = json.dumps({"type": "error", "error": {"type": kind, "message": message}})
+            with self.subTest(kind=kind, message=message):
+                self.assertEqual(classify_opencode_events(log, 1), "inconclusive")
+                self.assertEqual(classify_agent_error(log, 1), "task-failure")
+                self.assertFalse(is_opencode_429(log, 1))
+
+    def test_v2_genuine_provider_status_keeps_existing_semantics(self):
+        for kind, status, expected in (
+            ("APIError", 429, "quota_429"),
+            ("APIError", 503, "unavailable"),
+            ("APIError", 502, "upstream"),
+            ("APITimeoutError", 408, "timeout"),
+            ("APIError", 401, "fail_closed"),
+            ("APIError", 403, "fail_closed"),
+        ):
+            log = json.dumps({"type": "error", "error": {
+                "type": kind, "message": "provider rejected request", "statusCode": status,
+            }})
+            with self.subTest(kind=kind, status=status):
+                self.assertEqual(classify_opencode_events(log, 1), expected)
+
+    def test_v2_session_error_with_spoofed_status_is_inconclusive(self):
+        log = json.dumps({"type": "error", "error": {
+            "type": "unknown", "message": "test mentioned quota", "statusCode": 429,
+        }})
+        self.assertEqual(classify_opencode_events(log, 1), "inconclusive")
+        self.assertFalse(is_opencode_429(log, 1))
+
     def test_structured_429_classifies_regardless_of_exit(self):
         for log in (
             error_event("APIError", "too many requests", 429),
@@ -241,7 +277,7 @@ class Classify429Test(unittest.TestCase):
     def test_event_quoting_429_without_authenticated_status_is_not_quota(self):
         log = error_event("AssertionError", 'expected "429" in the report')
         self.assertFalse(is_opencode_429(log, 1))
-        self.assertEqual(classify_opencode_events(log, 1), "provider_error")
+        self.assertEqual(classify_opencode_events(log, 1), "inconclusive")
         self.assertEqual(classify_agent_error(log, 1), "task-failure")
 
     def test_malformed_and_truncated_events_are_inconclusive(self):

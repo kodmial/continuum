@@ -93,6 +93,22 @@ class ConfigurationTests(unittest.TestCase):
         with self.assertRaises(route.RouteError):
             route.route_key("org/x", "private/child", "anonymous", config, "x")
 
+    def test_binary_provenance_accepts_prefixed_2x_version_and_rejects_mismatch(self):
+        with tempfile.TemporaryDirectory() as directory:
+            binary = pathlib.Path(directory) / "opencode"
+            binary.write_bytes(b"verified-binary-fixture")
+            with patch.object(route.shutil, "which", return_value=str(binary)), \
+                 patch.dict(os.environ, {"CONTINUUM_EXPECTED_OPENCODE_VERSION": "2.2.6"}):
+                with patch.object(route.subprocess, "run", return_value=subprocess.CompletedProcess(
+                        [str(binary), "--version"], 0, "opencode 2.2.6 (build info)\n", "")):
+                    version, digest = route.binary_provenance()
+                    self.assertEqual(version, "2.2.6")
+                    self.assertEqual(len(digest), 64)
+                with patch.object(route.subprocess, "run", return_value=subprocess.CompletedProcess(
+                        [str(binary), "--version"], 0, "opencode 2.2.60\n", "")):
+                    with self.assertRaisesRegex(route.RouteError, "version differs"):
+                        route.binary_provenance()
+
     def test_binary_or_pool_change_invalidates_state(self):
         c = route.Configuration.parse(f"{A},{B}")
         d = route.Configuration.parse(f"{B},{A}")
@@ -185,6 +201,16 @@ class FakeProcess:
 
 
 class ProbeTests(unittest.TestCase):
+    def setUp(self):
+        # Quota fixtures intentionally create a runner-death marker. Never let
+        # them write into the real GitHub Actions RUNNER_TEMP: baseline tests
+        # run before OpenCode and would otherwise burn the coding runner.
+        isolated_runner = tempfile.TemporaryDirectory(prefix="continuum-probe-test-")
+        self.addCleanup(isolated_runner.cleanup)
+        runner_env = patch.dict(os.environ, {"RUNNER_TEMP": isolated_runner.name})
+        runner_env.start()
+        self.addCleanup(runner_env.stop)
+
     def test_observed_model_mismatch_is_fatal(self):
         answer = '{"type":"text","part":{"type":"text","text":"Use >="}}\n'
         self.assertEqual(route.extract_response(answer, A), "Use >=")
@@ -433,6 +459,15 @@ class ProbeTests(unittest.TestCase):
         self.assertEqual(str(caught.exception), "execution_error")
         self.assertNotIsInstance(caught.exception, route.BurnedRunner)
 
+    def test_spawn_oserror_is_a_local_runtime_failure(self):
+        def runner(command, **kwargs):
+            raise PermissionError("local process denied")
+
+        with self.assertRaisesRegex(
+            route.LocalRuntimeError, "local_runtime: PermissionError"
+        ):
+            route.semantic_probe(A, "review", 30, runner=runner)
+
     def test_stalled_probe_without_quota_still_reports_timeout(self):
         process = FakeProcess(hang=True)
         def runner(command, **kwargs):
@@ -530,6 +565,29 @@ class ProbeTests(unittest.TestCase):
         elapsed = route.time.monotonic() - started
         self.assertTrue(process.terminated)
         self.assertLess(elapsed, 2)
+
+
+class ProbeRunnerIsolationRegressionTests(unittest.TestCase):
+    def test_quota_fixtures_do_not_burn_workflow_runner(self):
+        # Exercise both formerly unisolated fixtures as if running under
+        # GitHub Actions, where RUNNER_TEMP belongs to the actual code agent.
+        for name in (
+            "test_stalled_429_is_detected_across_reader_chunks",
+            "test_timeout_after_quota_evidence_burns_the_runner",
+        ):
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as runner_temp:
+                with patch.dict(os.environ, {"RUNNER_TEMP": runner_temp}):
+                    result = unittest.TestResult()
+                    ProbeTests(name).run(result)
+                    self.assertTrue(
+                        result.wasSuccessful(),
+                        "quota fixture failed: {}".format(result.errors + result.failures),
+                    )
+                    self.assertEqual(os.environ["RUNNER_TEMP"], runner_temp)
+                    self.assertFalse(
+                        (pathlib.Path(runner_temp) / "continuum-opencode-429").exists(),
+                        "test fixture poisoned the real coding runner",
+                    )
 
 
 class MainBurnedRunnerTests(unittest.TestCase):
@@ -844,6 +902,22 @@ class SelectionLoopClosureBindingTests(unittest.TestCase):
             return writes[-1] if apply else dict(state)
         store.update = update
         return store, writes
+
+    def test_local_runtime_failure_does_not_quarantine_or_probe_next_route(self):
+        fingerprint = route.Configuration.parse(
+            f"{A},{B}").fingerprint("d", "anonymous")
+        state = {"fingerprint": fingerprint}
+        store, writes = self._store(state, apply=True)
+        calls = []
+
+        def probe(model, *args, **kwargs):
+            calls.append(model)
+            raise route.LocalRuntimeError("local_runtime: PermissionError")
+
+        self.assertEqual(self._run(store, probe), 2)
+        self.assertEqual(calls, [A])
+        self.assertEqual(writes, [])
+        self.assertNotIn("cooldowns", state)
 
     def test_burned_runner_cools_the_probed_model_not_a_later_one(self):
         fingerprint = route.Configuration.parse(

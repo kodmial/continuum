@@ -276,13 +276,40 @@ def _event_status(error: Mapping[str, Any]) -> Optional[int]:
 
 
 def _event_name(error: Mapping[str, Any]) -> str:
-    name = error.get("name")
+    # OpenCode 2.2.6 uses {type, message}; 1.19.3 used {name, data}.
+    name = error.get("name") or error.get("type")
     if isinstance(name, str):
         return name.strip()
     data = error.get("data")
     if isinstance(data, Mapping) and isinstance(data.get("name"), str):
         return str(data["name"]).strip()
     return ""
+
+
+# An OpenCode v2 terminal error is NOT necessarily a model/provider error.
+# Noninteractive session outcomes also produce type=error records. Never
+# infer authenticated provider failure merely from that outer event envelope.
+_PROVIDER_EVENT_TYPE_RE = re.compile(
+    r"(?:^|[._-])(?:api|provider|rate.?limit|quota|authentication|permission|"
+    r"timeout|connection|unavailable|http|status|badrequest|notfound|"
+    r"freeusage|gousage)|(?:api|provider|quota|usage|limit|timeout|"
+    r"connection|authentication|permission|http|status|unavailable|"
+    r"unprocessableentity|unauthorized|permissiondenied)error$",
+    re.IGNORECASE,
+)
+
+
+def _is_provider_error_event(error: Mapping[str, Any]) -> bool:
+    name = _event_name(error)
+    if not name or name.lower() in (
+        "unknown", "aborted", "cancelled", "canceled",
+        "session", "failed", "error", "interrupted",
+    ):
+        return False
+    # Legacy and v2 names must identify the provider/runtime's HTTP layer.
+    # Status-like numbers and quota words in an arbitrary session error's
+    # message are NOT enough to claim provider provenance.
+    return bool(_PROVIDER_EVENT_TYPE_RE.search(name))
 
 
 def _classify_provider_error(name: Any, status: Any, blob: Any) -> str:
@@ -363,8 +390,8 @@ def parse_opencode_error_events(log_text: Any) -> list:
 
 def _classify_error_event(event: Mapping[str, Any]) -> str:
     error = event.get("error")
-    if not isinstance(error, Mapping):
-        return ""
+    if not isinstance(error, Mapping) or not _is_provider_error_event(error):
+        return "inconclusive"
     return _classify_provider_error(
         _event_name(error),
         _event_status(error),
@@ -383,8 +410,10 @@ def _select_event_classification(classes: list, exit_code: Any) -> str:
         return "upstream"
     if "timeout" in classes:
         return "timeout"
-    if classes:
+    if "provider_error" in classes:
         return "provider_error"
+    if classes:
+        return "inconclusive"
     try:
         code = int(exit_code)
     except (TypeError, ValueError):

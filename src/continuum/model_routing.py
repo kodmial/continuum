@@ -51,6 +51,10 @@ class RouteError(RuntimeError):
     pass
 
 
+class LocalRuntimeError(RouteError):
+    """The local OpenCode process could not start; no provider was contacted."""
+
+
 class BurnedRunner(RouteError):
     pass
 
@@ -428,7 +432,7 @@ def semantic_probe(model: str, kind: str, timeout: int, *, runner=subprocess.Pop
             process = runner(command, cwd=scratch, env=_probe_environment(scratch),
                              stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         except OSError as error:
-            raise RouteError("local_runtime: " + type(error).__name__) from None
+            raise LocalRuntimeError("local_runtime: " + type(error).__name__) from None
         stdout: list[str] = []
         stderr: list[str] = []
         readers = [threading.Thread(target=_drain, args=(process.stdout, stdout), daemon=True),
@@ -756,13 +760,17 @@ def binary_provenance() -> tuple[str, str]:
     if not executable:
         raise RouteError("Official OpenCode binary missing")
     binary = Path(executable).resolve()
-    version = subprocess.run([str(binary), "--version"], capture_output=True,
-                             text=True, timeout=15, check=True).stdout.strip()
+    version_output = subprocess.run([str(binary), "--version"], capture_output=True,
+                                    text=True, timeout=15, check=True).stdout.strip()
+    # OpenCode 2.x can include a prefix/build details in the version banner.
+    # Extract one exact SemVer; the downloaded executable is SHA256 verified.
+    matches = re.findall(r"(?<![0-9.])[0-9]+\.[0-9]+\.[0-9]+(?![0-9.])",
+                         version_output)
     expected = os.environ.get("CONTINUUM_EXPECTED_OPENCODE_VERSION", "")
-    if not SEMVER.fullmatch(version) or (expected and version != expected):
+    if len(matches) != 1 or (expected and matches[0] != expected):
         raise RouteError("OpenCode version differs from verified manifest/override")
     digest = hashlib.sha256(binary.read_bytes()).hexdigest()
-    return version, digest
+    return matches[0], digest
 
 
 def write_outputs(env, values: dict) -> None:
@@ -869,6 +877,11 @@ def run() -> int:
             if not qualified:
                 semantic_probe(model, "review" if config.task_class == "review" else "coder",
                                config.timeout)
+        except LocalRuntimeError:
+            # Process creation failed locally, before the provider was contacted.
+            # This runner/runtime fault is shared by every route: do not quarantine
+            # the selected model or spend time probing the rest of the pool.
+            raise
         except GitHubStateUnavailable:
             # A GitHub state-store rate limit/transport failure is never a
             # model-provider failure: do not cool down an otherwise working
