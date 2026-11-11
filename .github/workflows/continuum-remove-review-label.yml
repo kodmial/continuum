@@ -31,10 +31,13 @@ jobs:
     steps:
       - uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
         env:
-          # The repair engine resolves its per-head lock label from
-          # INPUT || CONTINUUM_CI_REPAIR_LABEL || this default. A consumer that
-          # configures the label must have it reset here too, otherwise a stale
-          # lock from the previous head suppresses the next repair attempt.
+          # This synchronize reset can read only the repository variable, not
+          # the repair caller's optional `ci_repair_label` dispatch input. A
+          # label supplied only through that input is therefore not reset on a
+          # new head; keep such an override unique per head or expect a stale
+          # lock. When the engine falls back to the variable, that configured
+          # label must be reset here too, otherwise a stale lock from the
+          # previous head suppresses the next repair attempt.
           CI_REPAIR_LABEL: ${{ vars.CONTINUUM_CI_REPAIR_LABEL || 'opencode-ci-repair' }}
         with:
           script: |

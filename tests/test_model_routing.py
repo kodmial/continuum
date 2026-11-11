@@ -950,7 +950,9 @@ class SelectionLoopClosureBindingTests(unittest.TestCase):
         # write cannot expose a late-bound `model`. Assert the binding on the
         # captured mutator itself: a plain `def pause(current)` revert must
         # fail here.
-        self.assertEqual(deferred[0].__kwdefaults__, {"selected_model": A})
+        defaults = deferred[0].__kwdefaults__
+        self.assertEqual(defaults["selected_model"], A)
+        self.assertIn("deadline", defaults)
         saved = deferred[0](dict(state))
         self.assertIn(A, saved["cooldowns"])
         self.assertNotIn(B, saved["cooldowns"])
@@ -988,8 +990,13 @@ class SelectionLoopClosureBindingTests(unittest.TestCase):
         # binding. Assert the binding directly: each mutator's keyword default
         # must name the model of its own iteration, so reverting either
         # `def save(current)` or `def pause(current)` fails here.
-        self.assertEqual(deferred[0].__kwdefaults__, {"selected_model": A})
-        self.assertEqual(deferred[1].__kwdefaults__, {"selected_model": B})
+        pause_defaults = deferred[0].__kwdefaults__
+        save_defaults = deferred[1].__kwdefaults__
+        self.assertEqual(pause_defaults["selected_model"], A)
+        self.assertIn("deadline", pause_defaults)
+        self.assertEqual(save_defaults["selected_model"], B)
+        self.assertFalse(save_defaults["was_qualified"])
+        self.assertIsInstance(save_defaults["snapshot_now"], int)
         # Replay the captured mutators after the loop has finished, i.e.
         # after `model` has moved on. Each must still act on its own model.
         saved = dict(state)
@@ -1084,15 +1091,17 @@ class SelectionSaveRouteErrorTests(unittest.TestCase):
     def test_corrupt_selection_state_propagates_without_cooldown_or_probe(self):
         fingerprint = route.Configuration.parse(
             f"{A},{B}").fingerprint("d", "anonymous")
-        initial = {"fingerprint": fingerprint,
-                   "qualified_selections": ["corrupt"]}
-        probes = []
-        self.assertEqual(self._run(initial, dict(initial), probes), 2)
-        # Corrupt durable state is rejected before any model is probed or
-        # cooled down.
-        self.assertEqual(probes, [])
-        saved = _RacyStore._last.current
-        self.assertNotIn("cooldowns", saved)
+        for corrupt in ([], ["corrupt"]):
+            with self.subTest(corrupt=corrupt):
+                initial = {"fingerprint": fingerprint,
+                           "qualified_selections": corrupt}
+                probes = []
+                self.assertEqual(self._run(initial, dict(initial), probes), 2)
+                # Corrupt durable state is rejected before any model is probed
+                # or cooled down. An empty list is not an absent key.
+                self.assertEqual(probes, [])
+                saved = _RacyStore._last.current
+                self.assertNotIn("cooldowns", saved)
 
     def test_corrupt_selection_state_from_save_propagates_without_cooldown_or_probe(self):
         now = int(route.time.time())
@@ -1102,17 +1111,19 @@ class SelectionSaveRouteErrorTests(unittest.TestCase):
                    "last_successful_probe": {"model": A, "at": now}}
         # The initial snapshot is valid, so the save handler is reached. The
         # write path then observes corrupt selection state after another writer
-        # rewrote it.
-        later = {"fingerprint": fingerprint,
-                 "last_successful_probe": {"model": A, "at": now},
-                 "qualified_selections": ["corrupt"]}
-        probes = []
-        self.assertEqual(self._run(initial, later, probes), 2)
-        # Corruption discovered at save time is still a state failure: no model
-        # is probed or cooled down.
-        self.assertEqual(probes, [])
-        saved = _RacyStore._last.current
-        self.assertNotIn("cooldowns", saved)
+        # rewrote it. An empty list must be rejected, not replaced with {}.
+        for corrupt in ([], ["corrupt"]):
+            with self.subTest(corrupt=corrupt):
+                later = {"fingerprint": fingerprint,
+                         "last_successful_probe": {"model": A, "at": now},
+                         "qualified_selections": corrupt}
+                probes = []
+                self.assertEqual(self._run(initial, later, probes), 2)
+                # Corruption discovered at save time is still a state failure:
+                # no model is probed or cooled down.
+                self.assertEqual(probes, [])
+                saved = _RacyStore._last.current
+                self.assertNotIn("cooldowns", saved)
 
     def test_same_model_refreshed_proof_selects_without_cooldown_or_probe(self):
         now = int(route.time.time())
@@ -1135,6 +1146,46 @@ class SelectionSaveRouteErrorTests(unittest.TestCase):
         ticket = route.execution_ticket({"GITHUB_RUN_ID": "703",
                                          "GITHUB_RUN_ATTEMPT": "1"})
         self.assertIn(ticket, saved["qualified_selections"])
+
+    def test_far_future_probe_is_rejected_and_reprobed(self):
+        now = int(route.time.time())
+        fingerprint = route.Configuration.parse(
+            f"{A},{B}").fingerprint("d", "anonymous")
+        future = now + route.MAX_PROBE_CLOCK_SKEW_SECONDS + 60
+        initial = {"fingerprint": fingerprint,
+                   "last_successful_probe": {"model": A, "at": future}}
+        probes = []
+        self.assertEqual(self._run(initial, dict(initial), probes), 0)
+        # A proof beyond the bounded same-model race skew is not fresh
+        # qualification, so the route is probed again and a valid receipt is
+        # written against the current clock.
+        self.assertEqual(probes, [A])
+        saved = _RacyStore._last.current
+        self.assertEqual(saved.get("cooldowns", {}), {})
+        self.assertEqual(saved["last_successful_probe"]["model"], A)
+        self.assertLess(saved["last_successful_probe"]["at"], future)
+
+    def test_far_future_probe_replaced_before_save_is_rejected(self):
+        now = int(route.time.time())
+        fingerprint = route.Configuration.parse(
+            f"{A},{B}").fingerprint("d", "anonymous")
+        initial = {"fingerprint": fingerprint,
+                   "last_successful_probe": {"model": A, "at": now}}
+        # The initial snapshot is valid, so no probe runs. The write path then
+        # observes a proof far beyond the bounded clock skew.
+        later = {"fingerprint": fingerprint,
+                 "last_successful_probe": {
+                     "model": A,
+                     "at": now + route.MAX_PROBE_CLOCK_SKEW_SECONDS + 60,
+                 }}
+        probes = []
+        self.assertEqual(self._run(initial, later, probes), 2)
+        # The implausible timestamp is rejected instead of becoming a reusable
+        # selection receipt, and the healthy route is not cooled down.
+        self.assertEqual(probes, [])
+        saved = _RacyStore._last.current
+        self.assertNotIn("cooldowns", saved)
+        self.assertNotIn("qualified_selections", saved)
 
     def test_all_routes_unqualified_races_fail_closed_without_cooldown(self):
         now = int(route.time.time())
