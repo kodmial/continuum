@@ -45,6 +45,14 @@ jobs:
         with:
           script: |
             const { owner, repo, number } = context.issue;
+            const payload = context.payload || {};
+            const currentHeadSha = String(
+              (payload.pull_request &&
+               payload.pull_request.head &&
+               payload.pull_request.head.sha) ||
+              payload.after ||
+              ''
+            ).trim();
 
             // A new head always requires fresh CI and a fresh CI-repair
             // opportunity. The review-request lock is also reset here; after
@@ -55,16 +63,21 @@ jobs:
             const repairLockDescription =
               String(process.env.CI_REPAIR_LOCK_DESCRIPTION || '').trim();
 
-            // Always reset the known labels, even when the attached-label
-            // read below fails. Anything the repair engine tagged with its
-            // lock description is added to that set, which covers a dispatch
-            // input override this event cannot name from configuration.
-            const labelsToRemove = new Set([
+            const reviewLabels = new Set([
               'review-ready',
               'coderabbit-review-requested',
-              'opencode-ci-repair',
-              ciRepairLabel,
             ]);
+            // Always collect the known repair labels, even when the
+            // attached-label read below fails. Anything the repair engine
+            // tagged with its lock description is added to that set, which
+            // covers a dispatch input override this event cannot name from
+            // configuration.
+            const repairLabels = new Set([
+              'opencode-ci-repair',
+            ]);
+            if (!reviewLabels.has(ciRepairLabel)) {
+              repairLabels.add(ciRepairLabel);
+            }
             let labelDiscoveryFailed = false;
             if (repairLockDescription) {
               const maxAttempts = 3;
@@ -92,13 +105,81 @@ jobs:
                 }
               }
               for (const label of attached) {
-                if (label && label.description === repairLockDescription) {
-                  labelsToRemove.add(label.name);
+                if (label && label.description === repairLockDescription &&
+                    !reviewLabels.has(label.name)) {
+                  repairLabels.add(label.name);
                 }
               }
             }
 
-            for (const name of labelsToRemove) {
+            // A repair lock attached after the current head became the PR head
+            // belongs to that head. Preserve it so a CI report that acquired
+            // the lock before this reset ran cannot be dispatched a second
+            // time. The issue timeline orders each `committed` event before
+            // the labels attached to that head, so a lock event after the
+            // current head's commit is current-head state; an earlier lock is
+            // previous-head state and must still be reset.
+            let preserveAllRepairLocks = false;
+            const preservedRepairLocks = new Set();
+            if (currentHeadSha) {
+              try {
+                const timeline = await github.paginate(
+                  github.rest.issues.listEventsForTimeline,
+                  { owner, repo, issue_number: number, per_page: 100 }
+                );
+                let headEventIndex = -1;
+                const lastLabeledIndex = new Map();
+                timeline.forEach((event, index) => {
+                  if (!event) {
+                    return;
+                  }
+                  if (event.event === 'committed' && event.sha === currentHeadSha) {
+                    headEventIndex = index;
+                  } else if (event.event === 'labeled' && event.label) {
+                    lastLabeledIndex.set(event.label.name, index);
+                  }
+                });
+                if (headEventIndex < 0) {
+                  preserveAllRepairLocks = true;
+                } else {
+                  for (const name of repairLabels) {
+                    const index = lastLabeledIndex.get(name);
+                    if (index !== undefined && index > headEventIndex) {
+                      preservedRepairLocks.add(name);
+                    }
+                  }
+                }
+              } catch (err) {
+                console.log(
+                  `Could not read the issue timeline to identify repair locks for head ${currentHeadSha}: ${err.message}`
+                );
+                preserveAllRepairLocks = true;
+              }
+            }
+
+            for (const name of reviewLabels) {
+              try {
+                await github.rest.issues.removeLabel({
+                  owner,
+                  repo,
+                  issue_number: number,
+                  name,
+                });
+                console.log(`Removed ${name} from #${number}`);
+              } catch (err) {
+                if (err.status === 404) {
+                  console.log(`No ${name} label on #${number} (nothing to remove)`);
+                } else {
+                  throw err;
+                }
+              }
+            }
+
+            for (const name of repairLabels) {
+              if (preserveAllRepairLocks || preservedRepairLocks.has(name)) {
+                console.log(`Kept repair lock ${name} on #${number} for ${currentHeadSha}`);
+                continue;
+              }
               try {
                 await github.rest.issues.removeLabel({
                   owner,
@@ -120,8 +201,16 @@ jobs:
             // attached, which would suppress repair of the new head. Known
             // labels were removed above, but fail the job so the incomplete
             // reset is visible and can be rerun once label discovery recovers.
+            // When head identification failed, repair locks are deliberately
+            // kept instead of risking a duplicate dispatch; the failed job is
+            // still visible for a rerun.
             if (labelDiscoveryFailed) {
               throw new Error(
                 'Could not list attached labels; dispatch-only CI repair locks may remain. Rerun this job after label discovery recovers.'
+              );
+            }
+            if (preserveAllRepairLocks) {
+              throw new Error(
+                'Could not identify current-head repair locks; existing repair locks were kept. Rerun this job after issue-timeline discovery recovers.'
               );
             }

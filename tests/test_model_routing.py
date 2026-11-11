@@ -1076,6 +1076,49 @@ class SelectionSaveRouteErrorTests(unittest.TestCase):
                 self.assertIn(B, saved["cooldowns"])
                 self.assertNotIn("qualified_selections", saved)
 
+    def test_selected_route_cooled_before_save_is_not_reserved(self):
+        now = int(route.time.time())
+        fingerprint = route.Configuration.parse(
+            f"{A},{B}").fingerprint("d", "anonymous")
+        initial = {"fingerprint": fingerprint,
+                   "last_successful_probe": {"model": A, "at": now}}
+        # Another run cooled A after this run's snapshot but before its save.
+        later = {"fingerprint": fingerprint,
+                 "cooldowns": {A: now + 3600},
+                 "last_successful_probe": {"model": A, "at": now}}
+        probes = []
+        self.assertEqual(self._run(initial, later, probes), 0)
+        # The cooled route is not reserved or returned; selection refreshes
+        # the snapshot and fails over to the next healthy route.
+        self.assertEqual(probes, [B])
+        saved = _RacyStore._last.current
+        self.assertIn(A, saved["cooldowns"])
+        self.assertNotIn(B, saved["cooldowns"])
+        self.assertEqual(saved["last_successful_probe"]["model"], B)
+        ticket = route.execution_ticket({"GITHUB_RUN_ID": "703",
+                                         "GITHUB_RUN_ATTEMPT": "1"})
+        receipt = saved.get("qualified_selections", {}).get(ticket, {})
+        self.assertEqual(B, receipt.get("model"))
+
+    def test_pinned_route_cooled_before_save_does_not_reserve(self):
+        now = int(route.time.time())
+        config = route.Configuration((A, B), True)
+        fingerprint = config.fingerprint("d", "anonymous")
+        initial = {"fingerprint": fingerprint,
+                   "last_successful_probe": {"model": A, "at": now}}
+        later = {"fingerprint": fingerprint,
+                 "cooldowns": {A: now + 3600},
+                 "last_successful_probe": {"model": A, "at": now}}
+        probes = []
+        with patch.object(route.Configuration, "parse", lambda *a, **k: config):
+            self.assertEqual(self._run(initial, later, probes), 2)
+        # The refreshed snapshot shows A cooling down, so the pinned retry
+        # stops before probing or writing a selection receipt.
+        self.assertEqual(probes, [])
+        saved = _RacyStore._last.current
+        self.assertIn(A, saved["cooldowns"])
+        self.assertNotIn("qualified_selections", saved)
+
     def test_probe_expired_before_task_start_cools_that_model_and_fails_over(self):
         now = int(route.time.time())
         fingerprint = route.Configuration.parse(

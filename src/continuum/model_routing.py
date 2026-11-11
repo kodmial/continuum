@@ -968,6 +968,19 @@ def run() -> int:
                      was_qualified=qualified):
                 if current.get("fingerprint") != fingerprint:
                     current = {"fingerprint": fingerprint, "cooldowns": {}}
+                # Another run may cool this route after the snapshot check
+                # above. Re-check against the state being updated so a cooled
+                # route is never reserved or returned; the handler refreshes
+                # the snapshot and retries or fails over on the same path as
+                # a selection-state race.
+                cooldowns = current.get("cooldowns")
+                if isinstance(cooldowns, dict):
+                    try:
+                        cooled_until = int(cooldowns.get(selected_model, 0))
+                    except (TypeError, ValueError):
+                        cooled_until = 0
+                    if snapshot_now < cooled_until:
+                        raise SelectionStateRace("Selected route is cooling down")
                 current.update(schema=STATE_VERSION, fingerprint=fingerprint,
                                runtime={"version": version, "sha256": digest},
                                task_class=config.task_class)

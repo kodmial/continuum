@@ -14,6 +14,13 @@ removes those labels by that marker. Label discovery is retried; if it still
 fails, the job fails after removing the known labels so the incomplete reset is
 visible for a rerun.
 
+A CI report can acquire a repair lock for the new head before this reset job
+runs. The reset uses the issue timeline to distinguish a lock attached after
+the current head's commit from a previous-head lock, so it keeps current-head
+state and cannot permit a duplicate repair dispatch for the same head. If that
+head comparison cannot be made, repair locks are kept and the job fails
+visibly instead of risking the duplicate.
+
 The executable tests run the checked-in github-script body under Node with a
 fake ``github`` client and assert the exact label removals and retry behavior.
 """
@@ -44,8 +51,14 @@ const calls = [];
 const listCalls = [];
 const present = new Set();
 const attached = JSON.parse(process.env.TEST_ATTACHED_LABELS || '[]');
+const events = JSON.parse(process.env.TEST_LABEL_EVENTS || '[]');
 const listFailures = Number(process.env.TEST_LIST_LABEL_FAILURES || '0');
-global.context = { issue: { owner: 'owner', repo: 'repo', number: 7 } };
+const timelineFailures = Number(process.env.TEST_TIMELINE_FAILURES || '0');
+let timelineCalls = 0;
+global.context = {
+  issue: { owner: 'owner', repo: 'repo', number: 7 },
+  payload: JSON.parse(process.env.TEST_CONTEXT_PAYLOAD || '{}'),
+};
 global.github = {
   paginate: async (method, params) => method(params),
   rest: {
@@ -58,6 +71,15 @@ global.github = {
           throw error;
         }
         return attached;
+      },
+      listEventsForTimeline: async () => {
+        timelineCalls += 1;
+        if (timelineCalls <= timelineFailures) {
+          const error = new Error('timeline unavailable');
+          error.status = 502;
+          throw error;
+        }
+        return events;
       },
       removeLabel: async ({ name }) => {
         calls.push(name);
@@ -188,6 +210,106 @@ class RemoveReviewLabelResetTests(unittest.TestCase):
         self.assertEqual(sorted(BASE_LABELS), sorted(outcome["calls"]))
         self.assertIn("Rerun", outcome["error"])
 
+    @unittest.skipUnless(shutil.which("node"), "Node.js unavailable")
+    def test_current_head_lock_acquired_before_reset_is_preserved(self):
+        node = shutil.which("node")
+        program = HARNESS % script_body()
+        head_sha = "a" * 40
+        attached = [
+            {"name": DEFAULT_LABEL, "description": LOCK_DESCRIPTION},
+            {"name": "dispatch-only-lock", "description": LOCK_DESCRIPTION},
+        ]
+        events = [
+            {"event": "committed", "sha": head_sha},
+            {
+                "event": "labeled",
+                "label": {"name": DEFAULT_LABEL},
+                "created_at": "2026-11-11T17:05:00Z",
+            },
+            {
+                "event": "labeled",
+                "label": {"name": "dispatch-only-lock"},
+                "created_at": "2026-11-11T17:06:00Z",
+            },
+        ]
+        self.assertEqual(
+            ["review-ready", "coderabbit-review-requested"],
+            self.run_reset(
+                node,
+                program,
+                configured=None,
+                attached=attached,
+                payload={"pull_request": {"head": {"sha": head_sha}}},
+                events=events,
+            ),
+            "a repair lock acquired for the current head must not be reset",
+        )
+
+    @unittest.skipUnless(shutil.which("node"), "Node.js unavailable")
+    def test_previous_head_lock_is_still_reset(self):
+        node = shutil.which("node")
+        program = HARNESS % script_body()
+        head_sha = "b" * 40
+        attached = [
+            {"name": DEFAULT_LABEL, "description": LOCK_DESCRIPTION},
+            {"name": "dispatch-only-lock", "description": LOCK_DESCRIPTION},
+        ]
+        events = [
+            {
+                "event": "labeled",
+                "label": {"name": DEFAULT_LABEL},
+                "created_at": "2026-11-11T16:00:00Z",
+            },
+            {
+                "event": "labeled",
+                "label": {"name": "dispatch-only-lock"},
+                "created_at": "2026-11-11T16:01:00Z",
+            },
+            {"event": "committed", "sha": head_sha},
+        ]
+        self.assertEqual(
+            sorted(BASE_LABELS + ["dispatch-only-lock"]),
+            sorted(
+                self.run_reset(
+                    node,
+                    program,
+                    configured=None,
+                    attached=attached,
+                    payload={"pull_request": {"head": {"sha": head_sha}}},
+                    events=events,
+                )
+            ),
+        )
+
+    @unittest.skipUnless(shutil.which("node"), "Node.js unavailable")
+    def test_unreadable_timeline_keeps_repair_locks_and_fails_for_rerun(self):
+        node = shutil.which("node")
+        program = HARNESS % script_body()
+        head_sha = "c" * 40
+        attached = [
+            {"name": DEFAULT_LABEL, "description": LOCK_DESCRIPTION},
+            {"name": "dispatch-only-lock", "description": LOCK_DESCRIPTION},
+        ]
+        completed = self.run_reset_process(
+            node,
+            program,
+            configured=None,
+            attached=attached,
+            payload={"pull_request": {"head": {"sha": head_sha}}},
+            timeline_failures=1,
+        )
+        self.assertNotEqual(
+            0, completed.returncode,
+            "an unreadable timeline must fail visibly instead of risking a duplicate",
+        )
+        outcome = json.loads(completed.stdout)
+        self.assertEqual(
+            sorted(["review-ready", "coderabbit-review-requested"]),
+            sorted(outcome["calls"]),
+            "repair locks must be kept when current-head state cannot be identified",
+        )
+        self.assertIn("Rerun", outcome["error"])
+
     def run_reset(
         self,
         node,
@@ -195,6 +317,9 @@ class RemoveReviewLabelResetTests(unittest.TestCase):
         configured,
         attached=(),
         list_failures=0,
+        payload=None,
+        events=(),
+        timeline_failures=0,
     ):
         completed = self.run_reset_process(
             node,
@@ -202,6 +327,9 @@ class RemoveReviewLabelResetTests(unittest.TestCase):
             configured=configured,
             attached=attached,
             list_failures=list_failures,
+            payload=payload,
+            events=events,
+            timeline_failures=timeline_failures,
         )
         completed.check_returncode()
         return json.loads(completed.stdout)
@@ -213,6 +341,9 @@ class RemoveReviewLabelResetTests(unittest.TestCase):
         configured,
         attached=(),
         list_failures=0,
+        payload=None,
+        events=(),
+        timeline_failures=0,
     ):
         environment = {
             "PATH": "/usr/bin:/bin:/usr/local/bin",
@@ -220,6 +351,9 @@ class RemoveReviewLabelResetTests(unittest.TestCase):
             "TEST_REPAIR_LOCK_DESCRIPTION": LOCK_DESCRIPTION,
             "TEST_ATTACHED_LABELS": json.dumps(list(attached)),
             "TEST_LIST_LABEL_FAILURES": str(list_failures),
+            "TEST_TIMELINE_FAILURES": str(timeline_failures),
+            "TEST_CONTEXT_PAYLOAD": json.dumps(payload or {}),
+            "TEST_LABEL_EVENTS": json.dumps(list(events)),
         }
         return subprocess.run(
             [node, "-e", program],
