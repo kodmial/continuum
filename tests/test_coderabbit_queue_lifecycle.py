@@ -485,6 +485,10 @@ class WorkflowBindingTests(unittest.TestCase):
             Path(__file__).resolve().parents[1]
             / ".github/caller-stubs/continuum-coderabbit-retry.yml"
         ).read_text(encoding="utf-8")
+        cls.unresolved_workflow = (
+            Path(__file__).resolve().parents[1]
+            / ".github/workflows/continuum-coderabbit-unresolved.yml"
+        ).read_text(encoding="utf-8")
 
     def test_model_is_bound_to_review_queue_source(self):
         self.assertGreaterEqual(
@@ -619,6 +623,49 @@ assert.equal(shouldRecheckCodeRabbitAfterCi(
         self.assertIn("auto-merge-coderabbit-post-ci-verification", source)
         self.assertIn("latestAnswer, ci, alreadyRequested", source)
         self.assertIn("pr,\n                unresolvedThreads,\n                ci", source)
+
+    def test_verification_only_unresolved_never_recodes_pending_ci(self):
+        import subprocess
+        source = self.unresolved_workflow
+        begin = source.index("            function isVerificationOnlyUnresolved(")
+        end = source.index("            const active = [];", begin)
+        helper = source[begin:end]
+        checks = r"""
+const assert = require('node:assert/strict');
+const bot = [
+  '<details>Analysis chain with arbitrary quoted text</details>',
+  '`@kodmial` **UNRESOLVED**',
+  'At HEAD abc123, the behavior and focused tests are present.',
+  'I found no remaining code defect in this finding.',
+  'Verification is incomplete. Exact-head checks are still running.',
+  'Please retry after CI completes.',
+  '---',
+  '<details>Learnings used</details>'
+].join(String.fromCharCode(10));
+assert.equal(isVerificationOnlyUnresolved(bot), true);
+assert.equal(isVerificationOnlyUnresolved(
+  '`@kodmial` **UNRESOLVED**\nThe implementation is still incorrect.'
+), false);
+assert.equal(isVerificationOnlyUnresolved(
+  '`@kodmial` **UNRESOLVED**\nI found no remaining code defect, but an auth bypass remains.'
+), false);
+assert.equal(isVerificationOnlyUnresolved(
+  '`@kodmial` **RESOLVED**\nI found no remaining code defect. Verification is incomplete.'
+), false);
+assert.equal(isVerificationOnlyUnresolved(
+  'Some code quotes: no remaining code defect. Verification is incomplete.'
+), false);
+"""
+        result = subprocess.run(
+            ["node", "-e", helper + checks],
+            capture_output=True, text=True, timeout=15,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertLess(
+            source.index("if (isVerificationOnlyUnresolved(latestReply.body))"),
+            source.index("active.push({"),
+            "non-code verification should be deferred before any repair batch",
+        )
 
     def test_provider_rate_limit_is_a_global_queue_floor(self):
         for contract in (
