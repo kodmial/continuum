@@ -1619,7 +1619,7 @@ jobs:
             // not a permanent code defect. Recheck ONCE when the HEAD's
             // successful CI becomes newer than that reply. A substantive
             // UNRESOLVED after green CI still goes to the normal repair path.
-            return /verification remains incomplete|could not confirm a passing|(?:ci|contract[^\\n]{0,30}) checks? (?:are|were) still in progress|tests? (?:are|were) not (?:run|verified)/i
+            return /verification remains incomplete|could not confirm a passing|(?:ci|contract).{0,40} checks? (?:are|were) still in progress|tests? (?:are|were) not (?:run|verified)/i
               .test(String(answer.body || ''));
           }
 
@@ -1713,7 +1713,7 @@ jobs:
                           'Inspect the current code and the completed checks.',
                           'Reply RESOLVED only if the original finding is now fully addressed;',
                           'otherwise reply UNRESOLVED with the remaining defect.',
-                        ].join('\\n'),
+                        ].join('\n'),
                       }
                     );
                     requested += 1;
