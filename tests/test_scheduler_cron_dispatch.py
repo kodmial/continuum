@@ -394,6 +394,78 @@ class OrderingAndBlockerTests(unittest.TestCase):
         self.assertEqual(result.dispatched, [])
         self.assertIn("race window", result.skip_reasons[156])
 
+    def test_checkpoint_resume_hold_blocks_duplicate_pre_model_failures(self):
+        config = SchedulerConfig(max_dispatch_attempts=2, pause_on_failure=False)
+        issues = {454: p0_issue(454)}
+        now = utcnow()
+        old = now - timedelta(minutes=120)
+        # Two historical scheduler dispatches already burned the normal
+        # attempt budget and the issue still carries its reservation.
+        comments = {
+            454: [
+                CommentRecord(
+                    body=config.dispatch_marker,
+                    author_is_owner=True,
+                    created_at=old,
+                ),
+                CommentRecord(
+                    body=config.dispatch_marker,
+                    author_is_owner=True,
+                    created_at=old + timedelta(minutes=1),
+                ),
+            ]
+        }
+        issues[454].labels.add(config.in_progress_label)
+        holds = {454: "contract-unavailable"}
+
+        for offset in (0, 1, 5):
+            result = reconcile(
+                now + timedelta(minutes=offset),
+                issues,
+                set(),
+                set(),
+                comments,
+                {},
+                {},
+                set(),
+                config,
+                checkpoint_resume_holds=holds,
+            )
+            self.assertEqual([], result.dispatched)
+            self.assertEqual([454], result.held)
+            self.assertIn(454, result.skip_reasons)
+            self.assertIn("checkpoint resume hold", result.skip_reasons[454])
+            self.assertIn(
+                "material premise changes", result.skip_reasons[454]
+            )
+            # A deterministic hold is not an owner pause and must not fail
+            # the pass or burn the bounded retry budget.
+            self.assertNotIn(config.pause_label, issues[454].labels)
+            self.assertNotIn(config.in_progress_label, issues[454].labels)
+            self.assertFalse(result.failed)
+        self.assertEqual(
+            2, len([c for c in comments[454] if config.dispatch_marker in c.body])
+        )
+
+        # A material premise change releases the hold and consumes exactly
+        # one new reservation; the historical attempts remain bounded.
+        resumed = reconcile(
+            now + timedelta(minutes=6),
+            issues,
+            set(),
+            set(),
+            comments,
+            {},
+            {},
+            set(),
+            config,
+            checkpoint_resume_holds={},
+        )
+        self.assertEqual([454], resumed.dispatched)
+        self.assertEqual([454], resumed.reservations_added)
+        self.assertIn(config.in_progress_label, issues[454].labels)
+        self.assertNotIn(config.pause_label, issues[454].labels)
+
 
 class WorkflowContractPinTests(unittest.TestCase):
     """The shipped workflow must mirror this contract byte-for-byte in
@@ -406,6 +478,13 @@ class WorkflowContractPinTests(unittest.TestCase):
         self.assertIn("open implementation PR must not be duplicated", body)
         self.assertIn("waiting for a free WIP slot", body)
         self.assertIn("active local issues", body)
+
+    def test_scheduler_honors_deterministic_checkpoint_resume_holds(self):
+        body = scheduler_body()
+        self.assertIn("continuum-checkpoint-resume-blocked", body)
+        self.assertIn("checkpoint resume hold", body)
+        self.assertIn("material premise changes", body)
+        self.assertIn("checkpointResumeHold", body)
 
     def test_wip_saturation_keeps_backlog_queued_without_failing(self):
         body = scheduler_body()

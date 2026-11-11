@@ -83,7 +83,7 @@ MUTATION_COUNTS = {
     "continuum-issue-scheduler.yml": 11,
     "continuum-opencode-repair.yml": 2,
     "continuum-opencode-watchdog.yml": 4,
-    "continuum-opencode.yml": 12,  # additional functional batch-verification reply
+    "continuum-opencode.yml": 13,  # batch-verification reply + checkpoint-resume hold marker
     "continuum-pr-agent-auto-merge.yml": 1,
     "continuum-pr-agent-canary.yml": 4,
     "continuum-pr-agent-recovery.yml": 4,
@@ -335,6 +335,10 @@ BUILDER_REFS = {
         "const markerComment = [",
         "continuum-issue-scheduler.yml",
     ),
+    "$RESUME_MARKER": (
+        "def failure_marker(record",
+        "src/continuum/checkpoint_resume.py",
+    ),
 }
 
 
@@ -364,6 +368,9 @@ def builder_text(ref, own_file_text, own_name):
             source = handle.read()
     elif definition_file == own_name:
         source = own_file_text
+    elif definition_file.startswith("src/"):
+        with open(os.path.join(ROOT, definition_file), encoding="utf-8") as handle:
+            source = handle.read()
     else:
         source = read_workflow(definition_file)
     index = source.find(anchor)

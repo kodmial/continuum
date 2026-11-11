@@ -115,6 +115,26 @@ class VerificationContractTest(unittest.TestCase):
         self.assertIn("verification_python baseline", workflow)
         self.assertIn("verification_python final", workflow)
 
+    def test_issue_workflow_passes_checkpoint_resume_identity(self):
+        workflow = (
+            ROOT / ".github" / "workflows" / "continuum-opencode.yml"
+        ).read_text(encoding="utf-8")
+        for option in (
+            "--resume-repository",
+            "--resume-issue",
+            "--resume-generation",
+            "--resume-operation",
+            "--resume-checkpoint-ref",
+            "--resume-checkpoint-sha",
+            "--resume-base-sha",
+            "--resume-snapshot-spec",
+            "--resume-failure-record",
+        ):
+            self.assertIn(option, workflow)
+        self.assertIn("continuum-checkpoint-resume-blocked", workflow)
+        self.assertIn("baseline_base_sha=", workflow)
+        self.assertIn('BASE_START_SHA="$BASELINE_BASE_SHA"', workflow)
+
     def test_unconfigured_contract_is_an_explicit_failure(self):
         contract = verification.resolve_contract(self.repo, self.env)
         self.assertEqual("unconfigured", contract.state)

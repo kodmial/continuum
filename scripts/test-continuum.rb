@@ -5929,11 +5929,13 @@ class ContinuumTest < Minitest::Test
       'freshOpenBlockers.length > 0',
       'if (commandAgeMs < commandGraceMs) {',
       'const freshStop = await terminalGenerationStop(',
-      'terminalStopSkipReason(issue.number, freshStop)'
+      'terminalStopSkipReason(issue.number, freshStop)',
+      'const freshResumeHold = await checkpointResumeHold(',
+      'checkpointResumeHoldSkipReason(issue.number, freshResumeHold)'
     ].each { |guard| assert_includes dispatch, guard, "missing just-in-time guard: #{guard}" }
     local_dispatch = dispatch[/\/\/ Re-check mutable state immediately before dispatch\..*\z/m]
     refute_nil local_dispatch, 'the local just-in-time re-check block is gone'
-    assert_equal 7, local_dispatch.scan(/^\s+continue;\s*$/).size,
+    assert_equal 8, local_dispatch.scan(/^\s+continue;\s*$/).size,
                  'every local just-in-time guard must be a skip, not a fall-through'
   end
 
@@ -6531,6 +6533,41 @@ class ContinuumTest < Minitest::Test
                     'a verifier 429 must checkpoint the completed primary implementation stage'
     assert_includes issue, 'continuum_infra_evacuate "opencode-429-issue-issue${ISSUE_NUMBER}" "implementation-incomplete"',
                     'the primary session still checkpoints an incomplete stage'
+  end
+
+  # kodmial/continuum#442: an unattested legacy checkpoint must be validated
+  # before the baseline, re-baselined at its original immutable base, and held
+  # deterministically when the same identity cannot be continued.
+  def test_issue_mode_validates_checkpoint_identity_before_resuming
+    issue = step_body(workflow_body('continuum-opencode.yml'), 'Implement issue')
+    refute_nil issue
+
+    for option in %w[
+      --resume-repository --resume-issue --resume-generation --resume-operation
+      --resume-checkpoint-ref --resume-checkpoint-sha --resume-base-sha
+      --resume-snapshot-spec --resume-failure-record
+    ]
+      assert_includes issue, option, 'checkpoint resume must bind the exact identity'
+    end
+    assert_includes issue, 'continuum-checkpoint-resume-blocked'
+    assert_includes issue, 'baseline_base_sha='
+    assert_includes issue, 'BASE_START_SHA="$BASELINE_BASE_SHA"',
+                    'verification must use the checkpoint original base'
+    assert_includes issue, 'RESUME_CHECKPOINT_SHA="$(git rev-parse FETCH_HEAD)"'
+    refute_match(/git reset --hard/, issue,
+                 'a checkpoint must never be reset or discarded')
+    refute_match(/git push --force origin "FETCH_HEAD:/, issue,
+                 'a checkpoint must never be force-pushed')
+
+    scheduler = File.read(File.join(ROOT, '.github/scripts/issue_scheduler.js'))
+    assert_includes scheduler, 'continuum-checkpoint-resume-blocked'
+    assert_includes scheduler, 'checkpointResumeHold'
+    assert_includes scheduler, 'checkpoint resume hold'
+    assert_includes scheduler, 'material premise changes'
+
+    watchdog = File.read(File.join(ROOT, '.github/workflows/continuum-opencode-watchdog.yml'))
+    assert_includes watchdog, 'continuum-checkpoint-resume-blocked',
+                    'the watchdog must not retry a deterministic checkpoint hold'
   end
 
   # The verification contract is consumer-owned and is resolved from the same

@@ -25,6 +25,8 @@ Covered lifecycle:
 - dispatch-attempt accounting with lease expiry, stale-reservation
   recovery, and bounded retry (``max_dispatch_attempts`` with
   ``pause_on_failure`` gating only the terminal pause);
+- deterministic checkpoint-resume holds that release WIP without applying
+  the owner pause/stop labels until the checkpoint identity changes;
 - owner ``/oc`` race grace window;
 - exactly-once automatic dispatch per reservation (idempotent second
   pass);
@@ -105,6 +107,7 @@ class ReconcileResult:
     reservations_added: List[int] = field(default_factory=list)
     reservations_removed: List[int] = field(default_factory=list)
     paused: List[int] = field(default_factory=list)
+    held: List[int] = field(default_factory=list)
     skip_reasons: Dict[int, str] = field(default_factory=dict)
     wip_summary: str = ""
     failed: bool = False
@@ -157,6 +160,23 @@ def terminal_stop_skip_reason(number: int, generation: int = 1) -> str:
     )
 
 
+def checkpoint_resume_hold_skip_reason(number: int, reason: str = "") -> str:
+    """Auditable skip reason for a deterministic checkpoint-resume hold.
+
+    This is deliberately not ``automation:paused`` and not a terminal
+    generation stop: the saved checkpoint is preserved and the hold is
+    released automatically when its checkpoint/base/snapshot identity changes.
+    """
+
+    detail = str(reason or "resume-rejected").strip() or "resume-rejected"
+    return (
+        "checkpoint resume hold: issue #%d has a deterministic checkpoint "
+        "continuation rejection (%s); the saved checkpoint is preserved and "
+        "this exact checkpoint/base/snapshot is not redispatched until a "
+        "material premise changes" % (number, detail)
+    )
+
+
 def _normalize_terminal_stopped(
     terminal_stopped: Optional[Iterable[Any]],
 ) -> Set[Tuple[int, int]]:
@@ -202,6 +222,7 @@ def reconcile(
     terminal_stopped: Optional[Iterable[Any]] = None,
     generations: Optional[Dict[int, int]] = None,
     repository_owner: str = "",
+    checkpoint_resume_holds: Optional[Dict[int, str]] = None,
 ) -> ReconcileResult:
     """Run one deterministic scheduled reconcile pass (cron, no event).
 
@@ -261,6 +282,20 @@ def reconcile(
             result.skip_reasons[number] = (
                 "released implementation reservation: capability is in "
                 "qualification lifecycle"
+            )
+            continue
+        resume_hold = (checkpoint_resume_holds or {}).get(number)
+        if resume_hold:
+            # The checkpoint is deterministic-broken for this exact
+            # identity. Release the coding slot without applying the
+            # owner/pause label: a new checkpoint SHA, base, or pinned
+            # snapshot is a material premise change, and only then may the
+            # scheduler reconsider the issue.
+            labels.discard(in_progress)
+            result.reservations_removed.append(number)
+            result.held.append(number)
+            result.skip_reasons[number] = checkpoint_resume_hold_skip_reason(
+                number, resume_hold
             )
             continue
         if native_open_blockers.get(number):
@@ -373,6 +408,14 @@ def reconcile(
                 number, active_generation
             )
             continue
+        resume_hold = (checkpoint_resume_holds or {}).get(number)
+        if resume_hold:
+            if number not in result.held:
+                result.held.append(number)
+            result.skip_reasons[number] = checkpoint_resume_hold_skip_reason(
+                number, resume_hold
+            )
+            continue
         if number in active:
             _, rank = priority_of(issue)
             result.skip_reasons[number] = (
@@ -466,6 +509,11 @@ def reconcile(
         if (number, _active_generation(number, generations)) in stopped:
             result.skip_reasons[number] = terminal_stop_skip_reason(
                 number, _active_generation(number, generations)
+            )
+            continue
+        if (checkpoint_resume_holds or {}).get(number):
+            result.skip_reasons[number] = checkpoint_resume_hold_skip_reason(
+                number, (checkpoint_resume_holds or {}).get(number, "")
             )
             continue
         if (
