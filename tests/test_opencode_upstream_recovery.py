@@ -164,6 +164,46 @@ class ProductionWrapperTests(unittest.TestCase):
         self.assertTrue(result["inconclusive"])
         self.assertEqual(result["classification"], "inconclusive")
 
+    def test_v2_session_error_reports_cause_without_poisoning_runner(self):
+        for kind, message in (
+            ("unknown", "Session ended without a recorded outcome"),
+            ("unknown", "Prompt was not promoted"),
+            ("aborted", "Session interrupted"),
+        ):
+            with self.subTest(kind=kind, message=message):
+                result = self.invoke(
+                    stdout=event("error", error={"type": kind, "message": message}),
+                    exit_code=1,
+                )
+                self.assertEqual(result["rc"], 1, result["output"])
+                self.assertEqual(result["classification"], "inconclusive")
+                self.assertIn("OpenCode error: {} {}".format(kind, message), result["stderr"])
+                self.assertFalse(result["quota"])
+                self.assertFalse(result["unavailable"])
+
+    def test_v2_provider_error_and_redacted_diagnostics(self):
+        provider = self.invoke(
+            stdout=event("error", error={
+                "type": "APIError", "message": "provider unavailable", "statusCode": 503,
+            }),
+            exit_code=1,
+        )
+        self.assertEqual(provider["rc"], 76, provider["output"])
+        self.assertEqual(provider["classification"], "unavailable")
+        self.assertIn("OpenCode error: APIError status=503 provider unavailable", provider["stderr"])
+        sensitive = self.invoke(
+            stdout=event("error", error={
+                "type": "unknown",
+                "message": "Session ended\\n::error::INJECTED bearer SECRET123456789"
+                " api_key=abcdef0123456789",
+            }),
+            exit_code=1,
+        )
+        self.assertEqual(sensitive["classification"], "inconclusive")
+        self.assertNotIn("SECRET123456789", sensitive["stderr"])
+        self.assertNotIn("abcdef0123456789", sensitive["stderr"])
+        self.assertNotIn("\\n::error::INJECTED", sensitive["stderr"])
+
     def test_structured_provider_429_recovers_on_zero_and_nonzero_exit(self):
         for exit_code in (0, 1):
             with self.subTest(exit_code=exit_code):

@@ -22,6 +22,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sys
 from typing import Iterable, TextIO
 
@@ -54,18 +55,46 @@ def _print(value: str, stream: TextIO = sys.stdout) -> None:
     stream.flush()
 
 
+def _safe_diagnostic(value: object) -> str:
+    # Error messages are untrusted provider/session text. Never render newlines
+    # (including GitHub workflow command injection) or common credential forms.
+    text = " ".join(str(value or "").split())
+    text = re.sub(
+        r"(?i)\\bbearer\\s+[^\\s,;]+",
+        "Bearer [REDACTED]",
+        text,
+    )
+    text = re.sub(
+        r"(?i)\\b(?:authorization|api[_-]?key|token|password|secret)\\b"
+        r"\\s*[:=]\\s*[^\\s,;]+",
+        "credential=[REDACTED]",
+        text,
+    )
+    text = re.sub(
+        r"\\b(?:sk-[A-Za-z0-9_-]{12,}|ghp_[A-Za-z0-9_]{12,}|"
+        r"github_pat_[A-Za-z0-9_]{12,})\\b",
+        "[REDACTED]",
+        text,
+    )
+    return text[:450]
+
+
 def _error_summary(error: object) -> str:
     if not isinstance(error, dict):
         return "unknown error"
-    name = error.get("name") or "Error"
+    # v1.19.3: {name,data:{message,statusCode}};
+    # v2.2.6: {type,message}, with generic non-provider terminal failures.
     data = error.get("data") if isinstance(error.get("data"), dict) else {}
-    message = data.get("message") or ""
-    status = data.get("statusCode") or data.get("status") or ""
-    parts = ["{}".format(name)]
-    if status not in ("", None):
+    name = error.get("name") or error.get("type") or "Error"
+    message = data.get("message") or error.get("message") or ""
+    status = data.get("statusCode") or data.get("status")
+    if status is None:
+        status = error.get("statusCode") or error.get("status")
+    parts = [_safe_diagnostic(name)]
+    if status is not None and str(status).isdigit():
         parts.append("status={}".format(status))
     if message:
-        parts.append(str(message))
+        parts.append(_safe_diagnostic(message))
     return " ".join(parts)
 
 
