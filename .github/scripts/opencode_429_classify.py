@@ -60,24 +60,23 @@ def _safe_diagnostic(value: object) -> str:
     # (including GitHub workflow command injection) or common credential forms.
     text = " ".join(str(value or "").split())
     text = re.sub(
-        r"(?i)\\bbearer\\s+[^\\s,;]+",
+        r"(?i)\bbearer\s+[^\s,;]+",
         "Bearer [REDACTED]",
         text,
     )
     text = re.sub(
-        r"(?i)\\b(?:authorization|api[_-]?key|token|password|secret)\\b"
-        r"\\s*[:=]\\s*[^\\s,;]+",
+        r"(?i)\b(?:authorization|api[_-]?key|token|password|secret)\b"
+        r"\s*[:=]\s*[^\s,;]+",
         "credential=[REDACTED]",
         text,
     )
     text = re.sub(
-        r"\\b(?:sk-[A-Za-z0-9_-]{12,}|ghp_[A-Za-z0-9_]{12,}|"
-        r"github_pat_[A-Za-z0-9_]{12,})\\b",
+        r"\b(?:sk-[A-Za-z0-9_-]{12,}|ghp_[A-Za-z0-9_]{12,}|"
+        r"github_pat_[A-Za-z0-9_]{12,})\b",
         "[REDACTED]",
         text,
     )
     return text[:450]
-
 
 def _error_summary(error: object) -> str:
     if not isinstance(error, dict):
