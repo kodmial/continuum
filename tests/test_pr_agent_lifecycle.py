@@ -148,8 +148,11 @@ APPROVED_PROVIDER_RECOVERY_OPENCODE_SHA256 = (
     "bb2aef000e12b83f16f30b9ebc9c2d7e72987684e21a9be6b852b02d106f9ea2"
 )
 
+# Additional reviewed self-caller change: owner-only CodeRabbit repair dispatch
+# preserves the exact workflow_dispatch path and the no-auto-merge hold.
+# This pins the full file, not a permissive allowlist for workflow drift.
 APPROVED_350_SELF_CALLER_SHA256 = (
-    "f06cdcb9affc06f976aed97945ff9d31496e5954ca225971164f87ec4e1ca22c"
+    "f158c2e694fb77172c8955d301981d67bafaed4099c0a34f96f05cd9054c13c8"
 )
 APPROVED_350_CALLER_SHA256 = (
     "a595362c8353001d5f7af138ab848df8fac3a6c924d5d337f6819084f79b3938"
@@ -2576,7 +2579,7 @@ class ProtectedBaselineTests(unittest.TestCase):
                     self.assertEqual(
                         protected_file_digest(path),
                         APPROVED_350_SELF_CALLER_SHA256,
-                        f"{path}: unexpected drift outside reviewed #350 self-caller patch",
+                        f"{path}: unexpected drift outside reviewed owner-only repair caller",
                     )
                 if path == ".github/workflows/continuum-opencode.yml":
                     self.assertIn("Restore verified cached OpenCode for coder and repair", read_repo(path))
