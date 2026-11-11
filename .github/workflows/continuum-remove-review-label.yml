@@ -31,14 +31,17 @@ jobs:
     steps:
       - uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
         env:
-          # This synchronize reset can read only the repository variable, not
-          # the repair caller's optional `ci_repair_label` dispatch input. A
-          # label supplied only through that input is therefore not reset on a
-          # new head; keep such an override unique per head or expect a stale
-          # lock. When the engine falls back to the variable, that configured
-          # label must be reset here too, otherwise a stale lock from the
-          # previous head suppresses the next repair attempt.
+          # This synchronize reset can name only the repository-variable
+          # repair label, not a label supplied through the repair caller's
+          # optional `ci_repair_label` dispatch input. Such an override is
+          # still reset because the repair engine stamps the lock description
+          # below on every CI repair label it creates: the reset finds those
+          # labels by their marker, so a lock taken for the previous head can
+          # never suppress repair of the new one. Keep this literal identical
+          # to `lock_description`/`--description` in
+          # continuum-opencode-repair.yml.
           CI_REPAIR_LABEL: ${{ vars.CONTINUUM_CI_REPAIR_LABEL || 'opencode-ci-repair' }}
+          CI_REPAIR_LOCK_DESCRIPTION: 'One automatic OpenCode CI repair attempt per failing PR head.'
         with:
           script: |
             const { owner, repo, number } = context.issue;
@@ -49,12 +52,38 @@ jobs:
             // CodeRabbit or by proving a safe clean-main-sync carry-forward.
             const ciRepairLabel =
               String(process.env.CI_REPAIR_LABEL || 'opencode-ci-repair').trim();
-            for (const name of new Set([
+            const repairLockDescription =
+              String(process.env.CI_REPAIR_LOCK_DESCRIPTION || '').trim();
+
+            // Always reset the known labels, even when the attached-label
+            // read below fails. Anything the repair engine tagged with its
+            // lock description is added to that set, which covers a dispatch
+            // input override this event cannot name from configuration.
+            const labelsToRemove = new Set([
               'review-ready',
               'coderabbit-review-requested',
               'opencode-ci-repair',
               ciRepairLabel,
-            ])) {
+            ]);
+            if (repairLockDescription) {
+              try {
+                const attached = await github.paginate(
+                  github.rest.issues.listLabelsOnIssue,
+                  { owner, repo, issue_number: number, per_page: 100 }
+                );
+                for (const label of attached) {
+                  if (label && label.description === repairLockDescription) {
+                    labelsToRemove.add(label.name);
+                  }
+                }
+              } catch (err) {
+                console.log(
+                  `Could not list attached labels to find repair-lock overrides: ${err.message}`
+                );
+              }
+            }
+
+            for (const name of labelsToRemove) {
               try {
                 await github.rest.issues.removeLabel({
                   owner,
