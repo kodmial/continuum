@@ -65,21 +65,36 @@ jobs:
               'opencode-ci-repair',
               ciRepairLabel,
             ]);
+            let labelDiscoveryFailed = false;
             if (repairLockDescription) {
-              try {
-                const attached = await github.paginate(
-                  github.rest.issues.listLabelsOnIssue,
-                  { owner, repo, issue_number: number, per_page: 100 }
-                );
-                for (const label of attached) {
-                  if (label && label.description === repairLockDescription) {
-                    labelsToRemove.add(label.name);
+              const maxAttempts = 3;
+              let attached = [];
+              for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+                try {
+                  attached = await github.paginate(
+                    github.rest.issues.listLabelsOnIssue,
+                    { owner, repo, issue_number: number, per_page: 100 }
+                  );
+                  labelDiscoveryFailed = false;
+                  break;
+                } catch (err) {
+                  if (attempt === maxAttempts) {
+                    labelDiscoveryFailed = true;
+                    console.log(
+                      `Could not list attached labels to find repair-lock overrides after ${maxAttempts} attempts: ${err.message}`
+                    );
+                  } else {
+                    console.log(
+                      `Could not list attached labels to find repair-lock overrides (attempt ${attempt}/${maxAttempts}): ${err.message}; retrying`
+                    );
+                    await new Promise((resolve) => setTimeout(resolve, 1000 * attempt));
                   }
                 }
-              } catch (err) {
-                console.log(
-                  `Could not list attached labels to find repair-lock overrides: ${err.message}`
-                );
+              }
+              for (const label of attached) {
+                if (label && label.description === repairLockDescription) {
+                  labelsToRemove.add(label.name);
+                }
               }
             }
 
@@ -99,4 +114,14 @@ jobs:
                   throw err;
                 }
               }
+            }
+
+            // A failed discovery can leave a dispatch-only repair label
+            // attached, which would suppress repair of the new head. Known
+            // labels were removed above, but fail the job so the incomplete
+            // reset is visible and can be rerun once label discovery recovers.
+            if (labelDiscoveryFailed) {
+              throw new Error(
+                'Could not list attached labels; dispatch-only CI repair locks may remain. Rerun this job after label discovery recovers.'
+              );
             }

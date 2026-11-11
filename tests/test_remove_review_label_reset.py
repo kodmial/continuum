@@ -10,10 +10,12 @@ the next repair attempt.
 A label chosen only through the repair caller's ``ci_repair_label`` dispatch
 input is not visible to this synchronize event. The engine therefore stamps a
 fixed description on every repair lock it creates, and the reset discovers and
-removes those labels by that marker.
+removes those labels by that marker. Label discovery is retried; if it still
+fails, the job fails after removing the known labels so the incomplete reset is
+visible for a rerun.
 
-The executable test runs the checked-in github-script body under Node with a
-fake ``github`` client and asserts the exact label removals.
+The executable tests run the checked-in github-script body under Node with a
+fake ``github`` client and assert the exact label removals and retry behavior.
 """
 
 from __future__ import annotations
@@ -39,14 +41,24 @@ BASE_LABELS = ["review-ready", "coderabbit-review-requested", DEFAULT_LABEL]
 
 HARNESS = """\
 const calls = [];
+const listCalls = [];
 const present = new Set();
 const attached = JSON.parse(process.env.TEST_ATTACHED_LABELS || '[]');
+const listFailures = Number(process.env.TEST_LIST_LABEL_FAILURES || '0');
 global.context = { issue: { owner: 'owner', repo: 'repo', number: 7 } };
 global.github = {
   paginate: async (method, params) => method(params),
   rest: {
     issues: {
-      listLabelsOnIssue: async () => attached,
+      listLabelsOnIssue: async () => {
+        listCalls.push(listCalls.length + 1);
+        if (listCalls.length <= listFailures) {
+          const error = new Error('label API unavailable');
+          error.status = 502;
+          throw error;
+        }
+        return attached;
+      },
       removeLabel: async ({ name }) => {
         calls.push(name);
         if (!present.has(name)) {
@@ -72,7 +84,14 @@ console.log = (...args) => process.stderr.write(args.join(' ') + '\\n');
   process.stdout.write(JSON.stringify(calls));
 })().catch((error) => {
   console.error(error && error.stack ? error.stack : error);
-  process.exit(1);
+  process.stdout.write(
+    JSON.stringify({
+      calls,
+      listCalls,
+      error: String((error && error.message) || error),
+    })
+  );
+  process.exitCode = 1;
 });
 """
 
@@ -136,21 +155,79 @@ class RemoveReviewLabelResetTests(unittest.TestCase):
             ),
         )
 
-    def run_reset(self, node, program, configured, attached=()):
+    @unittest.skipUnless(shutil.which("node"), "Node.js unavailable")
+    def test_transient_label_discovery_failure_is_retried(self):
+        node = shutil.which("node")
+        program = HARNESS % script_body()
+        attached = [
+            {"name": "dispatch-only-lock", "description": LOCK_DESCRIPTION},
+        ]
+        self.assertEqual(
+            BASE_LABELS + ["dispatch-only-lock"],
+            self.run_reset(
+                node,
+                program,
+                configured=None,
+                attached=attached,
+                list_failures=2,
+            ),
+        )
+
+    @unittest.skipUnless(shutil.which("node"), "Node.js unavailable")
+    def test_exhausted_label_discovery_failure_is_visible_for_rerun(self):
+        node = shutil.which("node")
+        program = HARNESS % script_body()
+        completed = self.run_reset_process(
+            node, program, configured=None, list_failures=3
+        )
+        self.assertNotEqual(
+            0, completed.returncode, "an incomplete reset must fail the job"
+        )
+        outcome = json.loads(completed.stdout)
+        self.assertEqual(3, len(outcome["listCalls"]))
+        self.assertEqual(sorted(BASE_LABELS), sorted(outcome["calls"]))
+        self.assertIn("Rerun", outcome["error"])
+
+    def run_reset(
+        self,
+        node,
+        program,
+        configured,
+        attached=(),
+        list_failures=0,
+    ):
+        completed = self.run_reset_process(
+            node,
+            program,
+            configured=configured,
+            attached=attached,
+            list_failures=list_failures,
+        )
+        completed.check_returncode()
+        return json.loads(completed.stdout)
+
+    def run_reset_process(
+        self,
+        node,
+        program,
+        configured,
+        attached=(),
+        list_failures=0,
+    ):
         environment = {
             "PATH": "/usr/bin:/bin:/usr/local/bin",
             "TEST_CI_REPAIR_LABEL": configured or "",
             "TEST_REPAIR_LOCK_DESCRIPTION": LOCK_DESCRIPTION,
             "TEST_ATTACHED_LABELS": json.dumps(list(attached)),
+            "TEST_LIST_LABEL_FAILURES": str(list_failures),
         }
-        completed = subprocess.run(
+        return subprocess.run(
             [node, "-e", program],
-            check=True,
+            check=False,
             capture_output=True,
             text=True,
             env=environment,
         )
-        return json.loads(completed.stdout)
 
 
 if __name__ == "__main__":
