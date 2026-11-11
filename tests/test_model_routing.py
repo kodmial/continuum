@@ -201,6 +201,16 @@ class FakeProcess:
 
 
 class ProbeTests(unittest.TestCase):
+    def setUp(self):
+        # Quota fixtures intentionally create a runner-death marker. Never let
+        # them write into the real GitHub Actions RUNNER_TEMP: baseline tests
+        # run before OpenCode and would otherwise burn the coding runner.
+        isolated_runner = tempfile.TemporaryDirectory(prefix="continuum-probe-test-")
+        self.addCleanup(isolated_runner.cleanup)
+        runner_env = patch.dict(os.environ, {"RUNNER_TEMP": isolated_runner.name})
+        runner_env.start()
+        self.addCleanup(runner_env.stop)
+
     def test_observed_model_mismatch_is_fatal(self):
         answer = '{"type":"text","part":{"type":"text","text":"Use >="}}\n'
         self.assertEqual(route.extract_response(answer, A), "Use >=")
@@ -555,6 +565,29 @@ class ProbeTests(unittest.TestCase):
         elapsed = route.time.monotonic() - started
         self.assertTrue(process.terminated)
         self.assertLess(elapsed, 2)
+
+
+class ProbeRunnerIsolationRegressionTests(unittest.TestCase):
+    def test_quota_fixtures_do_not_burn_workflow_runner(self):
+        # Exercise both formerly unisolated fixtures as if running under
+        # GitHub Actions, where RUNNER_TEMP belongs to the actual code agent.
+        for name in (
+            "test_stalled_429_is_detected_across_reader_chunks",
+            "test_timeout_after_quota_evidence_burns_the_runner",
+        ):
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as runner_temp:
+                with patch.dict(os.environ, {"RUNNER_TEMP": runner_temp}):
+                    result = unittest.TestResult()
+                    ProbeTests(name).run(result)
+                    self.assertTrue(
+                        result.wasSuccessful(),
+                        "quota fixture failed: {}".format(result.errors + result.failures),
+                    )
+                    self.assertEqual(os.environ["RUNNER_TEMP"], runner_temp)
+                    self.assertFalse(
+                        (pathlib.Path(runner_temp) / "continuum-opencode-429").exists(),
+                        "test fixture poisoned the real coding runner",
+                    )
 
 
 class MainBurnedRunnerTests(unittest.TestCase):
