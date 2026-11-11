@@ -435,8 +435,12 @@ jobs:
               core.notice('PR HEAD or state advanced during CodeRabbit batching; deferring to next reconciliation.');
               return;
             }
+            // Verification replies may change unresolved_id without changing
+            // the finding. A lease belongs to the underlying finding set
+            // and exact head, never to a transient CodeRabbit reply.
+            const batchIdentity = items.map(item => [item.review_id, item.finding_id]);
             const batchKey = crypto.createHash('sha256')
-              .update(head + '\n' + batch).digest('hex');
+              .update(head + '\n' + JSON.stringify(batchIdentity)).digest('hex');
             const marker =
               `<!-- continuum-coderabbit-batch head=${head} digest=${batchKey} -->`;
             const priorComments = await github.paginate(github.rest.issues.listComments, {
@@ -449,6 +453,34 @@ jobs:
             const attempts = priorComments
               .filter(comment => (comment.body || '').includes(marker))
               .sort((a, b) => Number(b.id) - Number(a.id));
+            // Review replies can change the batch digest while the first
+            // repair is still running. Deduplicate ALL active repairs for
+            // this PR, including queued runs and different finding batches.
+            const { data: runsData } = await github.rest.actions.listWorkflowRuns({
+              owner, repo, workflow_id: opencodeWorkflow,
+              event: 'workflow_dispatch', per_page: 100,
+            });
+            const recentRuns = runsData.workflow_runs || [];
+            const isRepair = run =>
+              String(run.display_title || '') === `OpenCode repair PR #${pullNumber}`;
+            let activeRepairs = recentRuns.filter(run =>
+              isRepair(run) && run.status !== 'completed');
+            // High run volume can push a long-running repair out of the
+            // latest 100. Search active states explicitly before dispatch.
+            if (!activeRepairs.length && recentRuns.length >= 100) {
+              for (const status of ['in_progress', 'queued', 'pending', 'waiting']) {
+                const { data: activeData } = await github.rest.actions.listWorkflowRuns({
+                  owner, repo, workflow_id: opencodeWorkflow,
+                  event: 'workflow_dispatch', status, per_page: 100,
+                });
+                activeRepairs = (activeData.workflow_runs || []).filter(isRepair);
+                if (activeRepairs.length) break;
+              }
+            }
+            if (activeRepairs.length) {
+              core.notice('Canonical OpenCode repair for this PR is already active; duplicate verification suppressed.');
+              return;
+            }
             if (attempts.length) {
               const latest = attempts[0];
               const latestAt = Date.parse(latest.created_at || '');
@@ -465,18 +497,9 @@ jobs:
                 );
                 return;
               }
-              const { data: runsData } = await github.rest.actions.listWorkflowRuns({
-                owner, repo, workflow_id: opencodeWorkflow,
-                event: 'workflow_dispatch', per_page: 100,
-              });
-              const matching = (runsData.workflow_runs || []).filter(run =>
-                String(run.display_title || '') === `OpenCode repair PR #${pullNumber}` &&
-                Date.parse(run.created_at || '') >= latestAt - 15_000
+              const matching = recentRuns.filter(run =>
+                isRepair(run) && Date.parse(run.created_at || '') >= latestAt - 15_000
               );
-              if (matching.some(run => run.status !== 'completed')) {
-                core.notice('Canonical OpenCode repair for this PR is still active; duplicate batch suppressed.');
-                return;
-              }
               if (!matching.length && Date.now() - latestAt < 4 * 60 * 60_000) {
                 // A bounded workflow-run listing may lose a busy run outside
                 // the window. Do not race an unobservable in-flight agent;

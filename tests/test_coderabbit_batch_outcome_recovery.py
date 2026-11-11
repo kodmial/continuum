@@ -18,13 +18,15 @@ AUTO_MERGE = ROOT / ".github/workflows/continuum-auto-merge.yml"
 
 @unittest.skipUnless(shutil.which("node"), "Node.js is required")
 class BatchOutcomeRecoveryTests(unittest.TestCase):
-    def exercise(self, marker_minutes=None, run_state="completed"):
+    def exercise(self, marker_minutes=None, run_state="completed", latest_reply_id=205):
         fixture = r"""
 const crypto = require('crypto');
 const head = 'a'.repeat(40);
-const items = [{review_id:22, finding_id:100, unresolved_id:205, verified_head:head}];
+const items = [{review_id:22, finding_id:100,
+  unresolved_id:Number(process.env.REPLY_ID || 205), verified_head:head}];
 const batch = JSON.stringify(items);
-const digest = crypto.createHash('sha256').update(head+'\n'+batch).digest('hex');
+const identity = JSON.stringify(items.map(item => [item.review_id, item.finding_id]));
+const digest = crypto.createHash('sha256').update(head+'\n'+identity).digest('hex');
 const marker = '<!-- continuum-coderabbit-batch head='+head+' digest='+digest+' -->';
 const minutes = Number(process.env.MINUTES);
 const at = new Date(Date.now()-minutes*60_000).toISOString();
@@ -64,7 +66,8 @@ const github = {
             ["node", "-"], input=code, capture_output=True, text=True,
             check=False, env={**__import__("os").environ,
                               "MINUTES":str(marker_minutes if marker_minutes is not None else -1),
-                              "RUN_STATE":run_state},
+                              "RUN_STATE":run_state,
+                              "REPLY_ID":str(latest_reply_id)},
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         return json.loads(result.stdout)
@@ -82,6 +85,22 @@ const github = {
         outcome = self.exercise(marker_minutes=12)
         self.assertEqual(len(outcome["dispatches"]), 1)
         self.assertTrue(any("Re-dispatching" in m for m in outcome["messages"]))
+
+    def test_new_verdict_cannot_bypass_recent_finding_lease(self):
+        self.assertEqual(
+            len(self.exercise(marker_minutes=2, latest_reply_id=206)["dispatches"]), 0,
+        )
+
+    def test_new_verdict_cannot_duplicate_active_repair(self):
+        self.assertEqual(
+            len(self.exercise(marker_minutes=12, run_state="in_progress",
+                              latest_reply_id=206)["dispatches"]), 0,
+        )
+
+    def test_active_repair_is_suppressed_even_without_matching_marker(self):
+        self.assertEqual(
+            len(self.exercise(run_state="in_progress")["dispatches"]), 0,
+        )
 
     def test_auto_merge_wakes_batcher_when_marker_is_not_completion(self):
         source = AUTO_MERGE.read_text(encoding="utf-8")
