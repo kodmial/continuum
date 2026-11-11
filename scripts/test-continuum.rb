@@ -3392,6 +3392,123 @@ class ContinuumTest < Minitest::Test
     assert_includes body, 'STRATEGY_BLOCK'
   end
 
+  # Execute the shipped periodic gate with a fake `gh` so a caller/gate
+  # divergence is observed behaviorally instead of only matching source text.
+  # The fake applies the gate's own `--jq` filter to a controlled run listing,
+  # so evidence matching is the real jq program as well.
+  def run_periodic_gate(dir, caller_event:, periodic:, evidence_titles: nil)
+    bin = File.join(dir, 'bin')
+    FileUtils.mkdir_p(bin)
+    runs_path = File.join(dir, 'runs.json')
+    File.write(runs_path, JSON.generate(
+      'workflow_runs' => Array(evidence_titles).each_with_index.map do |title, index|
+        {
+          'id' => index + 1,
+          'event' => 'workflow_dispatch',
+          'status' => 'completed',
+          'conclusion' => 'success',
+          'display_title' => title,
+          'head_branch' => 'main'
+        }
+      end
+    ))
+    File.write(File.join(bin, 'gh'), <<~SH)
+      #!/usr/bin/env bash
+      set -e
+      case "$*" in
+        *"/actions/workflows/"*)
+          if [[ "${FAKE_GATE_EVIDENCE:-0}" == "0" ]]; then
+            echo 0
+          else
+            exec jq "${@: -1}" "$FAKE_GATE_RUNS"
+          fi
+          ;;
+        *"/actions/runs/"*) echo 42 ;;
+        *) exit 1 ;;
+      esac
+    SH
+    FileUtils.chmod(0755, File.join(bin, 'gh'))
+
+    output_path = File.join(dir, 'github-output')
+    File.write(output_path, '')
+    workflow = yaml(File.join(ROOT, '.github/workflows/continuum-issue-scheduler.yml'))
+    script = workflow.fetch('jobs').fetch('schedule').fetch('steps').first.fetch('run')
+    stdout, status = Open3.capture2e(
+      {
+        'PATH' => "#{bin}:#{ENV['PATH']}",
+        'GITHUB_REPOSITORY' => 'owner/repo',
+        'GITHUB_RUN_ID' => '123',
+        'GITHUB_OUTPUT' => output_path,
+        'CALLER_EVENT_NAME' => caller_event,
+        'PERIODIC_WAKE' => periodic,
+        'DEFAULT_BRANCH' => 'main',
+        'FAKE_GATE_EVIDENCE' => evidence_titles.nil? ? '0' : '1',
+        'FAKE_GATE_RUNS' => runs_path
+      },
+      'bash', '-c', script
+    )
+    assert status.success?, "periodic gate failed: #{stdout}"
+    File.readlines(output_path).each_with_object({}) do |line, outputs|
+      key, value = line.strip.split('=', 2)
+      outputs[key] = value if value
+    end
+  end
+
+  # The caller stub cannot trim inside a GitHub expression, so it always stamps
+  # the raw input in `[continuum-wake:...]`; the fixed marker is best-effort
+  # legacy evidence. The stub contract above pins both expressions.
+  def periodic_caller_run_name(periodic_wake)
+    marker = " #{periodic_wake} ".include?(' true ') ? '[continuum-periodic]' : 'workflow_dispatch'
+    "Issue scheduler #{marker} [continuum-wake:#{periodic_wake}]"
+  end
+
+  def jq_available?
+    system('jq', '--version', out: File::NULL, err: File::NULL)
+  end
+
+  # Whitespace handling is the canonical parser's rule (trim + case-fold, then
+  # accept only the literal `true`). Source matching cannot catch a divergence
+  # from that rule, so exercise the real gate step.
+  def test_periodic_gate_trims_whitespace_like_the_canonical_parser
+    {
+      ' true ' => true,
+      "\ttrue\t" => true,
+      'true false' => false
+    }.each do |input, periodic|
+      fixture do |dir|
+        outputs = run_periodic_gate(dir, caller_event: 'workflow_dispatch', periodic: input)
+        assert_equal 'true', outputs.fetch('run')
+        assert_equal(periodic ? 'window-due' : 'non-periodic', outputs.fetch('reason'),
+                     "gate must classify #{input.inspect} as " \
+                     "#{periodic ? 'periodic' : 'non-periodic'}")
+      end
+    end
+  end
+
+  # A completed run's own caller-generated name must be evidence exactly when
+  # the gate would treat that input as periodic; otherwise a later periodic
+  # wake either repeats the pass or skips a pass that never ran.
+  def test_periodic_evidence_classifies_the_callers_raw_wake_token
+    skip 'jq is required for the periodic evidence filter' unless jq_available?
+
+    {
+      ' true ' => true,
+      "\ttrue\t" => true,
+      'true false' => false
+    }.each do |input, periodic|
+      title = periodic_caller_run_name(input)
+      fixture do |dir|
+        outputs = run_periodic_gate(
+          dir, caller_event: 'workflow_dispatch', periodic: 'true', evidence_titles: [title]
+        )
+        assert_equal(periodic ? 'false' : 'true', outputs.fetch('run'),
+                     "caller run name #{title.inspect} must be " \
+                     "#{periodic ? '' : 'non-'}periodic evidence")
+        assert_equal(periodic ? 'duplicate-window' : 'window-due', outputs.fetch('reason'))
+      end
+    end
+  end
+
   # An optional external periodic wake must not become a second scheduler or
   # change any ordinary event path. Both sources share the same domain pass and
   # the cheap window guard runs before checkout/pagination.
@@ -3413,6 +3530,8 @@ class ContinuumTest < Minitest::Test
     assert_includes gate_run, '7 * 60'
     assert_includes gate_run, '10 * 60'
     assert_includes gate_run, '[continuum-periodic]'
+    assert_includes gate_run, '[continuum-wake:'
+    assert_includes gate_run, 'ascii_downcase'
     assert_includes gate_run, 'window-due'
     assert_includes gate_run, 'duplicate-window'
     assert_includes gate_run, 'lookup-unavailable'
@@ -3424,6 +3543,11 @@ class ContinuumTest < Minitest::Test
     crons = events(stub).fetch('schedule').map { |entry| entry.fetch('cron') }
     assert_equal ['7,17,27,37,47,57 * * * *'], crons
     assert_includes stub.fetch('run-name'), '[continuum-periodic]'
+    assert_includes stub.fetch('run-name'), '[continuum-wake:'
+    assert_includes stub.fetch('run-name'),
+                    "contains(format(' {0} ', github.event.inputs.periodic_wake), ' true ')"
+    assert_includes stub.fetch('run-name'),
+                    "format('[continuum-wake:{0}]', github.event.inputs.periodic_wake)"
     dispatch = events(stub).fetch('workflow_dispatch').fetch('inputs').fetch('periodic_wake')
     assert_equal 'string', dispatch.fetch('type')
     assert_equal 'false', dispatch.fetch('default')
@@ -3439,6 +3563,7 @@ class ContinuumTest < Minitest::Test
     assert_equal 'string', automation_dispatch.fetch('type')
     assert_equal 'false', automation_dispatch.fetch('default')
     assert_includes automation.fetch('run-name'), '[continuum-periodic]'
+    assert_includes automation.fetch('run-name'), '[continuum-wake:'
     assert_equal '${{ inputs.periodic_wake }}',
                  automation.fetch('jobs').fetch('scheduler').fetch('with').fetch('periodic_wake')
     doc = File.read(File.join(ROOT, 'docs/cron-job-org.md'))
@@ -5843,6 +5968,9 @@ class ContinuumTest < Minitest::Test
     assert_includes scheduler, 'await dispatchWorkflow(childWorkerWorkflow, {'
     assert_includes scheduler, 'local_opencode_pr_tasks'
     assert_includes scheduler, 'local_opencode_run_tasks'
+    assert_includes scheduler, '($runs | length) >= 100',
+                    'a full third Actions-run page must fail closed as unknown'
+    assert_includes scheduler, 'then "__unknown__" else empty end'
     assert_includes scheduler, 'local_override_active "$task_number"'
     assert_includes scheduler, 'sort_by(._rank, .number)'
     assert_includes scheduler, 'else 3'
@@ -7996,6 +8124,79 @@ class ContinuumTest < Minitest::Test
                     'fork PRs have no label-write token and must be skipped'
   end
 
+  # Label discovery is the only way a successor event can find a repair lock
+  # whose label came from a dispatch-only override. A transient API failure must
+  # be retried, and an exhausted failure must still remove the known labels
+  # before failing so the incomplete reset is visible for a rerun.
+  def test_remove_review_label_reset_retries_and_fails_after_removing_known_labels
+    script = script_body('continuum-remove-review-label.yml')
+    lock_description = 'One automatic OpenCode CI repair attempt per failing PR head.'
+    harness = <<~'JS'.sub('__SCRIPT__', script)
+      const calls = [];
+      const listCalls = [];
+      const attached = JSON.parse(process.env.TEST_ATTACHED_LABELS || '[]');
+      const failures = Number(process.env.TEST_LIST_FAILURES || '0');
+      global.setTimeout = (callback) => { callback(); return 0; };
+      global.context = { issue: { owner: 'owner', repo: 'repo', number: 7 } };
+      global.github = {
+        paginate: async (method, params) => method(params),
+        rest: { issues: {
+          listLabelsOnIssue: async () => {
+            listCalls.push(listCalls.length + 1);
+            if (listCalls.length <= failures) {
+              throw Object.assign(new Error('label API unavailable'), { status: 502 });
+            }
+            return attached;
+          },
+          removeLabel: async ({ name }) => {
+            calls.push(name);
+            throw Object.assign(new Error('not found'), { status: 404 });
+          },
+        } },
+      };
+      console.log = () => {};
+      (async () => {
+      __SCRIPT__
+        process.stdout.write(JSON.stringify({ calls, listCalls }));
+      })().catch((error) => {
+        process.stdout.write(JSON.stringify({ calls, listCalls, error: error.message }));
+        process.exitCode = 1;
+      });
+    JS
+    run = lambda do |failures:, attached: []|
+      environment = {
+        'TEST_ATTACHED_LABELS' => JSON.generate(attached),
+        'TEST_LIST_FAILURES' => failures.to_s,
+        'CI_REPAIR_LABEL' => 'opencode-ci-repair',
+        'CI_REPAIR_LOCK_DESCRIPTION' => lock_description,
+      }
+      Open3.capture3(environment, 'node', '-e', harness)
+    end
+
+    stdout, stderr, status = run.call(
+      failures: 2,
+      attached: [{name: 'dispatch-only-lock', description: lock_description}]
+    )
+    assert status.success?, stderr
+    outcome = JSON.parse(stdout)
+    assert_equal 3, outcome.fetch('listCalls').length,
+                 'a transient label-discovery failure must be retried'
+    assert_equal %w[coderabbit-review-requested dispatch-only-lock opencode-ci-repair review-ready],
+                 outcome.fetch('calls').sort,
+                 'the retry must remove the dispatch-only lock and every known label'
+
+    stdout, stderr, status = run.call(failures: 3)
+    refute status.success?, 'an exhausted label-discovery failure must fail the job'
+    outcome = JSON.parse(stdout)
+    assert_equal 3, outcome.fetch('listCalls').length,
+                 'label discovery must be attempted exactly three times'
+    assert_equal %w[coderabbit-review-requested opencode-ci-repair review-ready],
+                 outcome.fetch('calls').sort,
+                 'known labels must be removed before the failed reset is reported'
+    assert_includes outcome.fetch('error'), 'Rerun',
+                    'the failure must tell the operator that a rerun is required'
+  end
+
   def test_contract_gate_disables_status_publishing_for_fork_and_dependabot_pull_requests
     gate = yaml(File.join(ROOT, '.github/workflows/contract-gate.yml'))
     value = gate.fetch('jobs').fetch('contract').fetch('with').fetch('publish_status')
@@ -10083,6 +10284,48 @@ class ContinuumTest < Minitest::Test
                     'continuum-contract-qualification.yml'
   end
 
+  # kodmial/continuum#286 regression: `mode` was a public `workflow_call`
+  # input (`default: verify`) before Layer 3 moved into
+  # continuum-contract-canary.yml. Dropping it makes an existing consumer
+  # caller that still passes `mode:` fail input validation, so the input stays
+  # accepted, rejects unknown values at runtime, and keeps `canary` meaningful
+  # by exercising the same `evaluate_canary` deadline contract the live probe
+  # uses. The live canary stays a single job in its own write-capable workflow:
+  # a called workflow cannot elevate the caller's token, so a write-capable
+  # canary job here would force the read-only PR caller to grant write scopes.
+  def test_contract_qualification_legacy_mode_input_stays_compatible
+    workflow_path = File.join(ROOT, '.github/workflows/continuum-contract-qualification.yml')
+    workflow = yaml(workflow_path)
+    call = workflow.fetch(true).fetch('workflow_call')
+    mode = call.fetch('inputs').fetch('mode')
+    assert_equal 'string', mode.fetch('type')
+    assert_equal 'verify', mode.fetch('default')
+    assert_equal false, mode.fetch('required')
+    assert_includes mode.fetch('description'), 'verify'
+    assert_includes mode.fetch('description'), 'canary'
+    refute call.fetch('secrets', {}).key?('TAP_PAT'),
+           'the read-only qualification workflow must not require the canary PAT'
+
+    body = File.read(workflow_path)
+    refute_includes body, "process.env.MODE || 'verify'",
+                    'an explicitly empty mode must be rejected, not replaced with verify'
+    assert_includes body, "['verify', 'canary'].includes(mode)",
+                    'the legacy input must reject values other than verify|canary at runtime'
+    assert_includes body, 'Unsupported contract qualification mode'
+    assert_includes body, "if: inputs.mode == 'canary'",
+                    'the legacy canary mode must still select canary behavior'
+    assert_includes body, 'contract.evaluate_canary',
+                    'the legacy canary mode must exercise the shared canary deadline contract'
+
+    # The canary implementation must not be duplicated: the write-capable live
+    # probes stay in exactly one workflow job.
+    canary_jobs = workflow.fetch('jobs').values.select { |job| job['name'] == 'Live canary' }
+    assert_empty canary_jobs, 'the live canary job must not be duplicated into the qualification workflow'
+    live = yaml(File.join(ROOT, '.github/workflows/continuum-contract-canary.yml'))
+    assert_equal 1, live.fetch('jobs').values.count { |job| job['name'] == 'Live canary' },
+                 'the live canary must exist in exactly one job'
+  end
+
   def test_contract_qualification_gate_is_a_first_class_lifecycle
     body = File.read(File.join(ROOT, '.github/workflows/continuum-contract-qualification.yml'))
     assert_includes body, 'bash scripts/validate-continuum.sh', 'Layer 1 regression gate must use the canonical validation entrypoint'
@@ -10118,11 +10361,16 @@ class ContinuumTest < Minitest::Test
                  'the live canary must run on a bounded schedule'
     assert entry_events.key?('workflow_dispatch'),
            'the live canary must stay manually dispatchable'
+    assert_equal %w[canary qualify].sort, entry.fetch('jobs').keys.sort,
+                 'a manual canary dispatch must run the verify layer and the shared canary, ' \
+                 'which is the documented equivalent of the legacy `mode: canary` input'
     assert_equal({}, entry.fetch('permissions'),
                  'the project-owned canary entry must grant nothing itself')
 
     qualify = entry.fetch('jobs').fetch('qualify')
     assert_equal './.github/workflows/continuum-contract-qualification.yml', qualify.fetch('uses')
+    assert_equal 'canary', qualify.fetch('with').fetch('mode'),
+                 'the canary entry must keep the legacy mode input exercised'
     assert_equal %w[actions contents issues pull-requests statuses].sort,
                  qualify.fetch('permissions').keys.sort,
                  'the qualification job must request only read scopes and status writes'

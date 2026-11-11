@@ -45,6 +45,12 @@ STATE_VERSION = 1
 # Long-running consumers may finish after the semantic probe TTL expires.
 MAX_EXECUTION_SECONDS = 6 * 60 * 60
 MAX_PENDING_EXECUTIONS = 128
+# A pinned route retries its own qualification/reservation after a concurrent
+# rewrite; the budget keeps a persistent state race from probing forever.
+MAX_SELECTION_RACE_RETRIES = 1
+# A same-model proof refresh may land slightly ahead of this runner's clock.
+# Anything further ahead is corrupt durable state, not fresh qualification.
+MAX_PROBE_CLOCK_SKEW_SECONDS = 60
 
 
 class RouteError(RuntimeError):
@@ -65,6 +71,14 @@ class Conflict(RouteError):
 
 class SelectionNotVisible(RouteError):
     """The same-run selection receipt may lag a recent Git state ref write."""
+
+
+class StateValidationError(RouteError):
+    """Durable route state is structurally invalid; never a model failure."""
+
+
+class SelectionStateRace(RouteError):
+    """A concurrent writer replaced the selected route's qualification."""
 
 
 class GitHubStateUnavailable(RouteError):
@@ -264,6 +278,20 @@ def route_order(config: Configuration, state: dict, now: int) -> tuple[str, ...]
         allowed.remove(preferred)
         allowed.insert(0, preferred)
     return tuple(allowed)
+
+
+def record_cooldown(current: dict, model: str, deadline: int) -> dict:
+    """Record a cooldown without shortening a longer one from another run."""
+    cooldowns = current.get("cooldowns")
+    if not isinstance(cooldowns, dict):
+        cooldowns = {}
+        current["cooldowns"] = cooldowns
+    try:
+        existing = int(cooldowns.get(model, 0))
+    except (TypeError, ValueError):
+        existing = 0
+    cooldowns[model] = max(existing, int(deadline))
+    return current
 
 
 # A stalled free-quota probe still prints this before `opencode run` hangs.
@@ -550,7 +578,7 @@ class GitRefStore:
                 raise failure from None
             raise RouteError(f"GitHub model state {method} failed ({err.code})") from None
         except ValueError:
-            raise RouteError("GitHub model state response malformed") from None
+            raise GitHubStateUnavailable("malformed response") from None
         except OSError:
             raise GitHubStateUnavailable("transient") from None
 
@@ -614,9 +642,9 @@ def reserve_completion(state: dict, ticket: str, model: str, now: int,
     """Record qualified-at-selection proof without extending semantic TTL."""
     if not (0 <= now - probe_at <= 86400):
         raise RouteError("Invalid qualification timestamp")
-    pending = state.get("qualified_selections") or {}
+    pending = state.get("qualified_selections", {})
     if not isinstance(pending, dict):
-        raise RouteError("Corrupt model selection state")
+        raise StateValidationError("Corrupt model selection state")
     active = {
         key: value for key, value in pending.items()
         if isinstance(value, dict) and isinstance(value.get("at"), int)
@@ -864,79 +892,162 @@ def run() -> int:
     state, _, _ = store.read(key)
     if state.get("fingerprint") != fingerprint:
         state = {}
+    pending = state.get("qualified_selections", {})
+    if not isinstance(pending, dict):
+        # Corrupt durable state is a state failure, not a route qualification
+        # failure: reject it before probing or cooling down any model.
+        raise StateValidationError("Corrupt model selection state")
     order = route_order(config, state, now)
     if not order:
         publish_cooldown_not_before(config, state, now)
         raise RouteError("All trusted routes are cooling down")
     errors = {}
     for model in order:
-        last_probe = state.get("last_successful_probe") or {}
-        qualified = (last_probe.get("model") == model
-                     and now - int(last_probe.get("at", 0)) <= config.ttl)
-        try:
-            if not qualified:
-                semantic_probe(model, "review" if config.task_class == "review" else "coder",
-                               config.timeout)
-        except LocalRuntimeError:
-            # Process creation failed locally, before the provider was contacted.
-            # This runner/runtime fault is shared by every route: do not quarantine
-            # the selected model or spend time probing the rest of the pool.
-            raise
-        except GitHubStateUnavailable:
-            # A GitHub state-store rate limit/transport failure is never a
-            # model-provider failure: do not cool down an otherwise working
-            # route. The sanitized not-before epoch is published at the CLI
-            # boundary instead.
-            raise
-        except BurnedRunner:
-            def pause(current, *, selected_model=model):
-                if current.get("fingerprint") != fingerprint:
-                    current = {"fingerprint": fingerprint, "cooldowns": {}}
-                current.setdefault("cooldowns", {})[selected_model] = now + config.cooldown
-                return current
-            try:
-                store.update(key, pause)
-            except RouteError:
-                # The runner is burned regardless; a state-store failure
-                # must not mask the exit-75 runner-death outcome.
-                pass
-            raise
-        except RouteError as error:
-            errors[model] = str(error)
-            def pause(current, *, selected_model=model):
-                if current.get("fingerprint") != fingerprint:
-                    current = {"fingerprint": fingerprint, "cooldowns": {}}
-                current.setdefault("cooldowns", {})[selected_model] = now + config.cooldown
-                return current
-            store.update(key, pause)
-            if config.pinned:
+        stop = False
+        race_attempts = 0
+        while True:
+            # A concurrent run may cool this route after the snapshot (or after
+            # a race refresh); never probe or reserve a route in cooldown.
+            cooldowns = state.get("cooldowns") or {}
+            if now < int(cooldowns.get(model, 0)):
+                errors[model] = "Route is cooling down"
+                stop = config.pinned
                 break
-            continue
-        # The route qualified. Persist the selection outside the probe error
-        # handlers: a state-store Conflict/transport failure must propagate
-        # without cooling down a healthy route or failing over.
-        def save(current, *, selected_model=model):
-            if current.get("fingerprint") != fingerprint:
-                current = {"fingerprint": fingerprint, "cooldowns": {}}
-            current.update(schema=STATE_VERSION, fingerprint=fingerprint,
-                           runtime={"version": version, "sha256": digest},
-                           task_class=config.task_class)
-            if not qualified:
-                current["last_successful_probe"] = {"model": selected_model, "at": now}
-            # The proof's TTL is evaluated at selection time. The
-            # trusted run identity, not probe age at completion, is
-            # authoritative for a successful task receipt.
-            chosen_probe = current.get("last_successful_probe") or {}
-            if chosen_probe.get("model") != selected_model:
-                raise RouteError("Selected route has no qualification")
-            at = int(chosen_probe.get("at", 0))
-            if not 0 <= now - at <= config.ttl:
-                raise RouteError("Selected probe expired before task start")
-            return reserve_completion(current, ticket, selected_model, now, at)
-        store.update(key, save)
-        write_outputs(env, {"model": model})
-        print(model)
-        return 0
+            last_probe = state.get("last_successful_probe") or {}
+            try:
+                probe_at = int(last_probe.get("at", 0))
+            except (TypeError, ValueError):
+                probe_at = 0
+            qualified = (
+                last_probe.get("model") == model
+                and probe_at <= now + MAX_PROBE_CLOCK_SKEW_SECONDS
+                and now - probe_at <= config.ttl
+            )
+            try:
+                if not qualified:
+                    semantic_probe(model, "review" if config.task_class == "review" else "coder",
+                                   config.timeout)
+            except LocalRuntimeError:
+                # Process creation failed locally, before the provider was contacted.
+                # This runner/runtime fault is shared by every route: do not quarantine
+                # the selected model or spend time probing the rest of the pool.
+                raise
+            except GitHubStateUnavailable:
+                # A GitHub state-store rate limit/transport failure is never a
+                # model-provider failure: do not cool down an otherwise working
+                # route. The sanitized not-before epoch is published at the CLI
+                # boundary instead.
+                raise
+            except BurnedRunner:
+                def pause(current, *, selected_model=model,
+                          deadline=now + config.cooldown):
+                    if current.get("fingerprint") != fingerprint:
+                        current = {"fingerprint": fingerprint, "cooldowns": {}}
+                    return record_cooldown(current, selected_model, deadline)
+                try:
+                    store.update(key, pause)
+                except RouteError:
+                    # The runner is burned regardless; a state-store failure
+                    # must not mask the exit-75 runner-death outcome.
+                    pass
+                raise
+            except RouteError as error:
+                errors[model] = str(error)
+                def pause(current, *, selected_model=model,
+                          deadline=now + config.cooldown):
+                    if current.get("fingerprint") != fingerprint:
+                        current = {"fingerprint": fingerprint, "cooldowns": {}}
+                    return record_cooldown(current, selected_model, deadline)
+                store.update(key, pause)
+                stop = config.pinned
+                break
+            # The route qualified. Persist the selection outside the probe error
+            # handlers: a state-store Conflict/transport failure must propagate
+            # without cooling down a healthy route or failing over.
+            def save(current, *, selected_model=model, snapshot_now=now,
+                     was_qualified=qualified):
+                if current.get("fingerprint") != fingerprint:
+                    current = {"fingerprint": fingerprint, "cooldowns": {}}
+                # Another run may cool this route after the snapshot check
+                # above. Re-check against the state being updated so a cooled
+                # route is never reserved or returned; the handler refreshes
+                # the snapshot and retries or fails over on the same path as
+                # a selection-state race.
+                cooldowns = current.get("cooldowns")
+                if isinstance(cooldowns, dict):
+                    try:
+                        cooled_until = int(cooldowns.get(selected_model, 0))
+                    except (TypeError, ValueError):
+                        cooled_until = 0
+                    if snapshot_now < cooled_until:
+                        raise SelectionStateRace("Selected route is cooling down")
+                current.update(schema=STATE_VERSION, fingerprint=fingerprint,
+                               runtime={"version": version, "sha256": digest},
+                               task_class=config.task_class)
+                if not was_qualified:
+                    current["last_successful_probe"] = {
+                        "model": selected_model, "at": snapshot_now}
+                # The proof's TTL is evaluated at selection time. The
+                # trusted run identity, not probe age at completion, is
+                # authoritative for a successful task receipt.
+                chosen_probe = current.get("last_successful_probe") or {}
+                if chosen_probe.get("model") != selected_model:
+                    raise SelectionStateRace("Selected route has no qualification")
+                at = int(chosen_probe.get("at", 0))
+                if at > snapshot_now + MAX_PROBE_CLOCK_SKEW_SECONDS:
+                    raise StateValidationError(
+                        "Model probe timestamp is implausibly far in the future")
+                if at > snapshot_now:
+                    # A concurrent writer refreshed this same model's proof
+                    # after our snapshot. Treat bounded skew as fresh at our
+                    # snapshot so a healthy route is not cooled down and no
+                    # future timestamp enters the selection receipt.
+                    at = snapshot_now
+                if not 0 <= snapshot_now - at <= config.ttl:
+                    raise RouteError("Selected probe expired before task start")
+                return reserve_completion(
+                    current, ticket, selected_model, snapshot_now, at)
+            try:
+                store.update(key, save)
+            except (GitHubStateUnavailable, Conflict, StateValidationError):
+                # A state-store Conflict/transport failure or corrupt durable state
+                # is never a model-provider failure: never cool down a healthy
+                # route for it.
+                raise
+            except SelectionStateRace as error:
+                # A concurrent writer replaced this route's qualification between
+                # probe and reservation. The route itself is healthy, so refresh
+                # the snapshot. A pinned route retries its own qualification or
+                # reservation instead of exiting; an unpinned pool fails over.
+                errors[model] = str(error)
+                state, _, _ = store.read(key)
+                if state.get("fingerprint") != fingerprint:
+                    state = {}
+                if config.pinned and race_attempts < MAX_SELECTION_RACE_RETRIES:
+                    race_attempts += 1
+                    now = max(now, int(time.time()))
+                    continue
+                stop = config.pinned
+                break
+            except RouteError as error:
+                # The route lost its qualification for a non-concurrency reason
+                # (for example its proof expired before task start). That is a
+                # route-level failure: cool down this model and keep failing over,
+                # exactly like a probe error.
+                errors[model] = str(error)
+                def pause(current, *, selected_model=model,
+                          deadline=now + config.cooldown):
+                    if current.get("fingerprint") != fingerprint:
+                        current = {"fingerprint": fingerprint, "cooldowns": {}}
+                    return record_cooldown(current, selected_model, deadline)
+                store.update(key, pause)
+                stop = config.pinned
+                break
+            write_outputs(env, {"model": model})
+            print(model)
+            return 0
+        if stop:
+            break
     # Probes can cool every route within this selection attempt. Persist the
     # actual next eligible epoch instead of immediately spending review retries.
     latest_state, _, _ = store.read(key)

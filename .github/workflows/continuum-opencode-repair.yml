@@ -399,6 +399,11 @@ jobs:
             echo "PR #$PR_NUMBER carries no task snapshot reference (legacy, pre-guard PR); repair proceeds explicitly without drift protection."
           fi
 
+          # This description is the durable marker that
+          # continuum-remove-review-label.yml uses to reset a lock label chosen
+          # only through the `ci_repair_label` dispatch input; keep the literal
+          # identical to `CI_REPAIR_LOCK_DESCRIPTION` there and to the
+          # workflow_run path's `lock_description` below.
           gh label create "$CI_REPAIR_LABEL" --repo "$GITHUB_REPOSITORY" --color FBCA04 \
             --description "One automatic OpenCode CI repair attempt per failing PR head." \
             --force >/dev/null
@@ -595,6 +600,11 @@ jobs:
             exit 0
           fi
           lock_label="$CI_REPAIR_LABEL"
+          # This description is the durable marker that
+          # continuum-remove-review-label.yml uses to reset a lock label chosen
+          # only through the `ci_repair_label` dispatch input; keep the literal
+          # identical to `CI_REPAIR_LOCK_DESCRIPTION` there and to the
+          # dispatch path's `--description` above.
           lock_description="One automatic OpenCode CI repair attempt per failing PR head."
 
           pr=$(gh api "repos/$GITHUB_REPOSITORY/commits/$RUN_HEAD_SHA/pulls" \

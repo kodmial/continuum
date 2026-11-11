@@ -590,8 +590,10 @@ jobs:
           if [[ "${CALLER_EVENT_NAME,,}" == "schedule" ]]; then
             periodic=true
           fi
-          case "${PERIODIC_WAKE,,}" in
-            true|1|yes|on) periodic=true ;;
+          periodic_wake_trimmed="${PERIODIC_WAKE#"${PERIODIC_WAKE%%[![:space:]]*}"}"
+          periodic_wake_trimmed="${periodic_wake_trimmed%"${periodic_wake_trimmed##*[![:space:]]}"}"
+          case "${periodic_wake_trimmed,,}" in
+            true) periodic=true ;;
           esac
           if [[ "$periodic" != "true" ]]; then
             emit true "non-periodic"
@@ -616,12 +618,27 @@ jobs:
           fi
 
           created="$(date -u -d "@$window_start" +%Y-%m-%dT%H:%M:%SZ)"
-          filter='[.workflow_runs[]
+          # GitHub expressions cannot trim arbitrary whitespace in the caller's
+          # run-name, so a workflow_dispatch also stamps its raw periodic_wake
+          # value in `[continuum-wake:...]`. Prefer that token and normalize it
+          # exactly like the gate (trim + case-fold), then fall back to the
+          # legacy marker for runs created before the token existed.
+          filter='def periodic_run:
+              .event == "schedule"
+              or (.event == "workflow_dispatch" and
+                  ((.display_title // "") as $title
+                   | if ($title | test("\\[continuum-wake:")) then
+                       (($title | try capture("(?s)\\[continuum-wake:(?<wake>.*)\\]$").wake catch null)
+                        | if . == null then false
+                          else (gsub("^\\s+|\\s+$"; "") | ascii_downcase) == "true"
+                          end)
+                     else
+                       ($title | contains("[continuum-periodic]"))
+                     end));
+            [.workflow_runs[]
             | select(.id != '"$GITHUB_RUN_ID"')
             | select(.status == "completed" and .conclusion == "success")
-            | select(.event == "schedule" or
-                (.event == "workflow_dispatch" and
-                 ((.display_title // "") | contains("[continuum-periodic]"))))'
+            | select(periodic_run)'
           if [[ -n "${DEFAULT_BRANCH:-}" ]]; then
             filter="$filter"'
             | select((.head_branch // "") == "'"$DEFAULT_BRANCH"'")'
@@ -938,7 +955,6 @@ jobs:
               done <<<"$open_pr_tasks"
             fi
 
-            local_opencode_inventory_unknown=false
             if ! local_opencode_pr_tasks="$(
               gh pr list --repo "$child_repo" --state open --limit 100 \
                 --json headRefName \
@@ -946,29 +962,33 @@ jobs:
                 | sed -nE 's#^opencode/issue([0-9]+)-.*#\1#p'
             )"; then
               echo "::warning::Could not list open OpenCode PRs for $child_repo; treating its OpenCode WIP inventory as unknown for this pass."
-              local_opencode_pr_tasks=""
-              local_opencode_inventory_unknown=true
+              # Fail closed: a lookup failure must never read as an empty
+              # inventory, which would admit a second worker for a task a local
+              # run already owns. The legacy dispatcher uses the same sentinel.
+              local_opencode_pr_tasks="__unknown__"
             fi
-            local_opencode_run_tasks=()
-            # The scheduler only needs recent active work. Bound this lookup to
-            # the latest 300 runs instead of paginating the full Actions history.
-            for page in 1 2 3; do
-              if ! page_tasks="$(gh api "repos/$child_repo/actions/runs?per_page=100&page=$page" \
-                --jq '.workflow_runs[]
-                  | select(.status != "completed")
-                  | .display_title
-                  | select(test("^OpenCode issue #[0-9]+$"))
-                  | capture("^OpenCode issue #(?<task>[0-9]+)$").task' \
-                2>/dev/null)"; then
-                echo "::warning::Could not list active OpenCode runs for $child_repo; treating its OpenCode WIP inventory as unknown for this pass."
-                local_opencode_inventory_unknown=true
-                break
-              fi
-              while IFS= read -r local_task; do
-                [[ -n "$local_task" ]] || continue
-                local_opencode_run_tasks+=("$local_task")
-              done <<<"$page_tasks"
-            done
+            local_opencode_run_tasks="$(
+              # The scheduler only needs recent active work. Bound this lookup to
+              # the latest 300 runs instead of paginating the full Actions history.
+              # A full third page means older active work may sit outside the
+              # window, so fail closed with the same unknown sentinel.
+              for page in 1 2 3; do
+                if ! gh api "repos/$child_repo/actions/runs?per_page=100&page=$page" \
+                  --jq '.workflow_runs as $runs
+                    | ( $runs[]
+                        | select(.status != "completed")
+                        | .display_title
+                        | select(test("^OpenCode issue #[0-9]+$"))
+                        | capture("^OpenCode issue #(?<task>[0-9]+)$").task ),
+                      (if ('"$page"' == 3 and ($runs | length) >= 100)
+                        then "__unknown__" else empty end)' \
+                  2>/dev/null; then
+                  echo "::warning::Could not read the Actions run inventory for child $child_id (page $page); treating it as unknown for this pass." >&2
+                  echo "__unknown__"
+                  break
+                fi
+              done
+            )"
             child_owner="$(gh api "repos/$child_repo" --jq '.owner.login' 2>/dev/null || true)"
             command_grace_seconds=$(( COMMAND_GRACE_MINUTES * 60 ))
             command_parser="$CONTINUUM_ENGINE_ROOT/.github/scripts/opencode_command.py"
@@ -976,13 +996,14 @@ jobs:
             local_override_active() {
               local task_number="$1"
               local recent_command command_epoch now_epoch grace_since
-              # An unavailable PR or run inventory is not evidence of no local
-              # work. Block delegated admission for this child on this pass.
-              if [[ "$local_opencode_inventory_unknown" == "true" ]]; then
+              # Fail closed: an unknown inventory means active work cannot be
+              # ruled out, so never dispatch behind it.
+              if grep -Fxq "__unknown__" <<<"$local_opencode_pr_tasks" ||
+                 grep -Fxq "__unknown__" <<<"$local_opencode_run_tasks"; then
                 return 0
               fi
               if grep -Fxq "$task_number" <<<"$local_opencode_pr_tasks" ||
-                 printf '%s\n' "${local_opencode_run_tasks[@]}" | grep -Fxq "$task_number"; then
+                 grep -Fxq "$task_number" <<<"$local_opencode_run_tasks"; then
                 return 0
               fi
               [[ -n "$child_owner" ]] || return 1

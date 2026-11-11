@@ -146,11 +146,8 @@ def is_non_merge_critical_main_path(path: Any) -> bool:
     ``.github/scripts/`` and ``.github/actions/`` surfaces are control-plane
     code and always merge-critical; docs, other ``.github/`` metadata,
     license/ignore/changelog entries are not. The two auto-merge workflows
-    still hold inline copies that only recognize the
-    ``.github/workflows/continuum-*`` prefix; the ``pr/part-2`` change adds
-    the full ``.github/workflows/``, ``.github/scripts/``, and
-    ``.github/actions/`` prefix checks to those copies, so exact equality is
-    not claimed until then.
+    hold inline copies that mirror these exact prefix checks, so merge-gate
+    parity holds across all four copies.
     """
 
     text = str(path or "")

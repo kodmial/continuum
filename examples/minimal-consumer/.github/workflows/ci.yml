@@ -18,6 +18,10 @@ jobs:
     with:
       continuum_ref: main
       auto_detect: 'false'
+      # Fork and Dependabot pull requests receive a read-only GITHUB_TOKEN, so
+      # they cannot publish the continuum/validation commit status or dispatch
+      # repair. Consumers that accept those PRs must require the `Validate` job
+      # check rather than the custom status context (see docs/quickstart.md).
       publish_status: ${{ github.event_name == 'pull_request' && (github.event.pull_request.head.repo.fork || github.actor == 'dependabot[bot]') && 'false' || 'true' }}
       dispatch_repair: ${{ github.event_name == 'pull_request' && (github.event.pull_request.head.repo.fork || github.actor == 'dependabot[bot]') && 'false' || 'true' }}
       build_command: python3 -m compileall -q app.py tests

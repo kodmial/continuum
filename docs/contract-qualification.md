@@ -60,6 +60,26 @@ The probe explicitly verifies:
   the stalled stage, triggers bounded autonomous recovery where safe
   (`MAX_CANARY_RECOVERY_ATTEMPTS`), and otherwise fails loudly.
 
+### Manual dispatch and the legacy `mode` input
+
+`mode` remains a public `workflow_call` input on
+`continuum-contract-qualification.yml` (`type: string`, `default: verify`,
+accepted values `verify` and `canary`) so existing callers that still pass
+`mode:` do not fail input validation. `mode: verify` is the PR-evidence path.
+`mode: canary` additionally runs the read-only canary-deadline contract probe
+(`evaluate_canary`), which is the legacy behavior of that input.
+
+The live, write-capable canary is deliberately *not* executed from this
+workflow: a called workflow cannot elevate the caller's `GITHUB_TOKEN`, so a
+write-capable canary job here would force the read-only pull-request caller to
+grant issue/action writes. The live canary therefore lives once, in
+`continuum-contract-canary.yml`, and is never reimplemented here.
+
+The manual dispatch equivalent of `mode: canary` is the project-owned
+`Contract qualification canary` workflow (`contract-qualification-canary.yml`):
+choosing **Run workflow** executes the qualification job and the live canary
+job in one run. Both routes drive the same single canary implementation.
+
 ## Main-branch safety (server-side, required)
 
 Code cannot protect `main` by itself. Configure GitHub branch protection

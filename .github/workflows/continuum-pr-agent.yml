@@ -67,8 +67,8 @@ on:
         required: false
       max_tokens:
         description: >-
-          Token/output limit forwarded as the custom-model cap. Empty falls
-          back to vars.PR_AGENT_MAX_TOKENS, then to '128000'.
+          Custom-model context cap used for PR-Agent prompt budgeting. Empty
+          falls back to vars.PR_AGENT_MAX_TOKENS, then to '128000'.
         type: string
         default: ''
         required: false

@@ -507,6 +507,7 @@ class GlobalPrWatchdogTest(unittest.TestCase):
             outcome["result"]["counters"]["request_failures_by_status"].get("403"), 1
         )
         self.assertEqual(outcome["result"]["counters"]["reconciler_dispatches"], 3)
+
     def test_continuum_own_repository_is_excluded_by_id(self):
         own = repo(CONTINUUM_REPO_ID, "owner-self", "repo-self")
         other = repo(131, "owner-guest", "repo-guest")

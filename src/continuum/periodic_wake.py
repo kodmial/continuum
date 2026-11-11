@@ -8,10 +8,13 @@ instead of a second reconciliation pass.
 
 The issue scheduler's native cadence is ``7,17,27,37,47,57 * * * *``: a
 10-minute window anchored at minute 7. The external workflow-dispatch run is
-marked in its ``run-name`` with :data:`PERIODIC_RUN_MARKER`; native runs are
-identified by ``event == "schedule"``. A completed successful run from either
-source inside the current window is processing evidence, and a later periodic
-signal in that window does not run the domain work.
+marked in its ``run-name`` with :data:`PERIODIC_RUN_MARKER`, and also carries
+its raw ``periodic_wake`` input in a ``[continuum-wake:...]`` token; native
+runs are identified by ``event == "schedule"``. The token is trimmed and
+case-folded so the caller and gate agree even for padded inputs. A completed
+successful run from either source inside the current window is processing
+evidence, and a later periodic signal in that window does not run the domain
+work.
 
 Only successful completed runs count. A failed, cancelled, timed-out or
 in-progress run leaves the window open so the next tick retries. A lookup
@@ -23,6 +26,7 @@ gated by this periodic-only guard.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Iterable, Mapping, Optional
@@ -31,6 +35,14 @@ from typing import Any, Iterable, Mapping, Optional
 # ``periodic_wake`` is the string ``true``. Native schedule runs need no
 # marker because their event name is already unambiguous.
 PERIODIC_RUN_MARKER = "[continuum-periodic]"
+
+# Every workflow_dispatch also carries the raw input in this token because a
+# GitHub expression cannot trim arbitrary whitespace. The token is
+# authoritative when present; the fixed marker above remains the fallback for
+# runs created before the token existed.
+_PERIODIC_WAKE_TOKEN = re.compile(
+    r"\[continuum-wake:(.*)\]\s*$", re.DOTALL
+)
 
 # Native Issue scheduler cron: 7,17,27,37,47,57 * * * *.
 ISSUE_SCHEDULER_INTERVAL_SECONDS = 10 * 60
@@ -114,7 +126,13 @@ def is_periodic_evidence(
 
     event = str(run.get("event") or "")
     title = str(run.get("display_title") or run.get("displayTitle") or "")
-    periodic_dispatch = event == "workflow_dispatch" and PERIODIC_RUN_MARKER in title
+    periodic_dispatch = False
+    if event == "workflow_dispatch":
+        wake_token = _PERIODIC_WAKE_TOKEN.search(title)
+        if wake_token is not None:
+            periodic_dispatch = parse_periodic_wake(wake_token.group(1))
+        else:
+            periodic_dispatch = PERIODIC_RUN_MARKER in title
     if event != "schedule" and not periodic_dispatch:
         return False
 
