@@ -8124,6 +8124,79 @@ class ContinuumTest < Minitest::Test
                     'fork PRs have no label-write token and must be skipped'
   end
 
+  # Label discovery is the only way a successor event can find a repair lock
+  # whose label came from a dispatch-only override. A transient API failure must
+  # be retried, and an exhausted failure must still remove the known labels
+  # before failing so the incomplete reset is visible for a rerun.
+  def test_remove_review_label_reset_retries_and_fails_after_removing_known_labels
+    script = script_body('continuum-remove-review-label.yml')
+    lock_description = 'One automatic OpenCode CI repair attempt per failing PR head.'
+    harness = <<~'JS'.sub('__SCRIPT__', script)
+      const calls = [];
+      const listCalls = [];
+      const attached = JSON.parse(process.env.TEST_ATTACHED_LABELS || '[]');
+      const failures = Number(process.env.TEST_LIST_FAILURES || '0');
+      global.setTimeout = (callback) => { callback(); return 0; };
+      global.context = { issue: { owner: 'owner', repo: 'repo', number: 7 } };
+      global.github = {
+        paginate: async (method, params) => method(params),
+        rest: { issues: {
+          listLabelsOnIssue: async () => {
+            listCalls.push(listCalls.length + 1);
+            if (listCalls.length <= failures) {
+              throw Object.assign(new Error('label API unavailable'), { status: 502 });
+            }
+            return attached;
+          },
+          removeLabel: async ({ name }) => {
+            calls.push(name);
+            throw Object.assign(new Error('not found'), { status: 404 });
+          },
+        } },
+      };
+      console.log = () => {};
+      (async () => {
+      __SCRIPT__
+        process.stdout.write(JSON.stringify({ calls, listCalls }));
+      })().catch((error) => {
+        process.stdout.write(JSON.stringify({ calls, listCalls, error: error.message }));
+        process.exitCode = 1;
+      });
+    JS
+    run = lambda do |failures:, attached: []|
+      environment = {
+        'TEST_ATTACHED_LABELS' => JSON.generate(attached),
+        'TEST_LIST_FAILURES' => failures.to_s,
+        'CI_REPAIR_LABEL' => 'opencode-ci-repair',
+        'CI_REPAIR_LOCK_DESCRIPTION' => lock_description,
+      }
+      Open3.capture3(environment, 'node', '-e', harness)
+    end
+
+    stdout, stderr, status = run.call(
+      failures: 2,
+      attached: [{name: 'dispatch-only-lock', description: lock_description}]
+    )
+    assert status.success?, stderr
+    outcome = JSON.parse(stdout)
+    assert_equal 3, outcome.fetch('listCalls').length,
+                 'a transient label-discovery failure must be retried'
+    assert_equal %w[coderabbit-review-requested dispatch-only-lock opencode-ci-repair review-ready],
+                 outcome.fetch('calls').sort,
+                 'the retry must remove the dispatch-only lock and every known label'
+
+    stdout, stderr, status = run.call(failures: 3)
+    refute status.success?, 'an exhausted label-discovery failure must fail the job'
+    outcome = JSON.parse(stdout)
+    assert_equal 3, outcome.fetch('listCalls').length,
+                 'label discovery must be attempted exactly three times'
+    assert_equal %w[coderabbit-review-requested opencode-ci-repair review-ready],
+                 outcome.fetch('calls').sort,
+                 'known labels must be removed before the failed reset is reported'
+    assert_includes outcome.fetch('error'), 'Rerun',
+                    'the failure must tell the operator that a rerun is required'
+  end
+
   def test_contract_gate_disables_status_publishing_for_fork_and_dependabot_pull_requests
     gate = yaml(File.join(ROOT, '.github/workflows/contract-gate.yml'))
     value = gate.fetch('jobs').fetch('contract').fetch('with').fetch('publish_status')
