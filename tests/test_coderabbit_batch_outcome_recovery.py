@@ -46,11 +46,24 @@ const github = {
   pulls:{get:async()=>({data:{state:'open',head:{
     sha:head,ref:'opencode/issue212-123',repo:{full_name:'kodmial/nanodictate'}}}})},
   actions:{
-   listWorkflowRuns:async()=>({data:{workflow_runs:[{
-      display_title:'OpenCode repair PR #226',
-      status:process.env.RUN_STATE,
-      created_at:at
-   }]}}),
+   listWorkflowRuns:async ({status})=>{
+     if (process.env.RUN_STATE === 'missing') {
+       return {data:{workflow_runs:[]}};
+     }
+     if (process.env.RUN_STATE === 'overflow_active') {
+       if (status) return {data:{workflow_runs:status === 'in_progress' ? [{
+         display_title:'OpenCode repair PR #226',status:'in_progress',created_at:at
+       }] : []}};
+       return {data:{workflow_runs:Array.from({length:100}, (_,i)=>({
+         display_title:'Other PR #'+i,status:'completed',created_at:at
+       }))}};
+     }
+     return {data:{workflow_runs:[{
+       display_title:'OpenCode repair PR #226',
+       status:process.env.RUN_STATE,
+       created_at:at
+     }]}};
+   },
    createWorkflowDispatch:async params=>{emitted.push(params);}
   },
   repos:{getContent:async()=>({data:{
@@ -101,6 +114,18 @@ const github = {
         self.assertEqual(
             len(self.exercise(run_state="in_progress")["dispatches"]), 0,
         )
+
+    def test_bounded_history_does_not_hide_an_old_active_run(self):
+        self.assertEqual(
+            len(self.exercise(marker_minutes=12,
+                              run_state="overflow_active")["dispatches"]), 0,
+        )
+
+    def test_invisible_finished_run_retries_after_backoff_not_four_hours(self):
+        result = self.exercise(marker_minutes=12, run_state="missing")
+        self.assertEqual(len(result["dispatches"]), 1)
+        self.assertTrue(any("no active repair found" in m
+                            for m in result["messages"]))
 
     def test_auto_merge_wakes_batcher_when_marker_is_not_completion(self):
         source = AUTO_MERGE.read_text(encoding="utf-8")

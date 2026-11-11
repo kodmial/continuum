@@ -500,15 +500,15 @@ jobs:
               const matching = recentRuns.filter(run =>
                 isRepair(run) && Date.parse(run.created_at || '') >= latestAt - 15_000
               );
-              if (!matching.length && Date.now() - latestAt < 4 * 60 * 60_000) {
-                // A bounded workflow-run listing may lose a busy run outside
-                // the window. Do not race an unobservable in-flight agent;
-                // the periodic reconciliation can retry after that deadline.
-                core.warning('Previous dispatch run not visible in bounded Actions history; deferring.');
-                return;
+              // After the bounded retry delay, absence from recent history
+              // is NOT a four-hour lock. The active-status inventory above
+              // already excludes live repairs (including aged active runs).
+              // Resume safely if the old dispatch is completed or invisible.
+              if (!matching.length) {
+                core.warning('Previous dispatch is no longer in recent Actions history; no active repair found. Retrying after bounded backoff.');
               }
               core.warning(
-                `CodeRabbit batch remains unresolved on identical HEAD after ${attempts.length} completed dispatch(es). Re-dispatching through canonical OpenCode with bounded backoff.`
+                `CodeRabbit batch remains unresolved on identical HEAD after ${attempts.length} dispatch(es). Re-dispatching through canonical OpenCode with bounded backoff.`
               );
             }
 
