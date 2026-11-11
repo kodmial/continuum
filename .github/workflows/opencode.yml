@@ -155,6 +155,10 @@ permissions:
 
 jobs:
   call:
+    # /oc-repair is handled by owner-coderabbit-repair, not interactive github run.
+    if: >-
+      github.event_name != 'issue_comment' ||
+      !startsWith(github.event.comment.body, '/oc-repair ')
     uses: ./.github/workflows/continuum-opencode.yml
     secrets: inherit
     with:
