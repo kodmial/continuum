@@ -195,3 +195,96 @@ jobs:
       recovery_checkpoint_sha: "${{ inputs.recovery_identity && fromJSON(inputs.recovery_identity).recovery_checkpoint_sha || '' }}"
       recovery_stage: "${{ inputs.recovery_identity && fromJSON(inputs.recovery_identity).recovery_stage || '' }}"
       recovery_generation: "${{ inputs.recovery_identity && fromJSON(inputs.recovery_identity).recovery_generation || '' }}"
+
+  # Owner-authenticated escape hatch for an already-reviewed PR whose
+  # no-auto-merge hold suppresses the merge controller's reconciliation.
+  # It starts the canonical repair only; it NEVER merges or removes the hold.
+  owner-coderabbit-repair:
+    name: Dispatch existing CodeRabbit findings (owner)
+    if: >-
+      github.event_name == 'issue_comment' &&
+      github.event.action == 'created' &&
+      github.actor == github.repository_owner &&
+      github.event.issue.pull_request &&
+      startsWith(github.event.comment.body, '/oc-repair ')
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      actions: write
+      contents: read
+      pull-requests: read
+    steps:
+      - name: Validate exact review and dispatch canonical repair from main
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
+        env:
+          OWNER_REPAIR_COMMAND: ${{ github.event.comment.body }}
+          OWNER_REPAIR_PR: ${{ github.event.issue.number }}
+          REPAIR_PAT: ${{ secrets.TAP_PAT }}
+        with:
+          github-token: ${{ secrets.TAP_PAT }}
+          script: |
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const command = String(process.env.OWNER_REPAIR_COMMAND || '').trim();
+            const parsed = /^\/oc-repair ([1-9][0-9]*)$/.exec(command);
+            const number = Number(process.env.OWNER_REPAIR_PR);
+            if (!parsed || !Number.isSafeInteger(number) || number < 1 ||
+                !process.env.REPAIR_PAT) {
+              throw new Error('Invalid owner repair request or missing dispatch credentials.');
+            }
+            const reviewId = Number(parsed[1]);
+            if (!Number.isSafeInteger(reviewId)) throw new Error('Invalid CodeRabbit review ID.');
+            const { data: pr } = await github.rest.pulls.get({
+              owner, repo, pull_number: number,
+            });
+            if (pr.state !== 'open' || pr.draft ||
+                pr.head?.repo?.full_name !== `${owner}/${repo}` ||
+                !/^[A-Za-z0-9._/-]+$/.test(pr.head.ref) ||
+                pr.head.ref.includes('..') ||
+                pr.labels.some(label => ['automation:blocked', 'automation:paused'].includes(label.name))) {
+              throw new Error('PR is not eligible for owner-requested code repair.');
+            }
+            const { data: review } = await github.rest.pulls.getReview({
+              owner, repo, pull_number: number, review_id: reviewId,
+            });
+            if (review.user?.login !== 'coderabbitai[bot]' ||
+                review.commit_id !== pr.head.sha ||
+                !['CHANGES_REQUESTED', 'COMMENTED'].includes(review.state)) {
+              throw new Error('CodeRabbit review identity is stale, non-actionable, or untrusted.');
+            }
+            const findings = await github.paginate(github.rest.pulls.listReviewComments, {
+              owner, repo, pull_number: number, per_page: 100,
+            });
+            const actionable = findings.filter(item =>
+              item.pull_request_review_id === reviewId &&
+              item.user?.login === 'coderabbitai[bot]' &&
+              item.in_reply_to_id == null
+            );
+            if (!actionable.length) {
+              throw new Error('CodeRabbit review has no actionable original inline findings.');
+            }
+            const { data: runs } = await github.rest.actions.listWorkflowRuns({
+              owner, repo, workflow_id: 'opencode.yml',
+              event: 'workflow_dispatch', per_page: 100,
+            });
+            if (runs.workflow_runs.some(run =>
+                run.status !== 'completed' &&
+                run.display_title === `OpenCode repair PR #${number}`)) {
+              core.notice('Canonical CodeRabbit fix is already in progress; suppressing duplicate.');
+              return;
+            }
+            await github.rest.actions.createWorkflowDispatch({
+              owner, repo, workflow_id: 'opencode.yml',
+              ref: context.payload.repository.default_branch,
+              inputs: {
+                mode: 'coderabbit-fix',
+                pr_number: String(number),
+                head_ref: pr.head.ref,
+                review_id: String(reviewId),
+              },
+            });
+            core.notice(
+              `Dispatched canonical coderabbit-fix for PR #${number} ` +
+              `at exact HEAD ${pr.head.sha}; review ${reviewId}; ` +
+              `${actionable.length} original inline findings. no-auto-merge unchanged.`
+            );
