@@ -1,8 +1,25 @@
 {
   "$schema": "https://opencode.ai/config.json",
+  "websearch": {
+    "provider": "exa"
+  },
   "permission": {
     "external_directory": "deny",
     "doom_loop": "deny",
-    "question": "deny"
-  }
+    "question": "deny",
+    "websearch": "allow",
+    "webfetch": "allow"
+  },
+  "permissions": [
+    {
+      "action": "websearch",
+      "resource": "*",
+      "effect": "allow"
+    },
+    {
+      "action": "webfetch",
+      "resource": "*",
+      "effect": "allow"
+    }
+  ]
 }
