@@ -1606,7 +1606,26 @@ jobs:
             return unresolved;
           }
 
-          async function requestCodeRabbitThreadVerification(pr, threads) {
+          function shouldRecheckCodeRabbitAfterCi(answer, ci, alreadyRequested) {
+            if (alreadyRequested || !answer || !ci ||
+                ci.status !== 'completed' || ci.conclusion !== 'success') {
+              return false;
+            }
+            const answerAt = Date.parse(answer.created_at || '');
+            const ciFinishedAt = Date.parse(ci.updated_at || ci.completed_at || '');
+            if (!Number.isFinite(answerAt) || !Number.isFinite(ciFinishedAt) ||
+                ciFinishedAt <= answerAt) {
+              return false;
+            }
+            // A bot's "tests not verified yet" is a deferred evidence verdict,
+            // not a permanent code defect. Recheck ONCE when the HEAD's
+            // successful CI becomes newer than that reply. A substantive
+            // UNRESOLVED after green CI still goes to the normal repair path.
+            return /verification remains incomplete|could not confirm a passing|(?:ci|contract[^\\n]{0,30}) checks? (?:are|were) still in progress|tests? (?:are|were) not (?:run|verified)/i
+              .test(String(answer.body || ''));
+          }
+
+          async function requestCodeRabbitThreadVerification(pr, threads, ci) {
             if (!threads.length) return 0;
 
             const comments = await withReadFallback(client =>
@@ -1657,6 +1676,51 @@ jobs:
                   )
                   .sort((a, b) => Number(b.id) - Number(a.id))[0] || null;
                 if (latestAnswer) {
+                  const postCiMarker =
+                    `<!-- auto-merge-coderabbit-post-ci-verification finding=${thread.commentId} head=${pr.head.sha} -->`;
+                  const alreadyRequested = comments.some(comment =>
+                    comment.in_reply_to_id === thread.commentId &&
+                    (comment.body || '').includes(postCiMarker)
+                  );
+                  if (shouldRecheckCodeRabbitAfterCi(
+                    latestAnswer, ci, alreadyRequested
+                  )) {
+                    // Revalidate the exact HEAD before asking the reviewer
+                    // to reconsider newly available test evidence.
+                    const live = await withReadFallback(client =>
+                      client.rest.pulls.get({
+                        owner, repo, pull_number: pr.number,
+                      })
+                    );
+                    if (live.data.state !== 'open' ||
+                        live.data.head.sha !== pr.head.sha) {
+                      continue;
+                    }
+                    await github.request(
+                      'POST /repos/{owner}/{repo}/pulls/{pull_number}/comments/{comment_id}/replies',
+                      {
+                        owner,
+                        repo,
+                        pull_number: pr.number,
+                        comment_id: thread.commentId,
+                        body: [
+                          marker,
+                          postCiMarker,
+                          '⚡ **Continuum · auto-merge**',
+                          '<!-- continuum-origin role=continuum component=auto-merge -->',
+                          '@coderabbitai Re-check this exact finding now that the current HEAD passed CI and required gates.',
+                          '',
+                          `HEAD: \`${pr.head.sha}\``,
+                          'The previous response could not confirm a passing test run.',
+                          'Inspect the current code and the completed checks.',
+                          'Reply RESOLVED only if the original finding is now fully addressed;',
+                          'otherwise reply UNRESOLVED with the remaining defect.',
+                        ].join('\\n'),
+                      }
+                    );
+                    requested += 1;
+                    continue;
+                  }
                   if (!repairReconciliationDispatched &&
                       !codeRabbitExplicitlyResolved(latestAnswer.body || '')) {
                     // The event-driven CodeRabbit batcher normally handles
@@ -3502,12 +3566,11 @@ jobs:
               continue;
             }
 
-            if (hasLabel(pr, AUTO_MERGE_BLOCK_LABEL)) {
-              core.info(
-                `PR #${pr.number}: ${AUTO_MERGE_BLOCK_LABEL} is set; skipping.`
-              );
-              continue;
-            }
+            // A no-auto-merge hold must fence only the irreversible merge.
+            // Keep CI, main-sync, CodeRabbit finding verification/review queue,
+            // and conflict recovery live even while an owner holds merge.
+            // The hold is checked again against the authoritative PR directly
+            // before github.rest.pulls.merge below.
 
             // Self-healing conflict scan runs on every pass, before the
             // CI/review gates, so an already-dirty PR is never stranded
@@ -3751,7 +3814,8 @@ jobs:
             if (unresolvedThreads.length > 0) {
               const requested = await requestCodeRabbitThreadVerification(
                 pr,
-                unresolvedThreads
+                unresolvedThreads,
+                ci
               );
               core.info(
                 `PR #${pr.number}: waiting for ${unresolvedThreads.length} unresolved CodeRabbit thread(s); requested ${requested} fresh verification(s) for head ${pr.head.sha}: ` +

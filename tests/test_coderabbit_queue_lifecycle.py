@@ -560,6 +560,66 @@ class WorkflowBindingTests(unittest.TestCase):
             "thread convergence must happen before the generic completed-review wait",
         )
 
+    def test_no_auto_merge_hold_blocks_only_final_merge_not_reconciliation(self):
+        source = self.auto_merge
+        start = source.index("const leaseHead = listedHead")
+        ci_gate = source.index("const ci = await latestCurrentHeadCi(pr)", start)
+        self.assertNotIn(
+            "hasLabel(pr, AUTO_MERGE_BLOCK_LABEL)", source[start:ci_gate],
+            "a manual merge hold must not suppress review or repair controllers",
+        )
+        thread_recheck = source.index(
+            "const requested = await requestCodeRabbitThreadVerification(", ci_gate
+        )
+        final_pr_read = source.index(
+            "// Re-read every merge-critical fact immediately before the write.",
+            thread_recheck,
+        )
+        self.assertLess(thread_recheck, final_pr_read)
+        merge_call = source.index("const { data: result } = await github.rest.pulls.merge")
+        self.assertIn(
+            "hasLabel(pr, AUTO_MERGE_BLOCK_LABEL)",
+            source[final_pr_read:merge_call],
+            "no-auto-merge must still veto the final atomic merge",
+        )
+        self.assertEqual(
+            source.count("hasLabel(pr, AUTO_MERGE_BLOCK_LABEL)"),
+            1,
+            "merge-only hold must not be reintroduced as an early exit",
+        )
+
+    def test_deferred_review_rechecks_once_on_new_green_ci(self):
+        import subprocess
+        source = self.auto_merge
+        begin = source.index("          function shouldRecheckCodeRabbitAfterCi(")
+        end = source.index(
+            "          async function requestCodeRabbitThreadVerification(", begin
+        )
+        helper = source[begin:end]
+        checks = r"""
+const assert = require('node:assert/strict');
+const ci = {status:'completed', conclusion:'success', updated_at:'2026-11-11T13:40:00Z'};
+const answered = {body:'Verification remains incomplete. I could not confirm a passing test run.', created_at:'2026-11-11T13:24:47Z'};
+assert.equal(shouldRecheckCodeRabbitAfterCi(answered, ci, false), true);
+assert.equal(shouldRecheckCodeRabbitAfterCi(answered, ci, true), false);
+assert.equal(shouldRecheckCodeRabbitAfterCi(
+  answered, {...ci, updated_at:'2026-11-11T13:23:00Z'}, false), false);
+assert.equal(shouldRecheckCodeRabbitAfterCi(
+  answered, {...ci, conclusion:'failure'}, false), false);
+assert.equal(shouldRecheckCodeRabbitAfterCi(
+  {...answered, body:'UNRESOLVED: incorrect access control remains'}, ci, false), false);
+assert.equal(shouldRecheckCodeRabbitAfterCi(
+  {...answered, created_at:'invalid'}, ci, false), false);
+"""
+        result = subprocess.run(
+            ["node", "-e", helper + checks],
+            capture_output=True, text=True, timeout=15,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("auto-merge-coderabbit-post-ci-verification", source)
+        self.assertIn("latestAnswer, ci, alreadyRequested", source)
+        self.assertIn("pr,\n                unresolvedThreads,\n                ci", source)
+
     def test_provider_rate_limit_is_a_global_queue_floor(self):
         for contract in (
             "let latestRateLimitAt = 0",
