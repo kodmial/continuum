@@ -72,7 +72,7 @@ MUTATION_RES = (
 #: path must be classified here (role + component) before it can land:
 #: the count pin fails first with instructions.
 MUTATION_COUNTS = {
-    "continuum-auto-merge.yml": 7,
+    "continuum-auto-merge.yml": 8,  # includes one bounded post-CI CodeRabbit verification reply
     "continuum-coderabbit-retry.yml": 1,
     "continuum-coderabbit-unresolved.yml": 1,
     "continuum-consumer-child-dispatcher.yml": 1,
@@ -133,6 +133,7 @@ FUNCTIONAL_ANCHORS = {
     "continuum-auto-merge.yml": (
         "'@coderabbitai full review",
         "Re-check this unresolved original finding",
+        "Re-check this exact finding now that the current HEAD passed CI",
         "conflictRepairMarker(headSha, attempt)",
         "continuum-conflict-repair-deferred head=",
         "auto-main-sync head=${fresh.head.sha}",
