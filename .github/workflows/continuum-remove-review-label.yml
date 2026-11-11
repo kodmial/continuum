@@ -118,7 +118,11 @@ jobs:
             // time. The issue timeline orders each `committed` event before
             // the labels attached to that head, so a lock event after the
             // current head's commit is current-head state; an earlier lock is
-            // previous-head state and must still be reset.
+            // previous-head state and must still be reset. The timeline is the
+            // durable head-specific record this reset relies on: the label
+            // itself is mutable and cannot be read atomically with its
+            // removal, so acquisitions inside the race window are reconciled
+            // against the timeline again after the removals below.
             let preserveAllRepairLocks = false;
             const preservedRepairLocks = new Set();
             if (currentHeadSha) {
@@ -175,6 +179,7 @@ jobs:
               }
             }
 
+            const removedRepairLocks = [];
             for (const name of repairLabels) {
               if (preserveAllRepairLocks || preservedRepairLocks.has(name)) {
                 console.log(`Kept repair lock ${name} on #${number} for ${currentHeadSha}`);
@@ -187,6 +192,7 @@ jobs:
                   issue_number: number,
                   name,
                 });
+                removedRepairLocks.push(name);
                 console.log(`Removed ${name} from #${number}`);
               } catch (err) {
                 if (err.status === 404) {
@@ -194,6 +200,106 @@ jobs:
                 } else {
                   throw err;
                 }
+              }
+            }
+
+            // Removal is not atomic with the snapshot above. A CI report can
+            // attach a repair lock for the current head after that read and
+            // before the removal, which would let a later report dispatch a
+            // second repair for the same head. The issue timeline keeps that
+            // acquisition permanently and the removals just performed added
+            // their own `unlabeled` events, so a second read proves whether
+            // this reset removed a current-head lock. A removal is accepted
+            // only when the timeline reflects it; otherwise the timeline read
+            // is stale and every removed lock is restored and the job fails
+            // visibly instead of risking a duplicate dispatch.
+            const ensureRepairLocksAttached = async (names, reason) => {
+              for (const name of names) {
+                try {
+                  await github.rest.issues.addLabels({
+                    owner,
+                    repo,
+                    issue_number: number,
+                    labels: [name],
+                  });
+                  console.log(`Restored repair lock ${name} on #${number}: ${reason}`);
+                } catch (err) {
+                  throw new Error(
+                    `Could not restore repair lock ${name} on #${number} after an unverifiable reset: ${err.message}`
+                  );
+                }
+              }
+            };
+            if (removedRepairLocks.length > 0 && currentHeadSha) {
+              let verification = null;
+              try {
+                verification = await github.paginate(
+                  github.rest.issues.listEventsForTimeline,
+                  { owner, repo, issue_number: number, per_page: 100 }
+                );
+              } catch (err) {
+                console.log(
+                  `Could not re-read the issue timeline after removing repair locks for head ${currentHeadSha}: ${err.message}`
+                );
+              }
+              let verified = false;
+              const restoreRepairLocks = [];
+              if (verification) {
+                let headEventIndex = -1;
+                const labeledAfterHead = new Set();
+                const removalsSeen = new Set();
+                verification.forEach((event, index) => {
+                  if (!event) {
+                    return;
+                  }
+                  if (event.event === 'committed' && event.sha === currentHeadSha) {
+                    headEventIndex = index;
+                  }
+                });
+                if (headEventIndex >= 0) {
+                  verification.forEach((event, index) => {
+                    if (!event || index <= headEventIndex || !event.label) {
+                      return;
+                    }
+                    const name = event.label.name;
+                    if (event.event === 'labeled') {
+                      labeledAfterHead.add(name);
+                    } else if (event.event === 'unlabeled') {
+                      removalsSeen.add(name);
+                    }
+                  });
+                  // Every removal this job performed must appear in the
+                  // timeline. A read that misses one is stale, so it cannot
+                  // prove that no concurrent acquisition preceded the removal.
+                  verified = removedRepairLocks.every((name) => removalsSeen.has(name));
+                  if (verified) {
+                    // The snapshot preserved every lock already labeled for
+                    // this head, so any recovery of a removed label after the
+                    // head commit was acquired while this reset was removing
+                    // it. Re-attach it; the add is idempotent when the label
+                    // is already back.
+                    for (const name of removedRepairLocks) {
+                      if (labeledAfterHead.has(name)) {
+                        restoreRepairLocks.push(name);
+                      }
+                    }
+                  }
+                }
+              }
+              if (!verified) {
+                await ensureRepairLocksAttached(
+                  removedRepairLocks,
+                  'the reset could not be verified against the issue timeline'
+                );
+                throw new Error(
+                  'Could not verify the repair-lock reset against the issue timeline; removed repair locks were restored. Rerun this job after issue-timeline discovery recovers.'
+                );
+              }
+              if (restoreRepairLocks.length > 0) {
+                await ensureRepairLocksAttached(
+                  restoreRepairLocks,
+                  `a CI report acquired it for ${currentHeadSha} during this reset`
+                );
               }
             }
 

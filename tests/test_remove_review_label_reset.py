@@ -21,6 +21,14 @@ state and cannot permit a duplicate repair dispatch for the same head. If that
 head comparison cannot be made, repair locks are kept and the job fails
 visibly instead of risking the duplicate.
 
+Label removal is not atomic with that snapshot. The issue timeline is the
+durable, head-specific record of every acquisition, and each removal this job
+performs adds its own ``unlabeled`` event, so the reset reads the timeline
+again after the removals. A lock for the current head that was acquired inside
+the race window is re-attached, and a read that does not reflect this job's own
+removals is treated as stale: the removed locks are restored and the job fails
+visibly for a rerun.
+
 The executable tests run the checked-in github-script body under Node with a
 fake ``github`` client and assert the exact label removals and retry behavior.
 """
@@ -49,11 +57,15 @@ BASE_LABELS = ["review-ready", "coderabbit-review-requested", DEFAULT_LABEL]
 HARNESS = """\
 const calls = [];
 const listCalls = [];
-const present = new Set();
 const attached = JSON.parse(process.env.TEST_ATTACHED_LABELS || '[]');
+const present = new Set(attached.map((label) => label.name));
 const events = JSON.parse(process.env.TEST_LABEL_EVENTS || '[]');
+const eventsAfterRemoval = JSON.parse(
+  process.env.TEST_LABEL_EVENTS_AFTER_REMOVAL || 'null'
+);
 const listFailures = Number(process.env.TEST_LIST_LABEL_FAILURES || '0');
 const timelineFailures = Number(process.env.TEST_TIMELINE_FAILURES || '0');
+const verifyFailures = Number(process.env.TEST_TIMELINE_VERIFY_FAILURES || '0');
 let timelineCalls = 0;
 global.context = {
   issue: { owner: 'owner', repo: 'repo', number: 7 },
@@ -74,12 +86,17 @@ global.github = {
       },
       listEventsForTimeline: async () => {
         timelineCalls += 1;
-        if (timelineCalls <= timelineFailures) {
+        if (timelineCalls <= timelineFailures ||
+            (verifyFailures > 0 && timelineCalls > 1 &&
+             timelineCalls <= 1 + verifyFailures)) {
           const error = new Error('timeline unavailable');
           error.status = 502;
           throw error;
         }
-        return events;
+        if (timelineCalls === 1 || eventsAfterRemoval === null) {
+          return events;
+        }
+        return eventsAfterRemoval;
       },
       removeLabel: async ({ name }) => {
         calls.push(name);
@@ -87,6 +104,13 @@ global.github = {
           const error = new Error('not found');
           error.status = 404;
           throw error;
+        }
+        present.delete(name);
+      },
+      addLabels: async ({ labels }) => {
+        for (const name of labels) {
+          calls.push(`restored:${name}`);
+          present.add(name);
         }
       },
     },
@@ -267,6 +291,10 @@ class RemoveReviewLabelResetTests(unittest.TestCase):
             },
             {"event": "committed", "sha": head_sha},
         ]
+        events_after_removal = events + [
+            {"event": "unlabeled", "label": {"name": DEFAULT_LABEL}},
+            {"event": "unlabeled", "label": {"name": "dispatch-only-lock"}},
+        ]
         self.assertEqual(
             sorted(BASE_LABELS + ["dispatch-only-lock"]),
             sorted(
@@ -277,9 +305,116 @@ class RemoveReviewLabelResetTests(unittest.TestCase):
                     attached=attached,
                     payload={"pull_request": {"head": {"sha": head_sha}}},
                     events=events,
+                    events_after_removal=events_after_removal,
                 )
             ),
+            "a previous-head lock must be removed and must not be restored",
         )
+
+    @unittest.skipUnless(shutil.which("node"), "Node.js unavailable")
+    def test_lock_acquired_between_snapshot_and_removal_is_restored(self):
+        node = shutil.which("node")
+        program = HARNESS % script_body()
+        head_sha = "d" * 40
+        attached = [{"name": DEFAULT_LABEL, "description": LOCK_DESCRIPTION}]
+        # The snapshot sees only the commit: the CI report has not attached
+        # the lock yet. The post-removal read shows the acquisition that
+        # landed inside the race window together with the reset's own removal
+        # event, so the durable record proves the lock belongs to this head.
+        events_after_removal = [
+            {"event": "committed", "sha": head_sha},
+            {"event": "labeled", "label": {"name": DEFAULT_LABEL}},
+            {"event": "unlabeled", "label": {"name": DEFAULT_LABEL}},
+        ]
+        self.assertEqual(
+            sorted(
+                [
+                    "review-ready",
+                    "coderabbit-review-requested",
+                    DEFAULT_LABEL,
+                    f"restored:{DEFAULT_LABEL}",
+                ]
+            ),
+            sorted(
+                self.run_reset(
+                    node,
+                    program,
+                    configured=None,
+                    attached=attached,
+                    payload={"pull_request": {"head": {"sha": head_sha}}},
+                    events=[{"event": "committed", "sha": head_sha}],
+                    events_after_removal=events_after_removal,
+                )
+            ),
+            "a lock acquired after the snapshot but before the removal must be re-attached",
+        )
+
+    @unittest.skipUnless(shutil.which("node"), "Node.js unavailable")
+    def test_stale_post_removal_timeline_restores_locks_and_fails(self):
+        node = shutil.which("node")
+        program = HARNESS % script_body()
+        head_sha = "e" * 40
+        attached = [{"name": DEFAULT_LABEL, "description": LOCK_DESCRIPTION}]
+        # A read that does not reflect this job's own removal cannot prove
+        # that no concurrent acquisition preceded it. Fail closed: every
+        # removed lock is restored and the job fails visibly.
+        completed = self.run_reset_process(
+            node,
+            program,
+            configured=None,
+            attached=attached,
+            payload={"pull_request": {"head": {"sha": head_sha}}},
+            events=[{"event": "committed", "sha": head_sha}],
+            events_after_removal=[{"event": "committed", "sha": head_sha}],
+        )
+        self.assertNotEqual(
+            0, completed.returncode, "an unverifiable reset must fail the job"
+        )
+        outcome = json.loads(completed.stdout)
+        self.assertEqual(
+            sorted(
+                [
+                    "review-ready",
+                    "coderabbit-review-requested",
+                    DEFAULT_LABEL,
+                    f"restored:{DEFAULT_LABEL}",
+                ]
+            ),
+            sorted(outcome["calls"]),
+        )
+        self.assertIn("Rerun", outcome["error"])
+
+    @unittest.skipUnless(shutil.which("node"), "Node.js unavailable")
+    def test_unreadable_post_removal_timeline_restores_locks_and_fails(self):
+        node = shutil.which("node")
+        program = HARNESS % script_body()
+        head_sha = "f" * 40
+        attached = [{"name": DEFAULT_LABEL, "description": LOCK_DESCRIPTION}]
+        completed = self.run_reset_process(
+            node,
+            program,
+            configured=None,
+            attached=attached,
+            payload={"pull_request": {"head": {"sha": head_sha}}},
+            events=[{"event": "committed", "sha": head_sha}],
+            verify_failures=1,
+        )
+        self.assertNotEqual(
+            0, completed.returncode, "an unreadable verification must fail the job"
+        )
+        outcome = json.loads(completed.stdout)
+        self.assertEqual(
+            sorted(
+                [
+                    "review-ready",
+                    "coderabbit-review-requested",
+                    DEFAULT_LABEL,
+                    f"restored:{DEFAULT_LABEL}",
+                ]
+            ),
+            sorted(outcome["calls"]),
+        )
+        self.assertIn("Rerun", outcome["error"])
 
     @unittest.skipUnless(shutil.which("node"), "Node.js unavailable")
     def test_unreadable_timeline_keeps_repair_locks_and_fails_for_rerun(self):
@@ -319,7 +454,9 @@ class RemoveReviewLabelResetTests(unittest.TestCase):
         list_failures=0,
         payload=None,
         events=(),
+        events_after_removal=None,
         timeline_failures=0,
+        verify_failures=0,
     ):
         completed = self.run_reset_process(
             node,
@@ -329,7 +466,9 @@ class RemoveReviewLabelResetTests(unittest.TestCase):
             list_failures=list_failures,
             payload=payload,
             events=events,
+            events_after_removal=events_after_removal,
             timeline_failures=timeline_failures,
+            verify_failures=verify_failures,
         )
         completed.check_returncode()
         return json.loads(completed.stdout)
@@ -343,7 +482,9 @@ class RemoveReviewLabelResetTests(unittest.TestCase):
         list_failures=0,
         payload=None,
         events=(),
+        events_after_removal=None,
         timeline_failures=0,
+        verify_failures=0,
     ):
         environment = {
             "PATH": "/usr/bin:/bin:/usr/local/bin",
@@ -352,8 +493,10 @@ class RemoveReviewLabelResetTests(unittest.TestCase):
             "TEST_ATTACHED_LABELS": json.dumps(list(attached)),
             "TEST_LIST_LABEL_FAILURES": str(list_failures),
             "TEST_TIMELINE_FAILURES": str(timeline_failures),
+            "TEST_TIMELINE_VERIFY_FAILURES": str(verify_failures),
             "TEST_CONTEXT_PAYLOAD": json.dumps(payload or {}),
             "TEST_LABEL_EVENTS": json.dumps(list(events)),
+            "TEST_LABEL_EVENTS_AFTER_REMOVAL": json.dumps(events_after_removal),
         }
         return subprocess.run(
             [node, "-e", program],
