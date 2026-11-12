@@ -28,6 +28,21 @@ on:
         description: Source failed workflow run id
         required: false
         type: string
+      ci_attempt_id:
+        description: >-
+          Exact-HEAD CI-repair attempt correlation id. Empty for every other
+          mode. It is not required so an older installed caller remains valid;
+          the engine can also discover the current claim from the PR receipt.
+        required: false
+        type: string
+        default: ''
+      ci_head_sha:
+        description: >-
+          Exact PR HEAD SHA the CI-repair attempt belongs to. Empty for every
+          other mode.
+        required: false
+        type: string
+        default: ''
       issue_number:
         description: >-
           Issue number supplied by the dispatcher. Empty means "read
@@ -919,6 +934,108 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Record exact-HEAD CI repair dispatch correlation
+        if: >-
+          github.event_name == 'workflow_dispatch' &&
+          inputs.mode == 'ci-fix' &&
+          inputs.pr_number != ''
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
+        env:
+          TAP_PAT: ${{ secrets.TAP_PAT }}
+          PR_NUMBER: ${{ inputs.pr_number }}
+          CI_ATTEMPT_ID: ${{ inputs.ci_attempt_id }}
+          CI_HEAD_SHA: ${{ inputs.ci_head_sha }}
+          DISPATCH_RUN_ID: ${{ github.run_id }}
+          DISPATCH_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        with:
+          github-token: ${{ secrets.TAP_PAT }}
+          script: |
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const repository = `${owner}/${repo}`.toLowerCase();
+            const pullNumber = Number(process.env.PR_NUMBER || 0);
+            if (!Number.isInteger(pullNumber) || pullNumber <= 0) return;
+            const requestedAttempt = String(process.env.CI_ATTEMPT_ID || '').trim();
+            let head = String(process.env.CI_HEAD_SHA || '').trim().toLowerCase();
+            if (!/^[0-9a-f]{40}$/.test(head)) {
+              const { data: pr } = await github.rest.pulls.get({ owner, repo, pull_number: pullNumber });
+              head = String(pr.head?.sha || '').toLowerCase();
+            }
+            if (!/^[0-9a-f]{40}$/.test(head)) {
+              core.warning('CI repair correlation has no exact PR HEAD; not writing a receipt.');
+              return;
+            }
+            const comments = await github.paginate(github.rest.issues.listComments, {
+              owner, repo, issue_number: pullNumber, per_page: 100,
+            });
+            // The receipt author is whoever owns TAP_PAT. It may be an owner,
+            // a collaborator, or a dedicated automation account, so trust its
+            // own identity explicitly instead of guessing that it is OWNER.
+            let tokenLogin = '';
+            try {
+              tokenLogin = String((await github.rest.users.getAuthenticated()).data?.login || '')
+                .trim().toLowerCase();
+            } catch (error) {
+              core.warning(`Could not resolve the receipt author identity: ${error.message || error}`);
+            }
+            const marker = /<!--\s*continuum-ci-repair-receipt\s+v=1\s+repo=([^\s>]+)\s+pr=([0-9]+)\s+head=([0-9a-f]{40})\s+attempt=([A-Za-z0-9][A-Za-z0-9._:\-]{7,127})\s+status=(claimed|dispatched|ambiguous|rejected)(?:\s+run=([1-9][0-9]*))?(?:\s+url=([^\s>]+))?\s*-->/gi;
+            const observations = [];
+            for (const comment of comments) {
+              const login = String(comment.user?.login || '').toLowerCase();
+              const trusted = String(comment.author_association || '').toUpperCase() === 'OWNER' ||
+                login === 'github-actions[bot]' ||
+                (Boolean(tokenLogin) && login === tokenLogin);
+              if (!trusted) continue;
+              const body = String(comment.body || '');
+              for (const match of body.matchAll(marker)) {
+                if (match[1].toLowerCase() !== repository || Number(match[2]) !== pullNumber ||
+                    match[3].toLowerCase() !== head) continue;
+                observations.push({
+                  id: Number(comment.id) || 0,
+                  attempt: match[4],
+                  status: match[5].toLowerCase(),
+                  runId: match[6] ? Number(match[6]) : 0,
+                });
+              }
+            }
+            observations.sort((a, b) => a.id - b.id);
+            let attempt = requestedAttempt;
+            if (!attempt) {
+              const active = [...observations].reverse().find(item =>
+                item.status === 'claimed' || item.status === 'ambiguous');
+              if (!active) {
+                core.notice('No active exact-HEAD CI repair claim to correlate.');
+                return;
+              }
+              attempt = active.attempt;
+            }
+            const prior = observations.filter(item => item.attempt === attempt);
+            if (prior.some(item => item.status === 'dispatched')) {
+              core.notice(`CI repair attempt ${attempt} already has a dispatched receipt.`);
+              return;
+            }
+            if (!requestedAttempt && !prior.some(item => item.status === 'claimed' || item.status === 'ambiguous')) {
+              core.notice(`No claim receipt exists for CI repair attempt ${attempt}.`);
+              return;
+            }
+            const receipt = `<!-- continuum-ci-repair-receipt v=1 repo=${repository} ` +
+              `pr=${pullNumber} head=${head} attempt=${attempt} status=dispatched ` +
+              `run=${Number(process.env.DISPATCH_RUN_ID)} url=${process.env.DISPATCH_RUN_URL} -->`;
+            try {
+              await github.rest.issues.createComment({
+                owner,
+                repo,
+                issue_number: pullNumber,
+                body: '⚡ **Continuum · opencode**\n' +
+                  `${receipt}\n\nOpenCode started the admitted CI repair attempt \`${attempt}\`. ` +
+                  'This receipt proves the dispatch correlation; it never authorizes a second run.\n' +
+                  '<!-- continuum-origin role=continuum component=opencode -->',
+              });
+              core.notice(`Recorded dispatched CI repair attempt ${attempt} as run ${process.env.DISPATCH_RUN_ID}.`);
+            } catch (error) {
+              core.warning(`Could not record CI repair correlation for ${attempt}: ${error.message || error}`);
+            }
 
       - name: Checkout Continuum cancellation engine
         if: >-

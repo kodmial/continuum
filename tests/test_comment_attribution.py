@@ -83,7 +83,7 @@ MUTATION_COUNTS = {
     "continuum-issue-scheduler.yml": 11,
     "continuum-opencode-repair.yml": 2,
     "continuum-opencode-watchdog.yml": 4,
-    "continuum-opencode.yml": 12,  # additional functional batch-verification reply
+    "continuum-opencode.yml": 13,  # #446 dispatched-receipt correlation comment
     "continuum-pr-agent-auto-merge.yml": 1,
     "continuum-pr-agent-canary.yml": 4,
     "continuum-pr-agent-recovery.yml": 4,

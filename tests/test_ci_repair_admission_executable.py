@@ -1,0 +1,461 @@
+"""End-to-end tests for the serialized CI-repair admission executable (#446).
+
+The pure module tests prove the decision logic. These tests run the actual
+production wrapper with a stateful fake ``gh`` so the ordering guarantees are
+observed, not assumed:
+
+* the claim comment is persisted before any dispatch request;
+* one exact HEAD produces at most one dispatch across repeated reports;
+* a new HEAD gets its own attempt;
+* definite rejection, legacy 204, and ambiguous acceptance are reconciled
+  without a blind second dispatch;
+* a crashed claim is recovered only from a complete empty run inventory.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+import textwrap
+import unittest
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+SCRIPT = ROOT / ".github" / "scripts" / "ci_repair_admission.py"
+REPO = "Kodmial/Continuum"
+PR = 446
+HEAD = "a" * 40
+NEW_HEAD = "b" * 40
+NOW = "2026-11-12T01:00:00Z"
+
+FAKE_GH = r'''#!/usr/bin/env python3
+import json
+import os
+import pathlib
+import sys
+
+state = pathlib.Path(os.environ["FAKE_GH_STATE"])
+args = sys.argv[1:]
+
+with (state / "gh.log").open("a", encoding="utf-8") as log:
+    log.write(" ".join(args) + "\n")
+
+token_login = os.environ.get("FAKE_TOKEN_LOGIN", "github-actions[bot]")
+
+
+def read_json(name, default):
+    path = state / name
+    if not path.exists():
+        return default
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def write_json(name, value):
+    (state / name).write_text(json.dumps(value), encoding="utf-8")
+
+
+def output(status, body):
+    reason = {200: "OK", 204: "No Content", 403: "Forbidden",
+              422: "Unprocessable Entity"}.get(status, "Error")
+    sys.stdout.write("HTTP/2.0 %d %s\r\n\r\n%s" % (status, reason, body))
+    sys.exit(0 if status < 400 else 1)
+
+
+if args[:1] != ["api"]:
+    sys.exit(0)
+rest = args[1:]
+
+if rest[:1] == ["user"]:
+    print(json.dumps({"login": token_login}))
+    sys.exit(0)
+
+if rest[:1] == ["--paginate"]:
+    url = next((arg for arg in rest if arg.startswith("repos/")), "")
+    if "/issues/" in url and "/comments" in url:
+        print(json.dumps(read_json("comments_pages.json", [[]])))
+        sys.exit(0)
+    if "/actions/workflows/" in url and "/runs" in url:
+        if os.environ.get("FAKE_RUNS_FAIL") == "1":
+            sys.stderr.write("simulated run inventory failure\n")
+            sys.exit(1)
+        print(json.dumps(read_json("runs_pages.json", [])))
+        sys.exit(0)
+    sys.exit(0)
+
+if rest[:1] == ["--method"] and rest[1:2] == ["POST"]:
+    url = rest[2]
+    if url.endswith("/comments"):
+        body = next(
+            (arg[len("body="):] for arg in rest if arg.startswith("body=")),
+            "",
+        )
+        pages = read_json("comments_pages.json", [[]])
+        flat = [item for page in pages for item in page]
+        created = os.environ.get("FAKE_NOW", "2026-11-12T00:05:00Z")
+        comment = {
+            "id": max([item["id"] for item in flat], default=0) + 1,
+            "body": body,
+            "created_at": created,
+            "updated_at": created,
+            "author_association": "NONE",
+            "user": {"login": token_login},
+        }
+        pages.append([comment])
+        write_json("comments_pages.json", pages)
+        with (state / "posted.jsonl").open("a", encoding="utf-8") as posted:
+            posted.write(json.dumps(comment) + "\n")
+        print(json.dumps(comment))
+        sys.exit(0)
+    sys.exit(0)
+
+if rest[:1] == ["--include"]:
+    joined = " ".join(rest)
+    if (
+        os.environ.get("FAKE_REJECT_ATTEMPT_INPUTS") == "1"
+        and "inputs[ci_repair_identity]" in joined
+    ):
+        output(422, json.dumps({"message": "Unexpected inputs provided: [\"ci_repair_identity\"]"}))
+    if os.environ.get("FAKE_CREATE_MARKED_RUN") == "1":
+        identity = next(
+            (arg.split("=", 1)[1] for arg in rest
+             if arg.startswith("inputs[ci_repair_identity]=")),
+            "",
+        )
+        try:
+            packed = json.loads(identity) if identity else {}
+        except ValueError:
+            packed = {}
+        attempt = str(packed.get("ci_attempt_id") or "")
+        pull = next(
+            (arg.split("=", 1)[1] for arg in rest
+             if arg.startswith("inputs[pr_number]=")),
+            "0",
+        )
+        head = str(packed.get("ci_head_sha") or "")
+        pages = read_json("runs_pages.json", [])
+        runs = [item for page in pages for item in page.get("workflow_runs", [])]
+        runs.append({
+            "id": 700,
+            "display_title": "OpenCode repair PR #{} [ci-attempt:{}]".format(pull, attempt),
+            "status": "queued",
+            "conclusion": "",
+            "html_url": "https://github.com/%s/actions/runs/700" % os.environ.get(
+                "GITHUB_REPOSITORY", ""
+            ).lower(),
+            "created_at": os.environ.get("FAKE_NOW", "2026-11-12T00:05:00Z"),
+            "head_sha": head,
+        })
+        write_json("runs_pages.json", [{"total_count": len(runs), "workflow_runs": runs}])
+    status = int(os.environ.get("FAKE_DISPATCH_STATUS", "200"))
+    body = os.environ.get("FAKE_DISPATCH_BODY", '{"workflow_run_id": 501}')
+    if status == 204:
+        output(204, "")
+    output(status, body)
+
+if "/pulls/" in rest[-1]:
+    print(json.dumps(read_json("pr.json", {})))
+    sys.exit(0)
+
+sys.exit(0)
+'''
+
+
+def trusted_receipt(head=HEAD, attempt="ci-crashed-0001", status="claimed"):
+    return {
+        "id": 1,
+        "body": (
+            "<!-- continuum-ci-repair-receipt v=1 repo={} pr={} head={} "
+            "attempt={} status={} -->".format(
+                REPO.lower(), PR, head, attempt, status
+            )
+        ),
+        "created_at": "2026-11-12T00:00:00Z",
+        "updated_at": "2026-11-12T00:00:00Z",
+        "author_association": "NONE",
+        "user": {"login": "github-actions[bot]"},
+    }
+
+
+class AdmissionExecutableTests(unittest.TestCase):
+    def setUp(self):
+        self.dir = Path(
+            tempfile.mkdtemp(prefix="ci-repair-admission-", dir=str(self._tmp_root()))
+        )
+        self.addCleanup(shutil.rmtree, self.dir, True)
+        bin_dir = self.dir / "bin"
+        bin_dir.mkdir()
+        gh = bin_dir / "gh"
+        gh.write_text(FAKE_GH, encoding="utf-8")
+        gh.chmod(0o755)
+        self.bin = bin_dir
+        self.write_pr(head=HEAD, comments=0)
+        self.write_state("comments_pages.json", [[]])
+        self.write_state("runs_pages.json", [])
+        self.write_state("posted.jsonl", "")
+        self.write_state("gh.log", "")
+
+    @staticmethod
+    def _tmp_root():
+        root = ROOT / ".opencode-tmp"
+        root.mkdir(exist_ok=True)
+        return root
+
+    def write_state(self, name, value):
+        path = self.dir / name
+        if isinstance(value, str):
+            path.write_text(value, encoding="utf-8")
+        else:
+            path.write_text(json.dumps(value), encoding="utf-8")
+
+    def write_pr(self, *, head=HEAD, comments=0, state="open"):
+        self.write_state(
+            "pr.json",
+            {
+                "state": state,
+                "comments": comments,
+                "head": {
+                    "ref": "opencode/issue446-1",
+                    "sha": head,
+                    "repo": {"full_name": REPO},
+                },
+            },
+        )
+
+    def write_comments(self, comments):
+        self.write_state("comments_pages.json", [list(comments)])
+
+    def write_runs(self, runs):
+        self.write_state(
+            "runs_pages.json",
+            [{"total_count": len(runs), "workflow_runs": list(runs)}],
+        )
+
+    def run_admission(self, *, head=HEAD, extra_env=None, extra_args=()):
+        env = {
+            "PATH": "{}:{}".format(self.bin, os.environ.get("PATH", "")),
+            "PYTHONDONTWRITEBYTECODE": "1",
+            "GH_TOKEN": "test-token",
+            "GITHUB_REPOSITORY": REPO,
+            "FAKE_GH_STATE": str(self.dir),
+            "FAKE_NOW": "2026-11-12T00:05:00Z",
+            "FAKE_TOKEN_LOGIN": "github-actions[bot]",
+        }
+        env.update(extra_env or {})
+        arguments = [
+            sys.executable,
+            "-B",
+            str(SCRIPT),
+            "--repository",
+            REPO,
+            "--pull-number",
+            str(PR),
+            "--head-sha",
+            head,
+            "--head-ref",
+            "opencode/issue446-1",
+            "--workflow",
+            "continuum-opencode.yml",
+            "--failing-run-id",
+            "1234",
+            "--reported-run-id",
+            "1234",
+            "--owner-login",
+            "kodmial",
+            *extra_args,
+        ]
+        completed = subprocess.run(
+            arguments,
+            check=False,
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=60,
+        )
+        self.assertEqual(0, completed.returncode, completed.stderr + completed.stdout)
+        return completed
+
+    def posts(self):
+        return [
+            json.loads(line)
+            for line in (self.dir / "posted.jsonl").read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+
+    def posted_bodies(self):
+        return [entry["body"] for entry in self.posts()]
+
+    def log(self):
+        return (self.dir / "gh.log").read_text(encoding="utf-8").splitlines()
+
+    def dispatches(self):
+        return [line for line in self.log() if "inputs[mode]=ci-fix" in line]
+
+    def test_first_failure_persists_the_claim_before_exactly_one_dispatch(self):
+        self.run_admission()
+        bodies = self.posted_bodies()
+        self.assertTrue(any("status=claimed" in body for body in bodies), bodies)
+        self.assertTrue(
+            any("status=dispatched" in body and "run=501" in body for body in bodies),
+            bodies,
+        )
+        self.assertEqual(1, len(self.dispatches()))
+        claim_index = next(
+            index for index, line in enumerate(self.log()) if "status=claimed" in line
+        )
+        dispatch_index = next(
+            index for index, line in enumerate(self.log()) if "inputs[mode]=ci-fix" in line
+        )
+        self.assertLess(claim_index, dispatch_index)
+        self.assertIn("return_run_details=true", self.dispatches()[0])
+        self.assertIn("inputs[ci_repair_identity]=", self.dispatches()[0])
+
+    def test_a_second_report_for_the_same_head_never_dispatches_again(self):
+        self.run_admission()
+        before = len(self.posts())
+        self.run_admission()
+        self.assertEqual(1, len(self.dispatches()), "the same exact HEAD dispatched twice")
+        self.assertEqual(before, len(self.posts()), "a waiting pass must not mutate receipts")
+
+    def test_a_new_head_gets_its_own_attempt(self):
+        self.run_admission()
+        self.write_pr(head=NEW_HEAD)
+        self.run_admission(head=NEW_HEAD)
+        self.assertEqual(2, len(self.dispatches()))
+        claimed_heads = [
+            body for body in self.posted_bodies() if "status=claimed" in body
+        ]
+        self.assertEqual(2, len(claimed_heads))
+        self.assertTrue(any("head=" + NEW_HEAD in body for body in claimed_heads))
+
+    def test_old_head_records_do_not_block_a_new_head(self):
+        self.write_comments([trusted_receipt(head=HEAD)])
+        self.write_pr(head=NEW_HEAD)
+        self.run_admission(head=NEW_HEAD)
+        self.assertEqual(1, len(self.dispatches()))
+        self.assertTrue(
+            any("head=" + NEW_HEAD in body and "status=claimed" in body
+                for body in self.posted_bodies())
+        )
+
+    def test_optional_input_rejection_falls_back_without_a_duplicate_dispatch(self):
+        self.run_admission(extra_env={"FAKE_REJECT_ATTEMPT_INPUTS": "1"})
+        dispatches = self.dispatches()
+        self.assertEqual(
+            3,
+            len(dispatches),
+            "expected the combined shape, the input-only probe, and one fallback",
+        )
+        self.assertIn("inputs[ci_repair_identity]=", dispatches[0])
+        self.assertIn("inputs[ci_repair_identity]=", dispatches[1])
+        self.assertNotIn("inputs[ci_repair_identity]=", dispatches[2])
+        self.assertTrue(
+            any("status=dispatched" in body and "run=501" in body
+                for body in self.posted_bodies())
+        )
+
+    def test_a_definite_rejection_is_recorded_and_not_retried_in_the_same_pass(self):
+        self.run_admission(
+            extra_env={
+                "FAKE_DISPATCH_STATUS": "422",
+                "FAKE_DISPATCH_BODY": '{"message":"Validation Failed"}',
+            }
+        )
+        self.assertEqual(1, len(self.dispatches()))
+        bodies = self.posted_bodies()
+        self.assertTrue(any("status=rejected" in body for body in bodies), bodies)
+        self.assertFalse(any("status=dispatched" in body for body in bodies), bodies)
+
+    def test_ambiguous_acceptance_holds_and_a_later_pass_never_dispatches(self):
+        self.run_admission(
+            extra_env={
+                "FAKE_DISPATCH_STATUS": "403",
+                "FAKE_DISPATCH_BODY": '{"message":"rate limited"}',
+            }
+        )
+        self.assertEqual(1, len(self.dispatches()))
+        self.assertTrue(
+            any("status=ambiguous" in body for body in self.posted_bodies())
+        )
+        self.run_admission()
+        self.assertEqual(1, len(self.dispatches()), "ambiguous acceptance was retried blindly")
+
+    def test_legacy_204_is_correlated_to_the_actual_marked_run(self):
+        # GitHub created the run but the legacy dispatch response carried no
+        # details. The fake gh materializes the marked run on dispatch; the
+        # admission must correlate it and persist run details.
+        self.run_admission(
+            extra_env={
+                "FAKE_DISPATCH_STATUS": "204",
+                "FAKE_DISPATCH_BODY": "",
+                "FAKE_CREATE_MARKED_RUN": "1",
+            }
+        )
+        bodies = self.posted_bodies()
+        self.assertTrue(any("status=dispatched" in body for body in bodies), bodies)
+        self.assertTrue(any("run=700" in body for body in bodies), bodies)
+
+    def test_a_stale_crashed_claim_is_recovered_once_from_complete_evidence(self):
+        self.write_comments([trusted_receipt()])
+        self.write_pr(head=HEAD, comments=1)
+        self.run_admission(extra_args=("--now", NOW))
+        bodies = self.posted_bodies()
+        self.assertTrue(any("status=rejected" in body for body in bodies), bodies)
+        self.assertTrue(any("status=claimed" in body for body in bodies), bodies)
+        self.assertEqual(1, len(self.dispatches()))
+
+    def test_a_stale_claim_with_unreadable_inventory_becomes_a_visible_hold(self):
+        self.write_comments([trusted_receipt()])
+        self.write_pr(head=HEAD, comments=1)
+        self.run_admission(
+            extra_args=("--now", NOW),
+            extra_env={"FAKE_RUNS_FAIL": "1"},
+        )
+        self.assertEqual(0, len(self.dispatches()))
+        self.assertTrue(
+            any("status=ambiguous" in body for body in self.posted_bodies())
+        )
+
+    def test_a_stale_claim_with_an_unattributable_run_becomes_a_visible_hold(self):
+        self.write_comments([trusted_receipt()])
+        self.write_pr(head=HEAD, comments=1)
+        self.write_runs(
+            [
+                {
+                    "id": 800,
+                    "display_title": "OpenCode repair PR #{}".format(PR),
+                    "status": "queued",
+                    "conclusion": "",
+                    "html_url": "https://github.com/{}/actions/runs/800".format(REPO.lower()),
+                    "created_at": "2026-11-12T00:10:00Z",
+                    "head_sha": HEAD,
+                }
+            ]
+        )
+        self.run_admission(extra_args=("--now", NOW))
+        self.assertEqual(0, len(self.dispatches()))
+        self.assertTrue(
+            any("status=ambiguous" in body for body in self.posted_bodies())
+        )
+
+    def test_a_closed_pr_is_a_safe_no_op(self):
+        self.write_pr(head=HEAD, state="closed")
+        self.run_admission()
+        self.assertEqual(0, len(self.dispatches()))
+        self.assertEqual([], self.posts())
+
+    def test_untrusted_receipt_authors_cannot_suppress_a_dispatch(self):
+        spoof = trusted_receipt()
+        spoof["user"] = {"login": "somebody"}
+        spoof["author_association"] = "CONTRIBUTOR"
+        self.write_comments([spoof])
+        self.write_pr(head=HEAD, comments=1)
+        self.run_admission()
+        self.assertEqual(1, len(self.dispatches()))
+
+
+if __name__ == "__main__":
+    unittest.main()

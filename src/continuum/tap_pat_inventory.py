@@ -355,6 +355,14 @@ ENTRIES = (
     },
     {
         "workflow": "continuum-opencode.yml",
+        "step": "Record exact-HEAD CI repair dispatch correlation",
+        "capability": EXACTLY_ONCE_CLAIM,
+        "same_repo": True,
+        "reason": "The dispatched receipt must be written under the same PAT identity the admission owner trusts; splitting the credential or step would leave the claim without a correlated run and reopen duplicate-dispatch races.",
+        "evidence": ("TAP_PAT: ${{ secrets.TAP_PAT }}", "github-token: ${{ secrets.TAP_PAT }}"),
+    },
+    {
+        "workflow": "continuum-opencode.yml",
         "step": "Clear conflict-repair lock",
         "capability": CHAINING,
         "same_repo": True,

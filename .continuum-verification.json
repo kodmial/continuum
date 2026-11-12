@@ -1,0 +1,49 @@
+{
+  "baseline": {
+    "base_sha": "1e2cd287824bae37ac0e71fa46f4c5c8c8c86526",
+    "commands": [
+      {
+        "command": "bash scripts/validate-continuum.sh",
+        "duration_ms": 221188,
+        "exit_code": 0,
+        "name": "validation",
+        "output_sha256": "726a01a3ef887ddadf5cc4a1919b9e4c6a17a53cb32ad8720f7ceb22a4dcf01f",
+        "output_tail": "ange.\nPost-change verification passed using the same resolved command set as the baseline (passed-after-preexisting-failure).\nBaseline verification passed for the resolved repository command set.\nPost-change verification passed using the same resolved command set as the baseline (passed).\n::warning::Baseline verification failed for: test. The failure is recorded as pre-existing and the implementation must not claim a green result unless the same command set passes after the change.\nBaseline verification passed for the resolved repository command set.\n::error::Post-change verification failed (failed-new-regression). New failures: test; pre-existing failures: none.\n::warning::Baseline verification failed for: test. The failure is recorded as pre-existing and the implementation must not claim a green result unless the same command set passes after the change.\nPost-change verification passed using the same resolved command set as the baseline (passed-after-preexisting-failure).\nBaseline verification passed for the resolved repository command set.\nPost-change verification passed using the same resolved command set as the baseline (passed).\nReusing exact post-change verification evidence from the 429 checkpoint.\nBaseline verification passed for the resolved repository command set.\nPost-change verification passed using the same resolved command set as the baseline (passed).\nReusing exact post-change verification evidence from the 429 checkpoint.\n::warning::Baseline verification failed for: test. The failure is recorded as pre-existing and the implementation must not claim a green result unless the same command set passes after the change.\nPost-change verification passed using the same resolved command set as the baseline (passed).\nBaseline verification passed for the resolved repository command set.\nBaseline verification passed for the resolved repository command set.\nprovider/second\nprovider/second\nprovider/second\nprovider/first\nprovider/second\nprovider/first\nprovider/second\nprovider/first\nprovider/second\nprovider/second\nprovider/first\nBaseline verification passed for the resolved repository command set.\nPost-change verification passed using the same resolved command set as the baseline (passed).\nReusing exact post-change verification evidence from the 429 checkpoint.\nPost-change verification passed using the same resolved command set as the baseline (passed).\nPost-change verification passed using the same resolved command set as the baseline (passed).\nWrote JSON report to /home/runner/work/continuum/continuum/.opencode-tmp/coverage.json\ncoverage: no executable changed Python lines\n...................\n----------------------------------------------------------------------\nRan 19 tests in 0.013s\n\nOK\n/home/runner/work/continuum/continuum/.opencode-tmp/download-actionlint.bash: OK\nStart downloading actionlint v1.7.12 to /home/runner/work/continuum/continuum/.opencode-tmp/bin\nDetected OS=linux ext=tar.gz arch=amd64\nDownloading https://github.com/rhysd/actionlint/releases/download/v1.7.12/actionlint_1.7.12_linux_amd64.tar.gz with curl\n  % Total    % Received % Xferd  Average Speed  Time    Time    Time   Current\n                                 Dload  Upload  Total   Spent   Left   Speed\n\n  0      0   0      0   0      0      0      0                              0\n  0      0   0      0   0      0      0      0                              0\n  0      0   0      0   0      0      0      0                              0\n\n  0      0   0      0   0      0      0      0                              0actionlint\n\n100  2.24M 100  2.24M   0      0 22.21M      0                              0\n100  2.24M 100  2.24M   0      0 22.20M      0                              0\n100  2.24M 100  2.24M   0      0 22.18M      0                              0\nDownloaded and unarchived executable: /home/runner/work/continuum/continuum/.opencode-tmp/bin/actionlint\nDone: 1.7.12\ninstalled by downloading from release page\nbuilt with go1.26.1 compiler for linux/amd64\n",
+        "source": ".github/workflows/ci.yml:validation_command"
+      }
+    ],
+    "contract": {
+      "commands": [
+        {
+          "command": "bash scripts/validate-continuum.sh",
+          "name": "validation",
+          "source": ".github/workflows/ci.yml:validation_command"
+        }
+      ],
+      "errors": [],
+      "fingerprint": "f64c5cdb89b0ef8331e7cf22362d5aaf4328ec461a31e7d0f4cd9fda98292dfb",
+      "source": "ci-caller",
+      "state": "configured"
+    },
+    "environment_fingerprint": "92dbdd2ee8401c1864ea797f7066749e3766310e63b6e9f34e55ede141be3f66",
+    "failed_commands": [],
+    "head_sha": "1e2cd287824bae37ac0e71fa46f4c5c8c8c86526",
+    "phase": "baseline",
+    "recorded_at": "2026-11-12T02:18:57Z",
+    "state": "passed"
+  },
+  "contract": {
+    "commands": [
+      {
+        "command": "bash scripts/validate-continuum.sh",
+        "name": "validation",
+        "source": ".github/workflows/ci.yml:validation_command"
+      }
+    ],
+    "errors": [],
+    "fingerprint": "f64c5cdb89b0ef8331e7cf22362d5aaf4328ec461a31e7d0f4cd9fda98292dfb",
+    "source": "ci-caller",
+    "state": "configured"
+  },
+  "schema_version": 1
+}

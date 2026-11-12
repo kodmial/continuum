@@ -462,7 +462,8 @@ jobs:
             });
             const recentRuns = runsData.workflow_runs || [];
             const isRepair = run =>
-              String(run.display_title || '') === `OpenCode repair PR #${pullNumber}`;
+              new RegExp(`^OpenCode repair PR #${pullNumber}(?:\\s+\\[ci-attempt:[A-Za-z0-9][A-Za-z0-9._:\\-]{7,127}\\])?$`)
+                .test(String(run.display_title || ''));
             let activeRepairs = recentRuns.filter(run =>
               isRepair(run) && run.status !== 'completed');
             // High run volume can push a long-running repair out of the

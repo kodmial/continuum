@@ -148,6 +148,17 @@ APPROVED_PROVIDER_RECOVERY_OPENCODE_SHA256 = (
     "bb2aef000e12b83f16f30b9ebc9c2d7e72987684e21a9be6b852b02d106f9ea2"
 )
 
+# kodmial/continuum#446: the serialized exact-HEAD CI-repair admission owner
+# adds only the attempt/head correlation inputs and the dispatched-receipt
+# acknowledgement step. Keep the earlier pins above for audit; later drift
+# outside this reviewed change still fails closed.
+APPROVED_446_OPENCODE_SHA256 = (
+    "a1bc617426f9d5782c5692a5f85fc8f8f88f866218727fcdd6028743b28a61c8"
+)
+APPROVED_446_CALLER_SHA256 = (
+    "52b3b44729d9ebab7999d65e894e4eb5979572af0e3d3a1c7c6f48c5fe8668ee"
+)
+
 # Additional reviewed self-caller change: owner-only CodeRabbit repair dispatch
 # preserves the exact workflow_dispatch path and the no-auto-merge hold.
 # This pins the full file, not a permissive allowlist for workflow drift.
@@ -2569,7 +2580,7 @@ class ProtectedBaselineTests(unittest.TestCase):
                     # explicitly tested optional-attestation no-key branch.
                     self.assertEqual(
                         protected_file_digest(path),
-                        APPROVED_PROVIDER_RECOVERY_OPENCODE_SHA256,
+                        APPROVED_446_OPENCODE_SHA256,
                         f"{path}: unexpected drift outside reviewed wording cleanup",
                     )
                 else:
@@ -2596,8 +2607,8 @@ class ProtectedBaselineTests(unittest.TestCase):
             protected_file_digest(
                 ".github/caller-stubs/continuum-opencode.yml"
             ),
-            APPROVED_350_CALLER_SHA256,
-            "consumer caller stub: unexpected drift outside reviewed #350 patch",
+            APPROVED_446_CALLER_SHA256,
+            "consumer caller stub: unexpected drift outside reviewed #446 patch",
         )
 
     def test_provider_error_exit_preserves_dirty_coding_work_across_all_modes(self):
@@ -2640,7 +2651,7 @@ class ProtectedBaselineTests(unittest.TestCase):
         # therefore be dirty in this pre-commit worktree; any unapproved byte
         # change still fails the exact digest assertions above.
         approved = {
-            ".github/workflows/continuum-opencode.yml": APPROVED_PROVIDER_RECOVERY_OPENCODE_SHA256,
+            ".github/workflows/continuum-opencode.yml": APPROVED_446_OPENCODE_SHA256,
             ".github/workflows/opencode.yml": APPROVED_350_SELF_CALLER_SHA256,
         }
         for path in PROTECTED_FILES:
