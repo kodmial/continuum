@@ -363,6 +363,32 @@ class TrustTests(unittest.TestCase):
                 self.assertFalse(decision.allowed)
                 self.assertEqual(ACTION_HOLD, decision.action)
 
+    def test_malformed_author_trust_sources_fail_closed(self):
+        for field, value in (
+            ("user_login", 123),
+            ("user_login", {"name": "not-a-login"}),
+            ("association", 42),
+        ):
+            with self.subTest(field=field, value=value):
+                marked = comment(
+                    render_receipt(receipt()),
+                    login="untrusted-reader",
+                    association="NONE",
+                )
+                if field == "user_login":
+                    marked["user"]["login"] = value
+                else:
+                    marked["author_association"] = value
+                result = read([marked])
+                self.assertEqual(OUTCOME_INCOMPLETE, result.outcome)
+                self.assertEqual(ACTION_HOLD, decide_new_attempt(result).action)
+                self.assertFalse(decide_new_attempt(result).allowed)
+
+        # A malformed primary login must not fall back to a secondary string.
+        malformed = comment(render_receipt(receipt()), login=123)
+        malformed["author_login"] = "untrusted-reader"
+        self.assertEqual(OUTCOME_INCOMPLETE, read([malformed]).outcome)
+
     def test_positive_trust_with_one_author_source_remains_valid(self):
         trusted_bot = receipt_comment()
         del trusted_bot["author_association"]
