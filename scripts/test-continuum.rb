@@ -4046,6 +4046,20 @@ class ContinuumTest < Minitest::Test
           attempt_id=attempt,
           status='claimed',
       )
+      rejected = build_receipt(
+          repository=repository,
+          pull_number=pull_number,
+          head_sha=head_sha,
+          attempt_id=attempt,
+          status='rejected',
+      )
+      other_rejected = build_receipt(
+          repository=repository,
+          pull_number=pull_number,
+          head_sha=head_sha,
+          attempt_id=attempt,
+          status='rejected',
+      )
       legacy = {
           'id': 900,
           'display_title': 'OpenCode repair PR #449',
@@ -4068,12 +4082,12 @@ class ContinuumTest < Minitest::Test
           def __init__(self, runs):
               self.runs = runs
 
-      def comment(association, receipt=receipt):
+      def comment(association, receipt=receipt, author='old-automation'):
           return {
               'body': render_receipt(receipt),
               'created_at': '2026-11-12T00:00:00Z',
               'author_association': association,
-              'user': {'login': 'old-automation'},
+              'user': {'login': author},
           }
 
       def writers(
@@ -4082,13 +4096,18 @@ class ContinuumTest < Minitest::Test
           baseline='2026-11-11T00:00:00Z',
           receipt=receipt,
           legacy_retired='2026-11-11T00:00:00Z',
+          comments=None,
       ):
           admission._workflow_runs = lambda *args, **kwargs: Inventory(runs)
+          history = (
+              comments if comments is not None
+              else [comment(association, receipt)]
+          )
           return admission._historical_receipt_writers(
               repository,
               pull_number,
               head_sha,
-              [comment(association, receipt)],
+              history,
               workflow='continuum-opencode.yml',
               owner_login='',
               trusted_logins=('github-actions[bot]',),
@@ -4099,6 +4118,27 @@ class ContinuumTest < Minitest::Test
       verified, verified_hold = writers('NONE', [legacy])
       result['verified'] = list(verified)
       result['verified_hold'] = verified_hold
+      same_verified, same_writer_rejection_hold = writers(
+          'MEMBER',
+          [],
+          comments=[
+              comment('MEMBER', claimed),
+              comment('MEMBER', rejected),
+          ],
+      )
+      result['same_writer_rejection_verified'] = list(same_verified)
+      result['same_writer_rejection_hold'] = same_writer_rejection_hold
+      different_verified, different_writer_rejection_hold = writers(
+          'MEMBER',
+          [],
+          comments=[
+              comment('MEMBER', claimed),
+              comment('MEMBER', other_rejected, author='somebody-else'),
+          ],
+      )
+      result['different_writer_rejection_verified'] = list(different_verified)
+      result['different_writer_rejection_hold'] = (
+          different_writer_rejection_hold)
       _, member_hold = writers('MEMBER', [])
       _, none_hold = writers('NONE', [])
       result['member_hold'] = member_hold
@@ -4174,6 +4214,14 @@ class ContinuumTest < Minitest::Test
            'a different PR title must never prove the historical writer'
     assert_equal ['old-automation'], result.fetch('verified')
     refute result.fetch('verified_hold')
+    assert_empty result.fetch('same_writer_rejection_verified'),
+                 'a same-writer rejection must clear its claimed receipt'
+    refute result.fetch('same_writer_rejection_hold'),
+           'a same-writer rejected attempt must not hold admission'
+    assert_empty result.fetch('different_writer_rejection_verified'),
+                 'a rejection from another author must not verify the claim'
+    assert result.fetch('different_writer_rejection_hold'),
+           'a rejection from another author must not clear the claimed receipt'
     assert result.fetch('member_hold'),
            'an unproved collaborator receipt must hold admission'
     refute result.fetch('none_hold'),
