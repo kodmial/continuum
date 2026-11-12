@@ -1604,6 +1604,131 @@ jobs:
             return unresolved;
           }
 
+          // NanoDictate uses this single canonical auto-merge owner.
+          // Never send one inline verification per unresolved finding in
+          // the same wake. Full-review quota stays a separate shared queue.
+          const CODERABBIT_CHAT_MIN_GAP_MS = 5 * 60_000;
+          const CODERABBIT_CHAT_FALLBACK_MS = 65 * 60_000;
+          const CODERABBIT_CHAT_PADDING_MS = 30_000;
+          let codeRabbitChatSentThisPass = false;
+          let codeRabbitChatNextAllowedAt = null;
+
+          function isCodeRabbitChatLimitReply(comment) {
+            const body = String(comment?.body || '');
+            return comment?.user?.login === 'coderabbitai[bot]' &&
+              /(?:^|\n)\s*###\s*Rate Limit Exceeded\b/i.test(body) &&
+              /\bnumber of chat messages per hour\b/i.test(body);
+          }
+
+          function codeRabbitChatLimitNotBefore(comment) {
+            if (!isCodeRabbitChatLimitReply(comment)) return null;
+            const body = String(comment.body || '');
+            const countdown = body.match(
+              /please wait\s+\*\*([^*\n]{1,90})\*\*\s+before sending another message/i
+            );
+            let delay = 0;
+            if (countdown) {
+              for (const part of countdown[1].matchAll(
+                /(\d+)\s*(hours?|minutes?|seconds?)/gi
+              )) {
+                const amount = Number(part[1]);
+                const unit = part[2].toLowerCase();
+                delay += amount * (unit.startsWith('hour') ? 3_600_000 :
+                  unit.startsWith('minute') ? 60_000 : 1_000);
+              }
+            }
+            if (!(delay > 0 && delay <= 24 * 3_600_000)) {
+              delay = CODERABBIT_CHAT_FALLBACK_MS;
+            }
+            const at = Date.parse(comment.created_at || '');
+            return Number.isFinite(at)
+              ? at + delay + CODERABBIT_CHAT_PADDING_MS
+              : Number.MAX_SAFE_INTEGER;
+          }
+
+          function isTrustedContinuumChatRequest(comment) {
+            const body = String(comment?.body || '');
+            return ['OWNER', 'MEMBER', 'COLLABORATOR'].includes(
+              String(comment?.author_association || '').toUpperCase()
+            ) && body.includes('<!-- continuum-origin role=continuum') &&
+              (body.includes('<!-- auto-merge-coderabbit-verification finding=') ||
+               body.includes('<!-- opencode-coderabbit-verification review='));
+          }
+
+          async function allowOneCodeRabbitChatRequest() {
+            if (codeRabbitChatSentThisPass) return false;
+            if (codeRabbitChatNextAllowedAt === null) {
+              let notBefore = 0;
+              // Scan the newest verified comments of *all* open PRs, not
+              // only the current finding. The emitted review comment is the
+              // persisted cross-run lease; the controller is serialized.
+              for (const listed of pulls) {
+                const { data: meta } = await withReadFallback(client =>
+                  client.rest.pulls.get({
+                    owner, repo, pull_number: listed.number,
+                  })
+                );
+                const count = Number(meta.review_comments);
+                if (!Number.isSafeInteger(count) || count < 0) {
+                  throw new Error('Cannot establish CodeRabbit chat comment count.');
+                }
+                const lastPage = Math.max(1, Math.ceil(count / 100));
+                const firstPage = Math.max(1, lastPage - 9);
+                let windowComplete = false;
+                for (let page = lastPage; page >= firstPage; page -= 1) {
+                  const { data: comments } = await withReadFallback(client =>
+                    client.rest.pulls.listReviewComments({
+                      owner, repo, pull_number: listed.number,
+                      per_page: 100, page,
+                    })
+                  );
+                  if (!Array.isArray(comments)) {
+                    throw new Error('CodeRabbit chat history is unavailable.');
+                  }
+                  for (const comment of comments) {
+                    const limitUntil = codeRabbitChatLimitNotBefore(comment);
+                    if (limitUntil !== null) {
+                      notBefore = Math.max(notBefore, limitUntil);
+                    }
+                    if (isTrustedContinuumChatRequest(comment)) {
+                      const at = Date.parse(comment.created_at || '');
+                      notBefore = Math.max(notBefore, Number.isFinite(at)
+                        ? at + CODERABBIT_CHAT_MIN_GAP_MS
+                        : Number.MAX_SAFE_INTEGER);
+                    }
+                  }
+                  const oldest = comments.reduce((min, comment) =>
+                    Math.min(min, Date.parse(comment.created_at || '') || 0),
+                    Number.MAX_SAFE_INTEGER);
+                  if (comments.length < 100 ||
+                      oldest < Date.now() - 25 * 3_600_000) {
+                    windowComplete = true;
+                    break;
+                  }
+                }
+                if (!windowComplete && firstPage > 1) {
+                  core.warning(
+                    'PR #' + listed.number + ': CodeRabbit chat history exceeded ' +
+                    'the bounded newest window; suppressing chat dispatch.'
+                  );
+                  notBefore = Number.MAX_SAFE_INTEGER;
+                }
+              }
+              codeRabbitChatNextAllowedAt = notBefore;
+            }
+            if (Date.now() < codeRabbitChatNextAllowedAt) {
+              core.info(
+                'CodeRabbit chat deferred to shared not-before ' +
+                new Date(Math.min(
+                  codeRabbitChatNextAllowedAt, 8640000000000000
+                )).toISOString()
+              );
+              return false;
+            }
+            codeRabbitChatSentThisPass = true;
+            return true;
+          }
+
           function shouldRecheckCodeRabbitAfterCi(answer, ci, alreadyRequested) {
             if (alreadyRequested || !answer || !ci ||
                 ci.status !== 'completed' || ci.conclusion !== 'success') {
@@ -1670,7 +1795,8 @@ jobs:
                     comment.in_reply_to_id === thread.commentId &&
                     comment.user?.login?.startsWith('coderabbitai') &&
                     Number(comment.id) > Number(latestVerification.id) &&
-                    !/Review rate limited|Review limit reached/i.test(comment.body || '')
+                    !/Review rate limited|Review limit reached/i.test(comment.body || '') &&
+                    !isCodeRabbitChatLimitReply(comment)
                   )
                   .sort((a, b) => Number(b.id) - Number(a.id))[0] || null;
                 if (latestAnswer) {
@@ -1694,6 +1820,7 @@ jobs:
                         live.data.head.sha !== pr.head.sha) {
                       continue;
                     }
+                    if (!(await allowOneCodeRabbitChatRequest())) continue;
                     await github.request(
                       'POST /repos/{owner}/{repo}/pulls/{pull_number}/comments/{comment_id}/replies',
                       {
@@ -1816,6 +1943,7 @@ jobs:
                 'Otherwise explain exactly what remains unresolved.',
               ].join('\n');
 
+              if (!(await allowOneCodeRabbitChatRequest())) continue;
               await github.request(
                 'POST /repos/{owner}/{repo}/pulls/{pull_number}/comments/{comment_id}/replies',
                 {
