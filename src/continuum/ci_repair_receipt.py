@@ -462,6 +462,14 @@ def _has_author_metadata(comment: Mapping[str, Any]) -> bool:
     return bool(association) and bool(_comment_login(comment))
 
 
+def comment_login(comment: Mapping[str, Any]) -> str:
+    """Return the validated, normalized author login for one comment."""
+
+    if not isinstance(comment, Mapping):
+        return ""
+    return _comment_login(comment)
+
+
 def is_trusted_receipt_comment(
     comment: Mapping[str, Any],
     *,
@@ -540,6 +548,47 @@ def validate_receipt_transition(
     """
 
     _validate_advance(previous, following)
+
+
+def _reconcile_observation(previous: RepairReceipt, following: RepairReceipt) -> RepairReceipt:
+    """Fold one same-attempt observation into the reconciled attempt state.
+
+    The serialized owner and the dispatched executor both append receipts for
+    the same attempt around an uncertain dispatch, and they do not share the
+    owner's concurrency lock. An observation can therefore arrive that would
+    lower the reconciled state (the owner's ``ambiguous`` written after the
+    executor already proved ``dispatched``) or omit run details the other
+    writer already recorded (a legacy 204 write after a proved run ID). Those
+    two shapes are concurrent reports of the same event, not corruption:
+    they are reconciled monotonically so the proved run evidence wins and the
+    effective state never regresses. Every other impossible transition still
+    fails closed.
+    """
+
+    try:
+        _validate_advance(previous, following)
+        return following
+    except ReceiptError:
+        if receipt_key(previous) != receipt_key(following):
+            raise
+        if previous.attempt_id != following.attempt_id:
+            raise
+        if (
+            previous.status == STATUS_DISPATCHED
+            and following.status == STATUS_AMBIGUOUS
+        ):
+            # A concurrent writer reported uncertainty after the run was
+            # already proved; the proved dispatch stays authoritative.
+            return previous
+        if (
+            previous.status == STATUS_DISPATCHED
+            and following.status == STATUS_DISPATCHED
+            and following.run_id is None
+            and not following.run_url
+        ):
+            # A legacy 204 write must never overwrite a recorded run ID.
+            return previous
+        raise
 
 
 def transition_receipt(
@@ -676,10 +725,13 @@ def read_receipts(
     ``all_receipts`` as independent keys and their valid state does not block
     the queried HEAD. An impossible transition, reused attempt ID, or duplicate
     live attempt anywhere in the supplied log is corrupt evidence and fails
-    closed instead of permitting a dispatch. Untrusted marker lookalikes are
-    ignored without affecting authority. A marker whose author has neither an
-    association nor a usable login is unknown, not untrusted, and makes the
-    history incomplete.
+    closed instead of permitting a dispatch. The one exception is a concurrent
+    report of the same event -- a proved ``dispatched`` attempt followed by a
+    writer's ``ambiguous`` or run-detail-less duplicate -- which is reconciled
+    monotonically instead of regressing the attempt state. Untrusted marker
+    lookalikes are ignored without affecting authority. A marker whose author
+    has neither an association nor a usable login is unknown, not untrusted,
+    and makes the history incomplete.
     """
 
     repository_key = normalize_repository(repository)
@@ -795,7 +847,9 @@ def read_receipts(
             order.append(receipt.attempt_id)
             continue
         try:
-            _validate_advance(current[receipt.attempt_id], receipt)
+            current[receipt.attempt_id] = _reconcile_observation(
+                current[receipt.attempt_id], receipt
+            )
         except ReceiptError as exc:
             attempts = _summarize(order, current, counts, head)
             return _conflict(
@@ -805,7 +859,6 @@ def read_receipts(
                 attempts,
                 ignored_untrusted,
             )
-        current[receipt.attempt_id] = receipt
         counts[receipt.attempt_id] += 1
 
     attempts = _summarize(order, current, counts, head)
@@ -1026,6 +1079,7 @@ __all__ = [
     "render_receipt",
     "receipt_key",
     "parse_receipts",
+    "comment_login",
     "is_trusted_receipt_comment",
     "validate_receipt_transition",
     "transition_receipt",

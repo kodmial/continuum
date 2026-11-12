@@ -687,14 +687,76 @@ class AttemptDecisionTests(unittest.TestCase):
         self.assertFalse(decide_new_attempt(result).allowed)
 
     def test_dispatched_receipt_cannot_lose_proved_run_details(self):
+        # The owner and the dispatched executor write the same attempt without
+        # a shared lock, so a legacy 204 outcome can land after the run was
+        # already proved. That concurrent report is reconciled instead of
+        # conflicting the whole history: the proved run details always win and
+        # are never lost.
         comments = [
             receipt_comment(attempt=ATTEMPT),
             receipt_comment(attempt=ATTEMPT, status=STATUS_DISPATCHED, run_id=1),
             receipt_comment(attempt=ATTEMPT, status=STATUS_DISPATCHED),
         ]
         result = read(comments)
+        self.assertEqual(OUTCOME_COMPLETE, result.outcome)
+        attempt = attempt_for_id(result, ATTEMPT)
+        self.assertEqual(STATUS_DISPATCHED, attempt.status)
+        self.assertEqual(1, attempt.run_id)
+        self.assertEqual(3, attempt.receipt_count)
+        self.assertFalse(decide_new_attempt(result).allowed)
+
+
+class ConcurrentObservationTests(unittest.TestCase):
+    """Two writers publish the same attempt around an uncertain dispatch.
+
+    The serialized owner and the dispatched executor do not share a lock, so
+    their receipts can arrive in either order. Concurrent reports of the same
+    event are reconciled monotonically instead of regressing the attempt state
+    or conflicting the whole PR history.
+    """
+
+    def test_ambiguous_after_a_proved_run_keeps_the_dispatch(self):
+        comments = [
+            receipt_comment(attempt=ATTEMPT),
+            receipt_comment(attempt=ATTEMPT, status=STATUS_DISPATCHED, run_id=7),
+            receipt_comment(attempt=ATTEMPT, status=STATUS_AMBIGUOUS),
+        ]
+        result = read(comments)
+        self.assertEqual(OUTCOME_COMPLETE, result.outcome)
+        attempt = attempt_for_id(result, ATTEMPT)
+        self.assertEqual(STATUS_DISPATCHED, attempt.status)
+        self.assertEqual(7, attempt.run_id)
+        self.assertEqual(ACTION_WAIT, decide_new_attempt(result).action)
+
+    def test_reconciliation_keeps_later_heads_readable(self):
+        # A reconciled concurrency artifact must never poison the whole log:
+        # the next exact HEAD still owns an independent attempt key.
+        comments = [
+            receipt_comment(attempt=ATTEMPT),
+            receipt_comment(attempt=ATTEMPT, status=STATUS_DISPATCHED, run_id=7),
+            receipt_comment(attempt=ATTEMPT, status=STATUS_AMBIGUOUS),
+            receipt_comment(attempt=OTHER_ATTEMPT, head=OTHER_HEAD),
+        ]
+        result = read(comments, head=OTHER_HEAD)
+        self.assertEqual(OUTCOME_COMPLETE, result.outcome)
+        self.assertEqual(
+            STATUS_CLAIMED, attempt_for_id(result, OTHER_ATTEMPT).status
+        )
+        self.assertEqual(ACTION_WAIT, decide_new_attempt(result).action)
+        self.assertEqual(
+            {ATTEMPT, OTHER_ATTEMPT},
+            {item.attempt_id for item in result.all_receipts},
+        )
+
+    def test_a_rejected_attempt_is_never_resurrected_by_a_concurrent_write(self):
+        comments = [
+            receipt_comment(attempt=ATTEMPT),
+            receipt_comment(attempt=ATTEMPT, status=STATUS_REJECTED),
+            receipt_comment(attempt=ATTEMPT, status=STATUS_DISPATCHED, run_id=7),
+        ]
+        result = read(comments)
         self.assertEqual(OUTCOME_CONFLICT, result.outcome)
-        self.assertIn("must not lose", result.reason)
+        self.assertFalse(decide_new_attempt(result).allowed)
 
     def test_attempt_lookup_and_transition_helpers(self):
         result = read([receipt_comment()])

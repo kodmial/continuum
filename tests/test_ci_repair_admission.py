@@ -30,6 +30,7 @@ from continuum.ci_repair_admission import (
     normalize_run_pages,
     plan_admission,
     run_marker,
+    run_proves_dispatched_receipt,
     select_correlated_run,
     timestamp_is_stale,
     unexpected_dispatch_inputs,
@@ -414,6 +415,98 @@ class RunCorrelationTests(unittest.TestCase):
                 # Without a claim threshold the legacy run is still visible.
                 self.assertTrue(has_unattributed_repair_run(runs, pull_number=PR))
 
+    def test_a_run_without_a_usable_title_makes_the_inventory_incomplete(self):
+        # Correlation reads the attempt marker from the run title. A run that
+        # carries no usable title cannot be excluded as the accepted repair,
+        # so the inventory is not proof that no run exists.
+        for title in (None, "", "   ", 7):
+            with self.subTest(title=title):
+                entry = run(9)
+                if title is None:
+                    entry.pop("display_title")
+                else:
+                    entry["display_title"] = title
+                inventory = normalize_run_pages(
+                    [{"total_count": 1, "workflow_runs": [entry]}]
+                )
+                self.assertFalse(inventory.complete)
+                self.assertIn("display title", inventory.reason)
+
+
+class VerifiedHistoricalWriterTests(unittest.TestCase):
+    """A rotated PAT account keeps only GitHub-attested dispatch evidence."""
+
+    def dispatched(self, *, attempt=ATTEMPT, run_id=900):
+        return build_receipt(
+            repository=REPO,
+            pull_number=PR,
+            head_sha=HEAD,
+            attempt_id=attempt,
+            status=STATUS_DISPATCHED,
+            run_id=run_id,
+        )
+
+    @staticmethod
+    def actual_run(*, attempt=ATTEMPT, actor="old-automation", head=None, run_id=900):
+        return {
+            "id": run_id,
+            "display_title": "OpenCode repair PR #{} [ci-attempt:{}]".format(
+                PR, attempt
+            ),
+            "head_sha": head or HEAD,
+            "actor": {"login": actor},
+        }
+
+    def test_a_same_head_run_created_by_the_author_proves_the_receipt(self):
+        self.assertTrue(
+            run_proves_dispatched_receipt(
+                self.actual_run(),
+                self.dispatched(),
+                author_login="Old-Automation",
+            )
+        )
+
+    def test_a_legacy_unmarked_repair_title_still_proves_the_receipt(self):
+        self.assertTrue(
+            run_proves_dispatched_receipt(
+                {
+                    "id": 900,
+                    "display_title": "OpenCode repair PR #{}".format(PR),
+                    "head_sha": HEAD,
+                    "triggering_actor": {"login": "old-automation"},
+                },
+                self.dispatched(),
+                author_login="old-automation",
+            )
+        )
+
+    def test_foreign_or_mismatched_runs_never_prove_a_receipt(self):
+        cases = {
+            "another run id": self.actual_run(run_id=901),
+            "another exact HEAD": self.actual_run(head=OTHER_HEAD),
+            "another attempt marker": self.actual_run(attempt=OTHER_ATTEMPT),
+            "another actor": self.actual_run(actor="somebody-else"),
+            "no actor": {"id": 900, "head_sha": HEAD,
+                         "display_title": "OpenCode repair PR #{}".format(PR)},
+        }
+        for name, run in cases.items():
+            with self.subTest(case=name):
+                self.assertFalse(
+                    run_proves_dispatched_receipt(
+                        run, self.dispatched(), author_login="old-automation"
+                    )
+                )
+        # A receipt without a proved run, or with no author to attest, never
+        # becomes authoritative.
+        self.assertFalse(
+            run_proves_dispatched_receipt(
+                self.actual_run(), receipt(), author_login="old-automation"
+            )
+        )
+        self.assertFalse(
+            run_proves_dispatched_receipt(self.actual_run(), self.dispatched())
+        )
+
 
 # ---------------------------------------------------------------------------
 # Admission planning, including crash recovery.
@@ -511,6 +604,25 @@ class AdmissionPlanningTests(unittest.TestCase):
         plan = plan_admission(
             read([receipt_comment()]),
             runs=RunInventory((), False, "pagination incomplete"),
+            observed_at="2026-11-12T00:00:00Z",
+            now="2026-11-12T01:00:00Z",
+            claim_timeout_seconds=900,
+            pull_number=PR,
+        )
+        self.assertEqual(ACTION_HOLD, plan.action)
+        self.assertEqual(STATUS_AMBIGUOUS, plan.transition.status)
+
+    def test_a_stale_claim_holds_when_a_run_carries_no_usable_title(self):
+        # Without a display title the run cannot be excluded as the accepted
+        # repair, so the inventory is incomplete and re-arming would risk a
+        # duplicate dispatch for the same exact HEAD.
+        inventory = normalize_run_pages(
+            [{"total_count": 1, "workflow_runs": [{"id": 5, "head_sha": HEAD}]}]
+        )
+        self.assertFalse(inventory.complete)
+        plan = plan_admission(
+            read([receipt_comment()]),
+            runs=inventory,
             observed_at="2026-11-12T00:00:00Z",
             now="2026-11-12T01:00:00Z",
             claim_timeout_seconds=900,

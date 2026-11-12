@@ -49,10 +49,11 @@ from continuum.ci_repair_admission import (  # noqa: E402
     RunInventory,
     attempt_observed_at,
     classify_dispatch_response,
-    collection_from_pages,
     correlated_run_url,
+    normalize_comment_pages,
     normalize_run_pages,
     plan_admission,
+    run_proves_dispatched_receipt,
     select_correlated_run,
     unexpected_dispatch_inputs,
 )
@@ -60,14 +61,19 @@ from continuum.ci_repair_receipt import (  # noqa: E402
     ACTION_CLAIM,
     ACTION_HOLD,
     ACTION_WAIT,
+    RECEIPT_MARKER,
     STATUS_AMBIGUOUS,
     STATUS_CLAIMED,
     STATUS_DISPATCHED,
     build_receipt,
+    comment_login,
+    is_trusted_receipt_comment,
     new_attempt_id,
     normalize_head_sha,
     normalize_pull_number,
     normalize_repository,
+    parse_receipts,
+    read_receipts,
     render_receipt,
     transition_receipt,
 )
@@ -344,6 +350,127 @@ def _comment_body(receipt, headline: str) -> str:
     )
 
 
+def _pr_head_mismatch(
+    pr: Mapping[str, Any], repository: str, head_sha: str
+) -> Optional[str]:
+    """Return why ``pr`` is not the admitted exact HEAD, or ``None``."""
+
+    state = str(pr.get("state") or "")
+    head = pr.get("head") if isinstance(pr.get("head"), Mapping) else {}
+    current_head = str(head.get("sha") or "").strip().lower()
+    head_repo = str((head.get("repo") or {}).get("full_name") or "").strip().lower()
+    if state != "open":
+        return "it is not open (state={})".format(state or "-")
+    if head_repo != repository:
+        return "its head repository is {} instead of {}".format(
+            head_repo or "-", repository
+        )
+    if current_head != head_sha:
+        return "its HEAD moved from admitted {} to {}".format(
+            head_sha, current_head or "-"
+        )
+    return None
+
+
+def _revalidate_head(
+    repository: str, pull_number: int, head_sha: str
+) -> Optional[str]:
+    """Re-read the PR immediately before dispatch and prove the same HEAD."""
+
+    try:
+        pr = _pull(repository, pull_number)
+    except GhFailure as exc:
+        return "the PR could not be revalidated ({})".format(exc)
+    return _pr_head_mismatch(pr, repository, head_sha)
+
+
+def _historical_receipt_writers(
+    repository: str,
+    pull_number: int,
+    head_sha: str,
+    comments: Sequence[Mapping[str, Any]],
+    *,
+    workflow: str,
+    owner_login: str,
+    trusted_logins: Sequence[str],
+) -> Tuple[str, ...]:
+    """Return historical receipt authors proved by GitHub's run records.
+
+    ``TAP_PAT`` can be rotated to another account. Receipts the previous
+    account published must stay authoritative, or the exact HEAD they already
+    dispatched looks unused and admission dispatches it a second time. A
+    receipt is only re-trusted here when the ``dispatched`` run it names exists
+    for the same exact HEAD, carries this attempt's run-name marker (or the
+    canonical legacy repair title) and was created by the same account. An
+    unrelated commenter cannot borrow a run ID, so unverified lookalikes stay
+    ignored exactly as before.
+    """
+
+    candidates = []
+    for comment in comments:
+        if not isinstance(comment, Mapping):
+            continue
+        body = comment.get("body")
+        if not isinstance(body, str) or RECEIPT_MARKER not in body:
+            continue
+        author = comment_login(comment)
+        if not author:
+            continue
+        if is_trusted_receipt_comment(
+            comment,
+            owner_login=owner_login,
+            trusted_logins=tuple(trusted_logins),
+        ):
+            continue
+        try:
+            receipts = parse_receipts(body)
+        except ValueError:
+            # An untrusted lookalike is ignored, never fatal.
+            continue
+        for receipt in receipts:
+            if (
+                receipt.repository != repository
+                or receipt.pull_number != pull_number
+                or receipt.head_sha != head_sha
+                or receipt.status != STATUS_DISPATCHED
+                or receipt.run_id is None
+            ):
+                continue
+            candidates.append((author, receipt))
+    if not candidates:
+        return ()
+
+    try:
+        inventory = _workflow_runs(repository, workflow)
+    except GhFailure as exc:
+        print(
+            "::warning::Could not verify historical CI-repair receipt authors: {}".format(
+                exc
+            )
+        )
+        return ()
+    if not inventory.complete:
+        return ()
+
+    runs_by_id = {}
+    for run in inventory.runs:
+        run_id = run.get("id")
+        if isinstance(run_id, bool) or not isinstance(run_id, int):
+            continue
+        runs_by_id[run_id] = run
+
+    verified = []
+    for author, receipt in candidates:
+        run = runs_by_id.get(receipt.run_id)
+        if run is None:
+            continue
+        if not run_proves_dispatched_receipt(run, receipt, author_login=author):
+            continue
+        if author not in verified:
+            verified.append(author)
+    return tuple(verified)
+
+
 def _print_plan(plan: AdmissionPlan) -> None:
     level = "notice" if plan.action in (ACTION_CLAIM, ACTION_WAIT) else "warning"
     print(
@@ -369,17 +496,13 @@ def run(args) -> int:
     except GhFailure as exc:
         print("::warning::Could not revalidate PR #{}: {}".format(pull_number, exc))
         return 0
-    state = str(pr.get("state") or "")
     head = pr.get("head") if isinstance(pr.get("head"), Mapping) else {}
-    current_head = str(head.get("sha") or "")
-    head_repo = str((head.get("repo") or {}).get("full_name") or "")
     head_ref = str(head.get("ref") or args.head_ref or "")
-    if state != "open" or head_repo.lower() != repository or current_head.lower() != head_sha:
+    mismatch = _pr_head_mismatch(pr, repository, head_sha)
+    if mismatch:
         print(
-            "::notice::CI-repair admission skipped: PR #{} is not the open "
-            "same-repository PR at exact HEAD {} (state={}, head={}, repo={}).".format(
-                pull_number, head_sha, state or "-", current_head or "-",
-                head_repo or "-",
+            "::notice::CI-repair admission skipped for PR #{} at exact HEAD {}: {}.".format(
+                pull_number, head_sha, mismatch
             )
         )
         return 0
@@ -405,14 +528,9 @@ def run(args) -> int:
     trusted_logins.append(token_login)
 
     expected = pr.get("comments")
-    history, collection = collection_from_pages(
+    history = normalize_comment_pages(
         pages,
-        repository=repository,
-        pull_number=pull_number,
-        head_sha=head_sha,
         expected_count=expected if isinstance(expected, int) else None,
-        owner_login=args.owner_login or "",
-        trusted_logins=tuple(trusted_logins),
     )
     if not history.complete:
         print(
@@ -420,6 +538,38 @@ def run(args) -> int:
             "of dispatching: {}".format(history.reason)
         )
         return 0
+
+    # A rotated TAP_PAT account must not turn previously authoritative receipts
+    # into ignored lookalikes. Only dispatch evidence GitHub itself attests
+    # (a same-HEAD run created by that account for this attempt) extends trust.
+    for login in _historical_receipt_writers(
+        repository,
+        pull_number,
+        head_sha,
+        history.comments,
+        workflow=args.workflow,
+        owner_login=args.owner_login or "",
+        trusted_logins=tuple(trusted_logins),
+    ):
+        trusted_logins.append(login)
+        print(
+            "::notice::Historical CI-repair receipt author {!r} is verified by "
+            "its exact-HEAD dispatch run.".format(login)
+        )
+
+    collection = read_receipts(
+        history.comments,
+        repository=repository,
+        pull_number=pull_number,
+        head_sha=head_sha,
+        history_complete=True,
+        history_ordered=True,
+        expected_comment_count=(
+            len(history.comments) if history.expected_count is not None else None
+        ),
+        owner_login=args.owner_login or "",
+        trusted_logins=tuple(trusted_logins),
+    )
 
     plan = plan_admission(collection)
     attempt = None
@@ -522,6 +672,21 @@ def run(args) -> int:
         if isinstance(claim_created, str) and claim_created
         else None
     )
+
+    # The claim is persisted against an exact HEAD, but the branch can advance
+    # between admission and the dispatch request. Dispatching then would let
+    # this attempt repair a newer HEAD that independently receives its own
+    # attempt, so prove the admitted HEAD is still current immediately before
+    # dispatch. The persisted claim stays bound to its own exact HEAD and can
+    # never block the newer HEAD's key.
+    stale = _revalidate_head(repository, pull_number, head_sha)
+    if stale:
+        print(
+            "::notice::CI-repair dispatch withheld: {}. The persisted claim "
+            "remains bound to exact HEAD {}; a newer HEAD admits its own "
+            "attempt.".format(stale, head_sha)
+        )
+        return 0
 
     status, response_body, detail = _dispatch(
         repository,

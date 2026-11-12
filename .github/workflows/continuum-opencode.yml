@@ -957,18 +957,29 @@ jobs:
             const pullNumber = Number(process.env.PR_NUMBER || 0);
             if (!Number.isInteger(pullNumber) || pullNumber <= 0) return;
             const requestedAttempt = String(process.env.CI_ATTEMPT_ID || '').trim();
-            let head = String(process.env.CI_HEAD_SHA || '').trim().toLowerCase();
+            const head = String(process.env.CI_HEAD_SHA || '').trim().toLowerCase();
+            // Correlation needs verified dispatch evidence. The live PR HEAD is
+            // mutable, so a legacy run dispatched for H1 must never be
+            // attributed to whatever HEAD the PR shows once it starts: that
+            // would spend H2's attempt on H1's failure context. Without the
+            // pinned identity the run stays uncorrelated and the durable
+            // receipt history remains the only authority.
             if (!/^[0-9a-f]{40}$/.test(head)) {
-              const { data: pr } = await github.rest.pulls.get({ owner, repo, pull_number: pullNumber });
-              head = String(pr.head?.sha || '').toLowerCase();
-            }
-            if (!/^[0-9a-f]{40}$/.test(head)) {
-              core.warning('CI repair correlation has no exact PR HEAD; not writing a receipt.');
+              core.notice('CI repair correlation has no verified exact-HEAD dispatch evidence; leaving this run uncorrelated.');
               return;
             }
-            const comments = await github.paginate(github.rest.issues.listComments, {
-              owner, repo, issue_number: pullNumber, per_page: 100,
-            });
+            let comments;
+            try {
+              comments = await github.paginate(github.rest.issues.listComments, {
+                owner, repo, issue_number: pullNumber, per_page: 100,
+              });
+            } catch (error) {
+              // The owner already persisted the claim and that attempt is
+              // spent. A correlation read failure must never abort the
+              // admitted repair, so it stays a visible warning.
+              core.warning(`Could not read CI repair receipts; leaving this run uncorrelated: ${error.message || error}`);
+              return;
+            }
             // The receipt author is whoever owns TAP_PAT. It may be an owner,
             // a collaborator, or a dedicated automation account, so trust its
             // own identity explicitly instead of guessing that it is OWNER.
@@ -1000,23 +1011,28 @@ jobs:
               }
             }
             observations.sort((a, b) => a.id - b.id);
+            // Fold the observations per attempt: only each attempt's latest
+            // state is authoritative. An attempt that was later rejected or
+            // dispatched is spent, and appending a dispatched receipt for it
+            // would record an impossible transition that conflicts the whole
+            // history, including later exact HEADs.
+            const latest = new Map();
+            for (const item of observations) latest.set(item.attempt, item);
+            const isActive = item => Boolean(item) &&
+              (item.status === 'claimed' || item.status === 'ambiguous');
             let attempt = requestedAttempt;
             if (!attempt) {
-              const active = [...observations].reverse().find(item =>
-                item.status === 'claimed' || item.status === 'ambiguous');
-              if (!active) {
+              attempt = [...observations].reverse()
+                .map(item => item.attempt)
+                .find(id => isActive(latest.get(id))) || '';
+              if (!attempt) {
                 core.notice('No active exact-HEAD CI repair claim to correlate.');
                 return;
               }
-              attempt = active.attempt;
             }
-            const prior = observations.filter(item => item.attempt === attempt);
-            if (prior.some(item => item.status === 'dispatched')) {
-              core.notice(`CI repair attempt ${attempt} already has a dispatched receipt.`);
-              return;
-            }
-            if (!requestedAttempt && !prior.some(item => item.status === 'claimed' || item.status === 'ambiguous')) {
-              core.notice(`No claim receipt exists for CI repair attempt ${attempt}.`);
+            const current = latest.get(attempt);
+            if (!isActive(current)) {
+              core.notice(`CI repair attempt ${attempt} is not an active claim (${current ? current.status : 'no receipt'}); not correlating this run.`);
               return;
             }
             const dispatchRunId = Number(process.env.DISPATCH_RUN_ID);
@@ -1173,6 +1189,39 @@ jobs:
               *) echo "skip_opencode=false" ;;
             esac
           } >> "$GITHUB_OUTPUT"
+
+      # kodmial/continuum#446: a ci-fix dispatch carries the exact HEAD it was
+      # admitted for. The branch is mutable, so the run must not repair whatever
+      # the branch points at when the executor starts: the admitted SHA is the
+      # execution target, and a failure to prove it stops before any agent work.
+      # A 429 resumption is excluded because its restored checkpoint already
+      # pins and verifies the exact recovery identity.
+      - name: Bind CI repair to the admitted exact HEAD
+        if: >-
+          github.event_name == 'workflow_dispatch' &&
+          inputs.mode == 'ci-fix' &&
+          inputs.ci_head_sha != '' &&
+          steps.recovery_restore.outputs.resumed != 'true'
+        env:
+          ADMITTED_HEAD_SHA: ${{ inputs.ci_head_sha }}
+        run: |
+          set -euo pipefail
+          admitted="$(printf '%s' "${ADMITTED_HEAD_SHA:-}" | tr '[:upper:]' '[:lower:]')"
+          if [[ ! "$admitted" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::CI-repair dispatch carried no usable admitted HEAD SHA; refusing to start repair work."
+            exit 1
+          fi
+          if ! git fetch --no-tags --quiet origin "$admitted"; then
+            echo "::error::Admitted CI-repair HEAD $admitted is not fetchable; refusing to start repair work."
+            exit 1
+          fi
+          git checkout --force --detach "$admitted"
+          checked_out="$(git rev-parse HEAD)"
+          if [[ "$checked_out" != "$admitted" ]]; then
+            echo "::error::Checked-out HEAD $checked_out is not the admitted CI-repair HEAD $admitted; refusing to start repair work."
+            exit 1
+          fi
+          echo "CI repair is bound to the admitted exact HEAD $admitted."
 
       # One authoritative task-context resolver is shared by initial issue
       # implementation and later CI repair. PR metadata and failing logs are

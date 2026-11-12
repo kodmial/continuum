@@ -163,6 +163,17 @@ APPROVED_PROVIDER_RECOVERY_OPENCODE_SHA256 = (
 APPROVED_446_OPENCODE_SHA256 = (
     "0d1c0fbc41dfb3003ac04c5d308550ce1b4fee57655d87a1ff52b6758fdd0a61"
 )
+
+# kodmial/continuum#449 (CodeRabbit review 5870362881): the reviewed #446 pin
+# above stays for audit. The repair allows a run correlation only from verified
+# dispatch evidence (never the live PR HEAD), keeps an admitted ci-fix bound to
+# its exact HEAD, treats correlation read failures as warnings, folds attempt
+# state to its latest observation, and requires a usable run title before an
+# inventory may prove that no repair run exists. Unrelated drift still fails
+# closed.
+APPROVED_449_OPENCODE_SHA256 = (
+    "7220448a6652eaafd73a76847428ac1133a59332c8379be33bee2b79c5b08596"
+)
 APPROVED_446_CALLER_SHA256 = (
     "b7f3df118bc436526f48443b8f068372204073eb134c98e4a1543d025f314686"
 )
@@ -2588,7 +2599,7 @@ class ProtectedBaselineTests(unittest.TestCase):
                     # explicitly tested optional-attestation no-key branch.
                     self.assertEqual(
                         protected_file_digest(path),
-                        APPROVED_446_OPENCODE_SHA256,
+                        APPROVED_449_OPENCODE_SHA256,
                         f"{path}: unexpected drift outside reviewed wording cleanup",
                     )
                 else:
@@ -2659,7 +2670,7 @@ class ProtectedBaselineTests(unittest.TestCase):
         # therefore be dirty in this pre-commit worktree; any unapproved byte
         # change still fails the exact digest assertions above.
         approved = {
-            ".github/workflows/continuum-opencode.yml": APPROVED_446_OPENCODE_SHA256,
+            ".github/workflows/continuum-opencode.yml": APPROVED_449_OPENCODE_SHA256,
             ".github/workflows/opencode.yml": APPROVED_350_SELF_CALLER_SHA256,
         }
         for path in PROTECTED_FILES:

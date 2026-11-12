@@ -111,6 +111,17 @@ if rest[:1] == ["--method"] and rest[1:2] == ["POST"]:
         write_json("comments_pages.json", pages)
         with (state / "posted.jsonl").open("a", encoding="utf-8") as posted:
             posted.write(json.dumps(comment) + "\n")
+        # Simulate the PR branch advancing between the persisted claim and the
+        # dispatch request of the same serialized pass.
+        if (
+            os.environ.get("FAKE_ADVANCE_HEAD_AFTER_CLAIM") == "1"
+            and "status=claimed" in body
+        ):
+            pr = read_json("pr.json", {})
+            head = pr.get("head") if isinstance(pr.get("head"), dict) else {}
+            head["sha"] = os.environ.get("FAKE_ADVANCED_HEAD", "")
+            pr["head"] = head
+            write_json("pr.json", pr)
         print(json.dumps(comment))
         sys.exit(0)
     sys.exit(0)
@@ -167,15 +178,25 @@ sys.exit(0)
 '''
 
 
-def trusted_receipt(head=HEAD, attempt="ci-crashed-0001", status="claimed", author=None):
+def trusted_receipt(
+    head=HEAD,
+    attempt="ci-crashed-0001",
+    status="claimed",
+    author=None,
+    run_id=None,
+):
+    marker = (
+        "<!-- continuum-ci-repair-receipt v=1 repo={} pr={} head={} "
+        "attempt={} status={}".format(REPO.lower(), PR, head, attempt, status)
+    )
+    if run_id is not None:
+        marker += " run={} url=https://github.com/{}/actions/runs/{}".format(
+            run_id, REPO.lower(), run_id
+        )
+    marker += " -->"
     return {
         "id": 1,
-        "body": (
-            "<!-- continuum-ci-repair-receipt v=1 repo={} pr={} head={} "
-            "attempt={} status={} -->".format(
-                REPO.lower(), PR, head, attempt, status
-            )
-        ),
+        "body": marker,
         "created_at": "2026-11-12T00:00:00Z",
         "updated_at": "2026-11-12T00:00:00Z",
         "author_association": "NONE",
@@ -510,6 +531,94 @@ class AdmissionExecutableTests(unittest.TestCase):
         self.write_pr(head=HEAD, comments=1)
         self.run_admission()
         self.assertEqual(1, len(self.dispatches()))
+
+    def test_dispatch_is_withheld_when_the_head_advances_after_the_claim(self):
+        completed = self.run_admission(
+            extra_env={
+                "FAKE_ADVANCE_HEAD_AFTER_CLAIM": "1",
+                "FAKE_ADVANCED_HEAD": NEW_HEAD,
+            }
+        )
+        self.assertEqual(0, len(self.dispatches()))
+        self.assertIn("dispatch withheld", completed.stdout)
+        self.assertTrue(
+            any("status=claimed" in body and "head=" + HEAD in body
+                for body in self.posted_bodies())
+        )
+        # The persisted claim stays bound to its own exact HEAD, so the newer
+        # HEAD still admits its own single attempt.
+        self.run_admission(head=NEW_HEAD)
+        self.assertEqual(1, len(self.dispatches()))
+        self.assertTrue(
+            any("status=claimed" in body and "head=" + NEW_HEAD in body
+                for body in self.posted_bodies())
+        )
+
+    def test_a_previous_token_account_dispatch_is_never_redispatched(self):
+        # TAP_PAT rotated to another account: the previous account's dispatched
+        # receipt is no longer trusted by login alone. GitHub's run record
+        # proves that account created this exact-HEAD run for this attempt, so
+        # admission must keep waiting instead of dispatching a second repair.
+        self.write_comments(
+            [
+                trusted_receipt(
+                    attempt="ci-old-account-0001",
+                    status="dispatched",
+                    author="old-automation",
+                    run_id=900,
+                )
+            ]
+        )
+        self.write_pr(head=HEAD, comments=1)
+        self.write_runs(
+            [
+                {
+                    "id": 900,
+                    "display_title": "OpenCode repair PR #{} [ci-attempt:ci-old-account-0001]".format(PR),
+                    "status": "completed",
+                    "conclusion": "failure",
+                    "html_url": "https://github.com/{}/actions/runs/900".format(REPO.lower()),
+                    "created_at": "2026-11-12T00:00:00Z",
+                    "head_sha": HEAD,
+                    "actor": {"login": "old-automation"},
+                }
+            ]
+        )
+        completed = self.run_admission()
+        self.assertEqual(0, len(self.dispatches()))
+        self.assertIn("verified by its exact-HEAD dispatch run", completed.stdout)
+
+    def test_a_foreign_run_cannot_authenticate_an_untrusted_receipt(self):
+        # The same receipt shape without GitHub attesting that account as the
+        # run's actor is an unverified lookalike and must not block admission.
+        self.write_comments(
+            [
+                trusted_receipt(
+                    attempt="ci-old-account-0001",
+                    status="dispatched",
+                    author="old-automation",
+                    run_id=900,
+                )
+            ]
+        )
+        self.write_pr(head=HEAD, comments=1)
+        self.write_runs(
+            [
+                {
+                    "id": 900,
+                    "display_title": "OpenCode repair PR #{} [ci-attempt:ci-old-account-0001]".format(PR),
+                    "status": "completed",
+                    "conclusion": "failure",
+                    "html_url": "https://github.com/{}/actions/runs/900".format(REPO.lower()),
+                    "created_at": "2026-11-12T00:00:00Z",
+                    "head_sha": HEAD,
+                    "actor": {"login": "somebody-else"},
+                }
+            ]
+        )
+        completed = self.run_admission()
+        self.assertEqual(1, len(self.dispatches()))
+        self.assertNotIn("verified by its exact-HEAD dispatch run", completed.stdout)
 
 
 if __name__ == "__main__":

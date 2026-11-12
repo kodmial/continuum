@@ -377,6 +377,14 @@ def normalize_run_pages(
                 return RunInventory(
                     (), False, "workflow run {!r} appears on more than one page".format(raw_id)
                 )
+            title = run.get("display_title")
+            if not isinstance(title, str) or not title.strip():
+                # Attempt correlation reads the marker from the run title. A run
+                # without one cannot be excluded as the accepted repair, so an
+                # inventory containing it is not proof that no run exists.
+                return RunInventory(
+                    (), False, "a workflow run has no usable display title"
+                )
             seen_ids.add(raw_id)
             flattened.append((raw_id, run))
 
@@ -793,6 +801,59 @@ def correlated_run_url(repository: Any, run: Mapping[str, Any]) -> str:
     return _canonical_run_url(str(repository).strip().lower(), number)
 
 
+def _run_actor_logins(run: Mapping[str, Any]) -> frozenset:
+    """Return the normalized logins GitHub reports as a run's actors."""
+
+    logins = set()
+    for key in ("actor", "triggering_actor"):
+        actor = run.get(key)
+        if not isinstance(actor, Mapping):
+            continue
+        login = actor.get("login")
+        if isinstance(login, str) and login.strip():
+            logins.add(login.strip().lower())
+    return frozenset(logins)
+
+
+def run_proves_dispatched_receipt(
+    run: Any,
+    receipt: Any,
+    *,
+    author_login: Any = "",
+) -> bool:
+    """Whether GitHub's own run record proves an otherwise untrusted receipt.
+
+    ``TAP_PAT`` can be rotated to another account. A ``dispatched`` receipt the
+    previous account published must not become an ignored lookalike, or the
+    exact HEAD it already spent looks unused and admission dispatches it a
+    second time. The receipt is only re-trusted when the run it names exists
+    for the same exact HEAD, carries this attempt's run-name marker (or the
+    canonical legacy repair title) and was created by the same account. The
+    comment author alone is never sufficient, so an unrelated commenter cannot
+    borrow a run ID to suppress or authorize a repair.
+    """
+
+    if not isinstance(run, Mapping) or not isinstance(receipt, RepairReceipt):
+        return False
+    if receipt.status != STATUS_DISPATCHED or receipt.run_id is None:
+        return False
+    if _positive_run_id(run.get("id")) != receipt.run_id:
+        return False
+    if str(run.get("head_sha") or "").strip().lower() != receipt.head_sha:
+        return False
+    author = str(author_login or "").strip().lower()
+    if not author or author not in _run_actor_logins(run):
+        return False
+    title = run.get("display_title")
+    if not isinstance(title, str):
+        return False
+    marker = _ATTEMPT_RUN_MARKER_RE.search(title)
+    if marker:
+        return marker.group("attempt") == receipt.attempt_id
+    legacy = _UNMARKED_REPAIR_TITLE_RE.match(title)
+    return bool(legacy) and int(legacy.group(1)) == receipt.pull_number
+
+
 def run_marker(attempt_id: Any) -> str:
     """Render the run-name correlation marker for one attempt."""
 
@@ -1025,6 +1086,7 @@ __all__ = [
     "classify_dispatch_response",
     "select_correlated_run",
     "correlated_run_url",
+    "run_proves_dispatched_receipt",
     "has_unattributed_repair_run",
     "run_marker",
     "plan_admission",
