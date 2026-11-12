@@ -927,8 +927,11 @@ const heading = (id, created, wait) => ({
     'Please wait **' + wait + '** before sending another message.'
 });
 const rows = {
+  // PR #448's heading-only 90-minute reply is the only long deadline.
   448: [heading(1, '2026-11-12T07:53:15Z', '90 minutes')],
-  449: [heading(2, '2026-11-12T07:54:32Z', '89 minutes and 30 seconds')]
+  // PR #449's own quota expires much earlier, so it cannot mask a
+  // regression that ignores #448's heading-only reply.
+  449: [heading(2, '2026-11-12T07:58:00Z', '10 minutes')]
 };
 const client = {rest:{pulls:{
   get: async ({pull_number}) => ({data:{review_comments:rows[pull_number].length}}),
@@ -936,7 +939,7 @@ const client = {rest:{pulls:{
 }}};
 const withReadFallback = callback => callback(client);
 const RealDate = Date;
-let now = RealDate.parse('2026-11-12T08:00:00Z');
+let now = RealDate.parse('2026-11-12T08:10:00Z');
 class Clock extends RealDate {static now() {return now;}}
 global.Date = Clock;
 """ + helper + r"""
@@ -944,18 +947,20 @@ global.Date = Clock;
   assert.equal(codeRabbitChatLimitNotBefore(rows[448][0]),
     RealDate.parse('2026-11-12T09:23:45Z'));
   assert.equal(codeRabbitChatLimitNotBefore(rows[449][0]),
-    RealDate.parse('2026-11-12T09:24:32Z'));
+    RealDate.parse('2026-11-12T08:08:30Z'));
   const anonymous = {...rows[448][0], user: null};
   assert.equal(codeRabbitChatLimitNotBefore(anonymous), null,
     'missing author identity must not set the shared deadline');
+  // #449's own quota has expired, but the scan must still apply #448's
+  // heading-only 90-minute deadline to the whole account.
   assert.equal(await allowOneCodeRabbitChatRequest(), false,
-    'no send before the longer heading-only deadline');
-  now = RealDate.parse('2026-11-12T09:24:31Z');
+    'the other PR heading-only 90-minute reply still blocks the account');
+  now = RealDate.parse('2026-11-12T09:23:44Z');
   assert.equal(await allowOneCodeRabbitChatRequest(), false,
-    'the latest PR deadline still blocks one millisecond early');
-  now = RealDate.parse('2026-11-12T09:24:32Z');
+    'the other PR deadline still blocks one millisecond early');
+  now = RealDate.parse('2026-11-12T09:23:45Z');
   assert.equal(await allowOneCodeRabbitChatRequest(), true,
-    'send only after the latest shared heading-only deadline');
+    'send only after the other PR heading-only deadline');
   console.log('coderabbit-heading-only-budget PASS');
 })().catch(e => {console.error(e); process.exitCode = 1;});
 """
