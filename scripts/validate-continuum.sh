@@ -97,6 +97,13 @@ else:
 COVERAGE_PY
 PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s .github/scripts -p 'test_delegation_runtime.py'
 
+# Print the shared CodeRabbit chat-quota regression by name in the exact-HEAD
+# gate log. CodeRabbit excludes tests/** from review, so the named result is
+# the only reviewable evidence that a heading-only 90-minute reply on one PR
+# still blocks a chat send from another PR.
+PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=src python3 -m unittest -v \
+  tests.test_coderabbit_queue_lifecycle.CodeRabbitChatBudgetRegressionTests.test_account_wide_scan_uses_shared_heading_only_deadline
+
 mkdir -p "$PWD/.opencode-tmp/bin"
 # Pin both the installer URL and its content: the tag can move and a
 # compromised download would otherwise execute with this script's privileges.
