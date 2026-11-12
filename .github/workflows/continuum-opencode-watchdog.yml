@@ -2392,6 +2392,158 @@ jobs:
               (comment.body || '').includes(retryMarker)
             ).length;
 
+            // kodmial/continuum#442: a deterministic checkpoint-continuation
+            // rejection is persisted by the failing run. It is not a model
+            // failure and not an owner pause: retrying the identical
+            // checkpoint/base/snapshot would only burn another attempt. The
+            // scheduler releases a material-premise change, so the watchdog
+            // stays down while the marker is current.
+            const checkpointResumeBlockedRe =
+              /<!--\s*continuum-checkpoint-resume-blocked\s+repo=([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)\s+issue=(\d+)\s+generation=(\d+)\s+operation=(\S+)\s+checkpoint=(\S+)\s+checkpoint_sha=([0-9a-fA-F]{40})\s+base_ref=(\S+)\s+base_sha=([0-9a-fA-F]{40})\s+snapshot=([0-9a-fA-F]{64})\s+reason=(\S+)\s*-->/;
+            const checkpointSnapshotMarkerRe =
+              /<!--\s*continuum-task-snapshot(?:-ref)?\s+repo=([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)\s+issue=(\d+)\s+generation=(\d+)\s+title-sha256=([0-9a-fA-F]{64})\s+body-sha256=([0-9a-fA-F]{64})\s+spec-sha256=([0-9a-fA-F]{64})\s*-->/g;
+            const trustedCommentAuthor = comment => {
+              const association = String(
+                comment.author_association || ''
+              ).toUpperCase();
+              if (['OWNER', 'MEMBER', 'COLLABORATOR'].includes(association)) {
+                return true;
+              }
+              const login = String(comment.user?.login || '').toLowerCase();
+              return (
+                login === 'github-actions[bot]' ||
+                login === owner.toLowerCase()
+              );
+            };
+            let checkpointResumeBlocked = null;
+            for (const comment of comments) {
+              if (!trustedCommentAuthor(comment)) continue;
+              const match = String(comment.body || '').match(
+                checkpointResumeBlockedRe
+              );
+              if (!match) continue;
+              if (
+                match[1].toLowerCase() !== (owner + '/' + repo).toLowerCase() ||
+                Number(match[2]) !== issueNumber
+              ) continue;
+              const candidate = {
+                created_at: comment.created_at || '',
+                id: comment.id || 0,
+                generation: Number(match[3]),
+                operation: match[4],
+                checkpointRef: match[5],
+                checkpointSha: match[6].toLowerCase(),
+                baseRef: match[7],
+                baseSha: match[8].toLowerCase(),
+                snapshotSpec: match[9].toLowerCase(),
+                reason: match[10],
+              };
+              const order = candidate.created_at + '#' +
+                String(candidate.id).padStart(12, '0');
+              if (
+                !checkpointResumeBlocked ||
+                order > checkpointResumeBlocked.order
+              ) {
+                checkpointResumeBlocked = { ...candidate, order };
+              }
+            }
+            if (checkpointResumeBlocked) {
+              // A material premise change releases the hold: a newer trusted
+              // task snapshot (including a new generation) or a changed or
+              // deleted durable checkpoint ref. Owner /oc also supersedes it.
+              // A failed ref read keeps the hold fail-closed.
+              let premiseChanged = false;
+              let latestSnapshot = null;
+              let latestSnapshotOrder = '';
+              for (const comment of comments) {
+                if (!trustedCommentAuthor(comment)) continue;
+                const body = String(comment.body || '');
+                for (const match of body.matchAll(checkpointSnapshotMarkerRe)) {
+                  if (
+                    match[1].toLowerCase() !==
+                      (owner + '/' + repo).toLowerCase() ||
+                    Number(match[2]) !== issueNumber
+                  ) continue;
+                  const order = (comment.created_at || '') + '#' +
+                    String(comment.id || 0).padStart(12, '0');
+                  if (order > latestSnapshotOrder) {
+                    latestSnapshotOrder = order;
+                    latestSnapshot = {
+                      generation: Number(match[3]),
+                      snapshotSpec: match[6].toLowerCase(),
+                      order,
+                    };
+                  }
+                }
+              }
+              if (
+                latestSnapshot &&
+                (
+                  latestSnapshot.generation !==
+                    checkpointResumeBlocked.generation ||
+                  latestSnapshot.snapshotSpec !==
+                    checkpointResumeBlocked.snapshotSpec
+                )
+              ) {
+                premiseChanged = true;
+              }
+              if (
+                !premiseChanged &&
+                checkpointResumeBlocked.checkpointRef &&
+                checkpointResumeBlocked.checkpointRef !== '-'
+              ) {
+                try {
+                  const refName = checkpointResumeBlocked.checkpointRef
+                    .replace(/^refs\/heads\//, '');
+                  const response = await readGithub.rest.git.getRef({
+                    owner,
+                    repo,
+                    ref: 'heads/' + refName,
+                  });
+                  const tip = String(
+                    response.data?.object?.sha || ''
+                  ).toLowerCase();
+                  if (tip && tip !== checkpointResumeBlocked.checkpointSha) {
+                    premiseChanged = true;
+                  }
+                } catch (err) {
+                  if (err.status === 404) {
+                    premiseChanged = true;
+                  } else {
+                    core.warning(
+                      'Checkpoint-resume hold lookup failed for #' +
+                      issueNumber +
+                      '; keeping the deterministic hold until it can be ' +
+                      'proven changed.'
+                    );
+                  }
+                }
+              }
+              const supersededByOwner = comments.some(comment => {
+                const order = (comment.created_at || '') + '#' +
+                  String(comment.id || 0).padStart(12, '0');
+                return (
+                  order > checkpointResumeBlocked.order &&
+                  String(comment.user?.login || '').toLowerCase() ===
+                    owner.toLowerCase() &&
+                  !String(comment.body || '').includes(dispatchMarker) &&
+                  !String(comment.body || '').includes(retryMarker) &&
+                  /^[ ]{0,3}\/(?:opencode|oc)(?=\s|$)/m.test(
+                    String(comment.body || '')
+                  )
+                );
+              });
+              if (!premiseChanged && !supersededByOwner) {
+                core.notice(
+                  'Issue #' + issueNumber +
+                  ' has a deterministic checkpoint resume hold (' +
+                  checkpointResumeBlocked.reason +
+                  '); watchdog will not retry the identical checkpoint/base/snapshot.'
+                );
+                return;
+              }
+            }
+
             // A scheduler dispatch comment newer than this run means a *newer*
             // automated attempt already owns the issue. Retrying here would race
             // it, so the watchdog stands down and lets the newer attempt win.
