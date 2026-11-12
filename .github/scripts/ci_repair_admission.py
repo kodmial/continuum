@@ -23,12 +23,15 @@ run by recency, or a partial comment page:
 - a definite 4xx is recorded as ``rejected`` (a later serialized pass may
   claim a fresh attempt);
 - timeout/network/403/429/5xx is ``ambiguous`` and is correlated against the
-  attempt's run-name marker, never retried blindly.
+  attempt's run-name marker, never retried blindly;
+- trusted receipt authors are registered in independent repository variables,
+  so token rotation or a concurrent admission pass cannot erase writer history.
 """
 
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -88,12 +91,16 @@ _HEADER_SEPARATOR_RE = re.compile(rb"\r?\n\r?\n", re.MULTILINE)
 # receipt as absent; an unrelated commenter without repository write access
 # can neither authorize nor suppress a repair.
 _HISTORICAL_WRITER_ASSOCIATIONS = frozenset({"MEMBER", "COLLABORATOR"})
-#: Repository variable recording the logins that have authored trusted
-#: receipts. It is write-only through the authenticated TAP_PAT, so an
-#: unrelated issue commenter cannot add itself. The list survives run
-#: deletion and a later token rotation, when GitHub no longer has a
-#: dispatch run to prove the previous writer.
+#: Legacy comma/newline-separated registry of logins that authored trusted
+#: receipts. It is only read now: a pre-existing value is migrated into
+#: per-writer variables so history recorded before that format is not lost.
 _CI_REPAIR_WRITERS_VARIABLE = "CONTINUUM_CI_REPAIR_WRITERS"
+#: One repository variable per trusted writer. Registering a writer creates
+#: only its own variable, so two exact-HEAD admission passes can never erase
+#: each other's registration through a read-merge-write race. The value is the
+#: lowercase login; the suffix is a digest because a login may contain
+#: characters that repository variable names do not allow.
+_CI_REPAIR_WRITER_VARIABLE_PREFIX = "CONTINUUM_CI_REPAIR_WRITER_"
 
 
 class GhFailure(RuntimeError):
@@ -170,91 +177,201 @@ def _normalize_writer_logins(value: Any) -> Tuple[str, ...]:
     return tuple(logins)
 
 
-def _historical_writer_registry(
-    repository: str,
-) -> Tuple[Tuple[str, ...], Optional[bool]]:
-    """Read logins recorded as trusted CI-repair receipt authors.
+def _writer_variable_name(login: str) -> str:
+    """Return the deterministic per-writer repository variable name."""
 
-    The second value is ``True`` for an existing variable, ``False`` for a
-    missing one, and ``None`` when the registry could not be read. A missing
-    registry is a valid empty history; an unreadable one is not proof that no
-    historical writer exists.
+    digest = hashlib.sha256(login.encode("utf-8")).hexdigest()
+    return "{}{}".format(_CI_REPAIR_WRITER_VARIABLE_PREFIX, digest)
+
+
+def _legacy_historical_writers(repository: str) -> Optional[Tuple[str, ...]]:
+    """Read the legacy single-variable writer registry.
+
+    ``None`` means the registry could not be read and must not be treated as
+    empty. A missing variable is a normal empty baseline; its contents are
+    migrated into per-writer variables by :func:`_persist_historical_writers`.
     """
 
-    variable = _CI_REPAIR_WRITERS_VARIABLE
-    url = "repos/{}/actions/variables/{}".format(repository, variable)
+    url = "repos/{}/actions/variables/{}".format(
+        repository, _CI_REPAIR_WRITERS_VARIABLE
+    )
     _, stdout, stderr = _gh(["api", "--include", url])
     status, body = _parse_include(stdout, stderr)
     if status == 404:
-        return (), False
+        return ()
     if status != 200:
         print(
-            "::warning::Could not read historical CI-repair writer registry: "
+            "::warning::Could not read legacy historical CI-repair writer registry: "
             "{}".format((body or stderr).strip() or "HTTP status {}".format(status))
         )
-        return (), None
+        return None
     try:
         data = json.loads(body or "{}")
     except ValueError:
         print(
-            "::warning::Historical CI-repair writer registry is not valid JSON."
+            "::warning::Legacy historical CI-repair writer registry is not valid JSON."
         )
-        return (), None
+        return None
     if not isinstance(data, Mapping):
         print(
-            "::warning::Historical CI-repair writer registry is not an object."
+            "::warning::Legacy historical CI-repair writer registry is not an object."
         )
-        return (), None
-    return _normalize_writer_logins(data.get("value")), True
+        return None
+    return _normalize_writer_logins(data.get("value"))
+
+
+def _registered_historical_writers(
+    repository: str,
+) -> Optional[Tuple[str, ...]]:
+    """Read the per-writer registry variables.
+
+    ``None`` means the variable list could not be read and must not be treated
+    as an empty registry.
+    """
+
+    url = "repos/{}/actions/variables?per_page=100".format(repository)
+    code, stdout, stderr = _gh(["api", "--paginate", "--slurp", url])
+    if code != 0:
+        print(
+            "::warning::Could not read historical CI-repair writer registry: "
+            "{}".format(stderr.strip() or "gh exited {}".format(code))
+        )
+        return None
+    try:
+        pages = json.loads(stdout or "[]")
+    except ValueError:
+        print(
+            "::warning::Historical CI-repair writer registry is not valid JSON."
+        )
+        return None
+    if isinstance(pages, Mapping):
+        pages = [pages]
+    if not isinstance(pages, list):
+        print(
+            "::warning::Historical CI-repair writer registry is not an array of pages."
+        )
+        return None
+    logins = []
+    for page in pages:
+        if not isinstance(page, Mapping):
+            print(
+                "::warning::Historical CI-repair writer registry page is not an object."
+            )
+            return None
+        variables = page.get("variables")
+        if not isinstance(variables, list):
+            print(
+                "::warning::Historical CI-repair writer registry page has no variables."
+            )
+            return None
+        for variable in variables:
+            if not isinstance(variable, Mapping):
+                continue
+            name = variable.get("name")
+            if not isinstance(name, str) or not name.startswith(
+                _CI_REPAIR_WRITER_VARIABLE_PREFIX
+            ):
+                continue
+            value = variable.get("value")
+            if not isinstance(value, str):
+                continue
+            logins.extend(_normalize_writer_logins(value))
+    return _normalize_writer_logins("\n".join(logins))
+
+
+def _historical_writer_registry(
+    repository: str,
+) -> Tuple[Tuple[str, ...], Tuple[str, ...], bool]:
+    """Return known writers, writers already in per-writer variables, and health.
+
+    A missing registry is a normal empty baseline and is not proof that no
+    historical writer exists. Verified historical writers and the legacy
+    registry contents are migrated into per-writer variables, which survive
+    run deletion and a later token rotation. An unreadable registry is not
+    proof of an empty history, so the caller holds instead of dispatching. A
+    receipt with no proving run from an author that no registry, association,
+    or run evidence identifies remains an unrelated lookalike; treating every
+    such author as historical would let an arbitrary commenter suppress repair.
+    """
+
+    legacy = _legacy_historical_writers(repository)
+    registered = _registered_historical_writers(repository)
+    known = list(legacy or ())
+    for login in registered or ():
+        if login not in known:
+            known.append(login)
+    healthy = legacy is not None and registered is not None
+    return tuple(known), tuple(registered or ()), healthy
+
+
+def _writer_variable_records(repository: str, login: str) -> bool:
+    """Whether the per-writer variable already records this exact login."""
+
+    url = "repos/{}/actions/variables/{}".format(
+        repository, _writer_variable_name(login)
+    )
+    _, stdout, stderr = _gh(["api", "--include", url])
+    status, body = _parse_include(stdout, stderr)
+    if status != 200:
+        return False
+    try:
+        data = json.loads(body or "{}")
+    except ValueError:
+        return False
+    if not isinstance(data, Mapping):
+        return False
+    return login in _normalize_writer_logins(data.get("value"))
 
 
 def _persist_historical_writers(
     repository: str,
     logins: Sequence[str],
     *,
-    known: Sequence[str],
-    exists: bool,
+    known: Sequence[str] = (),
+    registered: Sequence[str] = (),
 ) -> Tuple[Tuple[str, ...], bool]:
-    """Merge trusted writer logins into the durable repository variable."""
+    """Record each trusted writer in its own durable repository variable.
+
+    Each login is written independently, so concurrent admission passes for
+    different exact HEADs cannot overwrite a writer another pass discovered.
+    The second result is ``False`` when any registration is not durably
+    recorded; the caller must then hold instead of dispatching.
+    """
 
     merged = list(_normalize_writer_logins("\n".join(known)))
     for login in _normalize_writer_logins("\n".join(logins)):
         if login not in merged:
             merged.append(login)
-    if tuple(merged) == tuple(known):
-        return tuple(merged), exists
 
-    value = "\n".join(merged)
-    if exists:
-        arguments = [
-            "api",
-            "--method",
-            "PATCH",
-            "repos/{}/actions/variables/{}".format(
-                repository, _CI_REPAIR_WRITERS_VARIABLE
-            ),
-            "-f",
-            "value={}".format(value),
-        ]
-    else:
-        arguments = [
-            "api",
-            "--method",
-            "POST",
-            "repos/{}/actions/variables".format(repository),
-            "-f",
-            "name={}".format(_CI_REPAIR_WRITERS_VARIABLE),
-            "-f",
-            "value={}".format(value),
-        ]
-    code, _, stderr = _gh(arguments)
-    if code != 0:
-        print(
-            "::warning::Could not record historical CI-repair writers: "
-            "{}".format(stderr.strip() or "gh exited {}".format(code))
+    already = frozenset(_normalize_writer_logins("\n".join(registered)))
+    durable = True
+    for login in merged:
+        if login in already:
+            continue
+        code, _, stderr = _gh(
+            [
+                "api",
+                "--method",
+                "POST",
+                "repos/{}/actions/variables".format(repository),
+                "-f",
+                "name={}".format(_writer_variable_name(login)),
+                "-f",
+                "value={}".format(login),
+            ]
         )
-        return tuple(merged), exists
-    return tuple(merged), True
+        if code == 0:
+            continue
+        # A concurrent pass may have created the exact same per-writer
+        # variable first. That is success, not a lost registration.
+        if _writer_variable_records(repository, login):
+            continue
+        print(
+            "::warning::Could not record historical CI-repair writer {!r}: "
+            "{}".format(login, stderr.strip() or "gh exited {}".format(code))
+        )
+        durable = False
+    return tuple(merged), durable
 
 
 def _comment_pages(repository: str, pull_number: int) -> Sequence[Any]:
@@ -704,8 +821,23 @@ def run(args) -> int:
     # into ignored lookalikes. GitHub-attested dispatch evidence and the
     # durable writer registry extend trust; an unrelated commenter can add
     # neither. Recording the current login before it rotates keeps deleted-run
-    # history authoritative for the next token.
-    known_writers, registry_exists = _historical_writer_registry(repository)
+    # history authoritative for the next token. Per-writer variables make the
+    # registration independent, so concurrent exact-HEAD passes cannot erase
+    # each other's writer.
+    known_writers, registered_writers, registry_healthy = _historical_writer_registry(
+        repository
+    )
+    if not registry_healthy:
+        # The registry may contain a writer whose dispatch run is gone. Without
+        # that history the exact HEAD could look unused, so do not dispatch.
+        # Still attempt to record this token so a later run can recover.
+        if not args.dry_run:
+            _persist_historical_writers(repository, (token_login,))
+        print(
+            "::warning::Historical CI-repair writer registry cannot be read; "
+            "holding instead of risking a duplicate dispatch."
+        )
+        return 0
     historical_writers, unverifiable_history = _historical_receipt_writers(
         repository,
         pull_number,
@@ -715,15 +847,21 @@ def run(args) -> int:
         owner_login=args.owner_login or "",
         trusted_logins=tuple(trusted_logins),
         known_writers=known_writers,
-        registry_available=registry_exists is not None,
+        registry_available=True,
     )
-    if registry_exists is not None and not args.dry_run:
-        _persist_historical_writers(
+    if not args.dry_run:
+        _, writers_durable = _persist_historical_writers(
             repository,
-            (token_login, *historical_writers),
+            (token_login, *historical_writers, *known_writers),
             known=known_writers,
-            exists=registry_exists,
+            registered=registered_writers,
         )
+        if not writers_durable:
+            print(
+                "::warning::Historical CI-repair writers are not durably recorded; "
+                "holding instead of risking a duplicate dispatch after rotation."
+            )
+            return 0
     if unverifiable_history:
         print(
             "::warning::Historical CI-repair receipts cannot be verified; "

@@ -14,6 +14,7 @@ observed, not assumed:
 
 from __future__ import annotations
 
+import importlib.util
 import json
 import os
 import shutil
@@ -23,6 +24,7 @@ import tempfile
 import textwrap
 import unittest
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / ".github" / "scripts" / "ci_repair_admission.py"
@@ -31,6 +33,8 @@ PR = 446
 HEAD = "a" * 40
 NEW_HEAD = "b" * 40
 NOW = "2026-11-12T01:00:00Z"
+LEGACY_WRITERS_VARIABLE = "CONTINUUM_CI_REPAIR_WRITERS"
+WRITER_VARIABLE_PREFIX = "CONTINUUM_CI_REPAIR_WRITER_"
 
 FAKE_GH = r'''#!/usr/bin/env python3
 import json
@@ -72,6 +76,22 @@ rest = args[1:]
 VARIABLE_NAME = "CONTINUUM_CI_REPAIR_WRITERS"
 if any("/actions/variables" in arg for arg in rest):
     variables = read_json("variables.json", {})
+    if os.environ.get("FAKE_VARIABLES_READ_FAIL") == "1":
+        if rest[:1] == ["--paginate"]:
+            sys.stderr.write("simulated variable list failure\n")
+            sys.exit(1)
+        if rest[:1] == ["--include"]:
+            output(500, json.dumps({"message": "simulated variable read failure"}))
+    if rest[:1] == ["--paginate"]:
+        page = {
+            "total_count": len(variables),
+            "variables": [
+                {"name": name, "value": value}
+                for name, value in variables.items()
+            ],
+        }
+        print(json.dumps([page]))
+        sys.exit(0)
     if rest[:1] == ["--include"]:
         url = next((arg for arg in rest if arg.startswith("repos/")), "")
         name = url.rsplit("/", 1)[-1]
@@ -79,6 +99,8 @@ if any("/actions/variables" in arg for arg in rest):
             output(404, json.dumps({"message": "Not Found"}))
         output(200, json.dumps({"name": name, "value": variables[name]}))
     if rest[:1] == ["--method"] and rest[1:2] == ["POST"]:
+        if os.environ.get("FAKE_VARIABLES_WRITE_FAIL") == "1":
+            output(500, json.dumps({"message": "simulated variable write failure"}))
         name = next(
             (arg[len("name="):] for arg in rest if arg.startswith("name=")),
             VARIABLE_NAME,
@@ -87,6 +109,8 @@ if any("/actions/variables" in arg for arg in rest):
             (arg[len("value="):] for arg in rest if arg.startswith("value=")),
             "",
         )
+        if name in variables:
+            output(422, json.dumps({"message": "Variable already exists"}))
         variables[name] = value
         write_json("variables.json", variables)
         output(201, "{}")
@@ -351,6 +375,32 @@ class AdmissionExecutableTests(unittest.TestCase):
     def dispatches(self):
         return [line for line in self.log() if "inputs[mode]=ci-fix" in line]
 
+    def variables(self):
+        path = self.dir / "variables.json"
+        if not path.exists():
+            return {}
+        return json.loads(path.read_text(encoding="utf-8"))
+
+    def writer_logins(self):
+        logins = []
+        for name, value in self.variables().items():
+            if name != LEGACY_WRITERS_VARIABLE and not name.startswith(
+                WRITER_VARIABLE_PREFIX
+            ):
+                continue
+            for login in str(value).replace(",", " ").split():
+                if login and login not in logins:
+                    logins.append(login)
+        return logins
+
+    def admission_module(self):
+        spec = importlib.util.spec_from_file_location(
+            "ci_repair_admission_under_test", SCRIPT
+        )
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+
     def assert_rotated_writer_receipt_is_not_redispatched(
         self, *, status, run_id=None, run_head=HEAD
     ):
@@ -521,28 +571,121 @@ class AdmissionExecutableTests(unittest.TestCase):
         self.write_pr(head=HEAD, comments=1)
         self.write_state(
             "variables.json",
-            {"CONTINUUM_CI_REPAIR_WRITERS": "old-automation"},
+            {LEGACY_WRITERS_VARIABLE: "old-automation"},
         )
         self.write_runs([])
         completed = self.run_admission()
         self.assertEqual(0, len(self.dispatches()))
         self.assertEqual([], self.posts())
         self.assertIn("cannot be verified", completed.stdout)
-        writers = json.loads(
-            (self.dir / "variables.json").read_text(encoding="utf-8")
-        )["CONTINUUM_CI_REPAIR_WRITERS"].splitlines()
+        writers = self.writer_logins()
         self.assertIn("old-automation", writers)
         self.assertIn("github-actions[bot]", writers)
 
     def test_the_authenticated_writer_is_recorded_for_future_rotations(self):
         self.run_admission()
-        variables = json.loads(
-            (self.dir / "variables.json").read_text(encoding="utf-8")
+        self.assertIn("github-actions[bot]", self.writer_logins())
+
+    def test_a_registry_write_failure_holds_without_dispatching(self):
+        completed = self.run_admission(
+            extra_env={"FAKE_VARIABLES_WRITE_FAIL": "1"}
         )
-        self.assertIn(
-            "github-actions[bot]",
-            variables["CONTINUUM_CI_REPAIR_WRITERS"].splitlines(),
+        self.assertEqual(0, len(self.dispatches()))
+        self.assertEqual([], self.posts())
+        self.assertIn("not durably recorded", completed.stdout)
+
+    def test_a_registry_read_failure_holds_without_dispatching(self):
+        completed = self.run_admission(
+            extra_env={"FAKE_VARIABLES_READ_FAIL": "1"}
         )
+        self.assertEqual(0, len(self.dispatches()))
+        self.assertEqual([], self.posts())
+        self.assertIn("cannot be read", completed.stdout)
+        # Recording the current writer is still attempted, so a later pass can
+        # recover once the registry API is readable again.
+        self.assertIn("github-actions[bot]", self.writer_logins())
+
+    def test_a_missing_registry_migrates_a_verified_writer(self):
+        # The registry predates this code in production. Bootstrap it from a
+        # writer GitHub can prove, then keep that writer authoritative after
+        # the token rotates and the proving run is deleted.
+        attempt = "ci-old-account-0001"
+        self.write_comments(
+            [
+                trusted_receipt(
+                    attempt=attempt,
+                    status="claimed",
+                    author="old-automation",
+                )
+            ]
+        )
+        self.write_pr(head=HEAD, comments=1)
+        self.write_runs(
+            [
+                {
+                    "id": 900,
+                    "display_title": "OpenCode repair PR #{} [ci-attempt:{}]".format(
+                        PR, attempt
+                    ),
+                    "status": "queued",
+                    "conclusion": "",
+                    "html_url": "https://github.com/{}/actions/runs/900".format(
+                        REPO.lower()
+                    ),
+                    "created_at": "2026-11-12T00:00:00Z",
+                    "head_sha": HEAD,
+                    "actor": {"login": "old-automation"},
+                }
+            ]
+        )
+        completed = self.run_admission()
+        self.assertEqual(0, len(self.dispatches()))
+        self.assertIn("verified by its exact-HEAD dispatch run", completed.stdout)
+        self.assertIn("old-automation", self.writer_logins())
+        self.assertIn("github-actions[bot]", self.writer_logins())
+
+        self.write_runs([])
+        completed = self.run_admission(
+            extra_env={"FAKE_TOKEN_LOGIN": "new-automation"}
+        )
+        self.assertEqual(0, len(self.dispatches()))
+        self.assertIn("cannot be verified", completed.stdout)
+        self.assertIn("old-automation", self.writer_logins())
+
+    def test_concurrent_writer_registrations_cannot_overwrite_each_other(self):
+        # Two exact-HEAD passes read the same stale registry and then register
+        # different writers. A read-merge-write variable would let the second
+        # write erase the first; independent per-writer variables must not.
+        module = self.admission_module()
+        env = {
+            "PATH": "{}:{}".format(self.bin, os.environ.get("PATH", "")),
+            "GH_TOKEN": "test-token",
+            "FAKE_GH_STATE": str(self.dir),
+            "FAKE_TOKEN_LOGIN": "github-actions[bot]",
+        }
+        with mock.patch.dict(os.environ, env, clear=False):
+            known_a, registered_a, healthy_a = (
+                module._historical_writer_registry(REPO)
+            )
+            known_b, registered_b, healthy_b = (
+                module._historical_writer_registry(REPO)
+            )
+            self.assertTrue(healthy_a)
+            self.assertTrue(healthy_b)
+            _, durable_a = module._persist_historical_writers(
+                REPO, ("old-a",), known=known_a, registered=registered_a
+            )
+            _, durable_b = module._persist_historical_writers(
+                REPO, ("old-b",), known=known_b, registered=registered_b
+            )
+            self.assertTrue(durable_a)
+            self.assertTrue(durable_b)
+            known, registered, healthy = module._historical_writer_registry(REPO)
+        self.assertTrue(healthy)
+        self.assertIn("old-a", known)
+        self.assertIn("old-b", known)
+        self.assertIn("old-a", registered)
+        self.assertIn("old-b", registered)
 
     def test_a_same_head_run_actor_without_a_proof_holds_admission(self):
         # Even when GitHub reports no repository association, an account that
