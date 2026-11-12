@@ -1290,6 +1290,67 @@ class AdmissionExecutableTests(unittest.TestCase):
         self.assertGreater(len(calls), 1, calls)
         self.assertEqual(len(calls), len(set(calls)), calls)
 
+    def test_a_fractional_end_never_reverses_an_adjacent_second_window(self):
+        module = self.admission_module()
+        runs = [
+            {
+                "id": index,
+                "display_title": "OpenCode repair PR #{}".format(PR),
+                "created_at": "2026-01-01T00:00:0{}Z".format(index),
+                "head_sha": HEAD,
+            }
+            for index in (2, 3)
+        ]
+        calls = []
+
+        class FakeDateTime(module.datetime):
+            @classmethod
+            def now(cls, tz=None):
+                value = cls(
+                    2026, 1, 1, 0, 0, 3, 500000, tzinfo=module.timezone.utc
+                )
+                return value if tz is None else value.astimezone(tz)
+
+        def fake_gh(arguments, *, stdin=None):
+            window = next(
+                argument[len("created="):]
+                for argument in arguments
+                if argument.startswith("created=")
+            )
+            start_text, end_text = window.split("..", 1)
+            start = module._parse_run_window_timestamp(start_text, "start")
+            end = module._parse_run_window_timestamp(end_text, "end")
+            selected = [
+                run
+                for run in runs
+                if start
+                <= module._parse_run_window_timestamp(run["created_at"], "run")
+                <= end
+            ]
+            calls.append((start, end, window))
+            return (
+                0,
+                json.dumps(
+                    [{"total_count": len(selected), "workflow_runs": selected}]
+                ),
+                "",
+            )
+
+        with mock.patch.object(module, "datetime", FakeDateTime), mock.patch.object(
+            module, "_RUN_SEARCH_RESULT_CEILING", 2
+        ), mock.patch.object(module, "_gh", side_effect=fake_gh):
+            inventory = module._workflow_runs(
+                REPO,
+                "continuum-opencode.yml",
+                since="2026-01-01T00:00:00Z",
+            )
+
+        self.assertTrue(inventory.complete, inventory.reason)
+        self.assertEqual([2, 3], [run["id"] for run in inventory.runs])
+        self.assertGreater(len(calls), 1, calls)
+        for start, end, window in calls:
+            self.assertLessEqual(start, end, window)
+
     def test_a_single_second_window_that_stays_saturated_is_incomplete(self):
         module = self.admission_module()
 

@@ -850,6 +850,11 @@ def _workflow_runs(
         _parse_run_window_timestamp(until, "until")
         or datetime.now(timezone.utc)
     )
+    # GitHub's ``created`` filter has second precision. Normalize the whole
+    # window to that precision before comparing or bisecting; otherwise a
+    # fractional endpoint can carry into a child's start and reverse its range.
+    start = start.replace(microsecond=0)
+    end = end.replace(microsecond=0)
     if start > end:
         raise GhFailure(
             "workflow run creation window starts after it ends: {} > {}".format(
@@ -876,7 +881,9 @@ def _workflow_runs(
                         "reaches GitHub's filtered-result ceiling"
                     ),
                 )
-            midpoint = window_start + (window_end - window_start) // 2
+            midpoint = (
+                window_start + (window_end - window_start) // 2
+            ).replace(microsecond=0)
             # Inclusive, second-precision, non-overlapping children. The right
             # child starts one second after the left child ends.
             pending.append((midpoint + timedelta(seconds=1), window_end))
