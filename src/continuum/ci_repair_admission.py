@@ -42,6 +42,7 @@ from .ci_repair_receipt import (
     STATUS_CLAIMED,
     STATUS_DISPATCHED,
     STATUS_REJECTED,
+    STATUS_REQUESTING,
     AttemptSummary,
     ReceiptCollection,
     RepairReceipt,
@@ -642,9 +643,14 @@ def classify_dispatch_response(
     any retry.
     """
 
-    if claimed.status not in (STATUS_CLAIMED, STATUS_AMBIGUOUS):
+    if claimed.status not in (
+        STATUS_CLAIMED,
+        STATUS_REQUESTING,
+        STATUS_AMBIGUOUS,
+    ):
         raise AdmissionError(
-            "dispatch outcomes may only follow a claimed/ambiguous attempt"
+            "dispatch outcomes may only follow a claimed, requesting, or "
+            "ambiguous attempt"
         )
 
     status = None
@@ -853,9 +859,10 @@ def run_proves_historical_receipt(
     ``TAP_PAT`` can be rotated to another account. A receipt the previous
     account published must not become an ignored lookalike, or the exact HEAD
     it already spent looks unused and admission dispatches it a second time.
-    A ``claimed`` or ``ambiguous`` receipt can remain when outcome persistence
-    fails after an accepted dispatch, so it is proved by the same run's
-    attempt marker and actor rather than by a run ID that was never stored.
+    A ``claimed``, ``requesting``, or ``ambiguous`` receipt can remain when
+    outcome persistence fails after an accepted dispatch, so it is proved by
+    the same run's attempt marker and actor rather than by a run ID that was
+    never stored.
 
     A ``workflow_dispatch`` run records its dispatch ref (normally ``main``) as
     ``head_sha``, not the admitted PR HEAD. A run-name attempt marker, and an
@@ -870,6 +877,7 @@ def run_proves_historical_receipt(
         return False
     if receipt.status not in (
         STATUS_CLAIMED,
+        STATUS_REQUESTING,
         STATUS_AMBIGUOUS,
         STATUS_DISPATCHED,
     ):
@@ -958,20 +966,24 @@ def plan_admission(
     """Plan claim/wait/hold/rearm for one serialized exact-HEAD admission pass.
 
     A new claim is permitted only by the phase-1 fail-closed decision. An
-    existing claimed/ambiguous attempt is first correlated with its actual run;
-    a proved run advances it to ``dispatched``. A ``dispatched`` attempt may be
-    enriched with run details but is otherwise a wait.
+    existing claimed/requesting/ambiguous attempt is first correlated with its
+    actual run; a proved run advances it to ``dispatched``. A ``dispatched``
+    attempt may be enriched with run details but is otherwise a wait.
 
-    A claim that outlives the bounded dispatch window is handled by evidence,
-    never by a blind retry:
+    An attempt that outlives the bounded dispatch window is handled by
+    evidence, never by a blind retry:
 
-    * a complete run inventory with no correlation marker and no
-      legacy-shaped repair run proves the dispatch never created a run, so the
-      dead claim is persisted as ``rejected`` and the same serialized pass may
-      claim a fresh attempt (``rearm``);
+    * only a stale ``claimed`` attempt proves the dispatch request was never
+      sent, because the owner persists ``requesting`` immediately before that
+      request. A complete run inventory with no correlation marker and no
+      legacy-shaped repair run then persists the dead claim as ``rejected`` so
+      the same serialized pass may claim a fresh attempt (``rearm``);
+    * a stale ``requesting`` attempt may already have reached GitHub even when
+      its run is absent from the inventory (runs can be deleted), so it is
+      persisted as a visible ``ambiguous`` hold instead of being re-armed;
     * an unreadable/partial inventory, or any repair run that cannot be
-      attributed to this attempt, marks the attempt a visible ``ambiguous``
-      hold instead.
+      attributed to this attempt, also marks the attempt a visible
+      ``ambiguous`` hold.
 
     An ``ambiguous`` attempt is never re-armed automatically: it may only be
     reconciled to a proved run, or stay a monitored hold.
@@ -1000,7 +1012,11 @@ def plan_admission(
         )
 
     complete_inventory = runs is not None and runs.complete
-    if attempt.status in (STATUS_CLAIMED, STATUS_AMBIGUOUS) and complete_inventory:
+    if attempt.status in (
+        STATUS_CLAIMED,
+        STATUS_REQUESTING,
+        STATUS_AMBIGUOUS,
+    ) and complete_inventory:
         try:
             run = select_correlated_run(
                 runs.runs,
@@ -1069,7 +1085,7 @@ def plan_admission(
                 run_url=receipt.run_url,
             )
 
-    if attempt.status == STATUS_CLAIMED and timestamp_is_stale(
+    if attempt.status in (STATUS_CLAIMED, STATUS_REQUESTING) and timestamp_is_stale(
         observed_at,
         now=now,
         timeout_seconds=claim_timeout_seconds,
@@ -1079,7 +1095,7 @@ def plan_admission(
             return AdmissionPlan(
                 action=ACTION_HOLD,
                 reason=(
-                    "claim {!r} exceeded the bounded dispatch window and the "
+                    "attempt {!r} exceeded the bounded dispatch window and the "
                     "workflow run inventory is unavailable/partial; it is now "
                     "a visible hold, not a retry".format(attempt.attempt_id)
                 ),
@@ -1096,22 +1112,42 @@ def plan_admission(
             return AdmissionPlan(
                 action=ACTION_HOLD,
                 reason=(
-                    "claim {!r} expired, but a repair run for this PR cannot "
+                    "attempt {!r} expired, but a repair run for this PR cannot "
                     "be attributed to it; holding instead of risking a "
                     "duplicate dispatch".format(attempt.attempt_id)
                 ),
                 attempt_id=attempt.attempt_id,
                 transition=receipt,
             )
+        if attempt.status == STATUS_REQUESTING:
+            # ``requesting`` is persisted immediately before the dispatch
+            # request. The request may have reached GitHub even though the run
+            # has since been deleted, so absence of a run is not proof that no
+            # repair started. Hold it visibly; only a proved run may advance it.
+            receipt = transition_attempt(attempt, status=STATUS_AMBIGUOUS)
+            return AdmissionPlan(
+                action=ACTION_HOLD,
+                reason=(
+                    "attempt {!r} recorded a dispatch request and the complete "
+                    "run inventory no longer proves whether it was accepted; "
+                    "holding instead of re-arming a possible duplicate".format(
+                        attempt.attempt_id
+                    )
+                ),
+                attempt_id=attempt.attempt_id,
+                transition=receipt,
+            )
+        # ``claimed`` is persisted before ``requesting`` and dispatch is only
+        # attempted after ``requesting`` is durable, so this state proves the
+        # request was never sent. The complete inventory must also show no run.
         receipt = transition_attempt(attempt, status=STATUS_REJECTED)
         return AdmissionPlan(
             action=ACTION_REARM,
             reason=(
-                "claim {!r} exceeded the bounded dispatch window and the "
-                "complete run inventory proves no run was created; the dead "
-                "attempt is rejected and a fresh claim may be admitted".format(
-                    attempt.attempt_id
-                )
+                "claim {!r} exceeded the bounded dispatch window with no "
+                "request marker and the complete run inventory proves no run "
+                "was created; the dead claim is rejected and a fresh claim may "
+                "be admitted".format(attempt.attempt_id)
             ),
             attempt_id=attempt.attempt_id,
             transition=receipt,

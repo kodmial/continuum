@@ -27,6 +27,7 @@ from continuum.ci_repair_receipt import (
     STATUS_CLAIMED,
     STATUS_DISPATCHED,
     STATUS_REJECTED,
+    STATUS_REQUESTING,
     AttemptSummary,
     ReceiptCollection,
     ReceiptError,
@@ -167,7 +168,12 @@ class BuildRenderParseTests(unittest.TestCase):
         self.assertEqual((built,), parse_receipts(render_receipt(built)))
 
     def test_run_details_are_rejected_for_unproved_statuses(self):
-        for status in (STATUS_CLAIMED, STATUS_AMBIGUOUS, STATUS_REJECTED):
+        for status in (
+            STATUS_CLAIMED,
+            STATUS_REQUESTING,
+            STATUS_AMBIGUOUS,
+            STATUS_REJECTED,
+        ):
             with self.subTest(status=status):
                 with self.assertRaises(ReceiptError):
                     receipt(status=status, run_id=1)
@@ -565,6 +571,14 @@ class AttemptDecisionTests(unittest.TestCase):
         self.assertEqual(ACTION_WAIT, decision.action)
         self.assertEqual(ATTEMPT, decision.attempt_id)
 
+    def test_a_requesting_attempt_may_have_reached_dispatch_and_holds(self):
+        result = read([receipt_comment(status=STATUS_REQUESTING)])
+        decision = decide_new_attempt(result)
+        self.assertFalse(decision.allowed)
+        self.assertEqual(ACTION_HOLD, decision.action)
+        self.assertEqual(ATTEMPT, decision.attempt_id)
+        self.assertIn("may have reached GitHub", decision.reason)
+
     def test_two_same_head_claim_attempts_conflict(self):
         result = read(
             [
@@ -826,9 +840,25 @@ class FailClosedTests(unittest.TestCase):
 class TransitionTests(unittest.TestCase):
     def test_claimed_to_dispatch_states_is_allowed(self):
         claimed = receipt()
-        for status in (STATUS_DISPATCHED, STATUS_AMBIGUOUS, STATUS_REJECTED):
+        for status in (
+            STATUS_REQUESTING,
+            STATUS_DISPATCHED,
+            STATUS_AMBIGUOUS,
+            STATUS_REJECTED,
+        ):
             with self.subTest(status=status):
                 following = transition_receipt(claimed, status=status)
+                self.assertEqual(status, following.status)
+
+    def test_requesting_to_dispatch_states_is_allowed(self):
+        requesting = transition_receipt(receipt(), status=STATUS_REQUESTING)
+        for status in (
+            STATUS_DISPATCHED,
+            STATUS_AMBIGUOUS,
+            STATUS_REJECTED,
+        ):
+            with self.subTest(status=status):
+                following = transition_receipt(requesting, status=status)
                 self.assertEqual(status, following.status)
 
     def test_ambiguous_to_dispatched_is_allowed_only_with_proof(self):
@@ -846,14 +876,17 @@ class TransitionTests(unittest.TestCase):
 
     def test_impossible_transitions_are_rejected(self):
         claimed = receipt()
+        requesting = transition_receipt(claimed, status=STATUS_REQUESTING)
         dispatched = transition_receipt(claimed, status=STATUS_DISPATCHED)
         ambiguous = transition_receipt(claimed, status=STATUS_AMBIGUOUS)
         rejected = transition_receipt(claimed, status=STATUS_REJECTED)
         cases = [
+            (requesting, STATUS_CLAIMED),
             (dispatched, STATUS_CLAIMED),
             (dispatched, STATUS_AMBIGUOUS),
             (dispatched, STATUS_REJECTED),
             (ambiguous, STATUS_CLAIMED),
+            (ambiguous, STATUS_REQUESTING),
             (ambiguous, STATUS_REJECTED),
             (rejected, STATUS_CLAIMED),
             (rejected, STATUS_DISPATCHED),

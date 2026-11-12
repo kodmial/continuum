@@ -40,7 +40,7 @@ import os
 import re
 import subprocess
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Mapping, Optional, Sequence, Tuple
 
@@ -75,6 +75,7 @@ from continuum.ci_repair_receipt import (  # noqa: E402
     STATUS_CLAIMED,
     STATUS_DISPATCHED,
     STATUS_REJECTED,
+    STATUS_REQUESTING,
     build_receipt,
     comment_login,
     is_trusted_receipt_comment,
@@ -633,19 +634,18 @@ def _dispatch(
     attempt_id: str,
     head_sha: str,
 ) -> Tuple[Optional[int], str, str]:
-    """Ask GitHub to create the repair run, with legacy-caller fallback.
+    """Ask GitHub to create the repair run without ever dropping the identity.
 
-    ``ci_repair_identity`` is an optional input in the current Continuum
-    caller. A consumer still running an older caller that does not declare it
-    rejects the request with HTTP 422 before creating a run. That is a
-    *definite* rejection, so retrying once without that input is safe; the
-    engine can still discover the claim from the PR receipt and publish its
-    own dispatched receipt. The executor refuses that legacy run before any
-    repair work, because it carries no admitted HEAD to bind.
+    ``ci_repair_identity`` is a required part of admission: the current
+    Continuum caller forwards it, the executor refuses a run without it, and
+    the attempt correlation depends on it. A consumer still running an older
+    caller rejects the input with HTTP 422 before creating a run. That is a
+    *definite* rejection, but it is not permission to dispatch an identity-less
+    run: such a run would spend the exact-HEAD attempt while failing the
+    mandatory executor check, so the caller must be upgraded first.
 
-    Continuum's checked-in ``opencode.yml`` caller forwards
-    ``ci_repair_identity``, so its run is correlated by the run-name marker
-    and bound to the exact admitted HEAD.
+    ``return_run_details`` is genuinely optional. If the target rejects only
+    that field, retry once with the same identity but without run details.
     """
 
     base = [
@@ -678,38 +678,105 @@ def _dispatch(
         "inputs[ci_repair_identity]={}".format(identity),
     ]
 
-    for include_attempt in (True, False):
-        for include_details in (True, False):
-            arguments = list(with_attempt if include_attempt else base)
+    for include_details in (True, False):
+        arguments = list(with_attempt)
+        if include_details:
+            arguments.extend(["-F", "return_run_details=true"])
+        code, stdout, stderr = _gh(arguments)
+        status, body = _parse_include(stdout, stderr)
+        detail = (body + "\n" + stderr).strip()
+        if status == 422 and unexpected_dispatch_inputs(detail):
+            if "ci_repair_identity" in detail.lower():
+                return (
+                    status,
+                    body,
+                    (
+                        "{}\nThe dispatch target rejected ci_repair_identity; "
+                        "upgrade the installed caller before repairing this "
+                        "exact HEAD. No identity-less run was created."
+                    ).format(detail),
+                )
             if include_details:
-                arguments.extend(["-F", "return_run_details=true"])
-            code, stdout, stderr = _gh(arguments)
-            status, body = _parse_include(stdout, stderr)
-            detail = (body + "\n" + stderr).strip()
-            if (
-                status == 422
-                and unexpected_dispatch_inputs(detail)
-                and (include_attempt or include_details)
-            ):
-                # No run was created; retry only the narrower, supported shape.
+                # No run was created; retry only without the optional run
+                # details, never without the admission identity.
                 print(
                     "::notice::CI-repair dispatch target rejected optional "
-                    "inputs; retrying with the legacy-compatible input shape."
+                    "run-detail input; retrying with the required identity "
+                    "intact."
                 )
                 continue
-            if status is None and code == 0:
-                status = 200
-            return status, body, detail
+            return (
+                status,
+                body,
+                (
+                    "{}\nThe dispatch target rejected the required "
+                    "ci_repair_identity input; upgrade the installed caller "
+                    "before repairing this exact HEAD."
+                ).format(detail),
+            )
+        if status is None and code == 0:
+            status = 200
+        return status, body, detail
     return None, "", "all dispatch shapes were rejected"
 
 
-def _workflow_runs(
+#: GitHub caps a filtered workflow-run search at 1,000 retrievable results.
+#: Every historical window must therefore stay strictly below this ceiling.
+_RUN_SEARCH_RESULT_CEILING = 1000
+_RUN_HISTORY_START = datetime(1970, 1, 1, tzinfo=timezone.utc)
+
+
+def _parse_run_window_timestamp(value: Any, label: str) -> Optional[datetime]:
+    """Parse one canonical UTC second-precision run-window boundary."""
+
+    text = str(value or "").strip()
+    if not text:
+        return None
+    if not _ISO_TIMESTAMP_RE.match(text):
+        raise GhFailure("{} is not a canonical UTC timestamp: {!r}".format(label, value))
+    try:
+        return datetime.strptime(text, "%Y-%m-%dT%H:%M:%SZ").replace(
+            tzinfo=timezone.utc
+        )
+    except ValueError as exc:
+        raise GhFailure("{} is not a valid timestamp: {!r}".format(label, value)) from exc
+
+
+def _format_run_window_timestamp(value: datetime) -> str:
+    return value.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _reported_run_count(
+    pages: Sequence[Any],
+) -> Tuple[Optional[int], bool, bool]:
+    """Return ``(count, is_lower_bound, is_present)`` for one run window."""
+
+    present = False
+    for page in pages:
+        if not isinstance(page, Mapping) or page.get("total_count") is None:
+            continue
+        present = True
+        text = str(page.get("total_count")).strip()
+        saturated = text.endswith("+")
+        if saturated:
+            text = text[:-1].strip()
+        try:
+            count = int(text)
+        except (TypeError, ValueError):
+            return None, saturated, present
+        if count < 0:
+            return None, saturated, present
+        return count, saturated, present
+    return None, False, present
+
+
+def _workflow_run_window(
     repository: str,
     workflow: str,
-    *,
-    since: Optional[str] = None,
-) -> RunInventory:
-    """Fetch the complete workflow-dispatch run inventory for correlation."""
+    start: datetime,
+    end: datetime,
+) -> Tuple[RunInventory, bool]:
+    """Fetch one bounded creation window and say whether it must be split."""
 
     arguments = [
         "api",
@@ -718,12 +785,17 @@ def _workflow_runs(
         "repos/{}/actions/workflows/{}/runs?event=workflow_dispatch&per_page=100".format(
             repository, workflow
         ),
-    ]
-    if since:
         # ``gh api`` switches to POST as soon as a field is supplied. An
-        # explicit GET keeps this an idempotent listing and appends the field
-        # as the ``created`` query filter.
-        arguments.extend(["--method", "GET", "-f", "created=>={}".format(since)])
+        # explicit GET keeps this an idempotent listing. The ``created`` range
+        # is inclusive at both second-precision endpoints.
+        "--method",
+        "GET",
+        "-f",
+        "created={}..{}".format(
+            _format_run_window_timestamp(start),
+            _format_run_window_timestamp(end),
+        ),
+    ]
     code, stdout, stderr = _gh(arguments)
     if code != 0:
         raise GhFailure(stderr.strip() or "workflow run listing failed")
@@ -733,7 +805,105 @@ def _workflow_runs(
         raise GhFailure("workflow run pages are not JSON: {}".format(exc)) from exc
     if isinstance(pages, Mapping):
         pages = [pages]
-    return normalize_run_pages(pages)
+    if not isinstance(pages, Sequence) or isinstance(
+        pages, (str, bytes, bytearray)
+    ):
+        raise GhFailure("workflow run pages are not an array")
+
+    reported, saturated, present = _reported_run_count(pages)
+    if present and reported is None:
+        return RunInventory((), False, "the reported run count is unreadable"), False
+    if saturated or (reported is not None and reported >= _RUN_SEARCH_RESULT_CEILING):
+        return (
+            RunInventory(
+                (),
+                False,
+                "the creation window reaches GitHub's filtered-result ceiling",
+            ),
+            True,
+        )
+    inventory = normalize_run_pages(pages, expected_count=reported)
+    if reported is None and len(inventory.runs) >= _RUN_SEARCH_RESULT_CEILING:
+        return inventory, True
+    return inventory, False
+
+
+def _workflow_runs(
+    repository: str,
+    workflow: str,
+    *,
+    since: Optional[str] = None,
+    until: Optional[str] = None,
+) -> RunInventory:
+    """Fetch the complete workflow-dispatch run inventory for correlation.
+
+    An ``event``-filtered workflow-run search can retrieve at most 1,000 rows,
+    so a single full-history query silently loses older runs once that ceiling
+    is reached. The history is partitioned into non-overlapping inclusive
+    creation windows instead. A saturated window is bisected down to single
+    seconds; each leaf is paginated independently, and the unique run IDs are
+    reconciled before the combined inventory is reported complete.
+    """
+
+    start = _parse_run_window_timestamp(since, "since") or _RUN_HISTORY_START
+    end = (
+        _parse_run_window_timestamp(until, "until")
+        or datetime.now(timezone.utc)
+    )
+    if start > end:
+        raise GhFailure(
+            "workflow run creation window starts after it ends: {} > {}".format(
+                _format_run_window_timestamp(start),
+                _format_run_window_timestamp(end),
+            )
+        )
+
+    pending = [(start, end)]
+    unique: dict[str, Mapping[str, Any]] = {}
+    windows = 0
+    while pending:
+        window_start, window_end = pending.pop()
+        inventory, needs_split = _workflow_run_window(
+            repository, workflow, window_start, window_end
+        )
+        if needs_split:
+            if window_start >= window_end:
+                return RunInventory(
+                    (),
+                    False,
+                    (
+                        "a single-second workflow run creation window still "
+                        "reaches GitHub's filtered-result ceiling"
+                    ),
+                )
+            midpoint = window_start + (window_end - window_start) // 2
+            # Inclusive, second-precision, non-overlapping children. The right
+            # child starts one second after the left child ends.
+            pending.append((midpoint + timedelta(seconds=1), window_end))
+            pending.append((window_start, midpoint))
+            continue
+        if not inventory.complete:
+            return inventory
+        windows += 1
+        for run in inventory.runs:
+            unique[str(run.get("id"))] = run
+
+    def sort_key(item):
+        run_id, run = item
+        created = run.get("created_at")
+        if not isinstance(created, str) or not _ISO_TIMESTAMP_RE.match(created):
+            created = ""
+        return (created, run_id)
+
+    ordered = sorted(unique.items(), key=sort_key)
+    return RunInventory(
+        tuple(run for _, run in ordered),
+        True,
+        "workflow run pagination is complete across {} creation window(s)".format(
+            windows
+        ),
+        len(ordered),
+    )
 
 
 def _carry_proved_runs(
@@ -835,9 +1005,9 @@ def _historical_receipt_writers(
     canonical legacy repair title for the same exact HEAD. A marked run may
     report the dispatch ref (normally ``main``) as its SHA rather than the PR
     HEAD, so the attempt marker and exact run ID, when present, are the binding
-    evidence. ``claimed``, ``ambiguous``, and run-detail-less ``dispatched``
-    receipts are included because outcome persistence can fail after an
-    accepted dispatch. An unrelated commenter cannot borrow a run, so
+    evidence. ``claimed``, ``requesting``, ``ambiguous``, and run-detail-less
+    ``dispatched`` receipts are included because outcome persistence can fail
+    after an accepted dispatch. An unrelated commenter cannot borrow a run, so
     unverified lookalikes stay ignored exactly as before.
 
     ``baseline`` is the durable writer-registry migration frontier. Any receipt
@@ -880,7 +1050,8 @@ def _historical_receipt_writers(
     inventory, and losing it must not turn a spent claim into a re-armable one.
     """
 
-    candidates = []
+    parsed_comments = []
+    rejected_attempts = set()
     for comment in comments:
         if not isinstance(comment, Mapping):
             continue
@@ -890,25 +1061,50 @@ def _historical_receipt_writers(
         author = comment_login(comment)
         if not author:
             continue
+        try:
+            receipts = parse_receipts(body)
+        except ValueError:
+            # An untrusted lookalike is ignored, never fatal.
+            continue
+        matching = tuple(
+            receipt
+            for receipt in receipts
+            if receipt.repository == repository
+            and receipt.pull_number == pull_number
+            and receipt.head_sha == head_sha
+        )
+        if not matching:
+            continue
+        parsed_comments.append((author, comment, matching))
+        for receipt in matching:
+            if receipt.status == STATUS_REJECTED:
+                # A definite rejection is terminal for its own attempt. It
+                # clears an earlier claim only when the same writer recorded
+                # both observations; a rejection from another commenter must
+                # never release a real writer's claim.
+                rejected_attempts.add((author, receipt.attempt_id))
+
+    candidates = []
+    for author, comment, receipts in parsed_comments:
         if is_trusted_receipt_comment(
             comment,
             owner_login=owner_login,
             trusted_logins=tuple(trusted_logins),
         ):
             continue
-        try:
-            receipts = parse_receipts(body)
-        except ValueError:
-            # An untrusted lookalike is ignored, never fatal.
-            continue
         for receipt in receipts:
+            if receipt.status == STATUS_REJECTED:
+                continue
             if (
-                receipt.repository == repository
-                and receipt.pull_number == pull_number
-                and receipt.head_sha == head_sha
-                and receipt.status != STATUS_REJECTED
+                receipt.status in (STATUS_CLAIMED, STATUS_REQUESTING)
+                and (author, receipt.attempt_id) in rejected_attempts
             ):
-                candidates.append((author, receipt, comment))
+                # The receipt model allows a claim/request marker to move to a
+                # definite rejection, but not an ambiguous or dispatched state.
+                # Clear only those legally pre-rejection observations, and only
+                # when the same writer recorded the rejection for this attempt.
+                continue
+            candidates.append((author, receipt, comment))
     if not candidates:
         return (), False
 
@@ -1209,7 +1405,11 @@ def run(args) -> int:
             None,
         )
     needs_runs = attempt is not None and (
-        attempt.status in (STATUS_CLAIMED, STATUS_AMBIGUOUS)
+        attempt.status in (
+            STATUS_CLAIMED,
+            STATUS_REQUESTING,
+            STATUS_AMBIGUOUS,
+        )
         or (attempt.status == STATUS_DISPATCHED and attempt.run_id is None)
     )
     if needs_runs:
@@ -1320,6 +1520,29 @@ def run(args) -> int:
         )
         return 0
 
+    # Persist the pre-request marker before asking GitHub to dispatch. From
+    # this point the request may have reached GitHub even if its run is later
+    # deleted, so a stale attempt may only be held, never re-armed. A crash
+    # before this marker leaves a plain ``claimed`` receipt, which proves the
+    # dispatch request was never sent.
+    requesting = transition_receipt(claimed, status=STATUS_REQUESTING)
+    try:
+        _create_comment(
+            repository,
+            pull_number,
+            _comment_body(
+                requesting,
+                "Recording the CI-repair dispatch request for attempt `{}` at "
+                "exact HEAD `{}`.".format(attempt_id, head_sha),
+            ),
+        )
+    except GhFailure as exc:
+        print(
+            "::error::{} Refusing to dispatch without a durable request "
+            "marker.".format(exc)
+        )
+        return 1
+
     status, response_body, detail = _dispatch(
         repository,
         args.workflow,
@@ -1331,7 +1554,7 @@ def run(args) -> int:
         head_sha=head_sha,
     )
     outcome = classify_dispatch_response(
-        claimed,
+        requesting,
         http_status=status,
         response_body=response_body,
         network_error=status is None,
@@ -1363,7 +1586,7 @@ def run(args) -> int:
                 run = None
             if run is not None:
                 receipt = transition_receipt(
-                    claimed,
+                    requesting,
                     status=STATUS_DISPATCHED,
                     run_id=run["id"],
                     run_url=correlated_run_url(repository, run),

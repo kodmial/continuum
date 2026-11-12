@@ -21,8 +21,14 @@ proves the same repository and run ID.
 Status vocabulary and allowed transitions
 -----------------------------------------
 ``claimed``
-    The serialized owner has persisted the claim before asking GitHub to
-    dispatch a repair. Run details are forbidden because no run is proved.
+    The serialized owner has persisted the claim but has not recorded that a
+    dispatch request is about to be sent. It therefore proves the request was
+    never sent. Run details are forbidden because no run is proved.
+``requesting``
+    The serialized owner persisted this state immediately before asking GitHub
+    to dispatch a repair. The request may have been sent even if no run is
+    visible (its run can be deleted), so a stale ``requesting`` attempt is held
+    rather than re-armed. Run details are forbidden because no run is proved.
 ``dispatched``
     A dispatch was accepted, or an ambiguous attempt was reconciled to a
     proved actual run. Run details are optional (legacy dispatch responses
@@ -67,6 +73,7 @@ RECEIPT_SCHEMA_VERSION = 1
 RECEIPT_MARKER = "continuum-ci-repair-receipt"
 
 STATUS_CLAIMED = "claimed"
+STATUS_REQUESTING = "requesting"
 STATUS_DISPATCHED = "dispatched"
 STATUS_AMBIGUOUS = "ambiguous"
 STATUS_REJECTED = "rejected"
@@ -74,6 +81,7 @@ STATUS_REJECTED = "rejected"
 #: Bounded status vocabulary. Unknown statuses are invalid.
 RECEIPT_STATUSES = (
     STATUS_CLAIMED,
+    STATUS_REQUESTING,
     STATUS_DISPATCHED,
     STATUS_AMBIGUOUS,
     STATUS_REJECTED,
@@ -120,11 +128,22 @@ _RECEIPT_MARKER_RE = re.compile(
     r"\s*-->"
 )
 
-# A status may only move forward. ``ambiguous`` may be reconciled to
-# ``dispatched`` once a proved run is found; it never re-enters ``claimed``.
+# A status may only move forward. ``requesting`` is persisted immediately
+# before the dispatch request; once it exists the request may have reached
+# GitHub. ``ambiguous`` may be reconciled to ``dispatched`` once a proved run is
+# found; it never re-enters ``claimed`` or becomes ``rejected``.
 _TRANSITIONS = {
     STATUS_CLAIMED: frozenset(
-        {STATUS_CLAIMED, STATUS_DISPATCHED, STATUS_AMBIGUOUS, STATUS_REJECTED}
+        {
+            STATUS_CLAIMED,
+            STATUS_REQUESTING,
+            STATUS_DISPATCHED,
+            STATUS_AMBIGUOUS,
+            STATUS_REJECTED,
+        }
+    ),
+    STATUS_REQUESTING: frozenset(
+        {STATUS_REQUESTING, STATUS_DISPATCHED, STATUS_AMBIGUOUS, STATUS_REJECTED}
     ),
     STATUS_DISPATCHED: frozenset({STATUS_DISPATCHED}),
     STATUS_AMBIGUOUS: frozenset({STATUS_AMBIGUOUS, STATUS_DISPATCHED}),
@@ -961,10 +980,11 @@ def decide_new_attempt(collection: ReceiptCollection) -> AttemptDecision:
 
     The only permitting result is a complete/valid history with no
     non-rejected attempt for the queried HEAD. An incomplete, invalid or
-    conflicting history holds. ``claimed`` waits for its owner; ``dispatched``
-    already spent the attempt; ``ambiguous`` holds for correlation and can
-    never authorize a second dispatch. A history containing only definitely
-    ``rejected`` attempts may re-arm with a new attempt ID.
+    conflicting history holds. ``claimed`` waits for its owner; ``requesting``
+    may already have reached dispatch and holds; ``dispatched`` already spent
+    the attempt; ``ambiguous`` holds for correlation and can never authorize a
+    second dispatch. A history containing only definitely ``rejected``
+    attempts may re-arm with a new attempt ID.
     """
 
     if collection.outcome == OUTCOME_INCOMPLETE:
@@ -1014,6 +1034,16 @@ def decide_new_attempt(collection: ReceiptCollection) -> AttemptDecision:
                 ),
                 attempt_id=attempt.attempt_id,
             )
+        if attempt.status == STATUS_REQUESTING:
+            return AttemptDecision(
+                allowed=False,
+                action=ACTION_HOLD,
+                reason=(
+                    "attempt {!r} recorded a dispatch request that may have "
+                    "reached GitHub; correlate it before any retry"
+                ).format(attempt.attempt_id),
+                attempt_id=attempt.attempt_id,
+            )
         if attempt.status == STATUS_DISPATCHED:
             return AttemptDecision(
                 allowed=False,
@@ -1051,6 +1081,7 @@ __all__ = [
     "RECEIPT_SCHEMA_VERSION",
     "RECEIPT_MARKER",
     "STATUS_CLAIMED",
+    "STATUS_REQUESTING",
     "STATUS_DISPATCHED",
     "STATUS_AMBIGUOUS",
     "STATUS_REJECTED",

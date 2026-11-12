@@ -581,6 +581,58 @@ class AdmissionExecutableTests(unittest.TestCase):
         self.assertEqual([], self.posts())
         self.assertIn("cannot be verified", completed.stdout)
 
+    def test_a_rejection_from_the_same_writer_clears_its_claimed_receipt(self):
+        # The same historical writer recorded a claim and then a definite
+        # rejection for that attempt. The rejection is terminal, so the stale
+        # claim must not keep admission on hold.
+        attempt = "ci-old-account-0001"
+        claimed = trusted_receipt(
+            attempt=attempt,
+            status="claimed",
+            author="old-automation",
+            author_association="MEMBER",
+        )
+        rejected = trusted_receipt(
+            attempt=attempt,
+            status="rejected",
+            author="old-automation",
+            author_association="MEMBER",
+        )
+        rejected["id"] = 2
+        rejected["created_at"] = "2026-11-12T00:00:01Z"
+        self.write_comments([claimed, rejected])
+        self.write_pr(head=HEAD, comments=2)
+        self.write_runs([])
+        completed = self.run_admission()
+        self.assertEqual(1, len(self.dispatches()))
+        self.assertNotIn("cannot be verified", completed.stdout)
+
+    def test_a_rejection_from_another_writer_does_not_clear_the_claim(self):
+        # A non-owner commenter must not release a real historical writer's
+        # claim by posting a same-attempt rejected receipt.
+        attempt = "ci-old-account-0001"
+        claimed = trusted_receipt(
+            attempt=attempt,
+            status="claimed",
+            author="old-automation",
+            author_association="MEMBER",
+        )
+        rejected = trusted_receipt(
+            attempt=attempt,
+            status="rejected",
+            author="somebody-else",
+            author_association="MEMBER",
+        )
+        rejected["id"] = 2
+        rejected["created_at"] = "2026-11-12T00:00:01Z"
+        self.write_comments([claimed, rejected])
+        self.write_pr(head=HEAD, comments=2)
+        self.write_runs([])
+        completed = self.run_admission()
+        self.assertEqual(0, len(self.dispatches()))
+        self.assertEqual([], self.posts())
+        self.assertIn("cannot be verified", completed.stdout)
+
     def test_a_deleted_previous_writer_run_stays_unverifiable(self):
         # The previous TAP_PAT account was recorded as a trusted writer before
         # rotation, but its repair run has since been deleted. The durable
@@ -1185,6 +1237,98 @@ class AdmissionExecutableTests(unittest.TestCase):
         self.assertEqual([], self.posts())
         self.assertIn("cannot be verified", completed.stdout)
 
+    def test_a_saturated_run_history_is_partitioned_by_creation_window(self):
+        module = self.admission_module()
+        runs = [
+            {
+                "id": index,
+                "display_title": "OpenCode repair PR #{}".format(PR),
+                "created_at": "2026-01-01T00:00:0{}Z".format(index),
+                "head_sha": HEAD,
+            }
+            for index in (1, 2, 3)
+        ]
+        calls = []
+
+        def fake_gh(arguments, *, stdin=None):
+            joined = " ".join(arguments)
+            window = next(
+                argument[len("created="):]
+                for argument in arguments
+                if argument.startswith("created=")
+            )
+            start_text, end_text = window.split("..", 1)
+            start = module._parse_run_window_timestamp(start_text, "start")
+            end = module._parse_run_window_timestamp(end_text, "end")
+            selected = [
+                run
+                for run in runs
+                if start
+                <= module._parse_run_window_timestamp(run["created_at"], "run")
+                <= end
+            ]
+            calls.append(window)
+            return (
+                0,
+                json.dumps(
+                    [{"total_count": len(selected), "workflow_runs": selected}]
+                ),
+                "",
+            )
+
+        with mock.patch.object(module, "_RUN_SEARCH_RESULT_CEILING", 2), mock.patch.object(
+            module, "_gh", side_effect=fake_gh
+        ):
+            inventory = module._workflow_runs(
+                REPO,
+                "continuum-opencode.yml",
+                since="2026-01-01T00:00:00Z",
+            )
+
+        self.assertTrue(inventory.complete, inventory.reason)
+        self.assertEqual([1, 2, 3], [run["id"] for run in inventory.runs])
+        self.assertGreater(len(calls), 1, calls)
+        self.assertEqual(len(calls), len(set(calls)), calls)
+
+    def test_a_single_second_window_that_stays_saturated_is_incomplete(self):
+        module = self.admission_module()
+
+        def fake_gh(arguments, *, stdin=None):
+            return (
+                0,
+                json.dumps(
+                    [
+                        {
+                            "total_count": 3,
+                            "workflow_runs": [
+                                {
+                                    "id": 1,
+                                    "display_title": "OpenCode repair PR #{}".format(
+                                        PR
+                                    ),
+                                    "created_at": "2026-01-01T00:00:00Z",
+                                    "head_sha": HEAD,
+                                }
+                            ],
+                        }
+                    ]
+                ),
+                "",
+            )
+
+        with mock.patch.object(module, "_RUN_SEARCH_RESULT_CEILING", 2), mock.patch.object(
+            module, "_gh", side_effect=fake_gh
+        ):
+            inventory = module._workflow_runs(
+                REPO,
+                "continuum-opencode.yml",
+                since="2026-01-01T00:00:00Z",
+                until="2026-01-01T00:00:10Z",
+            )
+
+        self.assertFalse(inventory.complete)
+        self.assertIn("single-second", inventory.reason)
+
     def test_first_failure_persists_the_claim_before_exactly_one_dispatch(self):
         self.run_admission()
         bodies = self.posted_bodies()
@@ -1232,21 +1376,23 @@ class AdmissionExecutableTests(unittest.TestCase):
                 for body in self.posted_bodies())
         )
 
-    def test_optional_input_rejection_falls_back_without_a_duplicate_dispatch(self):
-        self.run_admission(extra_env={"FAKE_REJECT_ATTEMPT_INPUTS": "1"})
+    def test_identity_input_rejection_requires_a_caller_upgrade_without_dispatch(self):
+        completed = self.run_admission(
+            extra_env={"FAKE_REJECT_ATTEMPT_INPUTS": "1"}
+        )
         dispatches = self.dispatches()
         self.assertEqual(
-            3,
+            1,
             len(dispatches),
-            "expected the combined shape, the input-only probe, and one fallback",
+            "an older caller must be upgraded, not dispatched without identity",
         )
-        self.assertIn("inputs[ci_repair_identity]=", dispatches[0])
-        self.assertIn("inputs[ci_repair_identity]=", dispatches[1])
-        self.assertNotIn("inputs[ci_repair_identity]=", dispatches[2])
         self.assertTrue(
-            any("status=dispatched" in body and "run=501" in body
-                for body in self.posted_bodies())
+            all("inputs[ci_repair_identity]=" in line for line in dispatches)
         )
+        bodies = self.posted_bodies()
+        self.assertTrue(any("status=rejected" in body for body in bodies), bodies)
+        self.assertFalse(any("status=dispatched" in body for body in bodies), bodies)
+        self.assertIn("upgrade the installed caller", completed.stdout)
 
     def test_a_definite_rejection_is_recorded_and_not_retried_in_the_same_pass(self):
         self.run_admission(
@@ -1306,8 +1452,11 @@ class AdmissionExecutableTests(unittest.TestCase):
         ]
         self.assertTrue(run_lists, self.log())
         self.assertTrue(
-            any("--method GET" in line and "created=>=2026-11-12T00:00:00Z" in line
-                for line in run_lists),
+            any(
+                "--method GET" in line
+                and "created=2026-11-12T00:00:00Z.." in line
+                for line in run_lists
+            ),
             run_lists,
         )
         self.assertFalse(
@@ -1329,6 +1478,41 @@ class AdmissionExecutableTests(unittest.TestCase):
         self.assertTrue(any("status=claimed" in body for body in bodies), bodies)
         self.run_admission(extra_args=("--now", "2026-11-13T00:00:00Z"))
         self.assertEqual(1, len(self.dispatches()), "the resumed pass duplicated repair")
+
+    def test_a_stale_requesting_attempt_is_held_not_rearmed(self):
+        # The request marker proves the dispatch may have reached GitHub even
+        # though its run can be deleted. A complete empty inventory must not
+        # re-arm this attempt and dispatch a duplicate for the same exact HEAD.
+        claimed = trusted_receipt()
+        requesting = trusted_receipt(status="requesting")
+        requesting["id"] = 2
+        requesting["created_at"] = "2026-11-12T00:00:01Z"
+        self.write_comments([claimed, requesting])
+        self.write_pr(head=HEAD, comments=2)
+        self.write_runs([])
+        completed = self.run_admission(extra_args=("--now", NOW))
+        self.assertEqual(0, len(self.dispatches()))
+        bodies = self.posted_bodies()
+        self.assertTrue(any("status=ambiguous" in body for body in bodies), bodies)
+        self.assertFalse(any("status=rejected" in body for body in bodies), bodies)
+        self.assertFalse(any("status=claimed" in body for body in bodies), bodies)
+        self.assertIn("holding instead of re-arming", completed.stdout)
+
+    def test_a_successful_dispatch_records_the_request_marker_before_dispatch(self):
+        self.run_admission()
+        bodies = self.posted_bodies()
+        self.assertTrue(any("status=requesting" in body for body in bodies), bodies)
+        request_index = next(
+            index
+            for index, line in enumerate(self.log())
+            if "status=requesting" in line
+        )
+        dispatch_index = next(
+            index
+            for index, line in enumerate(self.log())
+            if "inputs[mode]=ci-fix" in line
+        )
+        self.assertLess(request_index, dispatch_index)
 
     def test_a_receipt_authored_by_the_authenticated_token_is_trusted(self):
         # A collaborator-owned PAT is a supported TAP_PAT shape. Receipts it
