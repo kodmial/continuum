@@ -258,7 +258,7 @@ class ChatQuotaParserTests(unittest.TestCase):
         self.assertIsNone(rabbit.parse_chat_retry_delay_ms(review))
         self.assertEqual(rabbit.parse_retry_delay_ms(review), 13 * 60_000)
 
-    def test_retry_marker_is_exact_head_finding_and_reply_scoped(self):
+    def test_chat_retry_acknowledgement_accepts_trusted_author_and_rejects_untrusted_author_and_missing_author_at_exact_head(self):
         body = fixture("chat-rate-limit-pr448.json")["threads"][0]["replies"][0]
         head = "43e40cee0f1e664f55854c0bb0e017fb01c30669"
         marker = rabbit.chat_retry_marker(4546745854, head, body["id"])
@@ -484,7 +484,7 @@ assert.ok(dueA <= Math.max(dueA, dueB));
 """
         self.run_block(checks)
 
-    def test_js_retry_is_idempotent_across_restart_and_exact_identity(self):
+    def test_js_chat_retry_acknowledgement_accepts_trusted_author_and_rejects_untrusted_author_and_missing_author_at_exact_head(self):
         data = fixture("chat-rate-limit-pr448.json")
         finding = data["threads"][0]["finding_id"]
         head = data["head_sha"]

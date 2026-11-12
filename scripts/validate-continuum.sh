@@ -104,6 +104,15 @@ PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s .github/scripts -p 'te
 PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=src python3 -m unittest -v \
   tests.test_coderabbit_queue_lifecycle.CodeRabbitChatBudgetRegressionTests.test_account_wide_scan_uses_shared_heading_only_deadline
 
+# Print the CodeRabbit chat-retry author-trust cases by name in the exact-HEAD
+# gate log. CodeRabbit excludes tests/** from review, so the named
+# trusted/untrusted/missing-author results are the only reviewable evidence
+# that a copied or anonymous acknowledgment marker cannot suppress a retry.
+PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=src python3 -m unittest -v \
+  tests.test_coderabbit_chat_quota.ChatQuotaParserTests.test_chat_retry_acknowledgement_accepts_trusted_author_and_rejects_untrusted_author_and_missing_author_at_exact_head \
+  tests.test_coderabbit_chat_quota.ChatQuotaRuntimeParityTests.test_js_chat_retry_acknowledgement_accepts_trusted_author_and_rejects_untrusted_author_and_missing_author_at_exact_head \
+  tests.test_coderabbit_chat_quota.AutoMergeThreadVerifierTests.test_forged_verification_marker_cannot_bypass_chat_quota
+
 mkdir -p "$PWD/.opencode-tmp/bin"
 # Pin both the installer URL and its content: the tag can move and a
 # compromised download would otherwise execute with this script's privileges.
