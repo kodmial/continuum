@@ -231,6 +231,19 @@ class BuildRenderParseTests(unittest.TestCase):
         self.assertFalse(decision.allowed)
         self.assertEqual(ACTION_HOLD, decision.action)
 
+    def test_fractional_schema_version_is_rejected(self):
+        for schema_version in (1.9, 0.5):
+            with self.subTest(schema_version=schema_version):
+                with self.assertRaises(ReceiptError):
+                    build_receipt(
+                        repository=REPO,
+                        pull_number=PR,
+                        head_sha=HEAD,
+                        attempt_id=ATTEMPT,
+                        status=STATUS_CLAIMED,
+                        schema_version=schema_version,
+                    )
+
     def test_marker_token_inside_attempt_id_is_not_ambiguous(self):
         # Attempt IDs are opaque; only tokens outside a complete marker are
         # malformed evidence.
@@ -304,6 +317,31 @@ class TrustTests(unittest.TestCase):
         decision = decide_new_attempt(result)
         self.assertTrue(decision.allowed)
         self.assertEqual(ACTION_CLAIM, decision.action)
+
+    def test_member_and_collaborator_markers_are_untrusted_by_default(self):
+        for association in ("MEMBER", "COLLABORATOR"):
+            with self.subTest(association=association):
+                forged = comment(
+                    render_receipt(receipt(status=STATUS_DISPATCHED, run_id=1)),
+                    login="read-only-org-user",
+                    association=association,
+                )
+                result = read([forged])
+                self.assertEqual(OUTCOME_COMPLETE, result.outcome)
+                self.assertEqual((), result.receipts)
+                self.assertEqual(1, result.ignored_untrusted)
+                self.assertTrue(decide_new_attempt(result).allowed)
+
+    def test_marker_with_unknown_authorship_is_incomplete(self):
+        unknown = receipt_comment()
+        del unknown["user"]
+        del unknown["author_association"]
+        result = read([unknown])
+        self.assertEqual(OUTCOME_INCOMPLETE, result.outcome)
+        self.assertIn("unknown authorship", result.reason)
+        decision = decide_new_attempt(result)
+        self.assertFalse(decision.allowed)
+        self.assertEqual(ACTION_HOLD, decision.action)
 
     def test_untrusted_mixed_marker_cannot_block_trusted_history(self):
         forged = comment(
@@ -410,6 +448,26 @@ class HistoryCompletenessTests(unittest.TestCase):
         self.assertEqual(OUTCOME_INCOMPLETE, result.outcome)
         self.assertIn("not an integer", result.reason)
         self.assertFalse(decide_new_attempt(result).allowed)
+
+    def test_fractional_expected_length_is_incomplete(self):
+        result = read([receipt_comment()], expected=1.9)
+        self.assertEqual(OUTCOME_INCOMPLETE, result.outcome)
+        self.assertIn("not an integer", result.reason)
+        self.assertFalse(decide_new_attempt(result).allowed)
+
+    def test_comment_without_string_body_is_incomplete(self):
+        missing = comment(render_receipt(receipt()))
+        del missing["body"]
+        non_string = comment(render_receipt(receipt()))
+        non_string["body"] = None
+        for comments in ([missing], [non_string]):
+            with self.subTest(comments=comments):
+                result = read(comments)
+                self.assertEqual(OUTCOME_INCOMPLETE, result.outcome)
+                self.assertIn("string body", result.reason)
+                decision = decide_new_attempt(result)
+                self.assertFalse(decision.allowed)
+                self.assertEqual(ACTION_HOLD, decision.action)
 
     def test_expected_length_match_is_complete(self):
         result = read([receipt_comment()], expected=1)

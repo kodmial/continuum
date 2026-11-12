@@ -86,9 +86,12 @@ ACTION_CLAIM = "claim"
 ACTION_WAIT = "wait"
 ACTION_HOLD = "hold"
 
-#: Comment authorships trusted to publish receipts. Arbitrary issue
-#: commenters cannot forge authoritative evidence.
-TRUSTED_COMMENT_ASSOCIATIONS = frozenset({"OWNER", "MEMBER", "COLLABORATOR"})
+#: Comment authorships trusted to publish receipts. Only repository
+#: ownership grants trust here: organization membership and outside
+#: collaboration can be read-only, so they cannot prove write access.
+#: Any other author needs the configured owner login or an explicit login
+#: allowlist.
+TRUSTED_COMMENT_ASSOCIATIONS = frozenset({"OWNER"})
 TRUSTED_AUTOMATION_LOGINS = frozenset({"github-actions[bot]"})
 
 _REPO_RE = re.compile(r"[A-Za-z0-9_.\-]+/[A-Za-z0-9_.\-]+")
@@ -182,6 +185,25 @@ def normalize_attempt_id(value: Any) -> str:
     return text
 
 
+def _coerce_integral(value: Any) -> Optional[int]:
+    """Return ``value`` as an integer only when it carries no fractional part.
+
+    Floats and other numeric objects are rejected even when their value is
+    whole, because their fractional part must never be silently truncated.
+    Decimal strings remain accepted for marker text parsed from comments.
+    """
+
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str):
+        text = value.strip()
+        if re.fullmatch(r"[+-]?[0-9]+", text):
+            return int(text)
+    return None
+
+
 def new_attempt_id() -> str:
     """Return a fresh, nonempty attempt ID (UUID4; no network access)."""
 
@@ -245,12 +267,9 @@ def build_receipt(
     that does not prove the same repository and run ID. No I/O is performed.
     """
 
-    if isinstance(schema_version, bool):
+    version = _coerce_integral(schema_version)
+    if version is None:
         raise ReceiptError("receipt schema version must be an integer")
-    try:
-        version = int(schema_version)
-    except (TypeError, ValueError) as exc:
-        raise ReceiptError("receipt schema version must be an integer") from exc
     if version != RECEIPT_SCHEMA_VERSION:
         raise ReceiptError(
             "unsupported receipt schema version {} (expected {})".format(
@@ -419,6 +438,17 @@ def _comment_login(comment: Mapping[str, Any]) -> str:
     return ""
 
 
+def _has_author_metadata(comment: Mapping[str, Any]) -> bool:
+    """Whether the comment proves any authorship, trusted or not.
+
+    A marked comment with neither an association nor a usable login has
+    unknown authorship, not confirmed untrusted authorship.
+    """
+
+    association = str(comment.get("author_association") or "").strip()
+    return bool(association) or bool(_comment_login(comment))
+
+
 def is_trusted_receipt_comment(
     comment: Mapping[str, Any],
     *,
@@ -428,8 +458,9 @@ def is_trusted_receipt_comment(
 ) -> bool:
     """Whether a comment is authorized to publish authoritative receipts.
 
-    Repository-side authority (OWNER/MEMBER/COLLABORATOR), the workflow bot
-    login, and the configured owner login are trusted. Anything else is
+    Repository ownership (OWNER), the workflow bot login, and the configured
+    owner login are trusted. Membership and outside collaboration do not
+    prove write access, so they are not trusted by default. Anything else is
     ignored and can never spoof or block receipt state.
     """
 
@@ -623,7 +654,8 @@ def read_receipts(
     in ascending creation order. Their default is deliberately fail closed:
     an un-attested history yields ``incomplete``, never an empty permissive
     result. If ``expected_comment_count`` is supplied it must equal the
-    supplied length or the history is incomplete.
+    supplied length or the history is incomplete. A supplied comment without
+    a string body also makes the history incomplete.
 
     Trusted markers for another repository or PR invalidate the history as
     mixed evidence. Trusted markers for another HEAD are retained in
@@ -631,7 +663,9 @@ def read_receipts(
     the queried HEAD. An impossible transition, reused attempt ID, or duplicate
     live attempt anywhere in the supplied log is corrupt evidence and fails
     closed instead of permitting a dispatch. Untrusted marker lookalikes are
-    ignored without affecting authority.
+    ignored without affecting authority. A marker whose author has neither an
+    association nor a usable login is unknown, not untrusted, and makes the
+    history incomplete.
     """
 
     repository_key = normalize_repository(repository)
@@ -658,11 +692,8 @@ def read_receipts(
             "order unknown)"
         )
     if expected_comment_count is not None:
-        if isinstance(expected_comment_count, bool):
-            return _incomplete("expected comment count is not an integer")
-        try:
-            expected = int(expected_comment_count)
-        except (TypeError, ValueError):
+        expected = _coerce_integral(expected_comment_count)
+        if expected is None:
             return _incomplete("expected comment count is not an integer")
         if expected < 0 or expected != len(materialized):
             return _incomplete(
@@ -677,7 +708,13 @@ def read_receipts(
     for comment in materialized:
         if not isinstance(comment, Mapping):
             return _invalid("comment history contains a non-object entry")
-        body = str(comment.get("body") or "")
+        body_value = comment.get("body")
+        if not isinstance(body_value, str):
+            return _incomplete(
+                "comment history contains a comment without a string body; "
+                "authoritative receipt state cannot be read"
+            )
+        body = body_value
         if not is_trusted_receipt_comment(
             comment,
             owner_login=owner_login,
@@ -685,6 +722,12 @@ def read_receipts(
             trusted_logins=trusted_logins,
         ):
             if RECEIPT_MARKER in body:
+                if not _has_author_metadata(comment):
+                    return _incomplete(
+                        "marked receipt comment has unknown authorship; "
+                        "authoritative author metadata is required",
+                        ignored_untrusted,
+                    )
                 ignored_untrusted += 1
             continue
         if RECEIPT_MARKER not in body:
