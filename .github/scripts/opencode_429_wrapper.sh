@@ -84,12 +84,24 @@ if [[ "$command" == "run" ]]; then
   fi
 
   log="$(mktemp "$runner_temp/continuum-opencode-run.XXXXXX")"
+  # Live status contains only safe JSON event metadata, never source or prompts.
+  live_script="$script_dir/.github/scripts/opencode_live_status.py"
+  live_pid=""
+  if [[ -f "$live_script" && -n "${CONTINUUM_LIVE_LOG_TOKEN:-}" && -n "${CONTINUUM_LIVE_LOG_ISSUE:-}" ]]; then
+    python3 "$live_script" watch --log "$log" >/dev/null 2>&1 &
+    live_pid=$!
+  fi
   set +e
-  opencode "${args[@]}" 2>&1 | python3 "$classifier" render --log "$log"
+  env -u CONTINUUM_LIVE_LOG_TOKEN -u CONTINUUM_LIVE_LOG_ISSUE opencode "${args[@]}" 2>&1 | python3 "$classifier" render --log "$log"
   pipe_status=("${PIPESTATUS[@]}")
   status="${pipe_status[0]:-1}"
   render_status="${pipe_status[1]:-1}"
   set -e
+  if [[ -n "$live_pid" ]]; then
+    kill "$live_pid" 2>/dev/null || true
+    wait "$live_pid" 2>/dev/null || true
+    python3 "$live_script" once --log "$log" --state finished >/dev/null 2>&1 || true
+  fi
   if [[ "$render_status" -ne 0 ]]; then
     rm -f "$log"
     echo "::error::OpenCode event rendering failed; refusing to infer provider health." >&2
