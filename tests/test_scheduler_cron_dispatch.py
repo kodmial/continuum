@@ -516,6 +516,36 @@ function classifyComments(bodies) {
     created_at: createdAt,
     ...overrides
   });
+  const pagedClient = (totalCount, matchIndex = -1) => ({
+    rest: {
+      git: { getRef: async () => ({ data: { object: { sha } } }) },
+      actions: {
+        listWorkflowRunsForRepo: async ({ page = 1, per_page = 100 } = {}) => {
+          const start = (page - 1) * per_page;
+          const count = Math.max(
+            0, Math.min(per_page, totalCount - start)
+          );
+          return {
+            data: {
+              total_count: totalCount,
+              workflow_runs: Array.from({ length: count }, (_, offset) => {
+                const index = start + offset;
+                if (index === matchIndex) return issueRun();
+                return {
+                  id: 1000 + index,
+                  name: 'Unrelated workflow',
+                  path: '.github/workflows/other.yml',
+                  event: 'push',
+                  display_title: 'Unrelated run ' + index,
+                  created_at: '2026-11-12T04:30:00Z'
+                };
+              })
+            }
+          };
+        }
+      }
+    }
+  });
   const hold = (comments, cl = client()) =>
     checkpointResumeHold('kodmial', 'continuum', 442, comments, cl);
   assert.ok(await hold([saved]), 'recorded failure must hold');
@@ -570,6 +600,19 @@ function classifyComments(bodies) {
       }
     }),
     'an unreadable run inventory must keep the hold fail-closed'
+  );
+  assert.ok(
+    await hold([saved, manual], pagedClient(301)),
+    'a truncated run inventory must keep the hold fail-closed'
+  );
+  assert.ok(
+    await hold([saved, manual], pagedClient(301, 300)),
+    'a retry run outside the inspected inventory window must keep the hold'
+  );
+  assert.equal(
+    await hold([saved, manual], pagedClient(300)),
+    null,
+    'a complete inventory that reports its exact total may release'
   );
   const retried = item(9, marker.replace(
     ' reason=verification-failed -->',

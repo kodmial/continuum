@@ -761,12 +761,14 @@ module.exports = async function runIssueScheduler({ github, context, core }) {
   // retry that could not publish its own rejection episode (the publisher
   // fails closed instead of pretending the hold was recorded) must never let
   // a later wake redispatch the identical checkpoint. A run inventory that
-  // cannot be read stays fail-closed for the same reason.
+  // cannot be read, or that is truncated before its reported total, stays
+  // fail-closed for the same reason.
   async function openCodeIssueRunStartedAfter(
     targetOwner, targetRepo, issueNumber, order, client
   ) {
     const expectedTitle = 'OpenCode issue #' + issueNumber;
     const runs = [];
+    let inventoryComplete = false;
     try {
       for (let page = 1; page <= 3; page += 1) {
         const { data } = await client.rest.actions.listWorkflowRunsForRepo({
@@ -777,13 +779,33 @@ module.exports = async function runIssueScheduler({ github, context, core }) {
         });
         const batch = (data && data.workflow_runs) || [];
         runs.push(...batch);
-        if (batch.length < 100) break;
+        if (batch.length < 100) {
+          inventoryComplete = true;
+          break;
+        }
+        const totalCount = Number(data && data.total_count);
+        if (
+          Number.isInteger(totalCount) &&
+          totalCount >= 0 &&
+          runs.length >= totalCount
+        ) {
+          inventoryComplete = true;
+          break;
+        }
       }
     } catch (err) {
       core.warning(
         'OpenCode run inventory is unavailable for #' + issueNumber +
         '; keeping the deterministic hold because the owner override ' +
         'cannot be proven unconsumed.'
+      );
+      return true;
+    }
+    if (!inventoryComplete) {
+      core.warning(
+        'OpenCode run inventory is truncated for #' + issueNumber +
+        '; keeping the deterministic hold because the owner override ' +
+        'cannot be proven unconsumed outside the inspected window.'
       );
       return true;
     }

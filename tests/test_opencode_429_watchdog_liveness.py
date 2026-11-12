@@ -171,6 +171,7 @@ function makeRest() {
         const start = (page - 1) * perPage;
         return {
           data: {
+            total_count: items.length,
             workflow_runs: items
               .slice(start, start + perPage)
               .map(run => ({ ...run })),
@@ -1288,6 +1289,48 @@ class WatchdogHarness(unittest.TestCase):
         self.assertTrue(
             any(
                 "run inventory is unavailable" in " ".join(line)
+                for line in result["notices"]
+            ),
+            result["notices"],
+        )
+
+    def test_truncated_run_inventory_keeps_the_hold(self):
+        scenario = self.normal_retry_scenario()
+        scenario["comments"].extend([
+            thread_comment(20, hold_marker(), "2026-10-23T09:50:00Z"),
+            thread_comment(
+                21, "/oc", "2026-10-23T10:00:00Z", login="kodmial"
+            ),
+        ])
+        scenario["workflowRuns"] = [
+            {
+                "id": 700000 + index,
+                "status": "completed",
+                "conclusion": "success",
+                "event": "push",
+                "path": ".github/workflows/other.yml",
+                "name": "Other",
+                "display_title": "Other run " + str(index),
+                "created_at": "2026-10-23T10:00:01Z",
+            }
+            for index in range(300)
+        ] + [
+            {
+                "id": 4446,
+                "status": "completed",
+                "conclusion": "failure",
+                "event": "issue_comment",
+                "path": ".github/workflows/opencode.yml",
+                "name": "OpenCode agent",
+                "display_title": "OpenCode issue #382",
+                "created_at": "2026-10-23T10:00:05Z",
+            }
+        ]
+        result = self.run_scenario(scenario)
+        self.assertEqual(self.retried_bodies(result), [], result["comments"])
+        self.assertTrue(
+            any(
+                "run inventory is truncated" in " ".join(line)
                 for line in result["notices"]
             ),
             result["notices"],
