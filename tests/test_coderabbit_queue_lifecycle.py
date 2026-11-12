@@ -778,7 +778,7 @@ class CodeRabbitChatBudgetRegressionTests(unittest.TestCase):
         if not shutil.which("node"):
             self.skipTest("Node.js unavailable")
         source = self._workflow()
-        begin = source.index("          // NanoDictate uses this single canonical")
+        begin = source.index("          // Installed consumers use this single canonical")
         end = source.index(
             "          function shouldRecheckCodeRabbitAfterCi(", begin
         )
