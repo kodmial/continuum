@@ -4137,8 +4137,10 @@ class ContinuumTest < Minitest::Test
            'a pre-baseline dispatched receipt with a deleted run must hold admission'
     assert result.fetch('equal_baseline_hold'),
            'a receipt at the second-precision baseline must hold admission'
-    refute result.fetch('pre_baseline_claim_hold'),
-           'a pre-baseline claim from an unrelated commenter must not suppress a repair'
+    assert result.fetch('pre_baseline_claim_hold'),
+           'a pre-baseline claim can be the only trace of an accepted dispatch ' \
+           'whose outcome was not persisted and whose run was deleted, so it ' \
+           'must hold admission'
     assert result.fetch('pre_baseline_member_claim_hold'),
            'a pre-baseline claim from a plausible writer must hold admission'
   end

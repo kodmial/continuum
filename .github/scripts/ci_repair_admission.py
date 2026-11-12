@@ -94,9 +94,10 @@ _ISO_TIMESTAMP_RE = re.compile(
 # no run proves that writer, admission must hold instead of treating the
 # receipt as absent. After the registry baseline is established, an unrelated
 # commenter without repository write access can neither authorize nor suppress
-# a repair; a pre-baseline receipt that records a dispatch stays unverifiable
-# instead of being mistaken for such a lookalike, while a pre-baseline claim
-# with no attestation stays a lookalike.
+# a repair, because only receipts created after the frontier are classified as
+# lookalikes. Any receipt created at or before it stays unverifiable: its run
+# may already be deleted, and an accepted dispatch whose outcome failed to
+# persist can leave only a ``claimed`` receipt behind.
 _HISTORICAL_WRITER_ASSOCIATIONS = frozenset({"MEMBER", "COLLABORATOR"})
 #: Legacy comma/newline-separated registry of logins that authored trusted
 #: receipts. It is only read now: a pre-existing value is migrated into
@@ -740,16 +741,17 @@ def _historical_receipt_writers(
     accepted dispatch. An unrelated commenter cannot borrow a run, so
     unverified lookalikes stay ignored exactly as before.
 
-    ``baseline`` is the durable writer-registry migration frontier. A receipt
-    that records a dispatch (``dispatched`` or ``ambiguous``) and was created at
-    or before it may belong to a historical writer that was never migrated,
-    whose dispatch run may already be deleted; such an unproved author is
-    unverifiable, not a proven lookalike. The comparison is inclusive because
-    the frontier has second precision. A pre-baseline ``claimed`` receipt proves
-    no dispatch was accepted, so without registry, association, or run evidence
-    it is indistinguishable from an unrelated lookalike and must not suppress
-    repair. With no established baseline every unproved receipt is unverifiable,
-    so a missing registry can never reauthorize a spent exact HEAD.
+    ``baseline`` is the durable writer-registry migration frontier. Any receipt
+    created at or before it may belong to a historical writer that was never
+    migrated, whose dispatch run may already be deleted; such an unproved author
+    is unverifiable, not a proven lookalike. The comparison is inclusive because
+    the frontier has second precision. This includes ``claimed`` receipts: the
+    claim is persisted before the dispatch request, so a dispatch can be
+    accepted while persisting its outcome fails, leaving only the claim behind.
+    With no established baseline every unproved receipt is unverifiable, so a
+    missing registry can never reauthorize a spent exact HEAD. Receipts created
+    after the frontier remain lookalikes, so an unrelated commenter cannot
+    suppress repair once the baseline exists.
 
     The second result reports that history exists which cannot be verified
     because the run inventory failed or is incomplete, or because a plausible
@@ -870,16 +872,15 @@ def _historical_receipt_writers(
         # The baseline is recorded with second precision, so a receipt created
         # in the same second is ambiguous and must not be treated as newer.
         predates_baseline = created <= baseline_text
-        # A pre-baseline receipt can hide a spent exact HEAD only when it
-        # records a dispatch. A ``claimed`` receipt is persisted before the
-        # dispatch request; with no run and no GitHub-attested writer evidence
-        # it is indistinguishable from an unrelated lookalike, and holding on it
-        # would let any commenter suppress repair. A deleted run behind a
-        # ``dispatched`` or ``ambiguous`` receipt still holds.
-        if predates_baseline and receipt.status in (
-            STATUS_DISPATCHED,
-            STATUS_AMBIGUOUS,
-        ):
+        # Any pre-baseline receipt can hide a spent exact HEAD. A ``claimed``
+        # receipt is normally persisted before the dispatch request, but the
+        # dispatch can be accepted while persisting its outcome fails, leaving
+        # only the claim behind; its run may then be deleted. Without registry,
+        # association, or run evidence that author cannot be told apart from a
+        # historical writer, so the receipt fails closed instead of authorizing
+        # a duplicate dispatch. Receipts created after the frontier are still
+        # lookalikes, so an unrelated commenter cannot suppress repair then.
+        if predates_baseline:
             unverifiable = True
             break
     return tuple(verified), unverifiable
@@ -960,9 +961,9 @@ def run(args) -> int:
     # history authoritative for the next token. Per-writer variables make the
     # registration independent, so concurrent exact-HEAD passes cannot erase
     # each other's writer. A one-time baseline records when the registry became
-    # authoritative, so a pre-baseline receipt that records a dispatch is never
-    # mistaken for an unrelated lookalike after its proving run is deleted, while
-    # a bare pre-baseline claim cannot suppress repair.
+    # authoritative, so every pre-baseline receipt is unverifiable rather than a
+    # lookalike: its dispatch run may already be deleted, and an accepted
+    # dispatch whose outcome failed to persist can leave only a claim behind.
     known_writers, registered_writers, registry_healthy = _historical_writer_registry(
         repository
     )

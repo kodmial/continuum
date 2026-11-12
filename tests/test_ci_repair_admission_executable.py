@@ -627,17 +627,19 @@ class AdmissionExecutableTests(unittest.TestCase):
         self.assertEqual([], self.posts())
         self.assertIn("cannot be verified", completed.stdout)
 
-    def test_a_pre_baseline_lookalike_cannot_suppress_a_repair(self):
-        # A well-formed claimed receipt posted before the migration frontier
-        # proves no dispatch was accepted. With no registry, association, or run
-        # evidence it is indistinguishable from an unrelated lookalike, so it
-        # must not let any commenter suppress repair for this exact HEAD.
+    def test_a_pre_baseline_claim_with_a_deleted_run_holds_instead_of_redispatched(self):
+        # A previous writer dispatched a repair successfully, but persisting the
+        # outcome failed, so only its claim remains. The writer was never
+        # registered, its account now has no repository association, and its run
+        # was deleted. That is indistinguishable from a historical writer, so
+        # the missing registry must hold instead of dispatching the same exact
+        # HEAD again.
         self.write_comments(
             [
                 trusted_receipt(
-                    attempt="ci-lookalike-0001",
+                    attempt="ci-old-account-0001",
                     status="claimed",
-                    author="passer-by",
+                    author="old-automation",
                     author_association="NONE",
                 )
             ]
@@ -648,11 +650,19 @@ class AdmissionExecutableTests(unittest.TestCase):
         completed = self.run_admission(
             extra_args=("--now", "2026-11-12T00:05:00Z")
         )
-        self.assertEqual(1, len(self.dispatches()))
-        self.assertEqual(
-            "2026-11-12T00:05:00Z",
-            self.variables()[WRITERS_BASELINE_VARIABLE],
+        self.assertEqual(0, len(self.dispatches()))
+        self.assertEqual([], self.posts())
+        self.assertIn("cannot be verified", completed.stdout)
+        self.assertIn(WRITERS_BASELINE_VARIABLE, self.variables())
+
+        # The baseline is durable: a later pass must not reclassify the same
+        # pre-baseline claim as an unrelated lookalike and dispatch again.
+        completed = self.run_admission(
+            extra_args=("--now", "2026-11-12T00:10:00Z")
         )
+        self.assertEqual(0, len(self.dispatches()))
+        self.assertEqual([], self.posts())
+        self.assertIn("cannot be verified", completed.stdout)
 
     def test_a_pre_baseline_claim_from_a_plausible_writer_still_holds(self):
         # Repository write access is GitHub-attested evidence that the author
