@@ -1110,6 +1110,26 @@ jobs:
               return String(comment.created_at || '') + '#' +
                 String(comment.id || 0).padStart(12, '0');
             }
+            // Workflow-run ids and issue-comment ids come from different
+            // sequences, so a run and an owner command that share one
+            // `created_at` second cannot be ordered by id. That case stays
+            // fail-closed: the hold assumes the run started after the
+            // override rather than releasing on a guess.
+            function openCodeRunStartedAfter(run, order) {
+              const runCreatedAt = String(run.created_at || '');
+              const commentCreatedAt = String(order || '').split('#')[0];
+              if (
+                runCreatedAt &&
+                commentCreatedAt &&
+                runCreatedAt === commentCreatedAt
+              ) {
+                return true;
+              }
+              return checkpointCommentOrder({
+                created_at: runCreatedAt,
+                id: run.id || 0,
+              }) > order;
+            }
             function trustedCheckpointComment(comment) {
               const association = String(
                 comment.author_association || ''
@@ -1183,14 +1203,39 @@ jobs:
                 );
                 return true;
               }
-              return runs.some(candidate => (
-                isOpenCodeWorkflowCandidate(candidate) &&
-                String(candidate.display_title || '') === expectedTitle &&
-                checkpointCommentOrder({
-                  created_at: candidate.created_at || '',
-                  id: candidate.id || 0,
-                }) > order
-              ));
+              // A caller without `run-name:` reports the issue title
+              // instead of `OpenCode issue #<n>`. Map that legacy identity
+              // exactly as the retry routing does; a failed title read stays
+              // fail-closed.
+              let issueTitle = '';
+              try {
+                const { data } = await readGithub.rest.issues.get({
+                  owner,
+                  repo,
+                  issue_number: issueNumber,
+                });
+                issueTitle = String(data?.title || '');
+              } catch (err) {
+                core.warning(
+                  'OpenCode issue title is unavailable for #' + issueNumber +
+                  '; keeping the deterministic hold because a legacy-titled ' +
+                  'owner retry run cannot be ruled out.'
+                );
+                return true;
+              }
+              return runs.some(candidate => {
+                if (!isOpenCodeWorkflowCandidate(candidate)) return false;
+                const displayTitle = String(candidate.display_title || '');
+                const matchingTitle =
+                  displayTitle === expectedTitle ||
+                  (
+                    candidate.event === 'issue_comment' &&
+                    issueTitle !== '' &&
+                    displayTitle === issueTitle
+                  );
+                return matchingTitle &&
+                  openCodeRunStartedAfter(candidate, order);
+              });
             }
             async function checkpointResumeHold(
               issueNumber, comments, recoveryCheckpointRef = null

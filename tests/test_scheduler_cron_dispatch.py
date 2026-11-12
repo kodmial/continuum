@@ -497,9 +497,15 @@ function classifyComments(bodies) {
   const auto = item(2, '/oc\n\n<!-- issue-scheduler-dispatch -->');
   const watchdog = item(3, '/oc\n\n<!-- opencode-watchdog-retry -->');
   const manual = item(4, '/oc\ncheck again');
-  const client = (tip = sha, workflowRuns = []) => ({
+  const legacyIssueTitle = 'Legacy caller without run-name';
+  const client = (
+    tip = sha, workflowRuns = [], issueTitle = legacyIssueTitle
+  ) => ({
     rest: {
       git: { getRef: async () => ({ data: { object: { sha: tip } } }) },
+      issues: {
+        get: async () => ({ data: { number: 442, title: issueTitle } })
+      },
       actions: {
         listWorkflowRunsForRepo: async () => ({
           data: { workflow_runs: workflowRuns }
@@ -519,6 +525,9 @@ function classifyComments(bodies) {
   const pagedClient = (totalCount, matchIndex = -1) => ({
     rest: {
       git: { getRef: async () => ({ data: { object: { sha } } }) },
+      issues: {
+        get: async () => ({ data: { number: 442, title: legacyIssueTitle } })
+      },
       actions: {
         listWorkflowRunsForRepo: async ({ page = 1, per_page = 100 } = {}) => {
           const start = (page - 1) * per_page;
@@ -589,6 +598,49 @@ function classifyComments(bodies) {
     ),
     null,
     'an OpenCode run for another issue must not consume the override'
+  );
+  assert.ok(
+    await hold(
+      [saved, manual],
+      client(sha, [issueRun('2026-11-12T04:30:00Z', {
+        display_title: legacyIssueTitle
+      })])
+    ),
+    'a legacy caller run titled with the issue title must consume the override'
+  );
+  assert.equal(
+    await hold(
+      [saved, manual],
+      client(sha, [issueRun('2026-11-12T04:30:00Z', {
+        event: 'workflow_dispatch',
+        display_title: legacyIssueTitle
+      })])
+    ),
+    null,
+    'only an issue_comment run may use the legacy issue-title identity'
+  );
+  assert.ok(
+    await hold(
+      [saved, manual],
+      client(sha, [issueRun('2026-11-12T04:04:00Z', { id: 3 })])
+    ),
+    'a same-second run whose lower id cannot be ordered must keep the hold'
+  );
+  assert.ok(
+    await hold([saved, manual], {
+      rest: {
+        git: { getRef: async () => ({ data: { object: { sha } } }) },
+        issues: {
+          get: async () => { throw { status: 503 }; }
+        },
+        actions: {
+          listWorkflowRunsForRepo: async () => ({
+            data: { workflow_runs: [] }
+          })
+        }
+      }
+    }),
+    'an unreadable issue title must keep the hold fail-closed'
   );
   assert.ok(
     await hold([saved, manual], {

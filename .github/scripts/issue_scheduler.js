@@ -763,6 +763,22 @@ module.exports = async function runIssueScheduler({ github, context, core }) {
   // a later wake redispatch the identical checkpoint. A run inventory that
   // cannot be read, or that is truncated before its reported total, stays
   // fail-closed for the same reason.
+  //
+  // Workflow-run ids and issue-comment ids come from different sequences, so
+  // a run and an owner command that share one `created_at` second cannot be
+  // ordered by id. That case stays fail-closed: the hold assumes the run
+  // started after the override rather than releasing on a guess.
+  function openCodeRunStartedAfter(run, order) {
+    const runCreatedAt = String(run.created_at || '');
+    const commentCreatedAt = String(order || '').split('#')[0];
+    if (runCreatedAt && commentCreatedAt && runCreatedAt === commentCreatedAt) {
+      return true;
+    }
+    return stopOrderKey({
+      created_at: runCreatedAt,
+      id: run.id || 0,
+    }) > order;
+  }
   async function openCodeIssueRunStartedAfter(
     targetOwner, targetRepo, issueNumber, order, client
   ) {
@@ -809,15 +825,40 @@ module.exports = async function runIssueScheduler({ github, context, core }) {
       );
       return true;
     }
-    return runs.some(run =>
-      (run.path === opencodeWorkflowPath ||
-        (opencodeWorkflowName !== '' && run.name === opencodeWorkflowName)) &&
-      String(run.display_title || '') === expectedTitle &&
-      stopOrderKey({
-        created_at: run.created_at || '',
-        id: run.id || 0,
-      }) > order
-    );
+    // A caller without `run-name:` reports the issue title instead of
+    // `OpenCode issue #<n>`. Map that legacy identity exactly as the active
+    // run inventory does; a failed title read stays fail-closed.
+    let issueTitle = '';
+    try {
+      const { data } = await client.rest.issues.get({
+        owner: targetOwner,
+        repo: targetRepo,
+        issue_number: issueNumber,
+      });
+      issueTitle = String(data?.title || '');
+    } catch (err) {
+      core.warning(
+        'OpenCode issue title is unavailable for #' + issueNumber +
+        '; keeping the deterministic hold because a legacy-titled owner ' +
+        'retry run cannot be ruled out.'
+      );
+      return true;
+    }
+    return runs.some(run => {
+      if (!(run.path === opencodeWorkflowPath ||
+        (opencodeWorkflowName !== '' && run.name === opencodeWorkflowName))) {
+        return false;
+      }
+      const displayTitle = String(run.display_title || '');
+      const matchingTitle =
+        displayTitle === expectedTitle ||
+        (
+          run.event === 'issue_comment' &&
+          issueTitle !== '' &&
+          displayTitle === issueTitle
+        );
+      return matchingTitle && openCodeRunStartedAfter(run, order);
+    });
   }
   async function checkpointResumeHold(
     targetOwner, targetRepo, issueNumber, comments, client, taskGeneration = 1

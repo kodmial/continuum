@@ -1254,6 +1254,63 @@ class WatchdogHarness(unittest.TestCase):
         result = self.run_scenario(scenario)
         self.assertEqual(self.retried_bodies(result), [], result["comments"])
 
+    def test_unpublished_legacy_titled_manual_retry_consumes_the_override(self):
+        # A caller without `run-name:` titles its run with the issue title.
+        # That completed retry run must still be recognized as the owner's
+        # consumed one-shot override.
+        scenario = self.normal_retry_scenario()
+        legacy_title = "Legacy caller without run-name"
+        scenario["issues"] = [{
+            "number": 382,
+            "state": "open",
+            "title": legacy_title,
+            "body": "",
+            "labels": [],
+        }]
+        scenario["comments"].extend([
+            thread_comment(20, hold_marker(), "2026-10-23T09:50:00Z"),
+            thread_comment(
+                21, "/oc", "2026-10-23T10:00:00Z", login="kodmial"
+            ),
+        ])
+        scenario["runs"].append({
+            "id": 4447,
+            "status": "completed",
+            "conclusion": "failure",
+            "event": "issue_comment",
+            "path": ".github/workflows/opencode.yml",
+            "name": "OpenCode agent",
+            "display_title": legacy_title,
+            "created_at": "2026-10-23T10:00:05Z",
+        })
+        result = self.run_scenario(scenario)
+        self.assertEqual(self.retried_bodies(result), [], result["comments"])
+
+    def test_same_second_manual_retry_run_consumes_the_override(self):
+        # Workflow-run ids and comment ids are unrelated sequences. When the
+        # run and the owner command share one created_at second the ordering
+        # is ambiguous, so the hold must stay rather than release on the
+        # numerically lower run id.
+        scenario = self.normal_retry_scenario()
+        scenario["comments"].extend([
+            thread_comment(20, hold_marker(), "2026-10-23T09:50:00Z"),
+            thread_comment(
+                21, "/oc", "2026-10-23T10:00:00Z", login="kodmial"
+            ),
+        ])
+        scenario["runs"].append({
+            "id": 5,
+            "status": "completed",
+            "conclusion": "failure",
+            "event": "issue_comment",
+            "path": ".github/workflows/opencode.yml",
+            "name": "OpenCode agent",
+            "display_title": "OpenCode issue #382",
+            "created_at": "2026-10-23T10:00:00Z",
+        })
+        result = self.run_scenario(scenario)
+        self.assertEqual(self.retried_bodies(result), [], result["comments"])
+
     def test_manual_retry_run_for_another_issue_keeps_the_release(self):
         scenario = self.normal_retry_scenario()
         scenario["comments"].extend([
