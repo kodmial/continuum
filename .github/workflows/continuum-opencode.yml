@@ -968,6 +968,14 @@ jobs:
               core.notice('CI repair correlation has no verified exact-HEAD dispatch evidence; leaving this run uncorrelated.');
               return;
             }
+            // A HEAD match alone does not prove that this run belongs to an
+            // active claim; an older H1 run could otherwise be attributed to a
+            // same-HEAD claim that did not dispatch it. Require the attempt ID
+            // the owner actually dispatched with.
+            if (!/^[A-Za-z0-9][A-Za-z0-9._:\-]{7,127}$/.test(requestedAttempt)) {
+              core.notice('CI repair correlation has no verified attempt identity; leaving this run uncorrelated.');
+              return;
+            }
             let comments;
             try {
               comments = await github.paginate(github.rest.issues.listComments, {
@@ -1020,16 +1028,7 @@ jobs:
             for (const item of observations) latest.set(item.attempt, item);
             const isActive = item => Boolean(item) &&
               (item.status === 'claimed' || item.status === 'ambiguous');
-            let attempt = requestedAttempt;
-            if (!attempt) {
-              attempt = [...observations].reverse()
-                .map(item => item.attempt)
-                .find(id => isActive(latest.get(id))) || '';
-              if (!attempt) {
-                core.notice('No active exact-HEAD CI repair claim to correlate.');
-                return;
-              }
-            }
+            const attempt = requestedAttempt;
             const current = latest.get(attempt);
             if (!isActive(current)) {
               core.notice(`CI repair attempt ${attempt} is not an active claim (${current ? current.status : 'no receipt'}); not correlating this run.`);
@@ -1193,14 +1192,13 @@ jobs:
       # kodmial/continuum#446: a ci-fix dispatch carries the exact HEAD it was
       # admitted for. The branch is mutable, so the run must not repair whatever
       # the branch points at when the executor starts: the admitted SHA is the
-      # execution target, and a failure to prove it stops before any agent work.
-      # A 429 resumption is excluded because its restored checkpoint already
-      # pins and verifies the exact recovery identity.
+      # execution target, and a dispatch that cannot prove it stops before any
+      # agent work. A 429 resumption is excluded because its restored
+      # checkpoint already pins and verifies the exact recovery identity.
       - name: Bind CI repair to the admitted exact HEAD
         if: >-
           github.event_name == 'workflow_dispatch' &&
           inputs.mode == 'ci-fix' &&
-          inputs.ci_head_sha != '' &&
           steps.recovery_restore.outputs.resumed != 'true'
         env:
           ADMITTED_HEAD_SHA: ${{ inputs.ci_head_sha }}

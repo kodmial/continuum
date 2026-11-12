@@ -3799,6 +3799,351 @@ class ContinuumTest < Minitest::Test
                     'observed state must not expire on a fixed 48h horizon'
   end
 
+  # ------------------------------------------------- CI-repair correlation
+
+  # The correlation step is the only place that turns a queued ci-fix run into
+  # a dispatched receipt. #449 requires both halves of the dispatch identity:
+  # a mutable live HEAD or a same-HEAD active claim is not proof that this run
+  # owns that attempt.
+  def ci_repair_correlation_script
+    workflow = yaml(File.join(ROOT, '.github/workflows/continuum-opencode.yml'))
+    step = workflow.fetch('jobs').values
+                   .flat_map { |job| job['steps'] || [] }
+                   .find { |entry| entry['name'] == 'Record exact-HEAD CI repair dispatch correlation' }
+    refute_nil step, 'the exact-HEAD CI-repair correlation step is missing'
+    step.fetch('with').fetch('script')
+  end
+
+  def ci_repair_receipt(attempt, status, comment_id:, head: 'a' * 40)
+    {
+      'id' => comment_id,
+      'body' => "<!-- continuum-ci-repair-receipt v=1 repo=kodmial/continuum " \
+                "pr=449 head=#{head} attempt=#{attempt} status=#{status} -->",
+      'author_association' => 'OWNER',
+      'user' => { 'login' => 'kodmial' },
+    }
+  end
+
+  def run_ci_repair_correlation_cases(cases)
+    harness = <<~'JS'
+      const source = process.argv[1];
+      const payload = JSON.parse(process.argv[2]);
+      const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor;
+      (async () => {
+        const results = {};
+        for (const item of payload.cases) {
+          process.env.PR_NUMBER = String(payload.pullNumber);
+          process.env.CI_ATTEMPT_ID = item.attempt || '';
+          process.env.CI_HEAD_SHA = item.head || payload.head;
+          process.env.DISPATCH_RUN_ID = '9001';
+          const calls = { warnings: [], notices: [], created: [] };
+          const core = {
+            warning: message => calls.warnings.push(String(message)),
+            notice: message => calls.notices.push(String(message)),
+            info: message => calls.notices.push(String(message)),
+          };
+          const github = {
+            paginate: async () => {
+              if (item.paginateError) throw new Error(item.paginateError);
+              return item.comments || [];
+            },
+            rest: {
+              issues: {
+                listComments: async () => ({}),
+                createComment: async args => {
+                  calls.created.push(args);
+                  return { data: { id: 1000 } };
+                },
+              },
+              users: {
+                getAuthenticated: async () => ({ data: { login: 'github-actions[bot]' } }),
+              },
+            },
+          };
+          try {
+            await new AsyncFunction('github', 'context', 'core', source)(
+              github,
+              { repo: { owner: 'Kodmial', repo: 'Continuum' } },
+              core
+            );
+            calls.ok = true;
+          } catch (error) {
+            calls.ok = false;
+            calls.error = String((error && error.message) || error);
+          }
+          results[item.name] = calls;
+        }
+        process.stdout.write(JSON.stringify(results));
+      })().catch(error => {
+        console.error(error);
+        process.exit(1);
+      });
+    JS
+    stdout, stderr, status = Open3.capture3(
+      'node', '-e', harness, ci_repair_correlation_script,
+      JSON.generate('pullNumber' => 449, 'head' => 'a' * 40, 'cases' => cases)
+    )
+    assert status.success?, stderr
+    JSON.parse(stdout)
+  end
+
+  def test_ci_repair_correlation_requires_both_identity_parts
+    script = ci_repair_correlation_script
+    assert_includes script, 'if (!/^[0-9a-f]{40}$/.test(head))'
+    assert_includes script, 'if (!/^[A-Za-z0-9][A-Za-z0-9._:\-]{7,127}$/.test(requestedAttempt))'
+    assert_includes script, 'no verified attempt identity'
+    refute_includes script, '[...observations].reverse()',
+                    'correlation must never discover an attempt from the live HEAD'
+    assert_includes script, 'const attempt = requestedAttempt;'
+    assert_includes script, 'for (const item of observations) latest.set(item.attempt, item);'
+    assert_includes script, "item.status === 'claimed' || item.status === 'ambiguous'"
+  end
+
+  def test_ci_repair_correlation_failure_and_attempt_cases
+    other_head = 'b' * 40
+    results = run_ci_repair_correlation_cases(
+      [
+        {
+          'name' => 'read-failure',
+          'attempt' => 'ci-attempt-0001',
+          'paginateError' => 'pagination unavailable',
+        },
+        {
+          'name' => 'head-only',
+          'comments' => [ci_repair_receipt('ci-attempt-0001', 'claimed', comment_id: 1)],
+        },
+        {
+          'name' => 'advanced-head',
+          'attempt' => 'ci-attempt-0001',
+          'comments' => [ci_repair_receipt('ci-attempt-0002', 'claimed', comment_id: 2, head: other_head)],
+        },
+        {
+          'name' => 'different-active',
+          'attempt' => 'ci-attempt-0001',
+          'comments' => [ci_repair_receipt('ci-attempt-0002', 'claimed', comment_id: 2)],
+        },
+        {
+          'name' => 'rejected',
+          'attempt' => 'ci-attempt-0001',
+          'comments' => [
+            ci_repair_receipt('ci-attempt-0001', 'claimed', comment_id: 1),
+            ci_repair_receipt('ci-attempt-0001', 'rejected', comment_id: 2),
+          ],
+        },
+        {
+          'name' => 'missing',
+          'attempt' => 'ci-attempt-0001',
+        },
+        {
+          'name' => 'correlated',
+          'attempt' => 'ci-attempt-0001',
+          'comments' => [ci_repair_receipt('ci-attempt-0001', 'claimed', comment_id: 1)],
+        },
+      ]
+    )
+
+    read_failure = results.fetch('read-failure')
+    assert read_failure.fetch('ok'), read_failure
+    assert_empty read_failure.fetch('created')
+    assert(read_failure.fetch('warnings').any? { |warning| warning.include?('Could not read CI repair receipts') },
+           read_failure.fetch('warnings'))
+
+    # A correlation read failure returns from that step only: the admitted
+    # repair step must not be gated on it or the run would be silently lost.
+    workflow = yaml(File.join(ROOT, '.github/workflows/continuum-opencode.yml'))
+    repair = workflow.fetch('jobs').values
+                       .flat_map { |job| job['steps'] || [] }
+                       .find { |step| step['name'] == 'Run OpenCode' }
+    refute_nil repair
+    refute_match(/correlation/i, repair['if'].to_s,
+                 'a correlation-read failure must not gate the admitted repair')
+
+    head_only = results.fetch('head-only')
+    assert head_only.fetch('ok'), head_only
+    assert_empty head_only.fetch('created'),
+                 'a same-HEAD claim needs the dispatched attempt identity'
+    assert(head_only.fetch('notices').any? { |notice| notice.include?('no verified attempt identity') },
+           head_only.fetch('notices'))
+
+    advanced = results.fetch('advanced-head')
+    assert advanced.fetch('ok'), advanced
+    assert_empty advanced.fetch('created'),
+                 'an H1 run must never be correlated to an H2 claim'
+
+    different = results.fetch('different-active')
+    assert different.fetch('ok'), different
+    assert_empty different.fetch('created'),
+                 'a requested attempt must not borrow another active attempt'
+    assert(different.fetch('notices').any? { |notice| notice.include?('not an active claim (no receipt)') },
+           different.fetch('notices'))
+
+    rejected = results.fetch('rejected')
+    assert rejected.fetch('ok'), rejected
+    assert_empty rejected.fetch('created'), 'a spent attempt must stay spent'
+    assert(rejected.fetch('notices').any? { |notice| notice.include?('not an active claim (rejected)') },
+           rejected.fetch('notices'))
+
+    missing = results.fetch('missing')
+    assert missing.fetch('ok'), missing
+    assert_empty missing.fetch('created'), 'a missing attempt must not be invented'
+    assert(missing.fetch('notices').any? { |notice| notice.include?('not an active claim (no receipt)') },
+           missing.fetch('notices'))
+
+    correlated = results.fetch('correlated')
+    assert correlated.fetch('ok'), correlated
+    assert_equal 1, correlated.fetch('created').length, correlated.fetch('created')
+    body = correlated.fetch('created').first.fetch('body')
+    assert_includes body, 'attempt=ci-attempt-0001'
+    assert_includes body, 'status=dispatched'
+    assert_includes body, 'run=9001'
+  end
+
+  # A rotated TAP_PAT must not turn a legacy 204 receipt into an ignored
+  # lookalike, while an unrelated commenter must still be unable to suppress
+  # or authorize a repair. Exercise the real admission functions.
+  def test_ci_repair_admission_preserves_a_verified_legacy_writer
+    script = <<~'PY'
+      import json
+      import sys
+
+      sys.path.insert(0, 'src')
+      sys.path.insert(0, '.github/scripts')
+
+      from continuum.ci_repair_admission import run_proves_historical_receipt
+      from continuum.ci_repair_receipt import build_receipt, render_receipt
+      import ci_repair_admission as admission
+
+      repository = 'kodmial/continuum'
+      pull_number = 449
+      head_sha = 'a' * 40
+      attempt = 'ci-attempt-0001'
+      receipt = build_receipt(
+          repository=repository,
+          pull_number=pull_number,
+          head_sha=head_sha,
+          attempt_id=attempt,
+          status='dispatched',
+      )
+      legacy = {
+          'id': 900,
+          'display_title': 'OpenCode repair PR #449',
+          'head_sha': head_sha,
+          'actor': {'login': 'old-automation'},
+      }
+
+      result = {
+          'legacy': run_proves_historical_receipt(
+              legacy, receipt, author_login='old-automation'),
+          'wrong_pr': run_proves_historical_receipt(
+              dict(legacy, display_title='OpenCode repair PR #450'),
+              receipt, author_login='old-automation'),
+      }
+
+      class Inventory:
+          complete = True
+          reason = ''
+
+          def __init__(self, runs):
+              self.runs = runs
+
+      def comment(association):
+          return {
+              'body': render_receipt(receipt),
+              'author_association': association,
+              'user': {'login': 'old-automation'},
+          }
+
+      def writers(association, runs):
+          admission._workflow_runs = lambda *args, **kwargs: Inventory(runs)
+          return admission._historical_receipt_writers(
+              repository,
+              pull_number,
+              head_sha,
+              [comment(association)],
+              workflow='continuum-opencode.yml',
+              owner_login='',
+              trusted_logins=('github-actions[bot]',),
+          )
+
+      verified, verified_hold = writers('NONE', [legacy])
+      result['verified'] = list(verified)
+      result['verified_hold'] = verified_hold
+      _, member_hold = writers('MEMBER', [])
+      _, none_hold = writers('NONE', [])
+      result['member_hold'] = member_hold
+      result['none_hold'] = none_hold
+      print(json.dumps(result))
+    PY
+    stdout, stderr, status = Open3.capture3(
+      {
+        'PYTHONDONTWRITEBYTECODE' => '1',
+        'PYTHONPATH' => File.join(ROOT, 'src')
+      },
+      'python3', '-c', script, chdir: ROOT
+    )
+    assert status.success?, stderr
+    result = JSON.parse(stdout)
+    assert result.fetch('legacy'),
+           'a legacy unmarked repair run must prove its historical writer'
+    refute result.fetch('wrong_pr'),
+           'a different PR title must never prove the historical writer'
+    assert_equal ['old-automation'], result.fetch('verified')
+    refute result.fetch('verified_hold')
+    assert result.fetch('member_hold'),
+           'an unproved collaborator receipt must hold admission'
+    refute result.fetch('none_hold'),
+           'an unrelated commenter must not suppress a repair'
+  end
+
+  # The executor cannot repair a mutable branch tip. Every non-recovery ci-fix
+  # run must prove its admitted SHA before any agent step, and a missing or
+  # malformed SHA fails closed instead of skipping the binding.
+  def test_ci_repair_executor_fails_closed_without_the_admitted_head
+    workflow = yaml(File.join(ROOT, '.github/workflows/continuum-opencode.yml'))
+    steps = workflow.fetch('jobs').values.flat_map { |job| job['steps'] || [] }
+    binding_index = steps.index { |step| step['name'] == 'Bind CI repair to the admitted exact HEAD' }
+    refute_nil binding_index, 'the CI-repair HEAD binding step is missing'
+    binding = steps.fetch(binding_index)
+    condition = binding.fetch('if')
+    assert_includes condition, "inputs.mode == 'ci-fix'"
+    refute_includes condition, "inputs.ci_head_sha != ''",
+                    'an empty admitted SHA must fail closed, not skip the binding'
+    assert_includes condition, "steps.recovery_restore.outputs.resumed != 'true'"
+
+    body = binding.fetch('run')
+    assert_includes body, 'CI-repair dispatch carried no usable admitted HEAD SHA'
+    assert_includes body, 'exit 1'
+    assert_includes body, 'git checkout --force --detach "$admitted"'
+    assert_includes body, 'git rev-parse HEAD'
+
+    repair_index = steps.index { |step| step['name'] == 'Run OpenCode' }
+    refute_nil repair_index, 'the OpenCode execution step is missing'
+    assert_operator binding_index, :<, repair_index,
+                    'HEAD binding must run before any repair work'
+  end
+
+  # The self-dogfood caller must forward the packed identity exactly like the
+  # installed consumer stub, or its admitted run can never correlate or bind.
+  def test_self_dogfood_opencode_caller_forwards_ci_repair_identity
+    caller = yaml(File.join(ROOT, '.github/workflows/opencode.yml'))
+    inputs = events(caller).fetch('workflow_dispatch').fetch('inputs')
+    assert inputs.key?('ci_repair_identity'),
+           'the self-dogfood caller must declare the packed CI-repair identity'
+    refute inputs.key?('packaging_repair_label'),
+           'the packed identity replaces a presentation-only dispatch slot'
+    assert_match(/\[ci-attempt:\{1\}\]/,
+                 caller.fetch('run-name').to_s,
+                 'the dogfood run name must carry the correlation attempt marker')
+
+    with = caller.fetch('jobs').fetch('call').fetch('with')
+    %w[ci_attempt_id ci_head_sha].each do |key|
+      assert_includes with.fetch(key), "inputs.ci_repair_identity",
+                      "the self-dogfood caller must unpack #{key} from ci_repair_identity"
+    end
+    refute with.key?('packaging_repair_label'),
+           'the removed dispatch input must not be forwarded as an empty override'
+  end
+
   # ---------------------------------------------------------------- watchdog
 
   WATCHDOG = 'continuum-opencode-watchdog.yml'

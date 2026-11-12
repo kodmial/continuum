@@ -170,9 +170,11 @@ APPROVED_446_OPENCODE_SHA256 = (
 # its exact HEAD, treats correlation read failures as warnings, folds attempt
 # state to its latest observation, and requires a usable run title before an
 # inventory may prove that no repair run exists. Unrelated drift still fails
-# closed.
+# closed. This repair additionally binds every ci-fix run to its admitted HEAD
+# (an empty identity fails closed) and requires the dispatched attempt identity
+# before correlation may record a receipt.
 APPROVED_449_OPENCODE_SHA256 = (
-    "7220448a6652eaafd73a76847428ac1133a59332c8379be33bee2b79c5b08596"
+    "a5a9b476a84db8ed0d2f12be32d09e57f357c43288bdee920c1030d9b3d65a01"
 )
 APPROVED_446_CALLER_SHA256 = (
     "b7f3df118bc436526f48443b8f068372204073eb134c98e4a1543d025f314686"
@@ -182,7 +184,7 @@ APPROVED_446_CALLER_SHA256 = (
 # preserves the exact workflow_dispatch path and the no-auto-merge hold.
 # This pins the full file, not a permissive allowlist for workflow drift.
 APPROVED_350_SELF_CALLER_SHA256 = (
-    "9437c10318dc12f635069443ca9dc7c7a33f23e869f2dbc5fc7ae26ccf6f1eae"
+    "c676f9c9781ac5d4f083188d47680ec8f5fa1c7dfac106912e9d452f77fc1c0a"
 )
 APPROVED_350_CALLER_SHA256 = (
     "a595362c8353001d5f7af138ab848df8fac3a6c924d5d337f6819084f79b3938"

@@ -53,6 +53,7 @@ from continuum.ci_repair_admission import (  # noqa: E402
     normalize_comment_pages,
     normalize_run_pages,
     plan_admission,
+    run_actor_logins,
     run_proves_historical_receipt,
     select_correlated_run,
     unexpected_dispatch_inputs,
@@ -81,6 +82,11 @@ from continuum.ci_repair_receipt import (  # noqa: E402
 
 _HTTP_STATUS_RE = re.compile(rb"^HTTP/\S+\s+([0-9]{3})\b", re.MULTILINE)
 _HEADER_SEPARATOR_RE = re.compile(rb"\r?\n\r?\n", re.MULTILINE)
+# A rotated TAP_PAT can leave receipts authored by a former collaborator. If
+# no run proves that writer, admission must hold instead of treating the
+# receipt as absent; an unrelated commenter without repository write access
+# can neither authorize nor suppress a repair.
+_HISTORICAL_WRITER_ASSOCIATIONS = frozenset({"MEMBER", "COLLABORATOR"})
 
 
 class GhFailure(RuntimeError):
@@ -247,13 +253,12 @@ def _dispatch(
     rejects the request with HTTP 422 before creating a run. That is a
     *definite* rejection, so retrying once without that input is safe; the
     engine can still discover the claim from the PR receipt and publish its
-    own dispatched receipt.
+    own dispatched receipt. The executor refuses that legacy run before any
+    repair work, because it carries no admitted HEAD to bind.
 
-    Continuum's own ``opencode.yml`` caller also uses this fallback: it is at
-    GitHub's 25-input ``workflow_dispatch`` ceiling, so it cannot declare the
-    packed identity without dropping an existing input. Its run is still
-    correlated from the run ID in the ``return_run_details`` response (and by
-    the engine's receipt); only the run-name marker is unavailable there.
+    Continuum's checked-in ``opencode.yml`` caller forwards
+    ``ci_repair_identity``, so its run is correlated by the run-name marker
+    and bound to the exact admitted HEAD.
     """
 
     base = [
@@ -401,7 +406,7 @@ def _historical_receipt_writers(
     account published must stay authoritative, or the exact HEAD they already
     spent looks unused and admission dispatches it a second time. A receipt is
     only re-trusted here when a run exists for the same exact HEAD, carries
-    this attempt's run-name marker (or, for a receipt with its proved run ID,
+    this attempt's run-name marker (or, for a legacy caller without the marker,
     the canonical legacy repair title) and was created by the same account.
     ``claimed``, ``ambiguous``, and run-detail-less ``dispatched`` receipts are
     included because outcome persistence can fail after an accepted dispatch.
@@ -409,7 +414,8 @@ def _historical_receipt_writers(
     ignored exactly as before.
 
     The second result reports that history exists which cannot be verified
-    because the run inventory failed or is incomplete. The caller must hold in
+    because the run inventory failed or is incomplete, or because a plausible
+    historical writer's receipt has no proving run. The caller must hold in
     that case instead of treating those receipts as absent.
     """
 
@@ -441,7 +447,7 @@ def _historical_receipt_writers(
                 and receipt.head_sha == head_sha
                 and receipt.status != STATUS_REJECTED
             ):
-                candidates.append((author, receipt))
+                candidates.append((author, receipt, comment))
     if not candidates:
         return (), False
 
@@ -462,8 +468,9 @@ def _historical_receipt_writers(
         return (), True
 
     verified = []
+    unmatched = []
     unverifiable = False
-    for author, receipt in candidates:
+    for author, receipt, comment in candidates:
         matches = [
             run
             for run in inventory.runs
@@ -477,9 +484,32 @@ def _historical_receipt_writers(
             unverifiable = True
             continue
         if not matches:
+            unmatched.append((author, comment))
             continue
         if author not in verified:
             verified.append(author)
+
+    # A previously authoritative writer can be proved by any one of its
+    # receipts. An unproved receipt for that same writer adds no new risk. Only
+    # an unproved receipt from a writer with no other proof can hide a spent
+    # attempt, so hold when its author had repository write access or GitHub
+    # shows a same-HEAD run created by that account. An unrelated commenter
+    # with neither cannot suppress a repair.
+    for author, comment in unmatched:
+        if author in verified:
+            continue
+        association = str(comment.get("author_association") or "").strip().upper()
+        author_has_same_head_run = any(
+            author in run_actor_logins(run)
+            and str(run.get("head_sha") or "").strip().lower() == head_sha
+            for run in inventory.runs
+        )
+        if (
+            association in _HISTORICAL_WRITER_ASSOCIATIONS
+            or author_has_same_head_run
+        ):
+            unverifiable = True
+            break
     return tuple(verified), unverifiable
 
 

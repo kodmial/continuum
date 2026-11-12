@@ -6,8 +6,10 @@ production script from ``continuum-opencode.yml`` and execute it under Node
 with a fake Octokit, so the shipped behavior is observed rather than copied:
 
 * a comment-pagination failure warns and leaves the admitted repair running;
-* attempt selection uses each attempt's latest reconciled state, for both a
-  supplied ``ci_attempt_id`` and a discovered active claim.
+* attempt selection requires the dispatched attempt identity, folds each
+  attempt's latest reconciled state, and never falls back to the live HEAD;
+* a requested attempt is correlated only when its latest state is active, and
+  a queued run for an older HEAD cannot be attributed to a newer claim.
 """
 
 from __future__ import annotations
@@ -153,7 +155,13 @@ class CiRepairCorrelationStepTests(unittest.TestCase):
 
     def test_pagination_failure_warns_without_writing_or_failing(self):
         result = self.run_cases(
-            [{"name": "read-failure", "paginateError": "pagination unavailable"}]
+            [
+                {
+                    "name": "read-failure",
+                    "requestedAttempt": "ci-attempt-0001",
+                    "paginateError": "pagination unavailable",
+                }
+            ]
         )["read-failure"]
         self.assertTrue(result["ok"], result)
         self.assertEqual(result["created"], [])
@@ -165,22 +173,53 @@ class CiRepairCorrelationStepTests(unittest.TestCase):
             result["warnings"],
         )
 
-    def test_discovered_attempt_uses_latest_rejected_state(self):
+    def test_head_only_identity_never_selects_an_active_claim(self):
         result = self.run_cases(
             [
                 {
-                    "name": "rejected",
+                    "name": "head-only",
                     "comments": [
                         receipt("ci-attempt-0001", "claimed", comment_id=1),
-                        receipt("ci-attempt-0001", "rejected", comment_id=2),
                     ],
                 }
             ]
-        )["rejected"]
+        )["head-only"]
         self.assertTrue(result["ok"], result)
         self.assertEqual(result["created"], [])
         self.assertTrue(
-            any("No active exact-HEAD CI repair claim" in notice for notice in result["notices"]),
+            any(
+                "no verified attempt identity" in notice
+                for notice in result["notices"]
+            ),
+            result["notices"],
+        )
+
+    def test_an_older_head_run_is_never_correlated_to_a_newer_claim(self):
+        other_head = "b" * 40
+        result = self.run_cases(
+            [
+                {
+                    "name": "advanced",
+                    "requestedAttempt": "ci-attempt-0001",
+                    "head": HEAD,
+                    "comments": [
+                        receipt(
+                            "ci-attempt-0002",
+                            "claimed",
+                            comment_id=2,
+                            head=other_head,
+                        ),
+                    ],
+                }
+            ]
+        )["advanced"]
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(result["created"], [])
+        self.assertTrue(
+            any(
+                "not an active claim (no receipt)" in notice
+                for notice in result["notices"]
+            ),
             result["notices"],
         )
 
@@ -224,11 +263,34 @@ class CiRepairCorrelationStepTests(unittest.TestCase):
             result["notices"],
         )
 
+    def test_requested_attempt_ignores_a_different_active_attempt(self):
+        result = self.run_cases(
+            [
+                {
+                    "name": "different-active",
+                    "requestedAttempt": "ci-attempt-0001",
+                    "comments": [
+                        receipt("ci-attempt-0002", "claimed", comment_id=2),
+                    ],
+                }
+            ]
+        )["different-active"]
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(result["created"], [])
+        self.assertTrue(
+            any(
+                "not an active claim (no receipt)" in notice
+                for notice in result["notices"]
+            ),
+            result["notices"],
+        )
+
     def test_latest_claim_wins_after_an_earlier_attempt_is_rejected(self):
         result = self.run_cases(
             [
                 {
                     "name": "latest-claim",
+                    "requestedAttempt": "ci-attempt-0002",
                     "comments": [
                         receipt("ci-attempt-0001", "claimed", comment_id=1),
                         receipt("ci-attempt-0001", "rejected", comment_id=2),

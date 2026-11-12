@@ -500,7 +500,11 @@ class VerifiedHistoricalWriterTests(unittest.TestCase):
                     )
                 )
 
-    def test_an_unrun_receipt_needs_the_attempt_marker_not_a_legacy_title(self):
+    def test_a_legacy_title_proves_a_receipt_without_a_run_id(self):
+        # A legacy caller has no attempt marker, so an accepted 204 may leave
+        # only a claimed, ambiguous, or run-detail-less dispatched receipt.
+        # The canonical title is still bound to the same actor, exact HEAD,
+        # and PR, so token rotation must not turn it into an ignored lookalike.
         run = {
             "id": 900,
             "display_title": "OpenCode repair PR #{}".format(PR),
@@ -509,7 +513,7 @@ class VerifiedHistoricalWriterTests(unittest.TestCase):
         }
         for status in (STATUS_CLAIMED, STATUS_AMBIGUOUS, STATUS_DISPATCHED):
             with self.subTest(status=status):
-                self.assertFalse(
+                self.assertTrue(
                     run_proves_historical_receipt(
                         run,
                         receipt(status=status),
@@ -521,6 +525,30 @@ class VerifiedHistoricalWriterTests(unittest.TestCase):
                 run, self.dispatched(), author_login="old-automation"
             )
         )
+
+    def test_a_legacy_title_for_another_pr_or_actor_never_proves_a_receipt(self):
+        run = {
+            "id": 900,
+            "display_title": "OpenCode repair PR #{}".format(PR),
+            "head_sha": HEAD,
+            "actor": {"login": "old-automation"},
+        }
+        wrong_pr = dict(
+            run, display_title="OpenCode repair PR #{}".format(PR + 1)
+        )
+        wrong_actor = dict(run, actor={"login": "somebody-else"})
+        for name, candidate in (
+            ("another PR", wrong_pr),
+            ("another actor", wrong_actor),
+        ):
+            with self.subTest(case=name):
+                self.assertFalse(
+                    run_proves_historical_receipt(
+                        candidate,
+                        receipt(status=STATUS_DISPATCHED),
+                        author_login="old-automation",
+                    )
+                )
 
     def test_rejected_receipts_never_extend_historical_trust(self):
         self.assertFalse(

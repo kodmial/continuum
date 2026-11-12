@@ -184,6 +184,7 @@ def trusted_receipt(
     status="claimed",
     author=None,
     run_id=None,
+    author_association="NONE",
 ):
     marker = (
         "<!-- continuum-ci-repair-receipt v=1 repo={} pr={} head={} "
@@ -199,7 +200,7 @@ def trusted_receipt(
         "body": marker,
         "created_at": "2026-11-12T00:00:00Z",
         "updated_at": "2026-11-12T00:00:00Z",
-        "author_association": "NONE",
+        "author_association": author_association,
         "user": {"login": author or "github-actions[bot]"},
     }
 
@@ -366,6 +367,118 @@ class AdmissionExecutableTests(unittest.TestCase):
         self.assert_rotated_writer_receipt_is_not_redispatched(
             status="dispatched"
         )
+
+    def test_a_legacy_unmarked_run_keeps_the_unrun_dispatch_authority(self):
+        # A legacy caller produces no attempt marker, and a 204 response may
+        # leave the dispatched receipt without a run ID. Token rotation must
+        # still recognize that writer from GitHub's canonical repair run.
+        attempt = "ci-old-account-0001"
+        self.write_comments(
+            [
+                trusted_receipt(
+                    attempt=attempt,
+                    status="dispatched",
+                    author="old-automation",
+                )
+            ]
+        )
+        self.write_pr(head=HEAD, comments=1)
+        self.write_runs(
+            [
+                {
+                    "id": 900,
+                    "display_title": "OpenCode repair PR #{}".format(PR),
+                    "status": "queued",
+                    "conclusion": "",
+                    "html_url": "https://github.com/{}/actions/runs/900".format(
+                        REPO.lower()
+                    ),
+                    "created_at": "2026-11-12T00:00:00Z",
+                    "head_sha": HEAD,
+                    "actor": {"login": "old-automation"},
+                }
+            ]
+        )
+        completed = self.run_admission()
+        self.assertEqual(0, len(self.dispatches()))
+        self.assertIn("verified by its exact-HEAD dispatch run", completed.stdout)
+
+    def test_a_plausible_historical_writer_without_a_proving_run_holds(self):
+        # A collaborator-owned previous TAP_PAT leaves receipts that look
+        # authoritative but have no run to prove them. Admission must hold
+        # instead of treating the spent exact HEAD as unused.
+        self.write_comments(
+            [
+                trusted_receipt(
+                    attempt="ci-old-account-0001",
+                    status="claimed",
+                    author="old-automation",
+                    author_association="MEMBER",
+                )
+            ]
+        )
+        self.write_pr(head=HEAD, comments=1)
+        self.write_runs([])
+        completed = self.run_admission()
+        self.assertEqual(0, len(self.dispatches()))
+        self.assertEqual([], self.posts())
+        self.assertIn("cannot be verified", completed.stdout)
+
+    def test_a_same_head_run_actor_without_a_proof_holds_admission(self):
+        # Even when GitHub reports no repository association, an account that
+        # created a run for this exact HEAD is a plausible historical writer.
+        # Its unproved receipt must hold, not authorize or suppress a repair.
+        self.write_comments(
+            [
+                trusted_receipt(
+                    attempt="ci-old-account-0001",
+                    status="claimed",
+                    author="old-automation",
+                )
+            ]
+        )
+        self.write_pr(head=HEAD, comments=1)
+        self.write_runs(
+            [
+                {
+                    "id": 901,
+                    "display_title": "OpenCode repair PR #{} [ci-attempt:{}]".format(
+                        PR, "ci-other-0001"
+                    ),
+                    "status": "queued",
+                    "conclusion": "",
+                    "html_url": "https://github.com/{}/actions/runs/901".format(
+                        REPO.lower()
+                    ),
+                    "created_at": "2026-11-12T00:00:00Z",
+                    "head_sha": HEAD,
+                    "actor": {"login": "old-automation"},
+                }
+            ]
+        )
+        completed = self.run_admission()
+        self.assertEqual(0, len(self.dispatches()))
+        self.assertEqual([], self.posts())
+        self.assertIn("cannot be verified", completed.stdout)
+
+    def test_an_unrelated_none_commenter_cannot_suppress_a_repair(self):
+        # A lookalike receipt from an account with no repository write access
+        # and no same-HEAD run is not a plausible historical writer, so it
+        # must not turn an unused exact HEAD into a permanent hold.
+        self.write_comments(
+            [
+                trusted_receipt(
+                    attempt="ci-lookalike-0001",
+                    status="claimed",
+                    author="passer-by",
+                    author_association="NONE",
+                )
+            ]
+        )
+        self.write_pr(head=HEAD, comments=1)
+        self.write_runs([])
+        self.run_admission()
+        self.assertEqual(1, len(self.dispatches()))
 
     def test_unverifiable_historical_receipt_history_holds_without_claiming(self):
         self.write_comments(

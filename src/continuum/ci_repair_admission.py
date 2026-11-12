@@ -801,9 +801,11 @@ def correlated_run_url(repository: Any, run: Mapping[str, Any]) -> str:
     return _canonical_run_url(str(repository).strip().lower(), number)
 
 
-def _run_actor_logins(run: Mapping[str, Any]) -> frozenset:
+def run_actor_logins(run: Any) -> frozenset:
     """Return the normalized logins GitHub reports as a run's actors."""
 
+    if not isinstance(run, Mapping):
+        return frozenset()
     logins = set()
     for key in ("actor", "triggering_actor"):
         actor = run.get(key)
@@ -831,12 +833,11 @@ def run_proves_historical_receipt(
     attempt marker and actor rather than by a run ID that was never stored.
 
     The receipt is only re-trusted when a run exists for the same exact HEAD,
-    was created by the same account, and carries this attempt's run-name
-    marker. The canonical legacy repair title is only sufficient together
-    with the receipt's proved run ID, because without either an ID or a marker
-    it cannot be tied to this attempt. The comment author alone is never
-    sufficient, so an unrelated commenter cannot borrow a run to suppress or
-    authorize a repair.
+    was created by the same account, and either carries this attempt's
+    run-name marker or, for a legacy caller that has no identity input, uses
+    the canonical unmarked repair title for the same PR. The comment author
+    alone is never sufficient, so an unrelated commenter cannot borrow a run
+    to suppress or authorize a repair.
     """
 
     if not isinstance(run, Mapping) or not isinstance(receipt, RepairReceipt):
@@ -856,7 +857,7 @@ def run_proves_historical_receipt(
     if str(run.get("head_sha") or "").strip().lower() != receipt.head_sha:
         return False
     author = str(author_login or "").strip().lower()
-    if not author or author not in _run_actor_logins(run):
+    if not author or author not in run_actor_logins(run):
         return False
     title = run.get("display_title")
     if not isinstance(title, str):
@@ -864,8 +865,10 @@ def run_proves_historical_receipt(
     marker = _ATTEMPT_RUN_MARKER_RE.search(title)
     if marker:
         return marker.group("attempt") == receipt.attempt_id
-    if receipt.run_id is None:
-        return False
+    # Legacy callers predate the attempt marker. Their canonical repair title
+    # is still bound to this action (same actor, same exact HEAD, same PR), so
+    # it proves the historical writer even when a legacy 204 persisted no run
+    # ID. A different PR title or another account never matches.
     legacy = _UNMARKED_REPAIR_TITLE_RE.match(title)
     return bool(legacy) and int(legacy.group(1)) == receipt.pull_number
 
@@ -1124,6 +1127,7 @@ __all__ = [
     "classify_dispatch_response",
     "select_correlated_run",
     "correlated_run_url",
+    "run_actor_logins",
     "run_proves_historical_receipt",
     "run_proves_dispatched_receipt",
     "has_unattributed_repair_run",
