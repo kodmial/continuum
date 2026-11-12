@@ -761,5 +761,125 @@ assert.equal(isVerificationOnlyUnresolved(
         self.assertNotIn("kodmial/nanodictate", self.workflow)
 
 
+class CodeRabbitChatBudgetRegressionTests(unittest.TestCase):
+    """NanoDictate-style canonical owner: serialize inline verification."""
+
+    @staticmethod
+    def _workflow():
+        root = Path(__file__).resolve().parents[1]
+        return (
+            root / ".github" / "workflows" / "continuum-auto-merge.yml"
+        ).read_text(encoding="utf-8")
+
+    def test_real_chat_reply_countdown_and_repository_shared_serialization(self):
+        import shutil
+        import subprocess
+
+        if not shutil.which("node"):
+            self.skipTest("Node.js unavailable")
+        source = self._workflow()
+        begin = source.index("          // NanoDictate uses this single canonical")
+        end = source.index(
+            "          function shouldRecheckCodeRabbitAfterCi(", begin
+        )
+        helper = source[begin:end]
+        harness = r"""
+const assert = require('node:assert/strict');
+const owner = 'kodmial', repo = 'continuum';
+const pulls = [{number:448}, {number:449}];
+const core = {info: () => {}, warning: () => {}};
+const rows = {
+  448: [{
+    id: 4547727662, created_at: '2026-11-12T07:53:15Z',
+    user: {login:'coderabbitai[bot]'},
+    body: '<!-- coderabbit-ai-generated:v1 -->\n' +
+      '### Rate Limit Exceeded\n' +
+      '@kodmial have exceeded the limit for the number of chat messages per hour. ' +
+      'Please wait **14 minutes and 56 seconds** before sending another message.'
+  }],
+  449: [{
+    id: 4547737581, created_at: '2026-11-12T07:54:32Z',
+    user: {login:'coderabbitai[bot]'},
+    body: '### Rate Limit Exceeded\n' +
+      '@kodmial have exceeded the limit for the number of chat messages per hour. ' +
+      'Please wait **13 minutes and 39 seconds** before sending another message.'
+  }]
+};
+const client = {rest:{pulls:{
+  get: async ({pull_number}) => ({data:{review_comments:rows[pull_number].length}}),
+  listReviewComments: async ({pull_number}) => ({data:rows[pull_number]})
+}}};
+const withReadFallback = callback => callback(client);
+const RealDate = Date;
+let now = Date.parse('2026-11-12T08:00:00Z');
+class Clock extends RealDate {static now() {return now;}}
+global.Date = Clock;
+""" + helper + r"""
+(async () => {
+  assert.equal(codeRabbitChatLimitNotBefore(rows[448][0]),
+    RealDate.parse('2026-11-12T08:08:41Z'));
+  assert.equal(codeRabbitChatLimitNotBefore(rows[449][0]),
+    RealDate.parse('2026-11-12T08:08:41Z'));
+  const spoof = {...rows[448][0], user:{login:'someone-else'}};
+  assert.equal(codeRabbitChatLimitNotBefore(spoof), null);
+  const reviewQuota = {...rows[448][0],body:'Review rate limited. Next included review available in 41 minutes.'};
+  assert.equal(codeRabbitChatLimitNotBefore(reviewQuota), null);
+  assert.equal(await allowOneCodeRabbitChatRequest(), false,
+    'no request before provider deadline');
+  now = RealDate.parse('2026-11-12T08:08:41Z');
+  assert.equal(await allowOneCodeRabbitChatRequest(), true,
+    'one legal request after latest shared bot deadline');
+  assert.equal(await allowOneCodeRabbitChatRequest(), false,
+    'second PR/thread must not send in the same wake');
+  codeRabbitChatSentThisPass = false;
+  codeRabbitChatNextAllowedAt = null;
+  rows[448] = [{
+    id: 9000, created_at:'2026-11-12T08:09:00Z',
+    author_association:'OWNER',
+    user:{login:'kodmial'},
+    body:'<!-- auto-merge-coderabbit-verification finding=5 head=' +
+      'a'.repeat(40) + ' -->\n' +
+      '<!-- continuum-origin role=continuum component=auto-merge -->\n' +
+      '@coderabbitai Re-check this unresolved original finding'
+  }];
+  rows[449] = [];
+  now = RealDate.parse('2026-11-12T08:11:00Z');
+  assert.equal(await allowOneCodeRabbitChatRequest(), false,
+    'persistent prior verification across PRs must enforce min gap');
+  now = RealDate.parse('2026-11-12T08:14:00Z');
+  assert.equal(await allowOneCodeRabbitChatRequest(), true,
+    'five-minute gap expires without needing a new issue or lock label');
+  console.log('coderabbit-chat-budget PASS');
+})().catch(e => {console.error(e); process.exitCode = 1;});
+"""
+        completed = subprocess.run(
+            ["node", "-e", harness], capture_output=True,
+            text=True, timeout=30, check=False,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertIn("coderabbit-chat-budget PASS", completed.stdout)
+
+    def test_both_chat_mutations_are_guarded_and_quota_is_not_a_repair(self):
+        source = self._workflow()
+        start = source.index("          async function requestCodeRabbitThreadVerification(")
+        end = source.index("          async function cancelObsoleteRuns(", start)
+        scope = source[start:end]
+        self.assertEqual(
+            scope.count("await allowOneCodeRabbitChatRequest()"), 2,
+            "both post-CI and initial CodeRabbit replies must pass the budget",
+        )
+        self.assertIn("!isCodeRabbitChatLimitReply(comment)", scope)
+        self.assertIn("codeRabbitChatSentThisPass = true", source)
+        self.assertIn("for (const listed of pulls)", source)
+        self.assertIn("codeRabbitChatLimitNotBefore(comment)", source)
+        unresolved = (
+            Path(__file__).resolve().parents[1] /
+            ".github/workflows/continuum-coderabbit-unresolved.yml"
+        ).read_text(encoding="utf-8")
+        self.assertIn("number of chat messages per hour", unresolved)
+        self.assertIn("###", source)
+        self.assertIn("Review rate limited|Review limit reached", source)
+
+
 if __name__ == "__main__":
     unittest.main()
