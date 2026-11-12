@@ -90,6 +90,136 @@ jobs:
             const autoMergeVerificationPattern =
               /<!-- auto-merge-coderabbit-verification finding=(\d+) head=([0-9a-f]{40}) -->/;
 
+            // continuum-coderabbit-chat-quota:start
+            const CODERABBIT_BOT_LOGIN = 'coderabbitai[bot]';
+            const CHAT_QUOTA_FALLBACK_MS = 65 * 60_000;
+            const CHAT_RETRY_SAFETY_PADDING_MS = 30_000;
+            const CHAT_RATE_LIMIT_HEADING_RE =
+              /^[ \t]{0,3}#{1,6}[ \t]*Rate[ \t]+Limit[ \t]+Exceeded[ \t]*\r?$/im;
+            const CHAT_RATE_LIMIT_PROSE_RE =
+              /^[ \t]*(?!>)[^\n]*\bchat messages? per hour\b[^\n]*$/im;
+            const CHAT_COUNTDOWN_RE =
+              /please\s+wait\s+\*{0,2}\s*((?:less\s+than\s+(?:a|one)\s+minute)|[0-9][^\n*]*?)\s*\*{0,2}\s+before\s+sending\s+another\s+message/i;
+
+            function isTrustedCodeRabbitAuthor(login) {
+              return String(login || '').trim().toLowerCase() === CODERABBIT_BOT_LOGIN;
+            }
+
+            function parseChatDurationMs(text = '') {
+              if (/less than\s+(?:a|one)\s+minute/i.test(text)) return 60_000;
+              let totalMs = 0;
+              let found = false;
+              for (const part of String(text).matchAll(
+                /(\d+)\s*(hours?|hrs?|minutes?|mins?|seconds?|secs?)/gi
+              )) {
+                found = true;
+                const value = Number(part[1]);
+                const unit = part[2].toLowerCase();
+                if (unit.startsWith('hour') || unit.startsWith('hr')) {
+                  totalMs += value * 60 * 60_000;
+                } else if (unit.startsWith('minute') || unit.startsWith('min')) {
+                  totalMs += value * 60_000;
+                } else {
+                  totalMs += value * 1_000;
+                }
+              }
+              return found ? totalMs : null;
+            }
+
+            function parseChatQuotaDelayMs(body = '') {
+              const text = String(body || '');
+              if (!CHAT_RATE_LIMIT_HEADING_RE.test(text) &&
+                  !CHAT_RATE_LIMIT_PROSE_RE.test(text)) {
+                return null;
+              }
+              const match = text.match(CHAT_COUNTDOWN_RE);
+              if (!match) return CHAT_QUOTA_FALLBACK_MS;
+              const parsed = parseChatDurationMs(match[1]);
+              return parsed === null ? CHAT_QUOTA_FALLBACK_MS : parsed;
+            }
+
+            function parseReviewQuotaDelayMs(body = '') {
+              const text = String(body || '');
+              if (!/Review rate limited|Review limit reached/i.test(text)) {
+                return null;
+              }
+              const patterns = [
+                /next\s+(?:included\s+)?review\b[^\n<.]{0,120}?\bavailable\b[^\n<.]{0,40}?\b(?:in|after)\s+([^\n<.]+)/i,
+                /(?:try|retry)\s+again\b[^\n<.]{0,40}?\b(?:in|after)\s+([^\n<.]+)/i,
+              ];
+              for (const pattern of patterns) {
+                const match = text.match(pattern);
+                if (!match) continue;
+                const parsed = parseChatDurationMs(match[1]);
+                if (parsed !== null) return parsed;
+              }
+              return 65 * 60_000;
+            }
+
+            function classifyCodeRabbitReply(reply = {}) {
+              const login = String(
+                reply.user?.login || reply.author?.login || ''
+              );
+              if (login && !isTrustedCodeRabbitAuthor(login)) {
+                return { kind: 'untrusted', delayMs: null };
+              }
+              const chatDelayMs = parseChatQuotaDelayMs(reply.body || '');
+              if (chatDelayMs !== null) {
+                return { kind: 'chat_rate_limit', delayMs: chatDelayMs };
+              }
+              const reviewDelayMs = parseReviewQuotaDelayMs(reply.body || '');
+              if (reviewDelayMs !== null) {
+                return { kind: 'review_rate_limit', delayMs: reviewDelayMs };
+              }
+              return { kind: 'verdict', delayMs: null };
+            }
+
+            function isCodeRabbitQuotaReply(reply = {}) {
+              const kind = classifyCodeRabbitReply(reply).kind;
+              return kind === 'chat_rate_limit' || kind === 'review_rate_limit';
+            }
+
+            function chatQuotaNotBeforeMs(reply = {}) {
+              const delayMs = parseChatQuotaDelayMs(reply.body || '');
+              if (delayMs === null) return null;
+              const createdAt = Date.parse(reply.created_at || '');
+              if (!Number.isFinite(createdAt)) return null;
+              return createdAt + delayMs + CHAT_RETRY_SAFETY_PADDING_MS;
+            }
+
+            function latestChatQuotaReply(comments, rootCommentId) {
+              return (comments || [])
+                .filter(comment =>
+                  (rootCommentId === undefined || rootCommentId === null ||
+                   comment.in_reply_to_id === rootCommentId) &&
+                  isTrustedCodeRabbitAuthor(
+                    comment.user?.login || comment.author?.login
+                  ) &&
+                  classifyCodeRabbitReply(comment).kind === 'chat_rate_limit'
+                )
+                .sort((a, b) => Number(b.id) - Number(a.id))[0] || null;
+            }
+
+            function chatQuotaRetryMarker(findingId, headSha, limitedCommentId) {
+              return '<!-- auto-merge-coderabbit-chat-quota-retry ' +
+                `finding=${findingId} head=${String(headSha || '').toLowerCase()} ` +
+                `limited=${limitedCommentId} -->`;
+            }
+
+            function chatQuotaRetryAcknowledged(
+              comments, findingId, headSha, limitedCommentId, rootCommentId
+            ) {
+              const marker = chatQuotaRetryMarker(
+                findingId, headSha, limitedCommentId
+              );
+              return (comments || []).some(comment =>
+                (rootCommentId === undefined || rootCommentId === null ||
+                 comment.in_reply_to_id === rootCommentId) &&
+                String(comment.body || '').includes(marker)
+              );
+            }
+            // continuum-coderabbit-chat-quota:end
+
             // Bounded newest-first scan (#254): batching only needs the
             // latest verification per finding and replies newer than it,
             // so ten newest-first pages bound the cost. The review-comment
@@ -295,7 +425,7 @@ jobs:
                     comment.user?.login === 'coderabbitai[bot]' &&
                     getRootId(comment) === verification.findingId &&
                     comment.id > verification.comment.id &&
-                    !/Review rate limited|Review limit reached/i.test(comment.body ?? '')
+                    !isCodeRabbitQuotaReply(comment)
                 )
                 .sort((a, b) => b.id - a.id);
 

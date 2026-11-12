@@ -151,6 +151,8 @@
       "summary": "Batches unresolved CodeRabbit findings and dispatches one canonical OpenCode repair.",
       "canonical_policy": [
         "continuum.coderabbit_adapter.unresolved_blocking",
+        "continuum.coderabbit_adapter.classify_coderabbit_reply",
+        "continuum.coderabbit_adapter.is_provider_quota_reply",
         "workflow:.github/workflows/continuum-coderabbit-unresolved.yml#retry-unresolved"
       ],
       "state_inputs": [
