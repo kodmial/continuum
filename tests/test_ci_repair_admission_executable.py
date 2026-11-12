@@ -36,8 +36,12 @@ NOW = "2026-11-12T01:00:00Z"
 LEGACY_WRITERS_VARIABLE = "CONTINUUM_CI_REPAIR_WRITERS"
 WRITER_VARIABLE_PREFIX = "CONTINUUM_CI_REPAIR_WRITER_"
 WRITERS_BASELINE_VARIABLE = "CONTINUUM_CI_REPAIR_WRITERS_BASELINE"
+#: Marker emitted only by the current receipt writer. Legacy fixtures omit it
+#: to model an older controller still running or pinned across migration.
+WRITER_FORMAT_MARKER = "<!-- continuum-ci-repair-writer-format v=2 -->"
 #: An already-established registry baseline. Comment fixtures are created
-#: after it, so they are covered by the durable writer registry.
+#: after it, so current-format fixtures are post-baseline lookalikes while
+#: legacy fixtures exercise migration behaviour.
 WRITERS_BASELINE = "2026-11-11T00:00:00Z"
 
 FAKE_GH = r'''#!/usr/bin/env python3
@@ -245,6 +249,7 @@ def trusted_receipt(
     author=None,
     run_id=None,
     author_association="NONE",
+    current_format=False,
 ):
     marker = (
         "<!-- continuum-ci-repair-receipt v=1 repo={} pr={} head={} "
@@ -255,6 +260,8 @@ def trusted_receipt(
             run_id, REPO.lower(), run_id
         )
     marker += " -->"
+    if current_format:
+        marker += "\n" + WRITER_FORMAT_MARKER
     return {
         "id": 1,
         "body": marker,
@@ -713,6 +720,61 @@ class AdmissionExecutableTests(unittest.TestCase):
         self.assertEqual([], self.posts())
         self.assertIn("cannot be verified", completed.stdout)
 
+    def test_a_post_baseline_legacy_claim_from_an_overlapping_controller_holds(self):
+        # A new controller can establish the baseline while an older controller
+        # for another exact HEAD is still running (or remains pinned). That
+        # older controller only writes legacy-format receipts, after the
+        # baseline and without registering its token account. After rotation its
+        # run may be deleted, so the new controller must hold instead of
+        # treating the spent HEAD as unused.
+        self.write_comments(
+            [
+                trusted_receipt(
+                    attempt="ci-overlap-0001",
+                    status="claimed",
+                    author="old-automation",
+                    author_association="NONE",
+                )
+            ]
+        )
+        self.write_pr(head=HEAD, comments=1)
+        self.write_runs([])
+        completed = self.run_admission()
+        self.assertEqual(0, len(self.dispatches()))
+        self.assertEqual([], self.posts())
+        self.assertIn("cannot be verified", completed.stdout)
+
+        # A later pass must keep the same legacy receipt unverifiable rather
+        # than reclassify it as a post-baseline lookalike.
+        completed = self.run_admission(
+            extra_args=("--now", "2026-11-12T00:10:00Z")
+        )
+        self.assertEqual(0, len(self.dispatches()))
+        self.assertEqual([], self.posts())
+        self.assertIn("cannot be verified", completed.stdout)
+
+    def test_a_post_baseline_legacy_dispatch_from_an_overlapping_controller_holds(self):
+        # The older overlapping controller can also have dispatched before
+        # writing its receipt. That receipt remains legacy format and must hold
+        # even though its creation time is after the established baseline.
+        self.write_comments(
+            [
+                trusted_receipt(
+                    attempt="ci-overlap-0001",
+                    status="dispatched",
+                    author="old-automation",
+                    run_id=900,
+                    author_association="NONE",
+                )
+            ]
+        )
+        self.write_pr(head=HEAD, comments=1)
+        self.write_runs([])
+        completed = self.run_admission()
+        self.assertEqual(0, len(self.dispatches()))
+        self.assertEqual([], self.posts())
+        self.assertIn("cannot be verified", completed.stdout)
+
     def test_the_authenticated_writer_is_recorded_for_future_rotations(self):
         self.run_admission()
         self.assertIn("github-actions[bot]", self.writer_logins())
@@ -882,7 +944,8 @@ class AdmissionExecutableTests(unittest.TestCase):
 
     def test_an_unrelated_none_commenter_cannot_suppress_a_repair(self):
         # A lookalike receipt from an account with no repository write access
-        # and no same-HEAD run is not a plausible historical writer, so it
+        # and no same-HEAD run is not a plausible historical writer. A current
+        # format lookalike cannot have come from an older controller, so it
         # must not turn an unused exact HEAD into a permanent hold.
         self.write_comments(
             [
@@ -891,6 +954,7 @@ class AdmissionExecutableTests(unittest.TestCase):
                     status="claimed",
                     author="passer-by",
                     author_association="NONE",
+                    current_format=True,
                 )
             ]
         )
@@ -1141,7 +1205,9 @@ class AdmissionExecutableTests(unittest.TestCase):
         self.assertEqual([], self.posts())
 
     def test_untrusted_receipt_authors_cannot_suppress_a_dispatch(self):
-        spoof = trusted_receipt()
+        # Current-format only: a legacy receipt is plausibly from an older
+        # overlapping controller and holds instead (see the migration tests).
+        spoof = trusted_receipt(current_format=True)
         spoof["user"] = {"login": "somebody"}
         spoof["author_association"] = "CONTRIBUTOR"
         self.write_comments([spoof])
@@ -1215,6 +1281,7 @@ class AdmissionExecutableTests(unittest.TestCase):
                     status="dispatched",
                     author="old-automation",
                     run_id=900,
+                    current_format=True,
                 )
             ]
         )

@@ -118,6 +118,22 @@ _CI_REPAIR_WRITER_VARIABLE_PREFIX = "CONTINUUM_CI_REPAIR_WRITER_"
 #: comparison is inclusive. The name deliberately does not start with the
 #: per-writer prefix.
 _CI_REPAIR_WRITERS_BASELINE_VARIABLE = "CONTINUUM_CI_REPAIR_WRITERS_BASELINE"
+#: Hidden marker emitted by this admission writer. An older controller can
+#: still be running or pinned after the migration baseline is established, and
+#: it cannot emit this marker. Therefore an unproved receipt without the marker
+#: stays unverifiable regardless of its timestamp: treating it as a
+#: post-baseline lookalike would let an overlapping old controller spend the
+#: same exact HEAD twice. A marked receipt without proof is a lookalike (for
+#: example, copied text from a current receipt), so unrelated commenters still
+#: cannot suppress repair in the current format.
+#:
+#: Other writers of this generation (notably the digest-pinned workflow's
+#: dispatch correlation) still emit the legacy format. Treating their unproved
+#: receipts conservatively can withhold an unrelated repair, but it can never
+#: authorize a duplicate, so the marker is not required to be universal.
+_CI_REPAIR_WRITER_FORMAT_MARKER = (
+    "<!-- continuum-ci-repair-writer-format v=2 -->"
+)
 
 
 class GhFailure(RuntimeError):
@@ -673,9 +689,13 @@ def _workflow_runs(
 
 
 def _comment_body(receipt, headline: str) -> str:
-    return "{marker}\n\n{headline}\n<!-- continuum-origin role=continuum component=ci-repair -->".format(
+    return (
+        "{marker}\n\n{headline}\n{format_marker}\n"
+        "<!-- continuum-origin role=continuum component=ci-repair -->"
+    ).format(
         marker=render_receipt(receipt),
         headline=headline,
+        format_marker=_CI_REPAIR_WRITER_FORMAT_MARKER,
     )
 
 
@@ -749,9 +769,15 @@ def _historical_receipt_writers(
     claim is persisted before the dispatch request, so a dispatch can be
     accepted while persisting its outcome fails, leaving only the claim behind.
     With no established baseline every unproved receipt is unverifiable, so a
-    missing registry can never reauthorize a spent exact HEAD. Receipts created
-    after the frontier remain lookalikes, so an unrelated commenter cannot
-    suppress repair once the baseline exists.
+    missing registry can never reauthorize a spent exact HEAD.
+
+    The baseline alone cannot make an unproved receipt after it a lookalike:
+    an older controller for another exact HEAD can overlap the baseline
+    establishment, or remain pinned, and write a legacy receipt after it. Only a
+    receipt carrying the current writer-format marker is known not to come from
+    such an older controller, so an unproved legacy receipt always holds.
+    Current-format lookalikes created after the frontier remain ignored, so an
+    unrelated commenter posting the current format cannot suppress repair.
 
     The second result reports that history exists which cannot be verified
     because the run inventory failed or is incomplete, or because a plausible
@@ -782,6 +808,7 @@ def _historical_receipt_writers(
         except ValueError:
             # An untrusted lookalike is ignored, never fatal.
             continue
+        current_format = _CI_REPAIR_WRITER_FORMAT_MARKER in body
         for receipt in receipts:
             if (
                 receipt.repository == repository
@@ -789,7 +816,7 @@ def _historical_receipt_writers(
                 and receipt.head_sha == head_sha
                 and receipt.status != STATUS_REJECTED
             ):
-                candidates.append((author, receipt, comment))
+                candidates.append((author, receipt, comment, current_format))
     if not candidates:
         return (), False
 
@@ -812,7 +839,7 @@ def _historical_receipt_writers(
     verified = []
     unmatched = []
     unverifiable = False
-    for author, receipt, comment in candidates:
+    for author, receipt, comment, current_format in candidates:
         matches = [
             run
             for run in inventory.runs
@@ -826,7 +853,7 @@ def _historical_receipt_writers(
             unverifiable = True
             continue
         if not matches:
-            unmatched.append((author, receipt, comment))
+            unmatched.append((author, receipt, comment, current_format))
             continue
         if author not in verified:
             verified.append(author)
@@ -843,7 +870,7 @@ def _historical_receipt_writers(
     known = frozenset(_normalize_writer_logins("\n".join(known_writers)))
     baseline_text = str(baseline or "").strip()
     baseline_usable = bool(_ISO_TIMESTAMP_RE.match(baseline_text))
-    for author, receipt, comment in unmatched:
+    for author, receipt, comment, current_format in unmatched:
         if author in verified:
             continue
         association = str(comment.get("author_association") or "").strip().upper()
@@ -858,6 +885,13 @@ def _historical_receipt_writers(
             or association in _HISTORICAL_WRITER_ASSOCIATIONS
             or author_has_repair_run
         ):
+            unverifiable = True
+            break
+        if not current_format:
+            # Older controllers cannot emit this marker and can still be
+            # running or pinned after the baseline. Their receipts are
+            # indistinguishable from historical comments, so a post-baseline
+            # legacy receipt must hold instead of being treated as a lookalike.
             unverifiable = True
             break
         if not baseline_usable:
@@ -878,8 +912,9 @@ def _historical_receipt_writers(
         # only the claim behind; its run may then be deleted. Without registry,
         # association, or run evidence that author cannot be told apart from a
         # historical writer, so the receipt fails closed instead of authorizing
-        # a duplicate dispatch. Receipts created after the frontier are still
-        # lookalikes, so an unrelated commenter cannot suppress repair then.
+        # a duplicate dispatch. Current-format receipts created after the
+        # frontier are still lookalikes, so an unrelated commenter cannot
+        # suppress repair then.
         if predates_baseline:
             unverifiable = True
             break
