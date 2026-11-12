@@ -425,7 +425,14 @@ jobs:
                     comment.user?.login === 'coderabbitai[bot]' &&
                     getRootId(comment) === verification.findingId &&
                     comment.id > verification.comment.id &&
-                    !isCodeRabbitQuotaReply(comment)
+                    // CodeRabbit inline-chat quota is distinct from full-review
+                    // quota. A rejected reply is not UNRESOLVED evidence and
+                    // must never dispatch OpenCode to 'fix' a valid finding.
+                    // The shared classifier rejects both quota forms; keep the
+                    // explicit chat-quota shape as a second guard.
+                    !isCodeRabbitQuotaReply(comment) &&
+                    !(/(?:^|\n)\s*###\s*Rate Limit Exceeded\b/i.test(comment.body ?? '') &&
+                      /\bnumber of chat messages per hour\b/i.test(comment.body ?? ''))
                 )
                 .sort((a, b) => b.id - a.id);
 

@@ -557,6 +557,12 @@ const github = {
 };
 const shouldRecheckCodeRabbitAfterCi = () => false;
 const codeRabbitExplicitlyResolved = () => false;
+// The serialized cross-PR chat budget owns its own contract test in
+// tests/test_coderabbit_queue_lifecycle.py. Always allow here so these cases
+// exercise the chat-quota retry semantics in isolation from that budget.
+async function allowOneCodeRabbitChatRequest() {
+  return true;
+}
 async function reconciliationDispatchSupport() {
   return {ok: false, reason: 'test'};
 }
