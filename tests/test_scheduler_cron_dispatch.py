@@ -434,5 +434,103 @@ class WorkflowContractPinTests(unittest.TestCase):
         self.assertIn("READ_GITHUB_TOKEN: ${{ github.token }}", body)
 
 
+
+class CheckpointResumeHoldRegressionTests(unittest.TestCase):
+    """Exercise the shipped scheduler guard against real comment/ref shapes."""
+
+    def test_scheduler_hold_is_not_released_by_automatic_owner_oc(self):
+        from pathlib import Path
+        import shutil
+        import subprocess
+
+        node = shutil.which("node")
+        self.assertIsNotNone(node, "Node.js is needed for scheduler regression")
+        root = Path(__file__).resolve().parents[1]
+        source = (root / ".github/scripts/issue_scheduler.js").read_text(
+            encoding="utf-8"
+        )
+        start = source.index("  const checkpointResumeBlockedMarkerRe =")
+        end = source.index("  const ownerResumeMarkerRe =", start)
+        helper = source[start:end]
+        harness = r"""
+const assert = require('assert');
+const dispatchMarker = '<!-- issue-scheduler-dispatch -->';
+const core = { warning: () => {} };
+function isTrustedStopComment(c, owner) {
+  return ['OWNER', 'MEMBER', 'COLLABORATOR'].includes(c.author_association) ||
+    ['github-actions[bot]', owner].includes(c.user?.login);
+}
+function stopOrderKey(c) {
+  return String(c.created_at || '') + '#' +
+    String(c.id || 0).padStart(12, '0');
+}
+""" + helper + r"""
+(async () => {
+  const sha = 'a'.repeat(40);
+  const marker = '<!-- continuum-checkpoint-resume-blocked ' +
+    'repo=kodmial/continuum issue=442 generation=1 ' +
+    'operation=opencode-429-issue-issue442 ' +
+    'checkpoint=opencode/checkpoint-issue442 ' +
+    'checkpoint_sha=' + sha + ' base_ref=main base_sha=' +
+    'b'.repeat(40) + ' snapshot=' + 'c'.repeat(64) +
+    ' reason=verification-failed -->';
+  const item = (id, body, login = 'kodmial') => ({
+    id, body, created_at: '2026-11-12T04:' + String(id).padStart(2, '0') + ':00Z',
+    user: { login }, author_association: login === 'outsider' ? 'NONE' : 'OWNER'
+  });
+  const saved = item(1, marker);
+  const auto = item(2, '/oc\\n\\n<!-- issue-scheduler-dispatch -->');
+  const watchdog = item(3, '/oc\\n\\n<!-- opencode-watchdog-retry -->');
+  const manual = item(4, '/oc\\ncheck again');
+  const client = (tip = sha) => ({
+    rest: { git: { getRef: async () => ({ data: { object: { sha: tip } } }) } }
+  });
+  const hold = (comments, cl = client()) =>
+    checkpointResumeHold('kodmial', 'continuum', 442, comments, cl);
+  assert.ok(await hold([saved]), 'recorded failure must hold');
+  assert.ok(await hold([saved, auto]), 'scheduler /oc must not waive hold');
+  assert.ok(await hold([saved, watchdog]), 'watchdog /oc must not waive hold');
+  assert.equal(await hold([saved, manual]), null, 'manual owner /oc may resume');
+  assert.equal(await hold([saved], client('d'.repeat(40))), null,
+    'changed checkpoint SHA releases hold');
+  assert.equal(await hold([item(1, marker, 'outsider')]), null,
+    'untrusted authors cannot impose a hold');
+  assert.ok(await hold([saved], {rest: {git: {
+    getRef: async () => { throw {status: 503}; }
+  }}}), 'failed GitHub ref lookup must fail closed');
+  console.log('checkpoint-resume-hold-regression: PASS');
+})().catch(e => { console.error(e); process.exitCode = 1; });
+"""
+        result = subprocess.run(
+            [node, "-e", harness], cwd=root,
+            capture_output=True, text=True, timeout=30, check=False
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("checkpoint-resume-hold-regression: PASS", result.stdout)
+
+    def test_scheduler_and_watchdog_check_before_dispatch(self):
+        from pathlib import Path
+
+        root = Path(__file__).resolve().parents[1]
+        scheduler = (root / ".github/scripts/issue_scheduler.js").read_text(
+            encoding="utf-8"
+        )
+        watchdog = (
+            root / ".github/workflows/continuum-opencode-watchdog.yml"
+        ).read_text(encoding="utf-8")
+        self.assertEqual(scheduler.count("await checkpointResumeHold("), 3)
+        self.assertIn("await removeLabel(issueNumber, inProgressLabel)", scheduler)
+        self.assertIn("!body.includes(dispatchMarker)", scheduler)
+        self.assertIn("!body.includes('<!-- opencode-watchdog-retry -->')", scheduler)
+        self.assertIn("checkpointResumeBlockedRe", watchdog)
+        self.assertIn("!String(comment.body || '').includes(dispatchMarker)", watchdog)
+        self.assertIn("!String(comment.body || '').includes(retryMarker)", watchdog)
+        self.assertLess(
+            watchdog.index("const checkpointResumeBlockedRe ="),
+            watchdog.index("// A scheduler dispatch comment newer")
+        )
+
+
+
 if __name__ == "__main__":
     unittest.main()
