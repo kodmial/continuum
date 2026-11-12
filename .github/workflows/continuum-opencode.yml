@@ -2355,7 +2355,6 @@ jobs:
           mkdir -p "$install_root/.github/scripts" "$install_root/src"
           cp -R "$engine/src/continuum" "$install_root/src/"
           cp "$engine/.github/scripts/opencode_429_classify.py" "$install_root/.github/scripts/"
-          cp "$engine/.github/scripts/opencode_live_status.py" "$install_root/.github/scripts/"
           cp "$engine/.github/scripts/opencode_429_wrapper.sh" "$install_root/continuum-opencode"
           # kodmial/continuum#413: one deterministic staging boundary for every
           # checkpoint and publish path, independent of agent instructions and
@@ -2366,7 +2365,7 @@ jobs:
           # checkout. Keep a trusted copy outside the worktree so Owner STOP
           # checks still run after that cleanup.
           cp "$engine/.github/scripts/opencode_cancel.py" "$install_root/.github/scripts/"
-          chmod +x "$install_root/continuum-opencode" "$install_root/.github/scripts/opencode_429_classify.py" "$install_root/.github/scripts/opencode_live_status.py" "$install_root/.github/scripts/opencode_cancel.py"
+          chmod +x "$install_root/continuum-opencode" "$install_root/.github/scripts/opencode_429_classify.py" "$install_root/.github/scripts/opencode_cancel.py"
           rm -rf "$engine"
           echo "$install_root" >> "$GITHUB_PATH"
           echo "CONTINUUM_429_CLASSIFIER=$install_root/.github/scripts/opencode_429_classify.py" >> "$GITHUB_ENV"
@@ -2860,9 +2859,6 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.TAP_PAT }}
           GITHUB_TOKEN: ${{ secrets.TAP_PAT }}
-          # Minimum job-scoped issues:write credential, never shared TAP_PAT.
-          CONTINUUM_LIVE_LOG_TOKEN: ${{ github.token }}
-          CONTINUUM_LIVE_LOG_ISSUE: ${{ inputs.issue_number || github.event.issue.number }}
           OPENCODE_MODEL: ${{ steps.model_route.outputs.model }}
           ISSUE_NUMBER: ${{ inputs.issue_number || github.event.issue.number }}
           TASK_CONTEXT_PRESENT: ${{ steps.task_context.outputs.present }}

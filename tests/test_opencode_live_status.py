@@ -9,7 +9,7 @@ import unittest
 from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
-SRC = ROOT / ".github/scripts/opencode_live_status.py"
+SRC = ROOT / "src/continuum/opencode_live_status.py"
 spec = importlib.util.spec_from_file_location("opencode_live_status", SRC)
 live = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(live)
@@ -84,9 +84,9 @@ class LiveStatusTests(unittest.TestCase):
     def test_workflow_and_wrapper_wiring(self):
         flow = (ROOT / ".github/workflows/continuum-opencode.yml").read_text()
         wrapper = (ROOT / ".github/scripts/opencode_429_wrapper.sh").read_text()
-        self.assertIn('cp "$engine/.github/scripts/opencode_live_status.py"', flow)
-        self.assertIn("CONTINUUM_LIVE_LOG_TOKEN: $" + "{{ github.token }}", flow)
-        self.assertIn("CONTINUUM_LIVE_LOG_ISSUE:", flow)
+        self.assertIn('cp -R "$engine/src/continuum" "$install_root/src/"', flow)
+        self.assertIn('live_script="$script_dir/src/continuum/opencode_live_status.py"', wrapper)
+        self.assertIn('CONTINUUM_LIVE_LOG_TOKEN="$live_token"', wrapper)
         self.assertIn('python3 "$live_script" watch --log "$log"', wrapper)
         self.assertIn('python3 "$live_script" once --log "$log"', wrapper)
         self.assertIn("env -u CONTINUUM_LIVE_LOG_TOKEN", wrapper)
