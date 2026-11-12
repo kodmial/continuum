@@ -146,11 +146,14 @@ APPROVED_433_OPENCODE_SHA256 = (
 # all five guarded executor paths; unrelated workflow drift remains forbidden.
 # #442 (main 7e4da5d) deliberately extends this exact protected workflow with
 # an issue-checkpoint identity check and isolated original-base verification.
+# #450 (main 25273b4) additionally caps post-repair inline CodeRabbit
+# verification at one request per OpenCode run; the serialized auto-merge owner
+# handles the remaining exact-HEAD findings after its shared chat-quota wait.
 # Pin the complete resulting bytes. Tests below and test_comment_attribution
 # independently enforce the recovery contract and its diagnostic provenance;
 # do not replace this pin with an allowlist or ignore workflow differences.
 APPROVED_PROVIDER_RECOVERY_OPENCODE_SHA256 = (
-    "386efdaef0c8568eec94f4d0185b9e8d8b1390d6fb82d136f4bc7929e3ff5df8"
+    "61c6f4d0b8c0ac6d179750096606ecc14a488933dbda5ac51defd465dc44006d"
 )
 
 # Additional reviewed self-caller change: owner-only CodeRabbit repair dispatch
