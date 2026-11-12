@@ -148,6 +148,17 @@ if rest[:1] == ["--paginate"]:
         if os.environ.get("FAKE_RUNS_FAIL") == "1":
             sys.stderr.write("simulated run inventory failure\n")
             sys.exit(1)
+        if os.environ.get("FAKE_RUNS_DELETE_AFTER_FIRST_READ") == "1":
+            reads_path = state / "runs_reads.txt"
+            try:
+                reads = int(reads_path.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                reads = 0
+            reads += 1
+            reads_path.write_text(str(reads), encoding="utf-8")
+            if reads > 1:
+                print(json.dumps([{"total_count": 0, "workflow_runs": []}]))
+                sys.exit(0)
         print(json.dumps(read_json("runs_pages.json", [])))
         sys.exit(0)
     sys.exit(0)
@@ -601,6 +612,54 @@ class AdmissionExecutableTests(unittest.TestCase):
         writers = self.writer_logins()
         self.assertIn("old-automation", writers)
         self.assertIn("github-actions[bot]", writers)
+
+    def test_a_previous_writer_run_deleted_between_lookups_is_not_redispatched(self):
+        # Historical-writer verification reads one run inventory and stale-claim
+        # recovery reads another. If the proving run is deleted between those
+        # reads, the earlier proof must still prevent the spent claim from being
+        # re-armed and dispatched a second time for the same exact HEAD.
+        attempt = "ci-old-account-0001"
+        self.write_comments(
+            [
+                trusted_receipt(
+                    attempt=attempt,
+                    status="claimed",
+                    author="old-automation",
+                )
+            ]
+        )
+        self.write_pr(head=HEAD, comments=1)
+        self.write_runs(
+            [
+                {
+                    "id": 900,
+                    "display_title": "OpenCode repair PR #{} [ci-attempt:{}]".format(
+                        PR, attempt
+                    ),
+                    "status": "queued",
+                    "conclusion": "",
+                    "html_url": "https://github.com/{}/actions/runs/900".format(
+                        REPO.lower()
+                    ),
+                    "created_at": "2026-11-12T00:00:00Z",
+                    "head_sha": HEAD,
+                    "actor": {"login": "old-automation"},
+                }
+            ]
+        )
+        completed = self.run_admission(
+            extra_env={"FAKE_RUNS_DELETE_AFTER_FIRST_READ": "1"},
+            extra_args=("--claim-timeout-seconds", "1"),
+        )
+        self.assertEqual(0, len(self.dispatches()))
+        self.assertTrue(
+            any(
+                "status=dispatched" in body and "run=900" in body
+                for body in self.posted_bodies()
+            ),
+            self.posted_bodies(),
+        )
+        self.assertNotIn("action=rearm", completed.stdout)
 
     def test_a_missing_registry_with_a_deleted_run_holds_instead_of_redispatched(self):
         # The registry did not exist when the previous TAP_PAT wrote its

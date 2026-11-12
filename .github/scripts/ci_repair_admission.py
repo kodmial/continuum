@@ -736,6 +736,39 @@ def _workflow_runs(
     return normalize_run_pages(pages)
 
 
+def _carry_proved_runs(
+    inventory: RunInventory,
+    proved_runs: Sequence[Mapping[str, Any]],
+) -> RunInventory:
+    """Keep earlier verified runs in a later complete recovery inventory.
+
+    Historical-writer verification and stale-claim recovery read the run
+    inventory at different instants. A run can prove an already-dispatched
+    attempt and then be deleted before recovery. Treating that deletion as proof
+    that no run exists would re-arm the claim and dispatch the same exact HEAD
+    again, so the earlier verified run stays part of the recovery evidence. The
+    caller only reaches here with a complete current inventory; this adds a
+    previously proved run, it never hides a partial read.
+    """
+
+    existing = {str(run.get("id")) for run in inventory.runs}
+    missing = []
+    for run in proved_runs:
+        run_id = str(run.get("id"))
+        if run_id in existing:
+            continue
+        existing.add(run_id)
+        missing.append(run)
+    if not missing:
+        return inventory
+    return RunInventory(
+        runs=tuple(inventory.runs) + tuple(missing),
+        complete=inventory.complete,
+        reason=inventory.reason,
+        expected_count=inventory.expected_count,
+    )
+
+
 def _comment_body(receipt, headline: str) -> str:
     return "{marker}\n\n{headline}\n<!-- continuum-origin role=continuum component=ci-repair -->".format(
         marker=render_receipt(receipt),
@@ -790,6 +823,7 @@ def _historical_receipt_writers(
     registry_available: bool = True,
     baseline: Optional[str] = None,
     legacy_retired: Optional[str] = None,
+    proved_runs: Optional[list[Mapping[str, Any]]] = None,
 ) -> Tuple[Tuple[str, ...], bool]:
     """Return historical receipt authors proved by GitHub's run records.
 
@@ -839,6 +873,11 @@ def _historical_receipt_writers(
     durable repository registry remains plausible even after its dispatch run
     is deleted. The caller must hold in that case instead of treating those
     receipts as absent.
+
+    ``proved_runs``, when supplied, is extended with each run that proves a
+    candidate receipt. The caller carries this evidence into stale-claim
+    recovery: a run verified here can be deleted before the later recovery
+    inventory, and losing it must not turn a spent claim into a re-armable one.
     """
 
     candidates = []
@@ -908,6 +947,10 @@ def _historical_receipt_writers(
         if not matches:
             unmatched.append((author, receipt, comment))
             continue
+        if proved_runs is not None:
+            proved_id = matches[0].get("id")
+            if all(run.get("id") != proved_id for run in proved_runs):
+                proved_runs.append(matches[0])
         if author not in verified:
             verified.append(author)
 
@@ -1103,6 +1146,7 @@ def run(args) -> int:
             "read; holding instead of risking a duplicate dispatch."
         )
         return 0
+    proved_historical_runs: list[Mapping[str, Any]] = []
     historical_writers, unverifiable_history = _historical_receipt_writers(
         repository,
         pull_number,
@@ -1115,6 +1159,7 @@ def run(args) -> int:
         registry_available=True,
         baseline=baseline,
         legacy_retired=legacy_retired,
+        proved_runs=proved_historical_runs,
     )
     if not args.dry_run:
         _, writers_durable = _persist_historical_writers(
@@ -1186,6 +1231,8 @@ def run(args) -> int:
             )
         except GhFailure as exc:
             print("::warning::Could not reconcile CI-repair runs: {}".format(exc))
+        if runs is not None and runs.complete:
+            runs = _carry_proved_runs(runs, proved_historical_runs)
         plan = plan_admission(
             collection,
             runs=runs,
