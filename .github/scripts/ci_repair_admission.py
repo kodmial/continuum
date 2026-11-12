@@ -88,6 +88,12 @@ _HEADER_SEPARATOR_RE = re.compile(rb"\r?\n\r?\n", re.MULTILINE)
 # receipt as absent; an unrelated commenter without repository write access
 # can neither authorize nor suppress a repair.
 _HISTORICAL_WRITER_ASSOCIATIONS = frozenset({"MEMBER", "COLLABORATOR"})
+#: Repository variable recording the logins that have authored trusted
+#: receipts. It is write-only through the authenticated TAP_PAT, so an
+#: unrelated issue commenter cannot add itself. The list survives run
+#: deletion and a later token rotation, when GitHub no longer has a
+#: dispatch run to prove the previous writer.
+_CI_REPAIR_WRITERS_VARIABLE = "CONTINUUM_CI_REPAIR_WRITERS"
 
 
 class GhFailure(RuntimeError):
@@ -149,6 +155,106 @@ def _authenticated_login() -> Optional[str]:
         return None
     login = login.strip().lower()
     return login or None
+
+
+def _normalize_writer_logins(value: Any) -> Tuple[str, ...]:
+    """Return the normalized unique logins stored in a writer registry."""
+
+    if not isinstance(value, str):
+        return ()
+    logins = []
+    for token in re.split(r"[\s,]+", value.strip()):
+        login = token.strip().lower()
+        if login and login not in logins:
+            logins.append(login)
+    return tuple(logins)
+
+
+def _historical_writer_registry(
+    repository: str,
+) -> Tuple[Tuple[str, ...], Optional[bool]]:
+    """Read logins recorded as trusted CI-repair receipt authors.
+
+    The second value is ``True`` for an existing variable, ``False`` for a
+    missing one, and ``None`` when the registry could not be read. A missing
+    registry is a valid empty history; an unreadable one is not proof that no
+    historical writer exists.
+    """
+
+    variable = _CI_REPAIR_WRITERS_VARIABLE
+    url = "repos/{}/actions/variables/{}".format(repository, variable)
+    _, stdout, stderr = _gh(["api", "--include", url])
+    status, body = _parse_include(stdout, stderr)
+    if status == 404:
+        return (), False
+    if status != 200:
+        print(
+            "::warning::Could not read historical CI-repair writer registry: "
+            "{}".format((body or stderr).strip() or "HTTP status {}".format(status))
+        )
+        return (), None
+    try:
+        data = json.loads(body or "{}")
+    except ValueError:
+        print(
+            "::warning::Historical CI-repair writer registry is not valid JSON."
+        )
+        return (), None
+    if not isinstance(data, Mapping):
+        print(
+            "::warning::Historical CI-repair writer registry is not an object."
+        )
+        return (), None
+    return _normalize_writer_logins(data.get("value")), True
+
+
+def _persist_historical_writers(
+    repository: str,
+    logins: Sequence[str],
+    *,
+    known: Sequence[str],
+    exists: bool,
+) -> Tuple[Tuple[str, ...], bool]:
+    """Merge trusted writer logins into the durable repository variable."""
+
+    merged = list(_normalize_writer_logins("\n".join(known)))
+    for login in _normalize_writer_logins("\n".join(logins)):
+        if login not in merged:
+            merged.append(login)
+    if tuple(merged) == tuple(known):
+        return tuple(merged), exists
+
+    value = "\n".join(merged)
+    if exists:
+        arguments = [
+            "api",
+            "--method",
+            "PATCH",
+            "repos/{}/actions/variables/{}".format(
+                repository, _CI_REPAIR_WRITERS_VARIABLE
+            ),
+            "-f",
+            "value={}".format(value),
+        ]
+    else:
+        arguments = [
+            "api",
+            "--method",
+            "POST",
+            "repos/{}/actions/variables".format(repository),
+            "-f",
+            "name={}".format(_CI_REPAIR_WRITERS_VARIABLE),
+            "-f",
+            "value={}".format(value),
+        ]
+    code, _, stderr = _gh(arguments)
+    if code != 0:
+        print(
+            "::warning::Could not record historical CI-repair writers: "
+            "{}".format(stderr.strip() or "gh exited {}".format(code))
+        )
+        return tuple(merged), exists
+    return tuple(merged), True
 
 
 def _comment_pages(repository: str, pull_number: int) -> Sequence[Any]:
@@ -400,6 +506,8 @@ def _historical_receipt_writers(
     workflow: str,
     owner_login: str,
     trusted_logins: Sequence[str],
+    known_writers: Sequence[str] = (),
+    registry_available: bool = True,
 ) -> Tuple[Tuple[str, ...], bool]:
     """Return historical receipt authors proved by GitHub's run records.
 
@@ -418,8 +526,10 @@ def _historical_receipt_writers(
 
     The second result reports that history exists which cannot be verified
     because the run inventory failed or is incomplete, or because a plausible
-    historical writer's receipt has no proving run. The caller must hold in
-    that case instead of treating those receipts as absent.
+    historical writer's receipt has no proving run. A writer recorded in the
+    durable repository registry remains plausible even after its dispatch run
+    is deleted. The caller must hold in that case instead of treating those
+    receipts as absent.
     """
 
     candidates = []
@@ -495,11 +605,13 @@ def _historical_receipt_writers(
     # A previously authoritative writer can be proved by any one of its
     # receipts. An unproved receipt for that same writer adds no new risk. Only
     # an unproved receipt from a writer with no other proof can hide a spent
-    # attempt, so hold when its author had repository write access or GitHub
-    # shows a repair run for this PR created by that account. The run's SHA can
-    # be the dispatch ref (normally ``main``) instead of the PR HEAD, so it is
-    # not required to match the receipt HEAD here; an unrelated commenter with
-    # neither evidence cannot suppress a repair.
+    # attempt, so hold when its author is in the durable writer registry, had
+    # repository write access, or GitHub shows a repair run for this PR created
+    # by that account. The run's SHA can be the dispatch ref (normally ``main``)
+    # instead of the PR HEAD, so it is not required to match the receipt HEAD
+    # here; an unrelated commenter with none of that evidence cannot suppress a
+    # repair.
+    known = frozenset(_normalize_writer_logins("\n".join(known_writers)))
     for author, comment in unmatched:
         if author in verified:
             continue
@@ -510,7 +622,9 @@ def _historical_receipt_writers(
             for run in inventory.runs
         )
         if (
-            association in _HISTORICAL_WRITER_ASSOCIATIONS
+            author in known
+            or not registry_available
+            or association in _HISTORICAL_WRITER_ASSOCIATIONS
             or author_has_repair_run
         ):
             unverifiable = True
@@ -587,8 +701,11 @@ def run(args) -> int:
         return 0
 
     # A rotated TAP_PAT account must not turn previously authoritative receipts
-    # into ignored lookalikes. Only dispatch evidence GitHub itself attests
-    # (a same-HEAD run created by that account for this attempt) extends trust.
+    # into ignored lookalikes. GitHub-attested dispatch evidence and the
+    # durable writer registry extend trust; an unrelated commenter can add
+    # neither. Recording the current login before it rotates keeps deleted-run
+    # history authoritative for the next token.
+    known_writers, registry_exists = _historical_writer_registry(repository)
     historical_writers, unverifiable_history = _historical_receipt_writers(
         repository,
         pull_number,
@@ -597,7 +714,16 @@ def run(args) -> int:
         workflow=args.workflow,
         owner_login=args.owner_login or "",
         trusted_logins=tuple(trusted_logins),
+        known_writers=known_writers,
+        registry_available=registry_exists is not None,
     )
+    if registry_exists is not None and not args.dry_run:
+        _persist_historical_writers(
+            repository,
+            (token_login, *historical_writers),
+            known=known_writers,
+            exists=registry_exists,
+        )
     if unverifiable_history:
         print(
             "::warning::Historical CI-repair receipts cannot be verified; "

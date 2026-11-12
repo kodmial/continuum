@@ -69,6 +69,38 @@ if args[:1] != ["api"]:
     sys.exit(0)
 rest = args[1:]
 
+VARIABLE_NAME = "CONTINUUM_CI_REPAIR_WRITERS"
+if any("/actions/variables" in arg for arg in rest):
+    variables = read_json("variables.json", {})
+    if rest[:1] == ["--include"]:
+        url = next((arg for arg in rest if arg.startswith("repos/")), "")
+        name = url.rsplit("/", 1)[-1]
+        if name not in variables:
+            output(404, json.dumps({"message": "Not Found"}))
+        output(200, json.dumps({"name": name, "value": variables[name]}))
+    if rest[:1] == ["--method"] and rest[1:2] == ["POST"]:
+        name = next(
+            (arg[len("name="):] for arg in rest if arg.startswith("name=")),
+            VARIABLE_NAME,
+        )
+        value = next(
+            (arg[len("value="):] for arg in rest if arg.startswith("value=")),
+            "",
+        )
+        variables[name] = value
+        write_json("variables.json", variables)
+        output(201, "{}")
+    if rest[:1] == ["--method"] and rest[1:2] == ["PATCH"]:
+        name = rest[2].rsplit("/", 1)[-1]
+        value = next(
+            (arg[len("value="):] for arg in rest if arg.startswith("value=")),
+            "",
+        )
+        variables[name] = value
+        write_json("variables.json", variables)
+        output(204, "")
+    sys.exit(0)
+
 if rest[:1] == ["user"]:
     if os.environ.get("FAKE_TOKEN_FAIL") == "1":
         sys.stderr.write("simulated token identity failure\n")
@@ -470,6 +502,47 @@ class AdmissionExecutableTests(unittest.TestCase):
         self.assertEqual(0, len(self.dispatches()))
         self.assertEqual([], self.posts())
         self.assertIn("cannot be verified", completed.stdout)
+
+    def test_a_deleted_previous_writer_run_stays_unverifiable(self):
+        # The previous TAP_PAT account was recorded as a trusted writer before
+        # rotation, but its repair run has since been deleted. The durable
+        # registry still makes the old receipt plausible, so admission holds
+        # instead of dispatching the same exact HEAD again.
+        self.write_comments(
+            [
+                trusted_receipt(
+                    attempt="ci-old-account-0001",
+                    status="dispatched",
+                    author="old-automation",
+                    run_id=900,
+                )
+            ]
+        )
+        self.write_pr(head=HEAD, comments=1)
+        self.write_state(
+            "variables.json",
+            {"CONTINUUM_CI_REPAIR_WRITERS": "old-automation"},
+        )
+        self.write_runs([])
+        completed = self.run_admission()
+        self.assertEqual(0, len(self.dispatches()))
+        self.assertEqual([], self.posts())
+        self.assertIn("cannot be verified", completed.stdout)
+        writers = json.loads(
+            (self.dir / "variables.json").read_text(encoding="utf-8")
+        )["CONTINUUM_CI_REPAIR_WRITERS"].splitlines()
+        self.assertIn("old-automation", writers)
+        self.assertIn("github-actions[bot]", writers)
+
+    def test_the_authenticated_writer_is_recorded_for_future_rotations(self):
+        self.run_admission()
+        variables = json.loads(
+            (self.dir / "variables.json").read_text(encoding="utf-8")
+        )
+        self.assertIn(
+            "github-actions[bot]",
+            variables["CONTINUUM_CI_REPAIR_WRITERS"].splitlines(),
+        )
 
     def test_a_same_head_run_actor_without_a_proof_holds_admission(self):
         # Even when GitHub reports no repository association, an account that
