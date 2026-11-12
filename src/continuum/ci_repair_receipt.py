@@ -421,22 +421,27 @@ def parse_receipts(body: Any) -> Tuple[RepairReceipt, ...]:
 # ---------------------------------------------------------------------------
 
 def _comment_login(comment: Mapping[str, Any]) -> str:
-    user = comment.get("user")
-    if isinstance(user, Mapping):
-        login = str(user.get("login") or "").strip()
-        if login:
-            return login.lower()
-    author = comment.get("author")
-    if isinstance(author, Mapping):
-        login = str(author.get("login") or "").strip()
-        if login:
-            return login.lower()
-    for key in ("author_login", "login"):
-        login = str(comment.get(key) or "").strip()
-        if login:
-            return login.lower()
-    return ""
+    """Return a validated login; malformed primary metadata is unknown.
 
+    Do not coerce numeric/object author IDs into purported GitHub logins, or
+    fall back to a secondary login after the primary source is malformed.
+    """
+    for key in ("user", "author"):
+        source = comment.get(key)
+        if source is None:
+            continue
+        if not isinstance(source, Mapping):
+            return ""
+        if "login" not in source:
+            continue
+        raw = source["login"]
+        return raw.strip().lower() if isinstance(raw, str) else ""
+    for key in ("author_login", "login"):
+        if key not in comment:
+            continue
+        raw = comment[key]
+        return raw.strip().lower() if isinstance(raw, str) else ""
+    return ""
 
 def _has_author_metadata(comment: Mapping[str, Any]) -> bool:
     """Whether enough author metadata exists to prove a marked comment untrusted.
@@ -446,7 +451,8 @@ def _has_author_metadata(comment: Mapping[str, Any]) -> bool:
     a missing association might identify a repository OWNER.
     """
 
-    association = str(comment.get("author_association") or "").strip()
+    raw_association = comment.get("author_association")
+    association = raw_association.strip() if isinstance(raw_association, str) else ""
     return bool(association) and bool(_comment_login(comment))
 
 
@@ -467,7 +473,8 @@ def is_trusted_receipt_comment(
 
     if not isinstance(comment, Mapping):
         return False
-    association = str(comment.get("author_association") or "").upper()
+    raw_association = comment.get("author_association")
+    association = raw_association.strip().upper() if isinstance(raw_association, str) else ""
     associations = {str(item).upper() for item in trusted_associations}
     if association in associations:
         return True
