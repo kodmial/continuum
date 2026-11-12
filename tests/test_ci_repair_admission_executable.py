@@ -36,10 +36,12 @@ NOW = "2026-11-12T01:00:00Z"
 LEGACY_WRITERS_VARIABLE = "CONTINUUM_CI_REPAIR_WRITERS"
 WRITER_VARIABLE_PREFIX = "CONTINUUM_CI_REPAIR_WRITER_"
 WRITERS_BASELINE_VARIABLE = "CONTINUUM_CI_REPAIR_WRITERS_BASELINE"
-#: An already-established registry baseline. Comment fixtures are created
-#: after it, so an unproved receipt is a post-baseline lookalike unless its
-#: author has trusted writer evidence.
+LEGACY_RETIRED_VARIABLE = "CONTINUUM_CI_REPAIR_LEGACY_RETIRED_AT"
+#: An already-established registry baseline and retirement record. Comment
+#: fixtures are created after both, so an unproved receipt is a post-baseline
+#: lookalike unless its author has trusted writer evidence.
 WRITERS_BASELINE = "2026-11-11T00:00:00Z"
+LEGACY_RETIRED = "2026-11-11T00:00:00Z"
 
 FAKE_GH = r'''#!/usr/bin/env python3
 import json
@@ -283,8 +285,15 @@ class AdmissionExecutableTests(unittest.TestCase):
         self.write_state("runs_pages.json", [])
         self.write_state("posted.jsonl", "")
         self.write_state("gh.log", "")
+        # Lookalike classification only applies once the trusted retirement
+        # record says older controllers stopped writing. Tests that exercise the
+        # migration/overlap cases remove that record again.
         self.write_state(
-            "variables.json", {WRITERS_BASELINE_VARIABLE: WRITERS_BASELINE}
+            "variables.json",
+            {
+                WRITERS_BASELINE_VARIABLE: WRITERS_BASELINE,
+                LEGACY_RETIRED_VARIABLE: LEGACY_RETIRED,
+            },
         )
 
     @staticmethod
@@ -769,6 +778,109 @@ class AdmissionExecutableTests(unittest.TestCase):
         self.assertEqual(0, len(self.dispatches()))
         self.assertEqual([], self.posts())
         self.assertIn("cannot be verified", completed.stdout)
+
+    def test_a_post_baseline_none_association_legacy_claim_holds_until_retirement(self):
+        # Exact migration gap: an older controller writes a claim after the
+        # baseline without registering its account, the token later rotates, the
+        # account has no association, and its repair run is deleted. Until a
+        # trusted retirement record proves that older controller is gone, the
+        # receipt must hold instead of being treated as a lookalike and
+        # authorizing a duplicate dispatch for the same exact HEAD.
+        self.write_comments(
+            [
+                trusted_receipt(
+                    attempt="ci-overlap-0001",
+                    status="claimed",
+                    author="old-automation",
+                    author_association="NONE",
+                )
+            ]
+        )
+        self.write_pr(head=HEAD, comments=1)
+        self.write_state(
+            "variables.json", {WRITERS_BASELINE_VARIABLE: WRITERS_BASELINE}
+        )
+        self.write_runs([])
+        completed = self.run_admission()
+        self.assertEqual(0, len(self.dispatches()))
+        self.assertEqual([], self.posts())
+        self.assertIn("cannot be verified", completed.stdout)
+
+        # A retirement record that still predates the receipt does not retire
+        # the controller that wrote it, so the hold is unchanged.
+        self.write_state(
+            "variables.json",
+            {
+                WRITERS_BASELINE_VARIABLE: WRITERS_BASELINE,
+                LEGACY_RETIRED_VARIABLE: "2026-11-12T00:00:00Z",
+            },
+        )
+        completed = self.run_admission()
+        self.assertEqual(0, len(self.dispatches()))
+        self.assertEqual([], self.posts())
+        self.assertIn("cannot be verified", completed.stdout)
+
+        # Once the trusted record shows all legacy controllers were retired
+        # before the receipt, the same unproved NONE receipt is a lookalike and
+        # must not suppress a repair.
+        self.write_state(
+            "variables.json",
+            {
+                WRITERS_BASELINE_VARIABLE: WRITERS_BASELINE,
+                LEGACY_RETIRED_VARIABLE: LEGACY_RETIRED,
+            },
+        )
+        self.run_admission()
+        self.assertEqual(1, len(self.dispatches()))
+
+    def test_a_post_baseline_none_association_legacy_dispatch_holds_until_retirement(self):
+        # The older overlapping controller can also have dispatched before
+        # writing its receipt. With no association, no registry entry, and a
+        # deleted run, only the trusted retirement record can separate it from a
+        # lookalike; without that record it must hold.
+        self.write_comments(
+            [
+                trusted_receipt(
+                    attempt="ci-overlap-0001",
+                    status="dispatched",
+                    author="old-automation",
+                    run_id=900,
+                    author_association="NONE",
+                )
+            ]
+        )
+        self.write_pr(head=HEAD, comments=1)
+        self.write_state(
+            "variables.json", {WRITERS_BASELINE_VARIABLE: WRITERS_BASELINE}
+        )
+        self.write_runs([])
+        completed = self.run_admission()
+        self.assertEqual(0, len(self.dispatches()))
+        self.assertEqual([], self.posts())
+        self.assertIn("cannot be verified", completed.stdout)
+
+        self.write_state(
+            "variables.json",
+            {
+                WRITERS_BASELINE_VARIABLE: WRITERS_BASELINE,
+                LEGACY_RETIRED_VARIABLE: LEGACY_RETIRED,
+            },
+        )
+        self.run_admission()
+        self.assertEqual(1, len(self.dispatches()))
+
+    def test_an_unusable_legacy_retirement_holds_without_dispatching(self):
+        self.write_state(
+            "variables.json",
+            {
+                WRITERS_BASELINE_VARIABLE: WRITERS_BASELINE,
+                LEGACY_RETIRED_VARIABLE: "not-a-timestamp",
+            },
+        )
+        completed = self.run_admission()
+        self.assertEqual(0, len(self.dispatches()))
+        self.assertEqual([], self.posts())
+        self.assertIn("retirement record cannot be read", completed.stdout)
 
     def test_the_authenticated_writer_is_recorded_for_future_rotations(self):
         self.run_admission()

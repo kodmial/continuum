@@ -25,7 +25,10 @@ run by recency, or a partial comment page:
 - timeout/network/403/429/5xx is ``ambiguous`` and is correlated against the
   attempt's run-name marker, never retried blindly;
 - trusted receipt authors are registered in independent repository variables,
-  so token rotation or a concurrent admission pass cannot erase writer history.
+  so token rotation or a concurrent admission pass cannot erase writer history;
+- a separate trusted retirement record marks when older controller instances
+  stopped writing, so an unproved receipt after the migration baseline holds
+  until the operator can prove no legacy controller is still running.
 """
 
 from __future__ import annotations
@@ -92,13 +95,14 @@ _ISO_TIMESTAMP_RE = re.compile(
 )
 # A rotated TAP_PAT can leave receipts authored by a former collaborator. If
 # no run proves that writer, admission must hold instead of treating the
-# receipt as absent. After the registry baseline is established, an unrelated
-# commenter without repository write access can neither authorize nor suppress
-# a repair: only a receipt created after the frontier whose author has no
-# trusted writer evidence is classified as a lookalike. Any receipt created at
-# or before it stays unverifiable: its run may already be deleted, and an
-# accepted dispatch whose outcome failed to persist can leave only a
-# ``claimed`` receipt behind.
+# receipt as absent. Any receipt created at or before the registry baseline
+# stays unverifiable: its run may already be deleted, and an accepted dispatch
+# whose outcome failed to persist can leave only a ``claimed`` receipt behind.
+# An older controller can also write after the baseline, so a post-baseline
+# receipt from an author with no trusted writer evidence holds until the trusted
+# legacy-controller retirement record shows every older instance is gone. After
+# that record it is a lookalike and cannot suppress a repair, while a spent
+# exact HEAD is never re-dispatched.
 _HISTORICAL_WRITER_ASSOCIATIONS = frozenset({"MEMBER", "COLLABORATOR"})
 #: Legacy comma/newline-separated registry of logins that authored trusted
 #: receipts. It is only read now: a pre-existing value is migrated into
@@ -119,6 +123,17 @@ _CI_REPAIR_WRITER_VARIABLE_PREFIX = "CONTINUUM_CI_REPAIR_WRITER_"
 #: comparison is inclusive. The name deliberately does not start with the
 #: per-writer prefix.
 _CI_REPAIR_WRITERS_BASELINE_VARIABLE = "CONTINUUM_CI_REPAIR_WRITERS_BASELINE"
+#: Trusted legacy-controller retirement record. The registry baseline alone
+#: cannot make an unproved receipt after it a lookalike: an older controller can
+#: still be running, or remain pinned, and write a receipt after the frontier.
+#: Only an operator assertion that every legacy controller instance was retired
+#: separates that case from an unrelated commenter. Its value is the UTC instant
+#: at or before which legacy controllers may still have written receipts; a
+#: receipt created strictly after it cannot come from a legacy controller. Until
+#: the record exists every unproved post-baseline receipt holds, so a spent exact
+#: HEAD is never re-dispatched. It deliberately does not start with the
+#: per-writer prefix.
+_CI_REPAIR_LEGACY_RETIRED_VARIABLE = "CONTINUUM_CI_REPAIR_LEGACY_RETIRED_AT"
 
 
 class GhFailure(RuntimeError):
@@ -389,6 +404,54 @@ def _read_writer_baseline(repository: str) -> Tuple[Optional[str], bool]:
         print(
             "::warning::Historical CI-repair writer baseline is not a usable "
             "timestamp."
+        )
+        return None, False
+    return value.strip(), True
+
+
+def _read_legacy_retirement(repository: str) -> Tuple[Optional[str], bool]:
+    """Read the trusted legacy-controller retirement record.
+
+    ``(None, True)`` means legacy controllers have not been declared retired, so
+    an unproved post-baseline receipt cannot be classified as a lookalike and
+    must hold. ``(None, False)`` means the record could not be read and must not
+    be treated as retired.
+    """
+
+    url = "repos/{}/actions/variables/{}".format(
+        repository, _CI_REPAIR_LEGACY_RETIRED_VARIABLE
+    )
+    _, stdout, stderr = _gh(["api", "--include", url])
+    status, body = _parse_include(stdout, stderr)
+    if status == 404:
+        return None, True
+    if status != 200:
+        print(
+            "::warning::Could not read the CI-repair legacy-controller retirement "
+            "record: {}".format(
+                (body or stderr).strip() or "HTTP status {}".format(status)
+            )
+        )
+        return None, False
+    try:
+        data = json.loads(body or "{}")
+    except ValueError:
+        print(
+            "::warning::CI-repair legacy-controller retirement record is not "
+            "valid JSON."
+        )
+        return None, False
+    if not isinstance(data, Mapping):
+        print(
+            "::warning::CI-repair legacy-controller retirement record is not an "
+            "object."
+        )
+        return None, False
+    value = data.get("value")
+    if not isinstance(value, str) or not _ISO_TIMESTAMP_RE.match(value.strip()):
+        print(
+            "::warning::CI-repair legacy-controller retirement record is not a "
+            "usable timestamp."
         )
         return None, False
     return value.strip(), True
@@ -726,6 +789,7 @@ def _historical_receipt_writers(
     known_writers: Sequence[str] = (),
     registry_available: bool = True,
     baseline: Optional[str] = None,
+    legacy_retired: Optional[str] = None,
 ) -> Tuple[Tuple[str, ...], bool]:
     """Return historical receipt authors proved by GitHub's run records.
 
@@ -752,15 +816,22 @@ def _historical_receipt_writers(
     With no established baseline every unproved receipt is unverifiable, so a
     missing registry can never reauthorize a spent exact HEAD.
 
-    After the frontier, the receipt's age alone cannot classify it: an older
-    controller for another exact HEAD can remain pinned and write a receipt.
-    Trusted historical-writer evidence separates that case from an unrelated
-    lookalike: the durable writer registry, repository write access, or a
-    GitHub-attested repair run by that account. A post-baseline receipt whose
-    author has none of it is a lookalike and stays ignored, so an unrelated
+    The baseline alone still cannot classify a receipt after it: an older
+    controller for another exact HEAD can remain running or pinned and write a
+    receipt after the frontier, and token rotation can later leave its account
+    with no association and its run deleted. ``legacy_retired`` is the trusted
+    migration record that names the instant at which every such older controller
+    was retired. Only a receipt created strictly after both frontiers cannot
+    come from a legacy controller; without that record every unproved
+    post-baseline receipt holds. Once it is present, trusted historical-writer
+    evidence (the durable writer registry, repository write access, or a
+    GitHub-attested repair run by that account) separates a retired-era writer
+    from an unrelated lookalike. A post-baseline receipt whose author has none of
+    that evidence is then a lookalike and stays ignored, so an unrelated
     commenter cannot suppress a repair by posting a receipt, whatever its
-    format. An overlapping older controller wrote with an account that still
-    has that evidence, so its unproved receipt holds regardless of format.
+    format. A receipt created at or before the retirement frontier can still be
+    from an overlapping older controller, so its unproved receipt holds
+    regardless of format.
 
     The second result reports that history exists which cannot be verified
     because the run inventory failed or is incomplete, or because a plausible
@@ -852,6 +923,8 @@ def _historical_receipt_writers(
     known = frozenset(_normalize_writer_logins("\n".join(known_writers)))
     baseline_text = str(baseline or "").strip()
     baseline_usable = bool(_ISO_TIMESTAMP_RE.match(baseline_text))
+    retired_text = str(legacy_retired or "").strip()
+    retired_usable = bool(_ISO_TIMESTAMP_RE.match(retired_text))
     for author, receipt, comment in unmatched:
         if author in verified:
             continue
@@ -887,12 +960,23 @@ def _historical_receipt_writers(
         # only the claim behind; its run may then be deleted. Without registry,
         # association, or run evidence that author cannot be told apart from a
         # historical writer, so the receipt fails closed instead of authorizing
-        # a duplicate dispatch. After the frontier an author with none of that
-        # evidence is an unrelated lookalike: holding for it would let any
-        # commenter suppress a repair, so it stays ignored instead.
+        # a duplicate dispatch.
         if predates_baseline:
             unverifiable = True
             break
+        # The baseline only proves that the registry existed, not that an older
+        # controller stopped writing. Until the trusted retirement record says
+        # every legacy instance is gone, a post-baseline receipt can still be a
+        # genuine spent attempt whose run was deleted after token rotation, so
+        # it must hold. Both records have second precision, so a receipt in the
+        # same second as the retirement instant is treated as older.
+        if not retired_usable or created <= retired_text:
+            unverifiable = True
+            break
+        # Strictly after both frontiers the author cannot be a legacy
+        # controller. An author with none of the trusted evidence above is then
+        # an unrelated lookalike: holding for it would let any commenter
+        # suppress a repair, so it stays ignored instead.
     return tuple(verified), unverifiable
 
 
@@ -974,6 +1058,9 @@ def run(args) -> int:
     # authoritative, so every pre-baseline receipt is unverifiable rather than a
     # lookalike: its dispatch run may already be deleted, and an accepted
     # dispatch whose outcome failed to persist can leave only a claim behind.
+    # The separate retirement record is the only trusted evidence that an older,
+    # possibly pinned, controller can no longer write legacy receipts after that
+    # frontier; without it every unproved post-baseline receipt holds.
     known_writers, registered_writers, registry_healthy = _historical_writer_registry(
         repository
     )
@@ -1009,6 +1096,13 @@ def run(args) -> int:
                 "recorded; holding instead of risking a duplicate dispatch."
             )
             return 0
+    legacy_retired, retirement_healthy = _read_legacy_retirement(repository)
+    if not retirement_healthy:
+        print(
+            "::warning::CI-repair legacy-controller retirement record cannot be "
+            "read; holding instead of risking a duplicate dispatch."
+        )
+        return 0
     historical_writers, unverifiable_history = _historical_receipt_writers(
         repository,
         pull_number,
@@ -1020,6 +1114,7 @@ def run(args) -> int:
         known_writers=known_writers,
         registry_available=True,
         baseline=baseline,
+        legacy_retired=legacy_retired,
     )
     if not args.dry_run:
         _, writers_durable = _persist_historical_writers(

@@ -4081,6 +4081,7 @@ class ContinuumTest < Minitest::Test
           runs,
           baseline='2026-11-11T00:00:00Z',
           receipt=receipt,
+          legacy_retired='2026-11-11T00:00:00Z',
       ):
           admission._workflow_runs = lambda *args, **kwargs: Inventory(runs)
           return admission._historical_receipt_writers(
@@ -4092,6 +4093,7 @@ class ContinuumTest < Minitest::Test
               owner_login='',
               trusted_logins=('github-actions[bot]',),
               baseline=baseline,
+              legacy_retired=legacy_retired,
           )
 
       verified, verified_hold = writers('NONE', [legacy])
@@ -4130,6 +4132,31 @@ class ContinuumTest < Minitest::Test
           'NONE', [], baseline='2026-11-11T00:00:00Z')
       result['post_baseline_legacy_dispatch_ignored'] = (
           post_baseline_legacy_dispatch_ignored)
+      _, post_baseline_none_overlap_hold = writers(
+          'NONE', [], baseline='2026-11-11T00:00:00Z', legacy_retired=None)
+      result['post_baseline_none_overlap_hold'] = post_baseline_none_overlap_hold
+      _, post_baseline_none_before_retirement_hold = writers(
+          'NONE',
+          [],
+          baseline='2026-11-11T00:00:00Z',
+          legacy_retired='2026-11-12T00:00:00Z',
+      )
+      result['post_baseline_none_before_retirement_hold'] = (
+          post_baseline_none_before_retirement_hold)
+      _, post_baseline_none_claim_overlap_hold = writers(
+          'NONE', [], baseline='2026-11-11T00:00:00Z',
+          receipt=claimed, legacy_retired=None)
+      result['post_baseline_none_claim_overlap_hold'] = (
+          post_baseline_none_claim_overlap_hold)
+      _, post_baseline_none_retired_lookalike = writers(
+          'NONE',
+          [],
+          baseline='2026-11-11T00:00:00Z',
+          receipt=claimed,
+          legacy_retired='2026-11-11T00:00:00Z',
+      )
+      result['post_baseline_none_retired_lookalike'] = (
+          post_baseline_none_retired_lookalike)
       print(json.dumps(result))
     PY
     stdout, stderr, status = Open3.capture3(
@@ -4174,6 +4201,17 @@ class ContinuumTest < Minitest::Test
            'a post-baseline legacy claim lookalike must not suppress a repair'
     refute result.fetch('post_baseline_legacy_dispatch_ignored'),
            'a post-baseline legacy dispatch lookalike must not suppress a repair'
+    assert result.fetch('post_baseline_none_overlap_hold'),
+           'a post-baseline NONE-association legacy dispatch with a deleted run ' \
+           'must hold until older controllers are retired'
+    assert result.fetch('post_baseline_none_claim_overlap_hold'),
+           'a post-baseline NONE-association legacy claim with a deleted run ' \
+           'must hold until older controllers are retired'
+    assert result.fetch('post_baseline_none_before_retirement_hold'),
+           'a receipt created at the retirement boundary must hold admission'
+    refute result.fetch('post_baseline_none_retired_lookalike'),
+           'after the retirement record an unrelated NONE lookalike must not ' \
+           'suppress a repair'
   end
 
   # The executor cannot repair a mutable branch tip. Every non-recovery ci-fix
