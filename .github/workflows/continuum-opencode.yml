@@ -4409,6 +4409,9 @@ jobs:
                   { owner, repo, pull_number: pullNumber, comment_id: findingId, body }
                 );
                 requested += 1;
+                // One inline request per run; serialized auto-merge owns the
+                // remaining exact-HEAD verifications after CI and quota wait.
+                break;
               }
               core.notice(`Requested verification for ${requested}/${batchItems.length} batched CodeRabbit finding(s) at ${headSha}.`);
               return;
@@ -4469,6 +4472,9 @@ jobs:
                   }
                 );
                 requested += 1;
+                // One inline request per run; serialized auto-merge owns the
+                // remaining exact-HEAD verifications after CI and quota wait.
+                break;
               }
 
               core.notice(
