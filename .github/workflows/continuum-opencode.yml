@@ -1164,8 +1164,10 @@ jobs:
           {
             echo "resumed=true"
             echo "checkpoint_sha=$CHECKPOINT_SHA"
-            echo "stage=${RECOVERY_STAGE:-implementation-incomplete}"
+            echo "checkpoint_ref=$RECOVERY_CHECKPOINT_REF"
+            echo "operation_id=$RECOVERY_OPERATION_ID"
             echo "generation=${RECOVERY_GENERATION:-0}"
+            echo "stage=${RECOVERY_STAGE:-implementation-incomplete}"
             case "${RECOVERY_STAGE:-implementation-incomplete}" in
               tests-passed|publish-pr) echo "skip_opencode=true" ;;
               *) echo "skip_opencode=false" ;;
@@ -3007,6 +3009,9 @@ jobs:
           RECOVERY_RESUMED: ${{ steps.recovery_restore.outputs.resumed }}
           RECOVERY_SKIP_OPENCODE: ${{ steps.recovery_restore.outputs.skip_opencode }}
           RECOVERY_STAGE_IN: ${{ steps.recovery_restore.outputs.stage }}
+          RECOVERY_OPERATION_ID_IN: ${{ steps.recovery_restore.outputs.operation_id }}
+          RECOVERY_CHECKPOINT_REF_IN: ${{ steps.recovery_restore.outputs.checkpoint_ref }}
+          RECOVERY_CHECKPOINT_SHA_IN: ${{ steps.recovery_restore.outputs.checkpoint_sha }}
           RECOVERY_GENERATION_IN: ${{ inputs.recovery_generation }}
           CONTINUUM_PREPARE_COMMAND: ${{ vars.CONTINUUM_PREPARE_COMMAND }}
           CONTINUUM_BUILD_COMMAND: ${{ vars.CONTINUUM_BUILD_COMMAND }}
@@ -3163,19 +3168,50 @@ jobs:
           BRANCH="opencode/issue${ISSUE_NUMBER}-${GITHUB_RUN_ID}"
           CHECKPOINT_BRANCH="opencode/checkpoint-issue${ISSUE_NUMBER}"
 
+          # kodmial/continuum#442: a checkpoint restore must identify its
+          # exact saved identity before the verification baseline. The
+          # workflow passes the expected ref/SHA, operation, generation and
+          # pinned snapshot; the engine validates them against the immutable
+          # checkpoint commit and refuses drift. Legacy checkpoints predate
+          # the 429 metadata contract, so their identity is read from the
+          # checkpoint's own recovery metadata for the marker only; the
+          # engine still validates the metadata itself.
+          RESUME_ACTIVE=false
+          RESUME_CHECKPOINT_REF=""
+          RESUME_CHECKPOINT_SHA=""
+          RESUME_OPERATION="opencode-issue-issue${ISSUE_NUMBER}"
+          RESUME_GENERATION=1
+          RESUME_FAILURE_RECORD="${RUNNER_TEMP:-/tmp}/continuum-checkpoint-resume-failure.json"
+          rm -f "$RESUME_FAILURE_RECORD"
+
           # kodmial/continuum#290: a fresh-VM 429 resumption already restored
           # the exact checkpoint (see Restore 429 recovery checkpoint). Base
           # the task branch on the restored HEAD instead of the base or the
           # legacy interruption checkpoint, so no validated work is discarded.
           if [[ "${RECOVERY_RESUMED:-}" == "true" ]]; then
+            RESUME_ACTIVE=true
+            RESUME_CHECKPOINT_REF="${RECOVERY_CHECKPOINT_REF_IN:-}"
+            RESUME_CHECKPOINT_SHA="$(git rev-parse HEAD)"
+            RESUME_OPERATION="${RECOVERY_OPERATION_ID_IN:-$RESUME_OPERATION}"
+            RESUME_GENERATION="${RECOVERY_GENERATION_IN:-1}"
             git switch -c "$BRANCH"
             echo "Continuing issue #$ISSUE_NUMBER on fresh VM from 429 checkpoint stage '${RECOVERY_STAGE_IN:-implementation-incomplete}'."
           elif git ls-remote --exit-code --heads origin "refs/heads/$CHECKPOINT_BRANCH" >/dev/null 2>&1; then
             # Resume the latest interruption checkpoint if one exists. This
             # branch is workflow-owned and is deleted after a PR is published.
+            RESUME_ACTIVE=true
+            RESUME_CHECKPOINT_REF="$CHECKPOINT_BRANCH"
             git fetch origin "$CHECKPOINT_BRANCH" --quiet
-            git switch -c "$BRANCH" FETCH_HEAD
-            echo "Resuming issue #$ISSUE_NUMBER from interruption checkpoint $CHECKPOINT_BRANCH."
+            RESUME_CHECKPOINT_SHA="$(git rev-parse FETCH_HEAD)"
+            RESUME_METADATA_JSON="$(git show "${RESUME_CHECKPOINT_SHA}:.continuum-429-recovery.json" 2>/dev/null || true)"
+            if [[ -n "$RESUME_METADATA_JSON" ]]; then
+              RESUME_METADATA_OPERATION="$(printf '%s' "$RESUME_METADATA_JSON" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("operation_id") or "")' 2>/dev/null || true)"
+              RESUME_METADATA_GENERATION="$(printf '%s' "$RESUME_METADATA_JSON" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("generation") or "")' 2>/dev/null || true)"
+              [[ -n "$RESUME_METADATA_OPERATION" ]] && RESUME_OPERATION="$RESUME_METADATA_OPERATION"
+              [[ "$RESUME_METADATA_GENERATION" =~ ^[1-9][0-9]*$ ]] && RESUME_GENERATION="$RESUME_METADATA_GENERATION"
+            fi
+            git switch -c "$BRANCH" "$RESUME_CHECKPOINT_SHA"
+            echo "Resuming issue #$ISSUE_NUMBER from interruption checkpoint $CHECKPOINT_BRANCH at $RESUME_CHECKPOINT_SHA."
           else
             git switch --detach "origin/$BASE_REF"
             git switch -c "$BRANCH"
@@ -3255,13 +3291,69 @@ jobs:
             SKIP_PRIMARY_IMPLEMENTATION=true
           fi
 
-          verification_python baseline \
-            --repo "$GITHUB_WORKSPACE" \
-            --evidence "$VERIFICATION_EVIDENCE_PATH" \
-            --base-sha "$BASE_START_SHA" || {
-              echo "::error::The repository-authoritative verification baseline could not be established; refusing to implement without a known baseline."
-              exit 1
-            }
+          BASELINE_ARGS=(
+            --repo "$GITHUB_WORKSPACE"
+            --evidence "$VERIFICATION_EVIDENCE_PATH"
+            --base-sha "$BASE_START_SHA"
+          )
+          if [[ "$RESUME_ACTIVE" == "true" ]]; then
+            BASELINE_ARGS+=(
+              --resume-repository "$GITHUB_REPOSITORY"
+              --resume-issue "$ISSUE_NUMBER"
+              --resume-generation "$RESUME_GENERATION"
+              --resume-operation "$RESUME_OPERATION"
+              --resume-checkpoint-ref "$RESUME_CHECKPOINT_REF"
+              --resume-checkpoint-sha "$RESUME_CHECKPOINT_SHA"
+              --resume-base-sha "$BASE_START_SHA"
+              --resume-snapshot-spec "$SNAPSHOT_SPEC"
+              --resume-mode "issue"
+              --resume-failure-record "$RESUME_FAILURE_RECORD"
+            )
+          fi
+          set +e
+          BASELINE_OUTPUT="$(verification_python baseline "${BASELINE_ARGS[@]}" 2>&1)"
+          BASELINE_RC=$?
+          set -e
+          printf '%s\n' "$BASELINE_OUTPUT"
+          if [[ "$BASELINE_RC" -ne 0 ]]; then
+            # Persist the deterministic failure identity once, as workflow
+            # evidence (never product code). The scheduler holds this exact
+            # checkpoint/base/snapshot instead of redispatched the identical
+            # pre-model rejection forever. The stored comment carries the
+            # `continuum-checkpoint-resume-blocked` marker.
+            if [[ "$RESUME_ACTIVE" == "true" && -s "$RESUME_FAILURE_RECORD" ]]; then
+              RESUME_MARKER="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1], encoding="utf-8")).get("marker") or "")' "$RESUME_FAILURE_RECORD" 2>/dev/null || true)"
+              RESUME_MARKER_LINE="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1], encoding="utf-8")).get("marker_line") or "")' "$RESUME_FAILURE_RECORD" 2>/dev/null || true)"
+              if [[ -n "$RESUME_MARKER" && -n "$RESUME_MARKER_LINE" ]]; then
+                if ! gh api --paginate --slurp "repos/$GITHUB_REPOSITORY/issues/$ISSUE_NUMBER/comments?per_page=100" 2>/dev/null \
+                  | jq -r --arg owner "$GITHUB_REPOSITORY_OWNER" '
+                      add // [] | .[] |
+                      select(
+                        (.author_association == "OWNER" or
+                         .author_association == "MEMBER" or
+                         .author_association == "COLLABORATOR" or
+                         (.user.login // "") == "github-actions[bot]" or
+                         (.user.login // "") == $owner)
+                      ) | .body // ""
+                    ' \
+                  | grep -Fq "$RESUME_MARKER_LINE"; then
+                  gh issue comment "$ISSUE_NUMBER" --repo "$GITHUB_REPOSITORY" \
+                    --body "$RESUME_MARKER" >/dev/null 2>&1 || true
+                fi
+              fi
+            fi
+            echo "::error::The repository-authoritative verification baseline could not be established; refusing to implement without a known baseline."
+            exit 1
+          fi
+          BASELINE_BASE_SHA="$(sed -n 's/^baseline_base_sha=//p' <<<"$BASELINE_OUTPUT" | tail -n 1)"
+          if [[ ! "$BASELINE_BASE_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::The verification baseline did not report its authoritative base SHA."
+            exit 1
+          fi
+          # The authoritative base is the checkpoint's original immutable
+          # base, which may be older than current main. Every later
+          # verification/changes check and 429 evacuation uses that same base.
+          BASE_START_SHA="$BASELINE_BASE_SHA"
           BASELINE_SUMMARY="$(verification_python summary --evidence "$VERIFICATION_EVIDENCE_PATH")"
 
           PROMPT="$(cat <<EOF

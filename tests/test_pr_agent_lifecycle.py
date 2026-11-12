@@ -144,16 +144,24 @@ APPROVED_433_OPENCODE_SHA256 = (
 # recovery guards (commit c5a628c) so an exit-1 after provider classification
 # still evacuates uncommitted agent changes. The structural test below pins
 # all five guarded executor paths; unrelated workflow drift remains forbidden.
+# #442 (main 7e4da5d) deliberately extends this exact protected workflow with
+# an issue-checkpoint identity check and isolated original-base verification.
+# This pin records the #442-only artifact for audit; the active pin below
+# covers the merged #442 + #446 bytes. Tests below and test_comment_attribution
+# independently enforce the recovery contract and its diagnostic provenance;
+# do not replace this pin with an allowlist or ignore workflow differences.
 APPROVED_PROVIDER_RECOVERY_OPENCODE_SHA256 = (
-    "bb2aef000e12b83f16f30b9ebc9c2d7e72987684e21a9be6b852b02d106f9ea2"
+    "386efdaef0c8568eec94f4d0185b9e8d8b1390d6fb82d136f4bc7929e3ff5df8"
 )
 
 # kodmial/continuum#446: the serialized exact-HEAD CI-repair admission owner
 # adds only the attempt/head correlation inputs and the dispatched-receipt
-# acknowledgement step. Keep the earlier pins above for audit; later drift
-# outside this reviewed change still fails closed.
+# acknowledgement step. The merge with main's #442 checkpoint-resume extension
+# keeps both reviewed changes, so this active pin covers the combined bytes.
+# Keep the earlier pins above for audit; later drift outside these reviewed
+# changes still fails closed.
 APPROVED_446_OPENCODE_SHA256 = (
-    "e7c648f39c73c954c2d13c7e6b9250c73938e5f41f8bbca6b7bde93e05194ba4"
+    "0d1c0fbc41dfb3003ac04c5d308550ce1b4fee57655d87a1ff52b6758fdd0a61"
 )
 APPROVED_446_CALLER_SHA256 = (
     "b7f3df118bc436526f48443b8f068372204073eb134c98e4a1543d025f314686"
