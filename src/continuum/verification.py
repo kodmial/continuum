@@ -37,6 +37,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Set, Tuple
 
+from . import checkpoint_resume
+
 SCHEMA_VERSION = 1
 
 #: Workflow-owned evidence. It is retained on a 429 checkpoint and removed at
@@ -1192,6 +1194,7 @@ def ensure_baseline(
     base_sha: str,
     environ: Optional[Mapping[str, str]] = None,
     timeout_seconds: Optional[float] = None,
+    resume: Optional[Mapping[str, Any]] = None,
 ) -> Tuple[Dict[str, Any], bool]:
     """Ensure a pre-change baseline exists for ``base_sha``.
 
@@ -1200,6 +1203,14 @@ def ensure_baseline(
     decides whether a post-change result is acceptable. An unresolved contract,
     malformed evidence, or an attempt to baseline an already-mutated checkout
     raises :class:`VerificationError` and must fail closed.
+
+    ``resume`` identifies a pinned interruption checkpoint. When its legacy
+    baseline is unattested, the checkout has necessarily moved past the task
+    base; instead of refusing (and losing the saved tree) the checkpoint is
+    validated first and the baseline is re-derived from its original immutable
+    base in an isolated worktree. The checkpoint's writable evidence is only a
+    provenance input: it is never trusted, reused, or allowed to mark the
+    implementation verified.
     """
 
     root = Path(repo)
@@ -1209,16 +1220,52 @@ def ensure_baseline(
     if not re.fullmatch(r"[0-9a-f]{40}", base):
         raise VerificationError("baseline base SHA is malformed")
 
-    data = _load_evidence(path, env)
-    contract = resolve_contract(root, env)
-    if not contract.configured:
-        raise VerificationError(contract.errors[0] if contract.errors else "unconfigured verification contract")
+    request: Optional[checkpoint_resume.ResumeRequest] = None
+    checkpoint: Optional[checkpoint_resume.ValidatedCheckpoint] = None
+    if resume is not None:
+        request = checkpoint_resume.ResumeRequest.from_mapping(resume)
+        checkpoint = checkpoint_resume.validate_checkpoint(
+            root, request, ignored_paths=WORKFLOW_OWNED_PATHS
+        )
+
+    attested = _attestation_key(env) is not None
+    data: Dict[str, Any]
+    if checkpoint is not None and not attested:
+        # Legacy checkpoint evidence is writable by the coding agent. Its
+        # content was already inspected from the immutable commit for
+        # provenance; the worktree copy is discarded rather than loaded.
+        data = {"schema_version": SCHEMA_VERSION}
+    else:
+        try:
+            data = _load_evidence(path, env)
+        except VerificationError as exc:
+            if checkpoint is None or "is not attested" not in str(exc):
+                if checkpoint is not None:
+                    raise checkpoint_resume.ResumeError(
+                        "evidence-tampered", str(exc)
+                    ) from exc
+                raise
+            # A legacy checkpoint has no attestation. With a key configured,
+            # _load_evidence refuses to trust it, which is exactly why this
+            # path re-establishes a fresh baseline instead of reusing it.
+            data = {"schema_version": SCHEMA_VERSION}
 
     existing = data.get("baseline")
+
     # Worktree evidence is reusable only when attested by the
     # runner-controlled key. An unattested baseline is never trusted after the
-    # coding agent could have rewritten it; an advanced checkout fails closed.
-    if isinstance(existing, dict) and _attestation_key(env) is not None:
+    # coding agent could have rewritten it.
+    if isinstance(existing, dict) and attested:
+        expected_base = checkpoint.base_sha if checkpoint is not None else base
+        contract = resolve_contract(
+            root, env, ref=expected_base if checkpoint is not None else ""
+        )
+        if not contract.configured:
+            raise VerificationError(
+                contract.errors[0]
+                if contract.errors
+                else "unconfigured verification contract"
+            )
         recorded_contract = existing.get("contract")
         recorded_fingerprint = ""
         if isinstance(recorded_contract, dict):
@@ -1228,17 +1275,25 @@ def ensure_baseline(
                 "the resolved verification contract changed after the baseline was recorded"
             )
         recorded_base = str(existing.get("base_sha") or "").strip().lower()
-        if recorded_base != base:
+        if recorded_base != expected_base:
             raise VerificationError(
                 "the recorded baseline belongs to a different task base"
             )
-        if not _is_ancestor(root, base):
+        if not _is_ancestor(root, expected_base):
             raise VerificationError(
                 "the recorded baseline base is not an ancestor of the current checkout"
             )
         return data, True
 
     head = _git_value(root, "rev-parse", "HEAD").lower()
+    if checkpoint is not None:
+        # A validated checkpoint may already be exactly at the expected base
+        # (an interrupted run with no saved change). It still must not inherit
+        # the checkpoint's writable verifier/final sections: rebuild the
+        # baseline from the checkpoint's original base and discard them.
+        return _secure_resume_baseline(
+            root, path, checkpoint, env, timeout_seconds
+        )
     if head != base:
         hint = ""
         if isinstance(existing, dict):
@@ -1256,6 +1311,13 @@ def ensure_baseline(
             "contains uncommitted task changes"
         )
 
+    contract = resolve_contract(root, env)
+    if not contract.configured:
+        raise VerificationError(
+            contract.errors[0]
+            if contract.errors
+            else "unconfigured verification contract"
+        )
     result = run_command_set(contract, root, env, timeout_seconds)
     result.update(
         {
@@ -1283,6 +1345,82 @@ def ensure_baseline(
         )
     else:
         print("Baseline verification passed for the resolved repository command set.")
+    return data, False
+
+
+def _secure_resume_baseline(
+    root: Path,
+    path: Path,
+    checkpoint: checkpoint_resume.ValidatedCheckpoint,
+    env: Mapping[str, str],
+    timeout_seconds: Optional[float],
+) -> Tuple[Dict[str, Any], bool]:
+    """Establish trusted pre-change evidence for an unattested checkpoint.
+
+    The contract is resolved from the checkpoint's original immutable base,
+    never from the advanced (and potentially edited) checkpoint tree. The
+    baseline runs in a temporary detached worktree at that base, so the saved
+    tree is untouched. Every old evidence section is discarded: only the new
+    baseline, the base-resolved contract, and provenance are written back.
+    """
+
+    contract = resolve_contract(root, env, ref=checkpoint.base_sha)
+    if not contract.configured:
+        raise checkpoint_resume.ResumeError(
+            "contract-unavailable",
+            contract.errors[0]
+            if contract.errors
+            else "no authoritative verification contract exists at the checkpoint base",
+        )
+
+    claimed = checkpoint_resume.evidence_contract_fingerprints(checkpoint.evidence)
+    if claimed and contract.fingerprint not in claimed:
+        raise checkpoint_resume.ResumeError(
+            "contract-drift",
+            "the checkpoint evidence claims a verification contract that does "
+            "not exist at its original base",
+        )
+
+    environment = environment_fingerprint(root, env)
+    previous_environment = ""
+    if isinstance(checkpoint.evidence, Mapping):
+        recorded_baseline = checkpoint.evidence.get("baseline")
+        if isinstance(recorded_baseline, Mapping):
+            previous_environment = str(
+                recorded_baseline.get("environment_fingerprint") or ""
+            )
+
+    result = _baseline_at_base(
+        root,
+        contract,
+        checkpoint.base_sha,
+        env,
+        timeout_seconds,
+        environment,
+        previous_environment=previous_environment,
+    )
+    data: Dict[str, Any] = {
+        "schema_version": SCHEMA_VERSION,
+        "contract": contract.as_dict(),
+        "baseline": result,
+        "resume_provenance": checkpoint.as_dict(),
+    }
+    _save_evidence(path, data, env)
+    print(
+        "Re-established a fresh verification baseline at the checkpoint's "
+        "original base {} in an isolated worktree; the checkpoint's "
+        "unattested evidence was discarded, not reused.".format(
+            checkpoint.base_sha
+        )
+    )
+    if result["state"] != "passed":
+        print(
+            "::warning::Baseline verification failed for: {}. The checkpoint "
+            "remains preserved; the implementation must not claim a green "
+            "result unless the same command set passes after the change.".format(
+                ", ".join(result["failed_commands"])
+            )
+        )
     return data, False
 
 
@@ -1689,12 +1827,64 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     try:
         if command == "baseline":
-            data, reused = ensure_baseline(
-                options.get("repo", "."),
-                options.get("evidence", EVIDENCE_FILE_NAME),
-                options.get("base_sha", ""),
+            resume = None
+            resume_keys = (
+                "resume_repository",
+                "resume_issue",
+                "resume_generation",
+                "resume_operation",
+                "resume_checkpoint_ref",
+                "resume_checkpoint_sha",
+                "resume_base_sha",
+                "resume_snapshot_spec",
+                "resume_mode",
             )
+            if any(options.get(key) for key in resume_keys):
+                resume = {
+                    "repository": options.get("resume_repository", ""),
+                    "issue": options.get("resume_issue", ""),
+                    "generation": options.get("resume_generation", ""),
+                    "operation": options.get("resume_operation", ""),
+                    "checkpoint_ref": options.get("resume_checkpoint_ref", ""),
+                    "checkpoint_sha": options.get("resume_checkpoint_sha", ""),
+                    "base_sha": options.get("resume_base_sha", ""),
+                    "snapshot_spec": options.get("resume_snapshot_spec", ""),
+                    "mode": options.get("resume_mode", "issue"),
+                }
+            try:
+                data, reused = ensure_baseline(
+                    options.get("repo", "."),
+                    options.get("evidence", EVIDENCE_FILE_NAME),
+                    options.get("base_sha", ""),
+                    resume=resume,
+                )
+            except checkpoint_resume.ResumeError as exc:
+                failure_path = options.get("resume_failure_record", "")
+                if failure_path:
+                    request = None
+                    try:
+                        request = checkpoint_resume.ResumeRequest.from_mapping(
+                            resume or {}
+                        )
+                    except checkpoint_resume.ResumeError:
+                        request = None
+                    if request is not None and checkpoint_resume.should_hold(exc):
+                        record = checkpoint_resume.failure_record(request, exc)
+                        Path(failure_path).write_text(
+                            json.dumps(
+                                record, ensure_ascii=False, sort_keys=True
+                            )
+                            + "\n",
+                            encoding="utf-8",
+                        )
+                print("::error::{}".format(exc), file=sys.stderr)
+                return 4
             print("baseline_reused={}".format(str(reused).lower()))
+            print(
+                "baseline_base_sha={}".format(
+                    str((data.get("baseline") or {}).get("base_sha") or "")
+                )
+            )
             _emit(data.get("baseline", {}))
             return 0
         if command == "needs-verifier":
