@@ -985,7 +985,7 @@ jobs:
           const CHAT_RATE_LIMIT_HEADING_RE =
             /^[ \t]{0,3}#{1,6}[ \t]*Rate[ \t]+Limit[ \t]+Exceeded[ \t]*\r?$/im;
           const CHAT_RATE_LIMIT_PROSE_RE =
-            /^[ \t]*(?!>)[^\n]*\bchat messages? per hour\b[^\n]*$/im;
+            /^[ \t]*(?!>)[^\n]*\b(?:exceeded|reached)\b[^\n]*\blimit\b[^\n]*\bchat messages? per hour\b[^\n]*$/im;
           const CHAT_COUNTDOWN_RE =
             /please\s+wait\s+\*{0,2}\s*((?:less\s+than\s+(?:a|one)\s+minute)|[0-9][^\n*]*?)\s*\*{0,2}\s+before\s+sending\s+another\s+message/i;
 
@@ -1095,14 +1095,25 @@ jobs:
           }
 
           function chatQuotaRetryAcknowledged(
-            comments, findingId, headSha, limitedCommentId, rootCommentId
+            comments, findingId, headSha, limitedCommentId, rootCommentId,
+            trustedAuthors = []
           ) {
+            const allowed = new Set(
+              Array.from(trustedAuthors || [])
+                .map(login => String(login || '').trim().toLowerCase())
+                .filter(Boolean)
+            );
+            if (!allowed.size) return false;
             const marker = chatQuotaRetryMarker(
               findingId, headSha, limitedCommentId
             );
             return (comments || []).some(comment =>
               (rootCommentId === undefined || rootCommentId === null ||
                comment.in_reply_to_id === rootCommentId) &&
+              allowed.has(
+                String(comment.user?.login || comment.author?.login || '')
+                  .trim().toLowerCase()
+              ) &&
               String(comment.body || '').includes(marker)
             );
           }
@@ -1760,7 +1771,9 @@ jobs:
           }
 
           function codeRabbitChatLimitNotBefore(comment) {
-            if (!isCodeRabbitChatLimitReply(comment)) return null;
+            if (classifyCodeRabbitReply(comment).kind !== 'chat_rate_limit') {
+              return null;
+            }
             const body = String(comment.body || '');
             const countdown = body.match(
               /please wait\s+\*\*([^*\n]{1,90})\*\*\s+before sending another message/i
@@ -1908,6 +1921,21 @@ jobs:
             let repairReconciliationDispatched = false;
             const chatQuotaState =
               sharedChatQuota || { remaining: 1, notBeforeMs: 0 };
+            // Only the account that posts this workflow's verification
+            // replies may acknowledge a chat-quota retry. Resolve the
+            // PAT-authenticated login once per pass; github-actions[bot]
+            // remains trusted for run-scoped verification markers.
+            const trustedChatRetryAuthors = new Set(['github-actions[bot]']);
+            try {
+              const { data: authenticated } =
+                await github.rest.users.getAuthenticated();
+              const login = String(authenticated?.login || '').trim();
+              if (login) trustedChatRetryAuthors.add(login);
+            } catch (err) {
+              core.warning(
+                `PR #${pr.number}: could not resolve the verification-reply author; only github-actions[bot] chat-quota acknowledgements are trusted: ${err.message || err}`
+              );
+            }
             for (const thread of threads) {
               if (!thread.commentId) continue;
 
@@ -2104,7 +2132,8 @@ jobs:
                   }
                   if (chatQuotaRetryAcknowledged(
                     comments, thread.commentId, pr.head.sha,
-                    pendingChatLimit.id, thread.commentId
+                    pendingChatLimit.id, thread.commentId,
+                    trustedChatRetryAuthors
                   )) {
                     core.info(
                       `PR #${pr.number}: CodeRabbit chat-quota retry for finding #${thread.commentId} was already sent for HEAD ${pr.head.sha}.`
@@ -2144,7 +2173,8 @@ jobs:
                 }
                 if (chatQuotaRetryAcknowledged(
                   comments, thread.commentId, pr.head.sha,
-                  pendingChatLimit.id, thread.commentId
+                  pendingChatLimit.id, thread.commentId,
+                  trustedChatRetryAuthors
                 )) {
                   core.info(
                     `PR #${pr.number}: CodeRabbit chat-quota retry for finding #${thread.commentId} was already sent for HEAD ${pr.head.sha}.`

@@ -78,7 +78,8 @@ _CHAT_RATE_LIMIT_HEADING_RE = re.compile(
     re.IGNORECASE | re.MULTILINE,
 )
 _CHAT_RATE_LIMIT_PROSE_RE = re.compile(
-    r"^[ \t]*(?!>)[^\n]*\bchat messages? per hour\b[^\n]*$",
+    r"^[ \t]*(?!>)[^\n]*\b(?:exceeded|reached)\b[^\n]*\blimit\b"
+    r"[^\n]*\bchat messages? per hour\b[^\n]*$",
     re.IGNORECASE | re.MULTILINE,
 )
 _CHAT_COUNTDOWN_RE = re.compile(
@@ -302,18 +303,32 @@ def chat_retry_acknowledged(
     head_sha: Any,
     limited_comment_id: Any,
     root_comment_id: Any = None,
+    trusted_author_logins: Sequence[Any] = (),
 ) -> bool:
     """Whether this exact chat-quota retry was already sent.
 
     The marker is stored in a thread reply, so it survives workflow
-    cancellation, controller restarts, and concurrent wakeups.
+    cancellation, controller restarts, and concurrent wakeups. Only the
+    accounts that post auto-merge verification replies may acknowledge the
+    retry; a copied marker from any other commenter never suppresses it.
     """
 
+    allowed = {
+        str(login or "").strip().lower()
+        for login in trusted_author_logins or ()
+        if str(login or "").strip()
+    }
+    if not allowed:
+        return False
     marker = chat_retry_marker(finding_id, head_sha, limited_comment_id)
     for comment in comments or []:
         if not isinstance(comment, Mapping):
             continue
         if root_comment_id is not None and comment.get("in_reply_to_id") != root_comment_id:
+            continue
+        user = comment.get("user")
+        login = str(user.get("login") or "") if isinstance(user, Mapping) else ""
+        if login.strip().lower() not in allowed:
             continue
         if marker in str(comment.get("body") or ""):
             return True

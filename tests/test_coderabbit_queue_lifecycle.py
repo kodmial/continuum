@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import textwrap
 import unittest
 from dataclasses import dataclass
 from pathlib import Path
@@ -778,12 +779,31 @@ class CodeRabbitChatBudgetRegressionTests(unittest.TestCase):
         if not shutil.which("node"):
             self.skipTest("Node.js unavailable")
         source = self._workflow()
+        quota_start = source.index(
+            "          // continuum-coderabbit-chat-quota:start"
+        )
+        quota_end = source.index(
+            "          // continuum-coderabbit-chat-quota:end", quota_start
+        )
+        quota_end = source.find("\n", quota_end)
+        quota_lines = source[quota_start:quota_end].splitlines()
+        quota_indent = min(
+            len(line) - len(line.lstrip(" "))
+            for line in quota_lines
+            if line.strip()
+        )
+        quota_block = textwrap.dedent(
+            "\n".join(
+                line[quota_indent:] if line.strip() else ""
+                for line in quota_lines
+            )
+        )
         begin = source.index("          // Installed consumers use this single canonical")
         end = source.index(
             "          function shouldRecheckCodeRabbitAfterCi(", begin
         )
         helper = source[begin:end]
-        harness = r"""
+        harness = quota_block + "\n" + r"""
 const assert = require('node:assert/strict');
 const owner = 'kodmial', repo = 'continuum';
 const pulls = [{number:448}, {number:449}];
@@ -822,6 +842,12 @@ global.Date = Clock;
     RealDate.parse('2026-11-12T08:08:41Z'));
   const spoof = {...rows[448][0], user:{login:'someone-else'}};
   assert.equal(codeRabbitChatLimitNotBefore(spoof), null);
+  const headingOnly = {...rows[448][0],
+    body:'### Rate Limit Exceeded\n' +
+      'Please wait **5 minutes** before sending another message.'};
+  assert.equal(codeRabbitChatLimitNotBefore(headingOnly),
+    RealDate.parse('2026-11-12T07:58:45Z'),
+    'heading-only trusted quota replies still set the shared deadline');
   const reviewQuota = {...rows[448][0],body:'Review rate limited. Next included review available in 41 minutes.'};
   assert.equal(codeRabbitChatLimitNotBefore(reviewQuota), null);
   assert.equal(await allowOneCodeRabbitChatRequest(), false,

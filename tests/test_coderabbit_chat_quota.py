@@ -156,6 +156,20 @@ class ChatQuotaParserTests(unittest.TestCase):
             with self.subTest(body=body):
                 self.assertEqual(rabbit.parse_chat_retry_delay_ms(body), expected)
 
+    def test_chat_messages_per_hour_without_quota_evidence_is_a_verdict(self):
+        body = (
+            "**UNRESOLVED**\n"
+            "The number of chat messages per hour is not tracked across "
+            "threads, so this finding still needs a code change."
+        )
+        self.assertIsNone(rabbit.parse_chat_retry_delay_ms(body))
+        self.assertEqual(
+            rabbit.classify_coderabbit_reply(
+                body, author_login="coderabbitai[bot]"
+            )["kind"],
+            "verdict",
+        )
+
     def test_fake_author_and_quoted_text_are_never_provider_quota(self):
         body = fixture("chat-rate-limit-pr448.json")["threads"][0]["replies"][0]["body"]
         self.assertEqual(
@@ -248,7 +262,11 @@ class ChatQuotaParserTests(unittest.TestCase):
         body = fixture("chat-rate-limit-pr448.json")["threads"][0]["replies"][0]
         head = "43e40cee0f1e664f55854c0bb0e017fb01c30669"
         marker = rabbit.chat_retry_marker(4546745854, head, body["id"])
-        reply = {"in_reply_to_id": 4546745854, "body": marker}
+        reply = {
+            "in_reply_to_id": 4546745854,
+            "user": {"login": "github-actions[bot]"},
+            "body": marker,
+        }
         self.assertTrue(
             rabbit.chat_retry_acknowledged(
                 [reply],
@@ -256,6 +274,18 @@ class ChatQuotaParserTests(unittest.TestCase):
                 head_sha=head,
                 limited_comment_id=body["id"],
                 root_comment_id=4546745854,
+                trusted_author_logins=("github-actions[bot]",),
+            )
+        )
+        # A copied marker from any other commenter never suppresses the retry.
+        self.assertFalse(
+            rabbit.chat_retry_acknowledged(
+                [{**reply, "user": {"login": "random"}}],
+                finding_id=4546745854,
+                head_sha=head,
+                limited_comment_id=body["id"],
+                root_comment_id=4546745854,
+                trusted_author_logins=("github-actions[bot]",),
             )
         )
         # A DIFFERENT HEAD, finding, quota reply, or thread never reuses it.
@@ -270,6 +300,7 @@ class ChatQuotaParserTests(unittest.TestCase):
                 "head_sha": head,
                 "limited_comment_id": body["id"],
                 "root_comment_id": 4546745854,
+                "trusted_author_logins": ("github-actions[bot]",),
             }
             arguments.update(kwargs)
             with self.subTest(kwargs=kwargs):
@@ -386,6 +417,7 @@ class ChatQuotaRuntimeParityTests(unittest.TestCase):
             "Review limit reached. Your next review is available after 1 hour 5 minutes.",
             "### Rate Limit Exceeded\nPlease wait before sending another message.",
             "> ### Rate Limit Exceeded\n> Please wait **14 minutes and 56 seconds** before sending another message.",
+            "**UNRESOLVED**\nThe number of chat messages per hour is not tracked across threads, so this finding still needs a code change.",
             "**RESOLVED** the finding is fixed.",
         ]
         expected = [
@@ -453,34 +485,42 @@ assert.ok(marker.includes(`finding=${{finding}}`));
 assert.ok(marker.includes(`head=${{head}}`));
 assert.ok(marker.includes(`limited=${{limited}}`));
 const threadRoot = {finding};
+const trusted = ['github-actions[bot]'];
 const comments = [];
 // First event: nothing was sent yet.
 assert.equal(chatQuotaRetryAcknowledged(
-  comments, finding, head, limited, threadRoot
+  comments, finding, head, limited, threadRoot, trusted
 ), false);
-// The retry is posted once as a thread reply.
-comments.push({{id: 900, in_reply_to_id: threadRoot, body: marker}});
+// The retry is posted once as a thread reply by the verification account.
+comments.push({{id: 900, in_reply_to_id: threadRoot,
+  user: {{login: 'github-actions[bot]'}}, body: marker}});
 assert.equal(chatQuotaRetryAcknowledged(
-  comments, finding, head, limited, threadRoot
+  comments, finding, head, limited, threadRoot, trusted
 ), true);
+// A copied marker from any other commenter never acknowledges the retry.
+const forged = [{{id: 901, in_reply_to_id: threadRoot,
+  user: {{login: 'random'}}, body: marker}}];
+assert.equal(chatQuotaRetryAcknowledged(
+  forged, finding, head, limited, threadRoot, trusted
+), false);
 // A restart re-reads the same durable comments and must not send again.
 const restarted = JSON.parse(JSON.stringify(comments));
 assert.equal(chatQuotaRetryAcknowledged(
-  restarted, finding, head, limited, threadRoot
+  restarted, finding, head, limited, threadRoot, trusted
 ), true);
 // A concurrent cron/webhook on the perfect next event also sees the ack.
 assert.equal(chatQuotaRetryAcknowledged(
-  restarted.concat([]), finding, head, limited, threadRoot
+  restarted.concat([]), finding, head, limited, threadRoot, trusted
 ), true);
 // Wrong HEAD, wrong finding, and wrong quota reply are different retries.
 assert.equal(chatQuotaRetryAcknowledged(
-  restarted, finding, 'f'.repeat(40), limited, threadRoot
+  restarted, finding, 'f'.repeat(40), limited, threadRoot, trusted
 ), false);
 assert.equal(chatQuotaRetryAcknowledged(
-  restarted, finding + 1, head, limited, threadRoot
+  restarted, finding + 1, head, limited, threadRoot, trusted
 ), false);
 assert.equal(chatQuotaRetryAcknowledged(
-  restarted, finding, head, limited + 1, threadRoot
+  restarted, finding, head, limited + 1, threadRoot, trusted
 ), false);
 """
         self.run_block(checks)
@@ -553,6 +593,11 @@ const github = {
       created_at: new Date().toISOString(),
       body: args.body,
     });
+  },
+  rest: {
+    users: {
+      getAuthenticated: async () => ({data: {login: 'github-actions[bot]'}}),
+    },
   },
 };
 const shouldRecheckCodeRabbitAfterCi = () => false;
@@ -689,6 +734,24 @@ results.ack = {{
   posted: posted.length,
 }};
 
+// 4b. A copied marker from any other commenter never suppresses the retry.
+comments = [
+  {{id: requestId, in_reply_to_id: finding, user: {{login: 'kodmial'}},
+    created_at: new Date(now - 3 * 60_000).toISOString(), body: marker}},
+  {{id: chatId, in_reply_to_id: finding, user: {{login: 'coderabbitai[bot]'}},
+    created_at: expired, body: chatBody}},
+  {{id: chatId + 2, in_reply_to_id: finding, user: {{login: 'random'}},
+    created_at: new Date(now - 30_000).toISOString(),
+    body: chatQuotaRetryMarker(finding, head, chatId)}},
+];
+posted = [];
+results.forged = {{
+  requested: await requestCodeRabbitThreadVerification(
+    pr, liveThreads, {{}}, {{remaining: 1, notBeforeMs: 0}}
+  ),
+  posted: posted.length,
+}};
+
 // 5. A resolved finding, a moved HEAD, or a closed PR skips the stale retry,
 //    even when the original chat reply is beyond its deadline.
 comments = [
@@ -756,6 +819,8 @@ process.stdout.write(JSON.stringify(results));
         self.assertEqual(result["restart"]["requested"], 0)
         self.assertEqual(result["restart"]["posted"], 0)
         self.assertEqual(result["ack"]["posted"], 0)
+        self.assertEqual(result["forged"]["requested"], 1)
+        self.assertEqual(result["forged"]["posted"], 1)
         self.assertEqual(result["resolved"]["posted"], 0)
         self.assertEqual(result["moved"]["posted"], 0)
         self.assertEqual(result["closed"]["posted"], 0)
@@ -905,6 +970,21 @@ const github = {{
         self.assertEqual(out["should_run"], "false")
         self.assertEqual(out["items_json"], "[]")
 
+    def test_chat_message_explanation_without_quota_evidence_still_dispatches(self):
+        out = self.run_collector(
+            "{id: 105, in_reply_to_id: 100, "
+            "user: {login: 'coderabbitai[bot]'}, "
+            "pull_request_review_id: 11, "
+            "created_at: '2026-11-12T08:09:00Z', "
+            "body: '**UNRESOLVED**\\nThe number of chat messages per hour is "
+            "not tracked across threads, so the defect remains.'}"
+        )
+        self.assertEqual(out["should_run"], "true")
+        self.assertEqual(
+            [item["finding_id"] for item in json.loads(out["items_json"])],
+            [100],
+        )
+
     def test_substantive_unresolved_still_dispatches(self):
         out = self.run_collector(
             "{id: 103, in_reply_to_id: 100, "
@@ -974,6 +1054,7 @@ class ChatQuotaDurableStateTests(unittest.TestCase):
             {
                 "id": 10,
                 "in_reply_to_id": chosen["finding"],
+                "user": {"login": "github-actions[bot]"},
                 "body": marker,
             }
         ]
@@ -984,6 +1065,7 @@ class ChatQuotaDurableStateTests(unittest.TestCase):
                 head_sha=chosen["head"],
                 limited_comment_id=chosen["reply"]["id"],
                 root_comment_id=chosen["finding"],
+                trusted_author_logins=("github-actions[bot]",),
             )
         )
         # On the next wakeup (or a restarted runner) the exact same retry is
@@ -998,6 +1080,7 @@ class ChatQuotaDurableStateTests(unittest.TestCase):
                     head_sha=candidate["head"],
                     limited_comment_id=candidate["reply"]["id"],
                     root_comment_id=candidate["finding"],
+                    trusted_author_logins=("github-actions[bot]",),
                 )
             ),
             1,

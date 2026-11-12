@@ -97,7 +97,7 @@ jobs:
             const CHAT_RATE_LIMIT_HEADING_RE =
               /^[ \t]{0,3}#{1,6}[ \t]*Rate[ \t]+Limit[ \t]+Exceeded[ \t]*\r?$/im;
             const CHAT_RATE_LIMIT_PROSE_RE =
-              /^[ \t]*(?!>)[^\n]*\bchat messages? per hour\b[^\n]*$/im;
+              /^[ \t]*(?!>)[^\n]*\b(?:exceeded|reached)\b[^\n]*\blimit\b[^\n]*\bchat messages? per hour\b[^\n]*$/im;
             const CHAT_COUNTDOWN_RE =
               /please\s+wait\s+\*{0,2}\s*((?:less\s+than\s+(?:a|one)\s+minute)|[0-9][^\n*]*?)\s*\*{0,2}\s+before\s+sending\s+another\s+message/i;
 
@@ -207,14 +207,25 @@ jobs:
             }
 
             function chatQuotaRetryAcknowledged(
-              comments, findingId, headSha, limitedCommentId, rootCommentId
+              comments, findingId, headSha, limitedCommentId, rootCommentId,
+              trustedAuthors = []
             ) {
+              const allowed = new Set(
+                Array.from(trustedAuthors || [])
+                  .map(login => String(login || '').trim().toLowerCase())
+                  .filter(Boolean)
+              );
+              if (!allowed.size) return false;
               const marker = chatQuotaRetryMarker(
                 findingId, headSha, limitedCommentId
               );
               return (comments || []).some(comment =>
                 (rootCommentId === undefined || rootCommentId === null ||
                  comment.in_reply_to_id === rootCommentId) &&
+                allowed.has(
+                  String(comment.user?.login || comment.author?.login || '')
+                    .trim().toLowerCase()
+                ) &&
                 String(comment.body || '').includes(marker)
               );
             }
