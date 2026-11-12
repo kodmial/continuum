@@ -456,6 +456,8 @@ class CheckpointResumeHoldRegressionTests(unittest.TestCase):
 const assert = require('assert');
 const { execFileSync } = require('child_process');
 const dispatchMarker = '<!-- issue-scheduler-dispatch -->';
+const opencodeWorkflowPath = '.github/workflows/opencode.yml';
+const opencodeWorkflowName = 'OpenCode agent';
 const core = { warning: () => {} };
 function isTrustedStopComment(c, owner) {
   return ['OWNER', 'MEMBER', 'COLLABORATOR'].includes(c.author_association) ||
@@ -495,8 +497,24 @@ function classifyComments(bodies) {
   const auto = item(2, '/oc\n\n<!-- issue-scheduler-dispatch -->');
   const watchdog = item(3, '/oc\n\n<!-- opencode-watchdog-retry -->');
   const manual = item(4, '/oc\ncheck again');
-  const client = (tip = sha) => ({
-    rest: { git: { getRef: async () => ({ data: { object: { sha: tip } } }) } }
+  const client = (tip = sha, workflowRuns = []) => ({
+    rest: {
+      git: { getRef: async () => ({ data: { object: { sha: tip } } }) },
+      actions: {
+        listWorkflowRunsForRepo: async () => ({
+          data: { workflow_runs: workflowRuns }
+        })
+      }
+    }
+  });
+  const issueRun = (createdAt = '2026-11-12T04:30:00Z', overrides = {}) => ({
+    id: 900,
+    name: 'OpenCode agent',
+    path: '.github/workflows/opencode.yml',
+    event: 'issue_comment',
+    display_title: 'OpenCode issue #442',
+    created_at: createdAt,
+    ...overrides
   });
   const hold = (comments, cl = client()) =>
     checkpointResumeHold('kodmial', 'continuum', 442, comments, cl);
@@ -521,6 +539,38 @@ function classifyComments(bodies) {
     'an indented /oc code block must not waive the hold'
   );
   assert.equal(await hold([saved, manual]), null, 'manual owner /oc may resume');
+  assert.ok(
+    await hold([saved, manual], client(sha, [issueRun()])),
+    'an owner /oc whose own OpenCode run already started consumes the override'
+  );
+  assert.equal(
+    await hold(
+      [saved, manual], client(sha, [issueRun('2026-11-12T04:00:00Z')])
+    ),
+    null,
+    'a run older than the owner /oc must not consume the override'
+  );
+  assert.equal(
+    await hold(
+      [saved, manual],
+      client(sha, [issueRun('2026-11-12T04:30:00Z', {
+        display_title: 'OpenCode issue #999'
+      })])
+    ),
+    null,
+    'an OpenCode run for another issue must not consume the override'
+  );
+  assert.ok(
+    await hold([saved, manual], {
+      rest: {
+        git: { getRef: async () => ({ data: { object: { sha } } }) },
+        actions: {
+          listWorkflowRunsForRepo: async () => { throw { status: 503 }; }
+        }
+      }
+    }),
+    'an unreadable run inventory must keep the hold fail-closed'
+  );
   const retried = item(9, marker.replace(
     ' reason=verification-failed -->',
     ' reason=verification-failed episode=run-9-1 -->'
@@ -555,6 +605,10 @@ function classifyComments(bodies) {
   );
   assert.equal(await hold([saved, manual], client('d'.repeat(40))), null,
     'changed checkpoint SHA still releases a manual override');
+  assert.equal(
+    await hold([saved, manual], client('d'.repeat(40), [issueRun()])), null,
+    'a changed checkpoint still releases the hold after an owner retry run'
+  );
   assert.equal(await hold([item(1, marker, 'outsider')]), null,
     'untrusted authors cannot impose a hold');
   assert.ok(await hold([saved], {rest: {git: {
@@ -606,6 +660,18 @@ function classifyComments(bodies) {
             root / ".github/workflows/continuum-opencode-watchdog.yml"
         ).read_text(encoding="utf-8")
         self.assertEqual(scheduler.count("await checkpointResumeHold("), 3)
+        self.assertIn(
+            "async function openCodeIssueRunStartedAfter(", scheduler
+        )
+        self.assertIn(
+            "await openCodeIssueRunStartedAfter(", scheduler
+        )
+        self.assertIn(
+            "async function openCodeIssueRunStartedAfter(", watchdog
+        )
+        self.assertIn(
+            "await openCodeIssueRunStartedAfter(", watchdog
+        )
         self.assertIn("await removeLabel(issueNumber, inProgressLabel)", scheduler)
         self.assertIn("!body.includes(dispatchMarker)", scheduler)
         self.assertIn("!body.includes(watchdogOriginMarker)", scheduler)

@@ -156,6 +156,9 @@ function makeRest() {
           page: Number(params.page || 1),
           per_page: Number(params.per_page || 30),
         });
+        if (!params.status && scenario.holdRunListError) {
+          throw apiError(scenario.holdRunListError, 'run inventory failed');
+        }
         if (params.status && scenario.activeRunsError) {
           throw apiError(scenario.activeRunsError, 'active run listing failed');
         }
@@ -1225,6 +1228,70 @@ class WatchdogHarness(unittest.TestCase):
         ])
         result = self.run_scenario(scenario)
         self.assertEqual(self.retried_bodies(result), [])
+
+    def test_unpublished_failed_manual_retry_consumes_the_override(self):
+        # The publisher fails closed when it cannot record the new rejection
+        # episode. The owner's own /oc run is still a durable record that the
+        # one-shot override was already used, so no automatic retry follows.
+        scenario = self.normal_retry_scenario()
+        scenario["comments"].extend([
+            thread_comment(20, hold_marker(), "2026-10-23T09:50:00Z"),
+            thread_comment(
+                21, "/oc", "2026-10-23T10:00:00Z", login="kodmial"
+            ),
+        ])
+        scenario["runs"].append({
+            "id": 4444,
+            "status": "completed",
+            "conclusion": "failure",
+            "event": "issue_comment",
+            "path": ".github/workflows/opencode.yml",
+            "name": "OpenCode agent",
+            "display_title": "OpenCode issue #382",
+            "created_at": "2026-10-23T10:00:05Z",
+        })
+        result = self.run_scenario(scenario)
+        self.assertEqual(self.retried_bodies(result), [], result["comments"])
+
+    def test_manual_retry_run_for_another_issue_keeps_the_release(self):
+        scenario = self.normal_retry_scenario()
+        scenario["comments"].extend([
+            thread_comment(20, hold_marker(), "2026-10-23T09:50:00Z"),
+            thread_comment(
+                21, "/oc", "2026-10-23T10:00:00Z", login="kodmial"
+            ),
+        ])
+        scenario["runs"].append({
+            "id": 4445,
+            "status": "completed",
+            "conclusion": "failure",
+            "event": "issue_comment",
+            "path": ".github/workflows/opencode.yml",
+            "name": "OpenCode agent",
+            "display_title": "OpenCode issue #999",
+            "created_at": "2026-10-23T10:00:05Z",
+        })
+        result = self.run_scenario(scenario)
+        self.assertEqual(len(self.retried_bodies(result)), 1, result["comments"])
+
+    def test_unreadable_run_inventory_keeps_the_hold(self):
+        scenario = self.normal_retry_scenario()
+        scenario["comments"].extend([
+            thread_comment(20, hold_marker(), "2026-10-23T09:50:00Z"),
+            thread_comment(
+                21, "/oc", "2026-10-23T10:00:00Z", login="kodmial"
+            ),
+        ])
+        scenario["holdRunListError"] = 503
+        result = self.run_scenario(scenario)
+        self.assertEqual(self.retried_bodies(result), [], result["comments"])
+        self.assertTrue(
+            any(
+                "run inventory is unavailable" in " ".join(line)
+                for line in result["notices"]
+            ),
+            result["notices"],
+        )
 
     def test_manual_retry_hold_releases_on_a_changed_checkpoint(self):
         scenario = self.normal_retry_scenario()

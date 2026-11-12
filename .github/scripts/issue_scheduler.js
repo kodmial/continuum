@@ -742,7 +742,8 @@ module.exports = async function runIssueScheduler({ github, context, core }) {
   // this exact identity. A new checkpoint tip, a new pinned task snapshot,
   // checkpoint deletion, or a later owner /oc are material premise changes.
   // Every failed retry publishes a new rejection marker episode, so an
-  // owner /oc releases the hold only until that retry's own marker arrives.
+  // owner /oc releases the hold only until that retry's own marker arrives,
+  // and only while the owner's own retry run has not started yet.
   //
   // Two different generation concepts meet here and must never be compared
   // with each other:
@@ -753,6 +754,49 @@ module.exports = async function runIssueScheduler({ github, context, core }) {
   //   * a `continuum-task-snapshot` marker's `generation` is the *task*
   //     generation, which the workflow pins to 1 (`continuum-opencode.yml`).
   //     Only that generation can release the hold with a different spec.
+  //
+  // A manual owner /oc is a one-shot override, not an open-ended release. The
+  // owner command itself starts an OpenCode issue run, and GitHub records that
+  // run durably. Once that run exists, the override is consumed: a failed
+  // retry that could not publish its own rejection episode (the publisher
+  // fails closed instead of pretending the hold was recorded) must never let
+  // a later wake redispatch the identical checkpoint. A run inventory that
+  // cannot be read stays fail-closed for the same reason.
+  async function openCodeIssueRunStartedAfter(
+    targetOwner, targetRepo, issueNumber, order, client
+  ) {
+    const expectedTitle = 'OpenCode issue #' + issueNumber;
+    const runs = [];
+    try {
+      for (let page = 1; page <= 3; page += 1) {
+        const { data } = await client.rest.actions.listWorkflowRunsForRepo({
+          owner: targetOwner,
+          repo: targetRepo,
+          per_page: 100,
+          page,
+        });
+        const batch = (data && data.workflow_runs) || [];
+        runs.push(...batch);
+        if (batch.length < 100) break;
+      }
+    } catch (err) {
+      core.warning(
+        'OpenCode run inventory is unavailable for #' + issueNumber +
+        '; keeping the deterministic hold because the owner override ' +
+        'cannot be proven unconsumed.'
+      );
+      return true;
+    }
+    return runs.some(run =>
+      (run.path === opencodeWorkflowPath ||
+        (opencodeWorkflowName !== '' && run.name === opencodeWorkflowName)) &&
+      String(run.display_title || '') === expectedTitle &&
+      stopOrderKey({
+        created_at: run.created_at || '',
+        id: run.id || 0,
+      }) > order
+    );
+  }
   async function checkpointResumeHold(
     targetOwner, targetRepo, issueNumber, comments, client, taskGeneration = 1
   ) {
@@ -802,6 +846,7 @@ module.exports = async function runIssueScheduler({ github, context, core }) {
       String(comment.user?.login || '').toLowerCase() ===
         String(targetOwner || '').toLowerCase()
     );
+    let manualOwnerRelease = false;
     if (laterOwnerComments.length > 0) {
       const ownerClasses = classifyComments(
         laterOwnerComments.map(comment => String(comment.body || ''))
@@ -839,11 +884,21 @@ module.exports = async function runIssueScheduler({ github, context, core }) {
         });
         if (order > latestManualOwnerOrder) latestManualOwnerOrder = order;
       }
+      // A recorded automatic dispatch consumes the override. The owner's own
+      // /oc run is equally durable evidence that the one-shot override was
+      // already used, so a failed retry that could not publish its own new
+      // rejection episode keeps the hold instead of letting this wake
+      // redispatch the identical checkpoint.
       if (
         latestManualOwnerOrder &&
-        !automationDispatchOrders.some(order => order > latestManualOwnerOrder)
+        !automationDispatchOrders.some(
+          order => order > latestManualOwnerOrder
+        ) &&
+        !(await openCodeIssueRunStartedAfter(
+          targetOwner, targetRepo, issueNumber, latestManualOwnerOrder, client
+        ))
       ) {
-        return null;
+        manualOwnerRelease = true;
       }
     }
 
@@ -882,7 +937,7 @@ module.exports = async function runIssueScheduler({ github, context, core }) {
     // A changed or deleted durable checkpoint ref is a material premise
     // change. A failed read stays fail-closed: no automatic redispatch.
     if (!marker.checkpointRef || marker.checkpointRef === '-') {
-      return marker;
+      return manualOwnerRelease ? null : marker;
     }
     try {
       const refName = marker.checkpointRef.replace(/^refs\/heads\//, '');
@@ -900,7 +955,7 @@ module.exports = async function runIssueScheduler({ github, context, core }) {
         '; keeping the deterministic hold until it can be proven changed.'
       );
     }
-    return marker;
+    return manualOwnerRelease ? null : marker;
   }
 
   function checkpointResumeHoldSkipReason(issueNumber, hold) {

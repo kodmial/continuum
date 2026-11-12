@@ -1132,6 +1132,44 @@ jobs:
             // publishes a new rejection marker episode, which restores the
             // hold until the next material premise change. A failed ref read
             // keeps the hold fail-closed.
+            //
+            // A manual owner /oc is a one-shot override, not an open-ended
+            // release. The owner command itself starts an OpenCode issue run,
+            // and GitHub records that run durably. Once such a run exists the
+            // override is consumed: if the failed retry could not publish its
+            // own rejection episode, this wake must not redispatch the
+            // identical checkpoint behind the owner's back. An unreadable run
+            // inventory stays fail-closed for the same reason.
+            async function openCodeIssueRunStartedAfter(order, issueNumber) {
+              const expectedTitle = 'OpenCode issue #' + issueNumber;
+              const runs = [];
+              try {
+                for (let page = 1; page <= 3; page += 1) {
+                  const { data } = await readGithub.rest.actions
+                    .listWorkflowRunsForRepo({
+                      owner, repo, per_page: 100, page,
+                    });
+                  const batch = (data && data.workflow_runs) || [];
+                  runs.push(...batch);
+                  if (batch.length < 100) break;
+                }
+              } catch (err) {
+                core.warning(
+                  'OpenCode run inventory is unavailable for #' +
+                  issueNumber + '; keeping the deterministic hold because ' +
+                  'the owner override cannot be proven unconsumed.'
+                );
+                return true;
+              }
+              return runs.some(candidate => (
+                isOpenCodeWorkflowCandidate(candidate) &&
+                String(candidate.display_title || '') === expectedTitle &&
+                checkpointCommentOrder({
+                  created_at: candidate.created_at || '',
+                  id: candidate.id || 0,
+                }) > order
+              ));
+            }
             async function checkpointResumeHold(
               issueNumber, comments, recoveryCheckpointRef = null
             ) {
@@ -1242,6 +1280,7 @@ jobs:
                 String(comment.user?.login || '').toLowerCase() ===
                   owner.toLowerCase()
               );
+              let manualOwnerRelease = false;
               if (laterOwnerComments.length > 0) {
                 const classes = classifyComments(
                   laterOwnerComments.map(comment => String(comment.body || ''))
@@ -1282,16 +1321,24 @@ jobs:
                     latestManualOwnerOrder = order;
                   }
                 }
+                // The owner's own /oc run is durable evidence that the
+                // one-shot override was already used. A failed retry that
+                // could not publish its new rejection episode therefore keeps
+                // the hold instead of letting this wake redispatch the
+                // identical checkpoint.
                 if (
                   latestManualOwnerOrder &&
                   !automationDispatchOrders.some(
                     order => order > latestManualOwnerOrder
-                  )
+                  ) &&
+                  !(await openCodeIssueRunStartedAfter(
+                    latestManualOwnerOrder, wantedIssue
+                  ))
                 ) {
-                  return { blocked: false, marker };
+                  manualOwnerRelease = true;
                 }
               }
-              return { blocked: true, marker };
+              return { blocked: !manualOwnerRelease, marker };
             }
             async function discoverDurableRecoveryCandidates() {
               const reserved = await readGithub.paginate(
