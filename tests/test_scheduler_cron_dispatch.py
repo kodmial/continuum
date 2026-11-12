@@ -479,9 +479,9 @@ function stopOrderKey(c) {
     user: { login }, author_association: login === 'outsider' ? 'NONE' : 'OWNER'
   });
   const saved = item(1, marker);
-  const auto = item(2, '/oc\\n\\n<!-- issue-scheduler-dispatch -->');
-  const watchdog = item(3, '/oc\\n\\n<!-- opencode-watchdog-retry -->');
-  const manual = item(4, '/oc\\ncheck again');
+  const auto = item(2, '/oc\n\n<!-- issue-scheduler-dispatch -->');
+  const watchdog = item(3, '/oc\n\n<!-- opencode-watchdog-retry -->');
+  const manual = item(4, '/oc\ncheck again');
   const client = (tip = sha) => ({
     rest: { git: { getRef: async () => ({ data: { object: { sha: tip } } }) } }
   });
