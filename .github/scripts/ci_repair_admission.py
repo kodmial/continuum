@@ -94,10 +94,11 @@ _ISO_TIMESTAMP_RE = re.compile(
 # no run proves that writer, admission must hold instead of treating the
 # receipt as absent. After the registry baseline is established, an unrelated
 # commenter without repository write access can neither authorize nor suppress
-# a repair, because only receipts created after the frontier are classified as
-# lookalikes. Any receipt created at or before it stays unverifiable: its run
-# may already be deleted, and an accepted dispatch whose outcome failed to
-# persist can leave only a ``claimed`` receipt behind.
+# a repair: only a receipt created after the frontier whose author has no
+# trusted writer evidence is classified as a lookalike. Any receipt created at
+# or before it stays unverifiable: its run may already be deleted, and an
+# accepted dispatch whose outcome failed to persist can leave only a
+# ``claimed`` receipt behind.
 _HISTORICAL_WRITER_ASSOCIATIONS = frozenset({"MEMBER", "COLLABORATOR"})
 #: Legacy comma/newline-separated registry of logins that authored trusted
 #: receipts. It is only read now: a pre-existing value is migrated into
@@ -118,22 +119,6 @@ _CI_REPAIR_WRITER_VARIABLE_PREFIX = "CONTINUUM_CI_REPAIR_WRITER_"
 #: comparison is inclusive. The name deliberately does not start with the
 #: per-writer prefix.
 _CI_REPAIR_WRITERS_BASELINE_VARIABLE = "CONTINUUM_CI_REPAIR_WRITERS_BASELINE"
-#: Hidden marker emitted by this admission writer. An older controller can
-#: still be running or pinned after the migration baseline is established, and
-#: it cannot emit this marker. Therefore an unproved receipt without the marker
-#: stays unverifiable regardless of its timestamp: treating it as a
-#: post-baseline lookalike would let an overlapping old controller spend the
-#: same exact HEAD twice. A marked receipt without proof is a lookalike (for
-#: example, copied text from a current receipt), so unrelated commenters still
-#: cannot suppress repair in the current format.
-#:
-#: Other writers of this generation (notably the digest-pinned workflow's
-#: dispatch correlation) still emit the legacy format. Treating their unproved
-#: receipts conservatively can withhold an unrelated repair, but it can never
-#: authorize a duplicate, so the marker is not required to be universal.
-_CI_REPAIR_WRITER_FORMAT_MARKER = (
-    "<!-- continuum-ci-repair-writer-format v=2 -->"
-)
 
 
 class GhFailure(RuntimeError):
@@ -689,13 +674,9 @@ def _workflow_runs(
 
 
 def _comment_body(receipt, headline: str) -> str:
-    return (
-        "{marker}\n\n{headline}\n{format_marker}\n"
-        "<!-- continuum-origin role=continuum component=ci-repair -->"
-    ).format(
+    return "{marker}\n\n{headline}\n<!-- continuum-origin role=continuum component=ci-repair -->".format(
         marker=render_receipt(receipt),
         headline=headline,
-        format_marker=_CI_REPAIR_WRITER_FORMAT_MARKER,
     )
 
 
@@ -771,13 +752,15 @@ def _historical_receipt_writers(
     With no established baseline every unproved receipt is unverifiable, so a
     missing registry can never reauthorize a spent exact HEAD.
 
-    The baseline alone cannot make an unproved receipt after it a lookalike:
-    an older controller for another exact HEAD can overlap the baseline
-    establishment, or remain pinned, and write a legacy receipt after it. Only a
-    receipt carrying the current writer-format marker is known not to come from
-    such an older controller, so an unproved legacy receipt always holds.
-    Current-format lookalikes created after the frontier remain ignored, so an
-    unrelated commenter posting the current format cannot suppress repair.
+    After the frontier, the receipt's age alone cannot classify it: an older
+    controller for another exact HEAD can remain pinned and write a receipt.
+    Trusted historical-writer evidence separates that case from an unrelated
+    lookalike: the durable writer registry, repository write access, or a
+    GitHub-attested repair run by that account. A post-baseline receipt whose
+    author has none of it is a lookalike and stays ignored, so an unrelated
+    commenter cannot suppress a repair by posting a receipt, whatever its
+    format. An overlapping older controller wrote with an account that still
+    has that evidence, so its unproved receipt holds regardless of format.
 
     The second result reports that history exists which cannot be verified
     because the run inventory failed or is incomplete, or because a plausible
@@ -808,7 +791,6 @@ def _historical_receipt_writers(
         except ValueError:
             # An untrusted lookalike is ignored, never fatal.
             continue
-        current_format = _CI_REPAIR_WRITER_FORMAT_MARKER in body
         for receipt in receipts:
             if (
                 receipt.repository == repository
@@ -816,7 +798,7 @@ def _historical_receipt_writers(
                 and receipt.head_sha == head_sha
                 and receipt.status != STATUS_REJECTED
             ):
-                candidates.append((author, receipt, comment, current_format))
+                candidates.append((author, receipt, comment))
     if not candidates:
         return (), False
 
@@ -839,7 +821,7 @@ def _historical_receipt_writers(
     verified = []
     unmatched = []
     unverifiable = False
-    for author, receipt, comment, current_format in candidates:
+    for author, receipt, comment in candidates:
         matches = [
             run
             for run in inventory.runs
@@ -853,7 +835,7 @@ def _historical_receipt_writers(
             unverifiable = True
             continue
         if not matches:
-            unmatched.append((author, receipt, comment, current_format))
+            unmatched.append((author, receipt, comment))
             continue
         if author not in verified:
             verified.append(author)
@@ -870,7 +852,7 @@ def _historical_receipt_writers(
     known = frozenset(_normalize_writer_logins("\n".join(known_writers)))
     baseline_text = str(baseline or "").strip()
     baseline_usable = bool(_ISO_TIMESTAMP_RE.match(baseline_text))
-    for author, receipt, comment, current_format in unmatched:
+    for author, receipt, comment in unmatched:
         if author in verified:
             continue
         association = str(comment.get("author_association") or "").strip().upper()
@@ -885,13 +867,6 @@ def _historical_receipt_writers(
             or association in _HISTORICAL_WRITER_ASSOCIATIONS
             or author_has_repair_run
         ):
-            unverifiable = True
-            break
-        if not current_format:
-            # Older controllers cannot emit this marker and can still be
-            # running or pinned after the baseline. Their receipts are
-            # indistinguishable from historical comments, so a post-baseline
-            # legacy receipt must hold instead of being treated as a lookalike.
             unverifiable = True
             break
         if not baseline_usable:
@@ -912,9 +887,9 @@ def _historical_receipt_writers(
         # only the claim behind; its run may then be deleted. Without registry,
         # association, or run evidence that author cannot be told apart from a
         # historical writer, so the receipt fails closed instead of authorizing
-        # a duplicate dispatch. Current-format receipts created after the
-        # frontier are still lookalikes, so an unrelated commenter cannot
-        # suppress repair then.
+        # a duplicate dispatch. After the frontier an author with none of that
+        # evidence is an unrelated lookalike: holding for it would let any
+        # commenter suppress a repair, so it stays ignored instead.
         if predates_baseline:
             unverifiable = True
             break

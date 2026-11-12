@@ -4068,12 +4068,9 @@ class ContinuumTest < Minitest::Test
           def __init__(self, runs):
               self.runs = runs
 
-      def comment(association, receipt=receipt, current_format=False):
-          body = render_receipt(receipt)
-          if current_format:
-              body += '\n' + admission._CI_REPAIR_WRITER_FORMAT_MARKER
+      def comment(association, receipt=receipt):
           return {
-              'body': body,
+              'body': render_receipt(receipt),
               'created_at': '2026-11-12T00:00:00Z',
               'author_association': association,
               'user': {'login': 'old-automation'},
@@ -4084,14 +4081,13 @@ class ContinuumTest < Minitest::Test
           runs,
           baseline='2026-11-11T00:00:00Z',
           receipt=receipt,
-          current_format=False,
       ):
           admission._workflow_runs = lambda *args, **kwargs: Inventory(runs)
           return admission._historical_receipt_writers(
               repository,
               pull_number,
               head_sha,
-              [comment(association, receipt, current_format=current_format)],
+              [comment(association, receipt)],
               workflow='continuum-opencode.yml',
               owner_login='',
               trusted_logins=('github-actions[bot]',),
@@ -4102,7 +4098,7 @@ class ContinuumTest < Minitest::Test
       result['verified'] = list(verified)
       result['verified_hold'] = verified_hold
       _, member_hold = writers('MEMBER', [])
-      _, none_hold = writers('NONE', [], current_format=True)
+      _, none_hold = writers('NONE', [])
       result['member_hold'] = member_hold
       result['none_hold'] = none_hold
       _, missing_baseline_hold = writers('NONE', [], baseline=None)
@@ -4120,21 +4116,20 @@ class ContinuumTest < Minitest::Test
           'MEMBER', [], baseline='2026-11-12T00:05:00Z', receipt=claimed)
       result['pre_baseline_member_claim_hold'] = pre_baseline_member_claim_hold
       _, post_baseline_legacy_claim_hold = writers(
-          'NONE', [], baseline='2026-11-11T00:00:00Z', receipt=claimed)
+          'MEMBER', [], baseline='2026-11-11T00:00:00Z', receipt=claimed)
       result['post_baseline_legacy_claim_hold'] = post_baseline_legacy_claim_hold
       _, post_baseline_legacy_dispatch_hold = writers(
-          'NONE', [], baseline='2026-11-11T00:00:00Z')
+          'MEMBER', [], baseline='2026-11-11T00:00:00Z')
       result['post_baseline_legacy_dispatch_hold'] = (
           post_baseline_legacy_dispatch_hold)
-      _, post_baseline_current_claim_ignored = writers(
-          'NONE',
-          [],
-          baseline='2026-11-11T00:00:00Z',
-          receipt=claimed,
-          current_format=True,
-      )
-      result['post_baseline_current_claim_ignored'] = (
-          post_baseline_current_claim_ignored)
+      _, post_baseline_legacy_claim_ignored = writers(
+          'NONE', [], baseline='2026-11-11T00:00:00Z', receipt=claimed)
+      result['post_baseline_legacy_claim_ignored'] = (
+          post_baseline_legacy_claim_ignored)
+      _, post_baseline_legacy_dispatch_ignored = writers(
+          'NONE', [], baseline='2026-11-11T00:00:00Z')
+      result['post_baseline_legacy_dispatch_ignored'] = (
+          post_baseline_legacy_dispatch_ignored)
       print(json.dumps(result))
     PY
     stdout, stderr, status = Open3.capture3(
@@ -4155,7 +4150,8 @@ class ContinuumTest < Minitest::Test
     assert result.fetch('member_hold'),
            'an unproved collaborator receipt must hold admission'
     refute result.fetch('none_hold'),
-           'an unrelated commenter must not suppress a repair'
+           'a post-baseline lookalike from an unrelated commenter must not ' \
+           'suppress a repair'
     assert result.fetch('missing_baseline_hold'),
            'a receipt with no established writer baseline must hold admission'
     assert result.fetch('pre_baseline_dispatch_hold'),
@@ -4169,13 +4165,15 @@ class ContinuumTest < Minitest::Test
     assert result.fetch('pre_baseline_member_claim_hold'),
            'a pre-baseline claim from a plausible writer must hold admission'
     assert result.fetch('post_baseline_legacy_claim_hold'),
-           'a post-baseline legacy-format claim from an overlapping older ' \
-           'controller must hold admission'
+           'a post-baseline claim from an overlapping older controller with ' \
+           'repository write access must hold admission'
     assert result.fetch('post_baseline_legacy_dispatch_hold'),
-           'a post-baseline legacy-format dispatch from an overlapping older ' \
-           'controller must hold admission'
-    refute result.fetch('post_baseline_current_claim_ignored'),
-           'a current-format post-baseline lookalike must not suppress a repair'
+           'a post-baseline dispatch from an overlapping older controller with ' \
+           'repository write access must hold admission'
+    refute result.fetch('post_baseline_legacy_claim_ignored'),
+           'a post-baseline legacy claim lookalike must not suppress a repair'
+    refute result.fetch('post_baseline_legacy_dispatch_ignored'),
+           'a post-baseline legacy dispatch lookalike must not suppress a repair'
   end
 
   # The executor cannot repair a mutable branch tip. Every non-recovery ci-fix
