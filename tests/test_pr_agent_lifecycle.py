@@ -144,8 +144,13 @@ APPROVED_433_OPENCODE_SHA256 = (
 # recovery guards (commit c5a628c) so an exit-1 after provider classification
 # still evacuates uncommitted agent changes. The structural test below pins
 # all five guarded executor paths; unrelated workflow drift remains forbidden.
+# #442 (main 7e4da5d) deliberately extends this exact protected workflow with
+# an issue-checkpoint identity check and isolated original-base verification.
+# Pin the complete resulting bytes. Tests below and test_comment_attribution
+# independently enforce the recovery contract and its diagnostic provenance;
+# do not replace this pin with an allowlist or ignore workflow differences.
 APPROVED_PROVIDER_RECOVERY_OPENCODE_SHA256 = (
-    "bb2aef000e12b83f16f30b9ebc9c2d7e72987684e21a9be6b852b02d106f9ea2"
+    "386efdaef0c8568eec94f4d0185b9e8d8b1390d6fb82d136f4bc7929e3ff5df8"
 )
 
 # Additional reviewed self-caller change: owner-only CodeRabbit repair dispatch
