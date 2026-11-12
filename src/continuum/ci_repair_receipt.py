@@ -439,14 +439,15 @@ def _comment_login(comment: Mapping[str, Any]) -> str:
 
 
 def _has_author_metadata(comment: Mapping[str, Any]) -> bool:
-    """Whether the comment proves any authorship, trusted or not.
+    """Whether enough author metadata exists to prove a marked comment untrusted.
 
-    A marked comment with neither an association nor a usable login has
-    unknown authorship, not confirmed untrusted authorship.
+    Both trust sources must be known before a failed trust check may ignore
+    a marked comment. A missing login might identify a trusted workflow bot;
+    a missing association might identify a repository OWNER.
     """
 
     association = str(comment.get("author_association") or "").strip()
-    return bool(association) or bool(_comment_login(comment))
+    return bool(association) and bool(_comment_login(comment))
 
 
 def is_trusted_receipt_comment(
