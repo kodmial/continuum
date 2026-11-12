@@ -1604,7 +1604,7 @@ jobs:
             return unresolved;
           }
 
-          // NanoDictate uses this single canonical auto-merge owner.
+          // Installed consumers use this single canonical auto-merge owner.
           // Never send one inline verification per unresolved finding in
           // the same wake. Full-review quota stays a separate shared queue.
           const CODERABBIT_CHAT_MIN_GAP_MS = 5 * 60_000;
