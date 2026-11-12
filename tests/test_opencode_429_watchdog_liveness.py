@@ -386,6 +386,51 @@ def recovery_marker(state, sha, run_id, attempt=1, next_due=0):
     )
 
 
+def hold_marker(sha=NEW_SHA, generation=1, spec="c" * 64):
+    return (
+        "<!-- continuum-checkpoint-resume-blocked "
+        "repo={owner}/{repo} issue=382 generation={generation} "
+        "operation={op} checkpoint={ref} checkpoint_sha={sha} "
+        "base_ref=main base_sha={base} snapshot={spec} "
+        "reason=verification-failed -->"
+    ).format(
+        owner=OWNER,
+        repo=REPO,
+        generation=generation,
+        op=OPERATION,
+        ref=CHECKPOINT_REF,
+        sha=sha,
+        base=BASE_SHA,
+        spec=spec,
+    )
+
+
+def snapshot_marker(spec, generation=1):
+    return (
+        "<!-- continuum-task-snapshot repo={owner}/{repo} issue=382 "
+        "generation={generation} title-sha256={title} "
+        "body-sha256={body} spec-sha256={spec} -->"
+    ).format(
+        owner=OWNER,
+        repo=REPO,
+        generation=generation,
+        title="d" * 64,
+        body="e" * 64,
+        spec=spec,
+    )
+
+
+def thread_comment(comment_id, body, created_at, login="github-actions[bot]"):
+    return {
+        "id": comment_id,
+        "body": body,
+        "user": {"login": login},
+        "author_association": "OWNER",
+        "created_at": created_at,
+        "updated_at": created_at,
+    }
+
+
 def metadata(sha=NEW_SHA):
     return {
         "schema_version": 1,
@@ -468,7 +513,7 @@ class WatchdogHarness(unittest.TestCase):
         TMP_PARENT.mkdir(parents=True, exist_ok=True)
         cls.source = watchdog_script()
 
-    def run_scenario(self, scenario):
+    def run_scenario(self, scenario, env=None):
         workdir = Path(tempfile.mkdtemp(prefix="watchdog-", dir=str(TMP_PARENT)))
         try:
             source_path = workdir / "watchdog.js"
@@ -480,20 +525,26 @@ class WatchdogHarness(unittest.TestCase):
                 json.dumps(scenario, indent=2), encoding="utf-8"
             )
             harness_path.write_text(NODE_HARNESS, encoding="utf-8")
+            process_env = {
+                "PATH": str(Path(shutil.which("node")).parent) + ":/usr/bin:/bin",
+                "CONTINUUM_DISPATCH_HELPER": str(DISPATCH_HELPER),
+                "CONTINUUM_COMMAND_PARSER": str(
+                    ROOT / ".github/scripts/opencode_command.py"
+                ),
+                "PYTHONDONTWRITEBYTECODE": "1",
+                "READ_GITHUB_TOKEN": "test-token",
+                "MAX_429_RUNNER_RESTARTS": "3",
+                "OPENCODE_WORKFLOW": "opencode.yml",
+                "GITHUB_API_URL": "https://api.github.com",
+            }
+            process_env.update(env or {})
             completed = subprocess.run(
                 ["node", str(harness_path), str(source_path),
                  str(scenario_path), str(result_path)],
                 capture_output=True,
                 text=True,
                 cwd=str(ROOT),
-                env={
-                    "PATH": str(Path(shutil.which("node")).parent) + ":/usr/bin:/bin",
-                    "CONTINUUM_DISPATCH_HELPER": str(DISPATCH_HELPER),
-                    "READ_GITHUB_TOKEN": "test-token",
-                    "MAX_429_RUNNER_RESTARTS": "3",
-                    "OPENCODE_WORKFLOW": "opencode.yml",
-                    "GITHUB_API_URL": "https://api.github.com",
-                },
+                env=process_env,
                 timeout=120,
             )
             self.assertEqual(
@@ -1090,6 +1141,132 @@ class WatchdogHarness(unittest.TestCase):
         scenario["issues"][0]["labels"] = [{"name": "automation:ready"}]
         result = self.run_scenario(scenario)
         self.assert_no_dispatch(result)
+
+    def normal_retry_scenario(self):
+        # A failed OpenCode issue run without a 429 marker reaches the normal
+        # watchdog retry path (not `recoverFrom429OnFreshVm`).
+        scenario = base_scenario()
+        scenario["jobs"] = []
+        scenario["jobLog"] = ""
+        return scenario
+
+    def retried_bodies(self, result):
+        return [
+            comment["body"] for comment in result["comments"]
+            if "<!-- opencode-watchdog-retry -->" in comment["body"]
+        ]
+
+    def test_restart_route_honors_an_active_resume_hold(self):
+        scenario = base_scenario()
+        scenario["comments"].append(
+            thread_comment(20, hold_marker(), "2026-10-23T09:50:00Z")
+        )
+        result = self.run_scenario(scenario)
+        self.assert_no_dispatch(result)
+        self.assertTrue(
+            any(
+                "checkpoint resume rejection" in " ".join(line)
+                for line in result["notices"]
+            ),
+            result["notices"],
+        )
+
+    def test_scheduled_durable_recovery_honors_an_active_resume_hold(self):
+        scenario = self.durable_scenario()
+        scenario["comments"].append(
+            thread_comment(20, hold_marker(), "2026-10-23T09:50:00Z")
+        )
+        result = self.run_scenario(scenario)
+        self.assert_no_dispatch(result)
+
+    def test_hold_is_released_only_by_a_strictly_later_task_snapshot(self):
+        later = base_scenario()
+        later["comments"].append(
+            thread_comment(20, hold_marker(), "2026-10-23T09:50:00Z")
+        )
+        later["comments"].append(
+            thread_comment(21, snapshot_marker("f" * 64), "2026-10-23T09:55:00Z")
+        )
+        self.assert_one_current_dispatch(self.run_scenario(later), NEW_SHA)
+
+        older = base_scenario()
+        older["comments"].append(
+            thread_comment(19, snapshot_marker("f" * 64), "2026-10-23T09:20:00Z")
+        )
+        older["comments"].append(
+            thread_comment(20, hold_marker(), "2026-10-23T09:50:00Z")
+        )
+        self.assert_no_dispatch(self.run_scenario(older))
+
+        same = base_scenario()
+        same["comments"].append(
+            thread_comment(
+                20,
+                hold_marker() + "\n" + snapshot_marker("f" * 64),
+                "2026-10-23T09:50:00Z",
+            )
+        )
+        self.assert_no_dispatch(self.run_scenario(same))
+
+        same_spec = base_scenario()
+        same_spec["comments"].append(
+            thread_comment(20, hold_marker(), "2026-10-23T09:50:00Z")
+        )
+        same_spec["comments"].append(
+            thread_comment(21, snapshot_marker("c" * 64), "2026-10-23T09:55:00Z")
+        )
+        self.assert_no_dispatch(self.run_scenario(same_spec))
+
+    def test_normal_retry_path_honors_the_hold(self):
+        scenario = self.normal_retry_scenario()
+        scenario["comments"].append(
+            thread_comment(20, hold_marker(), "2026-10-23T09:50:00Z")
+        )
+        result = self.run_scenario(scenario)
+        self.assertEqual(self.retried_bodies(result), [])
+        self.assertTrue(
+            any(
+                "checkpoint resume hold" in " ".join(line)
+                for line in result["notices"]
+            ),
+            result["notices"],
+        )
+
+    def test_normal_retry_path_rejects_automatic_and_prose_owner_commands(self):
+        cases = {
+            "fenced": "```\n/oc\n```",
+            "explained": "Some explanation first.\n/oc",
+            "watchdog-origin": (
+                "/oc\n\n"
+                "<!-- continuum-origin role=continuum component=opencode-watchdog -->"
+            ),
+        }
+        for name, body in cases.items():
+            with self.subTest(name=name):
+                scenario = self.normal_retry_scenario()
+                scenario["comments"].append(
+                    thread_comment(20, hold_marker(), "2026-10-23T09:50:00Z")
+                )
+                scenario["comments"].append(
+                    thread_comment(
+                        21, body, "2026-10-23T10:00:00Z", login="kodmial"
+                    )
+                )
+                result = self.run_scenario(
+                    scenario, env={"RETRY_MARKER": "<!-- custom-retry -->"}
+                )
+                self.assertEqual(self.retried_bodies(result), [])
+
+    def test_normal_retry_path_accepts_a_manual_owner_command(self):
+        scenario = self.normal_retry_scenario()
+        scenario["comments"].append(
+            thread_comment(20, hold_marker(), "2026-10-23T09:50:00Z")
+        )
+        scenario["comments"].append(
+            thread_comment(21, "/oc", "2026-10-23T10:00:00Z", login="kodmial")
+        )
+        result = self.run_scenario(scenario)
+        self.assertEqual(len(self.retried_bodies(result)), 1, result["comments"])
 
     def test_production_source_verifies_authoritative_run_evidence(self):
         self.assertIn("getWorkflowRun", self.source)

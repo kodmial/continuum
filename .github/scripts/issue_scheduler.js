@@ -725,17 +725,37 @@ module.exports = async function runIssueScheduler({ github, context, core }) {
     /<!--\s*continuum-checkpoint-resume-blocked\s+repo=([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)\s+issue=(\d+)\s+generation=(\d+)\s+operation=(\S+)\s+checkpoint=(\S+)\s+checkpoint_sha=([0-9a-fA-F]{40})\s+base_ref=(\S+)\s+base_sha=([0-9a-fA-F]{40})\s+snapshot=([0-9a-fA-F]{64})\s+reason=(\S+)\s*-->/;
   const checkpointSnapshotMarkerRe =
     /<!--\s*continuum-task-snapshot(?:-ref)?\s+repo=([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)\s+issue=(\d+)\s+generation=(\d+)\s+title-sha256=([0-9a-fA-F]{64})\s+body-sha256=([0-9a-fA-F]{64})\s+spec-sha256=([0-9a-fA-F]{64})\s*-->/g;
+  // The watchdog writes this stable automation-origin marker into every
+  // comment it owns. Its retry marker is configurable, so the default retry
+  // literal alone cannot prove that a `/oc` comment was automated. Assemble
+  // it from fragments: the scheduler only recognises this identity, it never
+  // publishes a watchdog comment, and attribution scanners must not read a
+  // second component out of this file.
+  const watchdogOriginMarker = [
+    '<!-- continuum-origin role=continuum',
+    'component=opencode-watchdog -->',
+  ].join(' ');
 
   // A deterministic checkpoint-continuation rejection is persisted as a
   // typed marker. It is not an owner pause and not a terminal generation
   // stop: the saved checkpoint is preserved and the scheduler only holds
   // this exact identity. A new checkpoint tip, a new pinned task snapshot,
   // checkpoint deletion, or a later owner /oc are material premise changes.
+  //
+  // Two different generation concepts meet here and must never be compared
+  // with each other:
+  //   * the rejection marker's `generation` is the *recovery* generation of
+  //     the run that rejected the resume, and 429 evacuation generations can
+  //     be above 1. The rejection is bound to the checkpoint identity, so a
+  //     marker from any recovery generation >= 1 applies its hold;
+  //   * a `continuum-task-snapshot` marker's `generation` is the *task*
+  //     generation, which the workflow pins to 1 (`continuum-opencode.yml`).
+  //     Only that generation can release the hold with a different spec.
   async function checkpointResumeHold(
-    targetOwner, targetRepo, issueNumber, comments, client, generation = 1
+    targetOwner, targetRepo, issueNumber, comments, client, taskGeneration = 1
   ) {
     const wantedRepo = (targetOwner + '/' + targetRepo).toLowerCase();
-    const wantedGeneration = Number(generation) || 1;
+    const wantedTaskGeneration = Number(taskGeneration) || 1;
     const trusted = (comments || []).filter(comment =>
       isTrustedStopComment(comment, targetOwner)
     );
@@ -748,7 +768,7 @@ module.exports = async function runIssueScheduler({ github, context, core }) {
       if (
         match[1].toLowerCase() !== wantedRepo ||
         Number(match[2]) !== issueNumber ||
-        Number(match[3]) !== wantedGeneration
+        Number(match[3]) < 1
       ) continue;
       const candidate = {
         created_at: comment.created_at || '',
@@ -768,26 +788,41 @@ module.exports = async function runIssueScheduler({ github, context, core }) {
     if (!marker) return null;
 
     const markerOrder = stopOrderKey(marker);
-    for (const comment of trusted) {
-      if (stopOrderKey({
+    // The scheduler never reimplements the command grammar: one canonical
+    // parser call classifies every later owner comment. A fenced example or a
+    // token preceded by explanation classifies as `ignore` and can never
+    // release the hold.
+    const laterOwnerComments = trusted.filter(comment =>
+      stopOrderKey({
         created_at: comment.created_at || '',
         id: comment.id || 0,
-      }) <= markerOrder) continue;
-      const body = String(comment.body || '');
-      const login = String(comment.user?.login || '').toLowerCase();
-      if (
-        login === String(targetOwner || '').toLowerCase() &&
-        !body.includes(dispatchMarker) &&
-        !body.includes('<!-- opencode-watchdog-retry -->') &&
-        /^[ ]{0,3}\/(?:opencode|oc)(?=\s|$)/m.test(body)
-      ) {
-        return null;
+      }) > markerOrder &&
+      String(comment.user?.login || '').toLowerCase() ===
+        String(targetOwner || '').toLowerCase()
+    );
+    if (laterOwnerComments.length > 0) {
+      const ownerClasses = classifyComments(
+        laterOwnerComments.map(comment => String(comment.body || ''))
+      );
+      for (let index = 0; index < laterOwnerComments.length; index += 1) {
+        const body = String(laterOwnerComments[index].body || '');
+        if (
+          ownerClasses[index] === 'run' &&
+          !body.includes(dispatchMarker) &&
+          !body.includes(watchdogOriginMarker) &&
+          !body.includes('<!-- opencode-watchdog-retry -->')
+        ) {
+          return null;
+        }
       }
     }
 
     // A newer pinned snapshot is a material premise change. Only trusted
     // comments can move a generation baseline: an arbitrary commenter must
     // never release a deterministic hold by posting a forged snapshot marker.
+    // The snapshot must also be strictly later than the rejection: an older
+    // snapshot (or one inside the rejection comment itself) describes a
+    // premise the rejection already saw.
     let latestSnapshot = null;
     let latestSnapshotOrder = '';
     for (const comment of trusted) {
@@ -796,7 +831,7 @@ module.exports = async function runIssueScheduler({ github, context, core }) {
         if (
           match[1].toLowerCase() !== wantedRepo ||
           Number(match[2]) !== issueNumber ||
-          Number(match[3]) !== wantedGeneration
+          Number(match[3]) !== wantedTaskGeneration
         ) continue;
         const order = (comment.created_at || '') + '#' +
           String(comment.id || 0).padStart(12, '0');
@@ -806,7 +841,11 @@ module.exports = async function runIssueScheduler({ github, context, core }) {
         }
       }
     }
-    if (latestSnapshot && latestSnapshot !== marker.snapshotSpec) {
+    if (
+      latestSnapshot &&
+      latestSnapshotOrder > markerOrder &&
+      latestSnapshot !== marker.snapshotSpec
+    ) {
       return null;
     }
 

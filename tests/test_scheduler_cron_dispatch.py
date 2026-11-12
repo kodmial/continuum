@@ -454,6 +454,7 @@ class CheckpointResumeHoldRegressionTests(unittest.TestCase):
         helper = source[start:end]
         harness = r"""
 const assert = require('assert');
+const { execFileSync } = require('child_process');
 const dispatchMarker = '<!-- issue-scheduler-dispatch -->';
 const core = { warning: () => {} };
 function isTrustedStopComment(c, owner) {
@@ -463,6 +464,14 @@ function isTrustedStopComment(c, owner) {
 function stopOrderKey(c) {
   return String(c.created_at || '') + '#' +
     String(c.id || 0).padStart(12, '0');
+}
+function classifyComments(bodies) {
+  const output = execFileSync(
+    'python3',
+    ['.github/scripts/opencode_command.py', 'classify-json'],
+    { input: JSON.stringify(bodies), encoding: 'utf8' }
+  );
+  return JSON.parse(output);
 }
 """ + helper + r"""
 (async () => {
@@ -474,6 +483,10 @@ function stopOrderKey(c) {
     'checkpoint_sha=' + sha + ' base_ref=main base_sha=' +
     'b'.repeat(40) + ' snapshot=' + 'c'.repeat(64) +
     ' reason=verification-failed -->';
+  const snapshot = (spec, generation = 1) =>
+    '<!-- continuum-task-snapshot repo=kodmial/continuum issue=442 ' +
+    'generation=' + generation + ' title-sha256=' + 'd'.repeat(64) +
+    ' body-sha256=' + 'e'.repeat(64) + ' spec-sha256=' + spec + ' -->';
   const item = (id, body, login = 'kodmial') => ({
     id, body, created_at: '2026-11-12T04:' + String(id).padStart(2, '0') + ':00Z',
     user: { login }, author_association: login === 'outsider' ? 'NONE' : 'OWNER'
@@ -490,6 +503,23 @@ function stopOrderKey(c) {
   assert.ok(await hold([saved]), 'recorded failure must hold');
   assert.ok(await hold([saved, auto]), 'scheduler /oc must not waive hold');
   assert.ok(await hold([saved, watchdog]), 'watchdog /oc must not waive hold');
+  assert.ok(
+    await hold([saved, item(5, '/oc\n\n<!-- custom-retry -->\n' +
+      '<!-- continuum-origin role=continuum component=opencode-watchdog -->')]),
+    'watchdog origin marker must exclude a configured retry marker'
+  );
+  assert.ok(
+    await hold([saved, item(6, '```\n/oc\n```')]),
+    'a fenced /oc example must not waive the hold'
+  );
+  assert.ok(
+    await hold([saved, item(7, 'Some explanation first.\n/oc')]),
+    'an explained /oc mention must not waive the hold'
+  );
+  assert.ok(
+    await hold([saved, item(8, '    /oc')]),
+    'an indented /oc code block must not waive the hold'
+  );
   assert.equal(await hold([saved, manual]), null, 'manual owner /oc may resume');
   assert.equal(await hold([saved], client('d'.repeat(40))), null,
     'changed checkpoint SHA releases hold');
@@ -498,6 +528,31 @@ function stopOrderKey(c) {
   assert.ok(await hold([saved], {rest: {git: {
     getRef: async () => { throw {status: 503}; }
   }}}), 'failed GitHub ref lookup must fail closed');
+  assert.ok(
+    await hold([item(1, marker.replace('generation=1', 'generation=2'))]),
+    'a rejection from recovery generation 2 must still hold'
+  );
+  assert.ok(
+    await hold([item(0, snapshot('f'.repeat(64))), saved]),
+    'an older different-spec snapshot must not release the hold'
+  );
+  assert.ok(
+    await hold([item(1, marker + '\n' + snapshot('f'.repeat(64)))]),
+    'a snapshot inside the rejection comment must not release the hold'
+  );
+  assert.ok(
+    await hold([saved, item(5, snapshot('c'.repeat(64)))]),
+    'a later snapshot with the same spec must not release the hold'
+  );
+  assert.ok(
+    await hold([saved, item(5, snapshot('f'.repeat(64), 2))]),
+    'a later snapshot for another task generation must not release the hold'
+  );
+  assert.equal(
+    await hold([saved, item(5, snapshot('f'.repeat(64)))]),
+    null,
+    'a strictly later different-spec snapshot releases the hold'
+  );
   console.log('checkpoint-resume-hold-regression: PASS');
 })().catch(e => { console.error(e); process.exitCode = 1; });
 """
@@ -521,10 +576,21 @@ function stopOrderKey(c) {
         self.assertEqual(scheduler.count("await checkpointResumeHold("), 3)
         self.assertIn("await removeLabel(issueNumber, inProgressLabel)", scheduler)
         self.assertIn("!body.includes(dispatchMarker)", scheduler)
+        self.assertIn("!body.includes(watchdogOriginMarker)", scheduler)
         self.assertIn("!body.includes('<!-- opencode-watchdog-retry -->')", scheduler)
+        self.assertIn("ownerClasses[index] === 'run'", scheduler)
         self.assertIn("checkpointResumeBlockedRe", watchdog)
-        self.assertIn("!String(comment.body || '').includes(dispatchMarker)", watchdog)
-        self.assertIn("!String(comment.body || '').includes(retryMarker)", watchdog)
+        self.assertIn("async function checkpointResumeHold(", watchdog)
+        self.assertIn("function classifyComments(bodies)", watchdog)
+        self.assertIn("if (body.includes(dispatchMarker)) continue;", watchdog)
+        self.assertIn("if (body.includes(retryMarker)) continue;", watchdog)
+        self.assertIn(
+            "if (body.includes(watchdogAutomationMarker)) continue;", watchdog
+        )
+        self.assertIn(
+            "const hold = await checkpointResumeHold(issueText, comments);",
+            watchdog,
+        )
         self.assertLess(
             watchdog.index("const checkpointResumeBlockedRe ="),
             watchdog.index("// A scheduler dispatch comment newer")
