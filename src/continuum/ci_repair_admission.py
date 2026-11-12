@@ -201,6 +201,15 @@ def normalize_comment_pages(
                     False,
                     "a comment has no string body; receipt state is unreadable",
                 )
+            created = comment.get("created_at")
+            if not isinstance(created, str) or not _ISO_TIMESTAMP_RE.match(created):
+                return CommentHistory(
+                    (),
+                    False,
+                    False,
+                    "a comment has no usable creation timestamp; comment order "
+                    "and the attempt observation clock are unproven",
+                )
             raw_id = comment.get("id")
             if isinstance(raw_id, bool) or not isinstance(raw_id, int):
                 try:
@@ -441,8 +450,14 @@ def has_unattributed_repair_run(
         if wanted_pr is not None and int(match.group(1)) != wanted_pr:
             continue
         created = str(run.get("created_at") or "")
-        if threshold and (not _ISO_TIMESTAMP_RE.match(created) or created < threshold):
-            continue
+        if threshold:
+            if not _ISO_TIMESTAMP_RE.match(created):
+                # A legacy-shaped repair run with an unknown creation time
+                # cannot be proved older than the claim. Hold rather than
+                # treating it as absent and risking a duplicate dispatch.
+                return True
+            if created < threshold:
+                continue
         return True
     return False
 
@@ -458,17 +473,22 @@ def attempt_observed_at(
     trusted_associations: Sequence[str] = (),
     trusted_logins: Sequence[str] = (),
 ) -> Optional[str]:
-    """Return the latest trusted comment timestamp for one attempt.
+    """Return the earliest trusted comment timestamp for one attempt.
 
     The receipt itself is immutable and has no timestamp field; the comment
-    creation time is the durable observation clock. Untrusted lookalikes are
-    ignored exactly as in :func:`read_receipts`.
+    creation time is the durable observation clock. This returns the *first*
+    observation (the claim), because a run created by this attempt can never
+    predate its claim. A later transition comment is written after the dispatch
+    request, so using it as a ``created >=`` lower bound would hide a run that
+    was created between the claim and that comment, permanently preventing
+    correlation. Untrusted lookalikes are ignored exactly as in
+    :func:`read_receipts`.
     """
 
     wanted = str(attempt_id or "").strip()
     if not wanted:
         return None
-    latest = None
+    earliest = None
     for comment in comments:
         if not isinstance(comment, Mapping):
             continue
@@ -498,9 +518,9 @@ def attempt_observed_at(
             continue
         created = comment.get("created_at")
         if isinstance(created, str) and _ISO_TIMESTAMP_RE.match(created):
-            if latest is None or created > latest:
-                latest = created
-    return latest
+            if earliest is None or created < earliest:
+                earliest = created
+    return earliest
 
 
 def timestamp_is_stale(

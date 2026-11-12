@@ -1,10 +1,11 @@
 """Exact-HEAD CI-repair attempt receipts (kodmial/continuum#444).
 
 This module is the durable evidence format for the single-owner CI-repair
-controller described by kodmial/continuum#443 phase 1. It is deliberately
-pure: it builds, renders, parses, validates and reconciles supplied comment
-data only. It performs no GitHub API call, mutates no label/comment/workflow
-state, and is not called in production yet.
+controller described by kodmial/continuum#443. It is deliberately pure: it
+builds, renders, parses, validates and reconciles supplied comment data only.
+It performs no GitHub API call, mutates no label/comment/workflow state; the
+serialized admission owner in `.github/scripts/ci_repair_admission.py` performs
+the GitHub calls.
 
 A receipt is a hidden machine marker on an issue comment::
 
@@ -43,9 +44,10 @@ records and impossible transitions yield ``invalid`` or ``conflict``.
 valid history with no existing non-rejected attempt for the exact HEAD.
 
 This is a record, not an atomic lock. Issue-comment creation has no GitHub
-compare-and-swap guarantee. Phase 2 must still serialize the read -> claim ->
-dispatch sequence per ``(repository, exact HEAD)`` and reconcile an
-``ambiguous`` claim against the live run inventory before any retry.
+compare-and-swap guarantee. The admission owner still serializes the
+read -> claim -> dispatch sequence per ``(repository, exact HEAD)`` and
+reconciles an ``ambiguous`` claim against the live run inventory before any
+retry.
 """
 
 from __future__ import annotations
@@ -305,11 +307,15 @@ def build_receipt(
             raise ReceiptError("a run URL requires its workflow run ID")
         if number_run_id is not None and url_text:
             expected = _canonical_run_url(repository_key, number_run_id)
-            if url_text != expected:
+            if url_text.lower() != expected.lower():
                 raise ReceiptError(
                     "run URL must prove the same repository and run ID "
                     "(expected {})".format(expected)
                 )
+            # The marker format is canonical lowercase. GitHub preserves the
+            # display case in `github.repository`/run URLs, so accept a
+            # case-only variant and store the canonical form.
+            url_text = expected
 
     return RepairReceipt(
         schema_version=version,

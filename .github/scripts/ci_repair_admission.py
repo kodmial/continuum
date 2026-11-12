@@ -116,20 +116,25 @@ def _pull(repository: str, pull_number: int) -> Mapping[str, Any]:
     return _gh_json(["api", "repos/{}/pulls/{}".format(repository, pull_number)])
 
 
-def _authenticated_login() -> str:
-    """Return the login of the token that authors receipts, or empty.
+def _authenticated_login() -> Optional[str]:
+    """Return the login of the token that authors receipts, or ``None``.
 
     A classic PAT may belong to a repository collaborator rather than the
-    literal owner, so the token identity is trusted explicitly. Losing it only
-    makes the reader fail closed, never permissive.
+    literal owner, so the token identity is trusted explicitly. Receipts are
+    written with that same token. If its identity cannot be proved, the caller
+    holds: treating its own earlier claim as an untrusted lookalike would
+    authorize a duplicate dispatch for the exact same HEAD.
     """
 
     try:
         data = _gh_json(["api", "user"])
     except GhFailure:
-        return ""
+        return None
     login = data.get("login")
-    return login.strip().lower() if isinstance(login, str) else ""
+    if not isinstance(login, str):
+        return None
+    login = login.strip().lower()
+    return login or None
 
 
 def _comment_pages(repository: str, pull_number: int) -> Sequence[Any]:
@@ -310,7 +315,10 @@ def _workflow_runs(
         ),
     ]
     if since:
-        arguments.extend(["-f", "created=>={}".format(since)])
+        # ``gh api`` switches to POST as soon as a field is supplied. An
+        # explicit GET keeps this an idempotent listing and appends the field
+        # as the ``created`` query filter.
+        arguments.extend(["--method", "GET", "-f", "created=>={}".format(since)])
     code, stdout, stderr = _gh(arguments)
     if code != 0:
         raise GhFailure(stderr.strip() or "workflow run listing failed")
@@ -378,8 +386,17 @@ def run(args) -> int:
 
     trusted_logins = []
     token_login = _authenticated_login()
-    if token_login:
-        trusted_logins.append(token_login)
+    if not token_login:
+        # Receipts are authored by this token, including a collaborator PAT
+        # whose association is not OWNER. Without its identity the reader
+        # could classify its own claim as an untrusted lookalike and dispatch
+        # a second repair, so hold instead.
+        print(
+            "::warning::CI-repair token identity is unavailable; holding "
+            "instead of risking a duplicate claim."
+        )
+        return 0
+    trusted_logins.append(token_login)
 
     expected = pr.get("comments")
     history, collection = collection_from_pages(

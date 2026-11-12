@@ -153,17 +153,17 @@ APPROVED_PROVIDER_RECOVERY_OPENCODE_SHA256 = (
 # acknowledgement step. Keep the earlier pins above for audit; later drift
 # outside this reviewed change still fails closed.
 APPROVED_446_OPENCODE_SHA256 = (
-    "a1bc617426f9d5782c5692a5f85fc8f8f88f866218727fcdd6028743b28a61c8"
+    "e7c648f39c73c954c2d13c7e6b9250c73938e5f41f8bbca6b7bde93e05194ba4"
 )
 APPROVED_446_CALLER_SHA256 = (
-    "52b3b44729d9ebab7999d65e894e4eb5979572af0e3d3a1c7c6f48c5fe8668ee"
+    "b7f3df118bc436526f48443b8f068372204073eb134c98e4a1543d025f314686"
 )
 
 # Additional reviewed self-caller change: owner-only CodeRabbit repair dispatch
 # preserves the exact workflow_dispatch path and the no-auto-merge hold.
 # This pins the full file, not a permissive allowlist for workflow drift.
 APPROVED_350_SELF_CALLER_SHA256 = (
-    "f158c2e694fb77172c8955d301981d67bafaed4099c0a34f96f05cd9054c13c8"
+    "9437c10318dc12f635069443ca9dc7c7a33f23e869f2dbc5fc7ae26ccf6f1eae"
 )
 APPROVED_350_CALLER_SHA256 = (
     "a595362c8353001d5f7af138ab848df8fac3a6c924d5d337f6819084f79b3938"

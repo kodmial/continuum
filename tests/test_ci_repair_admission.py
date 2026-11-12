@@ -126,6 +126,8 @@ def run(
     pull_number=PR,
     created_at="2026-11-12T00:00:10Z",
     title=None,
+    status="queued",
+    conclusion="",
 ):
     display = title
     if display is None:
@@ -135,8 +137,8 @@ def run(
     return {
         "id": run_id,
         "display_title": display,
-        "status": "queued",
-        "conclusion": "",
+        "status": status,
+        "conclusion": conclusion,
         "html_url": "https://github.com/{}/actions/runs/{}".format(REPO.lower(), run_id),
         "created_at": created_at,
         "head_sha": HEAD,
@@ -214,6 +216,21 @@ class CommentHistoryTests(unittest.TestCase):
             expected_count=2,
         )[1]
         self.assertEqual(ACTION_HOLD, plan_admission(collection).action)
+
+    def test_missing_or_malformed_creation_times_fail_closed(self):
+        valid = comment("body", comment_id=1)
+        cases = (
+            {key: value for key, value in valid.items() if key != "created_at"},
+            {**valid, "created_at": ""},
+            {**valid, "created_at": "2026-11-12 00:00:00"},
+            {**valid, "created_at": "not-a-time"},
+        )
+        for case in cases:
+            with self.subTest(case=case.get("created_at", "<missing>")):
+                history = normalize_comment_pages([case])
+                self.assertFalse(history.complete)
+                self.assertFalse(history.ordered)
+                self.assertIn("creation timestamp", history.reason)
 
 
 # ---------------------------------------------------------------------------
@@ -381,6 +398,22 @@ class RunCorrelationTests(unittest.TestCase):
         self.assertFalse(has_unattributed_repair_run(runs, pull_number=999))
         self.assertFalse(has_unattributed_repair_run(check_inventory(run(3, attempt=ATTEMPT))))
 
+    def test_legacy_run_with_an_unknown_creation_time_holds(self):
+        # An unmarked repair run that cannot be proved older than the claim is
+        # unattributable evidence, not proof that no run exists.
+        for created in ("", "not-a-time"):
+            with self.subTest(created=created):
+                runs = check_inventory(run(1, created_at=created))
+                self.assertTrue(
+                    has_unattributed_repair_run(
+                        runs,
+                        pull_number=PR,
+                        since="2026-11-12T00:00:00Z",
+                    )
+                )
+                # Without a claim threshold the legacy run is still visible.
+                self.assertTrue(has_unattributed_repair_run(runs, pull_number=PR))
+
 
 # ---------------------------------------------------------------------------
 # Admission planning, including crash recovery.
@@ -436,6 +469,30 @@ class AdmissionPlanningTests(unittest.TestCase):
         )
         self.assertEqual(ACTION_WAIT, plan.action)
         self.assertEqual(STATUS_DISPATCHED, plan.transition.status)
+
+    def test_queued_and_canceled_repair_runs_still_spend_the_attempt(self):
+        # A queued admission and a canceled repair are observed outcomes of
+        # the same dispatch. Neither is evidence that no run was created, and
+        # neither may authorize a second repair.
+        for status, conclusion in (
+            ("queued", ""),
+            ("in_progress", ""),
+            ("completed", "cancelled"),
+        ):
+            with self.subTest(status=status, conclusion=conclusion):
+                plan = plan_admission(
+                    read([receipt_comment()]),
+                    runs=check_inventory(
+                        run(12, attempt=ATTEMPT, status=status, conclusion=conclusion)
+                    ),
+                    observed_at="2026-11-12T00:00:00Z",
+                    now="2026-11-12T01:00:00Z",
+                    claim_timeout_seconds=900,
+                    pull_number=PR,
+                )
+                self.assertEqual(ACTION_WAIT, plan.action)
+                self.assertEqual(STATUS_DISPATCHED, plan.transition.status)
+                self.assertEqual(12, plan.run_id)
 
     def test_a_stale_claim_with_a_complete_empty_inventory_rearms_once(self):
         plan = plan_admission(

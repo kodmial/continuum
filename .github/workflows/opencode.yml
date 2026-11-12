@@ -113,7 +113,7 @@ on:
         required: false
         type: string
       ci_repair_label:
-        description: "CI repair in-flight lock label"
+        description: "Presentation label for an automatic CI repair attempt (not admission state)"
         required: false
         type: string
       packaging_repair_label:

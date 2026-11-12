@@ -133,6 +133,18 @@ class BuildRenderParseTests(unittest.TestCase):
         self.assertEqual(HEAD, built.head_sha)
         self.assertEqual((built,), parse_receipts(render_receipt(built)))
 
+    def test_run_url_display_case_is_canonicalized(self):
+        built = receipt(
+            status=STATUS_DISPATCHED,
+            run_id=987654,
+            run_url="https://github.com/Kodmial/Continuum/actions/runs/987654",
+        )
+        self.assertEqual(
+            "https://github.com/kodmial/continuum/actions/runs/987654",
+            built.run_url,
+        )
+        self.assertIn("url=https://github.com/kodmial/continuum/", receipt_marker_line(built))
+
     def test_dispatched_receipt_accepts_proved_run_details(self):
         built = receipt(
             status=STATUS_DISPATCHED,

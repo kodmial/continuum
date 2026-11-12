@@ -70,6 +70,9 @@ if args[:1] != ["api"]:
 rest = args[1:]
 
 if rest[:1] == ["user"]:
+    if os.environ.get("FAKE_TOKEN_FAIL") == "1":
+        sys.stderr.write("simulated token identity failure\n")
+        sys.exit(1)
     print(json.dumps({"login": token_login}))
     sys.exit(0)
 
@@ -164,7 +167,7 @@ sys.exit(0)
 '''
 
 
-def trusted_receipt(head=HEAD, attempt="ci-crashed-0001", status="claimed"):
+def trusted_receipt(head=HEAD, attempt="ci-crashed-0001", status="claimed", author=None):
     return {
         "id": 1,
         "body": (
@@ -176,7 +179,7 @@ def trusted_receipt(head=HEAD, attempt="ci-crashed-0001", status="claimed"):
         "created_at": "2026-11-12T00:00:00Z",
         "updated_at": "2026-11-12T00:00:00Z",
         "author_association": "NONE",
-        "user": {"login": "github-actions[bot]"},
+        "user": {"login": author or "github-actions[bot]"},
     }
 
 
@@ -406,6 +409,58 @@ class AdmissionExecutableTests(unittest.TestCase):
         self.assertTrue(any("status=rejected" in body for body in bodies), bodies)
         self.assertTrue(any("status=claimed" in body for body in bodies), bodies)
         self.assertEqual(1, len(self.dispatches()))
+        # The stale recovery is the resumed watchdog: it re-lists runs after
+        # the claim observation. That listing must stay an idempotent GET; a
+        # field alone would make ``gh api`` send a POST and break recovery.
+        run_lists = [
+            line for line in self.log()
+            if "/actions/workflows/" in line and "/runs" in line
+        ]
+        self.assertTrue(run_lists, self.log())
+        self.assertTrue(
+            any("--method GET" in line and "created=>=2026-11-12T00:00:00Z" in line
+                for line in run_lists),
+            run_lists,
+        )
+        self.assertFalse(
+            any("--method POST" in line for line in run_lists),
+            "workflow-run reconciliation must never POST a listing",
+        )
+
+    def test_a_canceled_controller_is_resumed_once_by_the_next_serialized_pass(self):
+        # The claim was persisted, then the controller run was canceled before
+        # it could record a dispatch. The next serialized pass is the resumed
+        # watchdog: it rejects the dead claim and dispatches once, and every
+        # following pass waits.
+        self.write_comments([trusted_receipt(status="claimed")])
+        self.write_pr(head=HEAD, comments=1)
+        self.run_admission(extra_args=("--now", NOW))
+        self.assertEqual(1, len(self.dispatches()))
+        bodies = self.posted_bodies()
+        self.assertTrue(any("status=rejected" in body for body in bodies), bodies)
+        self.assertTrue(any("status=claimed" in body for body in bodies), bodies)
+        self.run_admission(extra_args=("--now", "2026-11-13T00:00:00Z"))
+        self.assertEqual(1, len(self.dispatches()), "the resumed pass duplicated repair")
+
+    def test_a_receipt_authored_by_the_authenticated_token_is_trusted(self):
+        # A collaborator-owned PAT is a supported TAP_PAT shape. Receipts it
+        # wrote carry COLLABORATOR/NONE association, so only the authenticated
+        # token login can prove they are our own attempts. If that identity is
+        # lost, a later pass would treat its own claim as untrusted and
+        # dispatch the same exact HEAD a second time.
+        self.write_comments([trusted_receipt(author="some-collaborator")])
+        self.write_pr(head=HEAD, comments=1)
+        self.run_admission(
+            extra_env={"FAKE_TOKEN_LOGIN": "some-collaborator"},
+            extra_args=("--now", NOW),
+        )
+        self.run_admission(extra_env={"FAKE_TOKEN_LOGIN": "some-collaborator"})
+        self.assertEqual(1, len(self.dispatches()))
+
+    def test_an_unprovable_token_identity_holds_without_a_claim(self):
+        self.run_admission(extra_env={"FAKE_TOKEN_FAIL": "1"})
+        self.assertEqual(0, len(self.dispatches()))
+        self.assertEqual([], self.posts())
 
     def test_a_stale_claim_with_unreadable_inventory_becomes_a_visible_hold(self):
         self.write_comments([trusted_receipt()])

@@ -90,7 +90,8 @@ on:
         default: 'true'
       ci_repair_label:
         description: >-
-          Label used as the in-flight lock for automatic CI repair.
+          Presentation label for an automatic CI repair attempt. It is never
+          used for admission; the exact-HEAD receipt is authoritative.
         required: false
         type: string
         default: ''
@@ -947,7 +948,6 @@ jobs:
           CI_ATTEMPT_ID: ${{ inputs.ci_attempt_id }}
           CI_HEAD_SHA: ${{ inputs.ci_head_sha }}
           DISPATCH_RUN_ID: ${{ github.run_id }}
-          DISPATCH_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         with:
           github-token: ${{ secrets.TAP_PAT }}
           script: |
@@ -1019,9 +1019,17 @@ jobs:
               core.notice(`No claim receipt exists for CI repair attempt ${attempt}.`);
               return;
             }
+            const dispatchRunId = Number(process.env.DISPATCH_RUN_ID);
+            if (!Number.isInteger(dispatchRunId) || dispatchRunId <= 0) {
+              core.warning('CI repair correlation has no valid dispatch run ID; not writing a receipt.');
+              return;
+            }
+            // The receipt parser requires the canonical lowercase repository in
+            // the run URL; github.repository may preserve display case.
+            const dispatchRunUrl = `https://github.com/${repository}/actions/runs/${dispatchRunId}`;
             const receipt = `<!-- continuum-ci-repair-receipt v=1 repo=${repository} ` +
               `pr=${pullNumber} head=${head} attempt=${attempt} status=dispatched ` +
-              `run=${Number(process.env.DISPATCH_RUN_ID)} url=${process.env.DISPATCH_RUN_URL} -->`;
+              `run=${dispatchRunId} url=${dispatchRunUrl} -->`;
             try {
               await github.rest.issues.createComment({
                 owner,
