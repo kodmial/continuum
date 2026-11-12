@@ -721,6 +721,128 @@ module.exports = async function runIssueScheduler({ github, context, core }) {
       'start an explicit new generation instead of redispatching.';
   }
   
+  const checkpointResumeBlockedMarkerRe =
+    /<!--\s*continuum-checkpoint-resume-blocked\s+repo=([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)\s+issue=(\d+)\s+generation=(\d+)\s+operation=(\S+)\s+checkpoint=(\S+)\s+checkpoint_sha=([0-9a-fA-F]{40})\s+base_ref=(\S+)\s+base_sha=([0-9a-fA-F]{40})\s+snapshot=([0-9a-fA-F]{64})\s+reason=(\S+)\s*-->/;
+  const checkpointSnapshotMarkerRe =
+    /<!--\s*continuum-task-snapshot(?:-ref)?\s+repo=([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)\s+issue=(\d+)\s+generation=(\d+)\s+title-sha256=([0-9a-fA-F]{64})\s+body-sha256=([0-9a-fA-F]{64})\s+spec-sha256=([0-9a-fA-F]{64})\s*-->/g;
+
+  // A deterministic checkpoint-continuation rejection is persisted as a
+  // typed marker. It is not an owner pause and not a terminal generation
+  // stop: the saved checkpoint is preserved and the scheduler only holds
+  // this exact identity. A new checkpoint tip, a new pinned task snapshot,
+  // checkpoint deletion, or a later owner /oc are material premise changes.
+  async function checkpointResumeHold(
+    targetOwner, targetRepo, issueNumber, comments, client, generation = 1
+  ) {
+    const wantedRepo = (targetOwner + '/' + targetRepo).toLowerCase();
+    const wantedGeneration = Number(generation) || 1;
+    const trusted = (comments || []).filter(comment =>
+      isTrustedStopComment(comment, targetOwner)
+    );
+    let marker = null;
+    for (const comment of trusted) {
+      const match = String(comment.body || '').match(
+        checkpointResumeBlockedMarkerRe
+      );
+      if (!match) continue;
+      if (
+        match[1].toLowerCase() !== wantedRepo ||
+        Number(match[2]) !== issueNumber ||
+        Number(match[3]) !== wantedGeneration
+      ) continue;
+      const candidate = {
+        created_at: comment.created_at || '',
+        id: comment.id || 0,
+        operation: match[4],
+        checkpointRef: match[5],
+        checkpointSha: match[6].toLowerCase(),
+        baseRef: match[7],
+        baseSha: match[8].toLowerCase(),
+        snapshotSpec: match[9].toLowerCase(),
+        reason: match[10],
+      };
+      if (!marker || stopOrderKey(candidate) > stopOrderKey(marker)) {
+        marker = candidate;
+      }
+    }
+    if (!marker) return null;
+
+    const markerOrder = stopOrderKey(marker);
+    for (const comment of trusted) {
+      if (stopOrderKey({
+        created_at: comment.created_at || '',
+        id: comment.id || 0,
+      }) <= markerOrder) continue;
+      const body = String(comment.body || '');
+      const login = String(comment.user?.login || '').toLowerCase();
+      if (
+        login === String(targetOwner || '').toLowerCase() &&
+        !body.includes(dispatchMarker) &&
+        !body.includes('<!-- opencode-watchdog-retry -->') &&
+        /^[ ]{0,3}\/(?:opencode|oc)(?=\s|$)/m.test(body)
+      ) {
+        return null;
+      }
+    }
+
+    // A newer pinned snapshot is a material premise change. Only trusted
+    // comments can move a generation baseline: an arbitrary commenter must
+    // never release a deterministic hold by posting a forged snapshot marker.
+    let latestSnapshot = null;
+    let latestSnapshotOrder = '';
+    for (const comment of trusted) {
+      const body = String(comment.body || '');
+      for (const match of body.matchAll(checkpointSnapshotMarkerRe)) {
+        if (
+          match[1].toLowerCase() !== wantedRepo ||
+          Number(match[2]) !== issueNumber ||
+          Number(match[3]) !== wantedGeneration
+        ) continue;
+        const order = (comment.created_at || '') + '#' +
+          String(comment.id || 0).padStart(12, '0');
+        if (order > latestSnapshotOrder) {
+          latestSnapshotOrder = order;
+          latestSnapshot = match[6].toLowerCase();
+        }
+      }
+    }
+    if (latestSnapshot && latestSnapshot !== marker.snapshotSpec) {
+      return null;
+    }
+
+    // A changed or deleted durable checkpoint ref is a material premise
+    // change. A failed read stays fail-closed: no automatic redispatch.
+    if (!marker.checkpointRef || marker.checkpointRef === '-') {
+      return marker;
+    }
+    try {
+      const refName = marker.checkpointRef.replace(/^refs\/heads\//, '');
+      const response = await client.rest.git.getRef({
+        owner: targetOwner,
+        repo: targetRepo,
+        ref: 'heads/' + refName,
+      });
+      const tip = String(response.data?.object?.sha || '').toLowerCase();
+      if (tip && tip !== marker.checkpointSha) return null;
+    } catch (err) {
+      if (err.status === 404) return null;
+      core.warning(
+        'Checkpoint-resume hold lookup failed for #' + issueNumber +
+        '; keeping the deterministic hold until it can be proven changed.'
+      );
+    }
+    return marker;
+  }
+
+  function checkpointResumeHoldSkipReason(issueNumber, hold) {
+    return 'checkpoint resume hold: #' + issueNumber +
+      ' has a deterministic checkpoint continuation rejection (' +
+      String(hold && hold.reason || 'resume-rejected') +
+      '); the saved checkpoint is preserved and this exact ' +
+      'checkpoint/base/snapshot is not redispatched until a material ' +
+      'premise changes.';
+  }
+
   const ownerResumeMarkerRe =
     /^[ \t]*<!--\s*continuum-resume-after:v1\s+predecessor=([1-9]\d*)\s*-->[ \t]*(?:\r?\n|$)/;
   const ownerResumeMarkerLineRe =
@@ -3446,6 +3568,20 @@ module.exports = async function runIssueScheduler({ github, context, core }) {
         per_page: 100,
       }
     );
+    const resumeHold = await checkpointResumeHold(
+      owner, repo, issueNumber, comments, readGithub
+    );
+    if (resumeHold) {
+      // Deterministic pre-model rejection: release the coding slot but do
+      // not apply the owner pause label and do not burn another attempt
+      // for the same checkpoint/base/snapshot identity.
+      await removeLabel(issueNumber, inProgressLabel);
+      core.notice(
+        'Released reservation on issue #' + issueNumber + ': ' +
+        checkpointResumeHoldSkipReason(issueNumber, resumeHold)
+      );
+      continue;
+    }
     const commentClasses = classifyComments(
       comments.map(comment => comment.body || '')
     );
@@ -3939,6 +4075,26 @@ module.exports = async function runIssueScheduler({ github, context, core }) {
       continue;
     }
   
+    const candidateComments = await readGithub.paginate(
+      readGithub.rest.issues.listComments,
+      {
+        owner,
+        repo,
+        issue_number: issue.number,
+        per_page: 100,
+      }
+    );
+    const candidateResumeHold = await checkpointResumeHold(
+      owner, repo, issue.number, candidateComments, readGithub
+    );
+    if (candidateResumeHold) {
+      core.info(
+        'Skipping #' + issue.number + ': ' +
+        checkpointResumeHoldSkipReason(issue.number, candidateResumeHold)
+      );
+      continue;
+    }
+  
     selected.push(candidate);
   }
   
@@ -4134,6 +4290,26 @@ module.exports = async function runIssueScheduler({ github, context, core }) {
       core.info(
         'Skipping #' + issue.number + ': ' +
         terminalStopSkipReason(issue.number, freshStop)
+      );
+      continue;
+    }
+  
+    const freshComments = await readGithub.paginate(
+      readGithub.rest.issues.listComments,
+      {
+        owner,
+        repo,
+        issue_number: issue.number,
+        per_page: 100,
+      }
+    );
+    const freshResumeHold = await checkpointResumeHold(
+      owner, repo, issue.number, freshComments, readGithub
+    );
+    if (freshResumeHold) {
+      core.info(
+        'Skipping #' + issue.number + ': ' +
+        checkpointResumeHoldSkipReason(issue.number, freshResumeHold)
       );
       continue;
     }
