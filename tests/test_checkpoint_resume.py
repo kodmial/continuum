@@ -422,6 +422,23 @@ class CheckpointResumeTest(unittest.TestCase):
             )[0]["episode"],
         )
 
+    def test_failure_marker_publication_is_retried_and_confirmed(self):
+        workflow = (
+            ROOT / ".github" / "workflows" / "continuum-opencode.yml"
+        ).read_text(encoding="utf-8")
+        self.assertIn("resume_hold_marker_published() {", workflow)
+        self.assertIn("for resume_publish_attempt in 1 2 3; do", workflow)
+        self.assertIn("RESUME_MARKER_CONFIRMED=true", workflow)
+        self.assertIn("! resume_hold_marker_published; then", workflow)
+        self.assertIn(
+            "refusing to continue while an earlier owner override can still "
+            "release the hold.",
+            workflow,
+        )
+        self.assertNotIn(
+            '--body "$RESUME_MARKER" >/dev/null 2>&1 || true', workflow
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

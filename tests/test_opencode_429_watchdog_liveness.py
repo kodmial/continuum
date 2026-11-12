@@ -1331,6 +1331,62 @@ class WatchdogHarness(unittest.TestCase):
         result = self.run_scenario(scenario)
         self.assertEqual(len(self.retried_bodies(result)), 1, result["comments"])
 
+    def test_recorded_automatic_dispatch_consumes_a_manual_retry(self):
+        cases = {
+            "scheduler": (
+                "/oc\n\n<!-- issue-scheduler-dispatch -->",
+                {},
+            ),
+            "watchdog": (
+                "/oc\n\n<!-- opencode-watchdog-retry -->\n"
+                "<!-- continuum-origin role=continuum component=opencode-watchdog -->",
+                {"MAX_RECOVERY_RETRIES": "2"},
+            ),
+        }
+        for name, (dispatch, env) in cases.items():
+            with self.subTest(dispatch=name):
+                scenario = self.normal_retry_scenario()
+                scenario["comments"].extend([
+                    thread_comment(20, hold_marker(), "2026-10-23T09:50:00Z"),
+                    thread_comment(
+                        21, "/oc", "2026-10-23T10:00:00Z", login="kodmial"
+                    ),
+                    thread_comment(22, dispatch, "2026-10-23T10:05:00Z"),
+                ])
+                seeded = sum(
+                    1
+                    for comment in scenario["comments"]
+                    if "<!-- opencode-watchdog-retry -->" in comment["body"]
+                )
+                result = self.run_scenario(scenario, env=env)
+                self.assertEqual(
+                    len(self.retried_bodies(result)) - seeded,
+                    0,
+                    result["comments"],
+                )
+
+    def test_manual_retry_after_a_consumed_override_resumes(self):
+        scenario = self.normal_retry_scenario()
+        scenario["comments"].extend([
+            thread_comment(20, hold_marker(), "2026-10-23T09:50:00Z"),
+            thread_comment(
+                21, "/oc", "2026-10-23T10:00:00Z", login="kodmial"
+            ),
+            thread_comment(
+                22,
+                "/oc\n\n<!-- opencode-watchdog-retry -->\n"
+                "<!-- continuum-origin role=continuum component=opencode-watchdog -->",
+                "2026-10-23T10:05:00Z",
+            ),
+            thread_comment(
+                23, "/oc\nretry again", "2026-10-23T10:10:00Z", login="kodmial"
+            ),
+        ])
+        result = self.run_scenario(
+            scenario, env={"MAX_RECOVERY_RETRIES": "2"}
+        )
+        self.assertEqual(len(self.retried_bodies(result)), 2, result["comments"])
+
     def test_production_source_verifies_authoritative_run_evidence(self):
         self.assertIn("getWorkflowRun", self.source)
         self.assertIn("inspectObservedRecovery", self.source)

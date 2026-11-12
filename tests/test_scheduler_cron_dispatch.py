@@ -534,6 +534,25 @@ function classifyComments(bodies) {
     null,
     'a later manual /oc after the new hold episode may resume'
   );
+  const schedulerDispatch = item(11,
+    '/oc\n\n<!-- issue-scheduler-dispatch -->\nretry');
+  assert.ok(
+    await hold([saved, manual, schedulerDispatch]),
+    'a recorded automatic dispatch consumes the manual override'
+  );
+  assert.ok(
+    await hold([saved, manual, item(12,
+      '/oc\n\n<!-- opencode-watchdog-retry -->\n' +
+      '<!-- continuum-origin role=continuum component=opencode-watchdog -->')]),
+    'a recorded watchdog retry consumes the manual override'
+  );
+  assert.equal(
+    await hold([
+      saved, manual, schedulerDispatch, item(13, '/oc\nretry again')
+    ]),
+    null,
+    'a new manual /oc after the consumed override may resume'
+  );
   assert.equal(await hold([saved, manual], client('d'.repeat(40))), null,
     'changed checkpoint SHA still releases a manual override');
   assert.equal(await hold([item(1, marker, 'outsider')]), null,

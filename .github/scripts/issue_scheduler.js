@@ -806,16 +806,44 @@ module.exports = async function runIssueScheduler({ github, context, core }) {
       const ownerClasses = classifyComments(
         laterOwnerComments.map(comment => String(comment.body || ''))
       );
+      // A recorded automatic dispatch consumes a manual owner override.
+      // This keeps the hold fail-closed even when the failed retry cannot
+      // publish its own new rejection episode: without it, the same old /oc
+      // would release the hold again on every later wake.
+      const automationDispatchOrders = trusted
+        .map(comment => ({
+          order: stopOrderKey({
+            created_at: comment.created_at || '',
+            id: comment.id || 0,
+          }),
+          body: String(comment.body || ''),
+        }))
+        .filter(entry =>
+          entry.body.includes(dispatchMarker) ||
+          (entry.body.trimStart().startsWith('/oc') &&
+            entry.body.includes(watchdogOriginMarker))
+        )
+        .map(entry => entry.order);
+      let latestManualOwnerOrder = '';
       for (let index = 0; index < laterOwnerComments.length; index += 1) {
         const body = String(laterOwnerComments[index].body || '');
-        if (
+        const manualOwnerCommand =
           ownerClasses[index] === 'run' &&
           !body.includes(dispatchMarker) &&
           !body.includes(watchdogOriginMarker) &&
-          !body.includes('<!-- opencode-watchdog-retry -->')
-        ) {
-          return null;
-        }
+          !body.includes('<!-- opencode-watchdog-retry -->');
+        if (!manualOwnerCommand) continue;
+        const order = stopOrderKey({
+          created_at: laterOwnerComments[index].created_at || '',
+          id: laterOwnerComments[index].id || 0,
+        });
+        if (order > latestManualOwnerOrder) latestManualOwnerOrder = order;
+      }
+      if (
+        latestManualOwnerOrder &&
+        !automationDispatchOrders.some(order => order > latestManualOwnerOrder)
+      ) {
+        return null;
       }
     }
 

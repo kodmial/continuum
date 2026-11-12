@@ -146,11 +146,14 @@ APPROVED_433_OPENCODE_SHA256 = (
 # all five guarded executor paths; unrelated workflow drift remains forbidden.
 # #442 (main 7e4da5d) deliberately extends this exact protected workflow with
 # an issue-checkpoint identity check and isolated original-base verification.
-# Pin the complete resulting bytes. Tests below and test_comment_attribution
-# independently enforce the recovery contract and its diagnostic provenance;
-# do not replace this pin with an allowlist or ignore workflow differences.
+# The PR #448 repair additionally retries and confirms publication of the
+# deterministic checkpoint-resume hold marker instead of swallowing a failed
+# write. Pin the complete resulting bytes. Tests below and
+# test_comment_attribution independently enforce the recovery contract and
+# its diagnostic provenance; do not replace this pin with an allowlist or
+# ignore workflow differences.
 APPROVED_PROVIDER_RECOVERY_OPENCODE_SHA256 = (
-    "386efdaef0c8568eec94f4d0185b9e8d8b1390d6fb82d136f4bc7929e3ff5df8"
+    "2a80745f08abb75321bdcf0880f6aec79eb0dbd311b68f1bae754daab902e6bd"
 )
 
 # Additional reviewed self-caller change: owner-only CodeRabbit repair dispatch
