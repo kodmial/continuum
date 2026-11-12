@@ -83,7 +83,7 @@ MUTATION_COUNTS = {
     "continuum-issue-scheduler.yml": 11,
     "continuum-opencode-repair.yml": 2,
     "continuum-opencode-watchdog.yml": 4,
-    "continuum-opencode.yml": 12,  # additional functional batch-verification reply
+    "continuum-opencode.yml": 13,  # #442 adds one fail-closed checkpoint-resume diagnostic
     "continuum-pr-agent-auto-merge.yml": 1,
     "continuum-pr-agent-canary.yml": 4,
     "continuum-pr-agent-recovery.yml": 4,
@@ -206,6 +206,7 @@ FUNCTIONAL_ANCHORS = {
         "Task contract drift detected before ",
         "continuum-task-snapshot-drift",
         "continuum-task-generation-stop",
+        'gh issue comment "$ISSUE_NUMBER" --repo "$GITHUB_REPOSITORY"',
     ),
     "continuum-opencode-repair.yml": (
         "Task contract drift detected for ",
@@ -771,6 +772,36 @@ class WorkflowAttributionTests(unittest.TestCase):
                             self.assertIn(plumbing, policy)
                         continue
                     resolved = window
+                    if ('gh issue comment "$ISSUE_NUMBER"' in window
+                            and '--body "$RESUME_MARKER"' in window):
+                        # #442 constructs this comment in the external, tested
+                        # checkpoint_resume.failure_marker builder, rather than
+                        # an inline shell literal. Verify the emitted payload,
+                        # not merely an attribution-looking workflow comment.
+                        from continuum import checkpoint_resume
+
+                        marker = checkpoint_resume.failure_marker({
+                            "repository": "kodmial/continuum",
+                            "issue": 442,
+                            "generation": 1,
+                            "operation": "opencode-429-issue-issue442",
+                            "checkpoint_ref": "opencode/checkpoint-issue442",
+                            "checkpoint_sha": "a" * 40,
+                            "base_ref": "main",
+                            "base_sha": "b" * 40,
+                            "snapshot_spec": "c" * 64,
+                            "reason": "verification-failed",
+                        })
+                        self.assertIn(
+                            "<!-- continuum-checkpoint-resume-blocked", marker
+                        )
+                        self.assertIn(
+                            expected_marker("continuum", "opencode"), marker
+                        )
+                        self.assertIn(
+                            expected_header("continuum", "opencode"), marker
+                        )
+                        resolved += "\n" + marker
                     for ref in sorted(BUILDER_REFS, key=len, reverse=True):
                         if ref in window:
                             resolved += "\n" + builder_text(ref, text, name)
