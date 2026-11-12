@@ -343,6 +343,41 @@ class TrustTests(unittest.TestCase):
         self.assertFalse(decision.allowed)
         self.assertEqual(ACTION_HOLD, decision.action)
 
+    def test_partial_untrusted_author_metadata_fails_closed(self):
+        # Without a login the commenter might be github-actions[bot];
+        # without an association the commenter might be OWNER.
+        for missing_field in ("user", "author_association"):
+            with self.subTest(missing_field=missing_field):
+                forged = comment(
+                    render_receipt(
+                        receipt(status=STATUS_DISPATCHED, run_id=1)
+                    ),
+                    login="untrusted-reader",
+                    association="NONE",
+                )
+                del forged[missing_field]
+                result = read([forged])
+                self.assertEqual(OUTCOME_INCOMPLETE, result.outcome)
+                self.assertIn("unknown authorship", result.reason)
+                decision = decide_new_attempt(result)
+                self.assertFalse(decision.allowed)
+                self.assertEqual(ACTION_HOLD, decision.action)
+
+    def test_positive_trust_with_one_author_source_remains_valid(self):
+        trusted_bot = receipt_comment()
+        del trusted_bot["author_association"]
+        trusted_owner = comment(
+            render_receipt(receipt()),
+            login="anything",
+            association="OWNER",
+        )
+        del trusted_owner["user"]
+        for marked in (trusted_bot, trusted_owner):
+            with self.subTest(marked=marked):
+                result = read([marked])
+                self.assertEqual(OUTCOME_COMPLETE, result.outcome)
+                self.assertEqual(1, len(result.attempts))
+
     def test_untrusted_mixed_marker_cannot_block_trusted_history(self):
         forged = comment(
             render_receipt(
