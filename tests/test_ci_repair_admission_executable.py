@@ -318,6 +318,91 @@ class AdmissionExecutableTests(unittest.TestCase):
     def dispatches(self):
         return [line for line in self.log() if "inputs[mode]=ci-fix" in line]
 
+    def assert_rotated_writer_receipt_is_not_redispatched(self, *, status, run_id=None):
+        # The previous TAP_PAT account only left a claimed/ambiguous receipt, or
+        # a dispatched receipt without run details. GitHub's actual run still
+        # proves that account created this exact-HEAD attempt.
+        attempt = "ci-old-account-0001"
+        self.write_comments(
+            [
+                trusted_receipt(
+                    attempt=attempt,
+                    status=status,
+                    author="old-automation",
+                    run_id=run_id,
+                )
+            ]
+        )
+        self.write_pr(head=HEAD, comments=1)
+        self.write_runs(
+            [
+                {
+                    "id": 900,
+                    "display_title": "OpenCode repair PR #{} [ci-attempt:{}]".format(
+                        PR, attempt
+                    ),
+                    "status": "queued",
+                    "conclusion": "",
+                    "html_url": "https://github.com/{}/actions/runs/900".format(
+                        REPO.lower()
+                    ),
+                    "created_at": "2026-11-12T00:00:00Z",
+                    "head_sha": HEAD,
+                    "actor": {"login": "old-automation"},
+                }
+            ]
+        )
+        completed = self.run_admission()
+        self.assertEqual(0, len(self.dispatches()))
+        self.assertIn("verified by its exact-HEAD dispatch run", completed.stdout)
+
+    def test_a_previous_token_account_claim_is_never_redispatched(self):
+        self.assert_rotated_writer_receipt_is_not_redispatched(status="claimed")
+
+    def test_a_previous_token_account_ambiguous_receipt_is_never_redispatched(self):
+        self.assert_rotated_writer_receipt_is_not_redispatched(status="ambiguous")
+
+    def test_a_previous_token_account_unrun_dispatch_is_never_redispatched(self):
+        self.assert_rotated_writer_receipt_is_not_redispatched(
+            status="dispatched"
+        )
+
+    def test_unverifiable_historical_receipt_history_holds_without_claiming(self):
+        self.write_comments(
+            [
+                trusted_receipt(
+                    attempt="ci-old-account-0001",
+                    status="claimed",
+                    author="old-automation",
+                )
+            ]
+        )
+        self.write_pr(head=HEAD, comments=1)
+        completed = self.run_admission(extra_env={"FAKE_RUNS_FAIL": "1"})
+        self.assertEqual(0, len(self.dispatches()))
+        self.assertEqual([], self.posts())
+        self.assertIn("cannot be verified", completed.stdout)
+
+    def test_incomplete_historical_run_inventory_holds_without_claiming(self):
+        self.write_comments(
+            [
+                trusted_receipt(
+                    attempt="ci-old-account-0001",
+                    status="claimed",
+                    author="old-automation",
+                )
+            ]
+        )
+        self.write_pr(head=HEAD, comments=1)
+        self.write_state(
+            "runs_pages.json",
+            [{"total_count": 2, "workflow_runs": []}],
+        )
+        completed = self.run_admission()
+        self.assertEqual(0, len(self.dispatches()))
+        self.assertEqual([], self.posts())
+        self.assertIn("cannot be verified", completed.stdout)
+
     def test_first_failure_persists_the_claim_before_exactly_one_dispatch(self):
         self.run_admission()
         bodies = self.posted_bodies()

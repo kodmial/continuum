@@ -53,7 +53,7 @@ from continuum.ci_repair_admission import (  # noqa: E402
     normalize_comment_pages,
     normalize_run_pages,
     plan_admission,
-    run_proves_dispatched_receipt,
+    run_proves_historical_receipt,
     select_correlated_run,
     unexpected_dispatch_inputs,
 )
@@ -65,6 +65,7 @@ from continuum.ci_repair_receipt import (  # noqa: E402
     STATUS_AMBIGUOUS,
     STATUS_CLAIMED,
     STATUS_DISPATCHED,
+    STATUS_REJECTED,
     build_receipt,
     comment_login,
     is_trusted_receipt_comment,
@@ -393,17 +394,23 @@ def _historical_receipt_writers(
     workflow: str,
     owner_login: str,
     trusted_logins: Sequence[str],
-) -> Tuple[str, ...]:
+) -> Tuple[Tuple[str, ...], bool]:
     """Return historical receipt authors proved by GitHub's run records.
 
     ``TAP_PAT`` can be rotated to another account. Receipts the previous
     account published must stay authoritative, or the exact HEAD they already
-    dispatched looks unused and admission dispatches it a second time. A
-    receipt is only re-trusted here when the ``dispatched`` run it names exists
-    for the same exact HEAD, carries this attempt's run-name marker (or the
-    canonical legacy repair title) and was created by the same account. An
-    unrelated commenter cannot borrow a run ID, so unverified lookalikes stay
+    spent looks unused and admission dispatches it a second time. A receipt is
+    only re-trusted here when a run exists for the same exact HEAD, carries
+    this attempt's run-name marker (or, for a receipt with its proved run ID,
+    the canonical legacy repair title) and was created by the same account.
+    ``claimed``, ``ambiguous``, and run-detail-less ``dispatched`` receipts are
+    included because outcome persistence can fail after an accepted dispatch.
+    An unrelated commenter cannot borrow a run, so unverified lookalikes stay
     ignored exactly as before.
+
+    The second result reports that history exists which cannot be verified
+    because the run inventory failed or is incomplete. The caller must hold in
+    that case instead of treating those receipts as absent.
     """
 
     candidates = []
@@ -429,16 +436,14 @@ def _historical_receipt_writers(
             continue
         for receipt in receipts:
             if (
-                receipt.repository != repository
-                or receipt.pull_number != pull_number
-                or receipt.head_sha != head_sha
-                or receipt.status != STATUS_DISPATCHED
-                or receipt.run_id is None
+                receipt.repository == repository
+                and receipt.pull_number == pull_number
+                and receipt.head_sha == head_sha
+                and receipt.status != STATUS_REJECTED
             ):
-                continue
-            candidates.append((author, receipt))
+                candidates.append((author, receipt))
     if not candidates:
-        return ()
+        return (), False
 
     try:
         inventory = _workflow_runs(repository, workflow)
@@ -448,27 +453,34 @@ def _historical_receipt_writers(
                 exc
             )
         )
-        return ()
+        return (), True
     if not inventory.complete:
-        return ()
-
-    runs_by_id = {}
-    for run in inventory.runs:
-        run_id = run.get("id")
-        if isinstance(run_id, bool) or not isinstance(run_id, int):
-            continue
-        runs_by_id[run_id] = run
+        print(
+            "::warning::Historical CI-repair receipt authors cannot be verified: "
+            "{}".format(inventory.reason)
+        )
+        return (), True
 
     verified = []
+    unverifiable = False
     for author, receipt in candidates:
-        run = runs_by_id.get(receipt.run_id)
-        if run is None:
+        matches = [
+            run
+            for run in inventory.runs
+            if run_proves_historical_receipt(
+                run, receipt, author_login=author
+            )
+        ]
+        if len(matches) > 1:
+            # Corrupt evidence cannot establish which run belongs to this
+            # attempt; hold rather than guessing or dispatching again.
+            unverifiable = True
             continue
-        if not run_proves_dispatched_receipt(run, receipt, author_login=author):
+        if not matches:
             continue
         if author not in verified:
             verified.append(author)
-    return tuple(verified)
+    return tuple(verified), unverifiable
 
 
 def _print_plan(plan: AdmissionPlan) -> None:
@@ -542,7 +554,7 @@ def run(args) -> int:
     # A rotated TAP_PAT account must not turn previously authoritative receipts
     # into ignored lookalikes. Only dispatch evidence GitHub itself attests
     # (a same-HEAD run created by that account for this attempt) extends trust.
-    for login in _historical_receipt_writers(
+    historical_writers, unverifiable_history = _historical_receipt_writers(
         repository,
         pull_number,
         head_sha,
@@ -550,7 +562,14 @@ def run(args) -> int:
         workflow=args.workflow,
         owner_login=args.owner_login or "",
         trusted_logins=tuple(trusted_logins),
-    ):
+    )
+    if unverifiable_history:
+        print(
+            "::warning::Historical CI-repair receipts cannot be verified; "
+            "holding instead of risking a duplicate dispatch."
+        )
+        return 0
+    for login in historical_writers:
         trusted_logins.append(login)
         print(
             "::notice::Historical CI-repair receipt author {!r} is verified by "

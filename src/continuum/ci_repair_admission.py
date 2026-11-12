@@ -815,7 +815,7 @@ def _run_actor_logins(run: Mapping[str, Any]) -> frozenset:
     return frozenset(logins)
 
 
-def run_proves_dispatched_receipt(
+def run_proves_historical_receipt(
     run: Any,
     receipt: Any,
     *,
@@ -823,22 +823,36 @@ def run_proves_dispatched_receipt(
 ) -> bool:
     """Whether GitHub's own run record proves an otherwise untrusted receipt.
 
-    ``TAP_PAT`` can be rotated to another account. A ``dispatched`` receipt the
-    previous account published must not become an ignored lookalike, or the
-    exact HEAD it already spent looks unused and admission dispatches it a
-    second time. The receipt is only re-trusted when the run it names exists
-    for the same exact HEAD, carries this attempt's run-name marker (or the
-    canonical legacy repair title) and was created by the same account. The
-    comment author alone is never sufficient, so an unrelated commenter cannot
-    borrow a run ID to suppress or authorize a repair.
+    ``TAP_PAT`` can be rotated to another account. A receipt the previous
+    account published must not become an ignored lookalike, or the exact HEAD
+    it already spent looks unused and admission dispatches it a second time.
+    A ``claimed`` or ``ambiguous`` receipt can remain when outcome persistence
+    fails after an accepted dispatch, so it is proved by the same run's
+    attempt marker and actor rather than by a run ID that was never stored.
+
+    The receipt is only re-trusted when a run exists for the same exact HEAD,
+    was created by the same account, and carries this attempt's run-name
+    marker. The canonical legacy repair title is only sufficient together
+    with the receipt's proved run ID, because without either an ID or a marker
+    it cannot be tied to this attempt. The comment author alone is never
+    sufficient, so an unrelated commenter cannot borrow a run to suppress or
+    authorize a repair.
     """
 
     if not isinstance(run, Mapping) or not isinstance(receipt, RepairReceipt):
         return False
-    if receipt.status != STATUS_DISPATCHED or receipt.run_id is None:
+    if receipt.status not in (
+        STATUS_CLAIMED,
+        STATUS_AMBIGUOUS,
+        STATUS_DISPATCHED,
+    ):
         return False
-    if _positive_run_id(run.get("id")) != receipt.run_id:
+    run_id = _positive_run_id(run.get("id"))
+    if run_id is None:
         return False
+    if receipt.run_id is not None:
+        if receipt.status != STATUS_DISPATCHED or run_id != receipt.run_id:
+            return False
     if str(run.get("head_sha") or "").strip().lower() != receipt.head_sha:
         return False
     author = str(author_login or "").strip().lower()
@@ -850,8 +864,32 @@ def run_proves_dispatched_receipt(
     marker = _ATTEMPT_RUN_MARKER_RE.search(title)
     if marker:
         return marker.group("attempt") == receipt.attempt_id
+    if receipt.run_id is None:
+        return False
     legacy = _UNMARKED_REPAIR_TITLE_RE.match(title)
     return bool(legacy) and int(legacy.group(1)) == receipt.pull_number
+
+
+def run_proves_dispatched_receipt(
+    run: Any,
+    receipt: Any,
+    *,
+    author_login: Any = "",
+) -> bool:
+    """Whether GitHub's run record proves a ``dispatched`` receipt's run.
+
+    This retains the original strict contract: the receipt must already carry
+    the proved run ID. Use :func:`run_proves_historical_receipt` for claimed,
+    ambiguous, or run-detail-less dispatched receipts.
+    """
+
+    if not isinstance(receipt, RepairReceipt):
+        return False
+    if receipt.status != STATUS_DISPATCHED or receipt.run_id is None:
+        return False
+    return run_proves_historical_receipt(
+        run, receipt, author_login=author_login
+    )
 
 
 def run_marker(attempt_id: Any) -> str:
@@ -1086,6 +1124,7 @@ __all__ = [
     "classify_dispatch_response",
     "select_correlated_run",
     "correlated_run_url",
+    "run_proves_historical_receipt",
     "run_proves_dispatched_receipt",
     "has_unattributed_repair_run",
     "run_marker",

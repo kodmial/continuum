@@ -31,6 +31,7 @@ from continuum.ci_repair_admission import (
     plan_admission,
     run_marker,
     run_proves_dispatched_receipt,
+    run_proves_historical_receipt,
     select_correlated_run,
     timestamp_is_stale,
     unexpected_dispatch_inputs,
@@ -476,6 +477,56 @@ class VerifiedHistoricalWriterTests(unittest.TestCase):
                     "triggering_actor": {"login": "old-automation"},
                 },
                 self.dispatched(),
+                author_login="old-automation",
+            )
+        )
+
+    def test_claimed_ambiguous_and_unrun_dispatched_receipts_are_proved_by_marker(self):
+        # Outcome persistence can fail after an accepted dispatch, leaving only
+        # the claim or a run-detail-less dispatched record. The actual run's
+        # attempt marker still proves that historical writer.
+        statuses = (
+            STATUS_CLAIMED,
+            STATUS_AMBIGUOUS,
+            STATUS_DISPATCHED,
+        )
+        for status in statuses:
+            with self.subTest(status=status):
+                self.assertTrue(
+                    run_proves_historical_receipt(
+                        self.actual_run(),
+                        receipt(status=status),
+                        author_login="old-automation",
+                    )
+                )
+
+    def test_an_unrun_receipt_needs_the_attempt_marker_not_a_legacy_title(self):
+        run = {
+            "id": 900,
+            "display_title": "OpenCode repair PR #{}".format(PR),
+            "head_sha": HEAD,
+            "actor": {"login": "old-automation"},
+        }
+        for status in (STATUS_CLAIMED, STATUS_AMBIGUOUS, STATUS_DISPATCHED):
+            with self.subTest(status=status):
+                self.assertFalse(
+                    run_proves_historical_receipt(
+                        run,
+                        receipt(status=status),
+                        author_login="old-automation",
+                    )
+                )
+        self.assertTrue(
+            run_proves_historical_receipt(
+                run, self.dispatched(), author_login="old-automation"
+            )
+        )
+
+    def test_rejected_receipts_never_extend_historical_trust(self):
+        self.assertFalse(
+            run_proves_historical_receipt(
+                self.actual_run(),
+                receipt(status=STATUS_REJECTED),
                 author_login="old-automation",
             )
         )
