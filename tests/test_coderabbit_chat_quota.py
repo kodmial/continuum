@@ -288,6 +288,19 @@ class ChatQuotaParserTests(unittest.TestCase):
                 trusted_author_logins=("github-actions[bot]",),
             )
         )
+        # A marker without an author identity is never trusted either.
+        for user in (None, {}, {"login": ""}):
+            with self.subTest(user=user):
+                self.assertFalse(
+                    rabbit.chat_retry_acknowledged(
+                        [{**reply, "user": user}],
+                        finding_id=4546745854,
+                        head_sha=head,
+                        limited_comment_id=body["id"],
+                        root_comment_id=4546745854,
+                        trusted_author_logins=("github-actions[bot]",),
+                    )
+                )
         # A DIFFERENT HEAD, finding, quota reply, or thread never reuses it.
         for kwargs in (
             {"head_sha": "a" * 40},
@@ -503,6 +516,12 @@ const forged = [{{id: 901, in_reply_to_id: threadRoot,
 assert.equal(chatQuotaRetryAcknowledged(
   forged, finding, head, limited, threadRoot, trusted
 ), false);
+// Missing author identity is not trusted.
+const anonymous = [{{id: 902, in_reply_to_id: threadRoot,
+  user: null, body: marker}}];
+assert.equal(chatQuotaRetryAcknowledged(
+  anonymous, finding, head, limited, threadRoot, trusted
+), false);
 // A restart re-reads the same durable comments and must not send again.
 const restarted = JSON.parse(JSON.stringify(comments));
 assert.equal(chatQuotaRetryAcknowledged(
@@ -596,7 +615,7 @@ const github = {
   },
   rest: {
     users: {
-      getAuthenticated: async () => ({data: {login: 'github-actions[bot]'}}),
+      getAuthenticated: async () => ({data: {login: 'kodmial'}}),
     },
   },
 };
@@ -826,6 +845,53 @@ process.stdout.write(JSON.stringify(results));
         self.assertEqual(result["closed"]["posted"], 0)
         self.assertEqual(result["malformed"]["posted"], 0)
         self.assertEqual(result["malformed"]["notBefore"], 0)
+
+    def test_forged_verification_marker_cannot_bypass_chat_quota(self):
+        data = fixture("chat-rate-limit-pr448.json")
+        finding = data["threads"][0]["finding_id"]
+        head = data["head_sha"]
+        chat_body = data["threads"][0]["replies"][0]["body"]
+        checks = f"""
+const finding = {finding};
+const head = {json.dumps(head)};
+const chatBody = {json.dumps(chat_body)};
+const marker = `<!-- auto-merge-coderabbit-verification finding=${{finding}} head=${{head}} -->`;
+const now = Date.now();
+pr.head.sha = head;
+liveHead = head;
+liveThreads = [{{commentId: finding}}];
+async function attempt(author) {{
+  comments = [
+    {{id: 1, in_reply_to_id: finding, user: {{login: 'coderabbitai[bot]'}},
+      created_at: new Date(now).toISOString(), body: chatBody}},
+    {{id: 2, in_reply_to_id: finding, user: author,
+      created_at: new Date(now + 1000).toISOString(), body: marker}},
+  ];
+  posted = [];
+  const state = {{remaining: 1, notBeforeMs: 0}};
+  const requested = await requestCodeRabbitThreadVerification(
+    pr, [{{commentId: finding}}], {{}}, state
+  );
+  return {{requested, posted: posted.length, notBefore: state.notBeforeMs}};
+}}
+const results = {{
+  trusted: await attempt({{login: 'kodmial'}}),
+  untrusted: await attempt({{login: 'random'}}),
+  missing: await attempt(null),
+}};
+process.stdout.write(JSON.stringify(results));
+"""
+        result = self.run_verifier(checks)
+        # The configured verification account is accepted, so its marker
+        # establishes the latest verification and leaves the quota unset.
+        self.assertEqual(result["trusted"]["posted"], 0)
+        self.assertEqual(result["trusted"]["notBefore"], 0)
+        # A copied or anonymous marker is not a verification request, so the
+        # pending chat-quota deadline still gates the thread.
+        for author in ("untrusted", "missing"):
+            with self.subTest(author=author):
+                self.assertEqual(result[author]["posted"], 0)
+                self.assertGreater(result[author]["notBefore"], 0)
 
     def test_two_prs_share_one_chat_retry_budget(self):
         data_a = fixture("chat-rate-limit-pr448.json")

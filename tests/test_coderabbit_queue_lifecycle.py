@@ -885,6 +885,87 @@ global.Date = Clock;
         self.assertEqual(completed.returncode, 0, completed.stderr)
         self.assertIn("coderabbit-chat-budget PASS", completed.stdout)
 
+    def test_account_wide_scan_uses_shared_heading_only_deadline(self):
+        import shutil
+        import subprocess
+
+        if not shutil.which("node"):
+            self.skipTest("Node.js unavailable")
+        source = self._workflow()
+        quota_start = source.index(
+            "          // continuum-coderabbit-chat-quota:start"
+        )
+        quota_end = source.index(
+            "          // continuum-coderabbit-chat-quota:end", quota_start
+        )
+        quota_end = source.find("\n", quota_end)
+        quota_lines = source[quota_start:quota_end].splitlines()
+        quota_indent = min(
+            len(line) - len(line.lstrip(" "))
+            for line in quota_lines
+            if line.strip()
+        )
+        quota_block = textwrap.dedent(
+            "\n".join(
+                line[quota_indent:] if line.strip() else ""
+                for line in quota_lines
+            )
+        )
+        begin = source.index("          // Installed consumers use this single canonical")
+        end = source.index(
+            "          function shouldRecheckCodeRabbitAfterCi(", begin
+        )
+        helper = source[begin:end]
+        harness = quota_block + "\n" + r"""
+const assert = require('node:assert/strict');
+const owner = 'kodmial', repo = 'continuum';
+const pulls = [{number:448}, {number:449}];
+const core = {info: () => {}, warning: () => {}};
+const heading = (id, created, wait) => ({
+  id, created_at: created, user: {login:'coderabbitai[bot]'},
+  body: '### Rate Limit Exceeded\n' +
+    'Please wait **' + wait + '** before sending another message.'
+});
+const rows = {
+  448: [heading(1, '2026-11-12T07:53:15Z', '90 minutes')],
+  449: [heading(2, '2026-11-12T07:54:32Z', '89 minutes and 30 seconds')]
+};
+const client = {rest:{pulls:{
+  get: async ({pull_number}) => ({data:{review_comments:rows[pull_number].length}}),
+  listReviewComments: async ({pull_number}) => ({data:rows[pull_number]})
+}}};
+const withReadFallback = callback => callback(client);
+const RealDate = Date;
+let now = RealDate.parse('2026-11-12T08:00:00Z');
+class Clock extends RealDate {static now() {return now;}}
+global.Date = Clock;
+""" + helper + r"""
+(async () => {
+  assert.equal(codeRabbitChatLimitNotBefore(rows[448][0]),
+    RealDate.parse('2026-11-12T09:23:45Z'));
+  assert.equal(codeRabbitChatLimitNotBefore(rows[449][0]),
+    RealDate.parse('2026-11-12T09:24:32Z'));
+  const anonymous = {...rows[448][0], user: null};
+  assert.equal(codeRabbitChatLimitNotBefore(anonymous), null,
+    'missing author identity must not set the shared deadline');
+  assert.equal(await allowOneCodeRabbitChatRequest(), false,
+    'no send before the longer heading-only deadline');
+  now = RealDate.parse('2026-11-12T09:24:31Z');
+  assert.equal(await allowOneCodeRabbitChatRequest(), false,
+    'the latest PR deadline still blocks one millisecond early');
+  now = RealDate.parse('2026-11-12T09:24:32Z');
+  assert.equal(await allowOneCodeRabbitChatRequest(), true,
+    'send only after the latest shared heading-only deadline');
+  console.log('coderabbit-heading-only-budget PASS');
+})().catch(e => {console.error(e); process.exitCode = 1;});
+"""
+        completed = subprocess.run(
+            ["node", "-e", harness], capture_output=True,
+            text=True, timeout=30, check=False,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertIn("coderabbit-heading-only-budget PASS", completed.stdout)
+
     def test_both_chat_mutations_are_guarded_and_quota_is_not_a_repair(self):
         source = self._workflow()
         start = source.index("          async function requestCodeRabbitThreadVerification(")
