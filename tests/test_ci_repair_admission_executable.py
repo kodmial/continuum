@@ -627,6 +627,82 @@ class AdmissionExecutableTests(unittest.TestCase):
         self.assertEqual([], self.posts())
         self.assertIn("cannot be verified", completed.stdout)
 
+    def test_a_pre_baseline_lookalike_cannot_suppress_a_repair(self):
+        # A well-formed claimed receipt posted before the migration frontier
+        # proves no dispatch was accepted. With no registry, association, or run
+        # evidence it is indistinguishable from an unrelated lookalike, so it
+        # must not let any commenter suppress repair for this exact HEAD.
+        self.write_comments(
+            [
+                trusted_receipt(
+                    attempt="ci-lookalike-0001",
+                    status="claimed",
+                    author="passer-by",
+                    author_association="NONE",
+                )
+            ]
+        )
+        self.write_pr(head=HEAD, comments=1)
+        self.write_state("variables.json", {})
+        self.write_runs([])
+        completed = self.run_admission(
+            extra_args=("--now", "2026-11-12T00:05:00Z")
+        )
+        self.assertEqual(1, len(self.dispatches()))
+        self.assertEqual(
+            "2026-11-12T00:05:00Z",
+            self.variables()[WRITERS_BASELINE_VARIABLE],
+        )
+
+    def test_a_pre_baseline_claim_from_a_plausible_writer_still_holds(self):
+        # Repository write access is GitHub-attested evidence that the author
+        # could be the previous automation account, even though its run is gone.
+        # The migration frontier must not downgrade that writer to a lookalike.
+        self.write_comments(
+            [
+                trusted_receipt(
+                    attempt="ci-old-account-0001",
+                    status="claimed",
+                    author="old-automation",
+                    author_association="MEMBER",
+                )
+            ]
+        )
+        self.write_pr(head=HEAD, comments=1)
+        self.write_state("variables.json", {})
+        self.write_runs([])
+        completed = self.run_admission(
+            extra_args=("--now", "2026-11-12T00:05:00Z")
+        )
+        self.assertEqual(0, len(self.dispatches()))
+        self.assertEqual([], self.posts())
+        self.assertIn("cannot be verified", completed.stdout)
+
+    def test_a_receipt_at_the_baseline_timestamp_holds_instead_of_redispatched(self):
+        # The frontier has second precision, so a receipt created in the same
+        # second as the baseline is ambiguous, not newer. Its missing run must
+        # hold instead of authorizing a duplicate dispatch.
+        self.write_comments(
+            [
+                trusted_receipt(
+                    attempt="ci-old-account-0001",
+                    status="dispatched",
+                    author="old-automation",
+                    run_id=900,
+                )
+            ]
+        )
+        self.write_pr(head=HEAD, comments=1)
+        self.write_state(
+            "variables.json",
+            {WRITERS_BASELINE_VARIABLE: "2026-11-12T00:00:00Z"},
+        )
+        self.write_runs([])
+        completed = self.run_admission()
+        self.assertEqual(0, len(self.dispatches()))
+        self.assertEqual([], self.posts())
+        self.assertIn("cannot be verified", completed.stdout)
+
     def test_the_authenticated_writer_is_recorded_for_future_rotations(self):
         self.run_admission()
         self.assertIn("github-actions[bot]", self.writer_logins())

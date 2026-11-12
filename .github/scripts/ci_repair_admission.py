@@ -94,8 +94,9 @@ _ISO_TIMESTAMP_RE = re.compile(
 # no run proves that writer, admission must hold instead of treating the
 # receipt as absent. After the registry baseline is established, an unrelated
 # commenter without repository write access can neither authorize nor suppress
-# a repair; a receipt older than the baseline stays unverifiable instead of
-# being mistaken for such a lookalike.
+# a repair; a pre-baseline receipt that records a dispatch stays unverifiable
+# instead of being mistaken for such a lookalike, while a pre-baseline claim
+# with no attestation stays a lookalike.
 _HISTORICAL_WRITER_ASSOCIATIONS = frozenset({"MEMBER", "COLLABORATOR"})
 #: Legacy comma/newline-separated registry of logins that authored trusted
 #: receipts. It is only read now: a pre-existing value is migrated into
@@ -109,10 +110,12 @@ _CI_REPAIR_WRITERS_VARIABLE = "CONTINUUM_CI_REPAIR_WRITERS"
 _CI_REPAIR_WRITER_VARIABLE_PREFIX = "CONTINUUM_CI_REPAIR_WRITER_"
 #: One-time migration frontier for the writer registry. Its value is the UTC
 #: timestamp at which the durable registry was first established. A receipt
-#: comment created before that instant may have been written by a historical
-#: writer that was never migrated (its dispatch run may already be deleted), so
-#: an unproved author of such a receipt is unverifiable rather than a proven
-#: lookalike. The name deliberately does not start with the per-writer prefix.
+#: comment created at or before that instant that records a dispatch (its run
+#: may already be deleted) may have been written by a historical writer that was
+#: never migrated, so an unproved author of such a receipt is unverifiable
+#: rather than a proven lookalike. The frontier has second precision, so the
+#: comparison is inclusive. The name deliberately does not start with the
+#: per-writer prefix.
 _CI_REPAIR_WRITERS_BASELINE_VARIABLE = "CONTINUUM_CI_REPAIR_WRITERS_BASELINE"
 
 
@@ -738,11 +741,15 @@ def _historical_receipt_writers(
     unverified lookalikes stay ignored exactly as before.
 
     ``baseline`` is the durable writer-registry migration frontier. A receipt
-    comment created before it may belong to a historical writer that was never
-    migrated, whose dispatch run may already be deleted; such an unproved
-    author is unverifiable, not a proven lookalike. With no established
-    baseline every unproved receipt is unverifiable, so a missing registry can
-    never reauthorize a spent exact HEAD.
+    that records a dispatch (``dispatched`` or ``ambiguous``) and was created at
+    or before it may belong to a historical writer that was never migrated,
+    whose dispatch run may already be deleted; such an unproved author is
+    unverifiable, not a proven lookalike. The comparison is inclusive because
+    the frontier has second precision. A pre-baseline ``claimed`` receipt proves
+    no dispatch was accepted, so without registry, association, or run evidence
+    it is indistinguishable from an unrelated lookalike and must not suppress
+    repair. With no established baseline every unproved receipt is unverifiable,
+    so a missing registry can never reauthorize a spent exact HEAD.
 
     The second result reports that history exists which cannot be verified
     because the run inventory failed or is incomplete, or because a plausible
@@ -817,7 +824,7 @@ def _historical_receipt_writers(
             unverifiable = True
             continue
         if not matches:
-            unmatched.append((author, comment))
+            unmatched.append((author, receipt, comment))
             continue
         if author not in verified:
             verified.append(author)
@@ -834,7 +841,7 @@ def _historical_receipt_writers(
     known = frozenset(_normalize_writer_logins("\n".join(known_writers)))
     baseline_text = str(baseline or "").strip()
     baseline_usable = bool(_ISO_TIMESTAMP_RE.match(baseline_text))
-    for author, comment in unmatched:
+    for author, receipt, comment in unmatched:
         if author in verified:
             continue
         association = str(comment.get("author_association") or "").strip().upper()
@@ -843,22 +850,35 @@ def _historical_receipt_writers(
             and run_repairs_pull(run, pull_number)
             for run in inventory.runs
         )
-        created = comment.get("created_at")
-        # No baseline, or a receipt written before the registry existed, may
-        # belong to a writer that was never migrated after its proving run was
-        # deleted. It stays unverifiable instead of being treated as absent.
-        predates_baseline = (
-            not baseline_usable
-            or not isinstance(created, str)
-            or not _ISO_TIMESTAMP_RE.match(created)
-            or created < baseline_text
-        )
         if (
-            predates_baseline
-            or author in known
+            author in known
             or not registry_available
             or association in _HISTORICAL_WRITER_ASSOCIATIONS
             or author_has_repair_run
+        ):
+            unverifiable = True
+            break
+        if not baseline_usable:
+            # Without a migration frontier no receipt can be classified as a
+            # lookalike, so fail closed.
+            unverifiable = True
+            break
+        created = comment.get("created_at")
+        if not isinstance(created, str) or not _ISO_TIMESTAMP_RE.match(created):
+            unverifiable = True
+            break
+        # The baseline is recorded with second precision, so a receipt created
+        # in the same second is ambiguous and must not be treated as newer.
+        predates_baseline = created <= baseline_text
+        # A pre-baseline receipt can hide a spent exact HEAD only when it
+        # records a dispatch. A ``claimed`` receipt is persisted before the
+        # dispatch request; with no run and no GitHub-attested writer evidence
+        # it is indistinguishable from an unrelated lookalike, and holding on it
+        # would let any commenter suppress repair. A deleted run behind a
+        # ``dispatched`` or ``ambiguous`` receipt still holds.
+        if predates_baseline and receipt.status in (
+            STATUS_DISPATCHED,
+            STATUS_AMBIGUOUS,
         ):
             unverifiable = True
             break
@@ -940,8 +960,9 @@ def run(args) -> int:
     # history authoritative for the next token. Per-writer variables make the
     # registration independent, so concurrent exact-HEAD passes cannot erase
     # each other's writer. A one-time baseline records when the registry became
-    # authoritative, so receipts written before it are never mistaken for
-    # unrelated lookalikes after their proving run is deleted.
+    # authoritative, so a pre-baseline receipt that records a dispatch is never
+    # mistaken for an unrelated lookalike after its proving run is deleted, while
+    # a bare pre-baseline claim cannot suppress repair.
     known_writers, registered_writers, registry_healthy = _historical_writer_registry(
         repository
     )

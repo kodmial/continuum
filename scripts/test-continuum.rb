@@ -4039,6 +4039,13 @@ class ContinuumTest < Minitest::Test
           attempt_id=attempt,
           status='dispatched',
       )
+      claimed = build_receipt(
+          repository=repository,
+          pull_number=pull_number,
+          head_sha=head_sha,
+          attempt_id=attempt,
+          status='claimed',
+      )
       legacy = {
           'id': 900,
           'display_title': 'OpenCode repair PR #449',
@@ -4061,7 +4068,7 @@ class ContinuumTest < Minitest::Test
           def __init__(self, runs):
               self.runs = runs
 
-      def comment(association):
+      def comment(association, receipt=receipt):
           return {
               'body': render_receipt(receipt),
               'created_at': '2026-11-12T00:00:00Z',
@@ -4069,13 +4076,13 @@ class ContinuumTest < Minitest::Test
               'user': {'login': 'old-automation'},
           }
 
-      def writers(association, runs, baseline='2026-11-11T00:00:00Z'):
+      def writers(association, runs, baseline='2026-11-11T00:00:00Z', receipt=receipt):
           admission._workflow_runs = lambda *args, **kwargs: Inventory(runs)
           return admission._historical_receipt_writers(
               repository,
               pull_number,
               head_sha,
-              [comment(association)],
+              [comment(association, receipt)],
               workflow='continuum-opencode.yml',
               owner_login='',
               trusted_logins=('github-actions[bot]',),
@@ -4091,6 +4098,18 @@ class ContinuumTest < Minitest::Test
       result['none_hold'] = none_hold
       _, missing_baseline_hold = writers('NONE', [], baseline=None)
       result['missing_baseline_hold'] = missing_baseline_hold
+      _, pre_baseline_dispatch_hold = writers(
+          'NONE', [], baseline='2026-11-12T00:05:00Z')
+      result['pre_baseline_dispatch_hold'] = pre_baseline_dispatch_hold
+      _, equal_baseline_hold = writers(
+          'NONE', [], baseline='2026-11-12T00:00:00Z')
+      result['equal_baseline_hold'] = equal_baseline_hold
+      _, pre_baseline_claim_hold = writers(
+          'NONE', [], baseline='2026-11-12T00:05:00Z', receipt=claimed)
+      result['pre_baseline_claim_hold'] = pre_baseline_claim_hold
+      _, pre_baseline_member_claim_hold = writers(
+          'MEMBER', [], baseline='2026-11-12T00:05:00Z', receipt=claimed)
+      result['pre_baseline_member_claim_hold'] = pre_baseline_member_claim_hold
       print(json.dumps(result))
     PY
     stdout, stderr, status = Open3.capture3(
@@ -4114,6 +4133,14 @@ class ContinuumTest < Minitest::Test
            'an unrelated commenter must not suppress a repair'
     assert result.fetch('missing_baseline_hold'),
            'a receipt with no established writer baseline must hold admission'
+    assert result.fetch('pre_baseline_dispatch_hold'),
+           'a pre-baseline dispatched receipt with a deleted run must hold admission'
+    assert result.fetch('equal_baseline_hold'),
+           'a receipt at the second-precision baseline must hold admission'
+    refute result.fetch('pre_baseline_claim_hold'),
+           'a pre-baseline claim from an unrelated commenter must not suppress a repair'
+    assert result.fetch('pre_baseline_member_claim_hold'),
+           'a pre-baseline claim from a plausible writer must hold admission'
   end
 
   # The executor cannot repair a mutable branch tip. Every non-recovery ci-fix
