@@ -51,6 +51,24 @@ class CodeRabbitBatchContractTests(unittest.TestCase):
         self.assertIn("UNRESOLVED_ITEMS_JSON", canonical)
         self.assertIn("unresolved_items_json:", STUB.read_text(encoding="utf-8"))
 
+    def test_post_repair_chat_is_one_at_a_time_not_an_inline_fanout(self):
+        # Both the canonical unresolved batch and legacy single-review mode
+        # may ask the provider, but no OpenCode run can fan out five requests.
+        # The remaining threads are handled by the serialized auto-merge owner.
+        code = js_for_step(OPENCODE, "Ask CodeRabbit to verify every original finding")
+        import re
+        requests = re.findall(
+            r"requested \\+= 1;\\s*// One inline request per run;"
+            r"[\\s\\S]*?break;", code
+        )
+        self.assertEqual(len(requests), 2)
+        self.assertEqual(code.count("One inline request per run"), 2)
+        merge = (ROOT / ".github/workflows/continuum-auto-merge.yml").read_text(
+            encoding="utf-8"
+        )
+        self.assertEqual(merge.count("await allowOneCodeRabbitChatRequest()"), 2)
+        self.assertIn("codeRabbitChatLimitNotBefore(comment)", merge)
+
     def test_installed_caller_declares_and_forwards_pr_number_for_reconciliation(self):
         caller = CALLER_STUB.read_text(encoding="utf-8")
         dispatch = caller.split("workflow_dispatch:", 1)[1].split("\npermissions:", 1)[0]
