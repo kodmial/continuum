@@ -500,6 +500,38 @@ class VerifiedHistoricalWriterTests(unittest.TestCase):
                     )
                 )
 
+    def test_a_marked_run_for_the_dispatch_ref_proves_the_receipt(self):
+        # ``workflow_dispatch`` records the dispatch ref (normally ``main``) as
+        # the run SHA, not the admitted PR HEAD. The attempt marker and actor
+        # still prove the historical writer.
+        main_sha = "c" * 40
+        for status in (STATUS_CLAIMED, STATUS_AMBIGUOUS, STATUS_DISPATCHED):
+            with self.subTest(status=status):
+                self.assertTrue(
+                    run_proves_historical_receipt(
+                        self.actual_run(head=main_sha),
+                        receipt(status=status),
+                        author_login="old-automation",
+                    )
+                )
+
+    def test_an_unmarked_dispatch_ref_run_cannot_prove_a_different_head(self):
+        # A legacy unmarked title has no attempt binding, so a run for the
+        # dispatch ref cannot prove which PR HEAD its receipt spent.
+        main_sha = "c" * 40
+        self.assertFalse(
+            run_proves_historical_receipt(
+                {
+                    "id": 900,
+                    "display_title": "OpenCode repair PR #{}".format(PR),
+                    "head_sha": main_sha,
+                    "actor": {"login": "old-automation"},
+                },
+                receipt(status=STATUS_CLAIMED),
+                author_login="old-automation",
+            )
+        )
+
     def test_a_legacy_title_proves_a_receipt_without_a_run_id(self):
         # A legacy caller has no attempt marker, so an accepted 204 may leave
         # only a claimed, ambiguous, or run-detail-less dispatched receipt.

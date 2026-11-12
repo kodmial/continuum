@@ -319,7 +319,9 @@ class AdmissionExecutableTests(unittest.TestCase):
     def dispatches(self):
         return [line for line in self.log() if "inputs[mode]=ci-fix" in line]
 
-    def assert_rotated_writer_receipt_is_not_redispatched(self, *, status, run_id=None):
+    def assert_rotated_writer_receipt_is_not_redispatched(
+        self, *, status, run_id=None, run_head=HEAD
+    ):
         # The previous TAP_PAT account only left a claimed/ambiguous receipt, or
         # a dispatched receipt without run details. GitHub's actual run still
         # proves that account created this exact-HEAD attempt.
@@ -348,7 +350,7 @@ class AdmissionExecutableTests(unittest.TestCase):
                         REPO.lower()
                     ),
                     "created_at": "2026-11-12T00:00:00Z",
-                    "head_sha": HEAD,
+                    "head_sha": run_head,
                     "actor": {"login": "old-automation"},
                 }
             ]
@@ -366,6 +368,15 @@ class AdmissionExecutableTests(unittest.TestCase):
     def test_a_previous_token_account_unrun_dispatch_is_never_redispatched(self):
         self.assert_rotated_writer_receipt_is_not_redispatched(
             status="dispatched"
+        )
+
+    def test_a_dispatch_ref_run_keeps_the_previous_writer_authority(self):
+        # A workflow_dispatch run reports the dispatch ref (normally main) as
+        # its SHA, not the admitted PR HEAD. The previous writer has no
+        # repository association after token rotation, so only the attempt
+        # marker and actor can preserve its receipt.
+        self.assert_rotated_writer_receipt_is_not_redispatched(
+            status="claimed", run_head="c" * 40
         )
 
     def test_a_legacy_unmarked_run_keeps_the_unrun_dispatch_authority(self):
@@ -402,6 +413,42 @@ class AdmissionExecutableTests(unittest.TestCase):
         completed = self.run_admission()
         self.assertEqual(0, len(self.dispatches()))
         self.assertIn("verified by its exact-HEAD dispatch run", completed.stdout)
+
+    def test_an_unmarked_dispatch_ref_run_holds_instead_of_redispatched(self):
+        # A legacy unmarked title cannot bind a run at the dispatch-ref SHA to
+        # the receipt's PR HEAD. The old writer has no association after token
+        # rotation, so admission must hold rather than dispatch a duplicate.
+        attempt = "ci-old-account-0001"
+        self.write_comments(
+            [
+                trusted_receipt(
+                    attempt=attempt,
+                    status="dispatched",
+                    author="old-automation",
+                )
+            ]
+        )
+        self.write_pr(head=HEAD, comments=1)
+        self.write_runs(
+            [
+                {
+                    "id": 900,
+                    "display_title": "OpenCode repair PR #{}".format(PR),
+                    "status": "queued",
+                    "conclusion": "",
+                    "html_url": "https://github.com/{}/actions/runs/900".format(
+                        REPO.lower()
+                    ),
+                    "created_at": "2026-11-12T00:00:00Z",
+                    "head_sha": "c" * 40,
+                    "actor": {"login": "old-automation"},
+                }
+            ]
+        )
+        completed = self.run_admission()
+        self.assertEqual(0, len(self.dispatches()))
+        self.assertEqual([], self.posts())
+        self.assertIn("cannot be verified", completed.stdout)
 
     def test_a_plausible_historical_writer_without_a_proving_run_holds(self):
         # A collaborator-owned previous TAP_PAT leaves receipts that look

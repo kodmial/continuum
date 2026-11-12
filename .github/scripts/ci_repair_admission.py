@@ -55,6 +55,7 @@ from continuum.ci_repair_admission import (  # noqa: E402
     plan_admission,
     run_actor_logins,
     run_proves_historical_receipt,
+    run_repairs_pull,
     select_correlated_run,
     unexpected_dispatch_inputs,
 )
@@ -405,13 +406,15 @@ def _historical_receipt_writers(
     ``TAP_PAT`` can be rotated to another account. Receipts the previous
     account published must stay authoritative, or the exact HEAD they already
     spent looks unused and admission dispatches it a second time. A receipt is
-    only re-trusted here when a run exists for the same exact HEAD, carries
-    this attempt's run-name marker (or, for a legacy caller without the marker,
-    the canonical legacy repair title) and was created by the same account.
-    ``claimed``, ``ambiguous``, and run-detail-less ``dispatched`` receipts are
-    included because outcome persistence can fail after an accepted dispatch.
-    An unrelated commenter cannot borrow a run, so unverified lookalikes stay
-    ignored exactly as before.
+    only re-trusted here when a run created by the same account carries this
+    attempt's run-name marker, or, for a legacy caller without the marker, the
+    canonical legacy repair title for the same exact HEAD. A marked run may
+    report the dispatch ref (normally ``main``) as its SHA rather than the PR
+    HEAD, so the attempt marker and exact run ID, when present, are the binding
+    evidence. ``claimed``, ``ambiguous``, and run-detail-less ``dispatched``
+    receipts are included because outcome persistence can fail after an
+    accepted dispatch. An unrelated commenter cannot borrow a run, so
+    unverified lookalikes stay ignored exactly as before.
 
     The second result reports that history exists which cannot be verified
     because the run inventory failed or is incomplete, or because a plausible
@@ -493,20 +496,22 @@ def _historical_receipt_writers(
     # receipts. An unproved receipt for that same writer adds no new risk. Only
     # an unproved receipt from a writer with no other proof can hide a spent
     # attempt, so hold when its author had repository write access or GitHub
-    # shows a same-HEAD run created by that account. An unrelated commenter
-    # with neither cannot suppress a repair.
+    # shows a repair run for this PR created by that account. The run's SHA can
+    # be the dispatch ref (normally ``main``) instead of the PR HEAD, so it is
+    # not required to match the receipt HEAD here; an unrelated commenter with
+    # neither evidence cannot suppress a repair.
     for author, comment in unmatched:
         if author in verified:
             continue
         association = str(comment.get("author_association") or "").strip().upper()
-        author_has_same_head_run = any(
+        author_has_repair_run = any(
             author in run_actor_logins(run)
-            and str(run.get("head_sha") or "").strip().lower() == head_sha
+            and run_repairs_pull(run, pull_number)
             for run in inventory.runs
         )
         if (
             association in _HISTORICAL_WRITER_ASSOCIATIONS
-            or author_has_same_head_run
+            or author_has_repair_run
         ):
             unverifiable = True
             break

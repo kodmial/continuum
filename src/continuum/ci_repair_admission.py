@@ -817,11 +817,36 @@ def run_actor_logins(run: Any) -> frozenset:
     return frozenset(logins)
 
 
+def run_repairs_pull(run: Any, pull_number: Any) -> bool:
+    """Whether a run title is the canonical CI-repair title for ``pull_number``.
+
+    A marked title is a repair run for the PR named before its attempt marker.
+    A legacy title has no marker but still names the PR. This is only a title
+    check; callers must also require the run actor before treating it as proof.
+    """
+
+    if not isinstance(run, Mapping):
+        return False
+    try:
+        wanted = int(str(pull_number).strip())
+    except (TypeError, ValueError):
+        raise AdmissionError("pull number is not an integer")
+    title = run.get("display_title")
+    if not isinstance(title, str):
+        return False
+    if _ATTEMPT_RUN_MARKER_RE.search(title):
+        pull = _PULL_TITLE_RE.match(title)
+        return bool(pull) and int(pull.group("pr")) == wanted
+    legacy = _UNMARKED_REPAIR_TITLE_RE.match(title)
+    return bool(legacy) and int(legacy.group(1)) == wanted
+
+
 def run_proves_historical_receipt(
     run: Any,
     receipt: Any,
     *,
     author_login: Any = "",
+    allow_dispatch_ref: bool = True,
 ) -> bool:
     """Whether GitHub's own run record proves an otherwise untrusted receipt.
 
@@ -832,12 +857,13 @@ def run_proves_historical_receipt(
     fails after an accepted dispatch, so it is proved by the same run's
     attempt marker and actor rather than by a run ID that was never stored.
 
-    The receipt is only re-trusted when a run exists for the same exact HEAD,
-    was created by the same account, and either carries this attempt's
-    run-name marker or, for a legacy caller that has no identity input, uses
-    the canonical unmarked repair title for the same PR. The comment author
-    alone is never sufficient, so an unrelated commenter cannot borrow a run
-    to suppress or authorize a repair.
+    A ``workflow_dispatch`` run records its dispatch ref (normally ``main``) as
+    ``head_sha``, not the admitted PR HEAD. A run-name attempt marker, and an
+    exact run ID when the receipt persisted one, bind that run to the receipt
+    even when the SHA differs. A legacy unmarked title has no such binding, so
+    it still has to name the same exact HEAD. The comment author alone is
+    never sufficient, so an unrelated commenter cannot borrow a run to
+    suppress or authorize a repair.
     """
 
     if not isinstance(run, Mapping) or not isinstance(receipt, RepairReceipt):
@@ -854,7 +880,8 @@ def run_proves_historical_receipt(
     if receipt.run_id is not None:
         if receipt.status != STATUS_DISPATCHED or run_id != receipt.run_id:
             return False
-    if str(run.get("head_sha") or "").strip().lower() != receipt.head_sha:
+    head_sha = str(run.get("head_sha") or "").strip().lower()
+    if not allow_dispatch_ref and head_sha != receipt.head_sha:
         return False
     author = str(author_login or "").strip().lower()
     if not author or author not in run_actor_logins(run):
@@ -864,13 +891,19 @@ def run_proves_historical_receipt(
         return False
     marker = _ATTEMPT_RUN_MARKER_RE.search(title)
     if marker:
+        if not run_repairs_pull(run, receipt.pull_number):
+            return False
         return marker.group("attempt") == receipt.attempt_id
     # Legacy callers predate the attempt marker. Their canonical repair title
     # is still bound to this action (same actor, same exact HEAD, same PR), so
     # it proves the historical writer even when a legacy 204 persisted no run
     # ID. A different PR title or another account never matches.
     legacy = _UNMARKED_REPAIR_TITLE_RE.match(title)
-    return bool(legacy) and int(legacy.group(1)) == receipt.pull_number
+    return (
+        bool(legacy)
+        and int(legacy.group(1)) == receipt.pull_number
+        and head_sha == receipt.head_sha
+    )
 
 
 def run_proves_dispatched_receipt(
@@ -882,8 +915,9 @@ def run_proves_dispatched_receipt(
     """Whether GitHub's run record proves a ``dispatched`` receipt's run.
 
     This retains the original strict contract: the receipt must already carry
-    the proved run ID. Use :func:`run_proves_historical_receipt` for claimed,
-    ambiguous, or run-detail-less dispatched receipts.
+    the proved run ID and the run must name the same exact HEAD. Use
+    :func:`run_proves_historical_receipt` for claimed, ambiguous, or
+    run-detail-less dispatched receipts.
     """
 
     if not isinstance(receipt, RepairReceipt):
@@ -891,7 +925,10 @@ def run_proves_dispatched_receipt(
     if receipt.status != STATUS_DISPATCHED or receipt.run_id is None:
         return False
     return run_proves_historical_receipt(
-        run, receipt, author_login=author_login
+        run,
+        receipt,
+        author_login=author_login,
+        allow_dispatch_ref=False,
     )
 
 
@@ -1128,6 +1165,7 @@ __all__ = [
     "select_correlated_run",
     "correlated_run_url",
     "run_actor_logins",
+    "run_repairs_pull",
     "run_proves_historical_receipt",
     "run_proves_dispatched_receipt",
     "has_unattributed_repair_run",
