@@ -6061,7 +6061,11 @@ class ContinuumTest < Minitest::Test
     ].each { |guard| assert_includes dispatch, guard, "missing just-in-time guard: #{guard}" }
     local_dispatch = dispatch[/\/\/ Re-check mutable state immediately before dispatch\..*\z/m]
     refute_nil local_dispatch, 'the local just-in-time re-check block is gone'
-    assert_equal 7, local_dispatch.scan(/^\s+continue;\s*$/).size,
+    # #442 adds an eighth mandatory fail-closed guard: do not dispatch
+    # against a checkpoint/base/snapshot already known to fail before coding.
+    assert_includes local_dispatch, 'const freshResumeHold = await checkpointResumeHold('
+    assert_includes local_dispatch, 'checkpointResumeHoldSkipReason(issue.number, freshResumeHold)'
+    assert_equal 8, local_dispatch.scan(/^\s+continue;\s*$/).size,
                  'every local just-in-time guard must be a skip, not a fall-through'
   end
 
