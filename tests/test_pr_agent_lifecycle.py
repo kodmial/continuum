@@ -172,9 +172,11 @@ APPROVED_446_OPENCODE_SHA256 = (
 # inventory may prove that no repair run exists. Unrelated drift still fails
 # closed. This repair additionally binds every ci-fix run to its admitted HEAD
 # (an empty identity fails closed) and requires the dispatched attempt identity
-# before correlation may record a receipt.
+# before correlation may record a receipt. The merge with main's reviewed
+# one-inline-request cap (25273b4) keeps both changes, so the active pin covers
+# the combined bytes; any drift outside them still fails closed.
 APPROVED_449_OPENCODE_SHA256 = (
-    "a5a9b476a84db8ed0d2f12be32d09e57f357c43288bdee920c1030d9b3d65a01"
+    "648a79711d211909f4c54972f82a9afb5406f31a39728fea55d70bbf33e37ddc"
 )
 APPROVED_446_CALLER_SHA256 = (
     "b7f3df118bc436526f48443b8f068372204073eb134c98e4a1543d025f314686"
