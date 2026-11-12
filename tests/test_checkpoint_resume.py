@@ -366,6 +366,7 @@ class CheckpointResumeTest(unittest.TestCase):
         self.assertEqual(1, len(parsed))
         self.assertEqual(checkpoint, parsed[0]["checkpoint_sha"])
         self.assertEqual("wrong-issue", parsed[0]["reason"])
+        self.assertEqual("", parsed[0]["episode"])
         self.assertFalse(
             checkpoint_resume.premise_changed(
                 parsed[0],
@@ -389,6 +390,36 @@ class CheckpointResumeTest(unittest.TestCase):
                 checkpoint_sha="f" * 40,
                 base_sha=self.base,
             )
+        )
+
+    def test_repeated_identity_uses_a_distinct_failure_episode(self):
+        checkpoint = self.make_checkpoint()
+        error = self.assert_rejected(
+            "wrong-issue", self.request(checkpoint, issue=999)
+        )
+        request = checkpoint_resume.ResumeRequest.from_mapping(
+            self.request(checkpoint)
+        )
+        first = checkpoint_resume.failure_record(
+            request, error, episode="12345-1"
+        )
+        second = checkpoint_resume.failure_record(
+            request, error, episode="12345-2"
+        )
+        self.assertNotEqual(first["marker_line"], second["marker_line"])
+        self.assertIn("episode=12345-1", first["marker_line"])
+        self.assertIn("episode=12345-2", second["marker_line"])
+        self.assertEqual(
+            "12345-1",
+            checkpoint_resume.parse_failure_markers(
+                first["marker"]
+            )[0]["episode"],
+        )
+        self.assertEqual(
+            "12345-2",
+            checkpoint_resume.parse_failure_markers(
+                second["marker"]
+            )[0]["episode"],
         )
 
 

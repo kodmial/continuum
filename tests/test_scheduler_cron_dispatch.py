@@ -521,8 +521,21 @@ function classifyComments(bodies) {
     'an indented /oc code block must not waive the hold'
   );
   assert.equal(await hold([saved, manual]), null, 'manual owner /oc may resume');
-  assert.equal(await hold([saved], client('d'.repeat(40))), null,
-    'changed checkpoint SHA releases hold');
+  const retried = item(9, marker.replace(
+    ' reason=verification-failed -->',
+    ' reason=verification-failed episode=run-9-1 -->'
+  ));
+  assert.ok(
+    await hold([saved, manual, retried]),
+    'a new hold episode after a failed manual retry must restore the hold'
+  );
+  assert.equal(
+    await hold([saved, manual, retried, item(10, '/oc\nretry again')]),
+    null,
+    'a later manual /oc after the new hold episode may resume'
+  );
+  assert.equal(await hold([saved, manual], client('d'.repeat(40))), null,
+    'changed checkpoint SHA still releases a manual override');
   assert.equal(await hold([item(1, marker, 'outsider')]), null,
     'untrusted authors cannot impose a hold');
   assert.ok(await hold([saved], {rest: {git: {
@@ -581,6 +594,8 @@ function classifyComments(bodies) {
         self.assertIn("ownerClasses[index] === 'run'", scheduler)
         self.assertIn("checkpointResumeBlockedRe", watchdog)
         self.assertIn("async function checkpointResumeHold(", watchdog)
+        self.assertIn("recoveryCheckpointRef = null", watchdog)
+        self.assertIn("normalizeCheckpointRef(match[5])", watchdog)
         self.assertIn("function classifyComments(bodies)", watchdog)
         self.assertIn("if (body.includes(dispatchMarker)) continue;", watchdog)
         self.assertIn("if (body.includes(retryMarker)) continue;", watchdog)
@@ -588,8 +603,10 @@ function classifyComments(bodies) {
             "if (body.includes(watchdogAutomationMarker)) continue;", watchdog
         )
         self.assertIn(
-            "const hold = await checkpointResumeHold(issueText, comments);",
-            watchdog,
+            "const hold = await checkpointResumeHold(", watchdog
+        )
+        self.assertIn(
+            "issueText, comments, checkpointRef", watchdog
         )
         self.assertLess(
             watchdog.index("const checkpointResumeBlockedRe ="),

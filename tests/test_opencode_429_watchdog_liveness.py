@@ -386,22 +386,27 @@ def recovery_marker(state, sha, run_id, attempt=1, next_due=0):
     )
 
 
-def hold_marker(sha=NEW_SHA, generation=1, spec="c" * 64):
+def hold_marker(
+    sha=NEW_SHA, generation=1, spec="c" * 64, ref=CHECKPOINT_REF,
+    episode="",
+):
+    suffix = " episode={}".format(episode) if episode else ""
     return (
         "<!-- continuum-checkpoint-resume-blocked "
         "repo={owner}/{repo} issue=382 generation={generation} "
         "operation={op} checkpoint={ref} checkpoint_sha={sha} "
         "base_ref=main base_sha={base} snapshot={spec} "
-        "reason=verification-failed -->"
+        "reason=verification-failed{suffix} -->"
     ).format(
         owner=OWNER,
         repo=REPO,
         generation=generation,
         op=OPERATION,
-        ref=CHECKPOINT_REF,
+        ref=ref,
         sha=sha,
         base=BASE_SHA,
         spec=spec,
+        suffix=suffix,
     )
 
 
@@ -1178,6 +1183,64 @@ class WatchdogHarness(unittest.TestCase):
         )
         result = self.run_scenario(scenario)
         self.assert_no_dispatch(result)
+
+    def test_recovery_hold_is_scoped_to_the_checkpoint_being_recovered(self):
+        for factory in (base_scenario, self.durable_scenario):
+            with self.subTest(route=factory.__name__):
+                scenario = factory()
+                scenario["comments"].append(
+                    thread_comment(
+                        20,
+                        hold_marker(ref=CHECKPOINT_REF + "-other"),
+                        "2026-10-23T09:50:00Z",
+                    )
+                )
+                result = self.run_scenario(scenario)
+                self.assert_one_current_dispatch(result, NEW_SHA)
+
+    def test_recovery_hold_matches_a_normalized_checkpoint_ref(self):
+        scenario = base_scenario()
+        scenario["comments"].append(
+            thread_comment(
+                20,
+                hold_marker(ref="refs/heads/" + CHECKPOINT_REF),
+                "2026-10-23T09:50:00Z",
+            )
+        )
+        result = self.run_scenario(scenario)
+        self.assert_no_dispatch(result)
+
+    def test_failed_manual_retry_restores_the_hold(self):
+        scenario = self.normal_retry_scenario()
+        scenario["comments"].extend([
+            thread_comment(20, hold_marker(), "2026-10-23T09:50:00Z"),
+            thread_comment(
+                21, "/oc", "2026-10-23T10:00:00Z", login="kodmial"
+            ),
+            thread_comment(
+                22,
+                hold_marker(episode="run-22-1"),
+                "2026-10-23T10:05:00Z",
+            ),
+        ])
+        result = self.run_scenario(scenario)
+        self.assertEqual(self.retried_bodies(result), [])
+
+    def test_manual_retry_hold_releases_on_a_changed_checkpoint(self):
+        scenario = self.normal_retry_scenario()
+        scenario["comments"].extend([
+            thread_comment(
+                20, hold_marker(sha=OLD_SHA), "2026-10-23T09:50:00Z"
+            ),
+            thread_comment(
+                21, "/oc", "2026-10-23T10:00:00Z", login="kodmial"
+            ),
+            thread_comment(
+                22, hold_marker(sha=OLD_SHA), "2026-10-23T10:05:00Z"
+            ),
+        ])
+        result = self.run_scenario(scenario)
+        self.assertEqual(len(self.retried_bodies(result)), 1, result["comments"])
 
     def test_hold_is_released_only_by_a_strictly_later_task_snapshot(self):
         later = base_scenario()

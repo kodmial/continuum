@@ -1069,7 +1069,7 @@ jobs:
             //     the hold with a different spec.
             const TASK_SNAPSHOT_GENERATION = 1;
             const checkpointResumeBlockedRe =
-              /<!--\s*continuum-checkpoint-resume-blocked\s+repo=([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)\s+issue=(\d+)\s+generation=(\d+)\s+operation=(\S+)\s+checkpoint=(\S+)\s+checkpoint_sha=([0-9a-fA-F]{40})\s+base_ref=(\S+)\s+base_sha=([0-9a-fA-F]{40})\s+snapshot=([0-9a-fA-F]{64})\s+reason=(\S+)\s*-->/;
+              /<!--\s*continuum-checkpoint-resume-blocked\s+repo=([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)\s+issue=(\d+)\s+generation=(\d+)\s+operation=(\S+)\s+checkpoint=(\S+)\s+checkpoint_sha=([0-9a-fA-F]{40})\s+base_ref=(\S+)\s+base_sha=([0-9a-fA-F]{40})\s+snapshot=([0-9a-fA-F]{64})\s+reason=(\S+)(?:\s+episode=(\S+))?\s*-->/;
             const checkpointSnapshotMarkerRe =
               /<!--\s*continuum-task-snapshot(?:-ref)?\s+repo=([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)\s+issue=(\d+)\s+generation=(\d+)\s+title-sha256=([0-9a-fA-F]{64})\s+body-sha256=([0-9a-fA-F]{64})\s+spec-sha256=([0-9a-fA-F]{64})\s*-->/g;
             // Stable automation origin the watchdog writes into every comment
@@ -1128,13 +1128,22 @@ jobs:
             // durable discovery. A material premise change releases the hold:
             // a strictly later trusted task snapshot for the task generation
             // with a different spec, a changed or deleted durable checkpoint
-            // ref, or a later manual owner command. A failed ref read keeps
-            // the hold fail-closed.
-            async function checkpointResumeHold(issueNumber, comments) {
+            // ref, or a later manual owner command. A failed manual retry
+            // publishes a new rejection marker episode, which restores the
+            // hold until the next material premise change. A failed ref read
+            // keeps the hold fail-closed.
+            async function checkpointResumeHold(
+              issueNumber, comments, recoveryCheckpointRef = null
+            ) {
               const wantedIssue = Number(issueNumber);
               if (!Number.isInteger(wantedIssue) || wantedIssue < 1) {
                 return { blocked: false, marker: null };
               }
+              const normalizeCheckpointRef = ref =>
+                String(ref || '').replace(/^refs\/heads\//, '');
+              const wantedCheckpointRef = recoveryCheckpointRef
+                ? normalizeCheckpointRef(recoveryCheckpointRef)
+                : null;
               const trusted = (comments || []).filter(
                 trustedCheckpointComment
               );
@@ -1148,6 +1157,13 @@ jobs:
                   match[1].toLowerCase() !== repoFullName.toLowerCase() ||
                   Number(match[2]) !== wantedIssue ||
                   Number(match[3]) < 1
+                ) continue;
+                // A fresh-VM recovery is scoped to its validated checkpoint.
+                // A rejection for another checkpoint on the same issue must
+                // not block this one.
+                if (
+                  wantedCheckpointRef &&
+                  normalizeCheckpointRef(match[5]) !== wantedCheckpointRef
                 ) continue;
                 const candidate = {
                   order: checkpointCommentOrder(comment),
@@ -1534,7 +1550,9 @@ jobs:
               // resume verification, so never create a recovery claim or
               // dispatch it again: stop the pass instead.
               if (mode === 'issue') {
-                const hold = await checkpointResumeHold(issueText, comments);
+                const hold = await checkpointResumeHold(
+                  issueText, comments, checkpointRef
+                );
                 if (hold.blocked) {
                   core.notice(
                     'OpenCode infrastructure operation ' + operation +

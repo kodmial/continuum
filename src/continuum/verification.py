@@ -1869,7 +1869,17 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     except checkpoint_resume.ResumeError:
                         request = None
                     if request is not None and checkpoint_resume.should_hold(exc):
-                        record = checkpoint_resume.failure_record(request, exc)
+                        episode = "-".join(
+                            part
+                            for part in (
+                                os.environ.get("GITHUB_RUN_ID", "").strip(),
+                                os.environ.get("GITHUB_RUN_ATTEMPT", "").strip(),
+                            )
+                            if part
+                        )
+                        record = checkpoint_resume.failure_record(
+                            request, exc, episode=episode
+                        )
                         Path(failure_path).write_text(
                             json.dumps(
                                 record, ensure_ascii=False, sort_keys=True

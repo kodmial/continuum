@@ -722,7 +722,7 @@ module.exports = async function runIssueScheduler({ github, context, core }) {
   }
   
   const checkpointResumeBlockedMarkerRe =
-    /<!--\s*continuum-checkpoint-resume-blocked\s+repo=([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)\s+issue=(\d+)\s+generation=(\d+)\s+operation=(\S+)\s+checkpoint=(\S+)\s+checkpoint_sha=([0-9a-fA-F]{40})\s+base_ref=(\S+)\s+base_sha=([0-9a-fA-F]{40})\s+snapshot=([0-9a-fA-F]{64})\s+reason=(\S+)\s*-->/;
+    /<!--\s*continuum-checkpoint-resume-blocked\s+repo=([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)\s+issue=(\d+)\s+generation=(\d+)\s+operation=(\S+)\s+checkpoint=(\S+)\s+checkpoint_sha=([0-9a-fA-F]{40})\s+base_ref=(\S+)\s+base_sha=([0-9a-fA-F]{40})\s+snapshot=([0-9a-fA-F]{64})\s+reason=(\S+)(?:\s+episode=(\S+))?\s*-->/;
   const checkpointSnapshotMarkerRe =
     /<!--\s*continuum-task-snapshot(?:-ref)?\s+repo=([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)\s+issue=(\d+)\s+generation=(\d+)\s+title-sha256=([0-9a-fA-F]{64})\s+body-sha256=([0-9a-fA-F]{64})\s+spec-sha256=([0-9a-fA-F]{64})\s*-->/g;
   // The watchdog writes this stable automation-origin marker into every
@@ -741,6 +741,8 @@ module.exports = async function runIssueScheduler({ github, context, core }) {
   // stop: the saved checkpoint is preserved and the scheduler only holds
   // this exact identity. A new checkpoint tip, a new pinned task snapshot,
   // checkpoint deletion, or a later owner /oc are material premise changes.
+  // Every failed retry publishes a new rejection marker episode, so an
+  // owner /oc releases the hold only until that retry's own marker arrives.
   //
   // Two different generation concepts meet here and must never be compared
   // with each other:
