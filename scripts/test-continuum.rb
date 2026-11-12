@@ -3833,8 +3833,8 @@ class ContinuumTest < Minitest::Test
         const results = {};
         for (const item of payload.cases) {
           process.env.PR_NUMBER = String(payload.pullNumber);
-          process.env.CI_ATTEMPT_ID = item.attempt || '';
-          process.env.CI_HEAD_SHA = item.head || payload.head;
+          process.env.CI_ATTEMPT_ID = item.attempt === undefined ? '' : item.attempt;
+          process.env.CI_HEAD_SHA = item.head === undefined ? payload.head : item.head;
           process.env.DISPATCH_RUN_ID = '9001';
           const calls = { warnings: [], notices: [], created: [] };
           const core = {
@@ -3918,6 +3918,12 @@ class ContinuumTest < Minitest::Test
           'comments' => [ci_repair_receipt('ci-attempt-0002', 'claimed', comment_id: 2, head: other_head)],
         },
         {
+          'name' => 'legacy-no-head-after-advance',
+          'head' => '',
+          'attempt' => '',
+          'comments' => [ci_repair_receipt('ci-attempt-0002', 'claimed', comment_id: 2, head: other_head)],
+        },
+        {
           'name' => 'different-active',
           'attempt' => 'ci-attempt-0001',
           'comments' => [ci_repair_receipt('ci-attempt-0002', 'claimed', comment_id: 2)],
@@ -3949,12 +3955,14 @@ class ContinuumTest < Minitest::Test
            read_failure.fetch('warnings'))
 
     # A correlation read failure returns from that step only: the admitted
-    # repair step must not be gated on it or the run would be silently lost.
+    # CI-repair step must not be gated on it or the run would be silently lost.
     workflow = yaml(File.join(ROOT, '.github/workflows/continuum-opencode.yml'))
     repair = workflow.fetch('jobs').values
                        .flat_map { |job| job['steps'] || [] }
-                       .find { |step| step['name'] == 'Run OpenCode' }
+                       .find { |step| step['name'] == 'Fix failed blocking workflow' }
     refute_nil repair
+    assert_includes repair['if'].to_s, "github.event_name == 'workflow_dispatch'"
+    assert_includes repair['if'].to_s, "inputs.mode == 'ci-fix'"
     refute_match(/correlation/i, repair['if'].to_s,
                  'a correlation-read failure must not gate the admitted repair')
 
@@ -3969,6 +3977,13 @@ class ContinuumTest < Minitest::Test
     assert advanced.fetch('ok'), advanced
     assert_empty advanced.fetch('created'),
                  'an H1 run must never be correlated to an H2 claim'
+
+    legacy = results.fetch('legacy-no-head-after-advance')
+    assert legacy.fetch('ok'), legacy
+    assert_empty legacy.fetch('created'),
+                 'a legacy run with no exact-HEAD identity must never use the live PR HEAD'
+    assert(legacy.fetch('notices').any? { |notice| notice.include?('no verified exact-HEAD dispatch evidence') },
+           legacy.fetch('notices'))
 
     different = results.fetch('different-active')
     assert different.fetch('ok'), different

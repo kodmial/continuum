@@ -43,8 +43,8 @@ const results = {};
 (async () => {
   for (const item of payload.cases) {
     process.env.PR_NUMBER = String(payload.pullNumber);
-    process.env.CI_ATTEMPT_ID = item.requestedAttempt || '';
-    process.env.CI_HEAD_SHA = item.head || payload.head;
+    process.env.CI_ATTEMPT_ID = item.requestedAttempt === undefined ? '' : item.requestedAttempt;
+    process.env.CI_HEAD_SHA = item.head === undefined ? payload.head : item.head;
     process.env.DISPATCH_RUN_ID = String(item.dispatchRunId || 9001);
     const calls = { warnings: [], notices: [], created: [] };
     const core = {
@@ -218,6 +218,35 @@ class CiRepairCorrelationStepTests(unittest.TestCase):
         self.assertTrue(
             any(
                 "not an active claim (no receipt)" in notice
+                for notice in result["notices"]
+            ),
+            result["notices"],
+        )
+
+    def test_a_legacy_run_without_head_identity_never_uses_the_live_head(self):
+        other_head = "b" * 40
+        result = self.run_cases(
+            [
+                {
+                    "name": "legacy-no-head",
+                    "head": "",
+                    "requestedAttempt": "",
+                    "comments": [
+                        receipt(
+                            "ci-attempt-0002",
+                            "claimed",
+                            comment_id=2,
+                            head=other_head,
+                        ),
+                    ],
+                }
+            ]
+        )["legacy-no-head"]
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(result["created"], [])
+        self.assertTrue(
+            any(
+                "no verified exact-HEAD dispatch evidence" in notice
                 for notice in result["notices"]
             ),
             result["notices"],
