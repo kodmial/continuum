@@ -241,6 +241,12 @@ def _dispatch(
     *definite* rejection, so retrying once without that input is safe; the
     engine can still discover the claim from the PR receipt and publish its
     own dispatched receipt.
+
+    Continuum's own ``opencode.yml`` caller also uses this fallback: it is at
+    GitHub's 25-input ``workflow_dispatch`` ceiling, so it cannot declare the
+    packed identity without dropping an existing input. Its run is still
+    correlated from the run ID in the ``return_run_details`` response (and by
+    the engine's receipt); only the run-name marker is unavailable there.
     """
 
     base = [

@@ -421,13 +421,20 @@ def has_unattributed_repair_run(
     *,
     pull_number: Any = None,
     since: Optional[str] = None,
+    attempt_id: Any = None,
 ) -> bool:
-    """Whether a legacy-shaped repair run exists that the receipt cannot claim.
+    """Whether a repair run exists that the receipt cannot attribute.
 
     Older installed callers render ``OpenCode repair PR #<n>`` without the
     correlation marker. If such a run exists for this PR after the claim was
     observed, the evidence cannot distinguish our dispatch from a manual one,
     so recovery must hold rather than dispatch again.
+
+    When ``attempt_id`` is supplied, a *marked* run for the same PR whose
+    marker names another attempt is also unattributable: the receipt history
+    cannot explain it, and re-arming the stale claim would risk a duplicate
+    repair for the same HEAD. Without ``attempt_id`` the previous marker-blind
+    behavior is retained for callers that only classify legacy runs.
     """
 
     wanted_pr = None
@@ -436,13 +443,34 @@ def has_unattributed_repair_run(
             wanted_pr = int(str(pull_number).strip())
         except (TypeError, ValueError):
             raise AdmissionError("pull number is not an integer")
+    wanted_attempt = str(attempt_id or "").strip()
     threshold = str(since or "").strip()
     if threshold and not _ISO_TIMESTAMP_RE.match(threshold):
         threshold = ""
 
     for run in inventory.runs:
         title = str(run.get("display_title") or "")
-        if _ATTEMPT_RUN_MARKER_RE.search(title):
+        marker = _ATTEMPT_RUN_MARKER_RE.search(title)
+        if marker:
+            pull = _PULL_TITLE_RE.match(title)
+            if not pull:
+                # A marker outside the canonical repair title is not a run this
+                # controller can attribute at all; never guess by recency.
+                continue
+            if wanted_pr is not None and int(pull.group("pr")) != wanted_pr:
+                continue
+            if not wanted_attempt:
+                # Preserve the marker-blind legacy classification for callers
+                # that do not name the attempt under recovery.
+                continue
+            if marker.group("attempt") != wanted_attempt:
+                created = str(run.get("created_at") or "")
+                if threshold:
+                    if not _ISO_TIMESTAMP_RE.match(created):
+                        return True
+                    if created < threshold:
+                        continue
+                return True
             continue
         match = _UNMARKED_REPAIR_TITLE_RE.match(title)
         if not match:
@@ -923,14 +951,15 @@ def plan_admission(
             runs,
             pull_number=pull_number,
             since=observed_at,
+            attempt_id=attempt.attempt_id,
         ):
             receipt = transition_attempt(attempt, status=STATUS_AMBIGUOUS)
             return AdmissionPlan(
                 action=ACTION_HOLD,
                 reason=(
-                    "claim {!r} expired, but a legacy-shaped repair run for "
-                    "this PR cannot be attributed to it; holding instead of "
-                    "risking a duplicate dispatch".format(attempt.attempt_id)
+                    "claim {!r} expired, but a repair run for this PR cannot "
+                    "be attributed to it; holding instead of risking a "
+                    "duplicate dispatch".format(attempt.attempt_id)
                 ),
                 attempt_id=attempt.attempt_id,
                 transition=receipt,

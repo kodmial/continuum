@@ -531,6 +531,24 @@ class AdmissionPlanningTests(unittest.TestCase):
         self.assertEqual(ACTION_HOLD, plan.action)
         self.assertEqual(STATUS_AMBIGUOUS, plan.transition.status)
 
+    def test_a_stale_claim_with_a_run_for_another_attempt_holds(self):
+        # A marked run for the same PR/HEAD that names a different attempt is
+        # not explained by the durable receipts. Re-arming the stale claim
+        # would create a second live repair for the same HEAD, so the pass must
+        # record the contradiction as a visible hold.
+        plan = plan_admission(
+            read([receipt_comment()]),
+            runs=check_inventory(
+                run(4, attempt=OTHER_ATTEMPT, created_at="2026-11-12T00:10:00Z")
+            ),
+            observed_at="2026-11-12T00:00:00Z",
+            now="2026-11-12T01:00:00Z",
+            claim_timeout_seconds=900,
+            pull_number=PR,
+        )
+        self.assertEqual(ACTION_HOLD, plan.action)
+        self.assertEqual(STATUS_AMBIGUOUS, plan.transition.status)
+
     def test_ambiguous_delivery_never_rearms_automatically(self):
         ambiguous = transition_receipt(receipt(), status=STATUS_AMBIGUOUS)
         plan = plan_admission(
@@ -618,7 +636,11 @@ class AdmissionPlanningTests(unittest.TestCase):
 
 
 class ObservationClockTests(unittest.TestCase):
-    def test_latest_trusted_observation_wins(self):
+    def test_earliest_trusted_observation_bounds_the_run_creation(self):
+        # The claim is persisted before the dispatch request, so a run created
+        # by the attempt cannot predate the *first* observation. Using a later
+        # transition comment as the lower bound would hide a run created
+        # between the claim and that comment and prevent correlation forever.
         first = receipt_comment(comment_id=1, created_at="2026-11-12T00:00:01Z")
         second = receipt_comment(comment_id=2, created_at="2026-11-12T00:05:01Z")
         observed = attempt_observed_at(
@@ -628,7 +650,7 @@ class ObservationClockTests(unittest.TestCase):
             pull_number=PR,
             head_sha=HEAD,
         )
-        self.assertEqual("2026-11-12T00:05:01Z", observed)
+        self.assertEqual("2026-11-12T00:00:01Z", observed)
 
     def test_trusted_token_login_is_respected(self):
         authored = comment(
