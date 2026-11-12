@@ -37,6 +37,7 @@ import os
 import re
 import subprocess
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping, Optional, Sequence, Tuple
 
@@ -86,10 +87,15 @@ from continuum.ci_repair_receipt import (  # noqa: E402
 
 _HTTP_STATUS_RE = re.compile(rb"^HTTP/\S+\s+([0-9]{3})\b", re.MULTILINE)
 _HEADER_SEPARATOR_RE = re.compile(rb"\r?\n\r?\n", re.MULTILINE)
+_ISO_TIMESTAMP_RE = re.compile(
+    r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"
+)
 # A rotated TAP_PAT can leave receipts authored by a former collaborator. If
 # no run proves that writer, admission must hold instead of treating the
-# receipt as absent; an unrelated commenter without repository write access
-# can neither authorize nor suppress a repair.
+# receipt as absent. After the registry baseline is established, an unrelated
+# commenter without repository write access can neither authorize nor suppress
+# a repair; a receipt older than the baseline stays unverifiable instead of
+# being mistaken for such a lookalike.
 _HISTORICAL_WRITER_ASSOCIATIONS = frozenset({"MEMBER", "COLLABORATOR"})
 #: Legacy comma/newline-separated registry of logins that authored trusted
 #: receipts. It is only read now: a pre-existing value is migrated into
@@ -101,6 +107,13 @@ _CI_REPAIR_WRITERS_VARIABLE = "CONTINUUM_CI_REPAIR_WRITERS"
 #: lowercase login; the suffix is a digest because a login may contain
 #: characters that repository variable names do not allow.
 _CI_REPAIR_WRITER_VARIABLE_PREFIX = "CONTINUUM_CI_REPAIR_WRITER_"
+#: One-time migration frontier for the writer registry. Its value is the UTC
+#: timestamp at which the durable registry was first established. A receipt
+#: comment created before that instant may have been written by a historical
+#: writer that was never migrated (its dispatch run may already be deleted), so
+#: an unproved author of such a receipt is unverifiable rather than a proven
+#: lookalike. The name deliberately does not start with the per-writer prefix.
+_CI_REPAIR_WRITERS_BASELINE_VARIABLE = "CONTINUUM_CI_REPAIR_WRITERS_BASELINE"
 
 
 class GhFailure(RuntimeError):
@@ -321,6 +334,88 @@ def _writer_variable_records(repository: str, login: str) -> bool:
     if not isinstance(data, Mapping):
         return False
     return login in _normalize_writer_logins(data.get("value"))
+
+
+def _admission_timestamp(value: Any = None) -> str:
+    """Return a normalized UTC timestamp for a new writer baseline."""
+
+    text = str(value or "").strip()
+    if _ISO_TIMESTAMP_RE.match(text):
+        return text
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _read_writer_baseline(repository: str) -> Tuple[Optional[str], bool]:
+    """Read the one-time writer-registry migration frontier.
+
+    ``(None, True)`` means no baseline has been established yet. That is not
+    proof that no historical writer exists: receipts may predate the registry,
+    and their proving runs may already be deleted. ``(None, False)`` means the
+    baseline could not be read and must also not be treated as absent.
+    """
+
+    url = "repos/{}/actions/variables/{}".format(
+        repository, _CI_REPAIR_WRITERS_BASELINE_VARIABLE
+    )
+    _, stdout, stderr = _gh(["api", "--include", url])
+    status, body = _parse_include(stdout, stderr)
+    if status == 404:
+        return None, True
+    if status != 200:
+        print(
+            "::warning::Could not read historical CI-repair writer baseline: "
+            "{}".format((body or stderr).strip() or "HTTP status {}".format(status))
+        )
+        return None, False
+    try:
+        data = json.loads(body or "{}")
+    except ValueError:
+        print(
+            "::warning::Historical CI-repair writer baseline is not valid JSON."
+        )
+        return None, False
+    if not isinstance(data, Mapping):
+        print(
+            "::warning::Historical CI-repair writer baseline is not an object."
+        )
+        return None, False
+    value = data.get("value")
+    if not isinstance(value, str) or not _ISO_TIMESTAMP_RE.match(value.strip()):
+        print(
+            "::warning::Historical CI-repair writer baseline is not a usable "
+            "timestamp."
+        )
+        return None, False
+    return value.strip(), True
+
+
+def _persist_writer_baseline(repository: str, timestamp: str) -> bool:
+    """Record the one-time writer-registry baseline without moving it."""
+
+    code, _, stderr = _gh(
+        [
+            "api",
+            "--method",
+            "POST",
+            "repos/{}/actions/variables".format(repository),
+            "-f",
+            "name={}".format(_CI_REPAIR_WRITERS_BASELINE_VARIABLE),
+            "-f",
+            "value={}".format(timestamp),
+        ]
+    )
+    if code == 0:
+        return True
+    # A concurrent pass may have established the baseline first. Keep that
+    # frontier instead of overwriting it with a later timestamp.
+    existing, healthy = _read_writer_baseline(repository)
+    if healthy and existing is not None:
+        return True
+    print(
+        "::warning::Could not record the historical CI-repair writer baseline: "
+        "{}".format(stderr.strip() or "gh exited {}".format(code))
+    )
+    return False
 
 
 def _persist_historical_writers(
@@ -625,6 +720,7 @@ def _historical_receipt_writers(
     trusted_logins: Sequence[str],
     known_writers: Sequence[str] = (),
     registry_available: bool = True,
+    baseline: Optional[str] = None,
 ) -> Tuple[Tuple[str, ...], bool]:
     """Return historical receipt authors proved by GitHub's run records.
 
@@ -640,6 +736,13 @@ def _historical_receipt_writers(
     receipts are included because outcome persistence can fail after an
     accepted dispatch. An unrelated commenter cannot borrow a run, so
     unverified lookalikes stay ignored exactly as before.
+
+    ``baseline`` is the durable writer-registry migration frontier. A receipt
+    comment created before it may belong to a historical writer that was never
+    migrated, whose dispatch run may already be deleted; such an unproved
+    author is unverifiable, not a proven lookalike. With no established
+    baseline every unproved receipt is unverifiable, so a missing registry can
+    never reauthorize a spent exact HEAD.
 
     The second result reports that history exists which cannot be verified
     because the run inventory failed or is incomplete, or because a plausible
@@ -729,6 +832,8 @@ def _historical_receipt_writers(
     # here; an unrelated commenter with none of that evidence cannot suppress a
     # repair.
     known = frozenset(_normalize_writer_logins("\n".join(known_writers)))
+    baseline_text = str(baseline or "").strip()
+    baseline_usable = bool(_ISO_TIMESTAMP_RE.match(baseline_text))
     for author, comment in unmatched:
         if author in verified:
             continue
@@ -738,8 +843,19 @@ def _historical_receipt_writers(
             and run_repairs_pull(run, pull_number)
             for run in inventory.runs
         )
+        created = comment.get("created_at")
+        # No baseline, or a receipt written before the registry existed, may
+        # belong to a writer that was never migrated after its proving run was
+        # deleted. It stays unverifiable instead of being treated as absent.
+        predates_baseline = (
+            not baseline_usable
+            or not isinstance(created, str)
+            or not _ISO_TIMESTAMP_RE.match(created)
+            or created < baseline_text
+        )
         if (
-            author in known
+            predates_baseline
+            or author in known
             or not registry_available
             or association in _HISTORICAL_WRITER_ASSOCIATIONS
             or author_has_repair_run
@@ -823,7 +939,9 @@ def run(args) -> int:
     # neither. Recording the current login before it rotates keeps deleted-run
     # history authoritative for the next token. Per-writer variables make the
     # registration independent, so concurrent exact-HEAD passes cannot erase
-    # each other's writer.
+    # each other's writer. A one-time baseline records when the registry became
+    # authoritative, so receipts written before it are never mistaken for
+    # unrelated lookalikes after their proving run is deleted.
     known_writers, registered_writers, registry_healthy = _historical_writer_registry(
         repository
     )
@@ -838,6 +956,27 @@ def run(args) -> int:
             "holding instead of risking a duplicate dispatch."
         )
         return 0
+    baseline, baseline_healthy = _read_writer_baseline(repository)
+    if not baseline_healthy:
+        print(
+            "::warning::Historical CI-repair writer baseline cannot be read; "
+            "holding instead of risking a duplicate dispatch."
+        )
+        return 0
+    if baseline is None:
+        # Establish the migration frontier now. Receipts already present may
+        # have been written by a historical writer that was never registered
+        # and whose proving run is already deleted, so an unproved author of
+        # those receipts stays unverifiable instead of authorizing a duplicate.
+        baseline = _admission_timestamp(args.now)
+        if not args.dry_run and not _persist_writer_baseline(
+            repository, baseline
+        ):
+            print(
+                "::warning::Historical CI-repair writer baseline is not durably "
+                "recorded; holding instead of risking a duplicate dispatch."
+            )
+            return 0
     historical_writers, unverifiable_history = _historical_receipt_writers(
         repository,
         pull_number,
@@ -848,6 +987,7 @@ def run(args) -> int:
         trusted_logins=tuple(trusted_logins),
         known_writers=known_writers,
         registry_available=True,
+        baseline=baseline,
     )
     if not args.dry_run:
         _, writers_durable = _persist_historical_writers(

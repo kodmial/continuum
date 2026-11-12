@@ -4064,11 +4064,12 @@ class ContinuumTest < Minitest::Test
       def comment(association):
           return {
               'body': render_receipt(receipt),
+              'created_at': '2026-11-12T00:00:00Z',
               'author_association': association,
               'user': {'login': 'old-automation'},
           }
 
-      def writers(association, runs):
+      def writers(association, runs, baseline='2026-11-11T00:00:00Z'):
           admission._workflow_runs = lambda *args, **kwargs: Inventory(runs)
           return admission._historical_receipt_writers(
               repository,
@@ -4078,6 +4079,7 @@ class ContinuumTest < Minitest::Test
               workflow='continuum-opencode.yml',
               owner_login='',
               trusted_logins=('github-actions[bot]',),
+              baseline=baseline,
           )
 
       verified, verified_hold = writers('NONE', [legacy])
@@ -4087,6 +4089,8 @@ class ContinuumTest < Minitest::Test
       _, none_hold = writers('NONE', [])
       result['member_hold'] = member_hold
       result['none_hold'] = none_hold
+      _, missing_baseline_hold = writers('NONE', [], baseline=None)
+      result['missing_baseline_hold'] = missing_baseline_hold
       print(json.dumps(result))
     PY
     stdout, stderr, status = Open3.capture3(
@@ -4108,6 +4112,8 @@ class ContinuumTest < Minitest::Test
            'an unproved collaborator receipt must hold admission'
     refute result.fetch('none_hold'),
            'an unrelated commenter must not suppress a repair'
+    assert result.fetch('missing_baseline_hold'),
+           'a receipt with no established writer baseline must hold admission'
   end
 
   # The executor cannot repair a mutable branch tip. Every non-recovery ci-fix

@@ -35,6 +35,10 @@ NEW_HEAD = "b" * 40
 NOW = "2026-11-12T01:00:00Z"
 LEGACY_WRITERS_VARIABLE = "CONTINUUM_CI_REPAIR_WRITERS"
 WRITER_VARIABLE_PREFIX = "CONTINUUM_CI_REPAIR_WRITER_"
+WRITERS_BASELINE_VARIABLE = "CONTINUUM_CI_REPAIR_WRITERS_BASELINE"
+#: An already-established registry baseline. Comment fixtures are created
+#: after it, so they are covered by the durable writer registry.
+WRITERS_BASELINE = "2026-11-11T00:00:00Z"
 
 FAKE_GH = r'''#!/usr/bin/env python3
 import json
@@ -278,6 +282,9 @@ class AdmissionExecutableTests(unittest.TestCase):
         self.write_state("runs_pages.json", [])
         self.write_state("posted.jsonl", "")
         self.write_state("gh.log", "")
+        self.write_state(
+            "variables.json", {WRITERS_BASELINE_VARIABLE: WRITERS_BASELINE}
+        )
 
     @staticmethod
     def _tmp_root():
@@ -571,7 +578,10 @@ class AdmissionExecutableTests(unittest.TestCase):
         self.write_pr(head=HEAD, comments=1)
         self.write_state(
             "variables.json",
-            {LEGACY_WRITERS_VARIABLE: "old-automation"},
+            {
+                LEGACY_WRITERS_VARIABLE: "old-automation",
+                WRITERS_BASELINE_VARIABLE: WRITERS_BASELINE,
+            },
         )
         self.write_runs([])
         completed = self.run_admission()
@@ -581,6 +591,41 @@ class AdmissionExecutableTests(unittest.TestCase):
         writers = self.writer_logins()
         self.assertIn("old-automation", writers)
         self.assertIn("github-actions[bot]", writers)
+
+    def test_a_missing_registry_with_a_deleted_run_holds_instead_of_redispatched(self):
+        # The registry did not exist when the previous TAP_PAT wrote its
+        # receipt, and its repair run was deleted before migration. Nothing can
+        # prove that writer, so a missing baseline must hold rather than treat
+        # the spent exact HEAD as unused and dispatch again.
+        self.write_comments(
+            [
+                trusted_receipt(
+                    attempt="ci-old-account-0001",
+                    status="dispatched",
+                    author="old-automation",
+                    run_id=900,
+                )
+            ]
+        )
+        self.write_pr(head=HEAD, comments=1)
+        self.write_state("variables.json", {})
+        self.write_runs([])
+        completed = self.run_admission(
+            extra_args=("--now", "2026-11-12T00:05:00Z")
+        )
+        self.assertEqual(0, len(self.dispatches()))
+        self.assertEqual([], self.posts())
+        self.assertIn("cannot be verified", completed.stdout)
+        self.assertIn(WRITERS_BASELINE_VARIABLE, self.variables())
+
+        # The baseline is durable: a later pass must not reclassify the same
+        # pre-baseline receipt as an unrelated lookalike.
+        completed = self.run_admission(
+            extra_args=("--now", "2026-11-12T00:10:00Z")
+        )
+        self.assertEqual(0, len(self.dispatches()))
+        self.assertEqual([], self.posts())
+        self.assertIn("cannot be verified", completed.stdout)
 
     def test_the_authenticated_writer_is_recorded_for_future_rotations(self):
         self.run_admission()
@@ -593,6 +638,26 @@ class AdmissionExecutableTests(unittest.TestCase):
         self.assertEqual(0, len(self.dispatches()))
         self.assertEqual([], self.posts())
         self.assertIn("not durably recorded", completed.stdout)
+
+    def test_a_baseline_write_failure_holds_without_dispatching(self):
+        # Without a durable migration frontier, pre-registry receipts cannot be
+        # distinguished from lookalikes, so admission must not proceed.
+        self.write_state("variables.json", {})
+        completed = self.run_admission(
+            extra_env={"FAKE_VARIABLES_WRITE_FAIL": "1"}
+        )
+        self.assertEqual(0, len(self.dispatches()))
+        self.assertEqual([], self.posts())
+        self.assertIn("baseline is not durably recorded", completed.stdout)
+
+    def test_an_unusable_baseline_holds_without_dispatching(self):
+        self.write_state(
+            "variables.json", {WRITERS_BASELINE_VARIABLE: "not-a-timestamp"}
+        )
+        completed = self.run_admission()
+        self.assertEqual(0, len(self.dispatches()))
+        self.assertEqual([], self.posts())
+        self.assertIn("baseline cannot be read", completed.stdout)
 
     def test_a_registry_read_failure_holds_without_dispatching(self):
         completed = self.run_admission(
@@ -620,6 +685,7 @@ class AdmissionExecutableTests(unittest.TestCase):
             ]
         )
         self.write_pr(head=HEAD, comments=1)
+        self.write_state("variables.json", {})
         self.write_runs(
             [
                 {
@@ -638,15 +704,19 @@ class AdmissionExecutableTests(unittest.TestCase):
                 }
             ]
         )
-        completed = self.run_admission()
+        completed = self.run_admission(
+            extra_args=("--now", "2026-11-12T00:05:00Z")
+        )
         self.assertEqual(0, len(self.dispatches()))
         self.assertIn("verified by its exact-HEAD dispatch run", completed.stdout)
         self.assertIn("old-automation", self.writer_logins())
         self.assertIn("github-actions[bot]", self.writer_logins())
+        self.assertIn(WRITERS_BASELINE_VARIABLE, self.variables())
 
         self.write_runs([])
         completed = self.run_admission(
-            extra_env={"FAKE_TOKEN_LOGIN": "new-automation"}
+            extra_args=("--now", "2026-11-12T00:10:00Z"),
+            extra_env={"FAKE_TOKEN_LOGIN": "new-automation"},
         )
         self.assertEqual(0, len(self.dispatches()))
         self.assertIn("cannot be verified", completed.stdout)
