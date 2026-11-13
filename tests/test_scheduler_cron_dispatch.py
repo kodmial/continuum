@@ -434,5 +434,245 @@ class WorkflowContractPinTests(unittest.TestCase):
         self.assertIn("READ_GITHUB_TOKEN: ${{ github.token }}", body)
 
 
+
+class CheckpointResumeHoldRegressionTests(unittest.TestCase):
+    """Exercise the shipped scheduler guard against real comment/ref shapes."""
+
+    def test_scheduler_hold_is_not_released_by_automatic_owner_oc(self):
+        from pathlib import Path
+        import shutil
+        import subprocess
+
+        node = shutil.which("node")
+        self.assertIsNotNone(node, "Node.js is needed for scheduler regression")
+        root = Path(__file__).resolve().parents[1]
+        source = (root / ".github/scripts/issue_scheduler.js").read_text(
+            encoding="utf-8"
+        )
+        start = source.index("  const checkpointResumeBlockedMarkerRe =")
+        end = source.index("  const ownerResumeMarkerRe =", start)
+        helper = source[start:end]
+        harness = r"""
+const assert = require('assert');
+const core = { warning: () => {} };
+function isTrustedStopComment(c, owner) {
+  return ['OWNER', 'MEMBER', 'COLLABORATOR'].includes(c.author_association) ||
+    ['github-actions[bot]', owner].includes(c.user?.login);
+}
+function stopOrderKey(c) {
+  return String(c.created_at || '') + '#' +
+    String(c.id || 0).padStart(12, '0');
+}
+""" + helper + r"""
+(async () => {
+  const sha = 'a'.repeat(40);
+  const marker = '<!-- continuum-checkpoint-resume-blocked ' +
+    'repo=kodmial/continuum issue=442 generation=1 ' +
+    'operation=opencode-429-issue-issue442 ' +
+    'checkpoint=opencode/checkpoint-issue442 ' +
+    'checkpoint_sha=' + sha + ' base_ref=main base_sha=' +
+    'b'.repeat(40) + ' snapshot=' + 'c'.repeat(64) +
+    ' reason=verification-failed -->';
+  const snapshot = (spec, generation = 1) =>
+    '<!-- continuum-task-snapshot repo=kodmial/continuum issue=442 ' +
+    'generation=' + generation + ' title-sha256=' + 'd'.repeat(64) +
+    ' body-sha256=' + 'e'.repeat(64) + ' spec-sha256=' + spec + ' -->';
+  const snapshotRef = (spec, generation = 1) =>
+    '<!-- continuum-task-snapshot-ref repo=kodmial/continuum issue=442 ' +
+    'generation=' + generation + ' title-sha256=' + 'd'.repeat(64) +
+    ' body-sha256=' + 'e'.repeat(64) + ' spec-sha256=' + spec + ' -->';
+  const item = (id, body, login = 'kodmial') => ({
+    id, body, created_at: '2026-11-12T04:' + String(id).padStart(2, '0') + ':00Z',
+    user: { login }, author_association: login === 'outsider' ? 'NONE' : 'OWNER'
+  });
+  const saved = item(1, marker);
+  const auto = item(2, '/oc\n\n<!-- issue-scheduler-dispatch -->');
+  const watchdog = item(3, '/oc\n\n<!-- opencode-watchdog-retry -->');
+  const manual = item(4, '/oc\ncheck again');
+  // Only the checkpoint ref is consulted. No workflow-run inventory and no
+  // issue-title lookup is part of the hold decision any more, so the client
+  // intentionally exposes nothing else.
+  const client = (tip = sha) => ({
+    rest: {
+      git: { getRef: async () => ({ data: { object: { sha: tip } } }) }
+    }
+  });
+  const hold = (comments, cl = client()) =>
+    checkpointResumeHold('kodmial', 'continuum', 442, comments, cl);
+  assert.ok(await hold([saved]), 'recorded failure must hold');
+  assert.ok(await hold([saved, auto]), 'scheduler /oc must not waive hold');
+  assert.ok(await hold([saved, watchdog]), 'watchdog /oc must not waive hold');
+  assert.ok(
+    await hold([saved, item(5, '/oc\n\n<!-- custom-retry -->\n' +
+      '<!-- continuum-origin role=continuum component=opencode-watchdog -->')]),
+    'watchdog origin marker must exclude a configured retry marker'
+  );
+  assert.ok(
+    await hold([saved, item(6, '```\n/oc\n```')]),
+    'a fenced /oc example must not waive the hold'
+  );
+  assert.ok(
+    await hold([saved, item(7, 'Some explanation first.\n/oc')]),
+    'an explained /oc mention must not waive the hold'
+  );
+  assert.ok(
+    await hold([saved, item(8, '    /oc')]),
+    'an indented /oc code block must not waive the hold'
+  );
+  assert.ok(
+    await hold([saved, manual]),
+    'a manual owner /oc must not waive the deterministic hold'
+  );
+  assert.ok(
+    await hold([saved, manual], { rest: {} }),
+    'the hold must never need a workflow-run inventory to stay closed'
+  );
+  const retried = item(9, marker.replace(
+    ' reason=verification-failed -->',
+    ' reason=verification-failed episode=run-9-1 -->'
+  ));
+  assert.ok(
+    await hold([saved, manual, retried]),
+    'a new hold episode after a failed manual retry must restore the hold'
+  );
+  assert.ok(
+    await hold([saved, manual, retried, item(10, '/oc\nretry again')]),
+    'a later manual /oc after the new hold episode must keep the hold'
+  );
+  const schedulerDispatch = item(11,
+    '/oc\n\n<!-- issue-scheduler-dispatch -->\nretry');
+  assert.ok(
+    await hold([saved, manual, schedulerDispatch]),
+    'a recorded automatic dispatch cannot reopen the manual override'
+  );
+  assert.ok(
+    await hold([saved, manual, item(12,
+      '/oc\n\n<!-- opencode-watchdog-retry -->\n' +
+      '<!-- continuum-origin role=continuum component=opencode-watchdog -->')]),
+    'a recorded watchdog retry cannot reopen the manual override'
+  );
+  assert.equal(await hold([saved], client('d'.repeat(40))), null,
+    'changed checkpoint SHA releases the hold');
+  assert.equal(
+    await hold([saved, manual], client('d'.repeat(40))), null,
+    'a changed checkpoint still releases the hold after a manual /oc'
+  );
+  assert.equal(
+    await hold([saved, manual, retried], client('d'.repeat(40))), null,
+    'a changed checkpoint still releases the hold after an owner retry run'
+  );
+  assert.equal(await hold([item(1, marker, 'outsider')]), null,
+    'untrusted authors cannot impose a hold');
+  assert.ok(await hold([saved], {rest: {git: {
+    getRef: async () => { throw {status: 503}; }
+  }}}), 'failed GitHub ref lookup must fail closed');
+  assert.ok(
+    await hold([item(1, marker.replace('generation=1', 'generation=2'))]),
+    'a rejection from recovery generation 2 must still hold'
+  );
+  assert.equal(
+    await hold([item(0, snapshot('f'.repeat(64))), saved]),
+    null,
+    'an earlier different-spec authoritative snapshot releases the hold'
+  );
+  assert.equal(
+    await hold([item(1, marker + '\n' + snapshot('f'.repeat(64)))]),
+    null,
+    'a different-spec snapshot in the rejection comment is authoritative'
+  );
+  assert.ok(
+    await hold([saved, item(5, snapshot('c'.repeat(64)))]),
+    'a later snapshot with the same spec must not release the hold'
+  );
+  assert.ok(
+    await hold([saved, item(5, snapshot('f'.repeat(64), 2))]),
+    'a later snapshot for another task generation must not release the hold'
+  );
+  assert.equal(
+    await hold([saved, item(5, snapshot('f'.repeat(64)))]),
+    null,
+    'a different-spec earliest snapshot releases the hold'
+  );
+  assert.ok(
+    await hold([
+      saved,
+      item(5, snapshot('c'.repeat(64))),
+      item(6, snapshot('f'.repeat(64)))
+    ]),
+    'a later different-spec duplicate must not override the earliest snapshot'
+  );
+  assert.ok(
+    await hold([item(0, snapshotRef('f'.repeat(64))), saved]),
+    'a snapshot reference is not the executor pin and must not release the hold'
+  );
+  assert.ok(
+    await hold([saved, item(5, snapshotRef('f'.repeat(64)))]),
+    'a later snapshot reference must not release the hold'
+  );
+  assert.ok(
+    await hold([
+      saved,
+      item(5,
+        snapshot('f'.repeat(64)).replace('issue=442', 'issue=999') + '\n' +
+        snapshot('f'.repeat(64)))
+    ]),
+    'only the first snapshot marker in a comment is the executor pin'
+  );
+  assert.ok(
+    await hold([
+      saved,
+      item(5, snapshot('c'.repeat(64)) + '\n' + snapshot('f'.repeat(64)))
+    ]),
+    'a later marker in one comment must not replace the first pin'
+  );
+  console.log('checkpoint-resume-hold-regression: PASS');
+})().catch(e => { console.error(e); process.exitCode = 1; });
+"""
+        result = subprocess.run(
+            [node, "-e", harness], cwd=root,
+            capture_output=True, text=True, timeout=30, check=False
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("checkpoint-resume-hold-regression: PASS", result.stdout)
+
+    def test_scheduler_and_watchdog_check_before_dispatch(self):
+        from pathlib import Path
+
+        root = Path(__file__).resolve().parents[1]
+        scheduler = (root / ".github/scripts/issue_scheduler.js").read_text(
+            encoding="utf-8"
+        )
+        watchdog = (
+            root / ".github/workflows/continuum-opencode-watchdog.yml"
+        ).read_text(encoding="utf-8")
+        self.assertEqual(scheduler.count("await checkpointResumeHold("), 3)
+        # A manual owner /oc already starts its own OpenCode run, so the hold
+        # never consults owner commands or a workflow-run inventory: those
+        # releases were not durable (runs are deletable) and could resume the
+        # identical zero-progress retry.
+        self.assertNotIn("openCodeIssueRunStartedAfter", scheduler)
+        self.assertNotIn("openCodeIssueRunStartedAfter", watchdog)
+        self.assertNotIn("listWorkflowRunsForRepo", scheduler.split(
+            "async function checkpointResumeHold(", 1
+        )[1].split("function checkpointResumeHoldSkipReason", 1)[0])
+        self.assertIn("await removeLabel(issueNumber, inProgressLabel)", scheduler)
+        self.assertIn("checkpointResumeBlockedRe", watchdog)
+        self.assertIn("async function checkpointResumeHold(", watchdog)
+        self.assertIn("recoveryCheckpointRef = null", watchdog)
+        self.assertIn("normalizeCheckpointRef(match[5])", watchdog)
+        self.assertIn("return { blocked: true, marker };", watchdog)
+        self.assertIn(
+            "const hold = await checkpointResumeHold(", watchdog
+        )
+        self.assertIn(
+            "issueText, comments, checkpointRef", watchdog
+        )
+        self.assertLess(
+            watchdog.index("const checkpointResumeBlockedRe ="),
+            watchdog.index("// A scheduler dispatch comment newer")
+        )
+
+
+
 if __name__ == "__main__":
     unittest.main()

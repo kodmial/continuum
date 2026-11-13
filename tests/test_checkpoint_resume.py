@@ -366,6 +366,7 @@ class CheckpointResumeTest(unittest.TestCase):
         self.assertEqual(1, len(parsed))
         self.assertEqual(checkpoint, parsed[0]["checkpoint_sha"])
         self.assertEqual("wrong-issue", parsed[0]["reason"])
+        self.assertEqual("", parsed[0]["episode"])
         self.assertFalse(
             checkpoint_resume.premise_changed(
                 parsed[0],
@@ -389,6 +390,53 @@ class CheckpointResumeTest(unittest.TestCase):
                 checkpoint_sha="f" * 40,
                 base_sha=self.base,
             )
+        )
+
+    def test_repeated_identity_uses_a_distinct_failure_episode(self):
+        checkpoint = self.make_checkpoint()
+        error = self.assert_rejected(
+            "wrong-issue", self.request(checkpoint, issue=999)
+        )
+        request = checkpoint_resume.ResumeRequest.from_mapping(
+            self.request(checkpoint)
+        )
+        first = checkpoint_resume.failure_record(
+            request, error, episode="12345-1"
+        )
+        second = checkpoint_resume.failure_record(
+            request, error, episode="12345-2"
+        )
+        self.assertNotEqual(first["marker_line"], second["marker_line"])
+        self.assertIn("episode=12345-1", first["marker_line"])
+        self.assertIn("episode=12345-2", second["marker_line"])
+        self.assertEqual(
+            "12345-1",
+            checkpoint_resume.parse_failure_markers(
+                first["marker"]
+            )[0]["episode"],
+        )
+        self.assertEqual(
+            "12345-2",
+            checkpoint_resume.parse_failure_markers(
+                second["marker"]
+            )[0]["episode"],
+        )
+
+    def test_failure_marker_publication_is_retried_and_confirmed(self):
+        workflow = (
+            ROOT / ".github" / "workflows" / "continuum-opencode.yml"
+        ).read_text(encoding="utf-8")
+        self.assertIn("resume_hold_marker_published() {", workflow)
+        self.assertIn("for resume_publish_attempt in 1 2 3; do", workflow)
+        self.assertIn("RESUME_MARKER_CONFIRMED=true", workflow)
+        self.assertIn("! resume_hold_marker_published; then", workflow)
+        self.assertIn(
+            "refusing to continue without a durable rejection record for "
+            "this checkpoint.",
+            workflow,
+        )
+        self.assertNotIn(
+            '--body "$RESUME_MARKER" >/dev/null 2>&1 || true', workflow
         )
 
 

@@ -134,12 +134,13 @@ jobs:
       READ_GITHUB_TOKEN: ${{ github.token }}
 
     steps:
-      - name: Checkout Continuum watchdog routing helper
+      - name: Checkout Continuum watchdog helpers
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           repository: kodmial/continuum
-          # Pinned: this file is executed by require(); never leave it on a
-          # mutable ref. Advance the pin only in the same PR that changes it.
+          # Pinned: these files are executed by require()/python3; never leave
+          # them on a mutable ref. Advance the pin only in the same PR that
+          # changes them.
           ref: b06bd207d8ff5ad079d14626eb10669c13d56435
           path: .continuum-watchdog-engine
           fetch-depth: 1
@@ -1041,6 +1042,184 @@ jobs:
               return [...active.values()];
             }
 
+            // kodmial/continuum#442: a deterministic checkpoint-continuation
+            // rejection is persisted by the failing run. It is not a model
+            // failure and not an owner pause: retrying the identical
+            // checkpoint/base/snapshot would only burn another attempt.
+            //
+            // Two different generation concepts meet here and must never be
+            // compared with each other:
+            //   * the rejection marker's `generation` is the *recovery*
+            //     generation of the run that rejected the resume, and 429
+            //     evacuation generations can be above 1. The rejection is
+            //     bound to the checkpoint identity, so a marker from any
+            //     recovery generation >= 1 applies its hold;
+            //   * a `continuum-task-snapshot` marker's `generation` is the
+            //     *task* generation, which the workflow pins to 1
+            //     (`continuum-opencode.yml`). Only that generation can release
+            //     the hold with a different spec.
+            const TASK_SNAPSHOT_GENERATION = 1;
+            const checkpointResumeBlockedRe =
+              /<!--\s*continuum-checkpoint-resume-blocked\s+repo=([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)\s+issue=(\d+)\s+generation=(\d+)\s+operation=(\S+)\s+checkpoint=(\S+)\s+checkpoint_sha=([0-9a-fA-F]{40})\s+base_ref=(\S+)\s+base_sha=([0-9a-fA-F]{40})\s+snapshot=([0-9a-fA-F]{64})\s+reason=(\S+)(?:\s+episode=(\S+))?\s*-->/;
+            // The executor consumes only `continuum-task-snapshot` here and
+            // parses only the first such marker in a comment before checking
+            // its identity. A `continuum-task-snapshot-ref` marker is a
+            // PR-body reference the executor never treats as the
+            // authoritative pin, so it must not release this hold either.
+            const checkpointSnapshotMarkerRe =
+              /<!--\s*continuum-task-snapshot\s+repo=([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)\s+issue=(\d+)\s+generation=(\d+)\s+title-sha256=([0-9a-fA-F]{64})\s+body-sha256=([0-9a-fA-F]{64})\s+spec-sha256=([0-9a-fA-F]{64})\s*-->/;
+            function checkpointCommentOrder(comment) {
+              return String(comment.created_at || '') + '#' +
+                String(comment.id || 0).padStart(12, '0');
+            }
+            function trustedCheckpointComment(comment) {
+              const association = String(
+                comment.author_association || ''
+              ).toUpperCase();
+              if (['OWNER', 'MEMBER', 'COLLABORATOR'].includes(association)) {
+                return true;
+              }
+              const login = String(comment.user?.login || '').toLowerCase();
+              return (
+                login === 'github-actions[bot]' ||
+                login === owner.toLowerCase()
+              );
+            }
+            // The shared hold semantics for every watchdog route: the normal
+            // retry path, the scheduled catch-up, the runner-restart path and
+            // durable discovery. A material premise change releases the hold:
+            // a different authoritative trusted task snapshot for the task
+            // generation, or a changed or deleted durable checkpoint ref. A
+            // failed ref read keeps the hold fail-closed.
+            //
+            // A manual owner /oc is not a release. The owner command already
+            // starts its own OpenCode issue run through the `issue_comment`
+            // trigger, and that run retries this exact checkpoint without
+            // watchdog admission, so a watchdog release only adds a duplicate
+            // dispatch. The release also cannot be made durable: when a failed
+            // retry cannot publish its own rejection episode nothing records
+            // the consumption, and workflow runs are deletable, so no run
+            // inventory can prove the override was already used. A release
+            // keyed on that command would therefore recur on a later wake and
+            // resume the zero-progress retries this hold exists to stop.
+            async function checkpointResumeHold(
+              issueNumber, comments, recoveryCheckpointRef = null
+            ) {
+              const wantedIssue = Number(issueNumber);
+              if (!Number.isInteger(wantedIssue) || wantedIssue < 1) {
+                return { blocked: false, marker: null };
+              }
+              const normalizeCheckpointRef = ref =>
+                String(ref || '').replace(/^refs\/heads\//, '');
+              const wantedCheckpointRef = recoveryCheckpointRef
+                ? normalizeCheckpointRef(recoveryCheckpointRef)
+                : null;
+              const trusted = (comments || []).filter(
+                trustedCheckpointComment
+              );
+              let marker = null;
+              for (const comment of trusted) {
+                const match = String(comment.body || '').match(
+                  checkpointResumeBlockedRe
+                );
+                if (!match) continue;
+                if (
+                  match[1].toLowerCase() !== repoFullName.toLowerCase() ||
+                  Number(match[2]) !== wantedIssue ||
+                  Number(match[3]) < 1
+                ) continue;
+                // A fresh-VM recovery is scoped to its validated checkpoint.
+                // A rejection for another checkpoint on the same issue must
+                // not block this one.
+                if (
+                  wantedCheckpointRef &&
+                  normalizeCheckpointRef(match[5]) !== wantedCheckpointRef
+                ) continue;
+                const candidate = {
+                  order: checkpointCommentOrder(comment),
+                  recoveryGeneration: Number(match[3]),
+                  operation: match[4],
+                  checkpointRef: match[5],
+                  checkpointSha: match[6].toLowerCase(),
+                  baseRef: match[7],
+                  baseSha: match[8].toLowerCase(),
+                  snapshotSpec: match[9].toLowerCase(),
+                  reason: match[10],
+                };
+                if (!marker || candidate.order > marker.order) {
+                  marker = candidate;
+                }
+              }
+              if (!marker) return { blocked: false, marker: null };
+
+              // Select the authoritative snapshot exactly as the executor
+              // does: only the first `continuum-task-snapshot` marker in a
+              // comment is parsed, and identity is checked after that parse,
+              // so a comment whose first marker belongs to another
+              // repo/issue/generation is discarded whole. The earliest
+              // trusted snapshot for the task generation then wins and later
+              // duplicates are ignored, never overwritten. Comparing a later
+              // duplicate instead would dispatch against the earlier pin, or
+              // repeat the unchanged rejection when live content still
+              // matches that earlier pin.
+              let authoritativeSnapshot = null;
+              let authoritativeSnapshotOrder = '';
+              for (const comment of trusted) {
+                const order = checkpointCommentOrder(comment);
+                const match = String(comment.body || '').match(
+                  checkpointSnapshotMarkerRe
+                );
+                if (!match) continue;
+                if (
+                  match[1].toLowerCase() !== repoFullName.toLowerCase() ||
+                  Number(match[2]) !== wantedIssue ||
+                  Number(match[3]) !== TASK_SNAPSHOT_GENERATION
+                ) continue;
+                if (
+                  authoritativeSnapshot === null ||
+                  order < authoritativeSnapshotOrder
+                ) {
+                  authoritativeSnapshotOrder = order;
+                  authoritativeSnapshot = match[6].toLowerCase();
+                }
+              }
+              if (
+                authoritativeSnapshot &&
+                authoritativeSnapshot !== marker.snapshotSpec
+              ) {
+                return { blocked: false, marker };
+              }
+
+              if (marker.checkpointRef && marker.checkpointRef !== '-') {
+                try {
+                  const refName = marker.checkpointRef
+                    .replace(/^refs\/heads\//, '');
+                  const response = await readGithub.rest.git.getRef({
+                    owner,
+                    repo,
+                    ref: 'heads/' + refName,
+                  });
+                  const tip = String(
+                    response.data?.object?.sha || ''
+                  ).toLowerCase();
+                  if (tip && tip !== marker.checkpointSha) {
+                    return { blocked: false, marker };
+                  }
+                } catch (err) {
+                  if (err.status === 404) {
+                    return { blocked: false, marker };
+                  }
+                  core.warning(
+                    'Checkpoint-resume hold lookup failed for #' +
+                    wantedIssue +
+                    '; keeping the deterministic hold until it can be ' +
+                    'proven changed.'
+                  );
+                }
+              }
+
+              return { blocked: true, marker };
+            }
             async function discoverDurableRecoveryCandidates() {
               const reserved = await readGithub.paginate(
                 readGithub.rest.issues.listForRepo,
@@ -1320,6 +1499,29 @@ jobs:
                   ' metadata failed validation: ' + validationError
                 );
                 return;
+              }
+
+              // kodmial/continuum#442: the scheduled catch-up and
+              // runner-restart routes reach this function before the normal
+              // retry path evaluates the deterministic checkpoint-resume
+              // hold. A held checkpoint/base/snapshot identity already failed
+              // resume verification, so never create a recovery claim or
+              // dispatch it again: stop the pass instead.
+              if (mode === 'issue') {
+                const hold = await checkpointResumeHold(
+                  issueText, comments, checkpointRef
+                );
+                if (hold.blocked) {
+                  core.notice(
+                    'OpenCode infrastructure operation ' + operation +
+                    ' generation ' + generation + ' is held by a deterministic ' +
+                    'checkpoint resume rejection (' + hold.marker.reason +
+                    ', recovery generation ' + hold.marker.recoveryGeneration +
+                    '); no recovery claim or dispatch was created for the ' +
+                    'identical checkpoint/base/snapshot.'
+                  );
+                  return;
+                }
               }
               // The ref tip is authoritative for a fetchable checkpoint; a
               // stale event pointer must not dispatch an older SHA than the
@@ -2391,6 +2593,26 @@ jobs:
             const previousRetries = comments.filter(comment =>
               (comment.body || '').includes(retryMarker)
             ).length;
+
+            // kodmial/continuum#442: a deterministic checkpoint-continuation
+            // rejection is persisted by the failing run. It is not a model
+            // failure and not an owner pause: retrying the identical
+            // checkpoint/base/snapshot would only burn another attempt. The
+            // shared hold also covers the scheduled catch-up and
+            // runner-restart routes, which reach `recoverFrom429OnFreshVm`.
+            const checkpointHold = await checkpointResumeHold(
+              issueNumber, comments
+            );
+            if (checkpointHold.blocked) {
+              core.notice(
+                'Issue #' + issueNumber +
+                ' has a deterministic checkpoint resume hold (' +
+                checkpointHold.marker.reason + ', recovery generation ' +
+                checkpointHold.marker.recoveryGeneration +
+                '); watchdog will not retry the identical checkpoint/base/snapshot.'
+              );
+              return;
+            }
 
             // A scheduler dispatch comment newer than this run means a *newer*
             // automated attempt already owns the issue. Retrying here would race

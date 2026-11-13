@@ -3371,8 +3371,8 @@ jobs:
             if [[ "$RESUME_ACTIVE" == "true" && -s "$RESUME_FAILURE_RECORD" ]]; then
               RESUME_MARKER="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1], encoding="utf-8")).get("marker") or "")' "$RESUME_FAILURE_RECORD" 2>/dev/null || true)"
               RESUME_MARKER_LINE="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1], encoding="utf-8")).get("marker_line") or "")' "$RESUME_FAILURE_RECORD" 2>/dev/null || true)"
-              if [[ -n "$RESUME_MARKER" && -n "$RESUME_MARKER_LINE" ]]; then
-                if ! gh api --paginate --slurp "repos/$GITHUB_REPOSITORY/issues/$ISSUE_NUMBER/comments?per_page=100" 2>/dev/null \
+              resume_hold_marker_published() {
+                gh api --paginate --slurp "repos/$GITHUB_REPOSITORY/issues/$ISSUE_NUMBER/comments?per_page=100" 2>/dev/null \
                   | jq -r --arg owner "$GITHUB_REPOSITORY_OWNER" '
                       add // [] | .[] |
                       select(
@@ -3383,9 +3383,25 @@ jobs:
                          (.user.login // "") == $owner)
                       ) | .body // ""
                     ' \
-                  | grep -Fq "$RESUME_MARKER_LINE"; then
-                  gh issue comment "$ISSUE_NUMBER" --repo "$GITHUB_REPOSITORY" \
-                    --body "$RESUME_MARKER" >/dev/null 2>&1 || true
+                  | grep -Fq "$RESUME_MARKER_LINE"
+              }
+              if [[ -n "$RESUME_MARKER" && -n "$RESUME_MARKER_LINE" ]]; then
+                RESUME_MARKER_CONFIRMED=false
+                for resume_publish_attempt in 1 2 3; do
+                  if resume_hold_marker_published; then
+                    RESUME_MARKER_CONFIRMED=true
+                    break
+                  fi
+                  if ! gh issue comment "$ISSUE_NUMBER" --repo "$GITHUB_REPOSITORY" \
+                    --body "$RESUME_MARKER" >/dev/null 2>&1; then
+                    echo "::warning::Checkpoint-resume hold marker publication attempt $resume_publish_attempt failed; retrying."
+                  fi
+                  sleep "$resume_publish_attempt"
+                done
+                if [[ "$RESUME_MARKER_CONFIRMED" != "true" ]] &&
+                  ! resume_hold_marker_published; then
+                  echo "::error::The deterministic checkpoint-resume hold marker could not be published or confirmed; refusing to continue without a durable rejection record for this checkpoint."
+                  exit 1
                 fi
               fi
             fi
