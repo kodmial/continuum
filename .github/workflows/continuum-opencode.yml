@@ -2517,6 +2517,7 @@ jobs:
           sparse-checkout: |
             src/continuum
             .github/scripts
+            opencode.json
 
       - name: Install Continuum OpenCode rate-limit wrapper
         if: steps.issue_readiness.outputs.ready != 'false'
@@ -2530,6 +2531,34 @@ jobs:
           cp -R "$engine/src/continuum" "$install_root/src/"
           cp "$engine/.github/scripts/opencode_429_classify.py" "$install_root/.github/scripts/"
           cp "$engine/.github/scripts/opencode_429_wrapper.sh" "$install_root/continuum-opencode"
+          # Reuse Continuum's already-reviewed websearch defaults (3a74fe5)
+          # for the non-interactive coder, including in consumer repositories.
+          # OPENCODE_CONFIG is merged BEFORE the consumer's project config;
+          # consumer-specific restrictions and product agents are not modified.
+          # Do not copy Continuum's unrelated global permissions into consumers.
+          python3 - "$engine/opencode.json" "$install_root/opencode-coder-websearch.json" <<'PY'
+          import json
+          import pathlib
+          import sys
+
+          source = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+          provider = source.get("websearch")
+          rules = source.get("permissions")
+          if not isinstance(provider, dict) or not isinstance(provider.get("provider"), str) or not provider["provider"].strip():
+              raise SystemExit("Continuum non-interactive websearch provider is missing")
+          if not isinstance(rules, list):
+              raise SystemExit("Continuum non-interactive websearch permissions are missing")
+          selected = [rule for rule in rules if isinstance(rule, dict) and rule.get("action") in ("websearch", "webfetch")]
+          if {rule.get("action") for rule in selected if rule.get("effect") == "allow"} != {"websearch", "webfetch"}:
+              raise SystemExit("Continuum non-interactive websearch allow rules are missing")
+          config = {"websearch": provider, "permissions": selected}
+          pathlib.Path(sys.argv[2]).write_text(json.dumps(config, separators=(",", ":")) + "\n", encoding="utf-8")
+          PY
+          if [[ -z "${OPENCODE_CONFIG:-}" ]]; then
+            echo "OPENCODE_CONFIG=$install_root/opencode-coder-websearch.json" >> "$GITHUB_ENV"
+          else
+            echo "::notice::Preserving caller-provided OPENCODE_CONFIG rather than overriding consumer policy."
+          fi
           # kodmial/continuum#413: one deterministic staging boundary for every
           # checkpoint and publish path, independent of agent instructions and
           # .gitignore. The library is installed outside the task worktree so
