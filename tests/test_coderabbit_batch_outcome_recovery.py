@@ -18,7 +18,8 @@ AUTO_MERGE = ROOT / ".github/workflows/continuum-auto-merge.yml"
 
 @unittest.skipUnless(shutil.which("node"), "Node.js is required")
 class BatchOutcomeRecoveryTests(unittest.TestCase):
-    def exercise(self, marker_minutes=None, run_state="completed", latest_reply_id=205):
+    def exercise(self, marker_minutes=None, run_state="completed", latest_reply_id=205,
+                 handoff_id=None, handoff_cutoff="0"):
         fixture = r"""
 const crypto = require('crypto');
 const head = 'a'.repeat(40);
@@ -30,7 +31,15 @@ const digest = crypto.createHash('sha256').update(head+'\n'+identity).digest('he
 const marker = '<!-- continuum-coderabbit-batch head='+head+' digest='+digest+' -->';
 const minutes = Number(process.env.MINUTES);
 const at = new Date(Date.now()-minutes*60_000).toISOString();
-const comments = process.env.MINUTES === '-1' ? [] : [{id:1,body:marker,created_at:at}];
+const handoff = process.env.HANDOFF_ID ? [{
+  id:Number(process.env.HANDOFF_ID),
+  user:{login:'kodmial'},
+  created_at:at,
+  body:'<!-- opencode-coderabbit-verification-pending head='+head+
+    ' findings=100 answers=205 -->',
+}] : [];
+const comments = (process.env.MINUTES === '-1' ? [] :
+  [{id:1,body:marker,created_at:at}]).concat(handoff);
 const emitted = [];
 const out = {dispatches:emitted, messages:[]};
 const core = {notice:s=>out.messages.push(s), warning:s=>out.messages.push(s)};
@@ -39,12 +48,14 @@ const context = {repo:{owner:'kodmial',repo:'nanodictate'},
 process.env.PR_NUMBER = '226';
 process.env.HEAD_REF = 'opencode/issue212-123';
 process.env.COLLECTED_HEAD = head;
+process.env.HANDOFF_CUTOFF = process.env.HANDOFF_CUTOFF_VALUE;
 process.env.UNRESOLVED_ITEMS_JSON = batch;
 const github = {
  paginate:async()=>comments,
  rest:{
   pulls:{get:async()=>({data:{state:'open',head:{
     sha:head,ref:'opencode/issue212-123',repo:{full_name:'kodmial/nanodictate'}}}})},
+  users:{getAuthenticated:async()=>({data:{login:'kodmial'}})},
   actions:{
    listWorkflowRuns:async ({status})=>{
      if (process.env.RUN_STATE === 'missing') {
@@ -80,7 +91,9 @@ const github = {
             check=False, env={**__import__("os").environ,
                               "MINUTES":str(marker_minutes if marker_minutes is not None else -1),
                               "RUN_STATE":run_state,
-                              "REPLY_ID":str(latest_reply_id)},
+                              "REPLY_ID":str(latest_reply_id),
+                              "HANDOFF_ID":str(handoff_id or ""),
+                              "HANDOFF_CUTOFF_VALUE":str(handoff_cutoff)},
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         return json.loads(result.stdout)
@@ -108,6 +121,18 @@ const github = {
         self.assertEqual(
             len(self.exercise(marker_minutes=12, run_state="in_progress",
                               latest_reply_id=206)["dispatches"]), 0,
+        )
+
+    def test_handoff_published_after_collection_defers_dispatch(self):
+        outcome = self.exercise(handoff_id=999, handoff_cutoff="100")
+        self.assertEqual(len(outcome["dispatches"]), 0)
+        self.assertTrue(any("published after collection" in message
+                            for message in outcome["messages"]))
+
+    def test_handoff_at_collection_cutoff_does_not_block_dispatch(self):
+        self.assertEqual(
+            len(self.exercise(handoff_id=100, handoff_cutoff="100")["dispatches"]),
+            1,
         )
 
     def test_active_repair_is_suppressed_even_without_matching_marker(self):

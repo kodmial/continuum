@@ -262,6 +262,7 @@ const github = {
  constructor: function () {
    this.rest = {users:{getAuthenticated:async()=>({data:{login:'kodmial'}})}};
  },
+ paginate: async endpoint => (await endpoint({})).data,
  graphql: async () => ({repository:{pullRequest:{reviewThreads:{
   nodes:[
    {isResolved:false,comments:{nodes:[{databaseId:100,author:{login:'coderabbitai[bot]'}}]}},
@@ -391,6 +392,7 @@ const github = {{
     this.rest = {{users: {{getAuthenticated: async () =>
       ({{data: {{login: 'kodmial'}}}})}}}};
   }},
+  paginate: async endpoint => (await endpoint({{}})).data,
   graphql: async () => ({{repository: {{pullRequest: {{reviewThreads: {{
     nodes: [
       {{isResolved: false, comments: {{nodes: [
@@ -461,6 +463,15 @@ async function attempt(options = {}) {
   results.pendingBoth = await attempt({
     issueComments: [handoff({findings: '100,200'})],
   });
+  const newerChatter = Array.from({length: 300}, (_, index) => ({
+    id: 1000 + index,
+    user: {login: 'commenter'},
+    created_at: at(25),
+    body: 'newer chatter ' + index,
+  }));
+  results.pendingBeyondNewestWindow = await attempt({
+    issueComments: [handoff(), ...newerChatter],
+  });
   const freshComments = baseComments().concat([{
     id: 103, in_reply_to_id: 100, user: {login: 'kodmial'},
     created_at: at(30),
@@ -508,6 +519,9 @@ async function attempt(options = {}) {
         # Once every active finding has a pending handoff, defer the batch.
         self.assertEqual(results["pendingBoth"]["should_run"], "false")
         self.assertEqual(results["pendingBoth"]["items"], [])
+        # Reading only the newest pages would miss this older pending handoff
+        # behind 300 newer comments and re-dispatch the repaired finding.
+        self.assertEqual(results["pendingBeyondNewestWindow"]["items"], [200])
         # A fresh verification settles the handoff; no reply means no repair.
         self.assertEqual(results["freshVerification"]["items"], [200])
         # A later UNRESOLVED after that verification selects repair again.

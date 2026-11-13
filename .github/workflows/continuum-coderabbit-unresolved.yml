@@ -542,32 +542,22 @@ jobs:
             // of writing into the CodeRabbit inline chat. Until auto-merge
             // turns that handoff into a fresh exact-HEAD verification, the
             // older UNRESOLVED answer must not select the same finding again.
-            // Read every handoff before deciding, because a second finding's
-            // new answer can otherwise drag the repaired finding into a new
-            // batch before its own verification is requested.
-            const repairHandoffs = [];
+            // Read every issue comment, not just a bounded newest window: an
+            // older pending handoff can predate newer chatter, and skipping
+            // it would re-select the repaired finding. A truncated read is
+            // therefore also a failed read.
+            let repairHandoffs = [];
             let repairHandoffReadFailed = false;
             try {
-              const totalHandoffComments = Number(pr.data.comments || 0);
-              const lastHandoffPage = Math.max(
-                1,
-                Math.ceil(
-                  (Number.isFinite(totalHandoffComments)
-                    ? totalHandoffComments : 0) / 100
-                ) || 1
-              );
-              const firstHandoffPage = Math.max(1, lastHandoffPage - 2);
-              for (let page = lastHandoffPage;
-                   page >= firstHandoffPage; page -= 1) {
-                const { data } = await github.rest.issues.listComments({
+              repairHandoffs = await github.paginate(
+                github.rest.issues.listComments,
+                {
                   owner,
                   repo,
                   issue_number: pullNumber,
                   per_page: 100,
-                  page,
-                });
-                if (Array.isArray(data)) repairHandoffs.push(...data);
-              }
+                }
+              );
             } catch (err) {
               repairHandoffReadFailed = true;
               core.warning(
@@ -579,6 +569,14 @@ jobs:
               core.setOutput('items_json', '[]');
               return;
             }
+            // Any handoff published after this scan has a larger issue-comment
+            // id. The dispatcher re-reads handoffs against this cutoff right
+            // before dispatch so a repair that finishes during the active-run
+            // check cannot select its own finding again.
+            const repairHandoffCutoff = repairHandoffs.reduce(
+              (max, comment) => Math.max(max, Number(comment.id) || 0),
+              0
+            );
             const repairHandoffPattern =
               /<!-- opencode-coderabbit-verification-pending head=([0-9a-f]{40}) findings=([0-9,]+)(?: answers=[0-9,]+)? -->/;
             const newestRepairHandoff = findingId => {
@@ -642,6 +640,7 @@ jobs:
             core.setOutput('pr_number', String(pullNumber));
             core.setOutput('head_ref', pr.data.head.ref);
             core.setOutput('head_sha', headSha);
+            core.setOutput('handoff_cutoff', String(repairHandoffCutoff));
             core.setOutput('items_json', JSON.stringify(dispatchable));
 
       - name: Dispatch one batched repair to canonical OpenCode
@@ -651,6 +650,7 @@ jobs:
           PR_NUMBER: ${{ steps.context.outputs.pr_number }}
           HEAD_REF: ${{ steps.context.outputs.head_ref }}
           COLLECTED_HEAD: ${{ steps.context.outputs.head_sha }}
+          HANDOFF_CUTOFF: ${{ steps.context.outputs.handoff_cutoff }}
           UNRESOLVED_ITEMS_JSON: ${{ steps.context.outputs.items_json }}
           CONTINUUM_OPENCODE_WORKFLOW: ${{ inputs.opencode_workflow || vars.CONTINUUM_OPENCODE_WORKFLOW || 'continuum-opencode.yml' }}
         with:
@@ -687,6 +687,16 @@ jobs:
             const pullNumber = Number(process.env.PR_NUMBER);
             const head = String(process.env.COLLECTED_HEAD || '');
             const headRef = String(process.env.HEAD_REF || '');
+            const handoffCutoffText = String(
+              process.env.HANDOFF_CUTOFF || ''
+            ).trim();
+            const handoffCutoff = Number(handoffCutoffText);
+            if (!/^\d+$/.test(handoffCutoffText) ||
+                !Number.isSafeInteger(handoffCutoff)) {
+              throw new Error(
+                'Invalid CodeRabbit repair handoff cutoff; refusing dispatch.'
+              );
+            }
             const items = JSON.parse(process.env.UNRESOLVED_ITEMS_JSON || '[]');
             if (!Number.isInteger(pullNumber) || pullNumber <= 0 ||
                 !/^[0-9a-f]{40}$/.test(head) ||
@@ -793,6 +803,59 @@ jobs:
               core.warning(
                 `CodeRabbit batch remains unresolved on identical HEAD after ${attempts.length} dispatch(es). Re-dispatching through canonical OpenCode with bounded backoff.`
               );
+            }
+
+            // The collector read handoffs before the active-run check above.
+            // A repair can publish its completion handoff during that window
+            // and finish before the check sees it. Re-read every handoff
+            // immediately before dispatch and defer if a handoff newer than
+            // the collector's cutoff now covers any finding in this batch.
+            let liveIssueComments = [];
+            try {
+              liveIssueComments = await github.paginate(
+                github.rest.issues.listComments,
+                { owner, repo, issue_number: pullNumber, per_page: 100 }
+              );
+            } catch (err) {
+              core.notice(
+                `PR #${pullNumber}: could not re-read CodeRabbit repair handoffs before dispatch; deferring until the next reconciliation: ${err.message || err}`
+              );
+              return;
+            }
+            const trustedHandoffAuthors = new Set(['github-actions[bot]']);
+            trustedHandoffAuthors.add(
+              String(
+                (await github.rest.users.getAuthenticated()).data.login || ''
+              ).trim().toLowerCase()
+            );
+            const repairHandoffPattern =
+              /<!-- opencode-coderabbit-verification-pending head=([0-9a-f]{40}) findings=([0-9,]+)(?: answers=[0-9,]+)? -->/;
+            const batchFindingIds = new Set(
+              items.map(item => item.finding_id)
+            );
+            const handoffPublishedDuringDispatch = liveIssueComments.some(
+              comment => {
+                if (Number(comment.id) <= handoffCutoff) return false;
+                const login = String(
+                  comment.user?.login || comment.author?.login || ''
+                ).trim().toLowerCase();
+                if (!trustedHandoffAuthors.has(login)) return false;
+                const match = String(comment.body || '').match(
+                  repairHandoffPattern
+                );
+                return Boolean(
+                  match && match[1] === head &&
+                  match[2].split(',').map(Number).some(
+                    findingId => batchFindingIds.has(findingId)
+                  )
+                );
+              }
+            );
+            if (handoffPublishedDuringDispatch) {
+              core.notice(
+                `PR #${pullNumber}: a CodeRabbit repair handoff was published after collection; deferring this batch until fresh verification.`
+              );
+              return;
             }
 
             // The optional batch input is an additive consumer API. An

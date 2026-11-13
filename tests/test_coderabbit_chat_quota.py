@@ -1470,6 +1470,7 @@ const github = {{
   constructor: function () {{
     this.rest = {{users: {{getAuthenticated: async () => ({{data: {{login: 'kodmial'}}}})}}}};
   }},
+  paginate: async endpoint => (await endpoint({{}})).data,
   graphql: async () => ({{repository: {{pullRequest: {{reviewThreads: {{
     nodes: [{{isResolved: false, comments: {{nodes: [
       {{databaseId: 100, author: {{login: 'coderabbitai[bot]'}}}}
