@@ -177,6 +177,9 @@ jobs:
           pid=$!
           trap 'kill "$pid" 2>/dev/null || true' EXIT
           sleep 6
+          # Keep the checked-out source tree free of Python .pyc files: the
+          # subsequent Ruby contract scanner reads every file as UTF-8.
+          export PYTHONDONTWRITEBYTECODE=1
           python3 .github/scripts/pr_agent_bridge.py --preflight 2>&1 | tee "$RUNNER_TEMP/reviewer-preflight.log"
           grep -Fqx "bridge-permission action=shell effect=deny" "$RUNNER_TEMP/reviewer-preflight.log"
           grep -Fqx "bridge-permission action=subagent effect=deny" "$RUNNER_TEMP/reviewer-preflight.log"
