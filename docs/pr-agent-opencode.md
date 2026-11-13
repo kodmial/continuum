@@ -17,17 +17,23 @@ same runner:
 ```text
 PR-Agent (pinned pip release, on the runner)
   -> POST 127.0.0.1:<bridge_port>/v1/chat/completions (this bridge)
-  -> POST 127.0.0.1:<server_port>/session + /session/:id/prompt_async
-  -> GET /session/status, then GET /session/:id/message (opencode serve)
+  -> POST /api/session; POST /api/session/:id/agent and /model
+  -> POST /api/session/:id/prompt (durable enqueue, not completion)
+  -> POST /api/experimental/session/:id/wait (idle barrier)
+  -> GET /api/session/:id (terminal outcome must be succeeded)
+  -> GET /api/session/:id/message?type=assistant (completed final answer)
   -> configured OpenCode provider/model (default: the free anonymous route)
 ```
 
-`opencode serve` is **not** OpenAI Chat Completions compatible: it speaks
-an asynchronous session/message API (`POST /session`, then
-`POST /session/:id/prompt_async` with `{model, agent, system, parts}`, then
-poll `GET /session/status` until the session leaves `busy`/`retry`, read the
-completed assistant turn with `GET /session/:id/message`, and finally
-`DELETE /session/:id`). The bridge (`.github/scripts/pr_agent_bridge.py`,
+`opencode serve` is **not** OpenAI Chat Completions compatible. OpenCode v2.2.6
+uses an authenticated `/api/` surface, independent selection of the read-only
+`plan` agent and model, and durable prompt enqueue rather than a synchronous
+response. The bridge waits for the v2 idle barrier, then requires the session's
+recorded terminal outcome to be `succeeded` and the newest assistant record to
+be a completed final answer (`finish="stop"`). An enqueue receipt, a failed or
+interrupted turn, an intermediate `finish="tool-calls"` step, or an older text
+record can never count as a successful review. A fresh, random job-only
+`OPENCODE_PASSWORD` protects the loopback server; `opencode` is its Basic user. The bridge (`.github/scripts/pr_agent_bridge.py`,
 standard library only) exposes exactly the OpenAI surface PR-Agent needs —
 `/v1/chat/completions`, `/v1/models`, health — and translates each completion
 into one isolated OpenCode session: a fresh session per request, deleted
@@ -47,12 +53,25 @@ GitHub-hosted runners.
 ## Inference hardening (reviewer-only)
 
 PR-Agent must never modify source code, and OpenCode is used here purely
-as an inference backend, not as a coding agent. Three verified layers hold
-this (all proven against the free tier):
+as an inference backend, not as a coding agent. Three layers hold this:
 
 1. Every bridge request runs as the read-only `plan` agent with a
-   reviewer-only system prompt. The bridge never sends a per-request
-   `tools` map.
+   reviewer-only system prompt. The bridge also creates the session with an
+   explicit session-level `Permission.Ruleset` that denies the pinned v2
+   `shell` and `subagent` tool actions (not the legacy `bash`/`task` names),
+   and fails closed unless the reported rules still decide `deny` under
+   OpenCode's last-match-wins evaluation; session rules are evaluated after
+   agent rules, so shell execution and subagent delegation stay denied. It
+   then probes `POST /api/session/:id/permission` for both actions with
+   concrete, non-destructive resources (a harmless shell command and the
+   built-in `general` subagent) so wildcard matching is exercised as a real
+   tool call would, and requires an actual `deny` effect from the live server
+   before any prompt is submitted; each confirmed decision prints one
+   content-free `bridge-permission action=<action> effect=deny` line, so the
+   no-LLM qualification log records the live enforcement result. The
+   qualification step fails closed unless both lines are present, and it
+   publishes them in the job summary, so a green job cannot mean the live
+   probe was skipped. The bridge never sends a per-request `tools` map.
 2. Each request gets a fresh session that is deleted afterwards.
 3. The workflow proves the checkout is untouched after the run
    (`git status --porcelain` must be empty and no local commit may exist)
@@ -61,9 +80,12 @@ this (all proven against the free tier):
 Two shapes are deliberately **not** used because the free tier rejects
 them with `FreeTierError: OpenCode's free tier can only be used from
 within OpenCode`: a per-request `tools` override map, and a hardened
-server permission config via `OPENCODE_CONFIG_CONTENT`. If a future
-OpenCode release changes this behavior, the bridge fails closed (HTTP 502
-with the upstream status) instead of silently degrading.
+server permission config via `OPENCODE_CONFIG_CONTENT`. The session-level
+ruleset above uses the versioned v2 session API instead, is verified against
+the reported rule order, and is exercised on the real server (no model turn,
+no tokens) before every prompt. If a future OpenCode release changes
+this behavior, the bridge fails closed (HTTP 502 with the upstream status)
+instead of silently degrading.
 
 ## Configuration
 
@@ -135,7 +157,10 @@ Continuum-internal bridge code into their repositories.
 
 - Disabled provider: one explanatory comment, no review.
 - Bridge or `opencode serve` unreachable, or upstream error/timeout: the
-  step fails with the upstream status; 5xx/429/408 are retryable.
+  step fails with the upstream status; 5xx/429/408 are retryable. The
+  preflight protocol check uses the same split: a retryable 429/5xx failure
+  is eligible for the bounded retry, while a v1/v2 protocol mismatch fails
+  deterministically without spending reviewer budget.
 - PR head moved mid-review: explicit stale-head failure; the review is
   valid only for the exact HEAD it evaluated.
 - Checkout modified by the run: explicit reviewer-only failure.

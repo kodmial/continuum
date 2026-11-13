@@ -144,6 +144,58 @@ jobs:
           set -euo pipefail
           python3 -m pip install --disable-pip-version-check PyYAML
 
+      # Mandatory real protocol/permission proof only for PR-Agent ABI changes.
+      - name: Detect PR-Agent protocol changes
+        id: reviewer_abi
+        shell: bash
+        run: |
+          set -euo pipefail
+          base=$(git merge-base origin/main HEAD)
+          if git diff --quiet "$base" HEAD -- .github/scripts/pr_agent_bridge.py .github/workflows/continuum-pr-agent.yml; then
+            echo "needed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "needed=true" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Install OpenCode for live v2 reviewer qualification
+        if: steps.reviewer_abi.outputs.needed == 'true'
+        uses: ./.github/actions/agent-toolchain
+        with:
+          components: opencode
+          opencode-version: '2.2.6'
+      - name: Prove live OpenCode reviewer permission denial
+        id: live_opencode
+        if: steps.reviewer_abi.outputs.needed == 'true'
+        timeout-minutes: 5
+        shell: bash
+        run: |
+          set -euo pipefail
+          export OPENCODE_PASSWORD="$(openssl rand -hex 32)"
+          echo "::add-mask::$OPENCODE_PASSWORD"
+          export OPENCODE_SERVER_URL="http://127.0.0.1:4096"
+          export OPENCODE_MODEL="opencode/deepseek-v4.1-flash-free"
+          opencode serve --hostname 127.0.0.1 --port 4096 > "$RUNNER_TEMP/live-v2.log" 2>&1 &
+          pid=$!
+          trap 'kill "$pid" 2>/dev/null || true' EXIT
+          ready=false
+          for attempt in $(seq 1 30); do
+            if python3 -c "import base64,json,os,urllib.request; key=base64.b64encode(('opencode:'+os.environ['OPENCODE_PASSWORD']).encode()).decode(); req=urllib.request.Request(os.environ['OPENCODE_SERVER_URL']+'/api/info',headers={'Authorization':'Basic '+key,'Accept':'application/json'}); info=json.load(urllib.request.urlopen(req,timeout=2)); assert isinstance(info.get('version'),str) and bool(info['version']); assert type(info.get('pid')) is int" >/dev/null 2>&1; then
+              ready=true
+              break
+            fi
+            sleep 2
+          done
+          if [[ "$ready" != true ]]; then
+            echo "::error::Authenticated OpenCode 2.2.6 server readiness timed out."
+            exit 1
+          fi
+          # Keep the checked-out source tree free of Python .pyc files: the
+          # subsequent Ruby contract scanner reads every file as UTF-8.
+          export PYTHONDONTWRITEBYTECODE=1
+          python3 .github/scripts/pr_agent_bridge.py --preflight 2>&1 | tee "$RUNNER_TEMP/reviewer-preflight.log"
+          grep -Fqx "bridge-permission action=shell effect=deny" "$RUNNER_TEMP/reviewer-preflight.log"
+          grep -Fqx "bridge-permission action=subagent effect=deny" "$RUNNER_TEMP/reviewer-preflight.log"
+          echo "Live OpenCode 2.2.6 denies shell and subagent" >> "$GITHUB_STEP_SUMMARY"
+
       - name: Run Layer 1 regression gate on the exact HEAD
         id: regression
         shell: bash
@@ -362,12 +414,15 @@ jobs:
           REGRESSION_OUTCOME: ${{ steps.regression.outcome }}
           LIFECYCLE_OUTCOME: ${{ steps.lifecycle.outcome }}
           CANARY_OUTCOME: ${{ steps.canary.outcome }}
+          REVIEWER_DETECT_OUTCOME: ${{ steps.reviewer_abi.outcome }}
+          REVIEWER_ABI_NEEDED: ${{ steps.reviewer_abi.outputs.needed }}
+          LIVE_REVIEWER_OUTCOME: ${{ steps.live_opencode.outcome }}
           STATUS_CONTEXT: ${{ inputs.status_context || vars.CONTINUUM_CONTRACT_STATUS_CONTEXT || 'continuum/contract-qualification' }}
           PUBLISH_STATUS: ${{ inputs.publish_status || vars.CONTINUUM_PUBLISH_STATUS || 'true' }}
           STATUS_ELIGIBLE: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
         with:
           script: |
-            const passed = process.env.REGRESSION_OUTCOME === 'success' && process.env.LIFECYCLE_OUTCOME === 'success' && (process.env.CANARY_OUTCOME === 'success' || process.env.CANARY_OUTCOME === 'skipped');
+            const passed = process.env.REGRESSION_OUTCOME === 'success' && process.env.LIFECYCLE_OUTCOME === 'success' && (process.env.CANARY_OUTCOME === 'success' || process.env.CANARY_OUTCOME === 'skipped') && process.env.REVIEWER_DETECT_OUTCOME === 'success' && (process.env.REVIEWER_ABI_NEEDED === 'false' || (process.env.REVIEWER_ABI_NEEDED === 'true' && process.env.LIVE_REVIEWER_OUTCOME === 'success'));
             const state = passed ? 'success' : 'failure';
             // Fork PRs are read-only; the qualification verdict still fails
             // the job, but no commit status can be written.
