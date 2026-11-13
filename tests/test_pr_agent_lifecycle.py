@@ -212,8 +212,12 @@ APPROVED_448_REPAIR_OPENCODE_SHA256 = (
 # serialized auto-merge owner rechecks exact HEAD after successful CI and
 # enforces one shared chat quota. Historical #448 repair digest above remains
 # immutable for audit. Pin the complete new workflow, not an exception list.
+# kodmial/continuum#451 repair (review 5895998761): a repaired batch also
+# publishes a durable verification-pending handoff outside the review thread
+# so an unchanged HEAD still reaches CodeRabbit verification instead of
+# another repair batch.
 APPROVED_450_SERIALIZED_OPENCODE_SHA256 = (
-    "b4d13f665705ab0b1131d05161f4441155627dc9b13d44dbd664b47833adb10d"
+    "87e29d6a6810f83390daa5ac5070ca00742bd8264935fa9a7098318bc828c603"
 )
 APPROVED_446_CALLER_SHA256 = (
     "b7f3df118bc436526f48443b8f068372204073eb134c98e4a1543d025f314686"
@@ -2721,7 +2725,7 @@ class ProtectedBaselineTests(unittest.TestCase):
         # therefore be dirty in this pre-commit worktree; any unapproved byte
         # change still fails the exact digest assertions above.
         approved = {
-            ".github/workflows/continuum-opencode.yml": APPROVED_448_REPAIR_OPENCODE_SHA256,
+            ".github/workflows/continuum-opencode.yml": APPROVED_450_SERIALIZED_OPENCODE_SHA256,
             ".github/workflows/opencode.yml": APPROVED_350_SELF_CALLER_SHA256,
         }
         for path in PROTECTED_FILES:

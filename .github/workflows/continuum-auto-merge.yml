@@ -1990,6 +1990,63 @@ jobs:
                 `PR #${pr.number}: could not resolve the verification-reply author; only github-actions[bot] chat-quota acknowledgements are trusted: ${err.message || err}`
               );
             }
+
+            // OpenCode never writes into the CodeRabbit inline chat. After a
+            // repair batch it publishes a completion handoff as an issue
+            // comment instead. Consume that handoff so a repair that leaves
+            // HEAD unchanged still triggers a fresh verification of its
+            // outcome, rather than the earlier UNRESOLVED answer selecting
+            // another repair batch forever.
+            const repairHandoffs = [];
+            try {
+              const totalHandoffComments = Number(pr.comments || 0);
+              const lastHandoffPage = Math.max(
+                1,
+                Math.ceil(
+                  (Number.isFinite(totalHandoffComments)
+                    ? totalHandoffComments : 0) / 100
+                ) || 1
+              );
+              const firstHandoffPage = Math.max(1, lastHandoffPage - 2);
+              for (let page = lastHandoffPage;
+                   page >= firstHandoffPage; page -= 1) {
+                const { data } = await withReadFallback(client =>
+                  client.rest.issues.listComments({
+                    owner,
+                    repo,
+                    issue_number: pr.number,
+                    per_page: 100,
+                    page,
+                  })
+                );
+                if (Array.isArray(data)) repairHandoffs.push(...data);
+              }
+            } catch (err) {
+              core.warning(
+                `PR #${pr.number}: could not read CodeRabbit repair handoffs; retaining existing verification decisions: ${err.message || err}`
+              );
+            }
+            const pendingRepairHandoff = (findingId, headSha) => {
+              const pattern =
+                /<!-- opencode-coderabbit-verification-pending head=([0-9a-f]{40}) findings=([0-9,]+)(?: answers=[0-9,]+)? -->/;
+              let newest = null;
+              for (const comment of repairHandoffs) {
+                const login = String(
+                  comment.user?.login || comment.author?.login || ''
+                ).trim().toLowerCase();
+                if (!trustedChatRetryAuthors.has(login)) continue;
+                const match = String(comment.body || '').match(pattern);
+                if (!match || match[1] !== headSha) continue;
+                if (!match[2].split(',').map(Number).includes(findingId)) {
+                  continue;
+                }
+                if (!newest || Number(comment.id) > Number(newest.id)) {
+                  newest = comment;
+                }
+              }
+              return newest;
+            };
+
             for (const thread of threads) {
               if (!thread.commentId) continue;
 
@@ -2011,6 +2068,9 @@ jobs:
                     new Date(a.created_at || 0).getTime()
                 );
               const latestVerification = verificationRequests[0] || null;
+              const repairHandoff = pendingRepairHandoff(
+                thread.commentId, pr.head.sha
+              );
               // A CodeRabbit "### Rate Limit Exceeded" reply is an inline
               // chat-message/hour rejection, not a finding verdict. Only a
               // trusted bot reply in this exact thread can establish it, and
@@ -2048,7 +2108,23 @@ jobs:
                     !isCodeRabbitChatLimitReply(comment)
                   )
                   .sort((a, b) => Number(b.id) - Number(a.id))[0] || null;
-                if (latestAnswer) {
+                // A repair handoff newer than the latest verification means
+                // the canonical repair finished without a new commit. Ask
+                // CodeRabbit to judge that outcome instead of treating the
+                // older answer as still awaiting repair.
+                const handoffAt = repairHandoff
+                  ? Date.parse(repairHandoff.created_at || '') : NaN;
+                const repairHandoffPending =
+                  !!latestAnswer &&
+                  Number.isFinite(handoffAt) &&
+                  (!Number.isFinite(verificationAt) ||
+                   handoffAt > verificationAt);
+                if (repairHandoffPending) {
+                  core.info(
+                    `PR #${pr.number}: consuming OpenCode repair handoff for finding #${thread.commentId}; requesting a fresh exact-HEAD verification.`
+                  );
+                }
+                if (latestAnswer && !repairHandoffPending) {
                   const postCiMarker =
                     `<!-- auto-merge-coderabbit-post-ci-verification finding=${thread.commentId} head=${pr.head.sha} -->`;
                   const alreadyRequested = comments.some(comment =>
@@ -2200,11 +2276,12 @@ jobs:
                   }
                   chatRetryLimitedId = pendingChatLimit.id;
                 } else if (
+                  !repairHandoffPending &&
                   Date.now() - verificationAt <
                   CODERABBIT_THREAD_VERIFICATION_TIMEOUT_MS
                 ) {
                   continue;
-                } else {
+                } else if (!repairHandoffPending) {
                   core.warning(
                     `PR #${pr.number}: CodeRabbit did not answer thread verification #${thread.commentId} within the bounded timeout; retrying the same exact-HEAD verification.`
                   );

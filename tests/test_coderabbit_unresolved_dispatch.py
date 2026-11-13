@@ -67,9 +67,20 @@ class CodeRabbitBatchContractTests(unittest.TestCase):
         )
         # Preserve the existing no-inline-findings full-review fallback.
         self.assertIn("@coderabbitai full review", code)
+        # A completed repair persists a durable handoff outside the review
+        # thread. Without it an unchanged HEAD would keep selecting repair
+        # batches and never reach a fresh provider verification.
+        self.assertIn("opencode-coderabbit-verification-pending", code)
+        self.assertIn("handOffRepairVerification(", code)
+        self.assertIn(
+            "'<!-- continuum-origin role=continuum component=opencode -->'",
+            code,
+        )
         merge = (ROOT / ".github/workflows/continuum-auto-merge.yml").read_text(
             encoding="utf-8"
         )
+        self.assertIn("pendingRepairHandoff(", merge)
+        self.assertIn("repairHandoffPending", merge)
         self.assertEqual(
             merge.count("await allowOneCodeRabbitChatRequest()") +
             merge.count("if (!(await codeRabbitChatBudgetAllowsSend())) continue;"),
@@ -78,6 +89,108 @@ class CodeRabbitBatchContractTests(unittest.TestCase):
         )
         self.assertIn("if (!consumeCodeRabbitChatSendSlot()) continue;", merge)
         self.assertIn("codeRabbitChatLimitNotBefore(comment)", merge)
+
+    @unittest.skipUnless(shutil.which("node"), "Node.js unavailable")
+    def test_repair_completion_handoff_is_durable_and_serialized(self):
+        # Execute the production deferral branch. A repair that leaves HEAD
+        # unchanged must publish one durable verification-pending handoff so
+        # auto-merge can request verification without writing into the
+        # CodeRabbit inline chat.
+        code = js_for_step(OPENCODE, "Ask CodeRabbit to verify every original finding")
+        head = "a" * 40
+        harness = (
+            "const posted = [];\n"
+            "const notices = [];\n"
+            "const existing = [];\n"
+            f"const head = {json.dumps(head)};\n"
+            "const context = {repo: {owner: 'o', repo: 'r'}};\n"
+            "process.env.PR_NUMBER = '450';\n"
+            "process.env.REVIEW_ID = '11';\n"
+            "process.env.UNRESOLVED_ITEMS_JSON = JSON.stringify([\n"
+            "  {review_id: 11, finding_id: 100, unresolved_id: 101,"
+            " verified_head: head},\n"
+            "  {review_id: 11, finding_id: 200, unresolved_id: 201,"
+            " verified_head: head},\n"
+            "]);\n"
+            "const core = {\n"
+            "  setFailed: message => { throw new Error(message); },\n"
+            "  notice: message => notices.push(message),\n"
+            "};\n"
+            "const github = {\n"
+            "  paginate: async () => existing.slice(),\n"
+            "  rest: {\n"
+            "    pulls: {\n"
+            "      getReview: async () => ({data: {commit_id: head}}),\n"
+            "      get: async () => ({data: {\n"
+            "        head: {repo: {full_name: 'o/r'}, ref: 'branch', sha: head},\n"
+            "        review_comments: 0,\n"
+            "        comments: 0,\n"
+            "      }}),\n"
+            "      listReviewComments: async () => ({data: []}),\n"
+            "    },\n"
+            "    git: {getRef: async () => ({data: {object: {sha: head}}})},\n"
+            "    issues: {\n"
+            "      listComments: async () => ({data: existing.slice()}),\n"
+            "      createComment: async args => {\n"
+            "        posted.push(args);\n"
+            "        existing.push({\n"
+            "          id: 900 + posted.length,\n"
+            "          user: {login: 'kodmial'},\n"
+            "          created_at: new Date().toISOString(),\n"
+            "          body: args.body,\n"
+            "        });\n"
+            "      },\n"
+            "    },\n"
+            "  },\n"
+            "};\n"
+            "async function runStep() {\n"
+            + textwrap.indent(code, "  ")
+            + "\n}\n"
+            "(async () => {\n"
+            "  await runStep();\n"
+            "  const first = posted.slice();\n"
+            "  await runStep();\n"
+            "  process.stdout.write(JSON.stringify({\n"
+            "    first: first.length,\n"
+            "    after: posted.length,\n"
+            "    bodies: posted.map(entry => entry.body),\n"
+            "    notices,\n"
+            "  }));\n"
+            "})().catch(error => { console.error(error); process.exit(1); });\n"
+        )
+        result = subprocess.run(
+            ["node", "-"],
+            input=harness,
+            text=True,
+            capture_output=True,
+            check=False,
+            timeout=60,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        outcome = json.loads(result.stdout)
+        self.assertEqual(outcome["first"], 1)
+        # A rerun for the same batch/HEAD must not create a second handoff.
+        self.assertEqual(outcome["after"], 1)
+        body = outcome["bodies"][0]
+        self.assertIn(
+            f"<!-- opencode-coderabbit-verification-pending "
+            f"head={head} findings=100,200 answers=101,201 -->",
+            body,
+        )
+        self.assertIn("⚡ **Continuum · opencode**", body)
+        self.assertIn(
+            "<!-- continuum-origin role=continuum component=opencode -->",
+            body,
+        )
+        self.assertTrue(
+            any("deferring 2 CodeRabbit finding(s)" in notice
+                for notice in outcome["notices"])
+        )
+        self.assertNotIn(
+            "POST /repos/{owner}/{repo}/pulls/{pull_number}/comments/"
+            "{comment_id}/replies",
+            body,
+        )
 
     def test_installed_caller_declares_and_forwards_pr_number_for_reconciliation(self):
         caller = CALLER_STUB.read_text(encoding="utf-8")

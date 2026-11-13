@@ -83,7 +83,7 @@ MUTATION_COUNTS = {
     "continuum-issue-scheduler.yml": 11,
     "continuum-opencode-repair.yml": 2,
     "continuum-opencode-watchdog.yml": 4,
-    "continuum-opencode.yml": 12,  # #450 moved two inline CodeRabbit replies into serialized auto-merge
+    "continuum-opencode.yml": 13,  # #450 moved two inline CodeRabbit replies into serialized auto-merge; #451 adds the repair-completion handoff
     "continuum-pr-agent-auto-merge.yml": 1,
     "continuum-pr-agent-canary.yml": 4,
     "continuum-pr-agent-recovery.yml": 4,
@@ -198,6 +198,7 @@ FUNCTIONAL_ANCHORS = {
     "continuum-opencode.yml": (
         "Continuum classified this CodeRabbit",
         "@coderabbitai full review",
+        "opencode-coderabbit-verification-pending",
         "Automation produced no code changes",
         "Qualification attempted product changes",
         "produced no trusted pass/fail evidence",

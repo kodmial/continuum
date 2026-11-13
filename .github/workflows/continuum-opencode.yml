@@ -4523,8 +4523,85 @@ jobs:
             // auto-merge serialization and can trip the hourly provider limit.
             // After exact-HEAD CI succeeds, the auto-merge reconciler owns
             // verification of each still-open finding on the published HEAD.
+            //
+            // Persist the repair completion as an issue-comment handoff. A
+            // repair that leaves HEAD unchanged publishes no new commit, so
+            // without this durable marker auto-merge only sees the earlier
+            // answer and keeps dispatching repair batches instead of asking
+            // CodeRabbit to verify the repair outcome. The marker is posted
+            // outside the review thread, so it never consumes chat quota.
+            const verificationPendingMarker = entries =>
+              `<!-- opencode-coderabbit-verification-pending head=${headSha} ` +
+              `findings=${entries.map(entry => entry.findingId).join(',')} ` +
+              `answers=${entries.map(entry => entry.answerId).join(',')} -->`;
+            const handOffRepairVerification = async attempts => {
+              const byFinding = new Map();
+              for (const attempt of attempts) {
+                const findingId = Number(attempt.findingId);
+                if (!Number.isInteger(findingId) || findingId <= 0) continue;
+                const answerId = Number(attempt.answerId);
+                byFinding.set(
+                  findingId,
+                  Number.isInteger(answerId) && answerId > 0 ? answerId : 0
+                );
+              }
+              const entries = [...byFinding.keys()]
+                .sort((a, b) => a - b)
+                .map(findingId => ({
+                  findingId,
+                  answerId: byFinding.get(findingId),
+                }));
+              if (!entries.length) return;
+              // The triggering answer id makes the handoff unique to one
+              // repair attempt: a rerun of the same batch is deduplicated,
+              // while a later answer that selects a new repair always
+              // publishes a new handoff for its own verification.
+              const marker = verificationPendingMarker(entries);
+              const totalHandoffComments = Number(pr.data.comments || 0);
+              const lastHandoffPage = Math.max(
+                1,
+                Math.ceil(
+                  (Number.isFinite(totalHandoffComments)
+                    ? totalHandoffComments : 0) / 100
+                ) || 1
+              );
+              const firstHandoffPage = Math.max(1, lastHandoffPage - 2);
+              const issueComments = [];
+              for (let page = lastHandoffPage; page >= firstHandoffPage; page--) {
+                const { data } = await github.rest.issues.listComments({
+                  owner,
+                  repo,
+                  issue_number: pullNumber,
+                  per_page: 100,
+                  page,
+                });
+                if (Array.isArray(data)) issueComments.push(...data);
+              }
+              if (issueComments.some(comment =>
+                (comment.body || '').includes(marker))) {
+                return;
+              }
+              await github.rest.issues.createComment({
+                owner,
+                repo,
+                issue_number: pullNumber,
+                body: [
+                  marker,
+                  '⚡ **Continuum · opencode**',
+                  '<!-- continuum-origin role=continuum component=opencode -->',
+                  `Canonical repair finished for ${entries.length} CodeRabbit finding(s) at HEAD \`${headSha}\`; serialized auto-merge owns verification.`,
+                ].join('\n'),
+              });
+            };
+
             const batchItems = JSON.parse(process.env.UNRESOLVED_ITEMS_JSON || '[]');
             if (batchItems.length) {
+              await handOffRepairVerification(
+                batchItems.map(item => ({
+                  findingId: item.finding_id,
+                  answerId: item.unresolved_id,
+                }))
+              );
               core.notice(
                 `PR #${pullNumber}: deferring ${batchItems.length} CodeRabbit finding(s) at HEAD ${headSha} to serialized auto-merge after exact-HEAD CI.`
               );
@@ -4538,6 +4615,20 @@ jobs:
                 !comment.in_reply_to_id
             );
             if (findings.length > 0) {
+              await handOffRepairVerification(
+                findings.map(finding => {
+                  const latestAnswer = comments
+                    .filter(comment =>
+                      comment.in_reply_to_id === finding.id &&
+                      comment.user?.login === 'coderabbitai[bot]'
+                    )
+                    .sort((a, b) => Number(b.id) - Number(a.id))[0];
+                  return {
+                    findingId: finding.id,
+                    answerId: latestAnswer ? latestAnswer.id : 0,
+                  };
+                })
+              );
               core.notice(
                 `PR #${pullNumber}: deferring ${findings.length} CodeRabbit finding(s) from review ${reviewId} at HEAD ${headSha} to serialized auto-merge after exact-HEAD CI.`
               );

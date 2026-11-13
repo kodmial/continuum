@@ -438,7 +438,8 @@ class ChatQuotaWorkflowContractTests(unittest.TestCase):
         )
         chat_gate = source.index("if (pendingChatLimit) {")
         timeout_gate = source.index(
-            "} else if (\n                  Date.now() - verificationAt <"
+            "} else if (\n                  !repairHandoffPending &&\n"
+            "                  Date.now() - verificationAt <"
         )
         self.assertLess(chat_gate, timeout_gate)
         retry_gate = source.index(
@@ -772,12 +773,14 @@ class AutoMergeThreadVerifierTests(unittest.TestCase):
         harness = r"""
 const assert = require('node:assert/strict');
 let comments = [];
+let issueComments = [];
 let liveThreads = [{commentId: 100}];
 let liveHead = '';
 let liveState = 'open';
 let posted = [];
 let authenticatedLogin = 'kodmial';
 let authenticatedFailure = false;
+const issueListComments = async () => ({data: issueComments.slice()});
 const pr = {number: 450, head: {sha: 'a'.repeat(40)}};
 liveHead = pr.head.sha;
 const owner = 'o';
@@ -809,6 +812,7 @@ const github = {
 };
 const shouldRecheckCodeRabbitAfterCi = () => false;
 const codeRabbitExplicitlyResolved = () => false;
+const isCodeRabbitChatLimitReply = () => false;
 // The serialized cross-PR chat budget owns its own contract test in
 // tests/test_coderabbit_queue_lifecycle.py. Always allow the budget scan
 // here so these cases exercise the chat-quota retry semantics in isolation
@@ -832,8 +836,12 @@ async function getPullWithAuthoritativeHead() {
 }
 async function withReadFallback(callback) {
   return callback({
-    paginate: async () => comments.slice(),
+    paginate: async endpoint =>
+      endpoint === issueListComments
+        ? issueComments.slice()
+        : comments.slice(),
     rest: {
+      issues: {listComments: issueListComments},
       pulls: {
         get: async () => ({
           data: {state: liveState, head: {sha: liveHead}},
@@ -1187,6 +1195,91 @@ process.stdout.write(JSON.stringify(results));
                 self.assertEqual(result[key]["requested"], 0)
                 self.assertEqual(result[key]["posted"], 0)
                 self.assertEqual(result[key]["remaining"], 1)
+
+    def test_repair_handoff_triggers_fresh_verification_when_head_is_unchanged(self):
+        data = fixture("chat-rate-limit-pr448.json")
+        finding = data["threads"][0]["finding_id"]
+        head = data["head_sha"]
+        checks = f"""
+const finding = {finding};
+const head = {json.dumps(head)};
+const now = Date.now();
+const marker = `<!-- auto-merge-coderabbit-verification finding=${{finding}} head=${{head}} -->`;
+const handoff = (at, author = 'kodmial', markerHead = head, markerFinding = finding) => ({{
+  id: 950,
+  user: {{login: author}},
+  created_at: new Date(at).toISOString(),
+  body: `<!-- opencode-coderabbit-verification-pending head=${{markerHead}} findings=${{markerFinding}} -->\\n` +
+    'Canonical repair finished; serialized auto-merge owns verification.',
+}});
+pr.head.sha = head;
+liveHead = head;
+liveThreads = [{{commentId: finding}}];
+const baseComments = [
+  {{id: 900, in_reply_to_id: finding, user: {{login: 'kodmial'}},
+    created_at: new Date(now - 10 * 60_000).toISOString(), body: marker}},
+  {{id: 901, in_reply_to_id: finding, user: {{login: 'coderabbitai[bot]'}},
+    created_at: new Date(now - 5 * 60_000).toISOString(),
+    body: '`@kodmial` **UNRESOLVED**\\nThe access-control defect remains.'}},
+];
+async function attempt(handoffComment, reviewComments = baseComments) {{
+  comments = reviewComments.slice();
+  issueComments = handoffComment ? [handoffComment] : [];
+  posted = [];
+  const state = {{remaining: 1, notBeforeMs: 0}};
+  const requested = await requestCodeRabbitThreadVerification(
+    pr, liveThreads, {{}}, state
+  );
+  return {{requested, posted: posted.length,
+    body: posted.length ? posted[0].body : ''}};
+}}
+const results = {{
+  pending: await attempt(handoff(now - 2 * 60_000)),
+  stale: await attempt(handoff(now - 15 * 60_000)),
+  otherHead: await attempt(handoff(now - 2 * 60_000, 'kodmial', 'f'.repeat(40))),
+  otherFinding: await attempt(
+    handoff(now - 2 * 60_000, 'kodmial', head, finding + 1)
+  ),
+  forged: await attempt(handoff(now - 2 * 60_000, 'random')),
+}};
+// After the fresh request exists, the same handoff is no longer pending.
+const verifiedComments = baseComments.concat([{{
+  id: 1000, in_reply_to_id: finding, user: {{login: 'kodmial'}},
+  created_at: new Date(now - 30_000).toISOString(), body: marker,
+}}]);
+results.settled = await attempt(
+  handoff(now - 2 * 60_000), verifiedComments
+);
+// A later answer selects a new repair, which publishes its own handoff
+// after the fresh verification. That must verify again, never loop silently.
+const nextCycleComments = verifiedComments.concat([{{
+  id: 1001, in_reply_to_id: finding, user: {{login: 'coderabbitai[bot]'}},
+  created_at: new Date(now - 20_000).toISOString(),
+  body: '`@kodmial` **UNRESOLVED**\\nThe access-control defect remains.',
+}}]);
+results.nextCycle = await attempt(handoff(now - 10_000), nextCycleComments);
+process.stdout.write(JSON.stringify(results));
+"""
+        result = self.run_verifier(checks)
+        # A repair that leaves HEAD unchanged publishes no commit, so the
+        # durable handoff must select a fresh exact-HEAD verification of the
+        # repair outcome instead of another repair batch.
+        self.assertEqual(result["pending"]["requested"], 1)
+        self.assertEqual(result["pending"]["posted"], 1)
+        self.assertIn(
+            f"auto-merge-coderabbit-verification finding={finding} head={head}",
+            result["pending"]["body"],
+        )
+        # Older, foreign, other-head, other-finding, or already-verified
+        # handoffs never cause an extra chat request.
+        for key in ("stale", "otherHead", "otherFinding", "forged", "settled"):
+            with self.subTest(case=key):
+                self.assertEqual(result[key]["requested"], 0)
+                self.assertEqual(result[key]["posted"], 0)
+        # The next repair attempt at the same unchanged HEAD posts a new
+        # handoff after the fresh verification and is verified again.
+        self.assertEqual(result["nextCycle"]["requested"], 1)
+        self.assertEqual(result["nextCycle"]["posted"], 1)
 
     def test_stale_finding_does_not_consume_the_only_send_slot(self):
         data = fixture("chat-rate-limit-pr448.json")
