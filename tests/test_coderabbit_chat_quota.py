@@ -177,7 +177,7 @@ class ChatQuotaParserTests(unittest.TestCase):
             "The user has not exceeded the limit for the number of chat messages per hour.",
             "The user never reached the limit for chat messages per hour.",
         ):
-            body = "**UNRESOLVED**\\n" + statement
+            body = "**UNRESOLVED**\n" + statement
             with self.subTest(statement=statement):
                 self.assertIsNone(rabbit.parse_chat_retry_delay_ms(body))
                 self.assertEqual(
@@ -448,8 +448,8 @@ class ChatQuotaRuntimeParityTests(unittest.TestCase):
             "### Rate Limit Exceeded\nPlease wait before sending another message.",
             "> ### Rate Limit Exceeded\n> Please wait **14 minutes and 56 seconds** before sending another message.",
             "**UNRESOLVED**\nThe number of chat messages per hour is not tracked across threads, so this finding still needs a code change.",
-            "**UNRESOLVED**\\nThe user has not exceeded the limit for the number of chat messages per hour.",
-            "**UNRESOLVED**\\nThe user never reached the limit for chat messages per hour.",
+            "**UNRESOLVED**\nThe user has not exceeded the limit for the number of chat messages per hour.",
+            "**UNRESOLVED**\nThe user never reached the limit for chat messages per hour.",
             "**RESOLVED** the finding is fixed.",
         ]
         expected = [
