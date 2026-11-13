@@ -2336,6 +2336,21 @@ jobs:
             });
             const issue = issueResponse.data;
 
+            // A pull request is also a GitHub issue resource. A /review
+            // comment can create a skipped caller run named "OpenCode issue #N";
+            // that is NOT an issue implementation, and retrying it emits /oc
+            // comments on the PR (kodmial/aa#509, 2026-11-13). PR-Agent
+            // exclusively owns PR review/repair. This guard must precede all
+            // retry and pause accounting, including watchdog catch-up.
+            if (issue.pull_request) {
+              core.notice(
+                'Ignoring OpenCode issue-style run ' + run.id +
+                ' for pull request #' + issueNumber +
+                '; PR-Agent owns its review and repair lifecycle.'
+              );
+              return;
+            }
+
             if (issue.state !== 'open') {
               core.info('Issue #' + issueNumber + ' is already closed.');
               return;
