@@ -783,8 +783,13 @@ let notices = [];
 let warnings = [];
 let authenticatedLogin = 'kodmial';
 let authenticatedFailure = false;
-const issueListComments = async () => {
+const issueListComments = async params => {
   if (issueListCommentsFailure) throw new Error('handoff comments unavailable');
+  // A pending handoff can predate the newest comments, so the scan must
+  // paginate every issue comment instead of requesting one bounded page.
+  if (params && params.page !== undefined) {
+    throw new Error('bounded handoff scan');
+  }
   return {data: issueComments.slice()};
 };
 const pr = {number: 450, head: {sha: 'a'.repeat(40)}};
@@ -846,9 +851,9 @@ async function getPullWithAuthoritativeHead() {
 }
 async function withReadFallback(callback) {
   return callback({
-    paginate: async endpoint =>
+    paginate: async (endpoint, params = {}) =>
       endpoint === issueListComments
-        ? issueComments.slice()
+        ? (await issueListComments(params)).data
         : comments.slice(),
     rest: {
       issues: {listComments: issueListComments},

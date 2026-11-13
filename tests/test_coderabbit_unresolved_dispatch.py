@@ -90,6 +90,26 @@ class CodeRabbitBatchContractTests(unittest.TestCase):
         self.assertIn("if (!consumeCodeRabbitChatSendSlot()) continue;", merge)
         self.assertIn("codeRabbitChatLimitNotBefore(comment)", merge)
 
+    def test_auto_merge_reads_every_repair_handoff_not_a_bounded_window(self):
+        # A pending handoff can be older than the newest issue comments. A
+        # bounded newest-page scan can miss it, dispatch another repair batch,
+        # and leave the finding without the fresh verification the handoff
+        # requires. Auto-merge must paginate every issue comment instead.
+        merge = (ROOT / ".github/workflows/continuum-auto-merge.yml").read_text(
+            encoding="utf-8"
+        )
+        scan = merge.split("const pendingRepairHandoff", 1)[0].split(
+            "// OpenCode never writes into the CodeRabbit inline chat", 1
+        )[1]
+        self.assertIn("client.paginate(", scan)
+        self.assertIn("client.rest.issues.listComments", scan)
+        self.assertIsNone(
+            re.search(r"(?m)^\s+page:", scan),
+            "the handoff scan must not request one bounded page",
+        )
+        self.assertNotIn("lastHandoffPage", scan)
+        self.assertIn("repairHandoffReadFailed = true", scan)
+
     @unittest.skipUnless(shutil.which("node"), "Node.js unavailable")
     def test_repair_completion_handoff_is_durable_and_serialized(self):
         # Execute the production deferral branch. A repair that leaves HEAD

@@ -1997,31 +1997,26 @@ jobs:
             // HEAD unchanged still triggers a fresh verification of its
             // outcome, rather than the earlier UNRESOLVED answer selecting
             // another repair batch forever.
-            const repairHandoffs = [];
+            //
+            // Read every issue comment instead of a bounded newest window:
+            // an older handoff can predate later chatter, and missing it
+            // would dispatch another repair batch instead of requesting the
+            // fresh verification that handoff already requires. A truncated
+            // or failed read is therefore a failed read.
+            let repairHandoffs = [];
             let repairHandoffReadFailed = false;
             try {
-              const totalHandoffComments = Number(pr.comments || 0);
-              const lastHandoffPage = Math.max(
-                1,
-                Math.ceil(
-                  (Number.isFinite(totalHandoffComments)
-                    ? totalHandoffComments : 0) / 100
-                ) || 1
-              );
-              const firstHandoffPage = Math.max(1, lastHandoffPage - 2);
-              for (let page = lastHandoffPage;
-                   page >= firstHandoffPage; page -= 1) {
-                const { data } = await withReadFallback(client =>
-                  client.rest.issues.listComments({
+              repairHandoffs = await withReadFallback(client =>
+                client.paginate(
+                  client.rest.issues.listComments,
+                  {
                     owner,
                     repo,
                     issue_number: pr.number,
                     per_page: 100,
-                    page,
-                  })
-                );
-                if (Array.isArray(data)) repairHandoffs.push(...data);
-              }
+                  }
+                )
+              );
             } catch (err) {
               // Without the handoff list a repair that left HEAD unchanged is
               // indistinguishable from no repair at all. Defer the repair
