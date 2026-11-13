@@ -176,7 +176,18 @@ jobs:
           opencode serve --hostname 127.0.0.1 --port 4096 > "$RUNNER_TEMP/live-v2.log" 2>&1 &
           pid=$!
           trap 'kill "$pid" 2>/dev/null || true' EXIT
-          sleep 6
+          ready=false
+          for attempt in $(seq 1 30); do
+            if python3 -c "import base64,json,os,urllib.request; key=base64.b64encode(('opencode:'+os.environ['OPENCODE_PASSWORD']).encode()).decode(); req=urllib.request.Request(os.environ['OPENCODE_SERVER_URL']+'/api/info',headers={'Authorization':'Basic '+key,'Accept':'application/json'}); info=json.load(urllib.request.urlopen(req,timeout=2)); assert isinstance(info.get('version'),str) and bool(info['version']); assert type(info.get('pid')) is int" >/dev/null 2>&1; then
+              ready=true
+              break
+            fi
+            sleep 2
+          done
+          if [[ "$ready" != true ]]; then
+            echo "::error::Authenticated OpenCode 2.2.6 server readiness timed out."
+            exit 1
+          fi
           # Keep the checked-out source tree free of Python .pyc files: the
           # subsequent Ruby contract scanner reads every file as UTF-8.
           export PYTHONDONTWRITEBYTECODE=1
