@@ -596,6 +596,31 @@ def timestamp_is_stale(
     return (current - observed).total_seconds() >= timeout
 
 
+def _claim_protocol_proven(
+    observed_at: Any,
+    protocol_since: Any,
+) -> bool:
+    """Whether a bare claim is proved to postdate the requesting protocol.
+
+    The current controller persists ``requesting`` before it asks GitHub to
+    dispatch. An older controller persisted ``claimed`` and dispatched
+    directly, so an unmarked claim may already have spent the exact HEAD even
+    when its run has since been deleted. The trusted legacy-controller
+    retirement frontier is the durable instant after which such an older
+    controller cannot have written. Only a claim observed strictly after it is
+    proved to come from the ``requesting`` protocol and safe to re-arm. Both
+    values share second precision, so equality must hold.
+    """
+
+    observed = str(observed_at or "").strip()
+    frontier = str(protocol_since or "").strip()
+    if not _ISO_TIMESTAMP_RE.match(observed):
+        return False
+    if not _ISO_TIMESTAMP_RE.match(frontier):
+        return False
+    return observed > frontier
+
+
 # ---------------------------------------------------------------------------
 # Dispatch response classification.
 # ---------------------------------------------------------------------------
@@ -962,6 +987,7 @@ def plan_admission(
     now: Any = None,
     claim_timeout_seconds: Any = 0,
     pull_number: Any = None,
+    claim_protocol_since: Any = None,
 ) -> AdmissionPlan:
     """Plan claim/wait/hold/rearm for one serialized exact-HEAD admission pass.
 
@@ -973,11 +999,17 @@ def plan_admission(
     An attempt that outlives the bounded dispatch window is handled by
     evidence, never by a blind retry:
 
-    * only a stale ``claimed`` attempt proves the dispatch request was never
-      sent, because the owner persists ``requesting`` immediately before that
-      request. A complete run inventory with no correlation marker and no
-      legacy-shaped repair run then persists the dead claim as ``rejected`` so
-      the same serialized pass may claim a fresh attempt (``rearm``);
+    * only a stale ``claimed`` attempt proved to postdate the trusted
+      legacy-controller retirement frontier (``claim_protocol_since``) proves
+      the dispatch request was never sent, because only the current owner
+      persists ``requesting`` immediately before that request. A complete run
+      inventory with no correlation marker and no legacy-shaped repair run then
+      persists the dead claim as ``rejected`` so the same serialized pass may
+      claim a fresh attempt (``rearm``);
+    * a stale ``claimed`` attempt that predates that frontier (or has no
+      usable frontier) may belong to an older controller that dispatched
+      directly after writing ``claimed``, so an absent run proves nothing; it
+      is persisted as a visible ``ambiguous`` hold instead of being re-armed;
     * a stale ``requesting`` attempt may already have reached GitHub even when
       its run is absent from the inventory (runs can be deleted), so it is
       persisted as a visible ``ambiguous`` hold instead of being re-armed;
@@ -1137,7 +1169,30 @@ def plan_admission(
                 attempt_id=attempt.attempt_id,
                 transition=receipt,
             )
-        # ``claimed`` is persisted before ``requesting`` and dispatch is only
+        if not _claim_protocol_proven(observed_at, claim_protocol_since):
+            # An older controller wrote ``claimed`` and then dispatched
+            # directly, without ever persisting ``requesting``. Its run may be
+            # deleted, so an empty inventory is not proof that no repair
+            # started. Only a claim created strictly after the trusted
+            # legacy-controller retirement frontier is proved to come from the
+            # protocol that writes the request marker; everything else is an
+            # unproven claim and must stay a visible hold. ``ambiguous`` can
+            # never move to ``rejected``, so it is the correct durable state.
+            receipt = transition_attempt(attempt, status=STATUS_AMBIGUOUS)
+            return AdmissionPlan(
+                action=ACTION_HOLD,
+                reason=(
+                    "claim {!r} exceeded the bounded dispatch window but is not "
+                    "proved to postdate the legacy-controller retirement "
+                    "frontier; an older controller may have dispatched without "
+                    "a request marker, so it is a visible hold, not a "
+                    "retry".format(attempt.attempt_id)
+                ),
+                attempt_id=attempt.attempt_id,
+                transition=receipt,
+            )
+        # This claim postdates the trusted retirement frontier, and
+        # ``claimed`` is persisted before ``requesting`` while dispatch is only
         # attempted after ``requesting`` is durable, so this state proves the
         # request was never sent. The complete inventory must also show no run.
         receipt = transition_attempt(attempt, status=STATUS_REJECTED)

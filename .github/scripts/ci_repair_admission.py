@@ -1564,6 +1564,12 @@ def run(args) -> int:
             now=args.now,
             claim_timeout_seconds=args.claim_timeout_seconds,
             pull_number=pull_number,
+            # Only a claim written strictly after the trusted legacy-
+            # controller retirement frontier is proved to come from the
+            # protocol that persists ``requesting`` before dispatch. An
+            # older controller dispatched directly after ``claimed``, so its
+            # bare claim must hold even when the run inventory is empty.
+            claim_protocol_since=legacy_retired,
         )
 
     if plan.transition is not None:

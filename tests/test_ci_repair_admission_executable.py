@@ -1623,6 +1623,26 @@ class AdmissionExecutableTests(unittest.TestCase):
             "workflow-run reconciliation must never POST a listing",
         )
 
+    def test_a_stale_trusted_legacy_claim_is_held_not_rearmed(self):
+        # A legacy controller persisted ``claimed`` and then dispatched directly,
+        # without ever writing a ``requesting`` marker. Its run can be deleted,
+        # so an empty inventory cannot prove the request was never sent. Only a
+        # claim created strictly after the trusted retirement frontier is proved
+        # to come from the requesting protocol and may be re-armed.
+        legacy = trusted_receipt()
+        legacy["created_at"] = "2026-11-10T00:00:00Z"
+        legacy["updated_at"] = "2026-11-10T00:00:00Z"
+        self.write_comments([legacy])
+        self.write_pr(head=HEAD, comments=1)
+        self.write_runs([])
+        completed = self.run_admission(extra_args=("--now", NOW))
+        self.assertEqual(0, len(self.dispatches()))
+        bodies = self.posted_bodies()
+        self.assertTrue(any("status=ambiguous" in body for body in bodies), bodies)
+        self.assertFalse(any("status=rejected" in body for body in bodies), bodies)
+        self.assertFalse(any("status=claimed" in body for body in bodies), bodies)
+        self.assertIn("not a retry", completed.stdout)
+
     def test_a_canceled_controller_is_resumed_once_by_the_next_serialized_pass(self):
         # The claim was persisted, then the controller run was canceled before
         # it could record a dispatch. The next serialized pass is the resumed

@@ -713,7 +713,7 @@ class AdmissionPlanningTests(unittest.TestCase):
                 self.assertEqual(STATUS_DISPATCHED, plan.transition.status)
                 self.assertEqual(12, plan.run_id)
 
-    def test_a_stale_claim_with_a_complete_empty_inventory_rearms_once(self):
+    def test_a_stale_claim_after_the_protocol_frontier_rearms_once(self):
         plan = plan_admission(
             read([receipt_comment()]),
             runs=check_inventory(),
@@ -721,10 +721,37 @@ class AdmissionPlanningTests(unittest.TestCase):
             now="2026-11-12T01:00:00Z",
             claim_timeout_seconds=900,
             pull_number=PR,
+            claim_protocol_since="2026-11-11T00:00:00Z",
         )
         self.assertEqual(ACTION_REARM, plan.action)
         self.assertIsNotNone(plan.transition)
         self.assertEqual(STATUS_REJECTED, plan.transition.status)
+
+    def test_a_stale_claim_that_predates_the_protocol_frontier_holds(self):
+        # A trusted legacy claim may have been written by an older controller
+        # that dispatched directly after ``claimed`` and never persisted a
+        # ``requesting`` marker. Its run can be deleted, so an empty inventory
+        # is not proof that no repair started; re-arming would dispatch a
+        # duplicate for the same exact HEAD.
+        for frontier in (
+            "2026-11-12T00:00:00Z",  # same second as the claim
+            "2026-11-12T00:00:01Z",  # after the claim
+            None,  # no trusted retirement record
+            "not-a-timestamp",  # unusable frontier
+        ):
+            with self.subTest(frontier=frontier):
+                plan = plan_admission(
+                    read([receipt_comment()]),
+                    runs=check_inventory(),
+                    observed_at="2026-11-12T00:00:00Z",
+                    now="2026-11-12T01:00:00Z",
+                    claim_timeout_seconds=900,
+                    pull_number=PR,
+                    claim_protocol_since=frontier,
+                )
+                self.assertEqual(ACTION_HOLD, plan.action)
+                self.assertIsNotNone(plan.transition)
+                self.assertEqual(STATUS_AMBIGUOUS, plan.transition.status)
 
     def test_a_stale_requesting_attempt_holds_even_with_a_complete_empty_inventory(self):
         # ``requesting`` is persisted immediately before the dispatch request.
