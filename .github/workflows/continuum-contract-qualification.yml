@@ -222,12 +222,17 @@ jobs:
           done
           {
             echo "### Real OpenCode 2.2.6 reviewer permission decisions"
-            grep -E '^bridge-permission action=(shell|subagent) effect=deny        shell: bash
+            grep -F "bridge-permission action=shell effect=deny" "$RUNNER_TEMP/reviewer-abi-preflight.log"
+            grep -F "bridge-permission action=subagent effect=deny" "$RUNNER_TEMP/reviewer-abi-preflight.log"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Run Layer 1 regression gate on the exact HEAD
+        id: regression
+        shell: bash
         run: |
           set -euo pipefail
           bash scripts/validate-continuum.sh
           echo "regression=pass" >> "$GITHUB_OUTPUT"
-
       - name: Run Layer 2 lifecycle integration probe
         id: lifecycle
         shell: bash
