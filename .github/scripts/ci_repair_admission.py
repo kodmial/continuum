@@ -720,17 +720,22 @@ def _dispatch(
     return None, "", "all dispatch shapes were rejected"
 
 
-#: GitHub caps a filtered workflow-run search at 1,000 retrievable results.
-#: Every historical window must therefore stay strictly below this ceiling.
+#: GitHub caps a filtered workflow-run search at 1,000 retrievable results
+#: when it uses any of ``actor``, ``branch``, ``check_suite_id``, ``created``,
+#: ``event``, ``head_sha``, or ``status``. Every filtered historical window must
+#: therefore stay strictly below this ceiling. The unfiltered per-workflow
+#: listing uses none of those search parameters and is the fallback for a
+#: single-second window that cannot be split further.
 _RUN_SEARCH_RESULT_CEILING = 1000
 #: GitHub documents an Actions queue limit of 500 workflow runs per 10-second
 #: interval per repository; runs beyond it are blocked instead of created
 #: ("Actions limits", "Workflow run queued"). Any single second therefore holds
 #: at most 500 runs, which is below the search ceiling above. That documented
-#: bound is what rules out a saturated one-second window: bisection never needs
-#: a narrower unit than a second, and the leaf is never assumed complete. If
-#: GitHub ever observed more runs in one second, the inventory stays incomplete
-#: and admission holds rather than trusting a partial history.
+#: bound is what normally rules out a saturated one-second window: bisection
+#: never needs a narrower unit than a second. If GitHub ever observed more runs
+#: in one second, the leaf is recovered from the unfiltered history below; only
+#: an incomplete fallback makes the inventory incomplete and holds admission
+#: rather than trusting a partial history.
 _MAX_RUNS_PER_SECOND = 500
 _RUN_HISTORY_START = datetime(1970, 1, 1, tzinfo=timezone.utc)
 
@@ -779,32 +784,48 @@ def _reported_run_count(
     return None, False, present
 
 
-def _workflow_run_window(
+def _workflow_run_pages(
     repository: str,
     workflow: str,
-    start: datetime,
-    end: datetime,
-) -> Tuple[RunInventory, bool]:
-    """Fetch one bounded creation window and say whether it must be split."""
+    *,
+    created: Optional[Tuple[datetime, datetime]] = None,
+) -> Sequence[Any]:
+    """Fetch paginated workflow-run pages for one query shape.
 
+    Passing ``created`` adds the ``event`` and ``created`` search parameters,
+    which are exactly what triggers GitHub's 1,000-result filtered-search cap.
+    Omitting it lists the workflow's whole run history without any capped
+    search parameter, which is the fallback for a creation window that a
+    filtered query cannot retrieve in full.
+    """
+
+    query = "per_page=100"
+    if created is not None:
+        query = "event=workflow_dispatch&per_page=100"
     arguments = [
         "api",
         "--paginate",
         "--slurp",
-        "repos/{}/actions/workflows/{}/runs?event=workflow_dispatch&per_page=100".format(
-            repository, workflow
+        "repos/{}/actions/workflows/{}/runs?{}".format(
+            repository, workflow, query
         ),
         # ``gh api`` switches to POST as soon as a field is supplied. An
         # explicit GET keeps this an idempotent listing. The ``created`` range
         # is inclusive at both second-precision endpoints.
         "--method",
         "GET",
-        "-f",
-        "created={}..{}".format(
-            _format_run_window_timestamp(start),
-            _format_run_window_timestamp(end),
-        ),
     ]
+    if created is not None:
+        start, end = created
+        arguments.extend(
+            [
+                "-f",
+                "created={}..{}".format(
+                    _format_run_window_timestamp(start),
+                    _format_run_window_timestamp(end),
+                ),
+            ]
+        )
     code, stdout, stderr = _gh(arguments)
     if code != 0:
         raise GhFailure(stderr.strip() or "workflow run listing failed")
@@ -818,7 +839,18 @@ def _workflow_run_window(
         pages, (str, bytes, bytearray)
     ):
         raise GhFailure("workflow run pages are not an array")
+    return pages
 
+
+def _workflow_run_window(
+    repository: str,
+    workflow: str,
+    start: datetime,
+    end: datetime,
+) -> Tuple[RunInventory, bool]:
+    """Fetch one bounded creation window and say whether it must be split."""
+
+    pages = _workflow_run_pages(repository, workflow, created=(start, end))
     reported, saturated, present = _reported_run_count(pages)
     if present and reported is None:
         return RunInventory((), False, "the reported run count is unreadable"), False
@@ -837,6 +869,60 @@ def _workflow_run_window(
     return inventory, False
 
 
+def _complete_workflow_run_window(
+    repository: str,
+    workflow: str,
+    start: datetime,
+    end: datetime,
+) -> RunInventory:
+    """Recover one saturated creation window from the unfiltered history.
+
+    GitHub's 1,000-result note applies to a run search that uses ``actor``,
+    ``branch``, ``check_suite_id``, ``created``, ``event``, ``head_sha``, or
+    ``status``. Listing the workflow's runs without those parameters is not
+    that capped search, so its paginated history is the complete source for a
+    single-second leaf that cannot be split further. The history is filtered
+    back to the same event and creation window before it is reconciled. The
+    unfiltered listing has a larger pagination cap, and
+    :func:`normalize_run_pages` still compares the retrieved rows with the
+    reported count so a truncated listing remains incomplete.
+    """
+
+    pages = _workflow_run_pages(repository, workflow)
+    reported, saturated, present = _reported_run_count(pages)
+    if present and reported is None:
+        return RunInventory((), False, "the reported run count is unreadable")
+    if saturated:
+        return RunInventory(
+            (),
+            False,
+            "the unfiltered workflow run history is itself truncated",
+        )
+    history = normalize_run_pages(pages, expected_count=reported)
+    if not history.complete:
+        return history
+    selected = []
+    for run in history.runs:
+        if run.get("event") != "workflow_dispatch":
+            continue
+        created = run.get("created_at")
+        if not isinstance(created, str) or not _ISO_TIMESTAMP_RE.match(created):
+            return RunInventory(
+                (),
+                False,
+                "a workflow run has no usable creation timestamp",
+            )
+        created_at = _parse_run_window_timestamp(created, "run")
+        if start <= created_at <= end:
+            selected.append(run)
+    return RunInventory(
+        tuple(selected),
+        True,
+        "workflow run history fallback is complete for the saturated creation window",
+        len(selected),
+    )
+
+
 def _workflow_runs(
     repository: str,
     workflow: str,
@@ -853,13 +939,14 @@ def _workflow_runs(
     seconds; each leaf is paginated independently, and the unique run IDs are
     reconciled before the combined inventory is reported complete.
 
-    One second is the narrowest unit needed because GitHub queues at most 500
-    runs per 10-second interval per repository, which keeps a single second
-    below the 1,000-result ceiling; :data:`_MAX_RUNS_PER_SECOND` records that
-    bound and the test suite pins it against the ceiling. A leaf that still
-    reports saturation contradicts the documented bound, so the inventory is
-    reported incomplete and the caller holds instead of trusting a truncated
-    history.
+    One second is the narrowest unit a filtered creation search offers, and
+    GitHub queues at most 500 runs per 10-second interval per repository, which
+    normally keeps a single second below the 1,000-result ceiling;
+    :data:`_MAX_RUNS_PER_SECOND` records that bound. A leaf that still reports
+    saturation contradicts the bound, so it is recovered from the workflow's
+    unfiltered run history, which GitHub does not cap at 1,000 results. Only if
+    that fallback is also incomplete is the combined inventory reported
+    incomplete and the caller holds instead of trusting a truncated history.
     """
 
     start = _parse_run_window_timestamp(since, "since") or _RUN_HISTORY_START
@@ -890,25 +977,27 @@ def _workflow_runs(
         )
         if needs_split:
             if window_start >= window_end:
-                print(
-                    "::warning::A single-second workflow run creation window "
-                    "reaches GitHub's filtered-result ceiling, exceeding the "
-                    "documented bound of {} runs per second. Admission will hold "
-                    "instead of trusting a truncated run inventory.".format(
-                        _MAX_RUNS_PER_SECOND
-                    )
+                fallback = _complete_workflow_run_window(
+                    repository, workflow, window_start, window_end
                 )
-                return RunInventory(
-                    (),
-                    False,
-                    (
+                if not fallback.complete:
+                    reason = (
                         "a single-second workflow run creation window still "
                         "reaches GitHub's filtered-result ceiling, exceeding the "
-                        "documented bound of {} runs per second".format(
-                            _MAX_RUNS_PER_SECOND
+                        "documented bound of {} runs per second, and the "
+                        "unfiltered history fallback is incomplete: {}".format(
+                            _MAX_RUNS_PER_SECOND, fallback.reason
                         )
-                    ),
-                )
+                    )
+                    print(
+                        "::warning::{} Admission will hold instead of trusting "
+                        "a truncated run inventory.".format(reason)
+                    )
+                    return RunInventory((), False, reason)
+                windows += 1
+                for run in fallback.runs:
+                    unique[str(run.get("id"))] = run
+                continue
             midpoint = (
                 window_start + (window_end - window_start) // 2
             ).replace(microsecond=0)

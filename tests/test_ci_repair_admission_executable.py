@@ -1403,10 +1403,90 @@ class AdmissionExecutableTests(unittest.TestCase):
 
         self.assertFalse(inventory.complete)
         self.assertIn("single-second", inventory.reason)
-        # An observed saturation contradicts GitHub's documented run-queue
-        # bound, so the hold names the bound instead of asking for a narrower
-        # window that cannot exist.
+        # A single-second leaf cannot be split further. This fake also returns
+        # an incomplete unfiltered history, so the hold names both the documented
+        # bound and the failed fallback instead of trusting a partial inventory.
         self.assertIn(str(module._MAX_RUNS_PER_SECOND), inventory.reason)
+
+    def test_a_saturated_single_second_window_falls_back_to_unfiltered_history(self):
+        module = self.admission_module()
+        window_runs = [
+            {
+                "id": index,
+                "display_title": "OpenCode repair PR #{}".format(PR),
+                "created_at": "2026-01-01T00:00:00Z",
+                "head_sha": HEAD,
+                "event": "workflow_dispatch",
+            }
+            for index in (1, 2)
+        ]
+        later_dispatch = {
+            "id": 3,
+            "display_title": "OpenCode repair PR #{}".format(PR),
+            "created_at": "2026-01-02T00:00:00Z",
+            "head_sha": HEAD,
+            "event": "workflow_dispatch",
+        }
+        other_event = {
+            "id": 4,
+            "display_title": "OpenCode repair PR #{}".format(PR),
+            "created_at": "2026-01-01T00:00:00Z",
+            "head_sha": HEAD,
+            "event": "workflow_run",
+        }
+        calls = []
+
+        def fake_gh(arguments, *, stdin=None):
+            joined = " ".join(arguments)
+            calls.append(arguments)
+            if "event=workflow_dispatch" in joined:
+                # The filtered single-second search is saturated at the ceiling.
+                return (
+                    0,
+                    json.dumps(
+                        [{"total_count": 2, "workflow_runs": window_runs}]
+                    ),
+                    "",
+                )
+            # The uncapped listing returns the whole history, including runs
+            # outside the window and runs from other events.
+            return (
+                0,
+                json.dumps(
+                    [
+                        {
+                            "total_count": 4,
+                            "workflow_runs": window_runs
+                            + [later_dispatch, other_event],
+                        }
+                    ]
+                ),
+                "",
+            )
+
+        with mock.patch.object(module, "_RUN_SEARCH_RESULT_CEILING", 2), mock.patch.object(
+            module, "_gh", side_effect=fake_gh
+        ):
+            inventory = module._workflow_runs(
+                REPO,
+                "continuum-opencode.yml",
+                since="2026-01-01T00:00:00Z",
+                until="2026-01-01T00:00:00Z",
+            )
+
+        self.assertTrue(inventory.complete, inventory.reason)
+        self.assertEqual([1, 2], [run["id"] for run in inventory.runs])
+        fallback_calls = [
+            arguments
+            for arguments in calls
+            if "event=workflow_dispatch" not in " ".join(arguments)
+        ]
+        self.assertTrue(fallback_calls, calls)
+        for arguments in fallback_calls:
+            joined = " ".join(arguments)
+            # The fallback must avoid every parameter that triggers the cap.
+            self.assertNotIn("created=", joined)
+            self.assertNotIn("event=workflow_dispatch", joined)
 
     def test_first_failure_persists_the_claim_before_exactly_one_dispatch(self):
         self.run_admission()
