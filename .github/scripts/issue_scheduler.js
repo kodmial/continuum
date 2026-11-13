@@ -721,6 +721,153 @@ module.exports = async function runIssueScheduler({ github, context, core }) {
       'start an explicit new generation instead of redispatching.';
   }
   
+  const checkpointResumeBlockedMarkerRe =
+    /<!--\s*continuum-checkpoint-resume-blocked\s+repo=([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)\s+issue=(\d+)\s+generation=(\d+)\s+operation=(\S+)\s+checkpoint=(\S+)\s+checkpoint_sha=([0-9a-fA-F]{40})\s+base_ref=(\S+)\s+base_sha=([0-9a-fA-F]{40})\s+snapshot=([0-9a-fA-F]{64})\s+reason=(\S+)(?:\s+episode=(\S+))?\s*-->/;
+  // The executor consumes only `continuum-task-snapshot` here and parses
+  // only the first such marker in a comment before checking its identity.
+  // A `continuum-task-snapshot-ref` marker is a PR-body reference the
+  // executor never treats as the authoritative pin, so it must not release
+  // this hold either.
+  const checkpointSnapshotMarkerRe =
+    /<!--\s*continuum-task-snapshot\s+repo=([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)\s+issue=(\d+)\s+generation=(\d+)\s+title-sha256=([0-9a-fA-F]{64})\s+body-sha256=([0-9a-fA-F]{64})\s+spec-sha256=([0-9a-fA-F]{64})\s*-->/;
+
+  // A deterministic checkpoint-continuation rejection is persisted as a
+  // typed marker. It is not an owner pause and not a terminal generation
+  // stop: the saved checkpoint is preserved and the scheduler only holds
+  // this exact identity. A changed checkpoint tip, a different authoritative
+  // pinned task snapshot, or checkpoint deletion are the only material
+  // premise changes.
+  //
+  // A manual owner /oc is not a release here. The owner command already
+  // starts its own OpenCode issue run through the `issue_comment` trigger,
+  // and that run retries this exact checkpoint without scheduler admission,
+  // so a scheduler release only adds a duplicate dispatch. The release also
+  // cannot be made durable: when a failed retry cannot publish its own
+  // rejection episode nothing records the consumption, and workflow runs are
+  // deletable, so no run inventory can prove the override was already used.
+  // A release keyed on that command would therefore recur on a later wake and
+  // resume the zero-progress retries this hold exists to stop. The hold stays
+  // until a material premise change proves the rejection stale.
+  //
+  // Two different generation concepts meet here and must never be compared
+  // with each other:
+  //   * the rejection marker's `generation` is the *recovery* generation of
+  //     the run that rejected the resume, and 429 evacuation generations can
+  //     be above 1. The rejection is bound to the checkpoint identity, so a
+  //     marker from any recovery generation >= 1 applies its hold;
+  //   * a `continuum-task-snapshot` marker's `generation` is the *task*
+  //     generation, which the workflow pins to 1 (`continuum-opencode.yml`).
+  //     Only that generation can release the hold with a different spec.
+  async function checkpointResumeHold(
+    targetOwner, targetRepo, issueNumber, comments, client, taskGeneration = 1
+  ) {
+    const wantedRepo = (targetOwner + '/' + targetRepo).toLowerCase();
+    const wantedTaskGeneration = Number(taskGeneration) || 1;
+    const trusted = (comments || []).filter(comment =>
+      isTrustedStopComment(comment, targetOwner)
+    );
+    let marker = null;
+    for (const comment of trusted) {
+      const match = String(comment.body || '').match(
+        checkpointResumeBlockedMarkerRe
+      );
+      if (!match) continue;
+      if (
+        match[1].toLowerCase() !== wantedRepo ||
+        Number(match[2]) !== issueNumber ||
+        Number(match[3]) < 1
+      ) continue;
+      const candidate = {
+        created_at: comment.created_at || '',
+        id: comment.id || 0,
+        operation: match[4],
+        checkpointRef: match[5],
+        checkpointSha: match[6].toLowerCase(),
+        baseRef: match[7],
+        baseSha: match[8].toLowerCase(),
+        snapshotSpec: match[9].toLowerCase(),
+        reason: match[10],
+      };
+      if (!marker || stopOrderKey(candidate) > stopOrderKey(marker)) {
+        marker = candidate;
+      }
+    }
+    if (!marker) return null;
+
+    // A different authoritative pinned snapshot is a material premise
+    // change. Select it exactly as the executor does: only the first
+    // `continuum-task-snapshot` marker in a comment is parsed, and identity
+    // is checked after that parse, so a comment whose first marker belongs
+    // to another repo/issue/generation is discarded whole. The earliest
+    // trusted snapshot for the task generation then wins and later
+    // duplicates are ignored, never overwritten. Comparing a later
+    // duplicate instead would dispatch against the earlier pin, or repeat
+    // the unchanged rejection when live content still matches that earlier
+    // pin. Only trusted comments can move a generation baseline: an
+    // arbitrary commenter must never release a deterministic hold by
+    // posting a forged snapshot marker.
+    let authoritativeSnapshot = null;
+    let authoritativeSnapshotOrder = '';
+    for (const comment of trusted) {
+      const match = String(comment.body || '').match(
+        checkpointSnapshotMarkerRe
+      );
+      if (!match) continue;
+      if (
+        match[1].toLowerCase() !== wantedRepo ||
+        Number(match[2]) !== issueNumber ||
+        Number(match[3]) !== wantedTaskGeneration
+      ) continue;
+      const order = (comment.created_at || '') + '#' +
+        String(comment.id || 0).padStart(12, '0');
+      if (
+        authoritativeSnapshot === null ||
+        order < authoritativeSnapshotOrder
+      ) {
+        authoritativeSnapshotOrder = order;
+        authoritativeSnapshot = match[6].toLowerCase();
+      }
+    }
+    if (
+      authoritativeSnapshot &&
+      authoritativeSnapshot !== marker.snapshotSpec
+    ) {
+      return null;
+    }
+
+    // A changed or deleted durable checkpoint ref is a material premise
+    // change. A failed read stays fail-closed: no automatic redispatch.
+    if (!marker.checkpointRef || marker.checkpointRef === '-') {
+      return marker;
+    }
+    try {
+      const refName = marker.checkpointRef.replace(/^refs\/heads\//, '');
+      const response = await client.rest.git.getRef({
+        owner: targetOwner,
+        repo: targetRepo,
+        ref: 'heads/' + refName,
+      });
+      const tip = String(response.data?.object?.sha || '').toLowerCase();
+      if (tip && tip !== marker.checkpointSha) return null;
+    } catch (err) {
+      if (err.status === 404) return null;
+      core.warning(
+        'Checkpoint-resume hold lookup failed for #' + issueNumber +
+        '; keeping the deterministic hold until it can be proven changed.'
+      );
+    }
+    return marker;
+  }
+
+  function checkpointResumeHoldSkipReason(issueNumber, hold) {
+    return 'checkpoint resume hold: #' + issueNumber +
+      ' has a deterministic checkpoint continuation rejection (' +
+      String(hold && hold.reason || 'resume-rejected') +
+      '); the saved checkpoint is preserved and this exact ' +
+      'checkpoint/base/snapshot is not redispatched until a material ' +
+      'premise changes.';
+  }
+
   const ownerResumeMarkerRe =
     /^[ \t]*<!--\s*continuum-resume-after:v1\s+predecessor=([1-9]\d*)\s*-->[ \t]*(?:\r?\n|$)/;
   const ownerResumeMarkerLineRe =
@@ -3446,6 +3593,20 @@ module.exports = async function runIssueScheduler({ github, context, core }) {
         per_page: 100,
       }
     );
+    const resumeHold = await checkpointResumeHold(
+      owner, repo, issueNumber, comments, readGithub
+    );
+    if (resumeHold) {
+      // Deterministic pre-model rejection: release the coding slot but do
+      // not apply the owner pause label and do not burn another attempt
+      // for the same checkpoint/base/snapshot identity.
+      await removeLabel(issueNumber, inProgressLabel);
+      core.notice(
+        'Released reservation on issue #' + issueNumber + ': ' +
+        checkpointResumeHoldSkipReason(issueNumber, resumeHold)
+      );
+      continue;
+    }
     const commentClasses = classifyComments(
       comments.map(comment => comment.body || '')
     );
@@ -3939,6 +4100,26 @@ module.exports = async function runIssueScheduler({ github, context, core }) {
       continue;
     }
   
+    const candidateComments = await readGithub.paginate(
+      readGithub.rest.issues.listComments,
+      {
+        owner,
+        repo,
+        issue_number: issue.number,
+        per_page: 100,
+      }
+    );
+    const candidateResumeHold = await checkpointResumeHold(
+      owner, repo, issue.number, candidateComments, readGithub
+    );
+    if (candidateResumeHold) {
+      core.info(
+        'Skipping #' + issue.number + ': ' +
+        checkpointResumeHoldSkipReason(issue.number, candidateResumeHold)
+      );
+      continue;
+    }
+  
     selected.push(candidate);
   }
   
@@ -4134,6 +4315,26 @@ module.exports = async function runIssueScheduler({ github, context, core }) {
       core.info(
         'Skipping #' + issue.number + ': ' +
         terminalStopSkipReason(issue.number, freshStop)
+      );
+      continue;
+    }
+  
+    const freshComments = await readGithub.paginate(
+      readGithub.rest.issues.listComments,
+      {
+        owner,
+        repo,
+        issue_number: issue.number,
+        per_page: 100,
+      }
+    );
+    const freshResumeHold = await checkpointResumeHold(
+      owner, repo, issue.number, freshComments, readGithub
+    );
+    if (freshResumeHold) {
+      core.info(
+        'Skipping #' + issue.number + ': ' +
+        checkpointResumeHoldSkipReason(issue.number, freshResumeHold)
       );
       continue;
     }

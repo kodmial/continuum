@@ -149,19 +149,23 @@ APPROVED_433_OPENCODE_SHA256 = (
 # #450 (main 25273b4) additionally caps post-repair inline CodeRabbit
 # verification at one request per OpenCode run; the serialized auto-merge owner
 # handles the remaining exact-HEAD findings after its shared chat-quota wait.
-# This pin records the #442 + #450 artifact for audit; the active pin below
-# covers the merged #442 + #446 + #449 + #450 bytes. Tests below and
+# The PR #448 repair additionally retries and confirms publication of the
+# deterministic checkpoint-resume hold marker instead of swallowing a failed
+# write, and main 25273b42's one-inline-request guard is part of the same
+# reviewed artifact; this is the actual full-workflow digest, not an exclusion.
+# This pin records the pre-merge artifact for audit; the active #448 pin below
+# covers the merged #448-repair + #450 bytes. Tests below and
 # test_comment_attribution independently enforce the recovery contract and its
 # diagnostic provenance; do not replace this pin with an allowlist or ignore
 # workflow differences.
 APPROVED_PROVIDER_RECOVERY_OPENCODE_SHA256 = (
-    "61c6f4d0b8c0ac6d179750096606ecc14a488933dbda5ac51defd465dc44006d"
+    "a35ebb39e4410be9b7709bf856470c352acd01efffc076cb4a0a5e776c1ee210"
 )
 
 # kodmial/continuum#446: the serialized exact-HEAD CI-repair admission owner
 # adds only the attempt/head correlation inputs and the dispatched-receipt
 # acknowledgement step. The merge with main's #442 checkpoint-resume extension
-# keeps both reviewed changes, so this active pin covers the combined bytes.
+# keeps both reviewed changes, so this pin covers the combined bytes.
 # Keep the earlier pins above for audit; later drift outside these reviewed
 # changes still fails closed.
 APPROVED_446_OPENCODE_SHA256 = (
@@ -177,10 +181,31 @@ APPROVED_446_OPENCODE_SHA256 = (
 # closed. This repair additionally binds every ci-fix run to its admitted HEAD
 # (an empty identity fails closed) and requires the dispatched attempt identity
 # before correlation may record a receipt. The merge with main's reviewed
-# one-inline-request cap (25273b4) keeps both changes, so the active pin covers
-# the combined bytes; any drift outside them still fails closed.
+# one-inline-request cap (25273b4) keeps both changes, so this pin covers the
+# combined #449 bytes; the #448 pin below covers the merge with main.
 APPROVED_449_OPENCODE_SHA256 = (
     "648a79711d211909f4c54972f82a9afb5406f31a39728fea55d70bbf33e37ddc"
+)
+
+# kodmial/continuum#448: the reviewed #449 pin above stays for audit. This
+# repair retries and confirms publication of the deterministic checkpoint-resume
+# hold marker instead of swallowing a failed write, and the merge with main
+# 91491b0 (#443 phase 2) keeps both reviewed changes. This active pin covers
+# the combined #448 + #449 + #446 + #443 bytes; unrelated drift outside them
+# still fails closed.
+APPROVED_448_OPENCODE_SHA256 = (
+    "9e8513629ce0099d6634e72c4760a16ad9f0b0777749e927d41b7d697912fdf7"
+)
+# kodmial/continuum#448 repair (review 5869670618, finding 4546745854): the
+# reviewed #448 pin above stays for audit. The deterministic checkpoint-resume
+# hold no longer releases on a later manual owner `/oc`: that command already
+# starts its own OpenCode run, and the release could not be made durable when
+# the failed retry's rejection marker was unpublished or its run was deleted.
+# Only this workflow's fail-closed diagnostic wording changed here; the retry
+# and confirmation of the hold-marker publication stay. Unrelated drift outside
+# this reviewed change still fails closed.
+APPROVED_448_REPAIR_OPENCODE_SHA256 = (
+    "886bc666915623c2e3caabfb482586aedbd23b479756175c2a0f235e617fe942"
 )
 APPROVED_446_CALLER_SHA256 = (
     "b7f3df118bc436526f48443b8f068372204073eb134c98e4a1543d025f314686"
@@ -2607,7 +2632,7 @@ class ProtectedBaselineTests(unittest.TestCase):
                     # explicitly tested optional-attestation no-key branch.
                     self.assertEqual(
                         protected_file_digest(path),
-                        APPROVED_449_OPENCODE_SHA256,
+                        APPROVED_448_REPAIR_OPENCODE_SHA256,
                         f"{path}: unexpected drift outside reviewed wording cleanup",
                     )
                 else:
@@ -2678,7 +2703,7 @@ class ProtectedBaselineTests(unittest.TestCase):
         # therefore be dirty in this pre-commit worktree; any unapproved byte
         # change still fails the exact digest assertions above.
         approved = {
-            ".github/workflows/continuum-opencode.yml": APPROVED_449_OPENCODE_SHA256,
+            ".github/workflows/continuum-opencode.yml": APPROVED_448_REPAIR_OPENCODE_SHA256,
             ".github/workflows/opencode.yml": APPROVED_350_SELF_CALLER_SHA256,
         }
         for path in PROTECTED_FILES:

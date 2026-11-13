@@ -16,7 +16,9 @@ worktree at the original task base.
 The persisted failure identity used by the scheduler/watchdog is deliberately
 small and stable so a deterministic resume rejection is not redispatched
 forever with identical inputs.  A new checkpoint SHA, task base, or pinned task
-snapshot is a material premise change and allows a new attempt.
+snapshot is a material premise change and allows a new attempt.  Each failed run
+episode carries a unique episode token so a repeated retry publishes a new hold
+marker rather than silently reusing the earlier comment.
 
 Standard library only.
 """
@@ -54,7 +56,7 @@ _FAILURE_MARKER_RE = re.compile(
     r"operation=(\S+)\s+checkpoint=(\S+)\s+"
     r"checkpoint_sha=([0-9a-f]{40})\s+base_ref=(\S+)\s+"
     r"base_sha=([0-9a-f]{40})\s+snapshot=([0-9a-f]{64})\s+"
-    r"reason=(\S+)\s*-->"
+    r"reason=(\S+)(?:\s+episode=(\S+))?\s*-->"
 )
 
 
@@ -701,9 +703,9 @@ def failure_marker(record: Mapping[str, Any]) -> str:
         text = str(record.get(key) or "").strip()
         return re.sub(r"\s+", "-", text) or default
 
-    body = [
+    marker_line = (
         "{} repo={} issue={} generation={} operation={} checkpoint={} "
-        "checkpoint_sha={} base_ref={} base_sha={} snapshot={} reason={} -->".format(
+        "checkpoint_sha={} base_ref={} base_sha={} snapshot={} reason={}".format(
             FAILURE_MARKER_PREFIX,
             value("repository"),
             value("issue"),
@@ -715,7 +717,18 @@ def failure_marker(record: Mapping[str, Any]) -> str:
             value("base_sha"),
             value("snapshot_spec"),
             value("reason"),
-        ),
+        )
+    )
+    # A rejection episode is unique per failed run attempt. The publisher only
+    # posts a marker line that is not already present, so a repeated retry of
+    # the same identity must carry a new episode to publish a new hold marker
+    # instead of silently reusing the earlier rejection comment.
+    episode = re.sub(r"\s+", "-", str(record.get("episode") or "").strip())
+    if episode:
+        marker_line += " episode={}".format(episode)
+    marker_line += " -->"
+    body = [
+        marker_line,
         "⚡ **Continuum · opencode**",
         "<!-- continuum-origin role=continuum component=opencode -->",
         "",
@@ -739,7 +752,7 @@ def failure_marker(record: Mapping[str, Any]) -> str:
 
 
 def failure_record(
-    request: ResumeRequest, error: ResumeError
+    request: ResumeRequest, error: ResumeError, *, episode: str = ""
 ) -> Dict[str, Any]:
     """Build the durable identity record for one deterministic rejection."""
 
@@ -753,6 +766,9 @@ def failure_record(
             if value not in (None, "")
         }
     )
+    episode = re.sub(r"\s+", "-", str(episode or "").strip())
+    if episode:
+        record["episode"] = episode
     record["reason"] = error.reason
     record["detail"] = error.detail
     record["marker"] = failure_marker(record)
@@ -779,6 +795,7 @@ def parse_failure_markers(body: Any) -> list[Dict[str, Any]]:
                 "base_sha": match.group(8).lower(),
                 "snapshot_spec": match.group(9).lower(),
                 "reason": match.group(10),
+                "episode": match.group(11) or "",
             }
         )
     return found
