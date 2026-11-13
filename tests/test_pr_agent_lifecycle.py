@@ -215,9 +215,11 @@ APPROVED_448_REPAIR_OPENCODE_SHA256 = (
 # kodmial/continuum#451 repair (review 5895998761): a repaired batch also
 # publishes a durable verification-pending handoff outside the review thread
 # so an unchanged HEAD still reaches CodeRabbit verification instead of
-# another repair batch.
+# another repair batch. Deduplication trusts only the PAT owner and
+# github-actions[bot], matching the authors auto-merge accepts, so a forged
+# marker from another commenter cannot suppress the real handoff.
 APPROVED_450_SERIALIZED_OPENCODE_SHA256 = (
-    "87e29d6a6810f83390daa5ac5070ca00742bd8264935fa9a7098318bc828c603"
+    "aa825a005b2dd7f4d5d8085848e690e7d8ea3aeee89c70b32b27f5cf5251744b"
 )
 APPROVED_446_CALLER_SHA256 = (
     "b7f3df118bc436526f48443b8f068372204073eb134c98e4a1543d025f314686"

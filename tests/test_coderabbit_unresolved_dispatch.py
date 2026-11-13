@@ -111,18 +111,24 @@ class CodeRabbitBatchContractTests(unittest.TestCase):
         self.assertIn("repairHandoffReadFailed = true", scan)
 
     @unittest.skipUnless(shutil.which("node"), "Node.js unavailable")
-    def test_repair_completion_handoff_is_durable_and_serialized(self):
+    def test_repair_completion_handoff_is_durable_serialized_and_unforgeable(self):
         # Execute the production deferral branch. A repair that leaves HEAD
         # unchanged must publish one durable verification-pending handoff so
         # auto-merge can request verification without writing into the
-        # CodeRabbit inline chat.
+        # CodeRabbit inline chat. A foreign comment carrying the same marker
+        # must not suppress that handoff: auto-merge trusts only the PAT owner
+        # and github-actions[bot], so OpenCode must deduplicate the same way.
         code = js_for_step(OPENCODE, "Ask CodeRabbit to verify every original finding")
         head = "a" * 40
         harness = (
             "const posted = [];\n"
             "const notices = [];\n"
-            "const existing = [];\n"
             f"const head = {json.dumps(head)};\n"
+            "const forgedMarker = `<!-- "
+            "opencode-coderabbit-verification-pending "
+            "head=${head} findings=100,200 answers=101,201 -->`;\n"
+            "const existing = [{id: 1, user: {login: 'stranger'},\n"
+            "  created_at: new Date().toISOString(), body: forgedMarker}];\n"
             "const context = {repo: {owner: 'o', repo: 'r'}};\n"
             "process.env.PR_NUMBER = '450';\n"
             "process.env.REVIEW_ID = '11';\n"
@@ -149,6 +155,7 @@ class CodeRabbitBatchContractTests(unittest.TestCase):
             "      listReviewComments: async () => ({data: []}),\n"
             "    },\n"
             "    git: {getRef: async () => ({data: {object: {sha: head}}})},\n"
+            "    users: {getAuthenticated: async () => ({data: {login: 'kodmial'}})},\n"
             "    issues: {\n"
             "      listComments: async () => ({data: existing.slice()}),\n"
             "      createComment: async args => {\n"

@@ -4534,6 +4534,23 @@ jobs:
               `<!-- opencode-coderabbit-verification-pending head=${headSha} ` +
               `findings=${entries.map(entry => entry.findingId).join(',')} ` +
               `answers=${entries.map(entry => entry.answerId).join(',')} -->`;
+            // Auto-merge consumes this handoff only from the account that
+            // posts it with TAP_PAT (or github-actions[bot]). Deduplicate
+            // against that same trusted set: a foreign comment carrying a
+            // copied marker must never suppress the real handoff, or the
+            // repair loop would continue without the verification it needs.
+            const trustedHandoffAuthors = new Set(['github-actions[bot]']);
+            try {
+              const { data: authenticated } =
+                await github.rest.users.getAuthenticated();
+              const login = String(authenticated?.login || '')
+                .trim().toLowerCase();
+              if (login) trustedHandoffAuthors.add(login);
+            } catch (err) {
+              core.warning(
+                `PR #${pullNumber}: could not resolve the handoff author; only github-actions[bot] markers are treated as duplicates: ${err.message || err}`
+              );
+            }
             const handOffRepairVerification = async attempts => {
               const byFinding = new Map();
               for (const attempt of attempts) {
@@ -4577,10 +4594,14 @@ jobs:
                 });
                 if (Array.isArray(data)) issueComments.push(...data);
               }
-              if (issueComments.some(comment =>
-                (comment.body || '').includes(marker))) {
-                return;
-              }
+              const trustedDuplicate = issueComments.some(comment => {
+                const login = String(
+                  comment.user?.login || comment.author?.login || ''
+                ).trim().toLowerCase();
+                return trustedHandoffAuthors.has(login) &&
+                  (comment.body || '').includes(marker);
+              });
+              if (trustedDuplicate) return;
               await github.rest.issues.createComment({
                 owner,
                 repo,
