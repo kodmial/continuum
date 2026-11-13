@@ -128,8 +128,31 @@ jobs:
               return found ? totalMs : null;
             }
 
+            function quotaVisibleMarkdown(body = '') {
+              let fenceChar = '';
+              let fenceLength = 0;
+              return String(body || '').split(/\r?\n/).map(line => {
+                const marker = line.match(/^[ \t]{0,3}(\x60{3,}|~{3,})/);
+                if (fenceChar) {
+                  if (marker && marker[1][0] === fenceChar &&
+                      marker[1].length >= fenceLength &&
+                      line.slice(marker[0].length).trim() === '') {
+                    fenceChar = '';
+                    fenceLength = 0;
+                  }
+                  return '';
+                }
+                if (marker) {
+                  fenceChar = marker[1][0];
+                  fenceLength = marker[1].length;
+                  return '';
+                }
+                return /^[ \t]*>/.test(line) ? '' : line;
+              }).join('\n');
+            }
+
             function parseChatQuotaDelayMs(body = '') {
-              const text = String(body || '');
+              const text = quotaVisibleMarkdown(body);
               if (!CHAT_RATE_LIMIT_HEADING_RE.test(text) &&
                 (!CHAT_RATE_LIMIT_PROSE_RE.test(text) ||
                  CHAT_RATE_LIMIT_NEGATED_RE.test(text))) {

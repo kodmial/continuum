@@ -244,6 +244,34 @@ class ChatQuotaParserTests(unittest.TestCase):
                     )["kind"],
                 )
 
+    def test_fenced_examples_do_not_hide_unresolved_findings(self):
+        # Regression: CodeRabbit PR #451 response 4564591077 was classified
+        # as a live quota merely because its UNRESOLVED finding quoted an
+        # example provider rejection inside a Markdown code fence.
+        examples = (
+            "**UNRESOLVED**\nThe parser misclassifies this example:\n\n"
+            "\x60\x60\x60text\nYou have exceeded the limit of chat messages per hour.\n"
+            "\x60\x60\x60\nA fix is still required.",
+            "**UNRESOLVED**\n~~~text\n### Rate Limit Exceeded\n"
+            "Please wait **90 minutes** before sending another message.\n"
+            "~~~\nThis is only a quoted example.",
+            "**UNRESOLVED**\n\x60\x60\x60\x60markdown\n"
+            "\x60\x60\x60text\nYou have reached the limit of chat messages per hour.\n"
+            "\x60\x60\x60\n\x60\x60\x60\x60\nThe fix is not complete.",
+        )
+        for body in examples:
+            with self.subTest(body=body):
+                self.assertIsNone(rabbit.parse_chat_retry_delay_ms(body))
+                self.assertEqual(
+                    rabbit.classify_coderabbit_reply(
+                        body, author_login="coderabbitai[bot]"
+                    )["kind"],
+                    "verdict",
+                )
+        # A real quota immediately AFTER the fenced example still counts.
+        live = examples[0] + "\n### Rate Limit Exceeded\nPlease wait **10 minutes** before sending another message."
+        self.assertEqual(rabbit.parse_chat_retry_delay_ms(live), 600_000)
+
     def test_chat_deadline_needs_a_reliable_reply_timestamp(self):
         body = fixture("chat-rate-limit-pr448.json")["threads"][0]["replies"][0]["body"]
         delay = rabbit.parse_chat_retry_delay_ms(body)
@@ -506,6 +534,34 @@ class ChatQuotaRuntimeParityTests(unittest.TestCase):
             "}).kind, 'untrusted');\n"
         )
         self.run_block(checks)
+
+    def test_js_fenced_quota_regression_in_both_workflows(self):
+        bodies = (
+            "**UNRESOLVED**\nThe parser misclassifies this example:\n\n"
+            "\x60\x60\x60text\nYou have exceeded the limit of chat messages per hour.\n"
+            "\x60\x60\x60\nA fix is still required.",
+            "**UNRESOLVED**\n~~~text\n### Rate Limit Exceeded\n"
+            "Please wait **90 minutes** before sending another message.\n"
+            "~~~\nThis is only a quoted example.",
+            "**UNRESOLVED**\n\x60\x60\x60\x60markdown\n"
+            "\x60\x60\x60text\nYou have reached the limit of chat messages per hour.\n"
+            "\x60\x60\x60\n\x60\x60\x60\x60\nThe fix is not complete.",
+        )
+        checks = (
+            "for (const body of " + json.dumps(bodies) + ") {\n"
+            "  assert.equal(parseChatQuotaDelayMs(body), null, body);\n"
+            "  assert.equal(classifyCodeRabbitReply({\n"
+            "    user: {login: 'coderabbitai[bot]'}, body\n"
+            "  }).kind, 'verdict', body);\n"
+            "}\n"
+            "assert.equal(parseChatQuotaDelayMs(\n"
+            "  'See example:\\n\x60\x60\x60\\nYou have exceeded the limit of chat messages per hour.\\n\x60\x60\x60\\n' +\n"
+            "  '### Rate Limit Exceeded\\nPlease wait **10 minutes** before sending another message.'\n"
+            "), 600000);\n"
+        )
+        for workflow in (AUTO_MERGE, UNRESOLVED):
+            with self.subTest(workflow=workflow.name):
+                self.run_block(checks, workflow=workflow)
 
     def test_js_exact_deadlines_and_two_pr_shared_quota(self):
         first = fixture("chat-rate-limit-pr448.json")

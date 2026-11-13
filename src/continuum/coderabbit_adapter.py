@@ -168,6 +168,42 @@ def is_trusted_coderabbit_author(login: Any) -> bool:
     return str(login or "").strip().lower() == CODERABBIT_BOT_LOGIN
 
 
+_QUOTA_MARKDOWN_FENCE_RE = re.compile(r"^[ \t]{0,3}(\x60{3,}|~{3,})")
+
+
+def _quota_visible_markdown(body: Any) -> str:
+    """Ignore fenced examples and blockquotes before testing quota language.
+
+    Real provider quota signals remain eligible; illustrative text in a
+    CodeRabbit UNRESOLVED finding must never suppress an actionable repair.
+    """
+    lines = []
+    fence_char = ""
+    fence_length = 0
+    for line in str(body or "").splitlines():
+        marker = _QUOTA_MARKDOWN_FENCE_RE.match(line)
+        if fence_char:
+            if (
+                marker
+                and marker.group(1)[0] == fence_char
+                and len(marker.group(1)) >= fence_length
+                and not line[marker.end():].strip()
+            ):
+                fence_char = ""
+                fence_length = 0
+            lines.append("")
+            continue
+        if marker:
+            fence_char = marker.group(1)[0]
+            fence_length = len(marker.group(1))
+            lines.append("")
+        elif re.match(r"^[ \t]*>", line):
+            lines.append("")
+        else:
+            lines.append(line)
+    return "\n".join(lines)
+
+
 def parse_chat_retry_delay_ms(body: Any) -> Optional[int]:
     """Parse an inline CodeRabbit chat-message quota reply.
 
@@ -178,7 +214,7 @@ def parse_chat_retry_delay_ms(body: Any) -> Optional[int]:
     chat-quota signal at all returns ``None``.
     """
 
-    text = str(body or "")
+    text = _quota_visible_markdown(body)
     if not _CHAT_RATE_LIMIT_HEADING_RE.search(text):
         if not _CHAT_RATE_LIMIT_PROSE_RE.search(text):
             return None
