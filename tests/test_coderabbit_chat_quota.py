@@ -445,18 +445,27 @@ class ChatQuotaWorkflowContractTests(unittest.TestCase):
             "if (chatRetryLimitedId !== null) {"
         )
         self.assertIn("if (!chatRetryAuthorResolved) {", source)
-        allow_index = source.index(
-            "if (!(await allowOneCodeRabbitChatRequest())) continue;",
+        budget_index = source.index(
+            "if (!(await codeRabbitChatBudgetAllowsSend())) continue;",
             retry_gate,
         )
         live_index = source.index(
             "const live = await getPullWithAuthoritativeHead(pr.number);",
             retry_gate,
         )
+        consume_index = source.index(
+            "if (!consumeCodeRabbitChatSendSlot()) continue;",
+            retry_gate,
+        )
         self.assertLess(
-            allow_index,
+            budget_index,
             live_index,
             "the authoritative PR/HEAD re-read must follow the shared budget scan",
+        )
+        self.assertLess(
+            live_index,
+            consume_index,
+            "the send slot must be consumed only after the live checks pass",
         )
         self.assertIn("PR/HEAD changed before the CodeRabbit chat-quota retry", source)
         self.assertIn("is no longer unresolved; skipping stale CodeRabbit chat-quota retry", source)
@@ -801,10 +810,16 @@ const github = {
 const shouldRecheckCodeRabbitAfterCi = () => false;
 const codeRabbitExplicitlyResolved = () => false;
 // The serialized cross-PR chat budget owns its own contract test in
-// tests/test_coderabbit_queue_lifecycle.py. Always allow here so these cases
-// exercise the chat-quota retry semantics in isolation from that budget.
+// tests/test_coderabbit_queue_lifecycle.py. Always allow the budget scan
+// here so these cases exercise the chat-quota retry semantics in isolation
+// from that budget; consumeCodeRabbitChatSendSlot stays overridable so the
+// stale-then-valid regression can model the single per-pass send slot.
+let codeRabbitChatBudgetAllowsSend = async () => true;
+let consumeCodeRabbitChatSendSlot = () => true;
+let codeRabbitChatSentThisPass = false;
 async function allowOneCodeRabbitChatRequest() {
-  return true;
+  if (!(await codeRabbitChatBudgetAllowsSend())) return false;
+  return consumeCodeRabbitChatSendSlot();
 }
 async function reconciliationDispatchSupport() {
   return {ok: false, reason: 'test'};
@@ -1172,6 +1187,73 @@ process.stdout.write(JSON.stringify(results));
                 self.assertEqual(result[key]["requested"], 0)
                 self.assertEqual(result[key]["posted"], 0)
                 self.assertEqual(result[key]["remaining"], 1)
+
+    def test_stale_finding_does_not_consume_the_only_send_slot(self):
+        data = fixture("chat-rate-limit-pr448.json")
+        stale_finding = data["threads"][0]["finding_id"]
+        valid_finding = stale_finding + 1
+        head = data["head_sha"]
+        chat_body = data["threads"][0]["replies"][0]["body"]
+        checks = f"""
+const staleFinding = {stale_finding};
+const validFinding = {valid_finding};
+const head = {json.dumps(head)};
+const now = Date.now();
+const expired = new Date(now - 20 * 60_000).toISOString();
+const chatBody = {json.dumps(chat_body)};
+const marker = id => `<!-- auto-merge-coderabbit-verification finding=${{id}} head=${{head}} -->`;
+pr.head.sha = head;
+liveHead = head;
+// The first finding was resolved after its quota reply; only the second is
+// still unresolved. Both are due for a chat-quota retry on this HEAD.
+comments = [
+  {{id: 900, in_reply_to_id: staleFinding, user: {{login: 'kodmial'}},
+    created_at: new Date(now - 3 * 60_000).toISOString(),
+    body: marker(staleFinding)}},
+  {{id: 901, in_reply_to_id: staleFinding, user: {{login: 'coderabbitai[bot]'}},
+    created_at: expired, body: chatBody}},
+  {{id: 910, in_reply_to_id: validFinding, user: {{login: 'kodmial'}},
+    created_at: new Date(now - 3 * 60_000).toISOString(),
+    body: marker(validFinding)}},
+  {{id: 911, in_reply_to_id: validFinding, user: {{login: 'coderabbitai[bot]'}},
+    created_at: expired, body: chatBody}},
+];
+liveThreads = [{{commentId: validFinding}}];
+let budgetChecks = 0;
+let slotsConsumed = 0;
+codeRabbitChatBudgetAllowsSend = async () => {{
+  budgetChecks += 1;
+  return true;
+}};
+consumeCodeRabbitChatSendSlot = () => {{
+  if (slotsConsumed >= 1) return false;
+  slotsConsumed += 1;
+  return true;
+}};
+posted = [];
+const state = {{remaining: 1, notBeforeMs: 0}};
+const requested = await requestCodeRabbitThreadVerification(
+  pr, [{{commentId: staleFinding}}, {{commentId: validFinding}}], {{}}, state
+);
+process.stdout.write(JSON.stringify({{
+  requested,
+  posted: posted.length,
+  postedTo: posted.map(entry => entry.comment_id),
+  remaining: state.remaining,
+  budgetChecks,
+  slotsConsumed,
+}}));
+"""
+        result = self.run_verifier(checks)
+        # The stale finding is checked after the shared budget scan but never
+        # consumes the pass's single send slot, so the still-unresolved
+        # finding can use it in the same pass.
+        self.assertEqual(result["budgetChecks"], 2)
+        self.assertEqual(result["slotsConsumed"], 1)
+        self.assertEqual(result["requested"], 1)
+        self.assertEqual(result["posted"], 1)
+        self.assertEqual(result["postedTo"], [valid_finding])
+        self.assertEqual(result["remaining"], 0)
 
 
 def unresolved_collector_source() -> str:

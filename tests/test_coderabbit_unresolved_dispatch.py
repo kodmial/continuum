@@ -66,7 +66,13 @@ class CodeRabbitBatchContractTests(unittest.TestCase):
         merge = (ROOT / ".github/workflows/continuum-auto-merge.yml").read_text(
             encoding="utf-8"
         )
-        self.assertEqual(merge.count("await allowOneCodeRabbitChatRequest()"), 2)
+        self.assertEqual(
+            merge.count("await allowOneCodeRabbitChatRequest()") +
+            merge.count("if (!(await codeRabbitChatBudgetAllowsSend())) continue;"),
+            2,
+            "both post-CI and retry replies must pass the shared chat budget",
+        )
+        self.assertIn("if (!consumeCodeRabbitChatSendSlot()) continue;", merge)
         self.assertIn("codeRabbitChatLimitNotBefore(comment)", merge)
 
     def test_installed_caller_declares_and_forwards_pr_number_for_reconciliation(self):

@@ -1843,8 +1843,7 @@ jobs:
                body.includes('<!-- opencode-coderabbit-verification review='));
           }
 
-          async function allowOneCodeRabbitChatRequest() {
-            if (codeRabbitChatSentThisPass) return false;
+          async function codeRabbitChatBudgetAllowsSend() {
             if (codeRabbitChatNextAllowedAt === null) {
               let notBefore = 0;
               // Scan the newest verified comments of *all* open PRs, not
@@ -1913,8 +1912,20 @@ jobs:
               );
               return false;
             }
+            return true;
+          }
+
+          // Consume the single legal send only after every live check has
+          // passed. A skipped stale finding must not burn the pass's slot.
+          function consumeCodeRabbitChatSendSlot() {
+            if (codeRabbitChatSentThisPass) return false;
             codeRabbitChatSentThisPass = true;
             return true;
+          }
+
+          async function allowOneCodeRabbitChatRequest() {
+            if (!(await codeRabbitChatBudgetAllowsSend())) return false;
+            return consumeCodeRabbitChatSendSlot();
           }
 
           function shouldRecheckCodeRabbitAfterCi(answer, ci, alreadyRequested) {
@@ -2285,7 +2296,8 @@ jobs:
                 'Otherwise explain exactly what remains unresolved.',
               ].join('\n');
 
-              if (!(await allowOneCodeRabbitChatRequest())) continue;
+              if (!(await codeRabbitChatBudgetAllowsSend())) continue;
+              if (codeRabbitChatSentThisPass) continue;
               if (chatRetryLimitedId !== null) {
                 // Deadline reached: after the shared chat-budget scan,
                 // re-read live state and retry only the same still-open,
@@ -2306,6 +2318,11 @@ jobs:
                   );
                   continue;
                 }
+              }
+              // Consume the single send slot only after the live checks pass,
+              // so a stale finding cannot block another thread in this pass.
+              if (!consumeCodeRabbitChatSendSlot()) continue;
+              if (chatRetryLimitedId !== null) {
                 chatQuotaState.remaining =
                   Number(chatQuotaState.remaining || 0) - 1;
               }

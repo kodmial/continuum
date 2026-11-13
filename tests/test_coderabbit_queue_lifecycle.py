@@ -977,8 +977,17 @@ global.Date = Clock;
         end = source.index("          async function cancelObsoleteRuns(", start)
         scope = source[start:end]
         self.assertEqual(
-            scope.count("await allowOneCodeRabbitChatRequest()"), 2,
-            "both post-CI and initial CodeRabbit replies must pass the budget",
+            scope.count("await allowOneCodeRabbitChatRequest()"), 1,
+            "the post-CI reply must pass the serialized chat budget",
+        )
+        self.assertEqual(
+            scope.count("if (!(await codeRabbitChatBudgetAllowsSend())) continue;"),
+            1,
+            "the chat-quota retry must scan the budget before its live checks",
+        )
+        self.assertEqual(
+            scope.count("if (!consumeCodeRabbitChatSendSlot()) continue;"), 1,
+            "the retry must consume its send slot only after the live checks",
         )
         self.assertIn("!isCodeRabbitChatLimitReply(comment)", scope)
         self.assertIn("codeRabbitChatSentThisPass = true", source)
