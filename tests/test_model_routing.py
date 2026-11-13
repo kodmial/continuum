@@ -1832,6 +1832,31 @@ class AttestationRecoveryContractTests(unittest.TestCase):
         self.assertIn('CONTINUUM_MODEL_STATE_NOT_BEFORE_EPOCH:-', schedule)
         self.assertNotIn("operation: fail", schedule)
 
+    def test_preflight_retryable_failure_only_routes_to_recovery(self):
+        step = self._block(
+            "      - name: Qualify native OpenCode v2 PR-Agent session API",
+            "      - name: Revalidate the admitted exact HEAD immediately before review")
+        self.assertIn("id: qualify_preflight", step)
+        self.assertIn('echo "retryable=true" >> "$GITHUB_OUTPUT"', step)
+        self.assertIn('echo "retryable=false" >> "$GITHUB_OUTPUT"', step)
+        self.assertIn('if [[ "$status" -eq 3 ]]', step)
+        clause = ("(steps.qualify_preflight.outcome == 'failure' &&\n"
+                  "            steps.qualify_preflight.outputs.retryable == 'true')")
+        status = self._block(
+            "      - name: Publish failed PR-Agent review state",
+            "      - name: Fail closed on a moved head")
+        self.assertIn(
+            "(steps.qualify_preflight.outcome == 'failure' && "
+            "steps.qualify_preflight.outputs.retryable == 'true')", status)
+        controller = self._block(
+            "      - name: Update persistent PR-Agent retry controller state",
+            "      - name: Schedule bounded retry for retryable PR-Agent review failure")
+        self.assertIn(clause, controller)
+        schedule = self.workflow.split(
+            "      - name: Schedule bounded retry for retryable PR-Agent review failure",
+            1)[1]
+        self.assertIn(clause, schedule)
+
     def test_success_status_and_merge_require_completed_attestation(self):
         attestation_at = self.workflow.index(
             "      - name: Attest successful independent OpenCode review")

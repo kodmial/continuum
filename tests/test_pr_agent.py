@@ -248,8 +248,10 @@ class FakeOpenCodeHandler(BaseHTTPRequestHandler):
         body = json.loads(self.rfile.read(length).decode() or "{}")
         if self.path == "/api/session":
             sid = f"ses-{len(type(self).sessions) + 1}"
-            type(self).sessions[sid] = True
-            self._send(200, {"data": {"id": sid}})
+            type(self).sessions[sid] = body.get("permissions") or []
+            self._send(200, {"data": {
+                "id": sid, "permissions": type(self).sessions[sid],
+            }})
             return
         if self.path.endswith("/agent"):
             type(self).selected_agents.append(body)
@@ -288,6 +290,17 @@ class FakeOpenCodeHandler(BaseHTTPRequestHandler):
                     "cursor": {"next": None, "previous": None},
                 },
             )
+            return
+        if self.path.startswith("/api/session/"):
+            sid = self.path.rsplit("/", 1)[-1]
+            if sid not in type(self).sessions:
+                self._send(404, {"error": "unknown session"})
+                return
+            self._send(200, {"data": {
+                "id": sid,
+                "permissions": type(self).sessions[sid],
+                "outcome": "succeeded",
+            }})
             return
         self._send(405, {"error": "obsolete method"})
 

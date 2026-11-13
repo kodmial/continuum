@@ -1069,6 +1069,7 @@ jobs:
           exit 1
 
       - name: Qualify native OpenCode v2 PR-Agent session API
+        id: qualify_preflight
         if: steps.stack.outputs.enabled == 'true' && steps.admit.outputs.admitted == 'true'
         env:
           BRIDGE_SCRIPT: ${{ steps.runtime.outputs.bridge_script }}
@@ -1079,7 +1080,18 @@ jobs:
           # The bridge's actual control API is exercised before review. A
           # v1/v2 ABI mismatch is a deterministic infrastructure failure,
           # not a model outage and must not consume reviewer inference budget.
+          # The bridge reserves exit status 3 for a retryable failure (429/5xx)
+          # and 1 for a protocol mismatch, so only the former is retryable.
+          set +e
           python3 "$BRIDGE_SCRIPT" --preflight
+          status=$?
+          set -e
+          if [[ "$status" -eq 3 ]]; then
+            echo "retryable=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "retryable=false" >> "$GITHUB_OUTPUT"
+          fi
+          exit "$status"
 
       - name: Revalidate the admitted exact HEAD immediately before review
         if: steps.stack.outputs.enabled == 'true' && steps.admit.outputs.admitted == 'true'
@@ -3118,7 +3130,7 @@ jobs:
         env:
           HEAD_SHA: ${{ steps.admit.outputs.head_sha }}
           PR_NUMBER: ${{ steps.stack.outputs.pr_number }}
-          RETRYABLE_FAILURE: ${{ (steps.retry_state.outputs.cooldown_active == 'true' || steps.model_route.outcome == 'failure' || steps.install_pragent.outcome == 'failure' || steps.install_opencode.outcome == 'failure' || steps.start_opencode.outcome == 'failure' || steps.runtime.outcome == 'failure' || steps.start_bridge.outcome == 'failure' || steps.pragent.outcome == 'failure' || steps.before.outputs.transient == 'true' || steps.result.outcome == 'failure' || steps.persistent.outcome == 'failure' || steps.improve_gate.outcome == 'failure' || steps.improve.outcome == 'failure' || steps.improve_skipped.outcome == 'failure' || steps.post_improve.outcome == 'failure' || steps.improve_output.outcome == 'failure' || (steps.review_attestation.outcome == 'failure' && env.CONTINUUM_MODEL_STATE_TRANSIENT != '')) && steps.result.outputs.stale_head != 'true' && steps.persistent.outputs.stale_head != 'true' && steps.improve_gate.outputs.stale_head != 'true' && steps.improve.outputs.stale_head != 'true' && steps.improve_skipped.outputs.stale_head != 'true' && steps.post_improve.outputs.stale_head != 'true' && 'true' || 'false' }}
+          RETRYABLE_FAILURE: ${{ (steps.retry_state.outputs.cooldown_active == 'true' || steps.model_route.outcome == 'failure' || steps.install_pragent.outcome == 'failure' || steps.install_opencode.outcome == 'failure' || steps.start_opencode.outcome == 'failure' || steps.runtime.outcome == 'failure' || steps.start_bridge.outcome == 'failure' || (steps.qualify_preflight.outcome == 'failure' && steps.qualify_preflight.outputs.retryable == 'true') || steps.pragent.outcome == 'failure' || steps.before.outputs.transient == 'true' || steps.result.outcome == 'failure' || steps.persistent.outcome == 'failure' || steps.improve_gate.outcome == 'failure' || steps.improve.outcome == 'failure' || steps.improve_skipped.outcome == 'failure' || steps.post_improve.outcome == 'failure' || steps.improve_output.outcome == 'failure' || (steps.review_attestation.outcome == 'failure' && env.CONTINUUM_MODEL_STATE_TRANSIENT != '')) && steps.result.outputs.stale_head != 'true' && steps.persistent.outputs.stale_head != 'true' && steps.improve_gate.outputs.stale_head != 'true' && steps.improve.outputs.stale_head != 'true' && steps.improve_skipped.outputs.stale_head != 'true' && steps.post_improve.outputs.stale_head != 'true' && 'true' || 'false' }}
         with:
           github-token: ${{ env.CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED == 'true' && secrets.TAP_PAT || (env.CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED != 'true' && github.token || '') }}
           script: |
@@ -3232,6 +3244,8 @@ jobs:
            steps.start_opencode.outcome == 'failure' ||
            steps.runtime.outcome == 'failure' ||
            steps.start_bridge.outcome == 'failure' ||
+           (steps.qualify_preflight.outcome == 'failure' &&
+            steps.qualify_preflight.outputs.retryable == 'true') ||
            steps.pragent.outcome == 'failure' ||
            steps.before.outputs.transient == 'true' ||
            steps.result.outcome == 'failure' ||
@@ -3377,6 +3391,8 @@ jobs:
            steps.start_opencode.outcome == 'failure' ||
            steps.runtime.outcome == 'failure' ||
            steps.start_bridge.outcome == 'failure' ||
+           (steps.qualify_preflight.outcome == 'failure' &&
+            steps.qualify_preflight.outputs.retryable == 'true') ||
            steps.pragent.outcome == 'failure' ||
            steps.before.outputs.transient == 'true' ||
            steps.result.outcome == 'failure' ||
