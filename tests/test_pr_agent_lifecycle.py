@@ -148,12 +148,13 @@ APPROVED_433_OPENCODE_SHA256 = (
 # an issue-checkpoint identity check and isolated original-base verification.
 # The PR #448 repair additionally retries and confirms publication of the
 # deterministic checkpoint-resume hold marker instead of swallowing a failed
-# write. Pin the complete resulting bytes. Tests below and
+# write. This reviewed pin also includes main 25273b42's one-inline-request
+# guard; it is the actual full-workflow digest, not an exclusion. Pin the complete resulting bytes. Tests below and
 # test_comment_attribution independently enforce the recovery contract and
 # its diagnostic provenance; do not replace this pin with an allowlist or
 # ignore workflow differences.
 APPROVED_PROVIDER_RECOVERY_OPENCODE_SHA256 = (
-    "2a80745f08abb75321bdcf0880f6aec79eb0dbd311b68f1bae754daab902e6bd"
+    "a35ebb39e4410be9b7709bf856470c352acd01efffc076cb4a0a5e776c1ee210"
 )
 
 # Additional reviewed self-caller change: owner-only CodeRabbit repair dispatch
