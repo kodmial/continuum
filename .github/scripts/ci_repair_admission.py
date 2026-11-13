@@ -723,6 +723,15 @@ def _dispatch(
 #: GitHub caps a filtered workflow-run search at 1,000 retrievable results.
 #: Every historical window must therefore stay strictly below this ceiling.
 _RUN_SEARCH_RESULT_CEILING = 1000
+#: GitHub documents an Actions queue limit of 500 workflow runs per 10-second
+#: interval per repository; runs beyond it are blocked instead of created
+#: ("Actions limits", "Workflow run queued"). Any single second therefore holds
+#: at most 500 runs, which is below the search ceiling above. That documented
+#: bound is what rules out a saturated one-second window: bisection never needs
+#: a narrower unit than a second, and the leaf is never assumed complete. If
+#: GitHub ever observed more runs in one second, the inventory stays incomplete
+#: and admission holds rather than trusting a partial history.
+_MAX_RUNS_PER_SECOND = 500
 _RUN_HISTORY_START = datetime(1970, 1, 1, tzinfo=timezone.utc)
 
 
@@ -843,6 +852,14 @@ def _workflow_runs(
     creation windows instead. A saturated window is bisected down to single
     seconds; each leaf is paginated independently, and the unique run IDs are
     reconciled before the combined inventory is reported complete.
+
+    One second is the narrowest unit needed because GitHub queues at most 500
+    runs per 10-second interval per repository, which keeps a single second
+    below the 1,000-result ceiling; :data:`_MAX_RUNS_PER_SECOND` records that
+    bound and the test suite pins it against the ceiling. A leaf that still
+    reports saturation contradicts the documented bound, so the inventory is
+    reported incomplete and the caller holds instead of trusting a truncated
+    history.
     """
 
     start = _parse_run_window_timestamp(since, "since") or _RUN_HISTORY_START
@@ -873,12 +890,23 @@ def _workflow_runs(
         )
         if needs_split:
             if window_start >= window_end:
+                print(
+                    "::warning::A single-second workflow run creation window "
+                    "reaches GitHub's filtered-result ceiling, exceeding the "
+                    "documented bound of {} runs per second. Admission will hold "
+                    "instead of trusting a truncated run inventory.".format(
+                        _MAX_RUNS_PER_SECOND
+                    )
+                )
                 return RunInventory(
                     (),
                     False,
                     (
                         "a single-second workflow run creation window still "
-                        "reaches GitHub's filtered-result ceiling"
+                        "reaches GitHub's filtered-result ceiling, exceeding the "
+                        "documented bound of {} runs per second".format(
+                            _MAX_RUNS_PER_SECOND
+                        )
                     ),
                 )
             midpoint = (

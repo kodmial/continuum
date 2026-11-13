@@ -1351,6 +1351,20 @@ class AdmissionExecutableTests(unittest.TestCase):
         for start, end, window in calls:
             self.assertLessEqual(start, end, window)
 
+    def test_the_documented_queue_bound_rules_out_a_saturated_second(self):
+        # GitHub queues at most 500 workflow runs per 10-second interval per
+        # repository, so any single second holds at most 500 runs. That
+        # documented bound is what keeps the one-second leaf of the run
+        # inventory below GitHub's 1,000-result filtered-search ceiling, so the
+        # leaf can never legitimately saturate.
+        module = self.admission_module()
+        self.assertEqual(500, module._MAX_RUNS_PER_SECOND)
+        self.assertGreater(
+            module._RUN_SEARCH_RESULT_CEILING,
+            module._MAX_RUNS_PER_SECOND,
+            "a single second could saturate the filtered-run search ceiling",
+        )
+
     def test_a_single_second_window_that_stays_saturated_is_incomplete(self):
         module = self.admission_module()
 
@@ -1389,6 +1403,10 @@ class AdmissionExecutableTests(unittest.TestCase):
 
         self.assertFalse(inventory.complete)
         self.assertIn("single-second", inventory.reason)
+        # An observed saturation contradicts GitHub's documented run-queue
+        # bound, so the hold names the bound instead of asking for a narrower
+        # window that cannot exist.
+        self.assertIn(str(module._MAX_RUNS_PER_SECOND), inventory.reason)
 
     def test_first_failure_persists_the_claim_before_exactly_one_dispatch(self):
         self.run_admission()
