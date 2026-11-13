@@ -192,6 +192,17 @@ APPROVED_449_OPENCODE_SHA256 = (
 APPROVED_448_OPENCODE_SHA256 = (
     "9e8513629ce0099d6634e72c4760a16ad9f0b0777749e927d41b7d697912fdf7"
 )
+# kodmial/continuum#448 repair (review 5869670618, finding 4546745854): the
+# reviewed #448 pin above stays for audit. The deterministic checkpoint-resume
+# hold no longer releases on a later manual owner `/oc`: that command already
+# starts its own OpenCode run, and the release could not be made durable when
+# the failed retry's rejection marker was unpublished or its run was deleted.
+# Only this workflow's fail-closed diagnostic wording changed here; the retry
+# and confirmation of the hold-marker publication stay. Unrelated drift outside
+# this reviewed change still fails closed.
+APPROVED_448_REPAIR_OPENCODE_SHA256 = (
+    "886bc666915623c2e3caabfb482586aedbd23b479756175c2a0f235e617fe942"
+)
 APPROVED_446_CALLER_SHA256 = (
     "b7f3df118bc436526f48443b8f068372204073eb134c98e4a1543d025f314686"
 )
@@ -2617,7 +2628,7 @@ class ProtectedBaselineTests(unittest.TestCase):
                     # explicitly tested optional-attestation no-key branch.
                     self.assertEqual(
                         protected_file_digest(path),
-                        APPROVED_448_OPENCODE_SHA256,
+                        APPROVED_448_REPAIR_OPENCODE_SHA256,
                         f"{path}: unexpected drift outside reviewed wording cleanup",
                     )
                 else:
@@ -2688,7 +2699,7 @@ class ProtectedBaselineTests(unittest.TestCase):
         # therefore be dirty in this pre-commit worktree; any unapproved byte
         # change still fails the exact digest assertions above.
         approved = {
-            ".github/workflows/continuum-opencode.yml": APPROVED_448_OPENCODE_SHA256,
+            ".github/workflows/continuum-opencode.yml": APPROVED_448_REPAIR_OPENCODE_SHA256,
             ".github/workflows/opencode.yml": APPROVED_350_SELF_CALLER_SHA256,
         }
         for path in PROTECTED_FILES:

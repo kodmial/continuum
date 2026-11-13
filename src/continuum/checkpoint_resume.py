@@ -17,8 +17,8 @@ The persisted failure identity used by the scheduler/watchdog is deliberately
 small and stable so a deterministic resume rejection is not redispatched
 forever with identical inputs.  A new checkpoint SHA, task base, or pinned task
 snapshot is a material premise change and allows a new attempt.  Each failed run
-episode carries a unique episode token so a repeated manual retry publishes a
-new hold marker instead of inheriting the earlier owner override.
+episode carries a unique episode token so a repeated retry publishes a new hold
+marker rather than silently reusing the earlier comment.
 
 Standard library only.
 """
@@ -720,9 +720,9 @@ def failure_marker(record: Mapping[str, Any]) -> str:
         )
     )
     # A rejection episode is unique per failed run attempt. The publisher only
-    # posts a marker line that is not already present, so a repeated manual
-    # retry of the same identity must carry a new episode to publish a new
-    # hold marker instead of leaving the earlier owner /oc release in force.
+    # posts a marker line that is not already present, so a repeated retry of
+    # the same identity must carry a new episode to publish a new hold marker
+    # instead of silently reusing the earlier rejection comment.
     episode = re.sub(r"\s+", "-", str(record.get("episode") or "").strip())
     if episode:
         marker_line += " episode={}".format(episode)

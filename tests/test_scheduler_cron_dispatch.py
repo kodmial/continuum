@@ -454,10 +454,6 @@ class CheckpointResumeHoldRegressionTests(unittest.TestCase):
         helper = source[start:end]
         harness = r"""
 const assert = require('assert');
-const { execFileSync } = require('child_process');
-const dispatchMarker = '<!-- issue-scheduler-dispatch -->';
-const opencodeWorkflowPath = '.github/workflows/opencode.yml';
-const opencodeWorkflowName = 'OpenCode agent';
 const core = { warning: () => {} };
 function isTrustedStopComment(c, owner) {
   return ['OWNER', 'MEMBER', 'COLLABORATOR'].includes(c.author_association) ||
@@ -466,14 +462,6 @@ function isTrustedStopComment(c, owner) {
 function stopOrderKey(c) {
   return String(c.created_at || '') + '#' +
     String(c.id || 0).padStart(12, '0');
-}
-function classifyComments(bodies) {
-  const output = execFileSync(
-    'python3',
-    ['.github/scripts/opencode_command.py', 'classify-json'],
-    { input: JSON.stringify(bodies), encoding: 'utf8' }
-  );
-  return JSON.parse(output);
 }
 """ + helper + r"""
 (async () => {
@@ -497,62 +485,12 @@ function classifyComments(bodies) {
   const auto = item(2, '/oc\n\n<!-- issue-scheduler-dispatch -->');
   const watchdog = item(3, '/oc\n\n<!-- opencode-watchdog-retry -->');
   const manual = item(4, '/oc\ncheck again');
-  const legacyIssueTitle = 'Legacy caller without run-name';
-  const client = (
-    tip = sha, workflowRuns = [], issueTitle = legacyIssueTitle
-  ) => ({
+  // Only the checkpoint ref is consulted. No workflow-run inventory and no
+  // issue-title lookup is part of the hold decision any more, so the client
+  // intentionally exposes nothing else.
+  const client = (tip = sha) => ({
     rest: {
-      git: { getRef: async () => ({ data: { object: { sha: tip } } }) },
-      issues: {
-        get: async () => ({ data: { number: 442, title: issueTitle } })
-      },
-      actions: {
-        listWorkflowRunsForRepo: async () => ({
-          data: { workflow_runs: workflowRuns }
-        })
-      }
-    }
-  });
-  const issueRun = (createdAt = '2026-11-12T04:30:00Z', overrides = {}) => ({
-    id: 900,
-    name: 'OpenCode agent',
-    path: '.github/workflows/opencode.yml',
-    event: 'issue_comment',
-    display_title: 'OpenCode issue #442',
-    created_at: createdAt,
-    ...overrides
-  });
-  const pagedClient = (totalCount, matchIndex = -1) => ({
-    rest: {
-      git: { getRef: async () => ({ data: { object: { sha } } }) },
-      issues: {
-        get: async () => ({ data: { number: 442, title: legacyIssueTitle } })
-      },
-      actions: {
-        listWorkflowRunsForRepo: async ({ page = 1, per_page = 100 } = {}) => {
-          const start = (page - 1) * per_page;
-          const count = Math.max(
-            0, Math.min(per_page, totalCount - start)
-          );
-          return {
-            data: {
-              total_count: totalCount,
-              workflow_runs: Array.from({ length: count }, (_, offset) => {
-                const index = start + offset;
-                if (index === matchIndex) return issueRun();
-                return {
-                  id: 1000 + index,
-                  name: 'Unrelated workflow',
-                  path: '.github/workflows/other.yml',
-                  event: 'push',
-                  display_title: 'Unrelated run ' + index,
-                  created_at: '2026-11-12T04:30:00Z'
-                };
-              })
-            }
-          };
-        }
-      }
+      git: { getRef: async () => ({ data: { object: { sha: tip } } }) }
     }
   });
   const hold = (comments, cl = client()) =>
@@ -577,94 +515,13 @@ function classifyComments(bodies) {
     await hold([saved, item(8, '    /oc')]),
     'an indented /oc code block must not waive the hold'
   );
-  assert.equal(await hold([saved, manual]), null, 'manual owner /oc may resume');
   assert.ok(
-    await hold([saved, manual], client(sha, [issueRun()])),
-    'an owner /oc whose own OpenCode run already started consumes the override'
-  );
-  assert.equal(
-    await hold(
-      [saved, manual], client(sha, [issueRun('2026-11-12T04:00:00Z')])
-    ),
-    null,
-    'a run older than the owner /oc must not consume the override'
-  );
-  assert.equal(
-    await hold(
-      [saved, manual],
-      client(sha, [issueRun('2026-11-12T04:30:00Z', {
-        display_title: 'OpenCode issue #999'
-      })])
-    ),
-    null,
-    'an OpenCode run for another issue must not consume the override'
+    await hold([saved, manual]),
+    'a manual owner /oc must not waive the deterministic hold'
   );
   assert.ok(
-    await hold(
-      [saved, manual],
-      client(sha, [issueRun('2026-11-12T04:30:00Z', {
-        display_title: legacyIssueTitle
-      })])
-    ),
-    'a legacy caller run titled with the issue title must consume the override'
-  );
-  assert.equal(
-    await hold(
-      [saved, manual],
-      client(sha, [issueRun('2026-11-12T04:30:00Z', {
-        event: 'workflow_dispatch',
-        display_title: legacyIssueTitle
-      })])
-    ),
-    null,
-    'only an issue_comment run may use the legacy issue-title identity'
-  );
-  assert.ok(
-    await hold(
-      [saved, manual],
-      client(sha, [issueRun('2026-11-12T04:04:00Z', { id: 3 })])
-    ),
-    'a same-second run whose lower id cannot be ordered must keep the hold'
-  );
-  assert.ok(
-    await hold([saved, manual], {
-      rest: {
-        git: { getRef: async () => ({ data: { object: { sha } } }) },
-        issues: {
-          get: async () => { throw { status: 503 }; }
-        },
-        actions: {
-          listWorkflowRunsForRepo: async () => ({
-            data: { workflow_runs: [] }
-          })
-        }
-      }
-    }),
-    'an unreadable issue title must keep the hold fail-closed'
-  );
-  assert.ok(
-    await hold([saved, manual], {
-      rest: {
-        git: { getRef: async () => ({ data: { object: { sha } } }) },
-        actions: {
-          listWorkflowRunsForRepo: async () => { throw { status: 503 }; }
-        }
-      }
-    }),
-    'an unreadable run inventory must keep the hold fail-closed'
-  );
-  assert.ok(
-    await hold([saved, manual], pagedClient(301)),
-    'a truncated run inventory must keep the hold fail-closed'
-  );
-  assert.ok(
-    await hold([saved, manual], pagedClient(301, 300)),
-    'a retry run outside the inspected inventory window must keep the hold'
-  );
-  assert.equal(
-    await hold([saved, manual], pagedClient(300)),
-    null,
-    'a complete inventory that reports its exact total may release'
+    await hold([saved, manual], { rest: {} }),
+    'the hold must never need a workflow-run inventory to stay closed'
   );
   const retried = item(9, marker.replace(
     ' reason=verification-failed -->',
@@ -674,34 +531,30 @@ function classifyComments(bodies) {
     await hold([saved, manual, retried]),
     'a new hold episode after a failed manual retry must restore the hold'
   );
-  assert.equal(
+  assert.ok(
     await hold([saved, manual, retried, item(10, '/oc\nretry again')]),
-    null,
-    'a later manual /oc after the new hold episode may resume'
+    'a later manual /oc after the new hold episode must keep the hold'
   );
   const schedulerDispatch = item(11,
     '/oc\n\n<!-- issue-scheduler-dispatch -->\nretry');
   assert.ok(
     await hold([saved, manual, schedulerDispatch]),
-    'a recorded automatic dispatch consumes the manual override'
+    'a recorded automatic dispatch cannot reopen the manual override'
   );
   assert.ok(
     await hold([saved, manual, item(12,
       '/oc\n\n<!-- opencode-watchdog-retry -->\n' +
       '<!-- continuum-origin role=continuum component=opencode-watchdog -->')]),
-    'a recorded watchdog retry consumes the manual override'
+    'a recorded watchdog retry cannot reopen the manual override'
+  );
+  assert.equal(await hold([saved], client('d'.repeat(40))), null,
+    'changed checkpoint SHA releases the hold');
+  assert.equal(
+    await hold([saved, manual], client('d'.repeat(40))), null,
+    'a changed checkpoint still releases the hold after a manual /oc'
   );
   assert.equal(
-    await hold([
-      saved, manual, schedulerDispatch, item(13, '/oc\nretry again')
-    ]),
-    null,
-    'a new manual /oc after the consumed override may resume'
-  );
-  assert.equal(await hold([saved, manual], client('d'.repeat(40))), null,
-    'changed checkpoint SHA still releases a manual override');
-  assert.equal(
-    await hold([saved, manual], client('d'.repeat(40), [issueRun()])), null,
+    await hold([saved, manual, retried], client('d'.repeat(40))), null,
     'a changed checkpoint still releases the hold after an owner retry run'
   );
   assert.equal(await hold([item(1, marker, 'outsider')]), null,
@@ -755,33 +608,21 @@ function classifyComments(bodies) {
             root / ".github/workflows/continuum-opencode-watchdog.yml"
         ).read_text(encoding="utf-8")
         self.assertEqual(scheduler.count("await checkpointResumeHold("), 3)
-        self.assertIn(
-            "async function openCodeIssueRunStartedAfter(", scheduler
-        )
-        self.assertIn(
-            "await openCodeIssueRunStartedAfter(", scheduler
-        )
-        self.assertIn(
-            "async function openCodeIssueRunStartedAfter(", watchdog
-        )
-        self.assertIn(
-            "await openCodeIssueRunStartedAfter(", watchdog
-        )
+        # A manual owner /oc already starts its own OpenCode run, so the hold
+        # never consults owner commands or a workflow-run inventory: those
+        # releases were not durable (runs are deletable) and could resume the
+        # identical zero-progress retry.
+        self.assertNotIn("openCodeIssueRunStartedAfter", scheduler)
+        self.assertNotIn("openCodeIssueRunStartedAfter", watchdog)
+        self.assertNotIn("listWorkflowRunsForRepo", scheduler.split(
+            "async function checkpointResumeHold(", 1
+        )[1].split("function checkpointResumeHoldSkipReason", 1)[0])
         self.assertIn("await removeLabel(issueNumber, inProgressLabel)", scheduler)
-        self.assertIn("!body.includes(dispatchMarker)", scheduler)
-        self.assertIn("!body.includes(watchdogOriginMarker)", scheduler)
-        self.assertIn("!body.includes('<!-- opencode-watchdog-retry -->')", scheduler)
-        self.assertIn("ownerClasses[index] === 'run'", scheduler)
         self.assertIn("checkpointResumeBlockedRe", watchdog)
         self.assertIn("async function checkpointResumeHold(", watchdog)
         self.assertIn("recoveryCheckpointRef = null", watchdog)
         self.assertIn("normalizeCheckpointRef(match[5])", watchdog)
-        self.assertIn("function classifyComments(bodies)", watchdog)
-        self.assertIn("if (body.includes(dispatchMarker)) continue;", watchdog)
-        self.assertIn("if (body.includes(retryMarker)) continue;", watchdog)
-        self.assertIn(
-            "if (body.includes(watchdogAutomationMarker)) continue;", watchdog
-        )
+        self.assertIn("return { blocked: true, marker };", watchdog)
         self.assertIn(
             "const hold = await checkpointResumeHold(", watchdog
         )

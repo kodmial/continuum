@@ -1230,10 +1230,12 @@ class WatchdogHarness(unittest.TestCase):
         result = self.run_scenario(scenario)
         self.assertEqual(self.retried_bodies(result), [])
 
-    def test_unpublished_failed_manual_retry_consumes_the_override(self):
+    def test_unpublished_failed_manual_retry_never_reopens_the_hold(self):
         # The publisher fails closed when it cannot record the new rejection
-        # episode. The owner's own /oc run is still a durable record that the
-        # one-shot override was already used, so no automatic retry follows.
+        # episode, and the failed retry run may then be deleted. Nothing
+        # durable proves that the manual override was consumed, so the hold
+        # must stay closed instead of letting a later wake redispatch the
+        # identical checkpoint. No run inventory is consulted for that.
         scenario = self.normal_retry_scenario()
         scenario["comments"].extend([
             thread_comment(20, hold_marker(), "2026-10-23T09:50:00Z"),
@@ -1241,23 +1243,13 @@ class WatchdogHarness(unittest.TestCase):
                 21, "/oc", "2026-10-23T10:00:00Z", login="kodmial"
             ),
         ])
-        scenario["runs"].append({
-            "id": 4444,
-            "status": "completed",
-            "conclusion": "failure",
-            "event": "issue_comment",
-            "path": ".github/workflows/opencode.yml",
-            "name": "OpenCode agent",
-            "display_title": "OpenCode issue #382",
-            "created_at": "2026-10-23T10:00:05Z",
-        })
         result = self.run_scenario(scenario)
         self.assertEqual(self.retried_bodies(result), [], result["comments"])
 
-    def test_unpublished_legacy_titled_manual_retry_consumes_the_override(self):
+    def test_unpublished_legacy_titled_manual_retry_keeps_the_hold(self):
         # A caller without `run-name:` titles its run with the issue title.
-        # That completed retry run must still be recognized as the owner's
-        # consumed one-shot override.
+        # The hold no longer depends on workflow-run identity at all, so that
+        # legacy-titled failure run cannot reopen the manual override.
         scenario = self.normal_retry_scenario()
         legacy_title = "Legacy caller without run-name"
         scenario["issues"] = [{
@@ -1286,11 +1278,10 @@ class WatchdogHarness(unittest.TestCase):
         result = self.run_scenario(scenario)
         self.assertEqual(self.retried_bodies(result), [], result["comments"])
 
-    def test_same_second_manual_retry_run_consumes_the_override(self):
-        # Workflow-run ids and comment ids are unrelated sequences. When the
-        # run and the owner command share one created_at second the ordering
-        # is ambiguous, so the hold must stay rather than release on the
-        # numerically lower run id.
+    def test_same_second_manual_retry_run_keeps_the_hold(self):
+        # Workflow-run ids and comment ids are unrelated sequences, and the
+        # hold no longer orders them at all: a run that shares one created_at
+        # second with the owner command cannot reopen the override.
         scenario = self.normal_retry_scenario()
         scenario["comments"].extend([
             thread_comment(20, hold_marker(), "2026-10-23T09:50:00Z"),
@@ -1311,7 +1302,7 @@ class WatchdogHarness(unittest.TestCase):
         result = self.run_scenario(scenario)
         self.assertEqual(self.retried_bodies(result), [], result["comments"])
 
-    def test_manual_retry_run_for_another_issue_keeps_the_release(self):
+    def test_manual_retry_run_for_another_issue_keeps_the_hold(self):
         scenario = self.normal_retry_scenario()
         scenario["comments"].extend([
             thread_comment(20, hold_marker(), "2026-10-23T09:50:00Z"),
@@ -1330,9 +1321,13 @@ class WatchdogHarness(unittest.TestCase):
             "created_at": "2026-10-23T10:00:05Z",
         })
         result = self.run_scenario(scenario)
-        self.assertEqual(len(self.retried_bodies(result)), 1, result["comments"])
+        self.assertEqual(self.retried_bodies(result), [], result["comments"])
 
-    def test_unreadable_run_inventory_keeps_the_hold(self):
+    def test_unreadable_run_inventory_never_reopens_the_hold(self):
+        # The hold is decided from trusted markers, the checkpoint ref and the
+        # pinned snapshot only. A workflow-run inventory is deletable and
+        # therefore can never prove a manual override was consumed, so the
+        # watchdog must not consult it at all.
         scenario = self.normal_retry_scenario()
         scenario["comments"].extend([
             thread_comment(20, hold_marker(), "2026-10-23T09:50:00Z"),
@@ -1343,15 +1338,8 @@ class WatchdogHarness(unittest.TestCase):
         scenario["holdRunListError"] = 503
         result = self.run_scenario(scenario)
         self.assertEqual(self.retried_bodies(result), [], result["comments"])
-        self.assertTrue(
-            any(
-                "run inventory is unavailable" in " ".join(line)
-                for line in result["notices"]
-            ),
-            result["notices"],
-        )
 
-    def test_truncated_run_inventory_keeps_the_hold(self):
+    def test_truncated_run_inventory_never_reopens_the_hold(self):
         scenario = self.normal_retry_scenario()
         scenario["comments"].extend([
             thread_comment(20, hold_marker(), "2026-10-23T09:50:00Z"),
@@ -1385,13 +1373,6 @@ class WatchdogHarness(unittest.TestCase):
         ]
         result = self.run_scenario(scenario)
         self.assertEqual(self.retried_bodies(result), [], result["comments"])
-        self.assertTrue(
-            any(
-                "run inventory is truncated" in " ".join(line)
-                for line in result["notices"]
-            ),
-            result["notices"],
-        )
 
     def test_manual_retry_hold_releases_on_a_changed_checkpoint(self):
         scenario = self.normal_retry_scenario()
@@ -1487,7 +1468,11 @@ class WatchdogHarness(unittest.TestCase):
                 )
                 self.assertEqual(self.retried_bodies(result), [])
 
-    def test_normal_retry_path_accepts_a_manual_owner_command(self):
+    def test_normal_retry_path_keeps_the_hold_on_a_manual_owner_command(self):
+        # The owner's /oc already starts its own OpenCode run; releasing the
+        # watchdog hold on the strength of that command only produced a
+        # duplicate retry that could not be made durable against a deleted or
+        # unpublished failure run.
         scenario = self.normal_retry_scenario()
         scenario["comments"].append(
             thread_comment(20, hold_marker(), "2026-10-23T09:50:00Z")
@@ -1496,9 +1481,9 @@ class WatchdogHarness(unittest.TestCase):
             thread_comment(21, "/oc", "2026-10-23T10:00:00Z", login="kodmial")
         )
         result = self.run_scenario(scenario)
-        self.assertEqual(len(self.retried_bodies(result)), 1, result["comments"])
+        self.assertEqual(self.retried_bodies(result), [], result["comments"])
 
-    def test_recorded_automatic_dispatch_consumes_a_manual_retry(self):
+    def test_recorded_automatic_dispatch_never_reopens_the_hold(self):
         cases = {
             "scheduler": (
                 "/oc\n\n<!-- issue-scheduler-dispatch -->",
@@ -1532,7 +1517,7 @@ class WatchdogHarness(unittest.TestCase):
                     result["comments"],
                 )
 
-    def test_manual_retry_after_a_consumed_override_resumes(self):
+    def test_repeated_manual_retries_never_reopen_the_hold(self):
         scenario = self.normal_retry_scenario()
         scenario["comments"].extend([
             thread_comment(20, hold_marker(), "2026-10-23T09:50:00Z"),
@@ -1552,7 +1537,14 @@ class WatchdogHarness(unittest.TestCase):
         result = self.run_scenario(
             scenario, env={"MAX_RECOVERY_RETRIES": "2"}
         )
-        self.assertEqual(len(self.retried_bodies(result)), 2, result["comments"])
+        seeded = sum(
+            1
+            for comment in scenario["comments"]
+            if "<!-- opencode-watchdog-retry -->" in comment["body"]
+        )
+        self.assertEqual(
+            len(self.retried_bodies(result)) - seeded, 0, result["comments"]
+        )
 
     def test_production_source_verifies_authoritative_run_evidence(self):
         self.assertIn("getWorkflowRun", self.source)

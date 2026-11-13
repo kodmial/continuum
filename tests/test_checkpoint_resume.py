@@ -431,8 +431,8 @@ class CheckpointResumeTest(unittest.TestCase):
         self.assertIn("RESUME_MARKER_CONFIRMED=true", workflow)
         self.assertIn("! resume_hold_marker_published; then", workflow)
         self.assertIn(
-            "refusing to continue while an earlier owner override can still "
-            "release the hold.",
+            "refusing to continue without a durable rejection record for "
+            "this checkpoint.",
             workflow,
         )
         self.assertNotIn(

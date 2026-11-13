@@ -3400,7 +3400,7 @@ jobs:
                 done
                 if [[ "$RESUME_MARKER_CONFIRMED" != "true" ]] &&
                   ! resume_hold_marker_published; then
-                  echo "::error::The deterministic checkpoint-resume hold marker could not be published or confirmed; refusing to continue while an earlier owner override can still release the hold."
+                  echo "::error::The deterministic checkpoint-resume hold marker could not be published or confirmed; refusing to continue without a durable rejection record for this checkpoint."
                   exit 1
                 fi
               fi
