@@ -43,7 +43,8 @@ on:
         required: false
       ci_repair_label:
         description: >-
-          Label holding the one-automatic-attempt-per-head CI repair lock.
+          Presentation label for an automatic CI repair attempt. It is never
+          used for admission; the exact-HEAD receipt is authoritative.
           Empty falls back to CONTINUUM_CI_REPAIR_LABEL.
         type: string
         default: ''
@@ -117,13 +118,22 @@ concurrency:
          github.event.workflow_run.name
        )) &&
       format('unapproved-{0}', github.run_id)
-      || github.event.workflow_run.head_sha
-      || inputs.head_sha
-      || github.event.pull_request.number
-      || inputs.pr_number
-      || github.sha
+      || format('{0}-{1}',
+           github.repository,
+           github.event.workflow_run.head_sha
+           || inputs.head_sha
+           || github.event.pull_request.number
+           || inputs.pr_number
+           || github.sha)
     }}
+  # kodmial/continuum#446: both CI entry points share one exact-HEAD owner per
+  # repository. This is the serialization that makes the receipt read -> claim
+  # -> dispatch sequence single-owner; issue comments are a durable record, not
+  # an atomic lock. Keep `queue: max` (GitHub permits up to 100 queued runs) so
+  # a burst cannot silently drop the only approved admission pass.
   cancel-in-progress: false
+  queue: max
+
 
 jobs:
   sync-current-pr:
@@ -144,7 +154,6 @@ jobs:
           HEAD_REF: ${{ github.event.pull_request.head.ref }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           PR_ACTION: ${{ github.event.action }}
-          CI_REPAIR_LABEL: ${{ inputs.ci_repair_label || vars.CONTINUUM_CI_REPAIR_LABEL || 'opencode-ci-repair' }}
           OPENCODE_WORKFLOW: ${{ inputs.opencode_workflow || vars.CONTINUUM_OPENCODE_WORKFLOW || 'continuum-opencode.yml' }}
         run: |
           set -euo pipefail
@@ -174,19 +183,16 @@ jobs:
             if [[ "$dest" == "$default_branch" ]]; then echo "::error::Continuum branch safety: refusing code push to the default branch '$dest'. Recovery resumes the same PR branch; only the PR merge operation may update the default branch." >&2; return 1; fi
           }
 
-          # Repair locks are one-attempt-per-HEAD, not one-attempt-per-PR.
-          # A synchronize event means the PR has a new head commit, so the CI
-          # repair lock belongs to the previous head and must not suppress
-          # repair of a fresh failure on this head. Reopened PRs also get a
-          # clean repair budget.
+          # kodmial/continuum#446: the synchronize reset owns review readiness
+          # only. CI-repair admission is a durable exact-HEAD receipt owned by
+          # the serialized controller; a mutable label must never clear,
+          # restore, or infer that attempt state. Only the unrelated conflict
+          # episode is reset here.
           if [[ "$PR_ACTION" == "synchronize" || "$PR_ACTION" == "reopened" ]]; then
-            gh api --method DELETE \
-              "repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/labels/$CI_REPAIR_LABEL" \
-              >/dev/null 2>&1 || true
             gh api --method DELETE \
               "repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/labels/opencode-conflict-repair" \
               >/dev/null 2>&1 || true
-            echo "Reset per-head CI/conflict repair locks for PR #$PR_NUMBER ($PR_ACTION)."
+            echo "Reset per-head conflict-repair episode for PR #$PR_NUMBER ($PR_ACTION)."
           fi
 
           gh label create opencode-conflict-repair --repo "$GITHUB_REPOSITORY" --color B60205 \
@@ -275,9 +281,10 @@ jobs:
           git init -q "$repo"
           git -C "$repo" remote add origin https://github.com/kodmial/continuum.git
           git -C "$repo" sparse-checkout init --no-cone
-          git -C "$repo" sparse-checkout set --no-cone .github/scripts/opencode_repair_state.py src/continuum
+          git -C "$repo" sparse-checkout set --no-cone .github/scripts/ci_repair_admission.py .github/scripts/opencode_repair_state.py src/continuum
           GIT_TERMINAL_PROMPT=0 git -C "$repo" -c credential.helper= fetch --no-tags --depth=1 origin "$CONTINUUM_REF"
           git -C "$repo" checkout --detach --force -q FETCH_HEAD
+          test -f "$repo/.github/scripts/ci_repair_admission.py"
           test -f "$repo/.github/scripts/opencode_repair_state.py"
           test -f "$repo/src/continuum/opencode_repair_state.py"
 
@@ -285,10 +292,12 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.TAP_PAT }}
           REPAIR_STATE_HELPER: ${{ github.workspace }}/.continuum-repair-engine/.github/scripts/opencode_repair_state.py
+          REPAIR_ADMISSION_HELPER: ${{ github.workspace }}/.continuum-repair-engine/.github/scripts/ci_repair_admission.py
           PR_NUMBER: ${{ inputs.pr_number }}
           REPORTED_HEAD_SHA: ${{ inputs.head_sha }}
           REPORTED_CONCLUSION: ${{ inputs.conclusion }}
           REPORTED_RUN_ID: ${{ inputs.run_id }}
+          OWNER_LOGIN: ${{ github.repository_owner }}
           CI_REPAIR_LABEL: ${{ inputs.ci_repair_label || vars.CONTINUUM_CI_REPAIR_LABEL || 'opencode-ci-repair' }}
           HEAD_REF_PATTERN: ${{ inputs.head_ref_pattern || vars.CONTINUUM_HEAD_REF_PATTERN || '^opencode/issue[0-9]+-' }}
           AUTO_MERGE_WORKFLOW: ${{ inputs.auto_merge_workflow || vars.CONTINUUM_AUTO_MERGE_WORKFLOW || 'continuum-auto-merge.yml' }}
@@ -304,14 +313,13 @@ jobs:
           # is skipped rather than failed, because a stale report is a normal
           # outcome of a CI run racing a push, not an error.
           #
-          # One pulls.get serves every guard plus the lock check below: the
-          # PR representation already carries labels, so no second
-          # labels-list read is needed (#254).
+          # One pulls.get serves every guard below: the PR representation
+          # already carries the state/head fields, so no second labels-list
+          # read is needed (#254). Labels are presentation only in #446.
           PR_JSON="$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER")" || PR_JSON='{}'
           read -r pr_state head_ref head_sha head_repo < <(
             jq -r '[.state, .head.ref, .head.sha, .head.repo.full_name] | @tsv' <<<"$PR_JSON"
           )
-          PR_LABELS="$(jq -r '[.labels[]?.name? // empty][]?' <<<"$PR_JSON" 2>/dev/null || true)"
 
           if [[ "$pr_state" != "open" || "$head_repo" != "$GITHUB_REPOSITORY" ]]; then
             echo "PR #$PR_NUMBER is not an open same-repository PR; ignoring the reported CI result."
@@ -399,14 +407,14 @@ jobs:
             echo "PR #$PR_NUMBER carries no task snapshot reference (legacy, pre-guard PR); repair proceeds explicitly without drift protection."
           fi
 
-          # This description is the durable marker that
-          # continuum-remove-review-label.yml uses to reset a lock label chosen
-          # only through the `ci_repair_label` dispatch input; keep the literal
-          # identical to `CI_REPAIR_LOCK_DESCRIPTION` there and to the
-          # workflow_run path's `lock_description` below.
+          # Presentation only: this label no longer participates in admission.
+          # The durable claim receipt below is the sole authority. Keeping the
+          # configured/default label visible is harmless and preserves
+          # consumer customization without letting a stale label block a new
+          # HEAD.
           gh label create "$CI_REPAIR_LABEL" --repo "$GITHUB_REPOSITORY" --color FBCA04 \
-            --description "One automatic OpenCode CI repair attempt per failing PR head." \
-            --force >/dev/null
+            --description "Presentation marker for an automatic OpenCode CI repair attempt." \
+            --force >/dev/null 2>&1 || true
 
           # GitHub keeps only one running and one pending run per concurrency
           # group: a burst of completions for the same head can replace a
@@ -441,38 +449,32 @@ jobs:
 
           case "$state" in
             failure)
-              if grep -Fxq "$CI_REPAIR_LABEL" <<<"$PR_LABELS"; then
-                echo "An automatic CI repair was already attempted for this exact PR head; waiting for a new head or a successful rerun."
-                exit 0
-              fi
-              echo "Latest approved workflow '$failing_name' failed for $REPORTED_HEAD_SHA; dispatching its repair."
-              gh api --method POST "repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/labels" \
-                -f "labels[]=$CI_REPAIR_LABEL" >/dev/null
-              if ! gh api --method POST \
-                "repos/$GITHUB_REPOSITORY/actions/workflows/$OPENCODE_WORKFLOW/dispatches" \
-                -f ref=main \
-                -f "inputs[mode]=ci-fix" \
-                -f "inputs[pr_number]=$PR_NUMBER" \
-                -f "inputs[head_ref]=$head_ref" \
-                -f "inputs[run_id]=${failing_run_id:-$REPORTED_RUN_ID}"; then
-                gh api --method DELETE \
-                  "repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/labels/$CI_REPAIR_LABEL" \
-                  >/dev/null 2>&1 || true
-                echo "::error::Failed to dispatch OpenCode repair for reported CI run; lock cleared for retry."
-                exit 1
-              fi
+              echo "Latest approved workflow '$failing_name' failed for $REPORTED_HEAD_SHA; entering the serialized exact-HEAD repair admission."
+              python3 -B "$REPAIR_ADMISSION_HELPER" \
+                --repository "$GITHUB_REPOSITORY" \
+                --pull-number "$PR_NUMBER" \
+                --head-sha "$REPORTED_HEAD_SHA" \
+                --head-ref "$head_ref" \
+                --workflow "$OPENCODE_WORKFLOW" \
+                --failing-run-id "${failing_run_id:-}" \
+                --reported-run-id "$REPORTED_RUN_ID" \
+                --label "$CI_REPAIR_LABEL" \
+                --owner-login "$OWNER_LOGIN"
               ;;
             green)
+              # The receipt is immutable and already owns this exact HEAD; a
+              # green result never erases it. Removing the presentation label
+              # only keeps the PR visually tidy.
               gh api --method DELETE \
                 "repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/labels/$CI_REPAIR_LABEL" \
                 >/dev/null 2>&1 || true
-              echo "All approved workflows passed for $REPORTED_HEAD_SHA; repair lock cleared and auto-merge reconciler woken."
+              echo "All approved workflows passed for $REPORTED_HEAD_SHA; presentation label cleared and auto-merge reconciler woken."
               gh api --method POST \
                 "repos/$GITHUB_REPOSITORY/actions/workflows/$AUTO_MERGE_WORKFLOW/dispatches" \
                 -f ref=main >/dev/null
               ;;
             inflight)
-              echo "Another approved workflow is still in flight for $REPORTED_HEAD_SHA; keeping repair lock '$CI_REPAIR_LABEL'."
+              echo "Another approved workflow is still in flight for $REPORTED_HEAD_SHA; no repair admission is authorized yet."
               if [[ "$REPORTED_CONCLUSION" == "success" ]]; then
                 gh api --method POST \
                   "repos/$GITHUB_REPOSITORY/actions/workflows/$AUTO_MERGE_WORKFLOW/dispatches" \
@@ -480,7 +482,7 @@ jobs:
               fi
               ;;
             unknown)
-              echo "Could not verify current approved workflow state for $REPORTED_HEAD_SHA; keeping repair lock '$CI_REPAIR_LABEL'."
+              echo "Could not verify current approved workflow state for $REPORTED_HEAD_SHA; failing closed without a repair claim."
               if [[ "$REPORTED_CONCLUSION" == "success" ]]; then
                 gh api --method POST \
                   "repos/$GITHUB_REPOSITORY/actions/workflows/$AUTO_MERGE_WORKFLOW/dispatches" \
@@ -537,9 +539,10 @@ jobs:
           git init -q "$repo"
           git -C "$repo" remote add origin https://github.com/kodmial/continuum.git
           git -C "$repo" sparse-checkout init --no-cone
-          git -C "$repo" sparse-checkout set --no-cone .github/scripts/opencode_repair_state.py src/continuum
+          git -C "$repo" sparse-checkout set --no-cone .github/scripts/ci_repair_admission.py .github/scripts/opencode_repair_state.py src/continuum
           GIT_TERMINAL_PROMPT=0 git -C "$repo" -c credential.helper= fetch --no-tags --depth=1 origin "$CONTINUUM_REF"
           git -C "$repo" checkout --detach --force -q FETCH_HEAD
+          test -f "$repo/.github/scripts/ci_repair_admission.py"
           test -f "$repo/.github/scripts/opencode_repair_state.py"
           test -f "$repo/src/continuum/opencode_repair_state.py"
 
@@ -547,10 +550,12 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.TAP_PAT }}
           REPAIR_STATE_HELPER: ${{ github.workspace }}/.continuum-repair-engine/.github/scripts/opencode_repair_state.py
+          REPAIR_ADMISSION_HELPER: ${{ github.workspace }}/.continuum-repair-engine/.github/scripts/ci_repair_admission.py
           RUN_ID: ${{ github.event.workflow_run.id }}
           RUN_NAME: ${{ github.event.workflow_run.name }}
           RUN_HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
           CONCLUSION: ${{ github.event.workflow_run.conclusion }}
+          OWNER_LOGIN: ${{ github.repository_owner }}
           CI_REPAIR_LABEL: ${{ inputs.ci_repair_label || vars.CONTINUUM_CI_REPAIR_LABEL || 'opencode-ci-repair' }}
           AUTO_MERGE_WORKFLOW: ${{ inputs.auto_merge_workflow || vars.CONTINUUM_AUTO_MERGE_WORKFLOW || 'continuum-auto-merge.yml' }}
           OPENCODE_WORKFLOW: ${{ inputs.opencode_workflow || vars.CONTINUUM_OPENCODE_WORKFLOW || 'continuum-opencode.yml' }}
@@ -600,12 +605,6 @@ jobs:
             exit 0
           fi
           lock_label="$CI_REPAIR_LABEL"
-          # This description is the durable marker that
-          # continuum-remove-review-label.yml uses to reset a lock label chosen
-          # only through the `ci_repair_label` dispatch input; keep the literal
-          # identical to `CI_REPAIR_LOCK_DESCRIPTION` there and to the
-          # dispatch path's `--description` above.
-          lock_description="One automatic OpenCode CI repair attempt per failing PR head."
 
           pr=$(gh api "repos/$GITHUB_REPOSITORY/commits/$RUN_HEAD_SHA/pulls" \
             -H "Accept: application/vnd.github+json" \
@@ -615,13 +614,13 @@ jobs:
             exit 0
           }
 
-          # One pulls.get serves the guards plus the lock check below: the
-          # PR representation already carries labels (#254).
+          # One pulls.get serves the guards below: the PR representation
+          # already carries the head fields, so no second labels-list read is
+          # needed (#254). Labels are presentation only in #446.
           PR_JSON="$(gh api "repos/$GITHUB_REPOSITORY/pulls/$pr")" || PR_JSON='{}'
           read -r head_ref head_sha head_repo < <(
             jq -r '[.head.ref, .head.sha, .head.repo.full_name] | @tsv' <<<"$PR_JSON"
           )
-          PR_LABELS="$(jq -r '[.labels[]?.name? // empty][]?' <<<"$PR_JSON" 2>/dev/null || true)"
 
           # Generated OpenCode PRs use opencode/*; some existing Continuum
           # implementation PRs use other branch names. Recognize those by the
@@ -713,9 +712,12 @@ jobs:
             echo "PR #$pr carries no task snapshot reference (legacy, pre-guard PR); repair proceeds explicitly without drift protection."
           fi
 
+          # Presentation only: the configured/default label never participates
+          # in admission. The durable exact-HEAD receipt below is the sole
+          # authority, so a stale label can neither authorize nor block repair.
           gh label create "$lock_label" --repo "$GITHUB_REPOSITORY" --color FBCA04 \
-            --description "$lock_description" \
-            --force >/dev/null
+            --description "Presentation marker for an automatic OpenCode CI repair attempt." \
+            --force >/dev/null 2>&1 || true
 
           # GitHub keeps only one running and one pending run per concurrency
           # group: a burst of completions for the same head can replace a
@@ -744,38 +746,32 @@ jobs:
 
           case "$state" in
             failure)
-              if grep -Fxq "$lock_label" <<<"$PR_LABELS"; then
-                echo "An automatic $RUN_NAME repair was already attempted for this exact PR head; waiting for a new head or a successful rerun."
-                exit 0
-              fi
-              echo "Latest approved workflow '$failing_name' failed for $RUN_HEAD_SHA; dispatching its repair."
-              gh api --method POST "repos/$GITHUB_REPOSITORY/issues/$pr/labels" \
-                -f "labels[]=$lock_label" >/dev/null
-              if ! gh api --method POST \
-                "repos/$GITHUB_REPOSITORY/actions/workflows/$OPENCODE_WORKFLOW/dispatches" \
-                -f ref=main \
-                -f "inputs[mode]=ci-fix" \
-                -f "inputs[pr_number]=$pr" \
-                -f "inputs[head_ref]=$head_ref" \
-                -f "inputs[run_id]=${failing_run_id:-$RUN_ID}"; then
-                gh api --method DELETE \
-                  "repos/$GITHUB_REPOSITORY/issues/$pr/labels/$lock_label" \
-                  >/dev/null 2>&1 || true
-                echo "::error::Failed to dispatch OpenCode repair for $RUN_NAME; lock cleared for retry."
-                exit 1
-              fi
+              echo "Latest approved workflow '$failing_name' failed for $RUN_HEAD_SHA; entering the serialized exact-HEAD repair admission."
+              python3 -B "$REPAIR_ADMISSION_HELPER" \
+                --repository "$GITHUB_REPOSITORY" \
+                --pull-number "$pr" \
+                --head-sha "$RUN_HEAD_SHA" \
+                --head-ref "$head_ref" \
+                --workflow "$OPENCODE_WORKFLOW" \
+                --failing-run-id "${failing_run_id:-}" \
+                --reported-run-id "$RUN_ID" \
+                --label "$lock_label" \
+                --owner-login "$OWNER_LOGIN"
               ;;
             green)
+              # Never erase durable attempt state on green: the receipt is the
+              # record and a later HEAD keeps its own key. Only the visual
+              # marker is removed.
               gh api --method DELETE \
                 "repos/$GITHUB_REPOSITORY/issues/$pr/labels/$lock_label" \
                 >/dev/null 2>&1 || true
-              echo "All approved workflows passed for $RUN_HEAD_SHA; automatic repair lock '$lock_label' cleared."
+              echo "All approved workflows passed for $RUN_HEAD_SHA; presentation label '$lock_label' cleared."
               ;;
             inflight)
-              echo "$RUN_NAME passed, but another approved workflow for $RUN_HEAD_SHA is still in flight; keeping repair lock '$lock_label'."
+              echo "$RUN_NAME passed, but another approved workflow for $RUN_HEAD_SHA is still in flight; no repair admission is authorized yet."
               ;;
             unknown)
-              echo "Could not verify current approved workflow state for $RUN_HEAD_SHA; keeping repair lock '$lock_label'."
+              echo "Could not verify current approved workflow state for $RUN_HEAD_SHA; failing closed without a repair claim."
               ;;
             *)
               echo "No approved workflow result is known for $RUN_HEAD_SHA; nothing to reconcile."

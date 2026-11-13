@@ -194,6 +194,7 @@ def workflow_run(name="CI", conclusion="failure", head_sha="a" * 40, event="pull
     return {
         "event_name": "workflow_run",
         "run_id": run_id,
+        "repository": "kodmial/nanodictate",
         "sha": "b" * 40,
         "event": {
             "workflow_run": {
@@ -211,6 +212,7 @@ def dispatch(head_sha="c" * 40, pr_number=245):
     return {
         "event_name": "workflow_dispatch",
         "run_id": 200,
+        "repository": "kodmial/nanodictate",
         "sha": "d" * 40,
         "event": {"pull_request": None},
         "inputs": {
@@ -375,8 +377,24 @@ class WakeupAdmissionTests(unittest.TestCase):
     def test_approved_completions_share_the_exact_head_group(self):
         first = self.group(workflow_run("CI", "failure", run_id=1), workflows="CI,Windows host")
         second = self.group(workflow_run("Windows host", "success", run_id=2), workflows="CI,Windows host")
-        self.assertEqual("opencode-repair-" + "a" * 40, first)
+        self.assertEqual("opencode-repair-kodmial/nanodictate-" + "a" * 40, first)
         self.assertEqual(first, second)
+
+    def test_the_effective_group_is_per_repository_and_exact_head(self):
+        same_repo = self.group(workflow_run("CI", "failure"), workflows="CI")
+        other_repo = workflow_run("CI", "failure")
+        other_repo["repository"] = "someone/else"
+        self.assertNotEqual(same_repo, self.group(other_repo, workflows="CI"))
+        # The consumer-reported path renders identically for the same HEAD.
+        self.assertEqual(
+            same_repo,
+            self.group(dispatch(head_sha="a" * 40), workflows="CI,Windows host"),
+        )
+
+    def test_both_entry_points_disable_cancellation_and_keep_the_queue(self):
+        concurrency = self.controller["concurrency"]
+        self.assertEqual(False, concurrency["cancel-in-progress"])
+        self.assertEqual("max", concurrency["queue"])
 
     def test_unapproved_completion_never_joins_the_approved_group(self):
         approved = self.group(workflow_run("CI", "failure", run_id=1), workflows="CI")
@@ -392,7 +410,7 @@ class WakeupAdmissionTests(unittest.TestCase):
             workflow_run("CI", "success", run_id=12),
         ]
         groups = {self.group(event, workflows="CI,Windows host") for event in events}
-        self.assertEqual({"opencode-repair-" + "a" * 40}, groups)
+        self.assertEqual({"opencode-repair-kodmial/nanodictate-" + "a" * 40}, groups)
 
     def test_unapproved_burst_cannot_strand_an_approved_failure(self):
         # Replay the concern from review: while an approved workflow is running,
@@ -439,10 +457,12 @@ class WakeupAdmissionTests(unittest.TestCase):
 
     def test_dispatch_and_branch_sync_keep_their_existing_group_keys(self):
         self.assertEqual(
-            "opencode-repair-245", self.group(pull_request_target(pr_number=245))
+            "opencode-repair-kodmial/nanodictate-245",
+            self.group(pull_request_target(pr_number=245)),
         )
         self.assertEqual(
-            "opencode-repair-" + "c" * 40, self.group(dispatch(head_sha="c" * 40))
+            "opencode-repair-kodmial/nanodictate-" + "c" * 40,
+            self.group(dispatch(head_sha="c" * 40)),
         )
 
     # A configuration change immediately changes admission without a trigger

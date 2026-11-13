@@ -27,6 +27,7 @@ from continuum.ci_repair_receipt import (
     STATUS_CLAIMED,
     STATUS_DISPATCHED,
     STATUS_REJECTED,
+    STATUS_REQUESTING,
     AttemptSummary,
     ReceiptCollection,
     ReceiptError,
@@ -133,6 +134,18 @@ class BuildRenderParseTests(unittest.TestCase):
         self.assertEqual(HEAD, built.head_sha)
         self.assertEqual((built,), parse_receipts(render_receipt(built)))
 
+    def test_run_url_display_case_is_canonicalized(self):
+        built = receipt(
+            status=STATUS_DISPATCHED,
+            run_id=987654,
+            run_url="https://github.com/Kodmial/Continuum/actions/runs/987654",
+        )
+        self.assertEqual(
+            "https://github.com/kodmial/continuum/actions/runs/987654",
+            built.run_url,
+        )
+        self.assertIn("url=https://github.com/kodmial/continuum/", receipt_marker_line(built))
+
     def test_dispatched_receipt_accepts_proved_run_details(self):
         built = receipt(
             status=STATUS_DISPATCHED,
@@ -155,7 +168,12 @@ class BuildRenderParseTests(unittest.TestCase):
         self.assertEqual((built,), parse_receipts(render_receipt(built)))
 
     def test_run_details_are_rejected_for_unproved_statuses(self):
-        for status in (STATUS_CLAIMED, STATUS_AMBIGUOUS, STATUS_REJECTED):
+        for status in (
+            STATUS_CLAIMED,
+            STATUS_REQUESTING,
+            STATUS_AMBIGUOUS,
+            STATUS_REJECTED,
+        ):
             with self.subTest(status=status):
                 with self.assertRaises(ReceiptError):
                     receipt(status=status, run_id=1)
@@ -553,6 +571,14 @@ class AttemptDecisionTests(unittest.TestCase):
         self.assertEqual(ACTION_WAIT, decision.action)
         self.assertEqual(ATTEMPT, decision.attempt_id)
 
+    def test_a_requesting_attempt_may_have_reached_dispatch_and_holds(self):
+        result = read([receipt_comment(status=STATUS_REQUESTING)])
+        decision = decide_new_attempt(result)
+        self.assertFalse(decision.allowed)
+        self.assertEqual(ACTION_HOLD, decision.action)
+        self.assertEqual(ATTEMPT, decision.attempt_id)
+        self.assertIn("may have reached GitHub", decision.reason)
+
     def test_two_same_head_claim_attempts_conflict(self):
         result = read(
             [
@@ -675,14 +701,76 @@ class AttemptDecisionTests(unittest.TestCase):
         self.assertFalse(decide_new_attempt(result).allowed)
 
     def test_dispatched_receipt_cannot_lose_proved_run_details(self):
+        # The owner and the dispatched executor write the same attempt without
+        # a shared lock, so a legacy 204 outcome can land after the run was
+        # already proved. That concurrent report is reconciled instead of
+        # conflicting the whole history: the proved run details always win and
+        # are never lost.
         comments = [
             receipt_comment(attempt=ATTEMPT),
             receipt_comment(attempt=ATTEMPT, status=STATUS_DISPATCHED, run_id=1),
             receipt_comment(attempt=ATTEMPT, status=STATUS_DISPATCHED),
         ]
         result = read(comments)
+        self.assertEqual(OUTCOME_COMPLETE, result.outcome)
+        attempt = attempt_for_id(result, ATTEMPT)
+        self.assertEqual(STATUS_DISPATCHED, attempt.status)
+        self.assertEqual(1, attempt.run_id)
+        self.assertEqual(3, attempt.receipt_count)
+        self.assertFalse(decide_new_attempt(result).allowed)
+
+
+class ConcurrentObservationTests(unittest.TestCase):
+    """Two writers publish the same attempt around an uncertain dispatch.
+
+    The serialized owner and the dispatched executor do not share a lock, so
+    their receipts can arrive in either order. Concurrent reports of the same
+    event are reconciled monotonically instead of regressing the attempt state
+    or conflicting the whole PR history.
+    """
+
+    def test_ambiguous_after_a_proved_run_keeps_the_dispatch(self):
+        comments = [
+            receipt_comment(attempt=ATTEMPT),
+            receipt_comment(attempt=ATTEMPT, status=STATUS_DISPATCHED, run_id=7),
+            receipt_comment(attempt=ATTEMPT, status=STATUS_AMBIGUOUS),
+        ]
+        result = read(comments)
+        self.assertEqual(OUTCOME_COMPLETE, result.outcome)
+        attempt = attempt_for_id(result, ATTEMPT)
+        self.assertEqual(STATUS_DISPATCHED, attempt.status)
+        self.assertEqual(7, attempt.run_id)
+        self.assertEqual(ACTION_WAIT, decide_new_attempt(result).action)
+
+    def test_reconciliation_keeps_later_heads_readable(self):
+        # A reconciled concurrency artifact must never poison the whole log:
+        # the next exact HEAD still owns an independent attempt key.
+        comments = [
+            receipt_comment(attempt=ATTEMPT),
+            receipt_comment(attempt=ATTEMPT, status=STATUS_DISPATCHED, run_id=7),
+            receipt_comment(attempt=ATTEMPT, status=STATUS_AMBIGUOUS),
+            receipt_comment(attempt=OTHER_ATTEMPT, head=OTHER_HEAD),
+        ]
+        result = read(comments, head=OTHER_HEAD)
+        self.assertEqual(OUTCOME_COMPLETE, result.outcome)
+        self.assertEqual(
+            STATUS_CLAIMED, attempt_for_id(result, OTHER_ATTEMPT).status
+        )
+        self.assertEqual(ACTION_WAIT, decide_new_attempt(result).action)
+        self.assertEqual(
+            {ATTEMPT, OTHER_ATTEMPT},
+            {item.attempt_id for item in result.all_receipts},
+        )
+
+    def test_a_rejected_attempt_is_never_resurrected_by_a_concurrent_write(self):
+        comments = [
+            receipt_comment(attempt=ATTEMPT),
+            receipt_comment(attempt=ATTEMPT, status=STATUS_REJECTED),
+            receipt_comment(attempt=ATTEMPT, status=STATUS_DISPATCHED, run_id=7),
+        ]
+        result = read(comments)
         self.assertEqual(OUTCOME_CONFLICT, result.outcome)
-        self.assertIn("must not lose", result.reason)
+        self.assertFalse(decide_new_attempt(result).allowed)
 
     def test_attempt_lookup_and_transition_helpers(self):
         result = read([receipt_comment()])
@@ -752,9 +840,25 @@ class FailClosedTests(unittest.TestCase):
 class TransitionTests(unittest.TestCase):
     def test_claimed_to_dispatch_states_is_allowed(self):
         claimed = receipt()
-        for status in (STATUS_DISPATCHED, STATUS_AMBIGUOUS, STATUS_REJECTED):
+        for status in (
+            STATUS_REQUESTING,
+            STATUS_DISPATCHED,
+            STATUS_AMBIGUOUS,
+            STATUS_REJECTED,
+        ):
             with self.subTest(status=status):
                 following = transition_receipt(claimed, status=status)
+                self.assertEqual(status, following.status)
+
+    def test_requesting_to_dispatch_states_is_allowed(self):
+        requesting = transition_receipt(receipt(), status=STATUS_REQUESTING)
+        for status in (
+            STATUS_DISPATCHED,
+            STATUS_AMBIGUOUS,
+            STATUS_REJECTED,
+        ):
+            with self.subTest(status=status):
+                following = transition_receipt(requesting, status=status)
                 self.assertEqual(status, following.status)
 
     def test_ambiguous_to_dispatched_is_allowed_only_with_proof(self):
@@ -772,14 +876,17 @@ class TransitionTests(unittest.TestCase):
 
     def test_impossible_transitions_are_rejected(self):
         claimed = receipt()
+        requesting = transition_receipt(claimed, status=STATUS_REQUESTING)
         dispatched = transition_receipt(claimed, status=STATUS_DISPATCHED)
         ambiguous = transition_receipt(claimed, status=STATUS_AMBIGUOUS)
         rejected = transition_receipt(claimed, status=STATUS_REJECTED)
         cases = [
+            (requesting, STATUS_CLAIMED),
             (dispatched, STATUS_CLAIMED),
             (dispatched, STATUS_AMBIGUOUS),
             (dispatched, STATUS_REJECTED),
             (ambiguous, STATUS_CLAIMED),
+            (ambiguous, STATUS_REQUESTING),
             (ambiguous, STATUS_REJECTED),
             (rejected, STATUS_CLAIMED),
             (rejected, STATUS_DISPATCHED),
