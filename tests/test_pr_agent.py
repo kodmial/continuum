@@ -380,6 +380,34 @@ class BridgeIsolationTests(unittest.TestCase):
             "providerID": "opencode", "id": "test-fixture-route"
         } for m in FakeOpenCodeHandler.selected_models))
 
+    def test_native_v2_preflight_shares_review_control_api(self):
+        import sys
+
+        root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+        sys.path.insert(0, os.path.join(root, ".github", "scripts"))
+        try:
+            import pr_agent_bridge as bridge
+        finally:
+            sys.path.pop(0)
+        saved = {
+            key: os.environ.get(key)
+            for key in ("OPENCODE_SERVER_URL", "OPENCODE_MODEL", "OPENCODE_PASSWORD")
+        }
+        before = len(FakeOpenCodeHandler.deleted)
+        try:
+            os.environ["OPENCODE_SERVER_URL"] = f"http://127.0.0.1:{self.port}"
+            os.environ["OPENCODE_MODEL"] = "opencode/test-fixture-route"
+            os.environ["OPENCODE_PASSWORD"] = "fixture-password"
+            bridge.preflight_review_session()
+            self.assertEqual(len(FakeOpenCodeHandler.deleted), before + 1)
+            self.assertEqual(FakeOpenCodeHandler.sessions, {})
+        finally:
+            for key, value in saved.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
+
     def test_bridge_handler_chat_completions_end_to_end(self):
         import sys
 

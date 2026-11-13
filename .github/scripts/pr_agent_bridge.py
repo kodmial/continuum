@@ -210,25 +210,28 @@ def _await_async_assistant(session_id: str, timeout: int) -> Dict[str, Any]:
     )
 
 
-def run_completion(body: Dict[str, Any], timeout: int) -> Dict[str, Any]:
-    messages = body.get("messages", [])
-    request_model = str(body.get("model", "") or "")
-    max_tokens = body.get("max_tokens", None)
-    try:
-        limit = int(max_tokens) if max_tokens is not None else DEFAULT_MAX_TOKENS
-    except (TypeError, ValueError):
-        limit = DEFAULT_MAX_TOKENS
-    opencode_body = build_opencode_request(messages, inference_model(request_model), limit)
-    require_inference_hardening(opencode_body)
 
-    # The v2 API uses a data envelope and explicit session configuration;
-    # prompt bodies no longer accept the legacy model/agent/system/parts keys.
-    status, raw = opencode_call("POST", "/api/session", {"title": "pr-agent-bridge"}, 15)
+def _delete_review_session(session_id: str) -> None:
+    """Best-effort deletion; review evidence is never inferred from cleanup."""
+    quoted = urllib.parse.quote(session_id, safe="")
+    try:
+        opencode_call("DELETE", f"/api/session/{quoted}", None, 15)
+    except BridgeUpstreamError:
+        pass
+
+
+def _create_review_session(model: Dict[str, str]) -> str:
+    """Native authenticated v2 control path shared by review and preflight."""
+    status, raw = opencode_call(
+        "POST", "/api/session", {"title": "pr-agent-bridge"}, 15
+    )
     _require_opencode_status(status, (200,), "create session")
     try:
         envelope = json.loads(raw)
-    except (ValueError, TypeError):
-        raise BridgeUpstreamError("malformed OpenCode v2 session envelope", retryable=False) from None
+    except (TypeError, ValueError):
+        raise BridgeUpstreamError(
+            "malformed OpenCode v2 session envelope", retryable=False
+        ) from None
     session = envelope.get("data") if isinstance(envelope, dict) else None
     session_id = session.get("id") if isinstance(session, dict) else None
     if not isinstance(session_id, str) or not session_id:
@@ -240,13 +243,43 @@ def run_completion(body: Dict[str, Any], timeout: int) -> Dict[str, Any]:
         )
         _require_opencode_status(status, (204,), "select read-only agent")
         status, _ = opencode_call(
-            "POST", f"/api/session/{quoted}/model",
-            {"model": {
-                "providerID": opencode_body["model"]["providerID"],
-                "id": opencode_body["model"]["modelID"],
-            }}, 15
+            "POST", f"/api/session/{quoted}/model", {"model": model}, 15
         )
         _require_opencode_status(status, (204,), "select pinned model")
+    except Exception:
+        _delete_review_session(session_id)
+        raise
+    return session_id
+
+
+def preflight_review_session() -> None:
+    """No-LLM ABI check on the actual pinned OpenCode v2 server.
+
+    Uses exactly the same authenticated session/agent/model control path as
+    real review, and never spends reviewer tokens or modifies the worktree.
+    """
+    provider, model_id = split_model(inference_model(""))
+    session_id = _create_review_session({"providerID": provider, "id": model_id})
+    _delete_review_session(session_id)
+
+
+def run_completion(body: Dict[str, Any], timeout: int) -> Dict[str, Any]:
+    messages = body.get("messages", [])
+    request_model = str(body.get("model", "") or "")
+    max_tokens = body.get("max_tokens", None)
+    try:
+        limit = int(max_tokens) if max_tokens is not None else DEFAULT_MAX_TOKENS
+    except (TypeError, ValueError):
+        limit = DEFAULT_MAX_TOKENS
+    opencode_body = build_opencode_request(messages, inference_model(request_model), limit)
+    require_inference_hardening(opencode_body)
+
+    session_id = _create_review_session({
+        "providerID": opencode_body["model"]["providerID"],
+        "id": opencode_body["model"]["modelID"],
+    })
+    quoted = urllib.parse.quote(session_id, safe="")
+    try:
         # Preserve the immutable reviewer-only system policy in the prompt
         # text because v2's admission body no longer has a system field.
         # The server-side 'plan' agent remains read-only independently.
@@ -269,10 +302,7 @@ def run_completion(body: Dict[str, Any], timeout: int) -> Dict[str, Any]:
             request_model or inference_model(request_model), text
         )
     finally:
-        try:
-            opencode_call("DELETE", f"/api/session/{quoted}", None, 15)
-        except BridgeUpstreamError:
-            pass
+        _delete_review_session(session_id)
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -408,7 +438,13 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--port", type=int, default=int(os.environ.get("PR_AGENT_BRIDGE_PORT", "18000")))
     parser.add_argument("--hostname", default="127.0.0.1")
+    parser.add_argument("--preflight", action="store_true",
+                        help="Verify v2 session ABI on the pinned server without LLM usage")
     args = parser.parse_args()
+    if args.preflight:
+        preflight_review_session()
+        print("PR-Agent/OpenCode v2 native session API qualified.", flush=True)
+        return 0
     if args.hostname not in ("127.0.0.1", "localhost", "::1"):
         print("refusing to bind beyond loopback", file=sys.stderr)
         return 2

@@ -1068,6 +1068,19 @@ jobs:
           cat "$RUNNER_TEMP/pr-agent-bridge.log" || true
           exit 1
 
+      - name: Qualify native OpenCode v2 PR-Agent session API
+        if: steps.stack.outputs.enabled == 'true' && steps.admit.outputs.admitted == 'true'
+        env:
+          BRIDGE_SCRIPT: ${{ steps.runtime.outputs.bridge_script }}
+          OPENCODE_MODEL: ${{ steps.model_route.outputs.model }}
+          OPENCODE_SERVER_URL: http://127.0.0.1:${{ steps.stack.outputs.server_port }}
+        run: |
+          set -euo pipefail
+          # The bridge's actual control API is exercised before review. A
+          # v1/v2 ABI mismatch is a deterministic infrastructure failure,
+          # not a model outage and must not consume reviewer inference budget.
+          python3 "$BRIDGE_SCRIPT" --preflight
+
       - name: Revalidate the admitted exact HEAD immediately before review
         if: steps.stack.outputs.enabled == 'true' && steps.admit.outputs.admitted == 'true'
         id: before
