@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import fnmatch
 import io
 import json
 import os
@@ -215,67 +216,117 @@ class UpstreamErrorTests(unittest.TestCase):
 
 
 class FakeOpenCodeHandler(BaseHTTPRequestHandler):
+    """Strict OpenCode v2 session API simulator with Basic authentication."""
+
     sessions: dict = {}
     deleted: list = []
     bodies: list = []
+    selected_agents: list = []
+    selected_models: list = []
+    permission_probes: list = []
 
     def log_message(self, *args: object) -> None:
         pass
 
-    def _send(self, status: int, payload: object) -> None:
-        data = json.dumps(payload).encode()
+    def _send(self, status: int, payload: object = None) -> None:
+        data = json.dumps(payload).encode() if payload is not None else b""
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(data)))
         self.end_headers()
-        self.wfile.write(data)
+        if data:
+            self.wfile.write(data)
+
+    def _authorized(self) -> bool:
+        import base64
+        token = base64.b64encode(b"opencode:fixture-password").decode()
+        return self.headers.get("Authorization") == "Basic " + token
 
     def do_POST(self) -> None:  # noqa: N802
+        if not self._authorized():
+            self._send(401, {"error": "unauthorized"})
+            return
         length = int(self.headers.get("Content-Length", "0") or "0")
-        raw = self.rfile.read(length).decode() if length else "{}"
-        if self.path == "/session":
+        body = json.loads(self.rfile.read(length).decode() or "{}")
+        if self.path == "/api/session":
             sid = f"ses-{len(type(self).sessions) + 1}"
-            type(self).sessions[sid] = True
-            self._send(200, {"id": sid})
+            type(self).sessions[sid] = body.get("permissions") or []
+            self._send(200, {"data": {
+                "id": sid, "permissions": type(self).sessions[sid],
+            }})
             return
-        if self.path.endswith("/prompt_async"):
-            type(self).bodies.append(json.loads(raw))
-            self.send_response(204)
-            self.send_header("Content-Length", "0")
-            self.end_headers()
+        if self.path.endswith("/agent"):
+            type(self).selected_agents.append(body)
+            self._send(204)
             return
-        if self.path.endswith("/message"):
-            # Deliberately refuse the legacy synchronous inference path.
-            self._send(400, {"error": "blocking message endpoint is forbidden"})
+        if self.path.endswith("/model"):
+            type(self).selected_models.append(body)
+            self._send(204)
             return
-        self._send(404, {"error": "nope"})
+        if self.path.endswith("/permission"):
+            # Evaluated exactly like OpenCode v2.2.6: merged agent+session
+            # rules, last match wins.
+            sid = self.path.split("/")[-2]
+            action = body.get("action", "")
+            effect = "ask"
+            for rule in type(self).sessions.get(sid, []):
+                pattern = rule.get("action")
+                if isinstance(pattern, str) and fnmatch.fnmatchcase(action, pattern):
+                    effect = rule.get("effect", "ask")
+            type(self).permission_probes.append((action, effect))
+            self._send(200, {"data": {"id": "per-probe", "effect": effect}})
+            return
+        if self.path.endswith("/prompt"):
+            type(self).bodies.append(body)
+            self._send(200, {"data": {"id": "msg-queued", "type": "user"}})
+            return
+        if self.path.endswith("/wait"):
+            self._send(204)
+            return
+        self._send(405, {"error": "obsolete method"})
 
     def do_GET(self) -> None:  # noqa: N802
-        if self.path == "/session/status":
-            self._send(
-                200,
-                {sid: {"type": "idle"} for sid in type(self).sessions},
-            )
+        if not self._authorized():
+            self._send(401, {"error": "unauthorized"})
             return
-        if self.path.endswith("/message"):
+        if "/api/session/" in self.path and "/message" in self.path:
             self._send(
                 200,
-                [{
-                    "info": {
-                        "role": "assistant",
+                {
+                    "data": [{
+                        "id": "msg-complete",
+                        "type": "assistant",
                         "time": {"created": 1, "completed": 2},
-                    },
-                    "parts": [{"type": "text", "text": "bridge-probe-ok"}],
-                }],
+                        "agent": "plan",
+                        "model": {"providerID": "opencode", "modelID": "test-fixture-route"},
+                        "content": [{"type": "text", "text": "bridge-probe-ok"}],
+                        "finish": "stop",
+                    }],
+                    "cursor": {"next": None, "previous": None},
+                },
             )
             return
-        self._send(404, {"error": "nope"})
+        if self.path.startswith("/api/session/"):
+            sid = self.path.rsplit("/", 1)[-1]
+            if sid not in type(self).sessions:
+                self._send(404, {"error": "unknown session"})
+                return
+            self._send(200, {"data": {
+                "id": sid,
+                "permissions": type(self).sessions[sid],
+                "outcome": "succeeded",
+            }})
+            return
+        self._send(405, {"error": "obsolete method"})
 
     def do_DELETE(self) -> None:  # noqa: N802
+        if not self._authorized():
+            self._send(401, {"error": "unauthorized"})
+            return
         sid = self.path.rsplit("/", 1)[-1]
         type(self).deleted.append(sid)
         type(self).sessions.pop(sid, None)
-        self._send(200, True)
+        self._send(204)
 
 
 class BridgeIsolationTests(unittest.TestCase):
@@ -284,6 +335,9 @@ class BridgeIsolationTests(unittest.TestCase):
         FakeOpenCodeHandler.sessions = {}
         FakeOpenCodeHandler.deleted = []
         FakeOpenCodeHandler.bodies = []
+        FakeOpenCodeHandler.selected_agents = []
+        FakeOpenCodeHandler.selected_models = []
+        FakeOpenCodeHandler.permission_probes = []
         cls.server = ThreadingHTTPServer(("127.0.0.1", 0), FakeOpenCodeHandler)
         cls.thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
         cls.thread.start()
@@ -307,6 +361,8 @@ class BridgeIsolationTests(unittest.TestCase):
             sys.path.remove(script_dir)
         old = os.environ.get("OPENCODE_SERVER_URL", "")
         old_model = os.environ.get("OPENCODE_MODEL")
+        old_password = os.environ.get("OPENCODE_PASSWORD")
+        os.environ["OPENCODE_PASSWORD"] = "fixture-password"
         os.environ["OPENCODE_MODEL"] = "opencode/test-fixture-route"
         os.environ["OPENCODE_SERVER_URL"] = f"http://127.0.0.1:{self.port}"
         bodies_before = len(FakeOpenCodeHandler.bodies)
@@ -329,6 +385,10 @@ class BridgeIsolationTests(unittest.TestCase):
                 os.environ.pop("OPENCODE_MODEL", None)
             else:
                 os.environ["OPENCODE_MODEL"] = old_model
+            if old_password is None:
+                os.environ.pop("OPENCODE_PASSWORD", None)
+            else:
+                os.environ["OPENCODE_PASSWORD"] = old_password
         self.assertEqual(
             first["choices"][0]["message"]["content"], "bridge-probe-ok"
         )
@@ -338,8 +398,51 @@ class BridgeIsolationTests(unittest.TestCase):
         self.assertEqual(len(FakeOpenCodeHandler.deleted) - deleted_before, 2)
         self.assertEqual(FakeOpenCodeHandler.sessions, {})
         for body in FakeOpenCodeHandler.bodies[bodies_before:]:
-            self.assertEqual(body.get("agent"), pr_agent.INFERENCE_AGENT)
+            self.assertIn("Never modify", body["text"])
             self.assertNotIn("tools", body)
+            self.assertNotIn("parts", body)
+        self.assertTrue(FakeOpenCodeHandler.selected_agents)
+        self.assertTrue(FakeOpenCodeHandler.selected_models)
+        self.assertTrue(all(a["agent"] == pr_agent.INFERENCE_AGENT
+                            for a in FakeOpenCodeHandler.selected_agents))
+        self.assertTrue(all(m["model"] == {
+            "providerID": "opencode", "id": "test-fixture-route"
+        } for m in FakeOpenCodeHandler.selected_models))
+
+    def test_native_v2_preflight_shares_review_control_api(self):
+        import sys
+
+        root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+        sys.path.insert(0, os.path.join(root, ".github", "scripts"))
+        try:
+            import pr_agent_bridge as bridge
+        finally:
+            sys.path.pop(0)
+        saved = {
+            key: os.environ.get(key)
+            for key in ("OPENCODE_SERVER_URL", "OPENCODE_MODEL", "OPENCODE_PASSWORD")
+        }
+        before = len(FakeOpenCodeHandler.deleted)
+        probes_before = len(FakeOpenCodeHandler.permission_probes)
+        try:
+            os.environ["OPENCODE_SERVER_URL"] = f"http://127.0.0.1:{self.port}"
+            os.environ["OPENCODE_MODEL"] = "opencode/test-fixture-route"
+            os.environ["OPENCODE_PASSWORD"] = "fixture-password"
+            bridge.preflight_review_session()
+            self.assertEqual(len(FakeOpenCodeHandler.deleted), before + 1)
+            self.assertEqual(FakeOpenCodeHandler.sessions, {})
+            # The no-LLM preflight exercises live enforcement for both
+            # restricted actions, not just their reported rule shape.
+            self.assertEqual(
+                FakeOpenCodeHandler.permission_probes[probes_before:],
+                [("shell", "deny"), ("subagent", "deny")],
+            )
+        finally:
+            for key, value in saved.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
 
     def test_bridge_handler_chat_completions_end_to_end(self):
         import sys
@@ -358,6 +461,8 @@ class BridgeIsolationTests(unittest.TestCase):
             port = server.server_address[1]
             old = os.environ.get("OPENCODE_SERVER_URL", "")
             old_model = os.environ.get("OPENCODE_MODEL")
+            old_password = os.environ.get("OPENCODE_PASSWORD")
+            os.environ["OPENCODE_PASSWORD"] = "fixture-password"
             os.environ["OPENCODE_MODEL"] = "opencode/test-fixture-route"
             os.environ["OPENCODE_SERVER_URL"] = f"http://127.0.0.1:{self.port}"
             try:
@@ -391,6 +496,10 @@ class BridgeIsolationTests(unittest.TestCase):
                     os.environ.pop("OPENCODE_MODEL", None)
                 else:
                     os.environ["OPENCODE_MODEL"] = old_model
+                if old_password is None:
+                    os.environ.pop("OPENCODE_PASSWORD", None)
+                else:
+                    os.environ["OPENCODE_PASSWORD"] = old_password
         finally:
             server.shutdown()
             thread.join(timeout=10)
@@ -398,7 +507,7 @@ class BridgeIsolationTests(unittest.TestCase):
 
 
 class MalformedSessionHandler(BaseHTTPRequestHandler):
-    """OpenCode stand-in whose ``POST /session`` reply is not a JSON object."""
+    """OpenCode v2 stand-in whose ``POST /api/session`` reply is malformed."""
 
     response = b"not json"
 
@@ -424,7 +533,7 @@ class MalformedSessionHandler(BaseHTTPRequestHandler):
 class BridgeErrorResponseTests(unittest.TestCase):
     """Every bad input must reach the reviewer as an HTTP status, not a reset."""
 
-    ENV_KEYS = ("OPENCODE_SERVER_URL", "OPENCODE_MODEL", "PR_AGENT_TIMEOUT_SECONDS")
+    ENV_KEYS = ("OPENCODE_SERVER_URL", "OPENCODE_MODEL", "PR_AGENT_TIMEOUT_SECONDS", "OPENCODE_PASSWORD")
 
     def setUp(self):
         import sys
@@ -440,6 +549,7 @@ class BridgeErrorResponseTests(unittest.TestCase):
             sys.path.remove(script_dir)
         self.bridge = bridge
         os.environ["OPENCODE_MODEL"] = "opencode/test-fixture-route"
+        os.environ["OPENCODE_PASSWORD"] = "fixture-password"
 
     def _restore_env(self):
         for key, value in self.saved_env.items():
@@ -531,7 +641,10 @@ class BridgeErrorResponseTests(unittest.TestCase):
         self.assertEqual(stdout.getvalue(), "")
 
     def test_malformed_session_response_is_a_502(self):
-        for raw in (b"not json", b"[]"):
+        for raw, expected in (
+            (b"not json", "malformed OpenCode v2 session envelope"),
+            (b"[]", "OpenCode v2 returned no session id"),
+        ):
             with self.subTest(response=raw):
                 MalformedSessionHandler.response = raw
                 upstream = self._serve(MalformedSessionHandler)
@@ -548,7 +661,7 @@ class BridgeErrorResponseTests(unittest.TestCase):
                 )
                 self.assertEqual(status, 502)
                 self.assertEqual(payload["error"]["type"], "upstream_error")
-                self.assertIn("malformed opencode response", payload["error"]["message"])
+                self.assertIn(expected, payload["error"]["message"])
 
 
 class FindingStateTests(unittest.TestCase):

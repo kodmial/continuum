@@ -3,9 +3,11 @@
 
 Protocol reality: `opencode serve` is NOT OpenAI Chat Completions
 compatible. It speaks an asynchronous session/message API (`POST /session`,
-then `POST /session/:id/prompt_async` with `{model, agent, system, parts}`,
-then poll `GET /session/status` until the turn completes, read the assistant
-record with `GET /session/:id/message`, and finally `DELETE /session/:id`).
+then select a read-only agent and model through `POST /api/session/:id/agent`
+and `POST /api/session/:id/model`, enqueue `POST /api/session/:id/prompt`,
+wait on `POST /api/experimental/session/:id/wait`, read a completed assistant
+record from `GET /api/session/:id/message`, and delete the isolated session.
+The v2 server requires loopback Basic auth even for this private workflow.
 PR-Agent reaches its model through LiteLLM, which
 routes any `openai/<name>` model to an OpenAI-compatible
 `POST /v1/chat/completions` endpoint. This bridge exposes exactly that
@@ -13,12 +15,16 @@ surface and translates each completion into one isolated OpenCode
 session: a fresh session per request, deleted afterwards, so requests
 never contaminate each other.
 
-Inference hardening (all verified free-tier compatible):
+Inference hardening:
 - every request runs as the read-only `plan` agent with a reviewer-only
   system prompt; the bridge never sends a per-request `tools` map and the
   server runs with its default tool surface (both overrides are rejected
-  by the free tier, so hardening lives in the agent selection plus the
-  workflow's post-run git-clean guard, not in request/server overrides);
+  by the free tier). The bridge creates each session with an explicit
+  session-level `Permission.Ruleset` that denies the v2 `shell` and
+  `subagent` tool actions, verifies the reported rules still decide `deny`
+  under OpenCode's last-match-wins evaluation, and probes the live session
+  permission endpoint for both actions with concrete, non-destructive
+  resources before submitting the prompt;
 - the server and the bridge both bind 127.0.0.1 only. A Docker action
   cannot reach runner loopback, so the workflow runs the pinned PR-Agent
   package directly on the runner instead of in a container;
@@ -31,12 +37,15 @@ Standard library only.
 from __future__ import annotations
 
 import argparse
+import base64
+import fnmatch
 import json
 import os
 import sys
 import threading
 import time
 import urllib.request
+import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Dict, Tuple
 
@@ -80,6 +89,41 @@ def split_model(model: str) -> Tuple[str, str]:
     return (provider.strip() or "opencode", (rest.strip() or model.strip()))
 
 
+#: Session-level permission rules (the v2 `Permission.Ruleset` shape) applied
+#: to every reviewer session. OpenCode evaluates session rules after agent
+#: rules with last-match-wins, so these denies override the `plan` agent's
+#: wildcard allows: the reviewer cannot execute shell commands or delegate to
+#: a subagent that would. The actions are the pinned v2 tool ids that assert
+#: them (`shell` and `subagent`), not the legacy v1 names (`bash`/`task`).
+#: Per-request `tools` overrides and server config permissions stay unused
+#: because the free tier rejects both.
+REVIEWER_SESSION_PERMISSIONS: Tuple[Dict[str, str], ...] = (
+    {"action": "shell", "resource": "*", "effect": "deny"},
+    {"action": "subagent", "resource": "*", "effect": "deny"},
+)
+
+#: Concrete, non-destructive resources used to prove the wildcard deny rules
+#: match a real tool invocation. Probing the literal `"*"` resource would also
+#: pass if the server treated it as a command/agent name instead of a wildcard,
+#: so each action is checked with the kind of resource its tool actually
+#: asserts: a harmless shell command and a built-in subagent id.
+REVIEWER_PERMISSION_PROBES: Tuple[Dict[str, str], ...] = (
+    {"action": "shell", "resource": "true"},
+    {"action": "subagent", "resource": "general"},
+)
+
+#: Distinct `--preflight` exit status for a retryable infrastructure failure
+#: (HTTP 429/5xx). The workflow retries only this status so a protocol
+#: mismatch (plain 1) can never consume the reviewer retry budget.
+PREFLIGHT_RETRYABLE_EXIT = 3
+
+# The v2 assistant finish reasons (`FinishReason` in the pinned schema).
+_FINAL_ASSISTANT_FINISH = "stop"
+_KNOWN_ASSISTANT_FINISHES = (
+    "stop", "length", "tool-calls", "content-filter", "error", "unknown",
+)
+
+
 def _bridge_timing(stage: str, started: float, outcome: str) -> None:
     """Structured, content-free evidence; never print prompts, paths or IDs."""
     elapsed_ms = int((time.monotonic() - started) * 1000)
@@ -94,18 +138,34 @@ def opencode_call(method: str, path: str, payload: Dict[str, Any] | None, timeou
     import urllib.error
 
     # Fixed labels avoid logging OpenCode session ids or request bodies.
-    if method == "POST" and path == "/session":
+    if method == "POST" and path == "/api/session":
         stage = "create-session"
-    elif method == "POST" and path.endswith("/prompt_async"):
+    elif method == "POST" and path.endswith("/prompt"):
         stage = "submit-async"
+    elif method == "POST" and path.endswith("/wait"):
+        stage = "wait-for-completion"
+    elif method == "POST" and path.endswith("/agent"):
+        stage = "select-agent"
+    elif method == "POST" and path.endswith("/model"):
+        stage = "select-model"
+    elif method == "POST" and path.endswith("/permission"):
+        stage = "probe-permissions"
     elif method == "GET" and path.endswith("/message"):
         stage = "read-messages"
+    elif method == "GET" and path.startswith("/api/session/"):
+        stage = "read-session"
     elif method == "POST" and path.endswith("/message"):
         stage = "send-message"
-    elif method == "DELETE" and path.startswith("/session/"):
+    elif method == "DELETE" and path.startswith("/api/session/"):
         stage = "delete-session"
     else:
         stage = "other"
+    # Every request uses the same version-pinned v2 server credential. Never
+    # silently fall back to an unauthenticated legacy endpoint.
+    password = _env("OPENCODE_PASSWORD")
+    if not password:
+        raise BridgeUpstreamError("OpenCode v2 bridge password not configured", retryable=False)
+    token = base64.b64encode(("opencode:" + password).encode("utf-8")).decode("ascii")
     started = time.monotonic()
     _bridge_timing(stage, started, "started")
     data = json.dumps(payload).encode() if payload is not None else None
@@ -113,7 +173,8 @@ def opencode_call(method: str, path: str, payload: Dict[str, Any] | None, timeou
         server_url() + path,
         data=data,
         method=method,
-        headers={"Content-Type": "application/json"},
+        headers={"Content-Type": "application/json", "Accept": "application/json",
+                 "Authorization": "Basic " + token},
     )
     try:
         with urllib.request.urlopen(request, timeout=timeout) as response:
@@ -121,115 +182,296 @@ def opencode_call(method: str, path: str, payload: Dict[str, Any] | None, timeou
             _bridge_timing(stage, started, f"http_{response.status}")
             return response.status, content
     except urllib.error.HTTPError as exc:
-        content = exc.read().decode(errors="replace")
+        # Upstream error bodies may contain prompts or secrets: retain only
+        # the authenticated HTTP status for classification and diagnostics.
+        exc.close()
         _bridge_timing(stage, started, f"http_{exc.code}")
-        return exc.code, content
+        return exc.code, ""
     except (urllib.error.URLError, TimeoutError, OSError) as exc:
         _bridge_timing(stage, started, type(exc).__name__)
         raise BridgeUpstreamError(f"cannot reach opencode server: {exc}", retryable=True) from None
 
 
-def _session_state_sample(session_id: str) -> str:
-    """Best-effort OpenCode session status; return a fixed non-sensitive label."""
-    request = urllib.request.Request(server_url() + "/session/status", method="GET")
+def _require_opencode_status(status: int, accepted: tuple[int, ...], stage: str) -> None:
+    """Fail closed with status-only diagnostics, never upstream response text."""
+    if status not in accepted:
+        raise BridgeUpstreamError(
+            f"OpenCode v2 {stage} rejected (status={status})",
+            retryable=status == 429 or status >= 500,
+        )
+
+
+def _session_info(session_id: str, stage: str = "read session") -> Dict[str, Any]:
+    """Fetch one v2 session record through the authenticated control API."""
+    quoted = urllib.parse.quote(session_id, safe="")
+    status, raw = opencode_call("GET", f"/api/session/{quoted}", None, 15)
+    _require_opencode_status(status, (200,), stage)
     try:
-        with urllib.request.urlopen(request, timeout=3) as response:
-            statuses = json.loads(response.read().decode())
-        value = statuses.get(session_id, {}) if isinstance(statuses, dict) else {}
-        state = str(value.get("type", "unknown")) if isinstance(value, dict) else "unknown"
-        return state if state in ("busy", "idle", "retry") else "unknown"
-    except (OSError, ValueError, TimeoutError):
-        return "unreachable"
+        envelope = json.loads(raw)
+    except (TypeError, ValueError):
+        raise BridgeUpstreamError(
+            "malformed OpenCode v2 session envelope", retryable=False
+        ) from None
+    info = envelope.get("data") if isinstance(envelope, dict) else None
+    if not isinstance(info, dict):
+        raise BridgeUpstreamError(
+            "invalid OpenCode v2 session envelope", retryable=False
+        )
+    return info
 
 
-def _monitor_opencode_session(session_id: str, finished: threading.Event) -> None:
-    """Probe server liveness every 30s while the synchronous message waits."""
-    started = time.monotonic()
-    while not finished.wait(30):
-        state = _session_state_sample(session_id)
-        # Reuse existing safe phase reporter so workflows print these metrics.
-        _bridge_timing("send-message", started, "status_" + state)
+def _last_rule_index(permissions: list, rule: Dict[str, str]) -> int:
+    """Index of the last rule that is exactly the one we requested."""
+    expected = (rule["action"], rule["resource"], rule["effect"])
+    index = -1
+    for position, candidate in enumerate(permissions):
+        if not isinstance(candidate, dict):
+            continue
+        actual = (
+            candidate.get("action"),
+            candidate.get("resource"),
+            candidate.get("effect"),
+        )
+        if actual == expected:
+            index = position
+    return index
+
+
+def _require_reviewer_session_rules(info: Dict[str, Any]) -> None:
+    """Fail closed unless the server still decides `deny` for both actions.
+
+    The session is only safe when OpenCode itself returns the ruleset we
+    requested: a server that ignored `permissions` must never run the
+    reviewer prompt with the agent's wildcard defaults still in force.
+
+    Presence alone is not enough. OpenCode merges the agent ruleset first and
+    evaluates the result with last-match-wins, so a later matching `allow`
+    (or `ask`) rule would override the deny even though the deny entry is
+    still reported. Any matching rule after our deny must therefore also be
+    a deny.
+    """
+    permissions = info.get("permissions")
+    if not isinstance(permissions, list):
+        raise BridgeUpstreamError(
+            "OpenCode v2 session did not report reviewer permissions",
+            retryable=False,
+        )
+    for rule in REVIEWER_SESSION_PERMISSIONS:
+        position = _last_rule_index(permissions, rule)
+        if position < 0:
+            raise BridgeUpstreamError(
+                "OpenCode v2 session did not enforce reviewer permissions",
+                retryable=False,
+            )
+        for later in permissions[position + 1:]:
+            if not isinstance(later, dict):
+                continue
+            pattern = later.get("action")
+            if not isinstance(pattern, str):
+                continue
+            if (
+                fnmatch.fnmatchcase(rule["action"], pattern)
+                and later.get("effect") != "deny"
+            ):
+                raise BridgeUpstreamError(
+                    "OpenCode v2 session did not enforce reviewer permissions",
+                    retryable=False,
+                )
+
+
+def _require_reviewer_permission_enforcement(session_id: str) -> None:
+    """Probe the server's live permission decision, without a model turn.
+
+    `POST /api/session/:id/permission` runs the same effective-rules
+    evaluation that a tool assertion uses (agent rules followed by the
+    session rules, last match wins). It spends no reviewer tokens and creates
+    no pending request when the action is already denied, so this is a real
+    enforcement check rather than a shape check on the reported rules. Each
+    probe uses a concrete, non-destructive resource so wildcard matching is
+    exercised exactly as a real tool call would. Each verified action prints
+    a content-free `bridge-permission` evidence line, so qualification and
+    review logs record the live server's decision.
+    """
+    quoted = urllib.parse.quote(session_id, safe="")
+    for probe in REVIEWER_PERMISSION_PROBES:
+        status, raw = opencode_call(
+            "POST",
+            f"/api/session/{quoted}/permission",
+            {"action": probe["action"], "resources": [probe["resource"]]},
+            15,
+        )
+        _require_opencode_status(status, (200,), "verify reviewer permissions")
+        try:
+            envelope = json.loads(raw)
+        except (TypeError, ValueError):
+            raise BridgeUpstreamError(
+                "malformed OpenCode v2 permission envelope", retryable=False
+            ) from None
+        decision = envelope.get("data") if isinstance(envelope, dict) else None
+        effect = decision.get("effect") if isinstance(decision, dict) else None
+        if effect != "deny":
+            label = effect if effect in ("allow", "ask") else "missing"
+            raise BridgeUpstreamError(
+                "OpenCode v2 session did not enforce reviewer permissions "
+                f"(effect={label})",
+                retryable=False,
+            )
+        # Content-free evidence that the live server decided "deny"; the
+        # qualification and review logs therefore record the actual result,
+        # not only that a probe request was made.
+        print(
+            f"bridge-permission action={probe['action']} effect=deny",
+            file=sys.stderr,
+            flush=True,
+        )
 
 
 def _await_async_assistant(session_id: str, timeout: int) -> Dict[str, Any]:
-    """Wait for a finished, server-recorded OpenCode reply, not a long socket read.
+    """A v2 enqueue receipt is NOT a finished review.
 
-    OpenCode /prompt_async acknowledges immediately (204). /session/status
-    reports busy or retry while the model works; /session/:id/message
-    contains a completed assistant message once the turn has actually ended.
-    The deadline here is a finite *infrastructure liveness watchdog*, never
-    a socket-read timeout or an invented successful review. Every HTTP poll
-    has a separate short transport timeout.
+    The v2 idle barrier bounds processing, but neither the barrier nor an
+    HTTP 200 admission proves execution succeeded. The session's recorded
+    terminal outcome must be `succeeded`, and the newest assistant message
+    must be a completed, non-error, final answer (`finish == "stop"`). An
+    intermediate step (for example `finish == "tool-calls"`) or an older
+    text record is never returned as the review.
     """
     if timeout <= 0:
         raise BridgeUpstreamError("invalid OpenCode completion watchdog", retryable=False)
-    started = time.monotonic()
-    deadline = started + timeout
-    last_status_log = started - 30.0
-    idle_without_reply_since: float | None = None
-    while True:
-        now = time.monotonic()
-        if now >= deadline:
-            raise BridgeUpstreamError(
-                "opencode session exceeded its configured completion watchdog",
-                retryable=True,
-            )
-        state = _session_state_sample(session_id)
-        if now - last_status_log >= 30:
-            _bridge_timing("send-message", started, "status_" + state)
-            last_status_log = now
-        if state not in ("busy", "retry"):
-            # OpenCode omits an idle session from /session/status in some
-            # releases. The durable assistant completion record, NOT missing
-            # status alone, is the authoritative successful response.
-            status, raw = opencode_call(
-                "GET", f"/session/{session_id}/message", None, 12
-            )
-            if status != 200:
-                raise map_opencode_error(status, raw)
-            try:
-                messages = json.loads(raw)
-            except (ValueError, TypeError):
-                raise BridgeUpstreamError(
-                    "opencode returned malformed session message list",
-                    retryable=True,
-                ) from None
-            if not isinstance(messages, list):
-                raise BridgeUpstreamError(
-                    "opencode returned non-list session messages",
-                    retryable=True,
-                )
-            assistants = [
-                entry for entry in messages
-                if isinstance(entry, dict)
-                and isinstance(entry.get("info"), dict)
-                and entry["info"].get("role") == "assistant"
-            ]
-            for entry in reversed(assistants):
-                info = entry["info"]
-                times = info.get("time")
-                if isinstance(times, dict) and times.get("completed") is not None:
-                    if info.get("error"):
-                        raise BridgeUpstreamError(
-                            "opencode completed with an assistant error",
-                            retryable=True,
-                        )
-                    # A completed assistant can still have no usable content:
-                    # extract_assistant_text fails closed on that condition.
-                    return entry
-            if state in ("idle", "unknown"):
-                if idle_without_reply_since is None:
-                    idle_without_reply_since = now
-                elif now - idle_without_reply_since >= 20:
-                    raise BridgeUpstreamError(
-                        "opencode became idle without a completed assistant reply",
-                        retryable=True,
-                    )
-            else:
-                idle_without_reply_since = None
-        else:
-            idle_without_reply_since = None
-        time.sleep(min(3.0, max(0.1, deadline - time.monotonic())))
+    quoted = urllib.parse.quote(session_id, safe="")
+    status, _ = opencode_call(
+        "POST", f"/api/experimental/session/{quoted}/wait", None, timeout
+    )
+    _require_opencode_status(status, (204,), "wait")
+    outcome = _session_info(session_id, "read session outcome").get("outcome")
+    if outcome != "succeeded":
+        label = outcome if outcome in ("failed", "interrupted") else "unknown"
+        raise BridgeUpstreamError(
+            f"OpenCode v2 session did not succeed (outcome={label})",
+            retryable=True,
+        )
+    status, raw = opencode_call(
+        "GET", f"/api/session/{quoted}/message?order=desc&type=assistant&limit=20", None, 12
+    )
+    _require_opencode_status(status, (200,), "message list")
+    try:
+        response = json.loads(raw)
+    except (TypeError, ValueError):
+        raise BridgeUpstreamError("malformed OpenCode v2 message page", retryable=False) from None
+    if not isinstance(response, dict) or not isinstance(response.get("data"), list):
+        raise BridgeUpstreamError("invalid OpenCode v2 message envelope", retryable=False)
+    latest = next(
+        (
+            entry for entry in response["data"]
+            if isinstance(entry, dict) and entry.get("type") == "assistant"
+        ),
+        None,
+    )
+    if latest is None:
+        raise BridgeUpstreamError(
+            "OpenCode v2 returned no assistant response", retryable=True
+        )
+    time_info = latest.get("time")
+    if not isinstance(time_info, dict) or time_info.get("completed") is None:
+        raise BridgeUpstreamError(
+            "OpenCode v2 assistant response is not completed", retryable=True
+        )
+    if latest.get("error"):
+        raise BridgeUpstreamError(
+            "OpenCode v2 assistant finished with error", retryable=True
+        )
+    finish = latest.get("finish")
+    if finish != _FINAL_ASSISTANT_FINISH:
+        label = finish if finish in _KNOWN_ASSISTANT_FINISHES else "missing"
+        raise BridgeUpstreamError(
+            f"OpenCode v2 assistant response is not final (finish={label})",
+            retryable=True,
+        )
+    content = latest.get("content")
+    if not isinstance(content, list):
+        raise BridgeUpstreamError(
+            "OpenCode v2 assistant response has no content", retryable=True
+        )
+    text = "".join(
+        part.get("text", "")
+        for part in content
+        if isinstance(part, dict) and part.get("type") == "text"
+        and isinstance(part.get("text"), str)
+    ).strip()
+    if not text:
+        raise BridgeUpstreamError(
+            "OpenCode v2 assistant response has no text", retryable=True
+        )
+    # Compatibility shape for PR-Agent's existing strict text extractor.
+    # This is backed exclusively by a real, completed, final v2 assistant.
+    return {"info": {"role": "assistant"}, "parts": [{"type": "text", "text": text}]}
+
+
+def _delete_review_session(session_id: str) -> None:
+    """Best-effort deletion; review evidence is never inferred from cleanup."""
+    quoted = urllib.parse.quote(session_id, safe="")
+    try:
+        opencode_call("DELETE", f"/api/session/{quoted}", None, 15)
+    except BridgeUpstreamError:
+        pass
+
+
+def _create_review_session(model: Dict[str, str]) -> str:
+    """Native authenticated v2 control path shared by review and preflight."""
+    status, raw = opencode_call(
+        "POST",
+        "/api/session",
+        {
+            "title": "pr-agent-bridge",
+            # Explicit reviewer-only rules, evaluated after agent rules.
+            "permissions": [dict(rule) for rule in REVIEWER_SESSION_PERMISSIONS],
+        },
+        15,
+    )
+    _require_opencode_status(status, (200,), "create session")
+    try:
+        envelope = json.loads(raw)
+    except (TypeError, ValueError):
+        raise BridgeUpstreamError(
+            "malformed OpenCode v2 session envelope", retryable=False
+        ) from None
+    session = envelope.get("data") if isinstance(envelope, dict) else None
+    session_id = session.get("id") if isinstance(session, dict) else None
+    if not isinstance(session_id, str) or not session_id:
+        raise BridgeUpstreamError("OpenCode v2 returned no session id", retryable=False)
+    quoted = urllib.parse.quote(session_id, safe="")
+    try:
+        # The server, not the prompt, owns this restriction: verify it took.
+        _require_reviewer_session_rules(
+            _session_info(session_id, "verify session permissions")
+        )
+        status, _ = opencode_call(
+            "POST", f"/api/session/{quoted}/agent", {"agent": "plan"}, 15
+        )
+        _require_opencode_status(status, (204,), "select read-only agent")
+        status, _ = opencode_call(
+            "POST", f"/api/session/{quoted}/model", {"model": model}, 15
+        )
+        _require_opencode_status(status, (204,), "select pinned model")
+        # Exercise the merged ruleset exactly as a tool assertion would,
+        # before any reviewer prompt can run.
+        _require_reviewer_permission_enforcement(session_id)
+    except Exception:
+        _delete_review_session(session_id)
+        raise
+    return session_id
+
+
+def preflight_review_session() -> None:
+    """No-LLM ABI check on the actual pinned OpenCode v2 server.
+
+    Uses exactly the same authenticated session/agent/model control path as
+    real review, including the live `shell`/`subagent` permission probe, and
+    never spends reviewer tokens or modifies the worktree.
+    """
+    provider, model_id = split_model(inference_model(""))
+    session_id = _create_review_session({"providerID": provider, "id": model_id})
+    _delete_review_session(session_id)
 
 
 def run_completion(body: Dict[str, Any], timeout: int) -> Dict[str, Any]:
@@ -243,29 +485,35 @@ def run_completion(body: Dict[str, Any], timeout: int) -> Dict[str, Any]:
     opencode_body = build_opencode_request(messages, inference_model(request_model), limit)
     require_inference_hardening(opencode_body)
 
-    status, raw = opencode_call("POST", "/session", {"title": "pr-agent-bridge"}, 15)
-    if status != 200:
-        raise map_opencode_error(status, raw)
-    session_id = json.loads(raw).get("id", "")
-    if not session_id:
-        raise BridgeUpstreamError("opencode server returned no session id", retryable=True)
+    session_id = _create_review_session({
+        "providerID": opencode_body["model"]["providerID"],
+        "id": opencode_body["model"]["modelID"],
+    })
+    quoted = urllib.parse.quote(session_id, safe="")
     try:
-        # Never hold one urllib socket for the entire model generation.
-        # The old synchronous POST was discarded after 170 seconds even
-        # when the actual session was still reporting status_busy.
-        status, raw = opencode_call(
-            "POST", f"/session/{session_id}/prompt_async", opencode_body, 15
+        # Preserve the immutable reviewer-only system policy in the prompt
+        # text because v2's admission body no longer has a system field.
+        # The server-side 'plan' agent remains read-only independently.
+        text = opencode_body["system"] + "\n\nReview request:\n" + (
+            opencode_body["parts"][0]["text"]
         )
-        if status != 204:
-            raise map_opencode_error(status, raw)
-        result = _await_async_assistant(session_id, timeout)
-        text = extract_assistant_text(result)
-        return opencode_response_to_openai(request_model or inference_model(request_model), text)
-    finally:
+        status, raw = opencode_call(
+            "POST", f"/api/session/{quoted}/prompt", {"text": text}, 15
+        )
+        _require_opencode_status(status, (200,), "enqueue prompt")
         try:
-            opencode_call("DELETE", f"/session/{session_id}", None, 15)
-        except BridgeUpstreamError:
-            pass
+            admission = json.loads(raw)
+        except (ValueError, TypeError):
+            raise BridgeUpstreamError("malformed OpenCode v2 prompt receipt", retryable=False) from None
+        if not isinstance(admission, dict) or not isinstance(admission.get("data"), dict):
+            raise BridgeUpstreamError("invalid OpenCode v2 prompt admission", retryable=False)
+        completed = _await_async_assistant(session_id, timeout)
+        text = extract_assistant_text(completed)
+        return opencode_response_to_openai(
+            request_model or inference_model(request_model), text
+        )
+    finally:
+        _delete_review_session(session_id)
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -401,7 +649,20 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--port", type=int, default=int(os.environ.get("PR_AGENT_BRIDGE_PORT", "18000")))
     parser.add_argument("--hostname", default="127.0.0.1")
+    parser.add_argument("--preflight", action="store_true",
+                        help="Verify v2 session ABI on the pinned server without LLM usage")
     args = parser.parse_args()
+    if args.preflight:
+        try:
+            preflight_review_session()
+        except BridgeUpstreamError as exc:
+            # Status-only diagnostics: never echo an upstream prompt body.
+            print(f"PR-Agent/OpenCode v2 preflight failed: {exc}", file=sys.stderr)
+            # The workflow retries only the distinct retryable status, so a
+            # protocol mismatch (plain 1) never consumes reviewer budget.
+            return PREFLIGHT_RETRYABLE_EXIT if exc.retryable else 1
+        print("PR-Agent/OpenCode v2 native session API qualified.", flush=True)
+        return 0
     if args.hostname not in ("127.0.0.1", "localhost", "::1"):
         print("refusing to bind beyond loopback", file=sys.stderr)
         return 2

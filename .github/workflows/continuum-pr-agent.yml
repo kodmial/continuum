@@ -1002,17 +1002,43 @@ jobs:
           SERVER_PORT: ${{ steps.stack.outputs.server_port }}
         run: |
           set -euo pipefail
+          # Dedicated ephemeral secret for this job; never place it on the
+          # process command line, logs, or any checked-out repository file.
+          OPENCODE_PASSWORD="$(openssl rand -hex 32)"
+          echo "::add-mask::${OPENCODE_PASSWORD}"
+          export OPENCODE_PASSWORD
+          echo "OPENCODE_PASSWORD=${OPENCODE_PASSWORD}" >> "$GITHUB_ENV"
           (setsid nohup opencode serve --hostname 127.0.0.1 --port "$SERVER_PORT" \
             > "$RUNNER_TEMP/opencode-serve.log" 2>&1 &)
           for attempt in $(seq 1 30); do
-            if curl -fsS "http://127.0.0.1:${SERVER_PORT}/global/health" >/dev/null 2>&1; then
-              echo "opencode serve is up on 127.0.0.1:${SERVER_PORT}."
+            # Probe through stdlib: the Basic secret never appears as a
+            # curl/-u process argument, in shell traces, or in server logs.
+            if python3 - "$SERVER_PORT" >/dev/null 2>&1 <<'PY'
+          import base64
+          import json
+          import os
+          import sys
+          import urllib.request
+
+          token = base64.b64encode(
+              ("opencode:" + os.environ["OPENCODE_PASSWORD"]).encode()
+          ).decode()
+          request = urllib.request.Request(
+              f"http://127.0.0.1:{sys.argv[1]}/api/info",
+              headers={"Authorization": "Basic " + token, "Accept": "application/json"},
+          )
+          with urllib.request.urlopen(request, timeout=2) as response:
+              payload = json.load(response)
+          assert isinstance(payload.get("version"), str) and payload["version"]
+          assert type(payload.get("pid")) is int
+          PY
+            then
+              echo "authenticated OpenCode v2 server is ready."
               exit 0
             fi
             sleep 2
           done
-          echo "::error::opencode serve did not become ready."
-          cat "$RUNNER_TEMP/opencode-serve.log" || true
+          echo "::error::authenticated OpenCode v2 server did not become ready."
           exit 1
 
       - name: Start the OpenAI-compatibility bridge on loopback
@@ -1041,6 +1067,50 @@ jobs:
           echo "::error::compatibility bridge did not become ready."
           cat "$RUNNER_TEMP/pr-agent-bridge.log" || true
           exit 1
+
+      - name: Qualify native OpenCode v2 PR-Agent session API
+        id: qualify_preflight
+        if: steps.stack.outputs.enabled == 'true' && steps.admit.outputs.admitted == 'true'
+        env:
+          BRIDGE_SCRIPT: ${{ steps.runtime.outputs.bridge_script }}
+          OPENCODE_MODEL: ${{ steps.model_route.outputs.model }}
+          OPENCODE_SERVER_URL: http://127.0.0.1:${{ steps.stack.outputs.server_port }}
+        run: |
+          set -euo pipefail
+          # The bridge's actual control API is exercised before review. A
+          # v1/v2 ABI mismatch is a deterministic infrastructure failure,
+          # not a model outage and must not consume reviewer inference budget.
+          # The bridge reserves exit status 3 for a retryable failure (429/5xx)
+          # and 1 for a protocol mismatch, so only the former is retryable.
+          preflight_log="$RUNNER_TEMP/pr-agent-preflight.log"
+          set +e
+          python3 "$BRIDGE_SCRIPT" --preflight 2>&1 | tee "$preflight_log"
+          status=${PIPESTATUS[0]}
+          set -e
+          if [[ "$status" -eq 0 ]]; then
+            # A successful preflight must have exercised the live reviewer
+            # permission control for both restricted actions. Without this
+            # evidence the job would only prove the session shape, not that
+            # shell execution and delegation are denied on the real server.
+            for action in shell subagent; do
+              if ! grep -Fxq "bridge-permission action=${action} effect=deny" "$preflight_log"; then
+                echo "::error::Live reviewer permission probe did not confirm deny for ${action}."
+                status=1
+              fi
+            done
+          fi
+          if [[ "$status" -eq 3 ]]; then
+            echo "retryable=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "retryable=false" >> "$GITHUB_OUTPUT"
+          fi
+          if [[ "$status" -eq 0 ]]; then
+            {
+              echo "### PR-Agent reviewer permission qualification"
+              grep -E '^bridge-permission action=(shell|subagent) effect=deny$' "$preflight_log"
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+          exit "$status"
 
       - name: Revalidate the admitted exact HEAD immediately before review
         if: steps.stack.outputs.enabled == 'true' && steps.admit.outputs.admitted == 'true'
@@ -3079,7 +3149,7 @@ jobs:
         env:
           HEAD_SHA: ${{ steps.admit.outputs.head_sha }}
           PR_NUMBER: ${{ steps.stack.outputs.pr_number }}
-          RETRYABLE_FAILURE: ${{ (steps.retry_state.outputs.cooldown_active == 'true' || steps.model_route.outcome == 'failure' || steps.install_pragent.outcome == 'failure' || steps.install_opencode.outcome == 'failure' || steps.start_opencode.outcome == 'failure' || steps.runtime.outcome == 'failure' || steps.start_bridge.outcome == 'failure' || steps.pragent.outcome == 'failure' || steps.before.outputs.transient == 'true' || steps.result.outcome == 'failure' || steps.persistent.outcome == 'failure' || steps.improve_gate.outcome == 'failure' || steps.improve.outcome == 'failure' || steps.improve_skipped.outcome == 'failure' || steps.post_improve.outcome == 'failure' || steps.improve_output.outcome == 'failure' || (steps.review_attestation.outcome == 'failure' && env.CONTINUUM_MODEL_STATE_TRANSIENT != '')) && steps.result.outputs.stale_head != 'true' && steps.persistent.outputs.stale_head != 'true' && steps.improve_gate.outputs.stale_head != 'true' && steps.improve.outputs.stale_head != 'true' && steps.improve_skipped.outputs.stale_head != 'true' && steps.post_improve.outputs.stale_head != 'true' && 'true' || 'false' }}
+          RETRYABLE_FAILURE: ${{ (steps.retry_state.outputs.cooldown_active == 'true' || steps.model_route.outcome == 'failure' || steps.install_pragent.outcome == 'failure' || steps.install_opencode.outcome == 'failure' || steps.start_opencode.outcome == 'failure' || steps.runtime.outcome == 'failure' || steps.start_bridge.outcome == 'failure' || (steps.qualify_preflight.outcome == 'failure' && steps.qualify_preflight.outputs.retryable == 'true') || steps.pragent.outcome == 'failure' || steps.before.outputs.transient == 'true' || steps.result.outcome == 'failure' || steps.persistent.outcome == 'failure' || steps.improve_gate.outcome == 'failure' || steps.improve.outcome == 'failure' || steps.improve_skipped.outcome == 'failure' || steps.post_improve.outcome == 'failure' || steps.improve_output.outcome == 'failure' || (steps.review_attestation.outcome == 'failure' && env.CONTINUUM_MODEL_STATE_TRANSIENT != '')) && steps.result.outputs.stale_head != 'true' && steps.persistent.outputs.stale_head != 'true' && steps.improve_gate.outputs.stale_head != 'true' && steps.improve.outputs.stale_head != 'true' && steps.improve_skipped.outputs.stale_head != 'true' && steps.post_improve.outputs.stale_head != 'true' && 'true' || 'false' }}
         with:
           github-token: ${{ env.CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED == 'true' && secrets.TAP_PAT || (env.CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED != 'true' && github.token || '') }}
           script: |
@@ -3193,6 +3263,8 @@ jobs:
            steps.start_opencode.outcome == 'failure' ||
            steps.runtime.outcome == 'failure' ||
            steps.start_bridge.outcome == 'failure' ||
+           (steps.qualify_preflight.outcome == 'failure' &&
+            steps.qualify_preflight.outputs.retryable == 'true') ||
            steps.pragent.outcome == 'failure' ||
            steps.before.outputs.transient == 'true' ||
            steps.result.outcome == 'failure' ||
@@ -3338,6 +3410,8 @@ jobs:
            steps.start_opencode.outcome == 'failure' ||
            steps.runtime.outcome == 'failure' ||
            steps.start_bridge.outcome == 'failure' ||
+           (steps.qualify_preflight.outcome == 'failure' &&
+            steps.qualify_preflight.outputs.retryable == 'true') ||
            steps.pragent.outcome == 'failure' ||
            steps.before.outputs.transient == 'true' ||
            steps.result.outcome == 'failure' ||

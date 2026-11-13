@@ -35,19 +35,21 @@ class BridgeTimingTests(unittest.TestCase):
     def test_per_stage_timing_records_healthy_opencode_without_payloads(self):
         stderr = io.StringIO()
         with patch.object(bridge.urllib.request, "urlopen", return_value=FakeReply()):
-            with patch.dict(bridge.os.environ, {"OPENCODE_SERVER_URL": "http://127.0.0.1:4096"}):
+            with patch.dict(bridge.os.environ, {"OPENCODE_SERVER_URL": "http://127.0.0.1:4096",
+                                                     "OPENCODE_PASSWORD": "private-credential"}):
                 with contextlib.redirect_stderr(stderr):
-                    status, _ = bridge.opencode_call("POST", "/session", {"text": "private-data"}, 170)
+                    status, _ = bridge.opencode_call("POST", "/api/session", {"text": "private-data"}, 170)
                     status2, _ = bridge.opencode_call(
-                        "POST", "/session/session-secret-should-not-be-logged/message",
+                        "POST", "/api/session/session-secret-should-not-be-logged/prompt",
                         {"text": "private-data"}, 170,
                     )
         self.assertEqual((status, status2), (200, 200))
         log = stderr.getvalue()
         self.assertRegex(log, r"bridge-phase stage=create-session elapsed_ms=\d+ outcome=http_200")
-        self.assertRegex(log, r"bridge-phase stage=send-message elapsed_ms=\d+ outcome=http_200")
+        self.assertRegex(log, r"bridge-phase stage=submit-async elapsed_ms=\d+ outcome=http_200")
         self.assertNotIn("private-data", log)
         self.assertNotIn("session-secret", log)
+        self.assertNotIn("private-credential", log)
 
     def test_bridge_socket_read_timeout_is_http_504(self):
         class RecordingHandler(bridge.Handler):
@@ -116,99 +118,374 @@ class BridgeTimingTests(unittest.TestCase):
                 handler.do_POST()
         self.assertEqual(handler.observed_status, 502)
 
-    def test_session_status_monitor_does_not_expose_session_or_prompt(self):
-        class StatusReply(FakeReply):
+    def test_authenticated_requests_never_log_password_or_prompt(self):
+        class AuthReply(FakeReply):
+            status = 204
+
             def read(self):
-                return b'{"secret-session-id": {"type": "busy"}}'
+                return b""
 
-        stderr = io.StringIO()
-        with patch.object(bridge.urllib.request, "urlopen", return_value=StatusReply()):
-            with contextlib.redirect_stderr(stderr):
-                state = bridge._session_state_sample("secret-session-id")
-                bridge._bridge_timing("send-message", 0.0, "status_" + state)
-        self.assertEqual(state, "busy")
-        self.assertIn("outcome=status_busy", stderr.getvalue())
-        self.assertNotIn("secret-session-id", stderr.getvalue())
-
-    def test_async_completion_survives_legacy_170_second_socket_cutoff(self):
-        """A busy model can finish at 180 seconds without waiting on one HTTP socket."""
-        finished = [{
-            "info": {"role": "assistant", "time": {"completed": 180001}},
-            "parts": [{"type": "text", "text": "grounded-review"}],
-        }]
-        clock = [0.0]
-
-        def monotonic():
-            # The server's model has been busy for >170s since dispatch.
-            clock[0] += 45.0
-            return clock[0]
-
-        with patch.object(bridge.time, "monotonic", side_effect=monotonic):
-            with patch.object(bridge.time, "sleep", return_value=None):
-                with patch.object(
-                    bridge, "_session_state_sample",
-                    side_effect=["busy", "busy", "busy", "idle"],
-                ) as status_sample:
-                    with patch.object(
-                        bridge, "opencode_call",
-                        return_value=(200, bridge.json.dumps(finished)),
-                    ) as read:
-                        answer = bridge._await_async_assistant("secret-session", 600)
-        self.assertEqual(bridge.extract_assistant_text(answer), "grounded-review")
-        self.assertEqual(status_sample.call_count, 4)
-        read.assert_called_once_with(
-            "GET", "/session/secret-session/message", None, 12
-        )
-
-    def test_async_status_does_not_accept_incomplete_or_error_reply(self):
-        for data in (
-            [{"info": {"role": "assistant", "time": {}},
-              "parts": [{"type": "text", "text": "partial"}]}],
-            [{"info": {"role": "assistant", "time": {"completed": 2},
-                       "error": {"message": "provider failure"}},
-              "parts": [{"type": "text", "text": "looks done"}]}],
-        ):
-            with self.subTest(data=data):
-                with patch.object(bridge, "_session_state_sample", return_value="idle"):
-                    with patch.object(
-                        bridge, "opencode_call",
-                        return_value=(200, bridge.json.dumps(data)),
-                    ):
-                        with patch.object(bridge.time, "sleep", return_value=None):
-                            with patch.object(
-                                bridge.time, "monotonic",
-                                side_effect=iter(range(0, 120, 3)),
-                            ):
-                                with self.assertRaises(bridge.BridgeUpstreamError):
-                                    bridge._await_async_assistant("secret-session", 60)
-
-    def test_async_endpoint_required_and_session_cleaned_after_failure(self):
-        with patch.dict(bridge.os.environ, {"OPENCODE_MODEL": "opencode/test-route"}):
-            with patch.object(
-                bridge, "opencode_call",
-                side_effect=[
-                    (200, '{"id":"private-session"}'),
-                    (500, '{"error":"unsupported async"}'),
-                    (200, "true"),
-                ],
-            ) as transport:
-                with self.assertRaises(bridge.BridgeUpstreamError):
-                    bridge.run_completion(
-                        {"messages": [{"role": "user", "content": "review"}]},
-                        timeout=600,
+        with patch.dict(bridge.os.environ, {"OPENCODE_PASSWORD": "private-password"}):
+            with patch.object(bridge.urllib.request, "urlopen", return_value=AuthReply()) as fetch:
+                stream = io.StringIO()
+                with contextlib.redirect_stderr(stream):
+                    status, _ = bridge.opencode_call(
+                        "POST", "/api/session/ses-private/agent", {"agent": "plan"}, 15
                     )
+        self.assertEqual(status, 204)
+        import base64
+        request = fetch.call_args.args[0]
+        self.assertEqual(request.get_header("Authorization"),
+                         "Basic " + base64.b64encode(b"opencode:private-password").decode())
+        self.assertNotIn("private-password", stream.getvalue())
+        self.assertNotIn("ses-private", stream.getvalue())
+
+    def test_missing_authentication_fails_before_any_network_request(self):
+        with patch.dict(bridge.os.environ, {"OPENCODE_PASSWORD": ""}):
+            with patch.object(bridge.urllib.request, "urlopen") as fetch:
+                with self.assertRaises(bridge.BridgeUpstreamError) as ctx:
+                    bridge.opencode_call("POST", "/api/session", {}, 15)
+        self.assertFalse(ctx.exception.retryable)
+        fetch.assert_not_called()
+
+    def test_wait_barrier_requires_a_real_completed_v2_assistant(self):
+        session = {
+            "id": "secret-session",
+            "permissions": list(bridge.REVIEWER_SESSION_PERMISSIONS),
+            "outcome": "succeeded",
+        }
+        complete = {
+            "data": [{
+                "id": "msg-1", "type": "assistant",
+                "time": {"created": 1, "completed": 2},
+                "content": [{"type": "text", "text": "grounded-review"}],
+                "finish": "stop",
+            }],
+            "cursor": {"next": None, "previous": None},
+        }
+        with patch.object(
+            bridge, "opencode_call",
+            side_effect=[
+                (204, ""),
+                (200, bridge.json.dumps({"data": session})),
+                (200, bridge.json.dumps(complete)),
+            ],
+        ) as transport:
+            result = bridge._await_async_assistant("secret-session", 600)
+        self.assertEqual(bridge.extract_assistant_text(result), "grounded-review")
+        self.assertEqual(transport.call_args_list[0].args[:2],
+                         ("POST", "/api/experimental/session/secret-session/wait"))
+        self.assertEqual(transport.call_args_list[1].args[:2],
+                         ("GET", "/api/session/secret-session"))
+        self.assertEqual(transport.call_args_list[2].args[:2],
+                         ("GET", "/api/session/secret-session/message?order=desc&type=assistant&limit=20"))
+
+    def test_async_enqueue_is_never_mistaken_for_completed_reply(self):
+        session = {"data": {
+            "id": "ses-1",
+            "permissions": list(bridge.REVIEWER_SESSION_PERMISSIONS),
+            "outcome": "succeeded",
+        }}
+        for item in (
+            {"type": "assistant", "time": {"created": 1}, "content": [
+                {"type": "text", "text": "partial"}]},
+            {"type": "assistant", "time": {"created": 1, "completed": 2},
+             "error": {"message": "failed"}, "content": [
+                 {"type": "text", "text": "fake successful reply"}]},
+            {"type": "user", "time": {"created": 1}, "text": "admission"},
+        ):
+            with self.subTest(item=item):
+                response = {"data": [item], "cursor": {}}
+                with patch.object(bridge, "opencode_call", side_effect=[
+                    (204, ""),
+                    (200, bridge.json.dumps(session)),
+                    (200, bridge.json.dumps(response)),
+                ]):
+                    with self.assertRaises(bridge.BridgeUpstreamError):
+                        bridge._await_async_assistant("ses-1", 60)
+
+    def test_tool_call_step_is_never_returned_as_a_final_review(self):
+        session = {"data": {
+            "id": "ses-1",
+            "permissions": list(bridge.REVIEWER_SESSION_PERMISSIONS),
+            "outcome": "succeeded",
+        }}
+        intermediate = {
+            "data": [
+                {"type": "assistant", "time": {"created": 3, "completed": 4},
+                 "content": [{"type": "text", "text": "intermediate step"}],
+                 "finish": "tool-calls"},
+                {"type": "assistant", "time": {"created": 1, "completed": 2},
+                 "content": [{"type": "text", "text": "earlier final answer"}],
+                 "finish": "stop"},
+            ],
+            "cursor": {},
+        }
+        with patch.object(bridge, "opencode_call", side_effect=[
+            (204, ""), (200, bridge.json.dumps(session)),
+            (200, bridge.json.dumps(intermediate)),
+        ]):
+            with self.assertRaises(bridge.BridgeUpstreamError) as ctx:
+                bridge._await_async_assistant("ses-1", 60)
+        self.assertIn("not final", str(ctx.exception))
+
+    def test_terminal_session_outcome_must_have_succeeded(self):
+        for outcome in ("failed", "interrupted", None):
+            with self.subTest(outcome=outcome):
+                session = {"data": {
+                    "id": "ses-1",
+                    "permissions": list(bridge.REVIEWER_SESSION_PERMISSIONS),
+                    "outcome": outcome,
+                }}
+                with patch.object(bridge, "opencode_call", side_effect=[
+                    (204, ""), (200, bridge.json.dumps(session)),
+                ]) as transport:
+                    with self.assertRaises(bridge.BridgeUpstreamError):
+                        bridge._await_async_assistant("ses-1", 60)
+                # The failed turn never reaches the message endpoint and
+                # never falls back to an earlier reply.
+                self.assertEqual(transport.call_count, 2)
+
+    def test_wait_fail_closed_on_503_without_polling_legacy_routes(self):
+        with patch.object(bridge, "opencode_call", return_value=(503, "")) as call:
+            with self.assertRaises(bridge.BridgeUpstreamError) as ctx:
+                bridge._await_async_assistant("ses-1", 600)
+        self.assertTrue(ctx.exception.retryable)
+        self.assertEqual(call.call_count, 1)
+
+    def test_prompt_admission_failure_still_deletes_v2_session(self):
+        with patch.dict(bridge.os.environ, {"OPENCODE_MODEL": "opencode/test-route"}):
+            with patch.object(bridge, "opencode_call", side_effect=[
+                (200, '{"data":{"id":"private-session"}}'),
+                (200, bridge.json.dumps({"data": {
+                    "id": "private-session",
+                    "permissions": list(bridge.REVIEWER_SESSION_PERMISSIONS),
+                }})),
+                (204, ""),
+                (204, ""),
+                (200, '{"data":{"id":"per-shell","effect":"deny"}}'),
+                (200, '{"data":{"id":"per-subagent","effect":"deny"}}'),
+                (405, ""),
+                (204, ""),
+            ]) as transport:
+                with self.assertRaises(bridge.BridgeUpstreamError):
+                    bridge.run_completion({
+                        "messages": [{"role": "user", "content": "review"}]
+                    }, timeout=600)
         self.assertEqual(
             [call.args[1] for call in transport.call_args_list],
-            ["/session", "/session/private-session/prompt_async",
-             "/session/private-session"],
+            ["/api/session", "/api/session/private-session",
+             "/api/session/private-session/agent",
+             "/api/session/private-session/model",
+             "/api/session/private-session/permission",
+             "/api/session/private-session/permission",
+             "/api/session/private-session/prompt", "/api/session/private-session"],
         )
+
+    def test_review_session_requests_and_verifies_reviewer_permissions(self):
+        session = {"data": {
+            "id": "private-session",
+            "permissions": list(bridge.REVIEWER_SESSION_PERMISSIONS),
+        }}
+        with patch.object(bridge, "opencode_call", side_effect=[
+            (200, '{"data":{"id":"private-session"}}'),
+            (200, bridge.json.dumps(session)),
+            (204, ""),
+            (204, ""),
+            (200, '{"data":{"id":"per-shell","effect":"deny"}}'),
+            (200, '{"data":{"id":"per-subagent","effect":"deny"}}'),
+        ]) as transport:
+            session_id = bridge._create_review_session(
+                {"providerID": "opencode", "id": "test-route"}
+            )
+        self.assertEqual(session_id, "private-session")
+        create_body = transport.call_args_list[0].args[2]
+        self.assertIn(
+            {"action": "shell", "resource": "*", "effect": "deny"},
+            create_body["permissions"],
+        )
+        self.assertIn(
+            {"action": "subagent", "resource": "*", "effect": "deny"},
+            create_body["permissions"],
+        )
+        self.assertEqual(transport.call_args_list[1].args[1],
+                         "/api/session/private-session")
+        # The live permission endpoint must be asked about both actions
+        # before the session is handed back for a prompt, using concrete
+        # resources that exercise wildcard matching like a real tool call.
+        self.assertEqual(
+            [call.args[2] for call in transport.call_args_list
+             if call.args[1].endswith("/permission")],
+            [{"action": "shell", "resources": ["true"]},
+             {"action": "subagent", "resources": ["general"]}],
+        )
+
+    def test_reviewer_permission_probes_use_concrete_non_wildcard_resources(self):
+        # A probe of the literal "*" would not prove that the wildcard deny
+        # rules match the command/agent resources a real tool asserts.
+        self.assertEqual(
+            [(probe["action"], probe["resource"])
+             for probe in bridge.REVIEWER_PERMISSION_PROBES],
+            [("shell", "true"), ("subagent", "general")],
+        )
+        self.assertEqual(
+            [probe["action"] for probe in bridge.REVIEWER_PERMISSION_PROBES],
+            [rule["action"] for rule in bridge.REVIEWER_SESSION_PERMISSIONS],
+        )
+        self.assertTrue(all(
+            probe["resource"] != "*"
+            for probe in bridge.REVIEWER_PERMISSION_PROBES
+        ))
+
+    def test_reviewer_permissions_target_pinned_v2_tool_actions(self):
+        # OpenCode v2.2.6 asserts these tool ids as permission actions; the
+        # legacy v1 names (`bash`/`task`) would never match and would leave
+        # shell execution and delegation allowed.
+        self.assertEqual(
+            [rule["action"] for rule in bridge.REVIEWER_SESSION_PERMISSIONS],
+            ["shell", "subagent"],
+        )
+        self.assertTrue(all(
+            rule["resource"] == "*" and rule["effect"] == "deny"
+            for rule in bridge.REVIEWER_SESSION_PERMISSIONS
+        ))
+
+    def test_ignored_reviewer_permissions_fail_closed_and_delete_session(self):
+        later_allow = {
+            "action": "shell", "resource": "*", "effect": "allow"
+        }
+        broader_later_allow = {
+            "action": "*", "resource": "*", "effect": "allow"
+        }
+        for permissions in (None, [], [
+            {"action": "shell", "resource": "*", "effect": "allow"},
+        ], [
+            *bridge.REVIEWER_SESSION_PERMISSIONS, later_allow,
+        ], [
+            *bridge.REVIEWER_SESSION_PERMISSIONS, broader_later_allow,
+        ]):
+            with self.subTest(permissions=permissions):
+                session = {"data": {"id": "private-session"}}
+                if permissions is not None:
+                    session["data"]["permissions"] = permissions
+                with patch.object(bridge, "opencode_call", side_effect=[
+                    (200, '{"data":{"id":"private-session"}}'),
+                    (200, bridge.json.dumps(session)),
+                    (204, ""),
+                ]) as transport:
+                    with self.assertRaises(bridge.BridgeUpstreamError) as ctx:
+                        bridge._create_review_session(
+                            {"providerID": "opencode", "id": "test-route"}
+                        )
+                self.assertFalse(ctx.exception.retryable)
+                self.assertEqual(
+                    [call.args[1] for call in transport.call_args_list][-1],
+                    "/api/session/private-session",
+                )
+                self.assertEqual(transport.call_args_list[-1].args[0], "DELETE")
+
+    def test_reviewer_deny_is_checked_under_last_match_wins(self):
+        # An earlier allow is harmless because the later deny wins. A later
+        # matching allow/ask would override the deny and must fail closed.
+        bridge._require_reviewer_session_rules({
+            "permissions": [
+                {"action": "*", "resource": "*", "effect": "allow"},
+                *bridge.REVIEWER_SESSION_PERMISSIONS,
+            ]
+        })
+        for later in (
+            {"action": "shell", "resource": "specific", "effect": "allow"},
+            {"action": "*", "resource": "*", "effect": "allow"},
+            {"action": "subagent", "resource": "*", "effect": "ask"},
+        ):
+            with self.subTest(later=later):
+                with self.assertRaises(bridge.BridgeUpstreamError) as ctx:
+                    bridge._require_reviewer_session_rules({
+                        "permissions": [
+                            *bridge.REVIEWER_SESSION_PERMISSIONS, later,
+                        ]
+                    })
+                self.assertFalse(ctx.exception.retryable)
+
+    def test_live_permission_probe_must_return_deny(self):
+        for decision in (
+            {"data": {"id": "per-probe", "effect": "allow"}},
+            {"data": {"id": "per-probe", "effect": "ask"}},
+            {"data": {"id": "per-probe"}},
+            {"not": "an envelope"},
+        ):
+            with self.subTest(decision=decision):
+                session = {"data": {
+                    "id": "private-session",
+                    "permissions": list(bridge.REVIEWER_SESSION_PERMISSIONS),
+                }}
+                with patch.object(bridge, "opencode_call", side_effect=[
+                    (200, '{"data":{"id":"private-session"}}'),
+                    (200, bridge.json.dumps(session)),
+                    (204, ""),
+                    (204, ""),
+                    (200, bridge.json.dumps(decision)),
+                    (204, ""),
+                ]) as transport:
+                    with self.assertRaises(bridge.BridgeUpstreamError) as ctx:
+                        bridge._create_review_session(
+                            {"providerID": "opencode", "id": "test-route"}
+                        )
+                self.assertFalse(ctx.exception.retryable)
+                self.assertEqual(transport.call_args_list[-1].args[0], "DELETE")
+
+    def test_live_permission_probe_records_content_free_deny_evidence(self):
+        session = {"data": {
+            "id": "private-session",
+            "permissions": list(bridge.REVIEWER_SESSION_PERMISSIONS),
+        }}
+        stderr = io.StringIO()
+        with patch.object(bridge, "opencode_call", side_effect=[
+            (200, '{"data":{"id":"private-session"}}'),
+            (200, bridge.json.dumps(session)),
+            (204, ""),
+            (204, ""),
+            (200, '{"data":{"id":"per-shell","effect":"deny"}}'),
+            (200, '{"data":{"id":"per-subagent","effect":"deny"}}'),
+        ]):
+            with contextlib.redirect_stderr(stderr):
+                bridge._create_review_session(
+                    {"providerID": "opencode", "id": "test-route"}
+                )
+        evidence = [
+            line for line in stderr.getvalue().splitlines()
+            if line.startswith("bridge-permission ")
+        ]
+        self.assertEqual(evidence, [
+            "bridge-permission action=shell effect=deny",
+            "bridge-permission action=subagent effect=deny",
+        ])
+        self.assertNotIn("private-session", stderr.getvalue())
+
+    def test_preflight_retryable_exit_status_is_distinct_from_protocol_failure(self):
+        for retryable, expected in (
+            (True, bridge.PREFLIGHT_RETRYABLE_EXIT),
+            (False, 1),
+        ):
+            with self.subTest(retryable=retryable):
+                failure = bridge.BridgeUpstreamError(
+                    "OpenCode v2 create session rejected (status=503)",
+                    retryable=retryable,
+                )
+                with patch.object(bridge, "preflight_review_session", side_effect=failure):
+                    with patch.object(
+                        bridge.sys, "argv", ["pr_agent_bridge.py", "--preflight"]
+                    ):
+                        with contextlib.redirect_stderr(io.StringIO()):
+                            self.assertEqual(bridge.main(), expected)
 
     def test_network_timeout_at_open_code_is_logged_as_distinct_error(self):
         stderr = io.StringIO()
-        with patch.object(bridge.urllib.request, "urlopen", side_effect=TimeoutError("private-data")):
-            with contextlib.redirect_stderr(stderr):
-                with self.assertRaises(bridge.BridgeUpstreamError):
-                    bridge.opencode_call("POST", "/session", None, 170)
+        with patch.dict(bridge.os.environ, {"OPENCODE_PASSWORD": "private-password"}):
+            with patch.object(bridge.urllib.request, "urlopen", side_effect=TimeoutError("private-data")):
+                with contextlib.redirect_stderr(stderr):
+                    with self.assertRaises(bridge.BridgeUpstreamError):
+                        bridge.opencode_call("POST", "/api/session", None, 170)
         self.assertRegex(
             stderr.getvalue(),
             r"bridge-phase stage=create-session elapsed_ms=\d+ outcome=TimeoutError",
