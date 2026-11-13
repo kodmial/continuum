@@ -1251,11 +1251,13 @@ reconciliationDispatchSupport = async () => ({{ok: true, reason: ''}});
 github.rest.actions = {{
   createWorkflowDispatch: async args => dispatches.push(args),
 }};
-async function attempt(identityUnavailable) {{
+async function attempt({{identityUnavailable = false, login = 'kodmial'}} = {{}}) {{
   authenticatedFailure = identityUnavailable;
+  authenticatedLogin = login;
   issueComments = [handoff];
   posted = [];
   notices = [];
+  dispatches.length = 0;
   const requested = await requestCodeRabbitThreadVerification(
     pr, liveThreads, {{}}, {{remaining: 1, notBeforeMs: 0}}
   );
@@ -1267,24 +1269,29 @@ async function attempt(identityUnavailable) {{
   }};
 }}
 const results = {{
-  unresolved: await attempt(true),
-  recovered: await attempt(false),
+  unresolved: await attempt({{identityUnavailable: true}}),
+  emptyLogin: await attempt({{login: ''}}),
+  whitespaceLogin: await attempt({{login: '   '}}),
+  recovered: await attempt(),
 }};
 process.stdout.write(JSON.stringify(results));
 """
         result = self.run_verifier(checks)
         # Unknown identity must not dispatch another repair batch over the
-        # still-unverifiable handoff.
-        self.assertEqual(result["unresolved"]["requested"], 0)
-        self.assertEqual(result["unresolved"]["posted"], 0)
-        self.assertEqual(result["unresolved"]["dispatches"], 0)
-        self.assertTrue(
-            any(
-                "posting identity is unresolved" in notice
-                for notice in result["unresolved"]["notices"]
-            ),
-            result["unresolved"]["notices"],
-        )
+        # still-unverifiable handoff. An empty or whitespace-only login is
+        # unresolved too.
+        for key in ("unresolved", "emptyLogin", "whitespaceLogin"):
+            with self.subTest(identity=key):
+                self.assertEqual(result[key]["requested"], 0)
+                self.assertEqual(result[key]["posted"], 0)
+                self.assertEqual(result[key]["dispatches"], 0)
+                self.assertTrue(
+                    any(
+                        "posting identity is unresolved" in notice
+                        for notice in result[key]["notices"]
+                    ),
+                    result[key]["notices"],
+                )
         # Once the identity resolves, the same handoff selects the fresh
         # exact-HEAD verification instead of a repair dispatch.
         self.assertEqual(result["recovered"]["requested"], 1)

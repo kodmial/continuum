@@ -123,11 +123,13 @@ class CodeRabbitBatchContractTests(unittest.TestCase):
         harness = (
             "const posted = [];\n"
             "const notices = [];\n"
+            "const warnings = [];\n"
+            "let identityFailure = false;\n"
             f"const head = {json.dumps(head)};\n"
             "const forgedMarker = `<!-- "
             "opencode-coderabbit-verification-pending "
             "head=${head} findings=100,200 answers=101,201 -->`;\n"
-            "const existing = [{id: 1, user: {login: 'stranger'},\n"
+            "let existing = [{id: 1, user: {login: 'stranger'},\n"
             "  created_at: new Date().toISOString(), body: forgedMarker}];\n"
             "const context = {repo: {owner: 'o', repo: 'r'}};\n"
             "process.env.PR_NUMBER = '450';\n"
@@ -141,6 +143,7 @@ class CodeRabbitBatchContractTests(unittest.TestCase):
             "const core = {\n"
             "  setFailed: message => { throw new Error(message); },\n"
             "  notice: message => notices.push(message),\n"
+            "  warning: message => warnings.push(message),\n"
             "};\n"
             "const github = {\n"
             "  paginate: async () => existing.slice(),\n"
@@ -155,7 +158,10 @@ class CodeRabbitBatchContractTests(unittest.TestCase):
             "      listReviewComments: async () => ({data: []}),\n"
             "    },\n"
             "    git: {getRef: async () => ({data: {object: {sha: head}}})},\n"
-            "    users: {getAuthenticated: async () => ({data: {login: 'kodmial'}})},\n"
+            "    users: {getAuthenticated: async () => {\n"
+            "      if (identityFailure) throw new Error('identity unavailable');\n"
+            "      return {data: {login: 'kodmial'}};\n"
+            "    }},\n"
             "    issues: {\n"
             "      listComments: async () => ({data: existing.slice()}),\n"
             "      createComment: async args => {\n"
@@ -177,11 +183,25 @@ class CodeRabbitBatchContractTests(unittest.TestCase):
             "  await runStep();\n"
             "  const first = posted.slice();\n"
             "  await runStep();\n"
+            "  const afterDedup = posted.length;\n"
+            "  // A transient identity failure must not suppress the handoff: the\n"
+            "  // repair still completed, and the next reconciliation can consume\n"
+            "  // the marker once its own identity lookup succeeds.\n"
+            "  identityFailure = true;\n"
+            "  existing = [{id: 1, user: {login: 'stranger'},\n"
+            "    created_at: new Date().toISOString(), body: forgedMarker}];\n"
+            "  posted.length = 0;\n"
+            "  await runStep();\n"
+            "  const identityFailurePosted = posted.slice();\n"
             "  process.stdout.write(JSON.stringify({\n"
             "    first: first.length,\n"
-            "    after: posted.length,\n"
-            "    bodies: posted.map(entry => entry.body),\n"
+            "    after: afterDedup,\n"
+            "    bodies: first.map(entry => entry.body),\n"
+            "    identityFailure: identityFailurePosted.length,\n"
+            "    identityFailureBodies:\n"
+            "      identityFailurePosted.map(entry => entry.body),\n"
             "    notices,\n"
+            "    warnings,\n"
             "  }));\n"
             "})().catch(error => { console.error(error); process.exit(1); });\n"
         )
@@ -217,6 +237,21 @@ class CodeRabbitBatchContractTests(unittest.TestCase):
             "POST /repos/{owner}/{repo}/pulls/{pull_number}/comments/"
             "{comment_id}/replies",
             body,
+        )
+        # A failed authenticated-login lookup must not drop the repair
+        # completion: still publish the handoff (the forged marker cannot
+        # suppress it) so a later reconciliation with a resolved identity
+        # consumes it and requests the fresh exact-HEAD verification.
+        self.assertEqual(outcome["identityFailure"], 1)
+        self.assertIn(
+            f"<!-- opencode-coderabbit-verification-pending "
+            f"head={head} findings=100,200 answers=101,201 -->",
+            outcome["identityFailureBodies"][0],
+        )
+        self.assertTrue(
+            any("could not resolve the handoff author" in warning
+                for warning in outcome["warnings"]),
+            outcome["warnings"],
         )
 
     def test_installed_caller_declares_and_forwards_pr_number_for_reconciliation(self):
