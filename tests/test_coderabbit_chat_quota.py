@@ -28,6 +28,7 @@ FIXTURES = ROOT / "tests" / "fixtures" / "coderabbit"
 AUTO_MERGE = ROOT / ".github" / "workflows" / "continuum-auto-merge.yml"
 UNRESOLVED = ROOT / ".github" / "workflows" / "continuum-coderabbit-unresolved.yml"
 RETRY = ROOT / ".github" / "workflows" / "continuum-coderabbit-retry.yml"
+OPENCODE = ROOT / ".github" / "workflows" / "continuum-opencode.yml"
 
 BLOCK_START = "// continuum-coderabbit-chat-quota:start"
 BLOCK_END = "// continuum-coderabbit-chat-quota:end"
@@ -155,6 +156,27 @@ class ChatQuotaParserTests(unittest.TestCase):
         for body, expected in vectors.items():
             with self.subTest(body=body):
                 self.assertEqual(rabbit.parse_chat_retry_delay_ms(body), expected)
+
+    def test_partially_parsed_countdown_fails_closed(self):
+        # "1h" is not a recognized unit, so the complete countdown cannot be
+        # parsed. Accepting only "30 seconds" would retry after the short
+        # suffix instead of the documented 65-minute fallback.
+        body = (
+            "### Rate Limit Exceeded\n"
+            "Please wait **1h 30 seconds** before sending another message."
+        )
+        self.assertIsNone(rabbit.parse_duration_ms("1h 30 seconds"))
+        self.assertEqual(
+            rabbit.parse_chat_retry_delay_ms(body),
+            rabbit.CHAT_QUOTA_FALLBACK_MS,
+        )
+        self.assertEqual(
+            rabbit.parse_retry_delay_ms(
+                "Review rate limited. Next included review available in "
+                "1h 30 seconds."
+            ),
+            rabbit.QUOTA_FALLBACK_MS,
+        )
 
     def test_chat_messages_per_hour_without_quota_evidence_is_a_verdict(self):
         body = (
@@ -423,6 +445,31 @@ class ChatQuotaWorkflowContractTests(unittest.TestCase):
             "chatQuotaRetryAcknowledged",
         ):
             self.assertIn(required, auto)
+
+    def test_repair_admission_reuses_the_shared_quota_classifier(self):
+        # OpenCode's live-batch admission must reject both quota forms with
+        # the same classifier the collector used to publish unresolved_id.
+        self.assertEqual(chat_quota_block(OPENCODE), chat_quota_block(AUTO_MERGE))
+        source = OPENCODE.read_text(encoding="utf-8")
+        self.assertIn("!isCodeRabbitQuotaReply(comment)", source)
+
+    def test_auto_merge_processes_finding_handoffs_before_full_review_quota(self):
+        # An unresolved finding (and any OpenCode repair handoff) must be
+        # consumed before the full-review quota return, otherwise a
+        # rate-limited status strands the finding while the retry controller
+        # refuses the PR until that finding is verified.
+        source = AUTO_MERGE.read_text(encoding="utf-8")
+        unresolved = source.index(
+            "const unresolvedThreads = requireCodeRabbit"
+        )
+        verification = source.index(
+            "const requested = await requestCodeRabbitThreadVerification(",
+            unresolved,
+        )
+        quota = source.index(
+            "// Rate-limit recovery applies only when this HEAD still needs its"
+        )
+        self.assertLess(verification, quota)
 
     def test_auto_merge_rejects_quota_replies_as_answers_and_gates_retry(self):
         source = AUTO_MERGE.read_text(encoding="utf-8")
@@ -761,6 +808,26 @@ assert.equal(parseChatQuotaDelayMs(quoted), null);
 assert.equal(chatQuotaNotBeforeMs({body: malformed}), null);
 """
         self.run_block(checks)
+
+    def test_js_partially_parsed_countdown_falls_back(self):
+        checks = """
+for (const text of ['1h 30 seconds', 'about 13 minutes', '1 hour 30x']) {
+  assert.equal(parseChatDurationMs(text), null, text);
+}
+for (const text of [
+  '1 hour 30 minutes',
+  '1 hour, 2 minutes, and 3 seconds',
+  'less than a minute',
+]) {
+  assert.equal(typeof parseChatDurationMs(text), 'number', text);
+}
+const body = '### Rate Limit Exceeded\\n' +
+  'Please wait **1h 30 seconds** before sending another message.';
+assert.equal(parseChatQuotaDelayMs(body), CHAT_QUOTA_FALLBACK_MS);
+"""
+        for workflow in (AUTO_MERGE, UNRESOLVED, OPENCODE):
+            with self.subTest(workflow=workflow.name):
+                self.run_block(checks, workflow=workflow)
 
 
 @unittest.skipUnless(shutil.which("node"), "Node.js unavailable")

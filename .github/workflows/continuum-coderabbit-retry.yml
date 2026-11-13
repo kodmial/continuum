@@ -305,30 +305,40 @@ jobs:
             }
 
             function parseDurationMs(text = '') {
-              if (/less than\s+(?:a|one)\s+minute/i.test(text)) {
-                return 60_000;
-              }
-
+              // Only a complete countdown parses. A window with an
+              // unrecognized token ("1h 30 seconds") must fall back to the
+              // provider quota fallback instead of retrying after its short
+              // suffix.
+              const value = String(text);
+              const token =
+                /(?<less>less\s+than\s+(?:a|one)\s+minute)|(?<amount>\d+)\s*(?<unit>hours?|hrs?|minutes?|mins?|seconds?|secs?)/gi;
+              const separator = /^[\s,.]*(?:and[\s,.]*)?$/i;
               let totalMs = 0;
               let found = false;
-              for (const part of text.matchAll(
-                /(\d+)\s*(hours?|hrs?|minutes?|mins?|seconds?|secs?)/gi
-              )) {
+              let cursor = 0;
+              for (const part of value.matchAll(token)) {
+                if (!separator.test(value.slice(cursor, part.index))) return null;
+                cursor = part.index + part[0].length;
                 found = true;
-                const value = Number(part[1]);
-                const unit = part[2].toLowerCase();
+                if (part.groups?.less) {
+                  totalMs += 60_000;
+                  continue;
+                }
+                const amount = Number(part.groups?.amount);
+                const unit = String(part.groups?.unit || '').toLowerCase();
                 if (unit.startsWith('hour') || unit.startsWith('hr')) {
-                  totalMs += value * 60 * 60_000;
+                  totalMs += amount * 60 * 60_000;
                 } else if (
                   unit.startsWith('minute') ||
                   unit.startsWith('min')
                 ) {
-                  totalMs += value * 60_000;
+                  totalMs += amount * 60_000;
                 } else {
-                  totalMs += value * 1_000;
+                  totalMs += amount * 1_000;
                 }
               }
-              return found ? totalMs : null;
+              if (!found || !separator.test(value.slice(cursor))) return null;
+              return totalMs;
             }
 
             function parseRetryDelayMs(body = '') {

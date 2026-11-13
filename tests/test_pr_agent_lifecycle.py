@@ -218,8 +218,11 @@ APPROVED_448_REPAIR_OPENCODE_SHA256 = (
 # another repair batch. Deduplication trusts only the PAT owner and
 # github-actions[bot], matching the authors auto-merge accepts, so a forged
 # marker from another commenter cannot suppress the real handoff.
+# kodmial/continuum#451 repair (review 5898694060): live batch admission now
+# reuses the canonical chat-quota classifier, so a newer CodeRabbit
+# "Rate Limit Exceeded" reply cannot supersede the admitted finding answer.
 APPROVED_450_SERIALIZED_OPENCODE_SHA256 = (
-    "aa825a005b2dd7f4d5d8085848e690e7d8ea3aeee89c70b32b27f5cf5251744b"
+    "c53e60b611badfbd783865f8d70793853a88bc80708510f80839cabd9a8dbea3"
 )
 APPROVED_446_CALLER_SHA256 = (
     "b7f3df118bc436526f48443b8f068372204073eb134c98e4a1543d025f314686"

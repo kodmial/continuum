@@ -4113,6 +4113,200 @@ jobs:
               (/\*\*RESOLVED(?:\.|\*\*)/i.test(body || '') ||
                /✅\s*Review thread resolved\.?/i.test(body || ''));
 
+            // CodeRabbit rate-limit replies are never finding verdicts. The
+            // collector already drops both quota forms before it publishes
+            // unresolved_id; admission must classify them the same way or a
+            // newer quota reply makes the admitted answer look changed and
+            // every dispatch of this batch is skipped. Keep this block
+            // byte-identical with the canonical chat-quota bundle in
+            // continuum-auto-merge.yml and continuum-coderabbit-unresolved.yml.
+            // continuum-coderabbit-chat-quota:start
+            const CODERABBIT_BOT_LOGIN = 'coderabbitai[bot]';
+            const CHAT_QUOTA_FALLBACK_MS = 65 * 60_000;
+            const CHAT_RETRY_SAFETY_PADDING_MS = 30_000;
+            const CHAT_RATE_LIMIT_HEADING_RE =
+              /^[ \t]{0,3}#{1,6}[ \t]*Rate[ \t]+Limit[ \t]+Exceeded[ \t]*\r?$/im;
+            const CHAT_RATE_LIMIT_PROSE_RE =
+              /^(?![ \t]*>)[^\n]*\b(?:exceeded|reached)\b[^\n]*\blimit\b[^\n]*\bchat messages? per hour\b[^\n]*$/im;
+            const CHAT_RATE_LIMIT_NEGATED_RE =
+              /(?:\b(?:not|never|no)\b|n['’]t)[^\n]*\b(?:exceeded|reached)\b/i;
+            const CHAT_COUNTDOWN_RE =
+              /please\s+wait\s+\*{0,2}\s*((?:less\s+than\s+(?:a|one)\s+minute)|[0-9][^\n*]*?)\s*\*{0,2}\s+before\s+sending\s+another\s+message/i;
+
+            function isTrustedCodeRabbitAuthor(login) {
+              return String(login || '').trim().toLowerCase() === CODERABBIT_BOT_LOGIN;
+            }
+
+            function parseChatDurationMs(text = '') {
+              // Only a complete countdown parses; a partially recognized
+              // window falls back to CHAT_QUOTA_FALLBACK_MS at the caller.
+              const value = String(text);
+              const token =
+                /(?<less>less\s+than\s+(?:a|one)\s+minute)|(?<amount>\d+)\s*(?<unit>hours?|hrs?|minutes?|mins?|seconds?|secs?)/gi;
+              const separator = /^[\s,.]*(?:and[\s,.]*)?$/i;
+              let totalMs = 0;
+              let found = false;
+              let cursor = 0;
+              for (const part of value.matchAll(token)) {
+                if (!separator.test(value.slice(cursor, part.index))) return null;
+                cursor = part.index + part[0].length;
+                found = true;
+                if (part.groups?.less) {
+                  totalMs += 60_000;
+                  continue;
+                }
+                const amount = Number(part.groups?.amount);
+                const unit = String(part.groups?.unit || '').toLowerCase();
+                if (unit.startsWith('hour') || unit.startsWith('hr')) {
+                  totalMs += amount * 60 * 60_000;
+                } else if (unit.startsWith('minute') || unit.startsWith('min')) {
+                  totalMs += amount * 60_000;
+                } else {
+                  totalMs += amount * 1_000;
+                }
+              }
+              if (!found || !separator.test(value.slice(cursor))) return null;
+              return totalMs;
+            }
+
+            function quotaVisibleMarkdown(body = '') {
+              let fenceChar = '';
+              let fenceLength = 0;
+              return String(body || '').split(/\r?\n/).map(line => {
+                const marker = line.match(/^[ \t]{0,3}(\x60{3,}|~{3,})/);
+                if (fenceChar) {
+                  if (marker && marker[1][0] === fenceChar &&
+                      marker[1].length >= fenceLength &&
+                      line.slice(marker[0].length).trim() === '') {
+                    fenceChar = '';
+                    fenceLength = 0;
+                  }
+                  return '';
+                }
+                if (marker) {
+                  fenceChar = marker[1][0];
+                  fenceLength = marker[1].length;
+                  return '';
+                }
+                return /^[ \t]*>/.test(line) ? '' : line;
+              }).join('\n');
+            }
+
+            function parseChatQuotaDelayMs(body = '') {
+              const text = quotaVisibleMarkdown(body);
+              if (!CHAT_RATE_LIMIT_HEADING_RE.test(text) &&
+                (!CHAT_RATE_LIMIT_PROSE_RE.test(text) ||
+                 CHAT_RATE_LIMIT_NEGATED_RE.test(text))) {
+                return null;
+              }
+              const match = text.match(CHAT_COUNTDOWN_RE);
+              if (!match) return CHAT_QUOTA_FALLBACK_MS;
+              const parsed = parseChatDurationMs(match[1]);
+              return parsed === null ? CHAT_QUOTA_FALLBACK_MS : parsed;
+            }
+
+            function parseReviewQuotaDelayMs(body = '') {
+              const text = String(body || '');
+              const quotaSignalled =
+                /Review rate limited|Review limit reached/i.test(text);
+              // The generic "try again" phrase is only a full-review quota
+              // window with an explicit quota signal; the "next review ...
+              // available ... in" form remains unambiguous on its own.
+              const patterns = [
+                [
+                  /next\s+(?:included\s+)?review\b[^\n<.]{0,120}?\bavailable\b[^\n<.]{0,40}?\b(?:in|after)\s+([^\n<.]+)/i,
+                  false,
+                ],
+                [
+                  /(?:try|retry)\s+again\b[^\n<.]{0,40}?\b(?:in|after)\s+([^\n<.]+)/i,
+                  true,
+                ],
+              ];
+              for (const [pattern, requiresQuotaSignal] of patterns) {
+                if (requiresQuotaSignal && !quotaSignalled) continue;
+                const match = text.match(pattern);
+                if (!match) continue;
+                const parsed = parseChatDurationMs(match[1]);
+                if (parsed !== null) return parsed;
+              }
+              return quotaSignalled ? 65 * 60_000 : null;
+            }
+
+            function classifyCodeRabbitReply(reply = {}) {
+              const login = String(
+                reply.user?.login || reply.author?.login || ''
+              );
+              if (login && !isTrustedCodeRabbitAuthor(login)) {
+                return { kind: 'untrusted', delayMs: null };
+              }
+              const chatDelayMs = parseChatQuotaDelayMs(reply.body || '');
+              if (chatDelayMs !== null) {
+                return { kind: 'chat_rate_limit', delayMs: chatDelayMs };
+              }
+              const reviewDelayMs = parseReviewQuotaDelayMs(reply.body || '');
+              if (reviewDelayMs !== null) {
+                return { kind: 'review_rate_limit', delayMs: reviewDelayMs };
+              }
+              return { kind: 'verdict', delayMs: null };
+            }
+
+            function isCodeRabbitQuotaReply(reply = {}) {
+              const kind = classifyCodeRabbitReply(reply).kind;
+              return kind === 'chat_rate_limit' || kind === 'review_rate_limit';
+            }
+
+            function chatQuotaNotBeforeMs(reply = {}) {
+              const delayMs = parseChatQuotaDelayMs(reply.body || '');
+              if (delayMs === null) return null;
+              const createdAt = Date.parse(reply.created_at || '');
+              if (!Number.isFinite(createdAt)) return null;
+              return createdAt + delayMs + CHAT_RETRY_SAFETY_PADDING_MS;
+            }
+
+            function latestChatQuotaReply(comments, rootCommentId) {
+              return (comments || [])
+                .filter(comment =>
+                  (rootCommentId === undefined || rootCommentId === null ||
+                   comment.in_reply_to_id === rootCommentId) &&
+                  isTrustedCodeRabbitAuthor(
+                    comment.user?.login || comment.author?.login
+                  ) &&
+                  classifyCodeRabbitReply(comment).kind === 'chat_rate_limit'
+                )
+                .sort((a, b) => Number(b.id) - Number(a.id))[0] || null;
+            }
+
+            function chatQuotaRetryMarker(findingId, headSha, limitedCommentId) {
+              return '<!-- auto-merge-coderabbit-chat-quota-retry ' +
+                `finding=${findingId} head=${String(headSha || '').toLowerCase()} ` +
+                `limited=${limitedCommentId} -->`;
+            }
+
+            function chatQuotaRetryAcknowledged(
+              comments, findingId, headSha, limitedCommentId, rootCommentId,
+              trustedAuthors = []
+            ) {
+              const allowed = new Set(
+                Array.from(trustedAuthors || [])
+                  .map(login => String(login || '').trim().toLowerCase())
+                  .filter(Boolean)
+              );
+              if (!allowed.size) return false;
+              const marker = chatQuotaRetryMarker(
+                findingId, headSha, limitedCommentId
+              );
+              return (comments || []).some(comment =>
+                (rootCommentId === undefined || rootCommentId === null ||
+                 comment.in_reply_to_id === rootCommentId) &&
+                allowed.has(
+                  String(comment.user?.login || comment.author?.login || '')
+                    .trim().toLowerCase()
+                ) &&
+                String(comment.body || '').includes(marker)
+              );
+            }
+            // continuum-coderabbit-chat-quota:end
+
             const valid = [];
             const unique = new Set();
             const comparisons = new Map();
@@ -4137,7 +4331,11 @@ jobs:
               const latest = recent.filter(comment =>
                 comment.in_reply_to_id === findingId &&
                 comment.user?.login === 'coderabbitai[bot]' &&
-                !/Review rate limited|Review limit reached/i.test(comment.body || '')
+                // The canonical collector already dropped both CodeRabbit
+                // quota forms before publishing unresolved_id; admission
+                // must classify them identically so a newer quota reply
+                // does not make the admitted answer look superseded.
+                !isCodeRabbitQuotaReply(comment)
               ).sort((a, b) => b.id - a.id)[0];
               // An in-flight newer verification supersedes an earlier bot
               // answer, even if the existing thread is still open.

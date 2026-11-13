@@ -77,8 +77,20 @@ _RETRY_WINDOW_PATTERNS = (
     ),
 )
 
-_DURATION_PART_RE = re.compile(
-    r"(\d+)\s*(hours?|hrs?|minutes?|mins?|seconds?|secs?)", re.IGNORECASE
+# One countdown token: either the "less than a minute" phrase or a
+# number/unit pair. Tokens must cover the whole countdown, so a partially
+# recognized window such as "1h 30 seconds" is rejected instead of silently
+# parsed as its shorter suffix.
+_DURATION_TOKEN_RE = re.compile(
+    r"(?P<less>less\s+than\s+(?:a|one)\s+minute)"
+    r"|(?P<amount>\d+)\s*(?P<unit>hours?|hrs?|minutes?|mins?|seconds?|secs?)",
+    re.IGNORECASE,
+)
+
+# Text allowed between and around countdown tokens: whitespace, list
+# punctuation, and the optional "and" joiner.
+_DURATION_SEPARATOR_RE = re.compile(
+    r"[\s,.]*(?:and[\s,.]*)?", re.IGNORECASE
 )
 
 # Inline chat-message quota lives in a PR review-comment thread. Its heading
@@ -135,24 +147,38 @@ def retry_window_text(body: Any) -> Optional[str]:
 
 
 def parse_duration_ms(text: Any) -> Optional[int]:
-    """Parse a human quota countdown into milliseconds."""
+    """Parse a human quota countdown into milliseconds.
+
+    Only a complete countdown parses. A window with an unrecognized token,
+    such as ``1h 30 seconds``, returns ``None`` so the caller falls back to
+    its provider quota fallback instead of retrying after the short suffix.
+    """
 
     value = str(text or "")
-    if re.search(r"less than\s+(?:a|one)\s+minute", value, re.IGNORECASE):
-        return 60_000
     total = 0
     found = False
-    for amount, unit in _DURATION_PART_RE.findall(value):
+    cursor = 0
+    for match in _DURATION_TOKEN_RE.finditer(value):
+        if not _DURATION_SEPARATOR_RE.fullmatch(value[cursor:match.start()]):
+            return None
+        cursor = match.end()
         found = True
-        number = int(amount)
-        lowered = unit.lower()
+        if match.group("less") is not None:
+            total += 60_000
+            continue
+        number = int(match.group("amount"))
+        lowered = match.group("unit").lower()
         if lowered.startswith("hour") or lowered.startswith("hr"):
             total += number * 3_600_000
         elif lowered.startswith("minute") or lowered.startswith("min"):
             total += number * 60_000
         else:
             total += number * 1_000
-    return total if found else None
+    if not found:
+        return None
+    if not _DURATION_SEPARATOR_RE.fullmatch(value[cursor:]):
+        return None
+    return total
 
 
 def parse_retry_delay_ms(body: Any) -> Optional[int]:
