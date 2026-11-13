@@ -17,17 +17,20 @@ same runner:
 ```text
 PR-Agent (pinned pip release, on the runner)
   -> POST 127.0.0.1:<bridge_port>/v1/chat/completions (this bridge)
-  -> POST 127.0.0.1:<server_port>/session + /session/:id/prompt_async
-  -> GET /session/status, then GET /session/:id/message (opencode serve)
+  -> POST /api/session; POST /api/session/:id/agent and /model
+  -> POST /api/session/:id/prompt (durable enqueue, not completion)
+  -> POST /api/experimental/session/:id/wait (idle barrier)
+  -> GET /api/session/:id/message?type=assistant (completed answer)
   -> configured OpenCode provider/model (default: the free anonymous route)
 ```
 
-`opencode serve` is **not** OpenAI Chat Completions compatible: it speaks
-an asynchronous session/message API (`POST /session`, then
-`POST /session/:id/prompt_async` with `{model, agent, system, parts}`, then
-poll `GET /session/status` until the session leaves `busy`/`retry`, read the
-completed assistant turn with `GET /session/:id/message`, and finally
-`DELETE /session/:id`). The bridge (`.github/scripts/pr_agent_bridge.py`,
+`opencode serve` is **not** OpenAI Chat Completions compatible. OpenCode v2.2.6
+uses an authenticated `/api/` surface, independent selection of the read-only
+`plan` agent and model, and durable prompt enqueue rather than a synchronous
+response. The bridge waits for the v2 idle barrier, then verifies a finished
+assistant record from the paginated message endpoint. A receipt or missing
+status can never count as a successful review. A fresh, random job-only
+`OPENCODE_PASSWORD` protects the loopback server; `opencode` is its Basic user. The bridge (`.github/scripts/pr_agent_bridge.py`,
 standard library only) exposes exactly the OpenAI surface PR-Agent needs —
 `/v1/chat/completions`, `/v1/models`, health — and translates each completion
 into one isolated OpenCode session: a fresh session per request, deleted

@@ -1002,17 +1002,25 @@ jobs:
           SERVER_PORT: ${{ steps.stack.outputs.server_port }}
         run: |
           set -euo pipefail
+          # Dedicated ephemeral secret for this job; never place it on the
+          # process command line, logs, or any checked-out repository file.
+          OPENCODE_PASSWORD="$(openssl rand -hex 32)"
+          echo "::add-mask::${OPENCODE_PASSWORD}"
+          export OPENCODE_PASSWORD
+          echo "OPENCODE_PASSWORD=${OPENCODE_PASSWORD}" >> "$GITHUB_ENV"
           (setsid nohup opencode serve --hostname 127.0.0.1 --port "$SERVER_PORT" \
             > "$RUNNER_TEMP/opencode-serve.log" 2>&1 &)
           for attempt in $(seq 1 30); do
-            if curl -fsS "http://127.0.0.1:${SERVER_PORT}/global/health" >/dev/null 2>&1; then
-              echo "opencode serve is up on 127.0.0.1:${SERVER_PORT}."
+            if curl -fsS -u "opencode:${OPENCODE_PASSWORD}" \
+              "http://127.0.0.1:${SERVER_PORT}/api/info" 2>/dev/null \
+              | python3 -c 'import sys,json; d=json.load(sys.stdin); assert d.get("version") and type(d.get("pid")) is int' \
+              >/dev/null 2>&1; then
+              echo "authenticated OpenCode v2 server is ready."
               exit 0
             fi
             sleep 2
           done
-          echo "::error::opencode serve did not become ready."
-          cat "$RUNNER_TEMP/opencode-serve.log" || true
+          echo "::error::authenticated OpenCode v2 server did not become ready."
           exit 1
 
       - name: Start the OpenAI-compatibility bridge on loopback
