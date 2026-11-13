@@ -276,7 +276,8 @@ const github = {
    listReviewComments: async () => ({data:comments}),
    getReviewComment: async ({comment_id}) => ({data:comments.find(c=>c.id===comment_id)})
  },
- git:{getRef:async()=>({data:{object:{sha:head}}})}
+ git:{getRef:async()=>({data:{object:{sha:head}}})},
+ issues:{listComments:async()=>({data:[]})}
 }};
 """
         production = js_for_step(BATCHER, "Collect all unresolved findings")
@@ -323,6 +324,202 @@ const github = {
         )
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("COMMENT_PAT is required", result.stderr)
+
+
+    @unittest.skipUnless(shutil.which("node"), "Node.js unavailable")
+    def test_pending_repair_handoff_blocks_redispatch_until_reverified(self):
+        # A second finding's new UNRESOLVED answer must not drag an already
+        # repaired finding into another batch before auto-merge consumes its
+        # completion handoff. Unreadable handoffs must defer every batch.
+        production = js_for_step(BATCHER, "Collect all unresolved findings")
+        head = "a" * 40
+        harness = f"""
+const head = {json.dumps(head)};
+process.env.COMMENT_PAT = 'test-pat';
+const base = Date.parse('2026-11-13T18:00:00Z');
+const at = minutes => new Date(base + minutes * 60_000).toISOString();
+let comments = [];
+let issueComments = [];
+let failIssueRead = false;
+let out = {{}};
+const notices = [];
+const warnings = [];
+const core = {{
+  setOutput: (key, value) => {{ out[key] = String(value); }},
+  notice: message => notices.push(message),
+  warning: message => warnings.push(message),
+}};
+const context = {{repo: {{owner: 'kodmial', repo: 'continuum'}},
+  payload: {{pull_request: {{number: 450}}}}}};
+const handoff = ({{
+  createdAt = at(20),
+  author = 'kodmial',
+  markerHead = head,
+  findings = '100',
+}} = {{}}) => ({{
+  id: 950,
+  user: {{login: author}},
+  created_at: createdAt,
+  body: `<!-- opencode-coderabbit-verification-pending head=${{markerHead}} ` +
+    `findings=${{findings}} answers=101 -->\\nCanonical repair finished.`,
+}});
+function baseComments() {{
+  return [
+    {{id: 100, user: {{login: 'coderabbitai[bot]'}},
+      pull_request_review_id: 11, created_at: at(0), body: 'finding 100'}},
+    {{id: 200, user: {{login: 'coderabbitai[bot]'}},
+      pull_request_review_id: 22, created_at: at(0), body: 'finding 200'}},
+    {{id: 101, in_reply_to_id: 100, user: {{login: 'kodmial'}},
+      created_at: at(1),
+      body: '<!-- opencode-coderabbit-verification review=11 finding=100 '
+        + 'head=' + head + ' -->'}},
+    {{id: 201, in_reply_to_id: 200, user: {{login: 'kodmial'}},
+      created_at: at(1),
+      body: '<!-- auto-merge-coderabbit-verification finding=200 head='
+        + head + ' -->'}},
+    {{id: 102, in_reply_to_id: 100, user: {{login: 'coderabbitai[bot]'}},
+      created_at: at(10),
+      body: '**UNRESOLVED**\\nThe access-control defect remains.'}},
+    {{id: 202, in_reply_to_id: 200, user: {{login: 'coderabbitai[bot]'}},
+      created_at: at(10),
+      body: '**UNRESOLVED**\\nThe timeout defect remains.'}},
+  ];
+}}
+const github = {{
+  request: {{endpoint: {{DEFAULTS: {{baseUrl: 'https://api.github.com'}}}}}},
+  constructor: function () {{
+    this.rest = {{users: {{getAuthenticated: async () =>
+      ({{data: {{login: 'kodmial'}}}})}}}};
+  }},
+  graphql: async () => ({{repository: {{pullRequest: {{reviewThreads: {{
+    nodes: [
+      {{isResolved: false, comments: {{nodes: [
+        {{databaseId: 100, author: {{login: 'coderabbitai[bot]'}}}},
+      ]}}}},
+      {{isResolved: false, comments: {{nodes: [
+        {{databaseId: 200, author: {{login: 'coderabbitai[bot]'}}}},
+      ]}}}},
+    ],
+    pageInfo: {{hasNextPage: false, endCursor: null}},
+  }}}}}}}}),
+  rest: {{
+    pulls: {{
+      get: async () => ({{data: {{
+        review_comments: comments.length,
+        comments: issueComments.length,
+        head: {{sha: head, ref: 'opencode/task',
+          repo: {{full_name: 'kodmial/continuum'}}}},
+      }}}}),
+      listReviewComments: async () => ({{data: comments.slice()}}),
+      getReviewComment: async ({{comment_id}}) => ({{
+        data: comments.find(comment => comment.id === comment_id),
+      }}),
+    }},
+    git: {{getRef: async () => ({{data: {{object: {{sha: head}}}}}})}},
+    issues: {{
+      listComments: async () => {{
+        if (failIssueRead) throw new Error('handoffs unavailable');
+        return {{data: issueComments.slice()}};
+      }},
+    }},
+  }},
+}};
+async function collect() {{
+"""
+        script = (
+            harness
+            + textwrap.indent(production, "  ")
+            + """
+}
+async function attempt(options = {}) {
+  comments = options.comments || baseComments();
+  issueComments = options.issueComments || [];
+  failIssueRead = !!options.failIssueRead;
+  out = {};
+  notices.length = 0;
+  warnings.length = 0;
+  await collect();
+  return {
+    should_run: out.should_run,
+    items: JSON.parse(out.items_json || '[]').map(item => item.finding_id),
+    notices: notices.slice(),
+    warnings: warnings.slice(),
+  };
+}
+(async () => {
+  const results = {};
+  results.none = await attempt();
+  results.pending = await attempt({issueComments: [handoff()]});
+  results.forged = await attempt({issueComments: [handoff({author: 'random'})]});
+  results.otherHead = await attempt({
+    issueComments: [handoff({markerHead: 'f'.repeat(40)})],
+  });
+  results.otherFinding = await attempt({
+    issueComments: [handoff({findings: '200'})],
+  });
+  results.stale = await attempt({issueComments: [handoff({createdAt: at(-5)})]});
+  results.pendingBoth = await attempt({
+    issueComments: [handoff({findings: '100,200'})],
+  });
+  const freshComments = baseComments().concat([{
+    id: 103, in_reply_to_id: 100, user: {login: 'kodmial'},
+    created_at: at(30),
+    body: '<!-- auto-merge-coderabbit-verification finding=100 head='
+      + head + ' -->',
+  }]);
+  results.freshVerification = await attempt({
+    comments: freshComments, issueComments: [handoff()],
+  });
+  const answeredAgain = freshComments.concat([{
+    id: 104, in_reply_to_id: 100, user: {login: 'coderabbitai[bot]'},
+    created_at: at(40),
+    body: '**UNRESOLVED**\\nThe access-control defect remains.',
+  }]);
+  results.freshAnswer = await attempt({
+    comments: answeredAgain, issueComments: [handoff()],
+  });
+  results.unreadable = await attempt({failIssueRead: true});
+  process.stdout.write(JSON.stringify(results));
+})().catch(error => { console.error(error); process.exit(1); });
+"""
+        )
+        result = subprocess.run(
+            ["node", "-"], input=script, text=True,
+            capture_output=True, check=False, timeout=60,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        results = json.loads(result.stdout)
+
+        # Without a handoff both live UNRESOLVED findings batch together.
+        self.assertEqual(results["none"]["items"], [100, 200])
+        # The repaired finding waits for fresh verification while the second
+        # finding proceeds in its own batch.
+        self.assertEqual(results["pending"]["items"], [200])
+        self.assertTrue(
+            any("pending repair handoff" in notice
+                for notice in results["pending"]["notices"]),
+            results["pending"]["notices"],
+        )
+        # Forged, stale, other-head, and other-finding handoffs do not suppress.
+        self.assertEqual(results["forged"]["items"], [100, 200])
+        self.assertEqual(results["otherHead"]["items"], [100, 200])
+        self.assertEqual(results["otherFinding"]["items"], [100])
+        self.assertEqual(results["stale"]["items"], [100, 200])
+        # Once every active finding has a pending handoff, defer the batch.
+        self.assertEqual(results["pendingBoth"]["should_run"], "false")
+        self.assertEqual(results["pendingBoth"]["items"], [])
+        # A fresh verification settles the handoff; no reply means no repair.
+        self.assertEqual(results["freshVerification"]["items"], [200])
+        # A later UNRESOLVED after that verification selects repair again.
+        self.assertEqual(results["freshAnswer"]["items"], [100, 200])
+        # An unreadable handoff list defers even otherwise actionable batches.
+        self.assertEqual(results["unreadable"]["should_run"], "false")
+        self.assertEqual(results["unreadable"]["items"], [])
+        self.assertTrue(
+            any("could not read CodeRabbit repair handoffs" in warning
+                for warning in results["unreadable"]["warnings"]),
+            results["unreadable"]["warnings"],
+        )
 
 
 class DispatchTargetResolutionTests(unittest.TestCase):

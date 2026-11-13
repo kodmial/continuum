@@ -1487,6 +1487,7 @@ const github = {{
       }}),
     }},
     git: {{getRef: async () => ({{data: {{object: {{sha: head}}}}}})}},
+    issues: {{listComments: async () => ({{data: []}})}},
   }},
 }};
 """

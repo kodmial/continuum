@@ -528,9 +528,6 @@ jobs:
               return;
             }
 
-            core.notice(
-              `Batching ${active.length} unresolved CodeRabbit finding(s) in one OpenCode run.`
-            );
             let headSha = pr.data.head.sha;
             if (pr.data.head.repo?.full_name === `${owner}/${repo}`) {
               const { data: headRef } = await github.rest.git.getRef({
@@ -541,11 +538,111 @@ jobs:
               if (headRef?.object?.sha) headSha = headRef.object.sha;
             }
 
+            // A completed repair publishes an issue-comment handoff instead
+            // of writing into the CodeRabbit inline chat. Until auto-merge
+            // turns that handoff into a fresh exact-HEAD verification, the
+            // older UNRESOLVED answer must not select the same finding again.
+            // Read every handoff before deciding, because a second finding's
+            // new answer can otherwise drag the repaired finding into a new
+            // batch before its own verification is requested.
+            const repairHandoffs = [];
+            let repairHandoffReadFailed = false;
+            try {
+              const totalHandoffComments = Number(pr.data.comments || 0);
+              const lastHandoffPage = Math.max(
+                1,
+                Math.ceil(
+                  (Number.isFinite(totalHandoffComments)
+                    ? totalHandoffComments : 0) / 100
+                ) || 1
+              );
+              const firstHandoffPage = Math.max(1, lastHandoffPage - 2);
+              for (let page = lastHandoffPage;
+                   page >= firstHandoffPage; page -= 1) {
+                const { data } = await github.rest.issues.listComments({
+                  owner,
+                  repo,
+                  issue_number: pullNumber,
+                  per_page: 100,
+                  page,
+                });
+                if (Array.isArray(data)) repairHandoffs.push(...data);
+              }
+            } catch (err) {
+              repairHandoffReadFailed = true;
+              core.warning(
+                `PR #${pullNumber}: could not read CodeRabbit repair handoffs; deferring the batch decision until the next reconciliation: ${err.message || err}`
+              );
+            }
+            if (repairHandoffReadFailed) {
+              core.setOutput('should_run', 'false');
+              core.setOutput('items_json', '[]');
+              return;
+            }
+            const repairHandoffPattern =
+              /<!-- opencode-coderabbit-verification-pending head=([0-9a-f]{40}) findings=([0-9,]+)(?: answers=[0-9,]+)? -->/;
+            const newestRepairHandoff = findingId => {
+              let newest = null;
+              for (const comment of repairHandoffs) {
+                if (!trustedMarkerAuthors.has(
+                  comment.user?.login || comment.author?.login || ''
+                )) {
+                  continue;
+                }
+                const match = String(comment.body || '').match(
+                  repairHandoffPattern
+                );
+                if (!match || match[1] !== headSha) continue;
+                if (!match[2].split(',').map(Number).includes(findingId)) {
+                  continue;
+                }
+                if (!newest || Number(comment.id) > Number(newest.id)) {
+                  newest = comment;
+                }
+              }
+              return newest;
+            };
+
+            const dispatchable = active.filter(item => {
+              const verification = latestVerification.get(item.finding_id);
+              const handoff = newestRepairHandoff(item.finding_id);
+              if (!verification || !handoff) return true;
+              const handoffAt = Date.parse(handoff.created_at || '');
+              const verificationAt = Date.parse(
+                verification.comment.created_at || ''
+              );
+              // The handoff is pending until a verification request is newer
+              // than the repair completion. Only then can CodeRabbit judge
+              // the repair outcome on the current HEAD.
+              return !(
+                Number.isFinite(handoffAt) &&
+                (!Number.isFinite(verificationAt) ||
+                 handoffAt > verificationAt)
+              );
+            });
+            if (dispatchable.length !== active.length) {
+              core.notice(
+                `PR #${pullNumber}: deferring ${active.length - dispatchable.length} CodeRabbit finding(s) with a pending repair handoff until fresh verification.`
+              );
+            }
+            if (dispatchable.length === 0) {
+              core.notice(
+                'No unresolved CodeRabbit findings are dispatchable before fresh verification.'
+              );
+              core.setOutput('should_run', 'false');
+              core.setOutput('items_json', '[]');
+              return;
+            }
+
+            core.notice(
+              `Batching ${dispatchable.length} unresolved CodeRabbit finding(s) in one OpenCode run.`
+            );
+
             core.setOutput('should_run', 'true');
             core.setOutput('pr_number', String(pullNumber));
             core.setOutput('head_ref', pr.data.head.ref);
             core.setOutput('head_sha', headSha);
-            core.setOutput('items_json', JSON.stringify(active));
+            core.setOutput('items_json', JSON.stringify(dispatchable));
 
       - name: Dispatch one batched repair to canonical OpenCode
         if: steps.context.outputs.should_run == 'true'
