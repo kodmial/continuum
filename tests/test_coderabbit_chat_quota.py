@@ -441,6 +441,23 @@ class ChatQuotaWorkflowContractTests(unittest.TestCase):
             "} else if (\n                  Date.now() - verificationAt <"
         )
         self.assertLess(chat_gate, timeout_gate)
+        retry_gate = source.index(
+            "if (chatRetryLimitedId !== null) {"
+        )
+        self.assertIn("if (!chatRetryAuthorResolved) {", source)
+        allow_index = source.index(
+            "if (!(await allowOneCodeRabbitChatRequest())) continue;",
+            retry_gate,
+        )
+        live_index = source.index(
+            "const live = await getPullWithAuthoritativeHead(pr.number);",
+            retry_gate,
+        )
+        self.assertLess(
+            allow_index,
+            live_index,
+            "the authoritative PR/HEAD re-read must follow the shared budget scan",
+        )
         self.assertIn("PR/HEAD changed before the CodeRabbit chat-quota retry", source)
         self.assertIn("is no longer unresolved; skipping stale CodeRabbit chat-quota retry", source)
         self.assertIn("MAX_CHAT_QUOTA_VERIFICATION_SENDS_PER_RUN = 1", source)
@@ -459,9 +476,46 @@ class ChatQuotaWorkflowContractTests(unittest.TestCase):
             source,
         )
 
+    def test_generic_try_again_needs_a_quota_signal(self):
+        for body in (
+            "Try again in 13 minutes.",
+            "Retry again in 5 minutes.",
+            "**UNRESOLVED**\nThe user can try again in 13 minutes.",
+        ):
+            with self.subTest(body=body):
+                self.assertIsNone(rabbit.parse_retry_delay_ms(body))
+                self.assertIsNone(rabbit.retry_window_text(body))
+                self.assertFalse(rabbit.is_provider_quota_reply(body))
+                self.assertEqual(
+                    rabbit.classify_coderabbit_reply(
+                        body, author_login="coderabbitai[bot]"
+                    )["kind"],
+                    "verdict",
+                )
+        # An explicit full-review quota signal makes the same phrase a window.
+        self.assertEqual(
+            rabbit.parse_retry_delay_ms(
+                "Review rate limited. Try again in 13 minutes."
+            ),
+            13 * 60_000,
+        )
+        self.assertTrue(
+            rabbit.is_provider_quota_reply(
+                "Review rate limited. Try again in 13 minutes."
+            )
+        )
+        # The unambiguous "next review ... available ... in" form is unchanged.
+        self.assertEqual(
+            rabbit.parse_retry_delay_ms("Next review available in 13 minutes."),
+            13 * 60_000,
+        )
+
     def test_full_review_queue_parser_and_regex_are_unchanged(self):
         retry = RETRY.read_text(encoding="utf-8")
         self.assertIn("/Review rate limited|Review limit reached/i", retry)
+        self.assertIn("const quotaSignalled = RATE_LIMIT_RE.test(body);", retry)
+        self.assertIn("requiresQuotaSignal && !quotaSignalled", retry)
+        self.assertIn("['Try again in 13 minutes.', null]", retry)
         self.assertNotIn("CHAT_QUOTA", retry)
         self.assertNotIn("chat messages per hour", retry)
         # The existing full-review countdown vectors still pass.
@@ -504,6 +558,10 @@ class ChatQuotaRuntimeParityTests(unittest.TestCase):
         bodies += [
             "Review rate limited. Next included review available in 13 minutes.",
             "Review limit reached. Your next review is available after 1 hour 5 minutes.",
+            "Next review available in 13 minutes.",
+            "Try again in 13 minutes.",
+            "Retry again in 5 minutes.",
+            "Review rate limited. Try again in 13 minutes.",
             "### Rate Limit Exceeded\nPlease wait before sending another message.",
             "> ### Rate Limit Exceeded\n> Please wait **14 minutes and 56 seconds** before sending another message.",
             "**UNRESOLVED**\nThe number of chat messages per hour is not tracked across threads, so this finding still needs a code change.",
@@ -709,6 +767,8 @@ let liveThreads = [{commentId: 100}];
 let liveHead = '';
 let liveState = 'open';
 let posted = [];
+let authenticatedLogin = 'kodmial';
+let authenticatedFailure = false;
 const pr = {number: 450, head: {sha: 'a'.repeat(40)}};
 liveHead = pr.head.sha;
 const owner = 'o';
@@ -731,7 +791,10 @@ const github = {
   },
   rest: {
     users: {
-      getAuthenticated: async () => ({data: {login: 'kodmial'}}),
+      getAuthenticated: async () => {
+        if (authenticatedFailure) throw new Error('token identity unavailable');
+        return {data: {login: authenticatedLogin}};
+      },
     },
   },
 };
@@ -748,6 +811,9 @@ async function reconciliationDispatchSupport() {
 }
 async function unresolvedCodeRabbitThreads() {
   return liveThreads.slice();
+}
+async function getPullWithAuthoritativeHead() {
+  return {state: liveState, head: {sha: liveHead}};
 }
 async function withReadFallback(callback) {
   return callback({
@@ -1047,6 +1113,57 @@ process.stdout.write(JSON.stringify({{
         self.assertEqual(result["second"], 0)
         self.assertEqual(result["posted"], 0)
         self.assertEqual(result["remaining"], 0)
+
+    def test_unresolved_posting_identity_defers_chat_quota_retry(self):
+        data = fixture("chat-rate-limit-pr448.json")
+        finding = data["threads"][0]["finding_id"]
+        head = data["head_sha"]
+        chat_body = data["threads"][0]["replies"][0]["body"]
+        marker = (
+            f"<!-- auto-merge-coderabbit-verification "
+            f"finding={finding} head={head} -->"
+        )
+        checks = f"""
+const finding = {finding};
+const head = {json.dumps(head)};
+const now = Date.now();
+const expired = new Date(now - 14 * 60_000 - 2 * 60_000).toISOString();
+const marker = {json.dumps(marker)};
+const chatBody = {json.dumps(chat_body)};
+pr.head.sha = head;
+liveHead = head;
+liveThreads = [{{commentId: finding}}];
+comments = [
+  {{id: 900, in_reply_to_id: finding, user: {{login: 'kodmial'}},
+    created_at: new Date(now - 3 * 60_000).toISOString(), body: marker}},
+  {{id: 901, in_reply_to_id: finding, user: {{login: 'coderabbitai[bot]'}},
+    created_at: expired, body: chatBody}},
+];
+async function attempt(identityUnavailable) {{
+  authenticatedFailure = identityUnavailable;
+  posted = [];
+  const state = {{remaining: 1, notBeforeMs: 0}};
+  const requested = await requestCodeRabbitThreadVerification(
+    pr, liveThreads, {{}}, state
+  );
+  return {{requested, posted: posted.length, remaining: state.remaining}};
+}}
+const results = {{
+  resolved: await attempt(false),
+  unresolved: await attempt(true),
+}};
+process.stdout.write(JSON.stringify(results));
+"""
+        result = self.run_verifier(checks)
+        # With the PAT identity resolved the expired quota retry is sent once.
+        self.assertEqual(result["resolved"]["requested"], 1)
+        self.assertEqual(result["resolved"]["posted"], 1)
+        self.assertEqual(result["resolved"]["remaining"], 0)
+        # Without that identity an acknowledged retry cannot be recognised,
+        # so the retry is deferred instead of risked twice.
+        self.assertEqual(result["unresolved"]["requested"], 0)
+        self.assertEqual(result["unresolved"]["posted"], 0)
+        self.assertEqual(result["unresolved"]["remaining"], 1)
 
 
 def unresolved_collector_source() -> str:

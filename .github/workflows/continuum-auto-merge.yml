@@ -937,12 +937,26 @@ jobs:
             return false;
           }
 
+          const REVIEW_QUOTA_SIGNAL_RE =
+            /Review rate limited|Review limit reached/i;
+
           function retryWindowText(body = '') {
+            const quotaSignalled = REVIEW_QUOTA_SIGNAL_RE.test(body);
+            // The generic "try again" phrase also appears in ordinary
+            // finding answers, so it needs an explicit quota signal; the
+            // "next review ... available ... in" form is unambiguous.
             const patterns = [
-              /next\s+(?:included\s+)?review\b[^\n<.]{0,120}?\bavailable\b[^\n<.]{0,40}?\b(?:in|after)\s+([^\n<.]+)/i,
-              /(?:try|retry)\s+again\b[^\n<.]{0,40}?\b(?:in|after)\s+([^\n<.]+)/i,
+              [
+                /next\s+(?:included\s+)?review\b[^\n<.]{0,120}?\bavailable\b[^\n<.]{0,40}?\b(?:in|after)\s+([^\n<.]+)/i,
+                false,
+              ],
+              [
+                /(?:try|retry)\s+again\b[^\n<.]{0,40}?\b(?:in|after)\s+([^\n<.]+)/i,
+                true,
+              ],
             ];
-            for (const pattern of patterns) {
+            for (const [pattern, requiresQuotaSignal] of patterns) {
+              if (requiresQuotaSignal && !quotaSignalled) continue;
               const match = body.match(pattern);
               if (match) return match[1];
             }
@@ -1054,20 +1068,29 @@ jobs:
 
           function parseReviewQuotaDelayMs(body = '') {
             const text = String(body || '');
-            if (!/Review rate limited|Review limit reached/i.test(text)) {
-              return null;
-            }
+            const quotaSignalled =
+              /Review rate limited|Review limit reached/i.test(text);
+            // The generic "try again" phrase is only a full-review quota
+            // window with an explicit quota signal; the "next review ...
+            // available ... in" form remains unambiguous on its own.
             const patterns = [
-              /next\s+(?:included\s+)?review\b[^\n<.]{0,120}?\bavailable\b[^\n<.]{0,40}?\b(?:in|after)\s+([^\n<.]+)/i,
-              /(?:try|retry)\s+again\b[^\n<.]{0,40}?\b(?:in|after)\s+([^\n<.]+)/i,
+              [
+                /next\s+(?:included\s+)?review\b[^\n<.]{0,120}?\bavailable\b[^\n<.]{0,40}?\b(?:in|after)\s+([^\n<.]+)/i,
+                false,
+              ],
+              [
+                /(?:try|retry)\s+again\b[^\n<.]{0,40}?\b(?:in|after)\s+([^\n<.]+)/i,
+                true,
+              ],
             ];
-            for (const pattern of patterns) {
+            for (const [pattern, requiresQuotaSignal] of patterns) {
+              if (requiresQuotaSignal && !quotaSignalled) continue;
               const match = text.match(pattern);
               if (!match) continue;
               const parsed = parseChatDurationMs(match[1]);
               if (parsed !== null) return parsed;
             }
-            return 65 * 60_000;
+            return quotaSignalled ? 65 * 60_000 : null;
           }
 
           function classifyCodeRabbitReply(reply = {}) {
@@ -1152,7 +1175,7 @@ jobs:
               : parseDurationMs(windowText);
             if (parsed !== null) return parsed;
 
-            if (/Review rate limited|Review limit reached/i.test(body)) {
+            if (REVIEW_QUOTA_SIGNAL_RE.test(body)) {
               core.warning(
                 'Could not parse CodeRabbit quota countdown; using 65-minute fallback.'
               );
@@ -1178,6 +1201,10 @@ jobs:
               'Review rate limited. Try again in less than a minute.',
               60_000,
             ],
+            // A bare "try again" phrase is ordinary prose, not a quota
+            // window; the unambiguous "next review ... available" form is.
+            ['Try again in 13 minutes.', null],
+            ['Next review available in 13 minutes.', 13 * 60_000],
           ];
           for (const [sample, expected] of retryParserCases) {
             const actual = parseCodeRabbitRetryDelayMs(sample);
@@ -1934,13 +1961,19 @@ jobs:
             // replies may acknowledge a chat-quota retry or establish a
             // verification request. Resolve the PAT-authenticated login once
             // per pass; github-actions[bot] remains trusted for run-scoped
-            // verification markers.
+            // verification markers. A chat-quota retry is deferred while the
+            // posting login remains unknown, because its own acknowledgement
+            // could not be distinguished from a foreign marker.
             const trustedChatRetryAuthors = new Set(['github-actions[bot]']);
+            let chatRetryAuthorResolved = false;
             try {
               const { data: authenticated } =
                 await github.rest.users.getAuthenticated();
               const login = String(authenticated?.login || '').trim().toLowerCase();
-              if (login) trustedChatRetryAuthors.add(login);
+              if (login) {
+                trustedChatRetryAuthors.add(login);
+                chatRetryAuthorResolved = true;
+              }
             } catch (err) {
               core.warning(
                 `PR #${pr.number}: could not resolve the verification-reply author; only github-actions[bot] chat-quota acknowledgements are trusted: ${err.message || err}`
@@ -2210,36 +2243,18 @@ jobs:
               }
 
               if (chatRetryLimitedId !== null) {
+                if (!chatRetryAuthorResolved) {
+                  core.notice(
+                    `PR #${pr.number}: posting identity is unresolved; deferring CodeRabbit chat-quota retry for thread #${thread.commentId} to the next wakeup.`
+                  );
+                  continue;
+                }
                 if (Number(chatQuotaState.remaining || 0) <= 0) {
                   core.notice(
                     `PR #${pr.number}: shared CodeRabbit chat quota already consumed its retry in this reconciliation; deferring thread #${thread.commentId} to the next wakeup.`
                   );
                   continue;
                 }
-                // Deadline reached: re-read live state and retry only the
-                // same still-open, still-unresolved finding on this HEAD.
-                const live = await withReadFallback(client =>
-                  client.rest.pulls.get({
-                    owner, repo, pull_number: pr.number,
-                  })
-                );
-                if (live.data.state !== 'open' ||
-                    live.data.head.sha !== pr.head.sha) {
-                  core.info(
-                    `PR #${pr.number}: PR/HEAD changed before the CodeRabbit chat-quota retry; skipping stale finding #${thread.commentId}.`
-                  );
-                  continue;
-                }
-                const liveThreads = await unresolvedCodeRabbitThreads(pr);
-                if (!liveThreads.some(candidate =>
-                  candidate.commentId === thread.commentId)) {
-                  core.info(
-                    `PR #${pr.number}: finding #${thread.commentId} is no longer unresolved; skipping stale CodeRabbit chat-quota retry.`
-                  );
-                  continue;
-                }
-                chatQuotaState.remaining =
-                  Number(chatQuotaState.remaining || 0) - 1;
               }
 
               const body = [
@@ -2271,6 +2286,29 @@ jobs:
               ].join('\n');
 
               if (!(await allowOneCodeRabbitChatRequest())) continue;
+              if (chatRetryLimitedId !== null) {
+                // Deadline reached: after the shared chat-budget scan,
+                // re-read live state and retry only the same still-open,
+                // still-unresolved finding on this HEAD.
+                const live = await getPullWithAuthoritativeHead(pr.number);
+                if (live.state !== 'open' ||
+                    live.head.sha !== pr.head.sha) {
+                  core.info(
+                    `PR #${pr.number}: PR/HEAD changed before the CodeRabbit chat-quota retry; skipping stale finding #${thread.commentId}.`
+                  );
+                  continue;
+                }
+                const liveThreads = await unresolvedCodeRabbitThreads(pr);
+                if (!liveThreads.some(candidate =>
+                  candidate.commentId === thread.commentId)) {
+                  core.info(
+                    `PR #${pr.number}: finding #${thread.commentId} is no longer unresolved; skipping stale CodeRabbit chat-quota retry.`
+                  );
+                  continue;
+                }
+                chatQuotaState.remaining =
+                  Number(chatQuotaState.remaining || 0) - 1;
+              }
               await github.request(
                 'POST /repos/{owner}/{repo}/pulls/{pull_number}/comments/{comment_id}/replies',
                 {

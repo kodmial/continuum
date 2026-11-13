@@ -50,24 +50,35 @@ CHAT_QUOTA_FALLBACK_MS = 65 * 60_000
 #: Safety padding added to the bot reply timestamp + chat countdown.
 CHAT_RETRY_SAFETY_PADDING_MS = 30_000
 
+_RATE_LIMIT_RE = re.compile(
+    r"Review rate limited|Review limit reached", re.IGNORECASE
+)
+
+# Each entry pairs a countdown pattern with whether it requires an explicit
+# full-review quota signal. The generic "try again in <duration>" phrase also
+# appears in ordinary finding answers, so it only establishes a quota window
+# when the same reply carries that quota signal. "next review ... available
+# ... in" is itself unambiguous and stays ungated.
 _RETRY_WINDOW_PATTERNS = (
-    re.compile(
-        r"next\s+(?:included\s+)?review\b[^\n<.]{0,120}?\bavailable\b"
-        r"[^\n<.]{0,40}?\b(?:in|after)\s+([^\n<.]+)",
-        re.IGNORECASE,
+    (
+        re.compile(
+            r"next\s+(?:included\s+)?review\b[^\n<.]{0,120}?\bavailable\b"
+            r"[^\n<.]{0,40}?\b(?:in|after)\s+([^\n<.]+)",
+            re.IGNORECASE,
+        ),
+        False,
     ),
-    re.compile(
-        r"(?:try|retry)\s+again\b[^\n<.]{0,40}?\b(?:in|after)\s+([^\n<.]+)",
-        re.IGNORECASE,
+    (
+        re.compile(
+            r"(?:try|retry)\s+again\b[^\n<.]{0,40}?\b(?:in|after)\s+([^\n<.]+)",
+            re.IGNORECASE,
+        ),
+        True,
     ),
 )
 
 _DURATION_PART_RE = re.compile(
     r"(\d+)\s*(hours?|hrs?|minutes?|mins?|seconds?|secs?)", re.IGNORECASE
-)
-
-_RATE_LIMIT_RE = re.compile(
-    r"Review rate limited|Review limit reached", re.IGNORECASE
 )
 
 # Inline chat-message quota lives in a PR review-comment thread. Its heading
@@ -107,10 +118,16 @@ _REVIEW_COMMAND_RE = re.compile(
 
 
 def retry_window_text(body: Any) -> Optional[str]:
-    """Extract the quota-countdown window text from a bot comment."""
+    """Extract the quota-countdown window text from a bot comment.
+
+    A generic "try/retry again in <duration>" phrase is only a quota window
+    when the same body carries a recognised full-review quota signal.
+    """
 
     text = str(body or "")
-    for pattern in _RETRY_WINDOW_PATTERNS:
+    for pattern, requires_quota_signal in _RETRY_WINDOW_PATTERNS:
+        if requires_quota_signal and not _RATE_LIMIT_RE.search(text):
+            continue
         match = pattern.search(text)
         if match:
             return match.group(1)

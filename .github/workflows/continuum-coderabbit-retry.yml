@@ -282,11 +282,22 @@ jobs:
             const MAX_CONTROLLER_LIFETIME_MS = 80 * 60_000;
 
             function retryWindowText(body = '') {
+              const quotaSignalled = RATE_LIMIT_RE.test(body);
+              // The generic "try again" phrase also appears in ordinary
+              // finding answers, so it needs an explicit quota signal; the
+              // "next review ... available ... in" form is unambiguous.
               const patterns = [
-                /next\s+(?:included\s+)?review\b[^\n<.]{0,120}?\bavailable\b[^\n<.]{0,40}?\b(?:in|after)\s+([^\n<.]+)/i,
-                /(?:try|retry)\s+again\b[^\n<.]{0,40}?\b(?:in|after)\s+([^\n<.]+)/i,
+                [
+                  /next\s+(?:included\s+)?review\b[^\n<.]{0,120}?\bavailable\b[^\n<.]{0,40}?\b(?:in|after)\s+([^\n<.]+)/i,
+                  false,
+                ],
+                [
+                  /(?:try|retry)\s+again\b[^\n<.]{0,40}?\b(?:in|after)\s+([^\n<.]+)/i,
+                  true,
+                ],
               ];
-              for (const pattern of patterns) {
+              for (const [pattern, requiresQuotaSignal] of patterns) {
+                if (requiresQuotaSignal && !quotaSignalled) continue;
                 const match = body.match(pattern);
                 if (match) return match[1];
               }
@@ -354,6 +365,10 @@ jobs:
                 'Review rate limited. Try again in less than a minute.',
                 60_000,
               ],
+              // A bare "try again" phrase is ordinary prose, not a quota
+              // window; the unambiguous "next review ... available" form is.
+              ['Try again in 13 minutes.', null],
+              ['Next review available in 13 minutes.', 13 * 60_000],
             ];
             for (const [sample, expected] of parserCases) {
               const actual = parseRetryDelayMs(sample);

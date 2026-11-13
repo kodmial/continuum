@@ -166,20 +166,29 @@ jobs:
 
             function parseReviewQuotaDelayMs(body = '') {
               const text = String(body || '');
-              if (!/Review rate limited|Review limit reached/i.test(text)) {
-                return null;
-              }
+              const quotaSignalled =
+                /Review rate limited|Review limit reached/i.test(text);
+              // The generic "try again" phrase is only a full-review quota
+              // window with an explicit quota signal; the "next review ...
+              // available ... in" form remains unambiguous on its own.
               const patterns = [
-                /next\s+(?:included\s+)?review\b[^\n<.]{0,120}?\bavailable\b[^\n<.]{0,40}?\b(?:in|after)\s+([^\n<.]+)/i,
-                /(?:try|retry)\s+again\b[^\n<.]{0,40}?\b(?:in|after)\s+([^\n<.]+)/i,
+                [
+                  /next\s+(?:included\s+)?review\b[^\n<.]{0,120}?\bavailable\b[^\n<.]{0,40}?\b(?:in|after)\s+([^\n<.]+)/i,
+                  false,
+                ],
+                [
+                  /(?:try|retry)\s+again\b[^\n<.]{0,40}?\b(?:in|after)\s+([^\n<.]+)/i,
+                  true,
+                ],
               ];
-              for (const pattern of patterns) {
+              for (const [pattern, requiresQuotaSignal] of patterns) {
+                if (requiresQuotaSignal && !quotaSignalled) continue;
                 const match = text.match(pattern);
                 if (!match) continue;
                 const parsed = parseChatDurationMs(match[1]);
                 if (parsed !== null) return parsed;
               }
-              return 65 * 60_000;
+              return quotaSignalled ? 65 * 60_000 : null;
             }
 
             function classifyCodeRabbitReply(reply = {}) {
