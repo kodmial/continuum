@@ -44,7 +44,7 @@ on:
       # each is empty by default so the engine falls through to the consumer's
       # `vars.` value rather than pinning one on every installed caller.
       ci_repair_label:
-        description: "Label holding the one-attempt-per-head CI repair lock"
+        description: "Presentation label for an automatic CI repair attempt (not admission state)"
         required: false
         type: string
       head_ref_pattern:

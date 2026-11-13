@@ -45,6 +45,9 @@ def make_source_repo(path: Path, *, complete: bool = True) -> Path:
         (path / ".github/scripts/opencode_repair_state.py").write_text(
             "# test CLI\n", encoding="utf-8"
         )
+        (path / ".github/scripts/ci_repair_admission.py").write_text(
+            "# test admission owner\n", encoding="utf-8"
+        )
     (path / "unrelated.txt").write_text("must not be fetched\n", encoding="utf-8")
     git("add", ".", cwd=path)
     git("commit", "-qm", "source fixture", cwd=path)
@@ -109,6 +112,7 @@ class CIRepairBootstrapContractTests(unittest.TestCase):
                     self.assertEqual(0, result.returncode, result.stderr)
                     checked_out = dest / ".continuum-repair-engine"
                     self.assertTrue((checked_out / ".github/scripts/opencode_repair_state.py").is_file())
+                    self.assertTrue((checked_out / ".github/scripts/ci_repair_admission.py").is_file())
                     self.assertTrue((checked_out / "src/continuum/opencode_repair_state.py").is_file())
                     self.assertFalse((checked_out / "unrelated.txt").exists())
 

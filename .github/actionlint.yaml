@@ -1,0 +1,12 @@
+# Temporary schema-gap suppression for GitHub's documented `concurrency.queue`
+# key (kodmial/continuum#446). actionlint 1.7.12 predates the key and rejects
+# the valid workflow before evaluating anything else:
+# https://github.com/rhysd/actionlint/issues/657
+#
+# Keep the suppression narrow: only this exact diagnostic, only in the one
+# workflow that owns the serialized exact-HEAD queue. Remove it once an
+# actionlint release supports the key.
+paths:
+  .github/workflows/continuum-opencode-repair.yml:
+    ignore:
+      - 'unexpected key "queue" for "concurrency" section'

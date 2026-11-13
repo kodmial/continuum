@@ -524,7 +524,7 @@ permissions: {}
         )[0])
 
         for stub_path, expected_inputs in (
-            (OPENCODE_STUB, 24),
+            (OPENCODE_STUB, 25),
             (PR_AGENT_REPAIR_STUB, None),
         ):
             stub = stub_path.read_text(encoding="utf-8")

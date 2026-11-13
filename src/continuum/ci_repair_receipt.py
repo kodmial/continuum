@@ -1,10 +1,11 @@
 """Exact-HEAD CI-repair attempt receipts (kodmial/continuum#444).
 
 This module is the durable evidence format for the single-owner CI-repair
-controller described by kodmial/continuum#443 phase 1. It is deliberately
-pure: it builds, renders, parses, validates and reconciles supplied comment
-data only. It performs no GitHub API call, mutates no label/comment/workflow
-state, and is not called in production yet.
+controller described by kodmial/continuum#443. It is deliberately pure: it
+builds, renders, parses, validates and reconciles supplied comment data only.
+It performs no GitHub API call, mutates no label/comment/workflow state; the
+serialized admission owner in `.github/scripts/ci_repair_admission.py` performs
+the GitHub calls.
 
 A receipt is a hidden machine marker on an issue comment::
 
@@ -20,8 +21,18 @@ proves the same repository and run ID.
 Status vocabulary and allowed transitions
 -----------------------------------------
 ``claimed``
-    The serialized owner has persisted the claim before asking GitHub to
-    dispatch a repair. Run details are forbidden because no run is proved.
+    The serialized owner persisted the receipt but has not recorded that a
+    dispatch request is about to be sent. For a receipt written by the
+    ``requesting`` protocol below, that proves the request was never sent; a
+    legacy ``claimed`` receipt predates that protocol, so its author may have
+    dispatched directly. Admission re-arms a stale claim only when the
+    trusted requesting-protocol retirement frontier proves it postdates that
+    protocol. Run details are forbidden because no run is proved.
+``requesting``
+    The serialized owner persisted this state immediately before asking GitHub
+    to dispatch a repair. The request may have been sent even if no run is
+    visible (its run can be deleted), so a stale ``requesting`` attempt is held
+    rather than re-armed. Run details are forbidden because no run is proved.
 ``dispatched``
     A dispatch was accepted, or an ambiguous attempt was reconciled to a
     proved actual run. Run details are optional (legacy dispatch responses
@@ -43,9 +54,10 @@ records and impossible transitions yield ``invalid`` or ``conflict``.
 valid history with no existing non-rejected attempt for the exact HEAD.
 
 This is a record, not an atomic lock. Issue-comment creation has no GitHub
-compare-and-swap guarantee. Phase 2 must still serialize the read -> claim ->
-dispatch sequence per ``(repository, exact HEAD)`` and reconcile an
-``ambiguous`` claim against the live run inventory before any retry.
+compare-and-swap guarantee. The admission owner still serializes the
+read -> claim -> dispatch sequence per ``(repository, exact HEAD)`` and
+reconciles an ``ambiguous`` claim against the live run inventory before any
+retry.
 """
 
 from __future__ import annotations
@@ -65,6 +77,7 @@ RECEIPT_SCHEMA_VERSION = 1
 RECEIPT_MARKER = "continuum-ci-repair-receipt"
 
 STATUS_CLAIMED = "claimed"
+STATUS_REQUESTING = "requesting"
 STATUS_DISPATCHED = "dispatched"
 STATUS_AMBIGUOUS = "ambiguous"
 STATUS_REJECTED = "rejected"
@@ -72,6 +85,7 @@ STATUS_REJECTED = "rejected"
 #: Bounded status vocabulary. Unknown statuses are invalid.
 RECEIPT_STATUSES = (
     STATUS_CLAIMED,
+    STATUS_REQUESTING,
     STATUS_DISPATCHED,
     STATUS_AMBIGUOUS,
     STATUS_REJECTED,
@@ -118,11 +132,22 @@ _RECEIPT_MARKER_RE = re.compile(
     r"\s*-->"
 )
 
-# A status may only move forward. ``ambiguous`` may be reconciled to
-# ``dispatched`` once a proved run is found; it never re-enters ``claimed``.
+# A status may only move forward. ``requesting`` is persisted immediately
+# before the dispatch request; once it exists the request may have reached
+# GitHub. ``ambiguous`` may be reconciled to ``dispatched`` once a proved run is
+# found; it never re-enters ``claimed`` or becomes ``rejected``.
 _TRANSITIONS = {
     STATUS_CLAIMED: frozenset(
-        {STATUS_CLAIMED, STATUS_DISPATCHED, STATUS_AMBIGUOUS, STATUS_REJECTED}
+        {
+            STATUS_CLAIMED,
+            STATUS_REQUESTING,
+            STATUS_DISPATCHED,
+            STATUS_AMBIGUOUS,
+            STATUS_REJECTED,
+        }
+    ),
+    STATUS_REQUESTING: frozenset(
+        {STATUS_REQUESTING, STATUS_DISPATCHED, STATUS_AMBIGUOUS, STATUS_REJECTED}
     ),
     STATUS_DISPATCHED: frozenset({STATUS_DISPATCHED}),
     STATUS_AMBIGUOUS: frozenset({STATUS_AMBIGUOUS, STATUS_DISPATCHED}),
@@ -305,11 +330,15 @@ def build_receipt(
             raise ReceiptError("a run URL requires its workflow run ID")
         if number_run_id is not None and url_text:
             expected = _canonical_run_url(repository_key, number_run_id)
-            if url_text != expected:
+            if url_text.lower() != expected.lower():
                 raise ReceiptError(
                     "run URL must prove the same repository and run ID "
                     "(expected {})".format(expected)
                 )
+            # The marker format is canonical lowercase. GitHub preserves the
+            # display case in `github.repository`/run URLs, so accept a
+            # case-only variant and store the canonical form.
+            url_text = expected
 
     return RepairReceipt(
         schema_version=version,
@@ -456,6 +485,14 @@ def _has_author_metadata(comment: Mapping[str, Any]) -> bool:
     return bool(association) and bool(_comment_login(comment))
 
 
+def comment_login(comment: Mapping[str, Any]) -> str:
+    """Return the validated, normalized author login for one comment."""
+
+    if not isinstance(comment, Mapping):
+        return ""
+    return _comment_login(comment)
+
+
 def is_trusted_receipt_comment(
     comment: Mapping[str, Any],
     *,
@@ -534,6 +571,47 @@ def validate_receipt_transition(
     """
 
     _validate_advance(previous, following)
+
+
+def _reconcile_observation(previous: RepairReceipt, following: RepairReceipt) -> RepairReceipt:
+    """Fold one same-attempt observation into the reconciled attempt state.
+
+    The serialized owner and the dispatched executor both append receipts for
+    the same attempt around an uncertain dispatch, and they do not share the
+    owner's concurrency lock. An observation can therefore arrive that would
+    lower the reconciled state (the owner's ``ambiguous`` written after the
+    executor already proved ``dispatched``) or omit run details the other
+    writer already recorded (a legacy 204 write after a proved run ID). Those
+    two shapes are concurrent reports of the same event, not corruption:
+    they are reconciled monotonically so the proved run evidence wins and the
+    effective state never regresses. Every other impossible transition still
+    fails closed.
+    """
+
+    try:
+        _validate_advance(previous, following)
+        return following
+    except ReceiptError:
+        if receipt_key(previous) != receipt_key(following):
+            raise
+        if previous.attempt_id != following.attempt_id:
+            raise
+        if (
+            previous.status == STATUS_DISPATCHED
+            and following.status == STATUS_AMBIGUOUS
+        ):
+            # A concurrent writer reported uncertainty after the run was
+            # already proved; the proved dispatch stays authoritative.
+            return previous
+        if (
+            previous.status == STATUS_DISPATCHED
+            and following.status == STATUS_DISPATCHED
+            and following.run_id is None
+            and not following.run_url
+        ):
+            # A legacy 204 write must never overwrite a recorded run ID.
+            return previous
+        raise
 
 
 def transition_receipt(
@@ -670,10 +748,13 @@ def read_receipts(
     ``all_receipts`` as independent keys and their valid state does not block
     the queried HEAD. An impossible transition, reused attempt ID, or duplicate
     live attempt anywhere in the supplied log is corrupt evidence and fails
-    closed instead of permitting a dispatch. Untrusted marker lookalikes are
-    ignored without affecting authority. A marker whose author has neither an
-    association nor a usable login is unknown, not untrusted, and makes the
-    history incomplete.
+    closed instead of permitting a dispatch. The one exception is a concurrent
+    report of the same event -- a proved ``dispatched`` attempt followed by a
+    writer's ``ambiguous`` or run-detail-less duplicate -- which is reconciled
+    monotonically instead of regressing the attempt state. Untrusted marker
+    lookalikes are ignored without affecting authority. A marker whose author
+    has neither an association nor a usable login is unknown, not untrusted,
+    and makes the history incomplete.
     """
 
     repository_key = normalize_repository(repository)
@@ -789,7 +870,9 @@ def read_receipts(
             order.append(receipt.attempt_id)
             continue
         try:
-            _validate_advance(current[receipt.attempt_id], receipt)
+            current[receipt.attempt_id] = _reconcile_observation(
+                current[receipt.attempt_id], receipt
+            )
         except ReceiptError as exc:
             attempts = _summarize(order, current, counts, head)
             return _conflict(
@@ -799,7 +882,6 @@ def read_receipts(
                 attempts,
                 ignored_untrusted,
             )
-        current[receipt.attempt_id] = receipt
         counts[receipt.attempt_id] += 1
 
     attempts = _summarize(order, current, counts, head)
@@ -902,10 +984,11 @@ def decide_new_attempt(collection: ReceiptCollection) -> AttemptDecision:
 
     The only permitting result is a complete/valid history with no
     non-rejected attempt for the queried HEAD. An incomplete, invalid or
-    conflicting history holds. ``claimed`` waits for its owner; ``dispatched``
-    already spent the attempt; ``ambiguous`` holds for correlation and can
-    never authorize a second dispatch. A history containing only definitely
-    ``rejected`` attempts may re-arm with a new attempt ID.
+    conflicting history holds. ``claimed`` waits for its owner; ``requesting``
+    may already have reached dispatch and holds; ``dispatched`` already spent
+    the attempt; ``ambiguous`` holds for correlation and can never authorize a
+    second dispatch. A history containing only definitely ``rejected``
+    attempts may re-arm with a new attempt ID.
     """
 
     if collection.outcome == OUTCOME_INCOMPLETE:
@@ -955,6 +1038,16 @@ def decide_new_attempt(collection: ReceiptCollection) -> AttemptDecision:
                 ),
                 attempt_id=attempt.attempt_id,
             )
+        if attempt.status == STATUS_REQUESTING:
+            return AttemptDecision(
+                allowed=False,
+                action=ACTION_HOLD,
+                reason=(
+                    "attempt {!r} recorded a dispatch request that may have "
+                    "reached GitHub; correlate it before any retry"
+                ).format(attempt.attempt_id),
+                attempt_id=attempt.attempt_id,
+            )
         if attempt.status == STATUS_DISPATCHED:
             return AttemptDecision(
                 allowed=False,
@@ -992,6 +1085,7 @@ __all__ = [
     "RECEIPT_SCHEMA_VERSION",
     "RECEIPT_MARKER",
     "STATUS_CLAIMED",
+    "STATUS_REQUESTING",
     "STATUS_DISPATCHED",
     "STATUS_AMBIGUOUS",
     "STATUS_REJECTED",
@@ -1020,6 +1114,7 @@ __all__ = [
     "render_receipt",
     "receipt_key",
     "parse_receipts",
+    "comment_login",
     "is_trusted_receipt_comment",
     "validate_receipt_transition",
     "transition_receipt",
