@@ -396,8 +396,8 @@ class BridgeIsolationTests(unittest.TestCase):
             port = server.server_address[1]
             old = os.environ.get("OPENCODE_SERVER_URL", "")
             old_model = os.environ.get("OPENCODE_MODEL")
-        old_password = os.environ.get("OPENCODE_PASSWORD")
-        os.environ["OPENCODE_PASSWORD"] = "fixture-password"
+            old_password = os.environ.get("OPENCODE_PASSWORD")
+            os.environ["OPENCODE_PASSWORD"] = "fixture-password"
             os.environ["OPENCODE_MODEL"] = "opencode/test-fixture-route"
             os.environ["OPENCODE_SERVER_URL"] = f"http://127.0.0.1:{self.port}"
             try:
