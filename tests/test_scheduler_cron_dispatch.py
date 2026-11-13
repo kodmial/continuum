@@ -477,6 +477,10 @@ function stopOrderKey(c) {
     '<!-- continuum-task-snapshot repo=kodmial/continuum issue=442 ' +
     'generation=' + generation + ' title-sha256=' + 'd'.repeat(64) +
     ' body-sha256=' + 'e'.repeat(64) + ' spec-sha256=' + spec + ' -->';
+  const snapshotRef = (spec, generation = 1) =>
+    '<!-- continuum-task-snapshot-ref repo=kodmial/continuum issue=442 ' +
+    'generation=' + generation + ' title-sha256=' + 'd'.repeat(64) +
+    ' body-sha256=' + 'e'.repeat(64) + ' spec-sha256=' + spec + ' -->';
   const item = (id, body, login = 'kodmial') => ({
     id, body, created_at: '2026-11-12T04:' + String(id).padStart(2, '0') + ':00Z',
     user: { login }, author_association: login === 'outsider' ? 'NONE' : 'OWNER'
@@ -596,6 +600,30 @@ function stopOrderKey(c) {
       item(6, snapshot('f'.repeat(64)))
     ]),
     'a later different-spec duplicate must not override the earliest snapshot'
+  );
+  assert.ok(
+    await hold([item(0, snapshotRef('f'.repeat(64))), saved]),
+    'a snapshot reference is not the executor pin and must not release the hold'
+  );
+  assert.ok(
+    await hold([saved, item(5, snapshotRef('f'.repeat(64)))]),
+    'a later snapshot reference must not release the hold'
+  );
+  assert.ok(
+    await hold([
+      saved,
+      item(5,
+        snapshot('f'.repeat(64)).replace('issue=442', 'issue=999') + '\n' +
+        snapshot('f'.repeat(64)))
+    ]),
+    'only the first snapshot marker in a comment is the executor pin'
+  );
+  assert.ok(
+    await hold([
+      saved,
+      item(5, snapshot('c'.repeat(64)) + '\n' + snapshot('f'.repeat(64)))
+    ]),
+    'a later marker in one comment must not replace the first pin'
   );
   console.log('checkpoint-resume-hold-regression: PASS');
 })().catch(e => { console.error(e); process.exitCode = 1; });

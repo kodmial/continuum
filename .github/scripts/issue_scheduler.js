@@ -723,8 +723,13 @@ module.exports = async function runIssueScheduler({ github, context, core }) {
   
   const checkpointResumeBlockedMarkerRe =
     /<!--\s*continuum-checkpoint-resume-blocked\s+repo=([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)\s+issue=(\d+)\s+generation=(\d+)\s+operation=(\S+)\s+checkpoint=(\S+)\s+checkpoint_sha=([0-9a-fA-F]{40})\s+base_ref=(\S+)\s+base_sha=([0-9a-fA-F]{40})\s+snapshot=([0-9a-fA-F]{64})\s+reason=(\S+)(?:\s+episode=(\S+))?\s*-->/;
+  // The executor consumes only `continuum-task-snapshot` here and parses
+  // only the first such marker in a comment before checking its identity.
+  // A `continuum-task-snapshot-ref` marker is a PR-body reference the
+  // executor never treats as the authoritative pin, so it must not release
+  // this hold either.
   const checkpointSnapshotMarkerRe =
-    /<!--\s*continuum-task-snapshot(?:-ref)?\s+repo=([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)\s+issue=(\d+)\s+generation=(\d+)\s+title-sha256=([0-9a-fA-F]{64})\s+body-sha256=([0-9a-fA-F]{64})\s+spec-sha256=([0-9a-fA-F]{64})\s*-->/g;
+    /<!--\s*continuum-task-snapshot\s+repo=([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)\s+issue=(\d+)\s+generation=(\d+)\s+title-sha256=([0-9a-fA-F]{64})\s+body-sha256=([0-9a-fA-F]{64})\s+spec-sha256=([0-9a-fA-F]{64})\s*-->/;
 
   // A deterministic checkpoint-continuation rejection is persisted as a
   // typed marker. It is not an owner pause and not a terminal generation
@@ -790,33 +795,37 @@ module.exports = async function runIssueScheduler({ github, context, core }) {
     if (!marker) return null;
 
     // A different authoritative pinned snapshot is a material premise
-    // change. Select it exactly as the executor does: the earliest trusted
-    // snapshot for the task generation wins and later duplicates are
-    // ignored, never overwritten. Comparing the latest duplicate instead
-    // would dispatch against the earlier pin, or repeat the unchanged
-    // rejection when live content still matches that earlier pin. Only
-    // trusted comments can move a generation baseline: an arbitrary
-    // commenter must never release a deterministic hold by posting a forged
-    // snapshot marker.
+    // change. Select it exactly as the executor does: only the first
+    // `continuum-task-snapshot` marker in a comment is parsed, and identity
+    // is checked after that parse, so a comment whose first marker belongs
+    // to another repo/issue/generation is discarded whole. The earliest
+    // trusted snapshot for the task generation then wins and later
+    // duplicates are ignored, never overwritten. Comparing a later
+    // duplicate instead would dispatch against the earlier pin, or repeat
+    // the unchanged rejection when live content still matches that earlier
+    // pin. Only trusted comments can move a generation baseline: an
+    // arbitrary commenter must never release a deterministic hold by
+    // posting a forged snapshot marker.
     let authoritativeSnapshot = null;
     let authoritativeSnapshotOrder = '';
     for (const comment of trusted) {
-      const body = String(comment.body || '');
-      for (const match of body.matchAll(checkpointSnapshotMarkerRe)) {
-        if (
-          match[1].toLowerCase() !== wantedRepo ||
-          Number(match[2]) !== issueNumber ||
-          Number(match[3]) !== wantedTaskGeneration
-        ) continue;
-        const order = (comment.created_at || '') + '#' +
-          String(comment.id || 0).padStart(12, '0');
-        if (
-          authoritativeSnapshot === null ||
-          order < authoritativeSnapshotOrder
-        ) {
-          authoritativeSnapshotOrder = order;
-          authoritativeSnapshot = match[6].toLowerCase();
-        }
+      const match = String(comment.body || '').match(
+        checkpointSnapshotMarkerRe
+      );
+      if (!match) continue;
+      if (
+        match[1].toLowerCase() !== wantedRepo ||
+        Number(match[2]) !== issueNumber ||
+        Number(match[3]) !== wantedTaskGeneration
+      ) continue;
+      const order = (comment.created_at || '') + '#' +
+        String(comment.id || 0).padStart(12, '0');
+      if (
+        authoritativeSnapshot === null ||
+        order < authoritativeSnapshotOrder
+      ) {
+        authoritativeSnapshotOrder = order;
+        authoritativeSnapshot = match[6].toLowerCase();
       }
     }
     if (

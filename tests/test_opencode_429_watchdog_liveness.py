@@ -429,6 +429,21 @@ def snapshot_marker(spec, generation=1):
     )
 
 
+def snapshot_ref_marker(spec, generation=1):
+    return (
+        "<!-- continuum-task-snapshot-ref repo={owner}/{repo} issue=382 "
+        "generation={generation} title-sha256={title} "
+        "body-sha256={body} spec-sha256={spec} -->"
+    ).format(
+        owner=OWNER,
+        repo=REPO,
+        generation=generation,
+        title="d" * 64,
+        body="e" * 64,
+        spec=spec,
+    )
+
+
 def thread_comment(comment_id, body, created_at, login="github-actions[bot]"):
     return {
         "id": comment_id,
@@ -1441,6 +1456,52 @@ class WatchdogHarness(unittest.TestCase):
             ),
         ])
         self.assert_no_dispatch(self.run_scenario(later_duplicate))
+
+        earlier_ref = base_scenario()
+        earlier_ref["comments"].extend([
+            thread_comment(
+                19, snapshot_ref_marker("f" * 64), "2026-10-23T09:20:00Z"
+            ),
+            thread_comment(20, hold_marker(), "2026-10-23T09:50:00Z"),
+        ])
+        self.assert_no_dispatch(self.run_scenario(earlier_ref))
+
+        later_ref = base_scenario()
+        later_ref["comments"].extend([
+            thread_comment(20, hold_marker(), "2026-10-23T09:50:00Z"),
+            thread_comment(
+                21, snapshot_ref_marker("f" * 64), "2026-10-23T09:55:00Z"
+            ),
+        ])
+        self.assert_no_dispatch(self.run_scenario(later_ref))
+
+        # The executor parses only the first snapshot marker in a comment,
+        # then checks its identity, so a non-matching first marker discards
+        # the whole comment even when a later matching marker follows.
+        first_marker_only = base_scenario()
+        first_marker_only["comments"].append(
+            thread_comment(
+                20,
+                hold_marker() + "\n" +
+                snapshot_marker("f" * 64).replace("issue=382", "issue=999") +
+                "\n" + snapshot_marker("f" * 64),
+                "2026-10-23T09:50:00Z",
+            )
+        )
+        self.assert_no_dispatch(self.run_scenario(first_marker_only))
+
+        later_marker_not_authoritative = base_scenario()
+        later_marker_not_authoritative["comments"].append(
+            thread_comment(
+                20,
+                hold_marker() + "\n" + snapshot_marker("c" * 64) +
+                "\n" + snapshot_marker("f" * 64),
+                "2026-10-23T09:50:00Z",
+            )
+        )
+        self.assert_no_dispatch(
+            self.run_scenario(later_marker_not_authoritative)
+        )
 
     def test_normal_retry_path_honors_the_hold(self):
         scenario = self.normal_retry_scenario()
