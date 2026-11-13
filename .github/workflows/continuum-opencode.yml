@@ -4235,7 +4235,9 @@ jobs:
             }
 
             function parseReviewQuotaDelayMs(body = '') {
-              const text = String(body || '');
+              // Findings often quote provider wording in fences or
+              // blockquotes; only visible evidence is a quota signal.
+              const text = quotaVisibleMarkdown(body);
               const quotaSignalled =
                 /Review rate limited|Review limit reached/i.test(text);
               // The generic "try again" phrase is only a full-review quota

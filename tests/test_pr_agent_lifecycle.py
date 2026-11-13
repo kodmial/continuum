@@ -228,8 +228,12 @@ APPROVED_448_REPAIR_OPENCODE_SHA256 = (
 # pin moves to the merged artifact instead of rejecting a legitimate main
 # change. The pin stays a full-file digest; any further byte drift still
 # fails closed, and the websearch block is asserted separately.
+# kodmial/continuum#451 repair (review 5899393557): the full-review quota
+# classifier now normalizes fenced examples and blockquotes before parsing, so
+# a trusted UNRESOLVED answer that quotes provider quota wording stays a
+# verdict instead of being discarded as a retry.
 APPROVED_450_SERIALIZED_OPENCODE_SHA256 = (
-    "1cfbd069e49244255eb5b1d2a917d061922e92af95db81f4dda9d1e54eb55c64"
+    "56ec91f0a9f0270c0199b6132a8f011b1ce9f107e9c24fd775f92ce2bd3772ba"
 )
 APPROVED_446_CALLER_SHA256 = (
     "b7f3df118bc436526f48443b8f068372204073eb134c98e4a1543d025f314686"

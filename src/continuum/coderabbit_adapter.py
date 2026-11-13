@@ -318,7 +318,9 @@ def classify_coderabbit_reply(
     chat_delay = parse_chat_retry_delay_ms(body)
     if chat_delay is not None:
         return {"kind": "chat_rate_limit", "delay_ms": chat_delay}
-    review_delay = parse_retry_delay_ms(body)
+    # Findings often quote provider wording in fences or blockquotes; only
+    # visible evidence may turn a verdict answer into a full-review quota.
+    review_delay = parse_retry_delay_ms(_quota_visible_markdown(body))
     if review_delay is not None:
         return {"kind": "review_rate_limit", "delay_ms": review_delay}
     return {"kind": "verdict", "delay_ms": None}

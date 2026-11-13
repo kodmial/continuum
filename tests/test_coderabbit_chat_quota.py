@@ -298,6 +298,42 @@ class ChatQuotaParserTests(unittest.TestCase):
         live = examples[0] + "\n### Rate Limit Exceeded\nPlease wait **10 minutes** before sending another message."
         self.assertEqual(rabbit.parse_chat_retry_delay_ms(live), 600_000)
 
+    def test_fenced_full_review_examples_do_not_hide_unresolved_findings(self):
+        # The full-review branch must ignore quoted provider wording exactly
+        # like the chat branch; otherwise a trusted UNRESOLVED answer with a
+        # fenced example becomes a quota reply and auto-merge discards it.
+        examples = (
+            "**UNRESOLVED**\nThe parser misclassifies this example:\n\n"
+            "\x60\x60\x60text\nReview rate limited. Next included review "
+            "available in 13 minutes.\n\x60\x60\x60\nA fix is still required.",
+            "**UNRESOLVED**\nHere is an illustrative provider reply:\n~~~\n"
+            "Review limit reached. Try again in 13 minutes.\n~~~\n"
+            "The quota check is defective.",
+            "**UNRESOLVED**\n> Review rate limited. Try again in 10 minutes.\n"
+            "The parser treats quoted provider messages as active limits.",
+        )
+        for body in examples:
+            with self.subTest(body=body):
+                self.assertEqual(
+                    rabbit.classify_coderabbit_reply(
+                        body, author_login="coderabbitai[bot]"
+                    )["kind"],
+                    "verdict",
+                )
+                # The standalone full-review queue parser is unchanged.
+                self.assertIsNotNone(rabbit.parse_retry_delay_ms(body))
+        # A real quota immediately AFTER the quoted example still counts.
+        live = examples[0] + (
+            "\nReview rate limited. Next included review available in "
+            "10 minutes."
+        )
+        self.assertEqual(
+            rabbit.classify_coderabbit_reply(
+                live, author_login="coderabbitai[bot]"
+            ),
+            {"kind": "review_rate_limit", "delay_ms": 600_000},
+        )
+
     def test_chat_deadline_needs_a_reliable_reply_timestamp(self):
         body = fixture("chat-rate-limit-pr448.json")["threads"][0]["replies"][0]["body"]
         delay = rabbit.parse_chat_retry_delay_ms(body)
@@ -685,6 +721,34 @@ class ChatQuotaRuntimeParityTests(unittest.TestCase):
             "), 600000);\n"
         )
         for workflow in (AUTO_MERGE, UNRESOLVED):
+            with self.subTest(workflow=workflow.name):
+                self.run_block(checks, workflow=workflow)
+
+    def test_js_fenced_full_review_examples_stay_verdicts(self):
+        bodies = (
+            "**UNRESOLVED**\nThe parser misclassifies this example:\n\n"
+            "\x60\x60\x60text\nReview rate limited. Next included review "
+            "available in 13 minutes.\n\x60\x60\x60\nA fix is still required.",
+            "**UNRESOLVED**\nHere is an illustrative provider reply:\n"
+            "~~~\nReview limit reached. Try again in 13 minutes.\n~~~\n"
+            "The quota check is defective.",
+            "**UNRESOLVED**\n> Review rate limited. Try again in 10 minutes.\n"
+            "The parser treats quoted provider messages as active limits.",
+        )
+        checks = (
+            "for (const body of " + json.dumps(bodies) + ") {\n"
+            "  assert.equal(parseReviewQuotaDelayMs(body), null, body);\n"
+            "  assert.equal(classifyCodeRabbitReply({\n"
+            "    user: {login: 'coderabbitai[bot]'}, body\n"
+            "  }).kind, 'verdict', body);\n"
+            "}\n"
+            "assert.equal(parseReviewQuotaDelayMs(\n"
+            "  'See example:\\n\x60\x60\x60\\nReview rate limited. Next included "
+            "review available in 13 minutes.\\n\x60\x60\x60\\n' +\n"
+            "  'Review rate limited. Next included review available in 10 minutes.'\n"
+            "), 600000);\n"
+        )
+        for workflow in (AUTO_MERGE, UNRESOLVED, OPENCODE):
             with self.subTest(workflow=workflow.name):
                 self.run_block(checks, workflow=workflow)
 
