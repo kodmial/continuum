@@ -275,7 +275,9 @@ def _require_reviewer_permission_enforcement(session_id: str) -> None:
     evaluation that a tool assertion uses (agent rules followed by the
     session rules, last match wins). It spends no reviewer tokens and creates
     no request when the action is already denied, so this is a real
-    enforcement check rather than a shape check on the reported rules.
+    enforcement check rather than a shape check on the reported rules. Each
+    verified action prints a content-free `bridge-permission` evidence line,
+    so qualification and review logs record the live server's decision.
     """
     quoted = urllib.parse.quote(session_id, safe="")
     for rule in REVIEWER_SESSION_PERMISSIONS:
@@ -301,6 +303,14 @@ def _require_reviewer_permission_enforcement(session_id: str) -> None:
                 f"(effect={label})",
                 retryable=False,
             )
+        # Content-free evidence that the live server decided "deny"; the
+        # qualification and review logs therefore record the actual result,
+        # not only that a probe request was made.
+        print(
+            f"bridge-permission action={rule['action']} effect=deny",
+            file=sys.stderr,
+            flush=True,
+        )
 
 
 def _await_async_assistant(session_id: str, timeout: int) -> Dict[str, Any]:

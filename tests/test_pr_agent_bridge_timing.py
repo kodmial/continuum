@@ -416,6 +416,34 @@ class BridgeTimingTests(unittest.TestCase):
                 self.assertFalse(ctx.exception.retryable)
                 self.assertEqual(transport.call_args_list[-1].args[0], "DELETE")
 
+    def test_live_permission_probe_records_content_free_deny_evidence(self):
+        session = {"data": {
+            "id": "private-session",
+            "permissions": list(bridge.REVIEWER_SESSION_PERMISSIONS),
+        }}
+        stderr = io.StringIO()
+        with patch.object(bridge, "opencode_call", side_effect=[
+            (200, '{"data":{"id":"private-session"}}'),
+            (200, bridge.json.dumps(session)),
+            (204, ""),
+            (204, ""),
+            (200, '{"data":{"id":"per-shell","effect":"deny"}}'),
+            (200, '{"data":{"id":"per-subagent","effect":"deny"}}'),
+        ]):
+            with contextlib.redirect_stderr(stderr):
+                bridge._create_review_session(
+                    {"providerID": "opencode", "id": "test-route"}
+                )
+        evidence = [
+            line for line in stderr.getvalue().splitlines()
+            if line.startswith("bridge-permission ")
+        ]
+        self.assertEqual(evidence, [
+            "bridge-permission action=shell effect=deny",
+            "bridge-permission action=subagent effect=deny",
+        ])
+        self.assertNotIn("private-session", stderr.getvalue())
+
     def test_preflight_retryable_exit_status_is_distinct_from_protocol_failure(self):
         for retryable, expected in (
             (True, bridge.PREFLIGHT_RETRYABLE_EXIT),
