@@ -1211,6 +1211,86 @@ process.stdout.write(JSON.stringify(results));
                 self.assertEqual(result[key]["posted"], 0)
                 self.assertEqual(result[key]["remaining"], 1)
 
+    def test_unresolved_posting_identity_defers_handoff_verification_decision(self):
+        # Regression for PR #451: an earlier verification from
+        # github-actions[bot] stays trusted when the PAT login cannot be
+        # resolved. Without deferring the whole decision, a newer TAP_PAT
+        # handoff would be ignored, the older UNRESOLVED answer would select
+        # another repair batch, and the completed repair would never be
+        # verified.
+        data = fixture("chat-rate-limit-pr448.json")
+        finding = data["threads"][0]["finding_id"]
+        head = data["head_sha"]
+        checks = f"""
+const finding = {finding};
+const head = {json.dumps(head)};
+const now = Date.now();
+const marker = `<!-- auto-merge-coderabbit-verification finding=${{finding}} head=${{head}} -->`;
+const handoff = {{
+  id: 950,
+  user: {{login: 'kodmial'}},
+  created_at: new Date(now - 2 * 60_000).toISOString(),
+  body: `<!-- opencode-coderabbit-verification-pending head=${{head}} findings=${{finding}} -->\\n` +
+    'Canonical repair finished; serialized auto-merge owns verification.',
+}};
+pr.head.sha = head;
+liveHead = head;
+liveThreads = [{{commentId: finding}}];
+// The earlier verification is from github-actions[bot], which remains
+// trusted even while the PAT identity lookup fails. The handoff is newer
+// and was published by that unresolved PAT identity.
+comments = [
+  {{id: 900, in_reply_to_id: finding, user: {{login: 'github-actions[bot]'}},
+    created_at: new Date(now - 10 * 60_000).toISOString(), body: marker}},
+  {{id: 901, in_reply_to_id: finding, user: {{login: 'coderabbitai[bot]'}},
+    created_at: new Date(now - 5 * 60_000).toISOString(),
+    body: '`@kodmial` **UNRESOLVED**\\nThe access-control defect remains.'}},
+];
+const dispatches = [];
+reconciliationDispatchSupport = async () => ({{ok: true, reason: ''}});
+github.rest.actions = {{
+  createWorkflowDispatch: async args => dispatches.push(args),
+}};
+async function attempt(identityUnavailable) {{
+  authenticatedFailure = identityUnavailable;
+  issueComments = [handoff];
+  posted = [];
+  notices = [];
+  const requested = await requestCodeRabbitThreadVerification(
+    pr, liveThreads, {{}}, {{remaining: 1, notBeforeMs: 0}}
+  );
+  return {{
+    requested,
+    posted: posted.length,
+    dispatches: dispatches.length,
+    notices: notices.slice(),
+  }};
+}}
+const results = {{
+  unresolved: await attempt(true),
+  recovered: await attempt(false),
+}};
+process.stdout.write(JSON.stringify(results));
+"""
+        result = self.run_verifier(checks)
+        # Unknown identity must not dispatch another repair batch over the
+        # still-unverifiable handoff.
+        self.assertEqual(result["unresolved"]["requested"], 0)
+        self.assertEqual(result["unresolved"]["posted"], 0)
+        self.assertEqual(result["unresolved"]["dispatches"], 0)
+        self.assertTrue(
+            any(
+                "posting identity is unresolved" in notice
+                for notice in result["unresolved"]["notices"]
+            ),
+            result["unresolved"]["notices"],
+        )
+        # Once the identity resolves, the same handoff selects the fresh
+        # exact-HEAD verification instead of a repair dispatch.
+        self.assertEqual(result["recovered"]["requested"], 1)
+        self.assertEqual(result["recovered"]["posted"], 1)
+        self.assertEqual(result["recovered"]["dispatches"], 0)
+
     def test_repair_handoff_triggers_fresh_verification_when_head_is_unchanged(self):
         data = fixture("chat-rate-limit-pr448.json")
         finding = data["threads"][0]["finding_id"]

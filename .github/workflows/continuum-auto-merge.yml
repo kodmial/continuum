@@ -1972,9 +1972,10 @@ jobs:
             // replies may acknowledge a chat-quota retry or establish a
             // verification request. Resolve the PAT-authenticated login once
             // per pass; github-actions[bot] remains trusted for run-scoped
-            // verification markers. A chat-quota retry is deferred while the
-            // posting login remains unknown, because its own acknowledgement
-            // could not be distinguished from a foreign marker.
+            // verification markers. The whole thread decision is deferred while
+            // the posting login remains unknown, because neither its
+            // acknowledgement nor its handoff could be distinguished from a
+            // foreign marker.
             const trustedChatRetryAuthors = new Set(['github-actions[bot]']);
             let chatRetryAuthorResolved = false;
             try {
@@ -1987,8 +1988,20 @@ jobs:
               }
             } catch (err) {
               core.warning(
-                `PR #${pr.number}: could not resolve the verification-reply author; only github-actions[bot] chat-quota acknowledgements are trusted: ${err.message || err}`
+                `PR #${pr.number}: could not resolve the verification-reply author; deferring CodeRabbit verification decisions until the next wakeup: ${err.message || err}`
               );
+            }
+            // A handoff or verification marker is authoritative only when it
+            // was published by the resolved posting account. While that
+            // identity is unknown, a PAT-authored handoff is indistinguishable
+            // from a foreign marker; deciding now could dispatch another repair
+            // batch over an already-completed repair and leave the finding
+            // without the fresh verification that handoff requires.
+            if (!chatRetryAuthorResolved) {
+              core.notice(
+                `PR #${pr.number}: posting identity is unresolved; deferring CodeRabbit thread verification decisions to the next wakeup.`
+              );
+              return 0;
             }
 
             // OpenCode never writes into the CodeRabbit inline chat. After a
@@ -2338,12 +2351,6 @@ jobs:
               }
 
               if (chatRetryLimitedId !== null) {
-                if (!chatRetryAuthorResolved) {
-                  core.notice(
-                    `PR #${pr.number}: posting identity is unresolved; deferring CodeRabbit chat-quota retry for thread #${thread.commentId} to the next wakeup.`
-                  );
-                  continue;
-                }
                 if (Number(chatQuotaState.remaining || 0) <= 0) {
                   core.notice(
                     `PR #${pr.number}: shared CodeRabbit chat quota already consumed its retry in this reconciliation; deferring thread #${thread.commentId} to the next wakeup.`
