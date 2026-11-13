@@ -58,8 +58,8 @@ class CodeRabbitBatchContractTests(unittest.TestCase):
         code = js_for_step(OPENCODE, "Ask CodeRabbit to verify every original finding")
         import re
         requests = re.findall(
-            r"requested \\+= 1;\\s*// One inline request per run;"
-            r"[\\s\\S]*?break;", code
+            r"requested \+= 1;\s*// One inline request per run;"
+            r"[\s\S]*?break;", code
         )
         self.assertEqual(len(requests), 2)
         self.assertEqual(code.count("One inline request per run"), 2)
