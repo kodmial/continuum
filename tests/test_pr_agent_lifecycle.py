@@ -221,8 +221,15 @@ APPROVED_448_REPAIR_OPENCODE_SHA256 = (
 # kodmial/continuum#451 repair (review 5898694060): live batch admission now
 # reuses the canonical chat-quota classifier, so a newer CodeRabbit
 # "Rate Limit Exceeded" reply cannot supersede the admitted finding answer.
+# Baseline advance after merging main: main's reviewed 145f6d3 ("reuse
+# noninteractive OpenCode websearch defaults in consumer coding runners")
+# adds exactly the 29-line opencode.json sparse-checkout plus
+# OPENCODE_CONFIG merge block below and nothing else, so the #450 full-file
+# pin moves to the merged artifact instead of rejecting a legitimate main
+# change. The pin stays a full-file digest; any further byte drift still
+# fails closed, and the websearch block is asserted separately.
 APPROVED_450_SERIALIZED_OPENCODE_SHA256 = (
-    "c53e60b611badfbd783865f8d70793853a88bc80708510f80839cabd9a8dbea3"
+    "1cfbd069e49244255eb5b1d2a917d061922e92af95db81f4dda9d1e54eb55c64"
 )
 APPROVED_446_CALLER_SHA256 = (
     "b7f3df118bc436526f48443b8f068372204073eb134c98e4a1543d025f314686"
@@ -2677,6 +2684,11 @@ class ProtectedBaselineTests(unittest.TestCase):
                         "to serialized auto-merge after exact-HEAD CI.",
                         read_repo(path),
                         "the removed inline chat paths must delegate to auto-merge",
+                    )
+                    self.assertIn(
+                        "opencode-coder-websearch.json",
+                        read_repo(path),
+                        "merged main 145f6d3 websearch defaults must stay in the pinned artifact",
                     )
 
         # The installed consumer caller stub is a separate protected artifact:
