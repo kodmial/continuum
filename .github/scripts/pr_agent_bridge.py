@@ -241,7 +241,10 @@ def run_completion(body: Dict[str, Any], timeout: int) -> Dict[str, Any]:
         _require_opencode_status(status, (204,), "select read-only agent")
         status, _ = opencode_call(
             "POST", f"/api/session/{quoted}/model",
-            {"model": opencode_body["model"]}, 15
+            {"model": {
+                "providerID": opencode_body["model"]["providerID"],
+                "id": opencode_body["model"]["modelID"],
+            }}, 15
         )
         _require_opencode_status(status, (204,), "select pinned model")
         # Preserve the immutable reviewer-only system policy in the prompt

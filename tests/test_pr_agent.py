@@ -376,8 +376,9 @@ class BridgeIsolationTests(unittest.TestCase):
         self.assertTrue(FakeOpenCodeHandler.selected_models)
         self.assertTrue(all(a["agent"] == pr_agent.INFERENCE_AGENT
                             for a in FakeOpenCodeHandler.selected_agents))
-        self.assertTrue(all(m["model"]["providerID"] == "opencode"
-                            for m in FakeOpenCodeHandler.selected_models))
+        self.assertTrue(all(m["model"] == {
+            "providerID": "opencode", "id": "test-fixture-route"
+        } for m in FakeOpenCodeHandler.selected_models))
 
     def test_bridge_handler_chat_completions_end_to_end(self):
         import sys

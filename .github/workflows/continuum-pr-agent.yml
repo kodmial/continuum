@@ -1011,10 +1011,28 @@ jobs:
           (setsid nohup opencode serve --hostname 127.0.0.1 --port "$SERVER_PORT" \
             > "$RUNNER_TEMP/opencode-serve.log" 2>&1 &)
           for attempt in $(seq 1 30); do
-            if curl -fsS -u "opencode:${OPENCODE_PASSWORD}" \
-              "http://127.0.0.1:${SERVER_PORT}/api/info" 2>/dev/null \
-              | python3 -c 'import sys,json; d=json.load(sys.stdin); assert d.get("version") and type(d.get("pid")) is int' \
-              >/dev/null 2>&1; then
+            # Probe through stdlib: the Basic secret never appears as a
+            # curl/-u process argument, in shell traces, or in server logs.
+            if python3 - "$SERVER_PORT" >/dev/null 2>&1 <<'PY'
+          import base64
+          import json
+          import os
+          import sys
+          import urllib.request
+
+          token = base64.b64encode(
+              ("opencode:" + os.environ["OPENCODE_PASSWORD"]).encode()
+          ).decode()
+          request = urllib.request.Request(
+              f"http://127.0.0.1:{sys.argv[1]}/api/info",
+              headers={"Authorization": "Basic " + token, "Accept": "application/json"},
+          )
+          with urllib.request.urlopen(request, timeout=2) as response:
+              payload = json.load(response)
+          assert isinstance(payload.get("version"), str) and payload["version"]
+          assert type(payload.get("pid")) is int
+          PY
+            then
               echo "authenticated OpenCode v2 server is ready."
               exit 0
             fi
