@@ -6702,6 +6702,133 @@ class ContinuumTest < Minitest::Test
                  'every local just-in-time guard must be a skip, not a fall-through'
   end
 
+  # #442: releasing the deterministic checkpoint hold is only safe against the
+  # same authoritative snapshot the executor pins. Both hold selectors must
+  # ignore PR-body snapshot references and parse only the first snapshot marker
+  # in a comment before checking identity, then keep the earliest trusted
+  # match. This contract lives here (not only under the unreviewed tests/
+  # tree) so the review surface proves the scheduler and watchdog behavior.
+  def test_checkpoint_resume_hold_selects_the_executor_snapshot
+    scheduler = File.read(File.join(ROOT, '.github/scripts/issue_scheduler.js'))
+    scheduler_start = scheduler.index('  const checkpointResumeBlockedMarkerRe =')
+    scheduler_finish = scheduler.index('  const ownerResumeMarkerRe =', scheduler_start)
+    refute_nil scheduler_start, 'the scheduler checkpoint hold is missing'
+    refute_nil scheduler_finish, 'the scheduler checkpoint hold boundary moved'
+    scheduler_hold = scheduler[scheduler_start...scheduler_finish]
+
+    watchdog = watchdog_body
+    watchdog_start = watchdog.index('            const TASK_SNAPSHOT_GENERATION = 1;')
+    watchdog_finish = watchdog.index(
+      '            async function discoverDurableRecoveryCandidates()',
+      watchdog_start
+    )
+    refute_nil watchdog_start, 'the watchdog checkpoint hold is missing'
+    refute_nil watchdog_finish, 'the watchdog checkpoint hold boundary moved'
+    watchdog_hold = watchdog[watchdog_start...watchdog_finish]
+
+    harness = <<~JS
+      const assert = require('assert');
+      const core = { warning: () => {} };
+
+      const scheduler = (() => {
+        function isTrustedStopComment(c, owner) {
+          return ['OWNER', 'MEMBER', 'COLLABORATOR'].includes(c.author_association) ||
+            ['github-actions[bot]', owner].includes(c.user?.login);
+        }
+        function stopOrderKey(c) {
+          return String(c.created_at || '') + '#' +
+            String(c.id || 0).padStart(12, '0');
+        }
+      #{scheduler_hold}
+        return (comments, client) =>
+          checkpointResumeHold('kodmial', 'continuum', 442, comments, client);
+      })();
+
+      const watchdog = (() => {
+        const owner = 'kodmial';
+        const repoFullName = 'kodmial/continuum';
+        let readGithub;
+      #{watchdog_hold}
+        return async (comments, client) => {
+          readGithub = client;
+          const result = await checkpointResumeHold(442, comments);
+          return result.blocked ? result.marker : null;
+        };
+      })();
+
+      const sha = 'a'.repeat(40);
+      const spec = 'c'.repeat(64);
+      const marker = '<!-- continuum-checkpoint-resume-blocked ' +
+        'repo=kodmial/continuum issue=442 generation=1 ' +
+        'operation=opencode-429-issue-issue442 ' +
+        'checkpoint=opencode/checkpoint-issue442 ' +
+        'checkpoint_sha=' + sha + ' base_ref=main base_sha=' +
+        'b'.repeat(40) + ' snapshot=' + spec +
+        ' reason=verification-failed -->';
+      const snapshot = (value, generation = 1) =>
+        '<!-- continuum-task-snapshot repo=kodmial/continuum issue=442 ' +
+        'generation=' + generation + ' title-sha256=' + 'd'.repeat(64) +
+        ' body-sha256=' + 'e'.repeat(64) + ' spec-sha256=' + value + ' -->';
+      const snapshotRef = (value, generation = 1) =>
+        '<!-- continuum-task-snapshot-ref repo=kodmial/continuum issue=442 ' +
+        'generation=' + generation + ' title-sha256=' + 'd'.repeat(64) +
+        ' body-sha256=' + 'e'.repeat(64) + ' spec-sha256=' + value + ' -->';
+      const item = (id, body) => ({
+        id, body,
+        created_at: '2026-11-13T12:' + String(id).padStart(2, '0') + ':00Z',
+        user: { login: 'kodmial' },
+        author_association: 'OWNER'
+      });
+      const client = (tip = sha) => ({
+        rest: { git: { getRef: async () => ({ data: { object: { sha: tip } } }) } }
+      });
+      const saved = item(1, marker);
+      const cases = [
+        [
+          [saved, item(5, snapshotRef('f'.repeat(64)))],
+          'a later snapshot reference must not release the hold'
+        ],
+        [
+          [item(0, snapshotRef('f'.repeat(64))), saved],
+          'an earlier snapshot reference must not release the hold'
+        ],
+        [
+          [saved, item(5, snapshot(spec) + '\\n' + snapshot('f'.repeat(64)))],
+          'a later marker in one comment must not replace the first pin'
+        ],
+        [
+          [saved, item(5, snapshot('f'.repeat(64)).replace('issue=442', 'issue=999') +
+            '\\n' + snapshot('f'.repeat(64)))],
+          'a non-matching first marker must discard the whole comment'
+        ],
+        [
+          [saved, item(5, snapshot(spec)), item(6, snapshot('f'.repeat(64)))],
+          'an earlier same-spec duplicate must keep the hold'
+        ]
+      ];
+      (async () => {
+        for (const [name, hold] of Object.entries({ scheduler, watchdog })) {
+          for (const [comments, message] of cases) {
+            assert.ok(await hold(comments, client()), name + ': ' + message);
+          }
+          assert.equal(
+            await hold([saved, item(5, snapshot('f'.repeat(64)))], client()),
+            null,
+            name + ': a different authoritative snapshot must release the hold'
+          );
+        }
+        console.log('checkpoint-resume-hold-selector: PASS');
+      })().catch((error) => {
+        console.error(error);
+        process.exitCode = 1;
+      });
+    JS
+
+    stdout, stderr, status = Open3.capture3('node', '-e', harness, chdir: ROOT)
+    assert status.success?, stderr
+    assert_includes stdout, 'checkpoint-resume-hold-selector: PASS'
+  end
+
   # kodmial/continuum#266: the optional `automation:ready` admission gate.
   # Empty configuration preserves current behavior; when configured, automatic
   # dispatch admits only issues carrying the label. Priority stays a ranking
