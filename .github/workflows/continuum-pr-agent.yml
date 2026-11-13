@@ -1082,14 +1082,33 @@ jobs:
           # not a model outage and must not consume reviewer inference budget.
           # The bridge reserves exit status 3 for a retryable failure (429/5xx)
           # and 1 for a protocol mismatch, so only the former is retryable.
+          preflight_log="$RUNNER_TEMP/pr-agent-preflight.log"
           set +e
-          python3 "$BRIDGE_SCRIPT" --preflight
-          status=$?
+          python3 "$BRIDGE_SCRIPT" --preflight 2>&1 | tee "$preflight_log"
+          status=${PIPESTATUS[0]}
           set -e
+          if [[ "$status" -eq 0 ]]; then
+            # A successful preflight must have exercised the live reviewer
+            # permission control for both restricted actions. Without this
+            # evidence the job would only prove the session shape, not that
+            # shell execution and delegation are denied on the real server.
+            for action in shell subagent; do
+              if ! grep -Fxq "bridge-permission action=${action} effect=deny" "$preflight_log"; then
+                echo "::error::Live reviewer permission probe did not confirm deny for ${action}."
+                status=1
+              fi
+            done
+          fi
           if [[ "$status" -eq 3 ]]; then
             echo "retryable=true" >> "$GITHUB_OUTPUT"
           else
             echo "retryable=false" >> "$GITHUB_OUTPUT"
+          fi
+          if [[ "$status" -eq 0 ]]; then
+            {
+              echo "### PR-Agent reviewer permission qualification"
+              grep -E '^bridge-permission action=(shell|subagent) effect=deny$' "$preflight_log"
+            } >> "$GITHUB_STEP_SUMMARY"
           fi
           exit "$status"
 

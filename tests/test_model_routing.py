@@ -1857,6 +1857,29 @@ class AttestationRecoveryContractTests(unittest.TestCase):
             1)[1]
         self.assertIn(clause, schedule)
 
+    def test_preflight_requires_live_reviewer_permission_evidence(self):
+        step = self._block(
+            "      - name: Qualify native OpenCode v2 PR-Agent session API",
+            "      - name: Revalidate the admitted exact HEAD immediately before review")
+        # A successful qualification must capture the live permission probe
+        # output and fail closed unless both restricted actions were denied.
+        self.assertIn(
+            'python3 "$BRIDGE_SCRIPT" --preflight 2>&1 | tee "$preflight_log"',
+            step,
+        )
+        self.assertIn("status=${PIPESTATUS[0]}", step)
+        self.assertIn("for action in shell subagent; do", step)
+        self.assertIn(
+            'grep -Fxq "bridge-permission action=${action} effect=deny" "$preflight_log"',
+            step,
+        )
+        self.assertIn("Live reviewer permission probe did not confirm deny", step)
+        self.assertIn(
+            "grep -E '^bridge-permission action=(shell|subagent) effect=deny$'",
+            step,
+        )
+        self.assertIn("$GITHUB_STEP_SUMMARY", step)
+
     def test_success_status_and_merge_require_completed_attestation(self):
         attestation_at = self.workflow.index(
             "      - name: Attest successful independent OpenCode review")

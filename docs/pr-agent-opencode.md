@@ -68,8 +68,10 @@ as an inference backend, not as a coding agent. Three layers hold this:
    tool call would, and requires an actual `deny` effect from the live server
    before any prompt is submitted; each confirmed decision prints one
    content-free `bridge-permission action=<action> effect=deny` line, so the
-   no-LLM qualification log records the live enforcement result. The bridge
-   never sends a per-request `tools` map.
+   no-LLM qualification log records the live enforcement result. The
+   qualification step fails closed unless both lines are present, and it
+   publishes them in the job summary, so a green job cannot mean the live
+   probe was skipped. The bridge never sends a per-request `tools` map.
 2. Each request gets a fresh session that is deleted afterwards.
 3. The workflow proves the checkout is untouched after the run
    (`git status --porcelain` must be empty and no local commit may exist)
