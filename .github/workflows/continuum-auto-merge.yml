@@ -1788,7 +1788,7 @@ jobs:
           let codeRabbitChatNextAllowedAt = null;
 
           function isCodeRabbitChatLimitReply(comment) {
-            const body = String(comment?.body || '');
+            const body = quotaVisibleMarkdown(comment?.body || '');
             return comment?.user?.login === 'coderabbitai[bot]' &&
               /(?:^|\n)\s*###\s*Rate Limit Exceeded\b/i.test(body) &&
               /\bnumber of chat messages per hour\b/i.test(body);

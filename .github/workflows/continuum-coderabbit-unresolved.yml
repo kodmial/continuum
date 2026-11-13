@@ -468,8 +468,10 @@ jobs:
                     // The shared classifier rejects both quota forms; keep the
                     // explicit chat-quota shape as a second guard.
                     !isCodeRabbitQuotaReply(comment) &&
-                    !(/(?:^|\n)\s*###\s*Rate Limit Exceeded\b/i.test(comment.body ?? '') &&
-                      /\bnumber of chat messages per hour\b/i.test(comment.body ?? ''))
+                    !(/(?:^|\n)\s*###\s*Rate Limit Exceeded\b/i.test(
+                      quotaVisibleMarkdown(comment.body ?? '')) &&
+                      /\bnumber of chat messages per hour\b/i.test(
+                        quotaVisibleMarkdown(comment.body ?? '')))
                 )
                 .sort((a, b) => b.id - a.id);
 

@@ -252,6 +252,10 @@ class ChatQuotaParserTests(unittest.TestCase):
             "**UNRESOLVED**\nThe parser misclassifies this example:\n\n"
             "\x60\x60\x60text\nYou have exceeded the limit of chat messages per hour.\n"
             "\x60\x60\x60\nA fix is still required.",
+            "**UNRESOLVED**\nHere is an illustrative provider error:\n"
+            "\x60\x60\x60text\n### Rate Limit Exceeded\n"
+            "The user has exceeded the limit for the number of chat messages per hour.\n"
+            "\x60\x60\x60\nThe quota check is defective.",
             "**UNRESOLVED**\n~~~text\n### Rate Limit Exceeded\n"
             "Please wait **90 minutes** before sending another message.\n"
             "~~~\nThis is only a quoted example.",
@@ -423,6 +427,7 @@ class ChatQuotaWorkflowContractTests(unittest.TestCase):
     def test_auto_merge_rejects_quota_replies_as_answers_and_gates_retry(self):
         source = AUTO_MERGE.read_text(encoding="utf-8")
         self.assertIn("!isCodeRabbitQuotaReply(comment)", source)
+        self.assertIn("const body = quotaVisibleMarkdown(comment?.body || '');", source)
         self.assertIn("const chatLimit = latestChatQuotaReply(", source)
         self.assertIn("const pendingChatLimit =", source)
         self.assertIn("chatQuotaRetryAcknowledged(", source)
@@ -445,6 +450,7 @@ class ChatQuotaWorkflowContractTests(unittest.TestCase):
     def test_unresolved_batcher_never_batches_a_quota_reply(self):
         source = UNRESOLVED.read_text(encoding="utf-8")
         self.assertIn("!isCodeRabbitQuotaReply(comment)", source)
+        self.assertIn("quotaVisibleMarkdown(comment.body ?? '')", source)
         # The old two-form full-review filter must no longer be the sole
         # exclusion in the replies filter.
         self.assertNotIn(
@@ -540,6 +546,10 @@ class ChatQuotaRuntimeParityTests(unittest.TestCase):
             "**UNRESOLVED**\nThe parser misclassifies this example:\n\n"
             "\x60\x60\x60text\nYou have exceeded the limit of chat messages per hour.\n"
             "\x60\x60\x60\nA fix is still required.",
+            "**UNRESOLVED**\nHere is an illustrative provider error:\n"
+            "\x60\x60\x60text\n### Rate Limit Exceeded\n"
+            "The user has exceeded the limit for the number of chat messages per hour.\n"
+            "\x60\x60\x60\nThe quota check is defective.",
             "**UNRESOLVED**\n~~~text\n### Rate Limit Exceeded\n"
             "Please wait **90 minutes** before sending another message.\n"
             "~~~\nThis is only a quoted example.",
