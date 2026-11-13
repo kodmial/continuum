@@ -222,6 +222,28 @@ class ChatQuotaParserTests(unittest.TestCase):
                     )
                 )
 
+    def test_indented_block_quotes_are_never_a_chat_quota(self):
+        # A finding that quotes the provider message with an indented quote
+        # marker must stay a verdict: the prose match must reject the quote
+        # marker before consuming leading whitespace.
+        for marker in (" >", "   >", "\t>"):
+            statement = (
+                marker + " You have exceeded the limit of chat messages per hour."
+            )
+            body = (
+                "**UNRESOLVED**\n"
+                + statement
+                + "\nThe parser treats quoted provider messages as active limits."
+            )
+            with self.subTest(marker=marker):
+                self.assertIsNone(rabbit.parse_chat_retry_delay_ms(body))
+                self.assertEqual(
+                    "verdict",
+                    rabbit.classify_coderabbit_reply(
+                        body, author_login="coderabbitai[bot]"
+                    )["kind"],
+                )
+
     def test_chat_deadline_needs_a_reliable_reply_timestamp(self):
         body = fixture("chat-rate-limit-pr448.json")["threads"][0]["replies"][0]["body"]
         delay = rabbit.parse_chat_retry_delay_ms(body)
@@ -456,6 +478,9 @@ class ChatQuotaRuntimeParityTests(unittest.TestCase):
             "**UNRESOLVED**\nThe user hasn't exceeded the limit for the number of chat messages per hour.",
             "**UNRESOLVED**\nThe user hasn’t reached the limit for chat messages per hour.",
             "**UNRESOLVED**\nThe user has not, according to the current account state and the recent thread history, exceeded the limit for chat messages per hour.",
+            "**UNRESOLVED**\n > You have exceeded the limit of chat messages per hour.\nThe parser treats quoted provider messages as active limits.",
+            "**UNRESOLVED**\n   > You have reached the limit of chat messages per hour.",
+            "**UNRESOLVED**\n\t> You have exceeded the limit of chat messages per hour.",
             "**RESOLVED** the finding is fixed.",
         ]
         expected = [
@@ -1096,6 +1121,25 @@ const github = {{
                     [item["finding_id"] for item in json.loads(out["items_json"])],
                     [100],
                 )
+
+    def test_indented_block_quote_still_dispatches_repair(self):
+        body = (
+            "**UNRESOLVED**\n"
+            " > You have exceeded the limit of chat messages per hour.\n"
+            "The parser treats quoted provider messages as active limits."
+        )
+        out = self.run_collector(
+            "{id: 107, in_reply_to_id: 100, "
+            "user: {login: 'coderabbitai[bot]'}, "
+            "pull_request_review_id: 11, "
+            "created_at: '2026-11-12T08:09:00Z', "
+            "body: " + json.dumps(body) + "}"
+        )
+        self.assertEqual(out["should_run"], "true")
+        self.assertEqual(
+            [item["finding_id"] for item in json.loads(out["items_json"])],
+            [100],
+        )
 
     def test_substantive_unresolved_still_dispatches(self):
         out = self.run_collector(

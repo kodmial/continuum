@@ -72,13 +72,16 @@ _RATE_LIMIT_RE = re.compile(
 
 # Inline chat-message quota lives in a PR review-comment thread. Its heading
 # and prose are matched only on unquoted Markdown lines, so a human comment
-# that pastes the provider text can never be mistaken for a quota reply.
+# that pastes the provider text can never be mistaken for a quota reply. The
+# quote marker is rejected before any leading whitespace is consumed,
+# otherwise the whitespace match backtracks and an indented ``> ...`` line
+# still looks like provider prose.
 _CHAT_RATE_LIMIT_HEADING_RE = re.compile(
     r"^[ \t]{0,3}#{1,6}[ \t]*Rate[ \t]+Limit[ \t]+Exceeded[ \t]*\r?$",
     re.IGNORECASE | re.MULTILINE,
 )
 _CHAT_RATE_LIMIT_PROSE_RE = re.compile(
-    r"^[ \t]*(?!>)[^\n]*\b(?:exceeded|reached)\b[^\n]*\blimit\b"
+    r"^(?![ \t]*>)[^\n]*\b(?:exceeded|reached)\b[^\n]*\blimit\b"
     r"[^\n]*\bchat messages? per hour\b[^\n]*$",
     re.IGNORECASE | re.MULTILINE,
 )

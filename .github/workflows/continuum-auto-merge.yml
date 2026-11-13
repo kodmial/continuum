@@ -985,7 +985,7 @@ jobs:
           const CHAT_RATE_LIMIT_HEADING_RE =
             /^[ \t]{0,3}#{1,6}[ \t]*Rate[ \t]+Limit[ \t]+Exceeded[ \t]*\r?$/im;
           const CHAT_RATE_LIMIT_PROSE_RE =
-            /^[ \t]*(?!>)[^\n]*\b(?:exceeded|reached)\b[^\n]*\blimit\b[^\n]*\bchat messages? per hour\b[^\n]*$/im;
+            /^(?![ \t]*>)[^\n]*\b(?:exceeded|reached)\b[^\n]*\blimit\b[^\n]*\bchat messages? per hour\b[^\n]*$/im;
           const CHAT_RATE_LIMIT_NEGATED_RE =
             /(?:\b(?:not|never|no)\b|n['’]t)[^\n]*\b(?:exceeded|reached)\b/i;
           const CHAT_COUNTDOWN_RE =
