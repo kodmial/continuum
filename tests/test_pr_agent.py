@@ -605,7 +605,10 @@ class BridgeErrorResponseTests(unittest.TestCase):
         self.assertEqual(stdout.getvalue(), "")
 
     def test_malformed_session_response_is_a_502(self):
-        for raw in (b"not json", b"[]"):
+        for raw, expected in (
+            (b"not json", "malformed OpenCode v2 session envelope"),
+            (b"[]", "OpenCode v2 returned no session id"),
+        ):
             with self.subTest(response=raw):
                 MalformedSessionHandler.response = raw
                 upstream = self._serve(MalformedSessionHandler)
@@ -622,7 +625,7 @@ class BridgeErrorResponseTests(unittest.TestCase):
                 )
                 self.assertEqual(status, 502)
                 self.assertEqual(payload["error"]["type"], "upstream_error")
-                self.assertIn("malformed opencode response", payload["error"]["message"])
+                self.assertIn(expected, payload["error"]["message"])
 
 
 class FindingStateTests(unittest.TestCase):
