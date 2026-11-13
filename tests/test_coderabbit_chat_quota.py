@@ -170,6 +170,23 @@ class ChatQuotaParserTests(unittest.TestCase):
             "verdict",
         )
 
+    def test_negated_hourly_quota_in_a_finding_is_not_a_rate_limit(self):
+        # An actual CodeRabbit UNRESOLVED verdict must never be ignored merely
+        # because it discusses a quota the user did not exceed.
+        for statement in (
+            "The user has not exceeded the limit for the number of chat messages per hour.",
+            "The user never reached the limit for chat messages per hour.",
+        ):
+            body = "**UNRESOLVED**\\n" + statement
+            with self.subTest(statement=statement):
+                self.assertIsNone(rabbit.parse_chat_retry_delay_ms(body))
+                self.assertEqual(
+                    "verdict",
+                    rabbit.classify_coderabbit_reply(
+                        body, author_login="coderabbitai[bot]"
+                    )["kind"],
+                )
+
     def test_fake_author_and_quoted_text_are_never_provider_quota(self):
         body = fixture("chat-rate-limit-pr448.json")["threads"][0]["replies"][0]["body"]
         self.assertEqual(
@@ -431,6 +448,8 @@ class ChatQuotaRuntimeParityTests(unittest.TestCase):
             "### Rate Limit Exceeded\nPlease wait before sending another message.",
             "> ### Rate Limit Exceeded\n> Please wait **14 minutes and 56 seconds** before sending another message.",
             "**UNRESOLVED**\nThe number of chat messages per hour is not tracked across threads, so this finding still needs a code change.",
+            "**UNRESOLVED**\\nThe user has not exceeded the limit for the number of chat messages per hour.",
+            "**UNRESOLVED**\\nThe user never reached the limit for chat messages per hour.",
             "**RESOLVED** the finding is fixed.",
         ]
         expected = [

@@ -82,6 +82,10 @@ _CHAT_RATE_LIMIT_PROSE_RE = re.compile(
     r"[^\n]*\bchat messages? per hour\b[^\n]*$",
     re.IGNORECASE | re.MULTILINE,
 )
+_CHAT_RATE_LIMIT_NEGATED_RE = re.compile(
+    r"\\b(?:not|never|no)\\b[^\\n]{0,80}\\b(?:exceeded|reached)\\b",
+    re.IGNORECASE,
+)
 _CHAT_COUNTDOWN_RE = re.compile(
     r"please\s+wait\s+\*{0,2}\s*"
     r"((?:less\s+than\s+(?:a|one)\s+minute)|[0-9][^\n*]*?)"
@@ -172,11 +176,12 @@ def parse_chat_retry_delay_ms(body: Any) -> Optional[int]:
     """
 
     text = str(body or "")
-    if not (
-        _CHAT_RATE_LIMIT_HEADING_RE.search(text)
-        or _CHAT_RATE_LIMIT_PROSE_RE.search(text)
-    ):
-        return None
+    if not _CHAT_RATE_LIMIT_HEADING_RE.search(text):
+        if not _CHAT_RATE_LIMIT_PROSE_RE.search(text):
+            return None
+        # A finding may discuss a quota that the user did NOT reach.
+        if _CHAT_RATE_LIMIT_NEGATED_RE.search(text):
+            return None
     match = _CHAT_COUNTDOWN_RE.search(text)
     if match is None:
         return CHAT_QUOTA_FALLBACK_MS
