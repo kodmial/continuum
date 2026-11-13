@@ -101,6 +101,10 @@ PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s .github/scripts -p 'te
 # gate log. CodeRabbit excludes tests/** from review, so the named result is
 # the only reviewable evidence that a heading-only 90-minute reply on one PR
 # still blocks a chat send from another PR.
+printf '%s\n' \
+  'CodeRabbit chat-quota regression evidence:' \
+  'setup: two open PRs; one has a trusted heading-only "### Rate Limit Exceeded" reply with a 90-minute countdown, the other has a shorter 10-minute countdown.' \
+  'assertions: the account-wide scan blocks a send from either PR one millisecond before the shared 90-minute deadline and allows the send at that deadline.'
 PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=src python3 -m unittest -v \
   tests.test_coderabbit_queue_lifecycle.CodeRabbitChatBudgetRegressionTests.test_account_wide_scan_uses_shared_heading_only_deadline
 
