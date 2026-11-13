@@ -566,13 +566,15 @@ function stopOrderKey(c) {
     await hold([item(1, marker.replace('generation=1', 'generation=2'))]),
     'a rejection from recovery generation 2 must still hold'
   );
-  assert.ok(
+  assert.equal(
     await hold([item(0, snapshot('f'.repeat(64))), saved]),
-    'an older different-spec snapshot must not release the hold'
+    null,
+    'an earlier different-spec authoritative snapshot releases the hold'
   );
-  assert.ok(
+  assert.equal(
     await hold([item(1, marker + '\n' + snapshot('f'.repeat(64)))]),
-    'a snapshot inside the rejection comment must not release the hold'
+    null,
+    'a different-spec snapshot in the rejection comment is authoritative'
   );
   assert.ok(
     await hold([saved, item(5, snapshot('c'.repeat(64)))]),
@@ -585,7 +587,15 @@ function stopOrderKey(c) {
   assert.equal(
     await hold([saved, item(5, snapshot('f'.repeat(64)))]),
     null,
-    'a strictly later different-spec snapshot releases the hold'
+    'a different-spec earliest snapshot releases the hold'
+  );
+  assert.ok(
+    await hold([
+      saved,
+      item(5, snapshot('c'.repeat(64))),
+      item(6, snapshot('f'.repeat(64)))
+    ]),
+    'a later different-spec duplicate must not override the earliest snapshot'
   );
   console.log('checkpoint-resume-hold-regression: PASS');
 })().catch(e => { console.error(e); process.exitCode = 1; });

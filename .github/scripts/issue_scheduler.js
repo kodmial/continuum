@@ -729,8 +729,9 @@ module.exports = async function runIssueScheduler({ github, context, core }) {
   // A deterministic checkpoint-continuation rejection is persisted as a
   // typed marker. It is not an owner pause and not a terminal generation
   // stop: the saved checkpoint is preserved and the scheduler only holds
-  // this exact identity. A changed checkpoint tip, a newer pinned task
-  // snapshot, or checkpoint deletion are the only material premise changes.
+  // this exact identity. A changed checkpoint tip, a different authoritative
+  // pinned task snapshot, or checkpoint deletion are the only material
+  // premise changes.
   //
   // A manual owner /oc is not a release here. The owner command already
   // starts its own OpenCode issue run through the `issue_comment` trigger,
@@ -788,16 +789,17 @@ module.exports = async function runIssueScheduler({ github, context, core }) {
     }
     if (!marker) return null;
 
-    const markerOrder = stopOrderKey(marker);
-
-    // A newer pinned snapshot is a material premise change. Only trusted
-    // comments can move a generation baseline: an arbitrary commenter must
-    // never release a deterministic hold by posting a forged snapshot marker.
-    // The snapshot must also be strictly later than the rejection: an older
-    // snapshot (or one inside the rejection comment itself) describes a
-    // premise the rejection already saw.
-    let latestSnapshot = null;
-    let latestSnapshotOrder = '';
+    // A different authoritative pinned snapshot is a material premise
+    // change. Select it exactly as the executor does: the earliest trusted
+    // snapshot for the task generation wins and later duplicates are
+    // ignored, never overwritten. Comparing the latest duplicate instead
+    // would dispatch against the earlier pin, or repeat the unchanged
+    // rejection when live content still matches that earlier pin. Only
+    // trusted comments can move a generation baseline: an arbitrary
+    // commenter must never release a deterministic hold by posting a forged
+    // snapshot marker.
+    let authoritativeSnapshot = null;
+    let authoritativeSnapshotOrder = '';
     for (const comment of trusted) {
       const body = String(comment.body || '');
       for (const match of body.matchAll(checkpointSnapshotMarkerRe)) {
@@ -808,16 +810,18 @@ module.exports = async function runIssueScheduler({ github, context, core }) {
         ) continue;
         const order = (comment.created_at || '') + '#' +
           String(comment.id || 0).padStart(12, '0');
-        if (order > latestSnapshotOrder) {
-          latestSnapshotOrder = order;
-          latestSnapshot = match[6].toLowerCase();
+        if (
+          authoritativeSnapshot === null ||
+          order < authoritativeSnapshotOrder
+        ) {
+          authoritativeSnapshotOrder = order;
+          authoritativeSnapshot = match[6].toLowerCase();
         }
       }
     }
     if (
-      latestSnapshot &&
-      latestSnapshotOrder > markerOrder &&
-      latestSnapshot !== marker.snapshotSpec
+      authoritativeSnapshot &&
+      authoritativeSnapshot !== marker.snapshotSpec
     ) {
       return null;
     }

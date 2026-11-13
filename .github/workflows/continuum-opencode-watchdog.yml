@@ -1083,9 +1083,9 @@ jobs:
             // The shared hold semantics for every watchdog route: the normal
             // retry path, the scheduled catch-up, the runner-restart path and
             // durable discovery. A material premise change releases the hold:
-            // a strictly later trusted task snapshot for the task generation
-            // with a different spec, or a changed or deleted durable
-            // checkpoint ref. A failed ref read keeps the hold fail-closed.
+            // a different authoritative trusted task snapshot for the task
+            // generation, or a changed or deleted durable checkpoint ref. A
+            // failed ref read keeps the hold fail-closed.
             //
             // A manual owner /oc is not a release. The owner command already
             // starts its own OpenCode issue run through the `issue_comment`
@@ -1147,10 +1147,16 @@ jobs:
               }
               if (!marker) return { blocked: false, marker: null };
 
-              let latestSnapshot = null;
+              // Select the authoritative snapshot exactly as the executor
+              // does: the earliest trusted snapshot for the task generation
+              // wins and later duplicates are ignored, never overwritten.
+              // Comparing the latest duplicate instead would dispatch against
+              // the earlier pin, or repeat the unchanged rejection when live
+              // content still matches that earlier pin.
+              let authoritativeSnapshot = null;
+              let authoritativeSnapshotOrder = '';
               for (const comment of trusted) {
                 const order = checkpointCommentOrder(comment);
-                if (order <= marker.order) continue;
                 for (const match of String(comment.body || '').matchAll(
                   checkpointSnapshotMarkerRe
                 )) {
@@ -1159,17 +1165,18 @@ jobs:
                     Number(match[2]) !== wantedIssue ||
                     Number(match[3]) !== TASK_SNAPSHOT_GENERATION
                   ) continue;
-                  if (!latestSnapshot || order > latestSnapshot.order) {
-                    latestSnapshot = {
-                      order,
-                      snapshotSpec: match[6].toLowerCase(),
-                    };
+                  if (
+                    authoritativeSnapshot === null ||
+                    order < authoritativeSnapshotOrder
+                  ) {
+                    authoritativeSnapshotOrder = order;
+                    authoritativeSnapshot = match[6].toLowerCase();
                   }
                 }
               }
               if (
-                latestSnapshot &&
-                latestSnapshot.snapshotSpec !== marker.snapshotSpec
+                authoritativeSnapshot &&
+                authoritativeSnapshot !== marker.snapshotSpec
               ) {
                 return { blocked: false, marker };
               }

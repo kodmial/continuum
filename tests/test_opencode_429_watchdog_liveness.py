@@ -1390,7 +1390,7 @@ class WatchdogHarness(unittest.TestCase):
         result = self.run_scenario(scenario)
         self.assertEqual(len(self.retried_bodies(result)), 1, result["comments"])
 
-    def test_hold_is_released_only_by_a_strictly_later_task_snapshot(self):
+    def test_hold_is_released_only_by_the_authoritative_task_snapshot(self):
         later = base_scenario()
         later["comments"].append(
             thread_comment(20, hold_marker(), "2026-10-23T09:50:00Z")
@@ -1400,24 +1400,26 @@ class WatchdogHarness(unittest.TestCase):
         )
         self.assert_one_current_dispatch(self.run_scenario(later), NEW_SHA)
 
-        older = base_scenario()
-        older["comments"].append(
+        earlier = base_scenario()
+        earlier["comments"].append(
             thread_comment(19, snapshot_marker("f" * 64), "2026-10-23T09:20:00Z")
         )
-        older["comments"].append(
+        earlier["comments"].append(
             thread_comment(20, hold_marker(), "2026-10-23T09:50:00Z")
         )
-        self.assert_no_dispatch(self.run_scenario(older))
+        self.assert_one_current_dispatch(self.run_scenario(earlier), NEW_SHA)
 
-        same = base_scenario()
-        same["comments"].append(
+        same_comment = base_scenario()
+        same_comment["comments"].append(
             thread_comment(
                 20,
                 hold_marker() + "\n" + snapshot_marker("f" * 64),
                 "2026-10-23T09:50:00Z",
             )
         )
-        self.assert_no_dispatch(self.run_scenario(same))
+        self.assert_one_current_dispatch(
+            self.run_scenario(same_comment), NEW_SHA
+        )
 
         same_spec = base_scenario()
         same_spec["comments"].append(
@@ -1427,6 +1429,18 @@ class WatchdogHarness(unittest.TestCase):
             thread_comment(21, snapshot_marker("c" * 64), "2026-10-23T09:55:00Z")
         )
         self.assert_no_dispatch(self.run_scenario(same_spec))
+
+        later_duplicate = base_scenario()
+        later_duplicate["comments"].extend([
+            thread_comment(20, hold_marker(), "2026-10-23T09:50:00Z"),
+            thread_comment(
+                21, snapshot_marker("c" * 64), "2026-10-23T09:55:00Z"
+            ),
+            thread_comment(
+                22, snapshot_marker("f" * 64), "2026-10-23T10:00:00Z"
+            ),
+        ])
+        self.assert_no_dispatch(self.run_scenario(later_duplicate))
 
     def test_normal_retry_path_honors_the_hold(self):
         scenario = self.normal_retry_scenario()
