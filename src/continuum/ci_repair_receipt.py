@@ -25,9 +25,9 @@ Status vocabulary and allowed transitions
     dispatch request is about to be sent. For a receipt written by the
     ``requesting`` protocol below, that proves the request was never sent; a
     legacy ``claimed`` receipt predates that protocol, so its author may have
-    dispatched directly. Admission re-arms a stale claim only when the trusted
-    legacy-controller retirement frontier proves it postdates that protocol.
-    Run details are forbidden because no run is proved.
+    dispatched directly. Admission re-arms a stale claim only when the
+    trusted requesting-protocol retirement frontier proves it postdates that
+    protocol. Run details are forbidden because no run is proved.
 ``requesting``
     The serialized owner persisted this state immediately before asking GitHub
     to dispatch a repair. The request may have been sent even if no run is

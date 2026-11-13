@@ -736,7 +736,7 @@ class AdmissionPlanningTests(unittest.TestCase):
         for frontier in (
             "2026-11-12T00:00:00Z",  # same second as the claim
             "2026-11-12T00:00:01Z",  # after the claim
-            None,  # no trusted retirement record
+            None,  # no trusted requesting-protocol retirement record
             "not-a-timestamp",  # unusable frontier
         ):
             with self.subTest(frontier=frontier):

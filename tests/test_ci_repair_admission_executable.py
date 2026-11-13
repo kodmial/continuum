@@ -37,11 +37,15 @@ LEGACY_WRITERS_VARIABLE = "CONTINUUM_CI_REPAIR_WRITERS"
 WRITER_VARIABLE_PREFIX = "CONTINUUM_CI_REPAIR_WRITER_"
 WRITERS_BASELINE_VARIABLE = "CONTINUUM_CI_REPAIR_WRITERS_BASELINE"
 LEGACY_RETIRED_VARIABLE = "CONTINUUM_CI_REPAIR_LEGACY_RETIRED_AT"
-#: An already-established registry baseline and retirement record. Comment
-#: fixtures are created after both, so an unproved receipt is a post-baseline
-#: lookalike unless its author has trusted writer evidence.
+REQUESTING_RETIRED_VARIABLE = "CONTINUUM_CI_REPAIR_REQUESTING_RETIRED_AT"
+#: An already-established registry baseline, writer-retirement record, and
+#: requesting-protocol retirement record. Comment fixtures are created after all
+#: of them, so an unproved receipt is a post-baseline lookalike unless its
+#: author has trusted writer evidence, while a bare claim is proved to come from
+#: the requesting protocol and may be re-armed.
 WRITERS_BASELINE = "2026-11-11T00:00:00Z"
 LEGACY_RETIRED = "2026-11-11T00:00:00Z"
+REQUESTING_RETIRED = "2026-11-11T00:00:00Z"
 
 FAKE_GH = r'''#!/usr/bin/env python3
 import json
@@ -298,12 +302,15 @@ class AdmissionExecutableTests(unittest.TestCase):
         self.write_state("gh.log", "")
         # Lookalike classification only applies once the trusted retirement
         # record says older controllers stopped writing. Tests that exercise the
-        # migration/overlap cases remove that record again.
+        # migration/overlap cases remove that record again. The independent
+        # requesting-protocol retirement record lets a bare stale claim be
+        # re-armed; tests that exercise a pre-requesting controller remove it.
         self.write_state(
             "variables.json",
             {
                 WRITERS_BASELINE_VARIABLE: WRITERS_BASELINE,
                 LEGACY_RETIRED_VARIABLE: LEGACY_RETIRED,
+                REQUESTING_RETIRED_VARIABLE: REQUESTING_RETIRED,
             },
         )
 
@@ -1627,8 +1634,8 @@ class AdmissionExecutableTests(unittest.TestCase):
         # A legacy controller persisted ``claimed`` and then dispatched directly,
         # without ever writing a ``requesting`` marker. Its run can be deleted,
         # so an empty inventory cannot prove the request was never sent. Only a
-        # claim created strictly after the trusted retirement frontier is proved
-        # to come from the requesting protocol and may be re-armed.
+        # claim created strictly after the requesting-protocol retirement
+        # frontier is proved to come from that protocol and may be re-armed.
         legacy = trusted_receipt()
         legacy["created_at"] = "2026-11-10T00:00:00Z"
         legacy["updated_at"] = "2026-11-10T00:00:00Z"
@@ -1642,6 +1649,32 @@ class AdmissionExecutableTests(unittest.TestCase):
         self.assertFalse(any("status=rejected" in body for body in bodies), bodies)
         self.assertFalse(any("status=claimed" in body for body in bodies), bodies)
         self.assertIn("not a retry", completed.stdout)
+
+    def test_a_post_retirement_legacy_claim_is_held_without_the_requesting_record(self):
+        # The writer-classification retirement record can already exist while a
+        # controller that dispatches directly after ``claimed`` is still
+        # allowed to run (for example, it retires revisions older than the one
+        # still pinned). A claim created after that record must not be treated
+        # as proof of the requesting protocol: its accepted dispatch can have
+        # left only the claim behind after its run was deleted. Only the
+        # separate requesting-protocol retirement record may authorize a re-arm.
+        self.write_state(
+            "variables.json",
+            {
+                WRITERS_BASELINE_VARIABLE: WRITERS_BASELINE,
+                LEGACY_RETIRED_VARIABLE: LEGACY_RETIRED,
+            },
+        )
+        self.write_comments([trusted_receipt()])
+        self.write_pr(head=HEAD, comments=1)
+        self.write_runs([])
+        completed = self.run_admission(extra_args=("--now", NOW))
+        self.assertEqual(0, len(self.dispatches()))
+        bodies = self.posted_bodies()
+        self.assertTrue(any("status=ambiguous" in body for body in bodies), bodies)
+        self.assertFalse(any("status=rejected" in body for body in bodies), bodies)
+        self.assertFalse(any("status=claimed" in body for body in bodies), bodies)
+        self.assertIn("requesting-protocol retirement", completed.stdout)
 
     def test_a_canceled_controller_is_resumed_once_by_the_next_serialized_pass(self):
         # The claim was persisted, then the controller run was canceled before

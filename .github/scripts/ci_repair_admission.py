@@ -28,7 +28,10 @@ run by recency, or a partial comment page:
   so token rotation or a concurrent admission pass cannot erase writer history;
 - a separate trusted retirement record marks when older controller instances
   stopped writing, so an unproved receipt after the migration baseline holds
-  until the operator can prove no legacy controller is still running.
+  until the operator can prove no legacy controller is still running;
+- an independent requesting-protocol retirement record proves when no
+  controller can still dispatch directly after ``claimed``, so only a bare
+  claim strictly after it may be re-armed instead of held.
 """
 
 from __future__ import annotations
@@ -135,6 +138,18 @@ _CI_REPAIR_WRITERS_BASELINE_VARIABLE = "CONTINUUM_CI_REPAIR_WRITERS_BASELINE"
 #: HEAD is never re-dispatched. It deliberately does not start with the
 #: per-writer prefix.
 _CI_REPAIR_LEGACY_RETIRED_VARIABLE = "CONTINUUM_CI_REPAIR_LEGACY_RETIRED_AT"
+#: Trusted requesting-protocol retirement record. The legacy-controller
+#: retirement record above only classifies receipt writers; it may have been
+#: established while a controller that dispatches directly after ``claimed`` was
+#: still allowed to run. Re-arming a bare claim therefore needs its own explicit
+#: frontier: the UTC instant at or before which a controller may have dispatched
+#: without first persisting ``requesting``. Only a claim created strictly after
+#: it is proved to come from the requesting protocol. Until the record exists
+#: every bare claim holds, because a deleted run can hide an accepted dispatch.
+#: It deliberately does not start with the per-writer prefix.
+_CI_REPAIR_REQUESTING_RETIRED_VARIABLE = (
+    "CONTINUUM_CI_REPAIR_REQUESTING_RETIRED_AT"
+)
 
 
 class GhFailure(RuntimeError):
@@ -366,6 +381,46 @@ def _admission_timestamp(value: Any = None) -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+def _read_timestamp_record(
+    repository: str,
+    variable: str,
+    description: str,
+) -> Tuple[Optional[str], bool]:
+    """Read one trusted UTC timestamp repository variable.
+
+    ``(None, True)`` means the record is absent. ``(None, False)`` means the
+    record could not be read as a trusted timestamp and must not be treated as
+    absent either.
+    """
+
+    url = "repos/{}/actions/variables/{}".format(repository, variable)
+    _, stdout, stderr = _gh(["api", "--include", url])
+    status, body = _parse_include(stdout, stderr)
+    if status == 404:
+        return None, True
+    if status != 200:
+        print(
+            "::warning::Could not read {}: {}".format(
+                description,
+                (body or stderr).strip() or "HTTP status {}".format(status),
+            )
+        )
+        return None, False
+    try:
+        data = json.loads(body or "{}")
+    except ValueError:
+        print("::warning::{} is not valid JSON.".format(description))
+        return None, False
+    if not isinstance(data, Mapping):
+        print("::warning::{} is not an object.".format(description))
+        return None, False
+    value = data.get("value")
+    if not isinstance(value, str) or not _ISO_TIMESTAMP_RE.match(value.strip()):
+        print("::warning::{} is not a usable timestamp.".format(description))
+        return None, False
+    return value.strip(), True
+
+
 def _read_writer_baseline(repository: str) -> Tuple[Optional[str], bool]:
     """Read the one-time writer-registry migration frontier.
 
@@ -375,39 +430,11 @@ def _read_writer_baseline(repository: str) -> Tuple[Optional[str], bool]:
     baseline could not be read and must also not be treated as absent.
     """
 
-    url = "repos/{}/actions/variables/{}".format(
-        repository, _CI_REPAIR_WRITERS_BASELINE_VARIABLE
+    return _read_timestamp_record(
+        repository,
+        _CI_REPAIR_WRITERS_BASELINE_VARIABLE,
+        "Historical CI-repair writer baseline",
     )
-    _, stdout, stderr = _gh(["api", "--include", url])
-    status, body = _parse_include(stdout, stderr)
-    if status == 404:
-        return None, True
-    if status != 200:
-        print(
-            "::warning::Could not read historical CI-repair writer baseline: "
-            "{}".format((body or stderr).strip() or "HTTP status {}".format(status))
-        )
-        return None, False
-    try:
-        data = json.loads(body or "{}")
-    except ValueError:
-        print(
-            "::warning::Historical CI-repair writer baseline is not valid JSON."
-        )
-        return None, False
-    if not isinstance(data, Mapping):
-        print(
-            "::warning::Historical CI-repair writer baseline is not an object."
-        )
-        return None, False
-    value = data.get("value")
-    if not isinstance(value, str) or not _ISO_TIMESTAMP_RE.match(value.strip()):
-        print(
-            "::warning::Historical CI-repair writer baseline is not a usable "
-            "timestamp."
-        )
-        return None, False
-    return value.strip(), True
 
 
 def _read_legacy_retirement(repository: str) -> Tuple[Optional[str], bool]:
@@ -419,43 +446,28 @@ def _read_legacy_retirement(repository: str) -> Tuple[Optional[str], bool]:
     be treated as retired.
     """
 
-    url = "repos/{}/actions/variables/{}".format(
-        repository, _CI_REPAIR_LEGACY_RETIRED_VARIABLE
+    return _read_timestamp_record(
+        repository,
+        _CI_REPAIR_LEGACY_RETIRED_VARIABLE,
+        "CI-repair legacy-controller retirement record",
     )
-    _, stdout, stderr = _gh(["api", "--include", url])
-    status, body = _parse_include(stdout, stderr)
-    if status == 404:
-        return None, True
-    if status != 200:
-        print(
-            "::warning::Could not read the CI-repair legacy-controller retirement "
-            "record: {}".format(
-                (body or stderr).strip() or "HTTP status {}".format(status)
-            )
-        )
-        return None, False
-    try:
-        data = json.loads(body or "{}")
-    except ValueError:
-        print(
-            "::warning::CI-repair legacy-controller retirement record is not "
-            "valid JSON."
-        )
-        return None, False
-    if not isinstance(data, Mapping):
-        print(
-            "::warning::CI-repair legacy-controller retirement record is not an "
-            "object."
-        )
-        return None, False
-    value = data.get("value")
-    if not isinstance(value, str) or not _ISO_TIMESTAMP_RE.match(value.strip()):
-        print(
-            "::warning::CI-repair legacy-controller retirement record is not a "
-            "usable timestamp."
-        )
-        return None, False
-    return value.strip(), True
+
+
+def _read_requesting_retirement(repository: str) -> Tuple[Optional[str], bool]:
+    """Read the trusted requesting-protocol retirement record.
+
+    ``(None, True)`` means no operator has asserted that every controller which
+    dispatches without persisting ``requesting`` is retired, so a bare stale
+    claim is not proved to be a pre-request crash and must hold. ``(None,
+    False)`` means the record could not be read and must also be treated as
+    absent.
+    """
+
+    return _read_timestamp_record(
+        repository,
+        _CI_REPAIR_REQUESTING_RETIRED_VARIABLE,
+        "CI-repair requesting-protocol retirement record",
+    )
 
 
 def _persist_writer_baseline(repository: str, timestamp: str) -> bool:
@@ -1557,6 +1569,24 @@ def run(args) -> int:
             print("::warning::Could not reconcile CI-repair runs: {}".format(exc))
         if runs is not None and runs.complete:
             runs = _carry_proved_runs(runs, proved_historical_runs)
+        # Re-arming a bare claim is safe only when its deleted run cannot hide
+        # an accepted dispatch from a controller that never persisted
+        # ``requesting``. The legacy-controller retirement record also
+        # classifies receipt writers and may already exist while such an older
+        # controller is still allowed to write, so it is not proof of the
+        # requesting protocol. Use the independent, explicitly established
+        # requesting-protocol retirement record instead; when it is absent or
+        # unreadable, ``claim_protocol_since`` stays unknown and the stale
+        # claim holds instead of being re-armed.
+        requesting_retired, requesting_retirement_healthy = (
+            _read_requesting_retirement(repository)
+        )
+        if not requesting_retirement_healthy:
+            print(
+                "::warning::CI-repair requesting-protocol retirement record "
+                "cannot be read; a stale bare claim will hold instead of being "
+                "re-armed."
+            )
         plan = plan_admission(
             collection,
             runs=runs,
@@ -1564,12 +1594,7 @@ def run(args) -> int:
             now=args.now,
             claim_timeout_seconds=args.claim_timeout_seconds,
             pull_number=pull_number,
-            # Only a claim written strictly after the trusted legacy-
-            # controller retirement frontier is proved to come from the
-            # protocol that persists ``requesting`` before dispatch. An
-            # older controller dispatched directly after ``claimed``, so its
-            # bare claim must hold even when the run inventory is empty.
-            claim_protocol_since=legacy_retired,
+            claim_protocol_since=requesting_retired,
         )
 
     if plan.transition is not None:
