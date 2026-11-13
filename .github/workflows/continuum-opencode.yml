@@ -4518,143 +4518,36 @@ jobs:
               ));
             }
 
-            // A provider-owned UNRESOLVED batch is one repair transaction.
-            // Verify exactly its still-current finding IDs, never all remarks
-            // from the original review (which may already be resolved).
+            // OpenCode repairs code; it does not own the repository-shared
+            // CodeRabbit inline-chat send lease. Direct replies here bypass
+            // auto-merge serialization and can trip the hourly provider limit.
+            // After exact-HEAD CI succeeds, the auto-merge reconciler owns
+            // verification of each still-open finding on the published HEAD.
             const batchItems = JSON.parse(process.env.UNRESOLVED_ITEMS_JSON || '[]');
             if (batchItems.length) {
-              let requested = 0;
-              const changed = process.env.REPAIR_CHANGED === 'true';
-              for (const item of batchItems) {
-                const findingId = Number(item.finding_id);
-                const itemReviewId = Number(item.review_id);
-                if (!Number.isInteger(findingId) || !Number.isInteger(itemReviewId) ||
-                    !/^[0-9a-f]{40}$/.test(String(item.verified_head || ''))) {
-                  throw new Error('Invalid CodeRabbit batch verification identity.');
-                }
-                // A no-diff repair on the exact already-rejected HEAD must not
-                // ask CodeRabbit for the same verdict again (no-progress loop).
-                if (!changed && item.verified_head === headSha) {
-                  core.notice(`No change for finding #${findingId} on its already-rejected HEAD; no same-state retry.`);
-                  continue;
-                }
-                const root = comments.find(comment => comment.id === findingId) ||
-                  (await github.rest.pulls.getReviewComment({
-                    owner, repo, comment_id: findingId,
-                  })).data;
-                if (root.user?.login !== 'coderabbitai[bot]' ||
-                    root.pull_request_review_id !== itemReviewId ||
-                    root.pull_request_url !== `https://api.github.com/repos/${owner}/${repo}/pulls/${pullNumber}`) {
-                  throw new Error('Invalid source finding/review association for CodeRabbit batch.');
-                }
-                const verdicts = comments.filter(comment =>
-                  comment.in_reply_to_id === findingId &&
-                  comment.user?.login === 'coderabbitai[bot]' &&
-                  /\b(?:RESOLVED|UNRESOLVED)\b/i.test(comment.body || '')
-                ).sort((a, b) => b.id - a.id);
-                if (!verdicts.length || verdicts[0].id !== Number(item.unresolved_id) ||
-                    !/\bUNRESOLVED\b/i.test(verdicts[0].body || '')) {
-                  core.info(`Finding #${findingId} already has a newer CodeRabbit decision; skipping.`);
-                  continue;
-                }
-                const marker =
-                  `<!-- opencode-coderabbit-verification review=${itemReviewId} finding=${findingId} head=${headSha} -->`;
-                if (comments.some(comment =>
-                    comment.in_reply_to_id === findingId &&
-                    (comment.body || '').includes(marker))) {
-                  core.info(`Finding #${findingId} already requested on ${headSha}.`);
-                  continue;
-                }
-                const body = [
-                  marker,
-                  '⚡ **Continuum · opencode**',
-                  '<!-- continuum-origin role=continuum component=opencode -->',
-                  '@coderabbitai Re-check this exact original finding after the batched OpenCode repair.',
-                  '',
-                  `Current PR HEAD: \`${headSha}\``,
-                  `Latest UNRESOLVED reply: ${item.unresolved_id}`,
-                  'Read the current code and the original finding, not only the incremental diff.',
-                  'Reply **RESOLVED** only if fully fixed; otherwise **UNRESOLVED** with remaining details.',
-                ].join('\n');
-                await github.request(
-                  'POST /repos/{owner}/{repo}/pulls/{pull_number}/comments/{comment_id}/replies',
-                  { owner, repo, pull_number: pullNumber, comment_id: findingId, body }
-                );
-                requested += 1;
-                // One inline request per run; serialized auto-merge owns the
-                // remaining exact-HEAD verifications after CI and quota wait.
-                break;
-              }
-              core.notice(`Requested verification for ${requested}/${batchItems.length} batched CodeRabbit finding(s) at ${headSha}.`);
+              core.notice(
+                `PR #${pullNumber}: deferring ${batchItems.length} CodeRabbit finding(s) at HEAD ${headSha} to serialized auto-merge after exact-HEAD CI.`
+              );
               return;
             }
 
             const findings = comments.filter(
-              (comment) =>
+              comment =>
                 comment.pull_request_review_id === reviewId &&
                 comment.user?.login === 'coderabbitai[bot]' &&
                 !comment.in_reply_to_id
             );
-
-            let requested = 0;
-            if (findings.length === 0) {
+            if (findings.length > 0) {
               core.notice(
-                `CodeRabbit review ${reviewId} has no inline threads; no thread replies are needed.`
+                `PR #${pullNumber}: deferring ${findings.length} CodeRabbit finding(s) from review ${reviewId} at HEAD ${headSha} to serialized auto-merge after exact-HEAD CI.`
               );
-            } else {
-              for (const finding of findings) {
-                const marker =
-                  `<!-- opencode-coderabbit-verification review=${reviewId} finding=${finding.id} head=${headSha} -->`;
-
-                const duplicate = comments.some(
-                  (comment) =>
-                    comment.in_reply_to_id === finding.id &&
-                    comment.body?.includes(marker)
-                );
-                if (duplicate) {
-                  core.info(
-                    `Verification already requested for finding ${finding.id} at ${headSha}.`
-                  );
-                  continue;
-                }
-
-                const body = [
-                  marker,
-                  '⚡ **Continuum · opencode**',
-                  '<!-- continuum-origin role=continuum component=opencode -->',
-                  '@coderabbitai Re-check this exact original finding after the OpenCode fixes.',
-                  '',
-                  `Current PR HEAD: \`${headSha}\``,
-                  '',
-                  'Compare the original finding in this thread with the current code itself,',
-                  'not merely with the latest incremental diff or the OpenCode report.',
-                  '',
-                  'Reply with **RESOLVED** only if the underlying issue is fully fixed.',
-                  'Otherwise reply with **UNRESOLVED** and state exactly what remains.',
-                ].join('\n');
-
-                await github.request(
-                  'POST /repos/{owner}/{repo}/pulls/{pull_number}/comments/{comment_id}/replies',
-                  {
-                    owner,
-                    repo,
-                    pull_number: pullNumber,
-                    comment_id: finding.id,
-                    body,
-                  }
-                );
-                requested += 1;
-                // One inline request per run; serialized auto-merge owns the
-                // remaining exact-HEAD verifications after CI and quota wait.
-                break;
-              }
-
-              core.notice(
-                `Requested CodeRabbit verification for ${requested}/${findings.length} findings from review ${reviewId} at HEAD ${headSha}.`
-              );
+              return;
             }
+            core.notice(
+              `CodeRabbit review ${reviewId} has no inline threads; no thread replies are needed.`
+            );
 
-            // Inline findings are independently verified in their own threads above,
+            // Inline findings are verified by serialized auto-merge after CI,
             // so an unchanged HEAD must not trigger another full review for them.
             // A body-only COMMENTED nitpick has no thread to verify; allow exactly
             // one full re-review for that narrow case. Policy-only CHANGES_REQUESTED
