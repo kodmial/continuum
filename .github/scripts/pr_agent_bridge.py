@@ -23,7 +23,8 @@ Inference hardening:
   session-level `Permission.Ruleset` that denies the v2 `shell` and
   `subagent` tool actions, verifies the reported rules still decide `deny`
   under OpenCode's last-match-wins evaluation, and probes the live session
-  permission endpoint for both actions before submitting the prompt;
+  permission endpoint for both actions with concrete, non-destructive
+  resources before submitting the prompt;
 - the server and the bridge both bind 127.0.0.1 only. A Docker action
   cannot reach runner loopback, so the workflow runs the pinned PR-Agent
   package directly on the runner instead of in a container;
@@ -99,6 +100,16 @@ def split_model(model: str) -> Tuple[str, str]:
 REVIEWER_SESSION_PERMISSIONS: Tuple[Dict[str, str], ...] = (
     {"action": "shell", "resource": "*", "effect": "deny"},
     {"action": "subagent", "resource": "*", "effect": "deny"},
+)
+
+#: Concrete, non-destructive resources used to prove the wildcard deny rules
+#: match a real tool invocation. Probing the literal `"*"` resource would also
+#: pass if the server treated it as a command/agent name instead of a wildcard,
+#: so each action is checked with the kind of resource its tool actually
+#: asserts: a harmless shell command and a built-in subagent id.
+REVIEWER_PERMISSION_PROBES: Tuple[Dict[str, str], ...] = (
+    {"action": "shell", "resource": "true"},
+    {"action": "subagent", "resource": "general"},
 )
 
 #: Distinct `--preflight` exit status for a retryable infrastructure failure
@@ -274,17 +285,19 @@ def _require_reviewer_permission_enforcement(session_id: str) -> None:
     `POST /api/session/:id/permission` runs the same effective-rules
     evaluation that a tool assertion uses (agent rules followed by the
     session rules, last match wins). It spends no reviewer tokens and creates
-    no request when the action is already denied, so this is a real
+    no pending request when the action is already denied, so this is a real
     enforcement check rather than a shape check on the reported rules. Each
-    verified action prints a content-free `bridge-permission` evidence line,
-    so qualification and review logs record the live server's decision.
+    probe uses a concrete, non-destructive resource so wildcard matching is
+    exercised exactly as a real tool call would. Each verified action prints
+    a content-free `bridge-permission` evidence line, so qualification and
+    review logs record the live server's decision.
     """
     quoted = urllib.parse.quote(session_id, safe="")
-    for rule in REVIEWER_SESSION_PERMISSIONS:
+    for probe in REVIEWER_PERMISSION_PROBES:
         status, raw = opencode_call(
             "POST",
             f"/api/session/{quoted}/permission",
-            {"action": rule["action"], "resources": [rule["resource"]]},
+            {"action": probe["action"], "resources": [probe["resource"]]},
             15,
         )
         _require_opencode_status(status, (200,), "verify reviewer permissions")
@@ -307,7 +320,7 @@ def _require_reviewer_permission_enforcement(session_id: str) -> None:
         # qualification and review logs therefore record the actual result,
         # not only that a probe request was made.
         print(
-            f"bridge-permission action={rule['action']} effect=deny",
+            f"bridge-permission action={probe['action']} effect=deny",
             file=sys.stderr,
             flush=True,
         )

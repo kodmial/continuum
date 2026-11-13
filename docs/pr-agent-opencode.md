@@ -62,12 +62,14 @@ as an inference backend, not as a coding agent. Three layers hold this:
    and fails closed unless the reported rules still decide `deny` under
    OpenCode's last-match-wins evaluation; session rules are evaluated after
    agent rules, so shell execution and subagent delegation stay denied. It
-   then probes `POST /api/session/:id/permission` for both actions and
-   requires an actual `deny` effect from the live server before any prompt is
-   submitted; each confirmed decision prints one content-free
-   `bridge-permission action=<action> effect=deny` line, so the no-LLM
-   qualification log records the live enforcement result. The bridge never
-   sends a per-request `tools` map.
+   then probes `POST /api/session/:id/permission` for both actions with
+   concrete, non-destructive resources (a harmless shell command and the
+   built-in `general` subagent) so wildcard matching is exercised as a real
+   tool call would, and requires an actual `deny` effect from the live server
+   before any prompt is submitted; each confirmed decision prints one
+   content-free `bridge-permission action=<action> effect=deny` line, so the
+   no-LLM qualification log records the live enforcement result. The bridge
+   never sends a per-request `tools` map.
 2. Each request gets a fresh session that is deleted afterwards.
 3. The workflow proves the checkout is untouched after the run
    (`git status --porcelain` must be empty and no local commit may exist)

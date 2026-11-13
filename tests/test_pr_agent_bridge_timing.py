@@ -311,13 +311,31 @@ class BridgeTimingTests(unittest.TestCase):
         self.assertEqual(transport.call_args_list[1].args[1],
                          "/api/session/private-session")
         # The live permission endpoint must be asked about both actions
-        # before the session is handed back for a prompt.
+        # before the session is handed back for a prompt, using concrete
+        # resources that exercise wildcard matching like a real tool call.
         self.assertEqual(
             [call.args[2] for call in transport.call_args_list
              if call.args[1].endswith("/permission")],
-            [{"action": "shell", "resources": ["*"]},
-             {"action": "subagent", "resources": ["*"]}],
+            [{"action": "shell", "resources": ["true"]},
+             {"action": "subagent", "resources": ["general"]}],
         )
+
+    def test_reviewer_permission_probes_use_concrete_non_wildcard_resources(self):
+        # A probe of the literal "*" would not prove that the wildcard deny
+        # rules match the command/agent resources a real tool asserts.
+        self.assertEqual(
+            [(probe["action"], probe["resource"])
+             for probe in bridge.REVIEWER_PERMISSION_PROBES],
+            [("shell", "true"), ("subagent", "general")],
+        )
+        self.assertEqual(
+            [probe["action"] for probe in bridge.REVIEWER_PERMISSION_PROBES],
+            [rule["action"] for rule in bridge.REVIEWER_SESSION_PERMISSIONS],
+        )
+        self.assertTrue(all(
+            probe["resource"] != "*"
+            for probe in bridge.REVIEWER_PERMISSION_PROBES
+        ))
 
     def test_reviewer_permissions_target_pinned_v2_tool_actions(self):
         # OpenCode v2.2.6 asserts these tool ids as permission actions; the
