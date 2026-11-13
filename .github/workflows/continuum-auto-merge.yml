@@ -1998,6 +1998,7 @@ jobs:
             // outcome, rather than the earlier UNRESOLVED answer selecting
             // another repair batch forever.
             const repairHandoffs = [];
+            let repairHandoffReadFailed = false;
             try {
               const totalHandoffComments = Number(pr.comments || 0);
               const lastHandoffPage = Math.max(
@@ -2022,8 +2023,13 @@ jobs:
                 if (Array.isArray(data)) repairHandoffs.push(...data);
               }
             } catch (err) {
+              // Without the handoff list a repair that left HEAD unchanged is
+              // indistinguishable from no repair at all. Defer the repair
+              // decision instead of re-selecting the batch from the older
+              // answer; the next scheduled reconciliation re-reads the list.
+              repairHandoffReadFailed = true;
               core.warning(
-                `PR #${pr.number}: could not read CodeRabbit repair handoffs; retaining existing verification decisions: ${err.message || err}`
+                `PR #${pr.number}: could not read CodeRabbit repair handoffs; deferring repair decisions until the next reconciliation: ${err.message || err}`
               );
             }
             const pendingRepairHandoff = (findingId, headSha) => {
@@ -2169,6 +2175,12 @@ jobs:
                       }
                     );
                     requested += 1;
+                    continue;
+                  }
+                  if (repairHandoffReadFailed) {
+                    core.notice(
+                      `PR #${pr.number}: CodeRabbit repair handoffs are unreadable; deferring the repair decision for thread #${thread.commentId} until the next reconciliation.`
+                    );
                     continue;
                   }
                   if (!repairReconciliationDispatched &&

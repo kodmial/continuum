@@ -774,13 +774,19 @@ class AutoMergeThreadVerifierTests(unittest.TestCase):
 const assert = require('node:assert/strict');
 let comments = [];
 let issueComments = [];
+let issueListCommentsFailure = false;
 let liveThreads = [{commentId: 100}];
 let liveHead = '';
 let liveState = 'open';
 let posted = [];
+let notices = [];
+let warnings = [];
 let authenticatedLogin = 'kodmial';
 let authenticatedFailure = false;
-const issueListComments = async () => ({data: issueComments.slice()});
+const issueListComments = async () => {
+  if (issueListCommentsFailure) throw new Error('handoff comments unavailable');
+  return {data: issueComments.slice()};
+};
 const pr = {number: 450, head: {sha: 'a'.repeat(40)}};
 liveHead = pr.head.sha;
 const owner = 'o';
@@ -789,7 +795,11 @@ const requireCodeRabbit = true;
 const codeRabbitUnresolvedWorkflow = 'u.yml';
 const CODERABBIT_THREAD_VERIFICATION_TIMEOUT_MS = 30 * 60_000;
 const context = {payload: {repository: {default_branch: 'main'}}};
-const core = {info: () => {}, notice: () => {}, warning: () => {}};
+const core = {
+  info: () => {},
+  notice: message => notices.push(message),
+  warning: message => warnings.push(message),
+};
 const github = {
   request: async (path, args) => {
     posted.push(args);
@@ -1280,6 +1290,76 @@ process.stdout.write(JSON.stringify(results));
         # handoff after the fresh verification and is verified again.
         self.assertEqual(result["nextCycle"]["requested"], 1)
         self.assertEqual(result["nextCycle"]["posted"], 1)
+
+    def test_unreadable_repair_handoff_defers_the_repair_decision(self):
+        data = fixture("chat-rate-limit-pr448.json")
+        finding = data["threads"][0]["finding_id"]
+        head = data["head_sha"]
+        checks = f"""
+const finding = {finding};
+const head = {json.dumps(head)};
+const now = Date.now();
+const marker = `<!-- auto-merge-coderabbit-verification finding=${{finding}} head=${{head}} -->`;
+pr.head.sha = head;
+liveHead = head;
+liveThreads = [{{commentId: finding}}];
+comments = [
+  {{id: 900, in_reply_to_id: finding, user: {{login: 'kodmial'}},
+    created_at: new Date(now - 10 * 60_000).toISOString(), body: marker}},
+  {{id: 901, in_reply_to_id: finding, user: {{login: 'coderabbitai[bot]'}},
+    created_at: new Date(now - 5 * 60_000).toISOString(),
+    body: '`@kodmial` **UNRESOLVED**\\nThe access-control defect remains.'}},
+];
+const dispatches = [];
+reconciliationDispatchSupport = async () => ({{ok: true, reason: ''}});
+github.rest.actions = {{
+  createWorkflowDispatch: async args => dispatches.push(args),
+}};
+async function attempt(failHandoffRead) {{
+  issueListCommentsFailure = failHandoffRead;
+  notices = [];
+  warnings = [];
+  posted = [];
+  const requested = await requestCodeRabbitThreadVerification(
+    pr, liveThreads, {{}}, {{remaining: 1, notBeforeMs: 0}}
+  );
+  return {{
+    requested,
+    posted: posted.length,
+    dispatches: dispatches.length,
+    notices: notices.slice(),
+    warnings: warnings.slice(),
+  }};
+}}
+const results = {{
+  unreadable: await attempt(true),
+  recovered: await attempt(false),
+}};
+process.stdout.write(JSON.stringify(results));
+"""
+        result = self.run_verifier(checks)
+        # An unreadable handoff list must not fall back to the older
+        # unresolved answer and dispatch another repair batch.
+        self.assertEqual(result["unreadable"]["requested"], 0)
+        self.assertEqual(result["unreadable"]["posted"], 0)
+        self.assertEqual(result["unreadable"]["dispatches"], 0)
+        self.assertTrue(
+            any(
+                "deferring the repair decision" in notice
+                for notice in result["unreadable"]["notices"]
+            ),
+            result["unreadable"]["notices"],
+        )
+        self.assertTrue(
+            any(
+                "deferring repair decisions" in warning
+                for warning in result["unreadable"]["warnings"]
+            ),
+            result["unreadable"]["warnings"],
+        )
+        # The deferral is temporary: once the read succeeds, the next
+        # reconciliation still selects the canonical repair path.
+        self.assertEqual(result["recovered"]["dispatches"], 1)
 
     def test_stale_finding_does_not_consume_the_only_send_slot(self):
         data = fixture("chat-rate-limit-pr448.json")
