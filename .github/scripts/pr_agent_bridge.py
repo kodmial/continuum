@@ -20,8 +20,9 @@ Inference hardening:
   system prompt; the bridge never sends a per-request `tools` map and the
   server runs with its default tool surface (both overrides are rejected
   by the free tier). The bridge creates each session with an explicit
-  session-level `Permission.Ruleset` that denies `bash` and `task`, and
-  verifies the server reported those rules before submitting the prompt;
+  session-level `Permission.Ruleset` that denies the v2 `shell` and
+  `subagent` tool actions, and verifies the server reported those rules
+  before submitting the prompt;
 - the server and the bridge both bind 127.0.0.1 only. A Docker action
   cannot reach runner loopback, so the workflow runs the pinned PR-Agent
   package directly on the runner instead of in a container;
@@ -89,11 +90,13 @@ def split_model(model: str) -> Tuple[str, str]:
 #: to every reviewer session. OpenCode evaluates session rules after agent
 #: rules with last-match-wins, so these denies override the `plan` agent's
 #: wildcard allows: the reviewer cannot execute shell commands or delegate to
-#: a subagent that would. Per-request `tools` overrides and server config
-#: permissions stay unused because the free tier rejects both.
+#: a subagent that would. The actions are the pinned v2 tool ids that assert
+#: them (`shell` and `subagent`), not the legacy v1 names (`bash`/`task`).
+#: Per-request `tools` overrides and server config permissions stay unused
+#: because the free tier rejects both.
 REVIEWER_SESSION_PERMISSIONS: Tuple[Dict[str, str], ...] = (
-    {"action": "bash", "resource": "*", "effect": "deny"},
-    {"action": "task", "resource": "*", "effect": "deny"},
+    {"action": "shell", "resource": "*", "effect": "deny"},
+    {"action": "subagent", "resource": "*", "effect": "deny"},
 )
 
 #: Distinct `--preflight` exit status for a retryable infrastructure failure

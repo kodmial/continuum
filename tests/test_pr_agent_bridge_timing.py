@@ -295,19 +295,32 @@ class BridgeTimingTests(unittest.TestCase):
         self.assertEqual(session_id, "private-session")
         create_body = transport.call_args_list[0].args[2]
         self.assertIn(
-            {"action": "bash", "resource": "*", "effect": "deny"},
+            {"action": "shell", "resource": "*", "effect": "deny"},
             create_body["permissions"],
         )
         self.assertIn(
-            {"action": "task", "resource": "*", "effect": "deny"},
+            {"action": "subagent", "resource": "*", "effect": "deny"},
             create_body["permissions"],
         )
         self.assertEqual(transport.call_args_list[1].args[1],
                          "/api/session/private-session")
 
+    def test_reviewer_permissions_target_pinned_v2_tool_actions(self):
+        # OpenCode v2.2.6 asserts these tool ids as permission actions; the
+        # legacy v1 names (`bash`/`task`) would never match and would leave
+        # shell execution and delegation allowed.
+        self.assertEqual(
+            [rule["action"] for rule in bridge.REVIEWER_SESSION_PERMISSIONS],
+            ["shell", "subagent"],
+        )
+        self.assertTrue(all(
+            rule["resource"] == "*" and rule["effect"] == "deny"
+            for rule in bridge.REVIEWER_SESSION_PERMISSIONS
+        ))
+
     def test_ignored_reviewer_permissions_fail_closed_and_delete_session(self):
         for permissions in (None, [], [
-            {"action": "bash", "resource": "*", "effect": "allow"},
+            {"action": "shell", "resource": "*", "effect": "allow"},
         ]):
             with self.subTest(permissions=permissions):
                 session = {"data": {"id": "private-session"}}

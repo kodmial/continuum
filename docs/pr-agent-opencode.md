@@ -57,7 +57,8 @@ as an inference backend, not as a coding agent. Three layers hold this:
 
 1. Every bridge request runs as the read-only `plan` agent with a
    reviewer-only system prompt. The bridge also creates the session with an
-   explicit session-level `Permission.Ruleset` that denies `bash` and `task`,
+   explicit session-level `Permission.Ruleset` that denies the pinned v2
+   `shell` and `subagent` tool actions (not the legacy `bash`/`task` names),
    and fails closed unless the server returns those rules; session rules are
    evaluated after agent rules, so shell execution and subagent delegation
    stay denied. The bridge never sends a per-request `tools` map.
