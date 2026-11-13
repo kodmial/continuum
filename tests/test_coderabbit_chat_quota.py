@@ -176,6 +176,9 @@ class ChatQuotaParserTests(unittest.TestCase):
         for statement in (
             "The user has not exceeded the limit for the number of chat messages per hour.",
             "The user never reached the limit for chat messages per hour.",
+            "The user hasn't exceeded the limit for the number of chat messages per hour.",
+            "The user hasn’t reached the limit for chat messages per hour.",
+            "The user has not, according to the current account state and the recent thread history, exceeded the limit for chat messages per hour.",
         ):
             body = "**UNRESOLVED**\n" + statement
             with self.subTest(statement=statement):
@@ -450,6 +453,9 @@ class ChatQuotaRuntimeParityTests(unittest.TestCase):
             "**UNRESOLVED**\nThe number of chat messages per hour is not tracked across threads, so this finding still needs a code change.",
             "**UNRESOLVED**\nThe user has not exceeded the limit for the number of chat messages per hour.",
             "**UNRESOLVED**\nThe user never reached the limit for chat messages per hour.",
+            "**UNRESOLVED**\nThe user hasn't exceeded the limit for the number of chat messages per hour.",
+            "**UNRESOLVED**\nThe user hasn’t reached the limit for chat messages per hour.",
+            "**UNRESOLVED**\nThe user has not, according to the current account state and the recent thread history, exceeded the limit for chat messages per hour.",
             "**RESOLVED** the finding is fixed.",
         ]
         expected = [
@@ -1069,6 +1075,27 @@ const github = {{
             [item["finding_id"] for item in json.loads(out["items_json"])],
             [100],
         )
+
+    def test_negated_quota_explanation_still_dispatches(self):
+        for statement in (
+            "The user hasn't exceeded the limit for the number of chat messages per hour.",
+            "The user hasn’t reached the limit for chat messages per hour.",
+        ):
+            with self.subTest(statement=statement):
+                out = self.run_collector(
+                    "{id: 106, in_reply_to_id: 100, "
+                    "user: {login: 'coderabbitai[bot]'}, "
+                    "pull_request_review_id: 11, "
+                    "created_at: '2026-11-12T08:09:00Z', "
+                    "body: " + json.dumps(
+                        "**UNRESOLVED**\n" + statement
+                    ) + "}"
+                )
+                self.assertEqual(out["should_run"], "true")
+                self.assertEqual(
+                    [item["finding_id"] for item in json.loads(out["items_json"])],
+                    [100],
+                )
 
     def test_substantive_unresolved_still_dispatches(self):
         out = self.run_collector(

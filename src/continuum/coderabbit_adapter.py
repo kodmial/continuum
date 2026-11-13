@@ -83,7 +83,7 @@ _CHAT_RATE_LIMIT_PROSE_RE = re.compile(
     re.IGNORECASE | re.MULTILINE,
 )
 _CHAT_RATE_LIMIT_NEGATED_RE = re.compile(
-    r"\b(?:not|never|no)\b[^\n]{0,80}\b(?:exceeded|reached)\b",
+    r"(?:\b(?:not|never|no)\b|n['’]t)[^\n]*\b(?:exceeded|reached)\b",
     re.IGNORECASE,
 )
 _CHAT_COUNTDOWN_RE = re.compile(

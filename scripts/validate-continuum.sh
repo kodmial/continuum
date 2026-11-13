@@ -113,6 +113,15 @@ PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=src python3 -m unittest -v \
   tests.test_coderabbit_chat_quota.ChatQuotaRuntimeParityTests.test_js_chat_retry_acknowledgement_accepts_trusted_author_and_rejects_untrusted_author_and_missing_author_at_exact_head \
   tests.test_coderabbit_chat_quota.AutoMergeThreadVerifierTests.test_forged_verification_marker_cannot_bypass_chat_quota
 
+# Print the negated-quota regression by name in the exact-HEAD gate log.
+# CodeRabbit excludes tests/** from review, so the named results are the only
+# reviewable evidence that a finding which merely discusses an unexceeded chat
+# quota is still forwarded to repair instead of being treated as a rate limit.
+PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=src python3 -m unittest -v \
+  tests.test_coderabbit_chat_quota.ChatQuotaParserTests.test_negated_hourly_quota_in_a_finding_is_not_a_rate_limit \
+  tests.test_coderabbit_chat_quota.ChatQuotaRuntimeParityTests.test_js_classifier_matches_python_for_real_and_edge_vectors \
+  tests.test_coderabbit_chat_quota.UnresolvedBatcherChatQuotaTests.test_negated_quota_explanation_still_dispatches
+
 mkdir -p "$PWD/.opencode-tmp/bin"
 # Pin both the installer URL and its content: the tag can move and a
 # compromised download would otherwise execute with this script's privileges.
