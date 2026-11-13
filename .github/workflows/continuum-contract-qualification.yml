@@ -144,6 +144,331 @@ jobs:
           set -euo pipefail
           python3 -m pip install --disable-pip-version-check PyYAML
 
+      # The fake v2 server in unit tests cannot establish that a real
+      # pinned OpenCode process enforces reviewer permissions. For changes
+      # to the PR-Agent ABI, prove both denies on a live authenticated server
+      # before publishing a green exact-HEAD qualification status.
+      - name: Detect changed PR-Agent OpenCode API
+        id: reviewer_abi
+        shell: bash
+        run: |
+          set -euo pipefail
+          if git diff --quiet "$(git merge-base origin/main HEAD)" HEAD -- \
+            .github/scripts/pr_agent_bridge.py \
+            .github/workflows/continuum-pr-agent.yml; then
+            echo "required=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "required=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Restore pinned OpenCode for live reviewer API qualification
+        if: steps.reviewer_abi.outputs.required == 'true'
+        uses: ./.github/actions/agent-toolchain
+        with:
+          components: opencode
+          opencode-version: '2.2.6'
+
+      - name: Prove live OpenCode v2 reviewer shell and delegation denial
+        id: reviewer_abi_live
+        if: steps.reviewer_abi.outputs.required == 'true'
+        timeout-minutes: 5
+        shell: bash
+        env:
+          OPENCODE_MODEL: opencode/deepseek-v4.1-flash-free
+        run: |
+          set -euo pipefail
+          export OPENCODE_PASSWORD="$(openssl rand -hex 32)"
+          echo "::add-mask::$OPENCODE_PASSWORD"
+          export OPENCODE_SERVER_URL="http://127.0.0.1:4096"
+          opencode serve --hostname 127.0.0.1 --port 4096 \
+            > "$RUNNER_TEMP/opencode-abi-live.log" 2>&1 &
+          server_pid=$!
+          trap 'kill "$server_pid" 2>/dev/null || true' EXIT
+          ready=false
+          for attempt in $(seq 1 30); do
+            if python3 - >/dev/null 2>&1 <<'PY'
+          import base64
+          import json
+          import os
+          import urllib.request
+          token = base64.b64encode(("opencode:" + os.environ["OPENCODE_PASSWORD"]).encode()).decode()
+          request = urllib.request.Request(
+              os.environ["OPENCODE_SERVER_URL"] + "/api/info",
+              headers={"Authorization": "Basic " + token, "Accept": "application/json"},
+          )
+          with urllib.request.urlopen(request, timeout=2) as response:
+              data = json.load(response)
+          assert isinstance(data.get("version"), str) and data["version"]
+          assert type(data.get("pid")) is int
+          PY
+            then
+              ready=true
+              break
+            fi
+            sleep 2
+          done
+          if [[ "$ready" != true ]]; then
+            echo "::error::Authenticated OpenCode v2 server readiness failed."
+            exit 1
+          fi
+          python3 .github/scripts/pr_agent_bridge.py --preflight \
+            2>&1 | tee "$RUNNER_TEMP/reviewer-abi-preflight.log"
+          for action in shell subagent; do
+            if ! grep -Fxq "bridge-permission action=$action effect=deny" \
+              "$RUNNER_TEMP/reviewer-abi-preflight.log"; then
+              echo "::error::Live OpenCode did not enforce reviewer $action deny."
+              exit 1
+            fi
+          done
+          {
+            echo "### Real OpenCode 2.2.6 reviewer permission decisions"
+            grep -E '^bridge-permission action=(shell|subagent) effect=deny        id: regression
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash scripts/validate-continuum.sh
+          echo "regression=pass" >> "$GITHUB_OUTPUT"
+
+      - name: Run Layer 2 lifecycle integration probe
+        id: lifecycle
+        shell: bash
+        env:
+          TARGET_SHA: ${{ steps.target.outputs.sha }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          # Observe the real reservations this repository holds before the
+          # deterministic invariants below. A stranded
+          # `automation:in-progress` label is a live scheduler defect and must
+          # fail qualification even when every constructed assertion passes.
+          observation_dir="$RUNNER_TEMP/continuum-observation"
+          mkdir -p "$observation_dir"
+          gh issue list --repo "$GITHUB_REPOSITORY" --state open \
+            --label automation:in-progress --limit 200 \
+            --json number,state,labels,createdAt,updatedAt,closedAt,body,title \
+            > "$observation_dir/issues.json"
+          gh run list --repo "$GITHUB_REPOSITORY" --limit 200 \
+            --json databaseId,status,conclusion,createdAt,startedAt,headBranch,displayTitle,name \
+            > "$observation_dir/runs.json"
+          gh pr list --repo "$GITHUB_REPOSITORY" --state all --limit 200 \
+            --json number,state,body,title,headRefName,updatedAt,mergedAt,reviewDecision \
+            > "$observation_dir/pulls.json"
+          PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=src OBSERVATION_DIR="$observation_dir" \
+            python3 - <<'PY'
+          import json
+          import os
+          from continuum import contract_observation as observation
+          from continuum import contract_qualification as contract
+
+          root = os.environ["OBSERVATION_DIR"]
+          def load(name):
+              with open(os.path.join(root, name), encoding="utf-8") as handle:
+                  return json.load(handle)
+
+          issues = observation.select_observations(load("issues.json"))
+          runs = load("runs.json")
+          pulls = load("pulls.json")
+          reservations = [
+              observation.observe_reservation(issue, runs, pulls)
+              for issue in issues
+          ]
+          stranded = []
+          for reservation in reservations:
+              verdict = contract.evaluate_reservation_liveness(reservation)
+              print(
+                  "observed reservation issue={} label={} run={} pr={} verdict={} ({})".format(
+                      reservation.issue_number,
+                      reservation.has_label,
+                      reservation.live_run_id,
+                      reservation.live_pr_number,
+                      verdict.outcome,
+                      verdict.reason,
+                  )
+              )
+              if verdict.outcome == contract.ERROR:
+                  stranded.append(reservation.issue_number)
+          assert not stranded, "stranded automation:in-progress reservation(s): %s" % stranded
+          print("Observed %d real reservation(s); none stranded." % len(reservations))
+          PY
+          PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=src python3 - <<'PY'
+          import os
+          from datetime import datetime, timezone
+          from continuum import contract_observation as observation
+          from continuum import contract_qualification as contract
+          # A deliberately broken lifecycle change is rejected: red/stale
+          # evidence on the exact HEAD never passes Layer 1.
+          head = os.environ["TARGET_SHA"].strip().lower()
+          assert contract.is_full_sha(head), "target must be a full HEAD SHA"
+          broken = [
+              contract.GateEvidence("CI", head, "completed", "failure"),
+              contract.GateEvidence(contract.CONTRACT_WORKFLOW_NAME, head, "completed", "success"),
+          ]
+          assert contract.evaluate_regression_gate(head, broken).outcome == contract.GATE_BLOCK
+          # A deliberately stranded automation:in-progress reservation is
+          # detected: a label with no live run/PR/lease is an error, while a
+          # stale lease and terminal workers route to bounded recovery.
+          stranded = contract.evaluate_reservation_liveness(
+              contract.Reservation(issue_number=1, has_label=True)
+          )
+          assert stranded.outcome == "error", stranded
+          stale = contract.evaluate_reservation_liveness(
+              contract.Reservation(issue_number=1, has_label=True, live_lease=True, lease_stale=True)
+          )
+          assert stale.outcome == "recover", stale
+          for state in ("completed", "failed", "cancelled"):
+              verdict = contract.evaluate_reservation_liveness(
+                  contract.Reservation(issue_number=1, has_label=True, live_run_id=9, worker_state=state)
+              )
+              assert verdict.outcome == "recover", (state, verdict)
+          # Duplicate wakeups coalesce instead of duplicating work.
+          assert contract.coalesce_wakeups(["a", "A", "b", "a"]) == ["a", "b"]
+          # WAIT (backpressure) is distinguishable from ERROR.
+          assert contract.classify_wait_vs_error("running") == contract.WAIT
+          assert contract.classify_wait_vs_error("failed") == contract.ERROR
+          # The watchdog moves stalled work forward without human intervention.
+          assert contract.watchdog_advance(stalled=True, attempt=0).action == "retry"
+          # Exact-HEAD evidence is required before merge on both merge paths.
+          for provider in ("none", "coderabbit", "pr-agent"):
+              allowed, _ = contract.merge_path_allowed(head, [], provider)
+              assert not allowed, provider
+          # Reservation lifecycle contract. Qualification cannot create real
+          # issues (that would mutate the target repository), so this is the
+          # equivalent probe: the same observe_reservation -> liveness path
+          # that production uses, driven by deterministic state snapshots for
+          # create, release, expire, terminal-worker and stranded phases.
+          now = datetime(2030, 1, 1, tzinfo=timezone.utc)
+          reserved_issue = {
+              "number": 1,
+              "state": "open",
+              "labels": [{"name": contract.IN_PROGRESS_LABEL}],
+              "created_at": "2029-12-31T23:00:00Z",
+              "updated_at": "2029-12-31T23:59:00Z",
+          }
+          live_run = {
+              "databaseId": 9,
+              "status": "in_progress",
+              "created_at": "2029-12-31T23:59:00Z",
+              "head_branch": "opencode/issue1-fix",
+          }
+          expired_run = dict(live_run, created_at="2029-12-31T20:00:00Z")
+          terminal_run = {
+              "databaseId": 10,
+              "status": "completed",
+              "conclusion": "failure",
+              "name": "OpenCode worker",
+              "created_at": "2029-12-31T23:59:00Z",
+              "head_branch": "opencode/issue1-fix",
+          }
+          merged_pr = {
+              "number": 5,
+              "state": "closed",
+              "merged_at": "2029-12-31T23:59:00Z",
+              "body": "Closes #1",
+          }
+
+          def lifecycle_outcome(issue_state, runs=(), pulls=()):
+              return contract.evaluate_reservation_liveness(
+                  observation.observe_reservation(
+                      issue_state, runs, pulls, now=now
+                  )
+              ).outcome
+
+          assert lifecycle_outcome(reserved_issue, [live_run]) == "progress", "create"
+          released = dict(reserved_issue, labels=[])
+          assert lifecycle_outcome(released, []) == "progress", "release"
+          assert lifecycle_outcome(reserved_issue, [expired_run]) == "recover", "expire"
+          assert lifecycle_outcome(reserved_issue, [terminal_run]) == "recover", "terminal"
+          assert lifecycle_outcome(reserved_issue, []) == "error", "stranded"
+          assert lifecycle_outcome(reserved_issue, [], [merged_pr]) == "error", "merged-pr"
+          stages = contract.lifecycle_path_stages()
+          assert contract.progress_events_cover_lifecycle(
+              {stage: True for stage in stages}
+          )[0], "full lifecycle must be covered"
+          assert not contract.progress_events_cover_lifecycle(
+              {stages[0]: True}
+          )[0], "a partial lifecycle must be rejected"
+          print("Layer 2 lifecycle probe passed for HEAD", head)
+          PY
+
+      - name: Run Layer 3 canary deadline contract probe
+        id: canary
+        # Compatibility for the public `mode` input. The live, write-capable
+        # canary lives in continuum-contract-canary.yml (a called workflow
+        # cannot elevate the caller's token, so it cannot run here without
+        # forcing the read-only PR caller to grant issue/action writes). This
+        # read-only step keeps `mode: canary` meaningful by exercising the same
+        # `evaluate_canary` deadline contract the live probe uses.
+        if: inputs.mode == 'canary'
+        shell: bash
+        run: |
+          set -euo pipefail
+          PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=src python3 - <<'PY'
+          from continuum import contract_qualification as contract
+          # A fresh stage progresses; a stage past its deadline is recoverable
+          # within the bounded budget and then fails loudly with exact IDs.
+          fresh = contract.evaluate_canary(
+              contract.CanaryState(canary_id="canary-main", issue_number=1, stage="worker", stage_elapsed_seconds=60)
+          )
+          assert fresh.outcome == contract.CANARY_PROGRESS, fresh
+          stalled = contract.evaluate_canary(
+              contract.CanaryState(
+                  canary_id="canary-main", issue_number=1, pr_number=2, run_id=3,
+                  stage="worker", stage_elapsed_seconds=10 * 3600, recovery_attempts=0,
+              )
+          )
+          assert stalled.outcome == contract.CANARY_STALLED_RECOVERABLE, stalled
+          failed = contract.evaluate_canary(
+              contract.CanaryState(
+                  canary_id="canary-main", issue_number=1, pr_number=2, run_id=3,
+                  stage="worker", stage_elapsed_seconds=10 * 3600,
+                  recovery_attempts=contract.MAX_CANARY_RECOVERY_ATTEMPTS,
+              )
+          )
+          assert failed.outcome == contract.CANARY_STALLED_FAILED, failed
+          for token in ("canary-main", "issue=1", "pr=2", "run=3", "stage=worker"):
+              assert token in failed.detail, (token, failed)
+          assert "review" not in failed.detail, failed
+          print("Layer 3 canary deadline contract probe passed")
+          PY
+
+      - name: Publish contract qualification result
+        if: always()
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
+        env:
+          TARGET_SHA: ${{ steps.target.outputs.sha }}
+          REGRESSION_OUTCOME: ${{ steps.regression.outcome }}
+          LIFECYCLE_OUTCOME: ${{ steps.lifecycle.outcome }}
+          CANARY_OUTCOME: ${{ steps.canary.outcome }}
+          REVIEWER_ABI_DETECT_OUTCOME: ${{ steps.reviewer_abi.outcome }}
+          REVIEWER_ABI_REQUIRED: ${{ steps.reviewer_abi.outputs.required }}
+          REVIEWER_ABI_LIVE_OUTCOME: ${{ steps.reviewer_abi_live.outcome }}
+          STATUS_CONTEXT: ${{ inputs.status_context || vars.CONTINUUM_CONTRACT_STATUS_CONTEXT || 'continuum/contract-qualification' }}
+          PUBLISH_STATUS: ${{ inputs.publish_status || vars.CONTINUUM_PUBLISH_STATUS || 'true' }}
+          STATUS_ELIGIBLE: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
+        with:
+          script: |
+            const passed = process.env.REGRESSION_OUTCOME === 'success' && process.env.LIFECYCLE_OUTCOME === 'success' && (process.env.CANARY_OUTCOME === 'success' || process.env.CANARY_OUTCOME === 'skipped') && process.env.REVIEWER_ABI_DETECT_OUTCOME === 'success' && (process.env.REVIEWER_ABI_REQUIRED === 'false' || (process.env.REVIEWER_ABI_REQUIRED === 'true' && process.env.REVIEWER_ABI_LIVE_OUTCOME === 'success'));
+            const state = passed ? 'success' : 'failure';
+            // Fork PRs are read-only; the qualification verdict still fails
+            // the job, but no commit status can be written.
+            if (process.env.PUBLISH_STATUS === 'true' && process.env.STATUS_ELIGIBLE === 'true') {
+              await github.rest.repos.createCommitStatus({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                sha: process.env.TARGET_SHA,
+                state,
+                context: process.env.STATUS_CONTEXT,
+                description: passed ? 'Contract qualification passed' : 'Contract qualification failed',
+                target_url: `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
+              });
+            }
+            if (!passed) {
+              core.setFailed('Contract qualification failed for the exact HEAD.');
+            }
+ \
+              "$RUNNER_TEMP/reviewer-abi-preflight.log"
+          } >> "$GITHUB_STEP_SUMMARY"
+
       - name: Run Layer 1 regression gate on the exact HEAD
         id: regression
         shell: bash
