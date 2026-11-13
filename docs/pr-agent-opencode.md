@@ -59,9 +59,12 @@ as an inference backend, not as a coding agent. Three layers hold this:
    reviewer-only system prompt. The bridge also creates the session with an
    explicit session-level `Permission.Ruleset` that denies the pinned v2
    `shell` and `subagent` tool actions (not the legacy `bash`/`task` names),
-   and fails closed unless the server returns those rules; session rules are
-   evaluated after agent rules, so shell execution and subagent delegation
-   stay denied. The bridge never sends a per-request `tools` map.
+   and fails closed unless the reported rules still decide `deny` under
+   OpenCode's last-match-wins evaluation; session rules are evaluated after
+   agent rules, so shell execution and subagent delegation stay denied. It
+   then probes `POST /api/session/:id/permission` for both actions and
+   requires an actual `deny` effect from the live server before any prompt is
+   submitted. The bridge never sends a per-request `tools` map.
 2. Each request gets a fresh session that is deleted afterwards.
 3. The workflow proves the checkout is untouched after the run
    (`git status --porcelain` must be empty and no local commit may exist)
@@ -71,8 +74,9 @@ Two shapes are deliberately **not** used because the free tier rejects
 them with `FreeTierError: OpenCode's free tier can only be used from
 within OpenCode`: a per-request `tools` override map, and a hardened
 server permission config via `OPENCODE_CONFIG_CONTENT`. The session-level
-ruleset above uses the versioned v2 session API instead and is verified on
-the real server before every prompt. If a future OpenCode release changes
+ruleset above uses the versioned v2 session API instead, is verified against
+the reported rule order, and is exercised on the real server (no model turn,
+no tokens) before every prompt. If a future OpenCode release changes
 this behavior, the bridge fails closed (HTTP 502 with the upstream status)
 instead of silently degrading.
 

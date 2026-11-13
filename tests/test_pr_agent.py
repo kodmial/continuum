@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import fnmatch
 import io
 import json
 import os
@@ -222,6 +223,7 @@ class FakeOpenCodeHandler(BaseHTTPRequestHandler):
     bodies: list = []
     selected_agents: list = []
     selected_models: list = []
+    permission_probes: list = []
 
     def log_message(self, *args: object) -> None:
         pass
@@ -260,6 +262,19 @@ class FakeOpenCodeHandler(BaseHTTPRequestHandler):
         if self.path.endswith("/model"):
             type(self).selected_models.append(body)
             self._send(204)
+            return
+        if self.path.endswith("/permission"):
+            # Evaluated exactly like OpenCode v2.2.6: merged agent+session
+            # rules, last match wins.
+            sid = self.path.split("/")[-2]
+            action = body.get("action", "")
+            effect = "ask"
+            for rule in type(self).sessions.get(sid, []):
+                pattern = rule.get("action")
+                if isinstance(pattern, str) and fnmatch.fnmatchcase(action, pattern):
+                    effect = rule.get("effect", "ask")
+            type(self).permission_probes.append((action, effect))
+            self._send(200, {"data": {"id": "per-probe", "effect": effect}})
             return
         if self.path.endswith("/prompt"):
             type(self).bodies.append(body)
@@ -322,6 +337,7 @@ class BridgeIsolationTests(unittest.TestCase):
         FakeOpenCodeHandler.bodies = []
         FakeOpenCodeHandler.selected_agents = []
         FakeOpenCodeHandler.selected_models = []
+        FakeOpenCodeHandler.permission_probes = []
         cls.server = ThreadingHTTPServer(("127.0.0.1", 0), FakeOpenCodeHandler)
         cls.thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
         cls.thread.start()
@@ -407,6 +423,7 @@ class BridgeIsolationTests(unittest.TestCase):
             for key in ("OPENCODE_SERVER_URL", "OPENCODE_MODEL", "OPENCODE_PASSWORD")
         }
         before = len(FakeOpenCodeHandler.deleted)
+        probes_before = len(FakeOpenCodeHandler.permission_probes)
         try:
             os.environ["OPENCODE_SERVER_URL"] = f"http://127.0.0.1:{self.port}"
             os.environ["OPENCODE_MODEL"] = "opencode/test-fixture-route"
@@ -414,6 +431,12 @@ class BridgeIsolationTests(unittest.TestCase):
             bridge.preflight_review_session()
             self.assertEqual(len(FakeOpenCodeHandler.deleted), before + 1)
             self.assertEqual(FakeOpenCodeHandler.sessions, {})
+            # The no-LLM preflight exercises live enforcement for both
+            # restricted actions, not just their reported rule shape.
+            self.assertEqual(
+                FakeOpenCodeHandler.permission_probes[probes_before:],
+                [("shell", "deny"), ("subagent", "deny")],
+            )
         finally:
             for key, value in saved.items():
                 if value is None:

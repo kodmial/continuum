@@ -263,6 +263,8 @@ class BridgeTimingTests(unittest.TestCase):
                 }})),
                 (204, ""),
                 (204, ""),
+                (200, '{"data":{"id":"per-shell","effect":"deny"}}'),
+                (200, '{"data":{"id":"per-subagent","effect":"deny"}}'),
                 (405, ""),
                 (204, ""),
             ]) as transport:
@@ -275,6 +277,8 @@ class BridgeTimingTests(unittest.TestCase):
             ["/api/session", "/api/session/private-session",
              "/api/session/private-session/agent",
              "/api/session/private-session/model",
+             "/api/session/private-session/permission",
+             "/api/session/private-session/permission",
              "/api/session/private-session/prompt", "/api/session/private-session"],
         )
 
@@ -288,6 +292,8 @@ class BridgeTimingTests(unittest.TestCase):
             (200, bridge.json.dumps(session)),
             (204, ""),
             (204, ""),
+            (200, '{"data":{"id":"per-shell","effect":"deny"}}'),
+            (200, '{"data":{"id":"per-subagent","effect":"deny"}}'),
         ]) as transport:
             session_id = bridge._create_review_session(
                 {"providerID": "opencode", "id": "test-route"}
@@ -304,6 +310,14 @@ class BridgeTimingTests(unittest.TestCase):
         )
         self.assertEqual(transport.call_args_list[1].args[1],
                          "/api/session/private-session")
+        # The live permission endpoint must be asked about both actions
+        # before the session is handed back for a prompt.
+        self.assertEqual(
+            [call.args[2] for call in transport.call_args_list
+             if call.args[1].endswith("/permission")],
+            [{"action": "shell", "resources": ["*"]},
+             {"action": "subagent", "resources": ["*"]}],
+        )
 
     def test_reviewer_permissions_target_pinned_v2_tool_actions(self):
         # OpenCode v2.2.6 asserts these tool ids as permission actions; the
@@ -319,8 +333,18 @@ class BridgeTimingTests(unittest.TestCase):
         ))
 
     def test_ignored_reviewer_permissions_fail_closed_and_delete_session(self):
+        later_allow = {
+            "action": "shell", "resource": "*", "effect": "allow"
+        }
+        broader_later_allow = {
+            "action": "*", "resource": "*", "effect": "allow"
+        }
         for permissions in (None, [], [
             {"action": "shell", "resource": "*", "effect": "allow"},
+        ], [
+            *bridge.REVIEWER_SESSION_PERMISSIONS, later_allow,
+        ], [
+            *bridge.REVIEWER_SESSION_PERMISSIONS, broader_later_allow,
         ]):
             with self.subTest(permissions=permissions):
                 session = {"data": {"id": "private-session"}}
@@ -340,6 +364,56 @@ class BridgeTimingTests(unittest.TestCase):
                     [call.args[1] for call in transport.call_args_list][-1],
                     "/api/session/private-session",
                 )
+                self.assertEqual(transport.call_args_list[-1].args[0], "DELETE")
+
+    def test_reviewer_deny_is_checked_under_last_match_wins(self):
+        # An earlier allow is harmless because the later deny wins. A later
+        # matching allow/ask would override the deny and must fail closed.
+        bridge._require_reviewer_session_rules({
+            "permissions": [
+                {"action": "*", "resource": "*", "effect": "allow"},
+                *bridge.REVIEWER_SESSION_PERMISSIONS,
+            ]
+        })
+        for later in (
+            {"action": "shell", "resource": "specific", "effect": "allow"},
+            {"action": "*", "resource": "*", "effect": "allow"},
+            {"action": "subagent", "resource": "*", "effect": "ask"},
+        ):
+            with self.subTest(later=later):
+                with self.assertRaises(bridge.BridgeUpstreamError) as ctx:
+                    bridge._require_reviewer_session_rules({
+                        "permissions": [
+                            *bridge.REVIEWER_SESSION_PERMISSIONS, later,
+                        ]
+                    })
+                self.assertFalse(ctx.exception.retryable)
+
+    def test_live_permission_probe_must_return_deny(self):
+        for decision in (
+            {"data": {"id": "per-probe", "effect": "allow"}},
+            {"data": {"id": "per-probe", "effect": "ask"}},
+            {"data": {"id": "per-probe"}},
+            {"not": "an envelope"},
+        ):
+            with self.subTest(decision=decision):
+                session = {"data": {
+                    "id": "private-session",
+                    "permissions": list(bridge.REVIEWER_SESSION_PERMISSIONS),
+                }}
+                with patch.object(bridge, "opencode_call", side_effect=[
+                    (200, '{"data":{"id":"private-session"}}'),
+                    (200, bridge.json.dumps(session)),
+                    (204, ""),
+                    (204, ""),
+                    (200, bridge.json.dumps(decision)),
+                    (204, ""),
+                ]) as transport:
+                    with self.assertRaises(bridge.BridgeUpstreamError) as ctx:
+                        bridge._create_review_session(
+                            {"providerID": "opencode", "id": "test-route"}
+                        )
+                self.assertFalse(ctx.exception.retryable)
                 self.assertEqual(transport.call_args_list[-1].args[0], "DELETE")
 
     def test_preflight_retryable_exit_status_is_distinct_from_protocol_failure(self):

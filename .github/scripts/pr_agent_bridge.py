@@ -21,8 +21,9 @@ Inference hardening:
   server runs with its default tool surface (both overrides are rejected
   by the free tier). The bridge creates each session with an explicit
   session-level `Permission.Ruleset` that denies the v2 `shell` and
-  `subagent` tool actions, and verifies the server reported those rules
-  before submitting the prompt;
+  `subagent` tool actions, verifies the reported rules still decide `deny`
+  under OpenCode's last-match-wins evaluation, and probes the live session
+  permission endpoint for both actions before submitting the prompt;
 - the server and the bridge both bind 127.0.0.1 only. A Docker action
   cannot reach runner loopback, so the workflow runs the pinned PR-Agent
   package directly on the runner instead of in a container;
@@ -36,6 +37,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import fnmatch
 import json
 import os
 import sys
@@ -135,6 +137,8 @@ def opencode_call(method: str, path: str, payload: Dict[str, Any] | None, timeou
         stage = "select-agent"
     elif method == "POST" and path.endswith("/model"):
         stage = "select-model"
+    elif method == "POST" and path.endswith("/permission"):
+        stage = "probe-permissions"
     elif method == "GET" and path.endswith("/message"):
         stage = "read-messages"
     elif method == "GET" and path.startswith("/api/session/"):
@@ -205,12 +209,35 @@ def _session_info(session_id: str, stage: str = "read session") -> Dict[str, Any
     return info
 
 
+def _last_rule_index(permissions: list, rule: Dict[str, str]) -> int:
+    """Index of the last rule that is exactly the one we requested."""
+    expected = (rule["action"], rule["resource"], rule["effect"])
+    index = -1
+    for position, candidate in enumerate(permissions):
+        if not isinstance(candidate, dict):
+            continue
+        actual = (
+            candidate.get("action"),
+            candidate.get("resource"),
+            candidate.get("effect"),
+        )
+        if actual == expected:
+            index = position
+    return index
+
+
 def _require_reviewer_session_rules(info: Dict[str, Any]) -> None:
-    """Fail closed unless the server reports the reviewer deny rules.
+    """Fail closed unless the server still decides `deny` for both actions.
 
     The session is only safe when OpenCode itself returns the ruleset we
     requested: a server that ignored `permissions` must never run the
     reviewer prompt with the agent's wildcard defaults still in force.
+
+    Presence alone is not enough. OpenCode merges the agent ruleset first and
+    evaluates the result with last-match-wins, so a later matching `allow`
+    (or `ask`) rule would override the deny even though the deny entry is
+    still reported. Any matching rule after our deny must therefore also be
+    a deny.
     """
     permissions = info.get("permissions")
     if not isinstance(permissions, list):
@@ -219,15 +246,59 @@ def _require_reviewer_session_rules(info: Dict[str, Any]) -> None:
             retryable=False,
         )
     for rule in REVIEWER_SESSION_PERMISSIONS:
-        if not any(
-            isinstance(candidate, dict)
-            and candidate.get("action") == rule["action"]
-            and candidate.get("resource") == rule["resource"]
-            and candidate.get("effect") == rule["effect"]
-            for candidate in permissions
-        ):
+        position = _last_rule_index(permissions, rule)
+        if position < 0:
             raise BridgeUpstreamError(
                 "OpenCode v2 session did not enforce reviewer permissions",
+                retryable=False,
+            )
+        for later in permissions[position + 1:]:
+            if not isinstance(later, dict):
+                continue
+            pattern = later.get("action")
+            if not isinstance(pattern, str):
+                continue
+            if (
+                fnmatch.fnmatchcase(rule["action"], pattern)
+                and later.get("effect") != "deny"
+            ):
+                raise BridgeUpstreamError(
+                    "OpenCode v2 session did not enforce reviewer permissions",
+                    retryable=False,
+                )
+
+
+def _require_reviewer_permission_enforcement(session_id: str) -> None:
+    """Probe the server's live permission decision, without a model turn.
+
+    `POST /api/session/:id/permission` runs the same effective-rules
+    evaluation that a tool assertion uses (agent rules followed by the
+    session rules, last match wins). It spends no reviewer tokens and creates
+    no request when the action is already denied, so this is a real
+    enforcement check rather than a shape check on the reported rules.
+    """
+    quoted = urllib.parse.quote(session_id, safe="")
+    for rule in REVIEWER_SESSION_PERMISSIONS:
+        status, raw = opencode_call(
+            "POST",
+            f"/api/session/{quoted}/permission",
+            {"action": rule["action"], "resources": [rule["resource"]]},
+            15,
+        )
+        _require_opencode_status(status, (200,), "verify reviewer permissions")
+        try:
+            envelope = json.loads(raw)
+        except (TypeError, ValueError):
+            raise BridgeUpstreamError(
+                "malformed OpenCode v2 permission envelope", retryable=False
+            ) from None
+        decision = envelope.get("data") if isinstance(envelope, dict) else None
+        effect = decision.get("effect") if isinstance(decision, dict) else None
+        if effect != "deny":
+            label = effect if effect in ("allow", "ask") else "missing"
+            raise BridgeUpstreamError(
+                "OpenCode v2 session did not enforce reviewer permissions "
+                f"(effect={label})",
                 retryable=False,
             )
 
@@ -359,6 +430,9 @@ def _create_review_session(model: Dict[str, str]) -> str:
             "POST", f"/api/session/{quoted}/model", {"model": model}, 15
         )
         _require_opencode_status(status, (204,), "select pinned model")
+        # Exercise the merged ruleset exactly as a tool assertion would,
+        # before any reviewer prompt can run.
+        _require_reviewer_permission_enforcement(session_id)
     except Exception:
         _delete_review_session(session_id)
         raise
@@ -369,7 +443,8 @@ def preflight_review_session() -> None:
     """No-LLM ABI check on the actual pinned OpenCode v2 server.
 
     Uses exactly the same authenticated session/agent/model control path as
-    real review, and never spends reviewer tokens or modifies the worktree.
+    real review, including the live `shell`/`subagent` permission probe, and
+    never spends reviewer tokens or modifies the worktree.
     """
     provider, model_id = split_model(inference_model(""))
     session_id = _create_review_session({"providerID": provider, "id": model_id})
