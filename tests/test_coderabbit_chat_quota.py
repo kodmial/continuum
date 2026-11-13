@@ -1139,8 +1139,11 @@ comments = [
   {{id: 901, in_reply_to_id: finding, user: {{login: 'coderabbitai[bot]'}},
     created_at: expired, body: chatBody}},
 ];
-async function attempt(identityUnavailable) {{
+async function attempt({{
+  identityUnavailable = false, login = 'kodmial',
+}} = {{}}) {{
   authenticatedFailure = identityUnavailable;
+  authenticatedLogin = login;
   posted = [];
   const state = {{remaining: 1, notBeforeMs: 0}};
   const requested = await requestCodeRabbitThreadVerification(
@@ -1149,8 +1152,10 @@ async function attempt(identityUnavailable) {{
   return {{requested, posted: posted.length, remaining: state.remaining}};
 }}
 const results = {{
-  resolved: await attempt(false),
-  unresolved: await attempt(true),
+  resolved: await attempt(),
+  emptyLogin: await attempt({{login: ''}}),
+  whitespaceLogin: await attempt({{login: '   '}}),
+  unresolved: await attempt({{identityUnavailable: true}}),
 }};
 process.stdout.write(JSON.stringify(results));
 """
@@ -1160,10 +1165,13 @@ process.stdout.write(JSON.stringify(results));
         self.assertEqual(result["resolved"]["posted"], 1)
         self.assertEqual(result["resolved"]["remaining"], 0)
         # Without that identity an acknowledged retry cannot be recognised,
-        # so the retry is deferred instead of risked twice.
-        self.assertEqual(result["unresolved"]["requested"], 0)
-        self.assertEqual(result["unresolved"]["posted"], 0)
-        self.assertEqual(result["unresolved"]["remaining"], 1)
+        # so the retry is deferred instead of risked twice. An empty or
+        # whitespace-only login is unresolved too.
+        for key in ("emptyLogin", "whitespaceLogin", "unresolved"):
+            with self.subTest(identity=key):
+                self.assertEqual(result[key]["requested"], 0)
+                self.assertEqual(result[key]["posted"], 0)
+                self.assertEqual(result[key]["remaining"], 1)
 
 
 def unresolved_collector_source() -> str:
