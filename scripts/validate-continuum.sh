@@ -133,10 +133,12 @@ PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=src python3 -m unittest -v \
 printf '%s\n' \
   'CodeRabbit repair-handoff regression evidence:' \
   'setup: a newer TAP_PAT verification-pending handoff follows an older trusted verification and UNRESOLVED answer at the same HEAD; the authenticated-login lookup then fails, returns an empty login, and finally succeeds.' \
-  'assertions: an unresolved posting identity posts no verification reply and dispatches no repair batch, while the resolved identity sends one fresh exact-HEAD verification from the same handoff without dispatching repair.'
+  'setup: the repair-handoff comment list is also unreadable, so the decision must defer instead of redispatching the older UNRESOLVED answer.' \
+  'assertions: an unresolved posting identity or unreadable handoff posts no verification reply and dispatches no repair batch, while the resolved identity sends one fresh exact-HEAD verification from the same handoff without dispatching repair.'
 PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=src python3 -m unittest -v \
   tests.test_coderabbit_chat_quota.AutoMergeThreadVerifierTests.test_unresolved_posting_identity_defers_handoff_verification_decision \
   tests.test_coderabbit_chat_quota.AutoMergeThreadVerifierTests.test_repair_handoff_triggers_fresh_verification_when_head_is_unchanged \
+  tests.test_coderabbit_chat_quota.AutoMergeThreadVerifierTests.test_unreadable_repair_handoff_defers_the_repair_decision \
   tests.test_coderabbit_unresolved_dispatch.CodeRabbitBatchContractTests.test_repair_completion_handoff_is_durable_serialized_and_unforgeable \
   tests.test_coderabbit_unresolved_dispatch.CodeRabbitBatchContractTests.test_pending_repair_handoff_blocks_redispatch_until_reverified
 
