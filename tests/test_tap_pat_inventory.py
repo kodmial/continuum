@@ -102,7 +102,10 @@ class CoverageTests(unittest.TestCase):
         # Live canary observation adds one recovery-comment/chaining binding,
         # CodeRabbit collection reads the marker-author login once, and the
         # durable PR-Agent retry-state preflight adds one delegated-aware read.
-        self.assertEqual(len(bindings), 125)
+        # kodmial/continuum#446 adds the dispatched-receipt correlation step,
+        # which binds TAP_PAT twice (env token + github-script token) under one
+        # exactly-once claim identity.
+        self.assertEqual(len(bindings), 127)
         gaps = inventory.coverage_gaps(WORKFLOWS_DIR)
         self.assertEqual(gaps, [], f"uninventoried TAP_PAT bindings: {gaps}")
 

@@ -474,6 +474,18 @@ class ContinuumTest < Minitest::Test
           end
           next
         end
+        # kodmial/continuum#446: the exact-HEAD CI-repair correlation is packed
+        # into one optional dispatch input for the same 25-input limit.
+        if key == 'ci_repair_identity' &&
+           File.basename(path) == 'continuum-opencode.yml'
+          assert_equal 'string', value.fetch('type')
+          %w[ci_attempt_id ci_head_sha].each do |packed|
+            assert_includes job.fetch('with').fetch(packed),
+                            'inputs.ci_repair_identity',
+                            "continuum-opencode.yml: `#{packed}` must unpack the packed CI-repair identity"
+          end
+          next
+        end
         expected = value['type'] == 'choice' ? 'string' : value['type']
         assert_equal expected, call.fetch('inputs').fetch(key).fetch('type')
         # continuum_ref is accepted by dispatch callers so isolated retries can
@@ -3282,11 +3294,16 @@ class ContinuumTest < Minitest::Test
   def test_every_whitelisted_mode_is_dispatched_by_a_core_workflow
     modes = dispatch_modes
     refute_empty modes
-    calls = all_dispatch_calls
-    refute_empty calls, 'no core workflow performs a /dispatches call'
+    # kodmial/continuum#446: ci-fix is dispatched by the serialized admission
+    # owner, a shipped engine script, instead of by inline workflow YAML.
+    sources = all_dispatch_calls + [File.read(File.join(ROOT, '.github/scripts/ci_repair_admission.py'))]
+    refute_empty sources, 'no core workflow performs a /dispatches call'
     modes.each do |mode|
-      dispatched = calls.any? do |call|
-        call.include?(%(-f "inputs[mode]=#{mode}")) || call.include?(%(mode: '#{mode}'))
+      dispatched = sources.any? do |call|
+        call.include?(%(-f "inputs[mode]=#{mode}")) ||
+          call.include?(%(mode: '#{mode}')) ||
+          call.include?(%('inputs[mode]': '#{mode}')) ||
+          call.include?("inputs[mode]=#{mode}")
       end
       assert dispatched, "mode #{mode} is whitelisted but no core workflow dispatches it"
     end
@@ -3782,6 +3799,518 @@ class ContinuumTest < Minitest::Test
                     'observed state must not expire on a fixed 48h horizon'
   end
 
+  # ------------------------------------------------- CI-repair correlation
+
+  # The correlation step is the only place that turns a queued ci-fix run into
+  # a dispatched receipt. #449 requires both halves of the dispatch identity:
+  # a mutable live HEAD or a same-HEAD active claim is not proof that this run
+  # owns that attempt.
+  def ci_repair_correlation_script
+    workflow = yaml(File.join(ROOT, '.github/workflows/continuum-opencode.yml'))
+    step = workflow.fetch('jobs').values
+                   .flat_map { |job| job['steps'] || [] }
+                   .find { |entry| entry['name'] == 'Record exact-HEAD CI repair dispatch correlation' }
+    refute_nil step, 'the exact-HEAD CI-repair correlation step is missing'
+    step.fetch('with').fetch('script')
+  end
+
+  def ci_repair_receipt(attempt, status, comment_id:, head: 'a' * 40)
+    {
+      'id' => comment_id,
+      'body' => "<!-- continuum-ci-repair-receipt v=1 repo=kodmial/continuum " \
+                "pr=449 head=#{head} attempt=#{attempt} status=#{status} -->",
+      'author_association' => 'OWNER',
+      'user' => { 'login' => 'kodmial' },
+    }
+  end
+
+  def run_ci_repair_correlation_cases(cases)
+    harness = <<~'JS'
+      const source = process.argv[1];
+      const payload = JSON.parse(process.argv[2]);
+      const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor;
+      (async () => {
+        const results = {};
+        for (const item of payload.cases) {
+          process.env.PR_NUMBER = String(payload.pullNumber);
+          process.env.CI_ATTEMPT_ID = item.attempt === undefined ? '' : item.attempt;
+          process.env.CI_HEAD_SHA = item.head === undefined ? payload.head : item.head;
+          process.env.DISPATCH_RUN_ID = '9001';
+          const calls = { warnings: [], notices: [], created: [] };
+          const core = {
+            warning: message => calls.warnings.push(String(message)),
+            notice: message => calls.notices.push(String(message)),
+            info: message => calls.notices.push(String(message)),
+          };
+          const github = {
+            paginate: async () => {
+              if (item.paginateError) throw new Error(item.paginateError);
+              return item.comments || [];
+            },
+            rest: {
+              issues: {
+                listComments: async () => ({}),
+                createComment: async args => {
+                  calls.created.push(args);
+                  return { data: { id: 1000 } };
+                },
+              },
+              users: {
+                getAuthenticated: async () => ({ data: { login: 'github-actions[bot]' } }),
+              },
+            },
+          };
+          try {
+            await new AsyncFunction('github', 'context', 'core', source)(
+              github,
+              { repo: { owner: 'Kodmial', repo: 'Continuum' } },
+              core
+            );
+            calls.ok = true;
+          } catch (error) {
+            calls.ok = false;
+            calls.error = String((error && error.message) || error);
+          }
+          results[item.name] = calls;
+        }
+        process.stdout.write(JSON.stringify(results));
+      })().catch(error => {
+        console.error(error);
+        process.exit(1);
+      });
+    JS
+    stdout, stderr, status = Open3.capture3(
+      'node', '-e', harness, ci_repair_correlation_script,
+      JSON.generate('pullNumber' => 449, 'head' => 'a' * 40, 'cases' => cases)
+    )
+    assert status.success?, stderr
+    JSON.parse(stdout)
+  end
+
+  def test_ci_repair_correlation_requires_both_identity_parts
+    script = ci_repair_correlation_script
+    assert_includes script, 'if (!/^[0-9a-f]{40}$/.test(head))'
+    assert_includes script, 'if (!/^[A-Za-z0-9][A-Za-z0-9._:\-]{7,127}$/.test(requestedAttempt))'
+    assert_includes script, 'no verified attempt identity'
+    refute_includes script, '[...observations].reverse()',
+                    'correlation must never discover an attempt from the live HEAD'
+    assert_includes script, 'const attempt = requestedAttempt;'
+    assert_includes script, 'for (const item of observations) latest.set(item.attempt, item);'
+    assert_includes script, "item.status === 'claimed' || item.status === 'ambiguous'"
+  end
+
+  def test_ci_repair_correlation_failure_and_attempt_cases
+    other_head = 'b' * 40
+    results = run_ci_repair_correlation_cases(
+      [
+        {
+          'name' => 'read-failure',
+          'attempt' => 'ci-attempt-0001',
+          'paginateError' => 'pagination unavailable',
+        },
+        {
+          'name' => 'head-only',
+          'comments' => [ci_repair_receipt('ci-attempt-0001', 'claimed', comment_id: 1)],
+        },
+        {
+          'name' => 'advanced-head',
+          'attempt' => 'ci-attempt-0001',
+          'comments' => [ci_repair_receipt('ci-attempt-0002', 'claimed', comment_id: 2, head: other_head)],
+        },
+        {
+          'name' => 'legacy-no-head-after-advance',
+          'head' => '',
+          'attempt' => '',
+          'comments' => [ci_repair_receipt('ci-attempt-0002', 'claimed', comment_id: 2, head: other_head)],
+        },
+        {
+          'name' => 'different-active',
+          'attempt' => 'ci-attempt-0001',
+          'comments' => [ci_repair_receipt('ci-attempt-0002', 'claimed', comment_id: 2)],
+        },
+        {
+          'name' => 'rejected',
+          'attempt' => 'ci-attempt-0001',
+          'comments' => [
+            ci_repair_receipt('ci-attempt-0001', 'claimed', comment_id: 1),
+            ci_repair_receipt('ci-attempt-0001', 'rejected', comment_id: 2),
+          ],
+        },
+        {
+          'name' => 'missing',
+          'attempt' => 'ci-attempt-0001',
+        },
+        {
+          'name' => 'correlated',
+          'attempt' => 'ci-attempt-0001',
+          'comments' => [ci_repair_receipt('ci-attempt-0001', 'claimed', comment_id: 1)],
+        },
+      ]
+    )
+
+    read_failure = results.fetch('read-failure')
+    assert read_failure.fetch('ok'), read_failure
+    assert_empty read_failure.fetch('created')
+    assert(read_failure.fetch('warnings').any? { |warning| warning.include?('Could not read CI repair receipts') },
+           read_failure.fetch('warnings'))
+
+    # A correlation read failure returns from that step only: the admitted
+    # CI-repair step must not be gated on it or the run would be silently lost.
+    workflow = yaml(File.join(ROOT, '.github/workflows/continuum-opencode.yml'))
+    repair = workflow.fetch('jobs').values
+                       .flat_map { |job| job['steps'] || [] }
+                       .find { |step| step['name'] == 'Fix failed blocking workflow' }
+    refute_nil repair
+    assert_includes repair['if'].to_s, "github.event_name == 'workflow_dispatch'"
+    assert_includes repair['if'].to_s, "inputs.mode == 'ci-fix'"
+    refute_match(/correlation/i, repair['if'].to_s,
+                 'a correlation-read failure must not gate the admitted repair')
+
+    head_only = results.fetch('head-only')
+    assert head_only.fetch('ok'), head_only
+    assert_empty head_only.fetch('created'),
+                 'a same-HEAD claim needs the dispatched attempt identity'
+    assert(head_only.fetch('notices').any? { |notice| notice.include?('no verified attempt identity') },
+           head_only.fetch('notices'))
+
+    advanced = results.fetch('advanced-head')
+    assert advanced.fetch('ok'), advanced
+    assert_empty advanced.fetch('created'),
+                 'an H1 run must never be correlated to an H2 claim'
+
+    legacy = results.fetch('legacy-no-head-after-advance')
+    assert legacy.fetch('ok'), legacy
+    assert_empty legacy.fetch('created'),
+                 'a legacy run with no exact-HEAD identity must never use the live PR HEAD'
+    assert(legacy.fetch('notices').any? { |notice| notice.include?('no verified exact-HEAD dispatch evidence') },
+           legacy.fetch('notices'))
+
+    different = results.fetch('different-active')
+    assert different.fetch('ok'), different
+    assert_empty different.fetch('created'),
+                 'a requested attempt must not borrow another active attempt'
+    assert(different.fetch('notices').any? { |notice| notice.include?('not an active claim (no receipt)') },
+           different.fetch('notices'))
+
+    rejected = results.fetch('rejected')
+    assert rejected.fetch('ok'), rejected
+    assert_empty rejected.fetch('created'), 'a spent attempt must stay spent'
+    assert(rejected.fetch('notices').any? { |notice| notice.include?('not an active claim (rejected)') },
+           rejected.fetch('notices'))
+
+    missing = results.fetch('missing')
+    assert missing.fetch('ok'), missing
+    assert_empty missing.fetch('created'), 'a missing attempt must not be invented'
+    assert(missing.fetch('notices').any? { |notice| notice.include?('not an active claim (no receipt)') },
+           missing.fetch('notices'))
+
+    correlated = results.fetch('correlated')
+    assert correlated.fetch('ok'), correlated
+    assert_equal 1, correlated.fetch('created').length, correlated.fetch('created')
+    body = correlated.fetch('created').first.fetch('body')
+    assert_includes body, 'attempt=ci-attempt-0001'
+    assert_includes body, 'status=dispatched'
+    assert_includes body, 'run=9001'
+  end
+
+  # A rotated TAP_PAT must not turn a legacy 204 receipt into an ignored
+  # lookalike, while an unrelated commenter must still be unable to suppress
+  # or authorize a repair. Exercise the real admission functions.
+  def test_ci_repair_admission_preserves_a_verified_legacy_writer
+    script = <<~'PY'
+      import json
+      import sys
+
+      sys.path.insert(0, 'src')
+      sys.path.insert(0, '.github/scripts')
+
+      from continuum.ci_repair_admission import run_proves_historical_receipt
+      from continuum.ci_repair_receipt import build_receipt, render_receipt
+      import ci_repair_admission as admission
+
+      repository = 'kodmial/continuum'
+      pull_number = 449
+      head_sha = 'a' * 40
+      attempt = 'ci-attempt-0001'
+      receipt = build_receipt(
+          repository=repository,
+          pull_number=pull_number,
+          head_sha=head_sha,
+          attempt_id=attempt,
+          status='dispatched',
+      )
+      claimed = build_receipt(
+          repository=repository,
+          pull_number=pull_number,
+          head_sha=head_sha,
+          attempt_id=attempt,
+          status='claimed',
+      )
+      rejected = build_receipt(
+          repository=repository,
+          pull_number=pull_number,
+          head_sha=head_sha,
+          attempt_id=attempt,
+          status='rejected',
+      )
+      other_rejected = build_receipt(
+          repository=repository,
+          pull_number=pull_number,
+          head_sha=head_sha,
+          attempt_id=attempt,
+          status='rejected',
+      )
+      legacy = {
+          'id': 900,
+          'display_title': 'OpenCode repair PR #449',
+          'head_sha': head_sha,
+          'actor': {'login': 'old-automation'},
+      }
+
+      result = {
+          'legacy': run_proves_historical_receipt(
+              legacy, receipt, author_login='old-automation'),
+          'wrong_pr': run_proves_historical_receipt(
+              dict(legacy, display_title='OpenCode repair PR #450'),
+              receipt, author_login='old-automation'),
+      }
+
+      class Inventory:
+          complete = True
+          reason = ''
+
+          def __init__(self, runs):
+              self.runs = runs
+
+      def comment(association, receipt=receipt, author='old-automation'):
+          return {
+              'body': render_receipt(receipt),
+              'created_at': '2026-11-12T00:00:00Z',
+              'author_association': association,
+              'user': {'login': author},
+          }
+
+      def writers(
+          association,
+          runs,
+          baseline='2026-11-11T00:00:00Z',
+          receipt=receipt,
+          legacy_retired='2026-11-11T00:00:00Z',
+          comments=None,
+      ):
+          admission._workflow_runs = lambda *args, **kwargs: Inventory(runs)
+          history = (
+              comments if comments is not None
+              else [comment(association, receipt)]
+          )
+          return admission._historical_receipt_writers(
+              repository,
+              pull_number,
+              head_sha,
+              history,
+              workflow='continuum-opencode.yml',
+              owner_login='',
+              trusted_logins=('github-actions[bot]',),
+              baseline=baseline,
+              legacy_retired=legacy_retired,
+          )
+
+      verified, verified_hold = writers('NONE', [legacy])
+      result['verified'] = list(verified)
+      result['verified_hold'] = verified_hold
+      same_verified, same_writer_rejection_hold = writers(
+          'MEMBER',
+          [],
+          comments=[
+              comment('MEMBER', claimed),
+              comment('MEMBER', rejected),
+          ],
+      )
+      result['same_writer_rejection_verified'] = list(same_verified)
+      result['same_writer_rejection_hold'] = same_writer_rejection_hold
+      different_verified, different_writer_rejection_hold = writers(
+          'MEMBER',
+          [],
+          comments=[
+              comment('MEMBER', claimed),
+              comment('MEMBER', other_rejected, author='somebody-else'),
+          ],
+      )
+      result['different_writer_rejection_verified'] = list(different_verified)
+      result['different_writer_rejection_hold'] = (
+          different_writer_rejection_hold)
+      _, member_hold = writers('MEMBER', [])
+      _, none_hold = writers('NONE', [])
+      result['member_hold'] = member_hold
+      result['none_hold'] = none_hold
+      _, missing_baseline_hold = writers('NONE', [], baseline=None)
+      result['missing_baseline_hold'] = missing_baseline_hold
+      _, pre_baseline_dispatch_hold = writers(
+          'NONE', [], baseline='2026-11-12T00:05:00Z')
+      result['pre_baseline_dispatch_hold'] = pre_baseline_dispatch_hold
+      _, equal_baseline_hold = writers(
+          'NONE', [], baseline='2026-11-12T00:00:00Z')
+      result['equal_baseline_hold'] = equal_baseline_hold
+      _, pre_baseline_claim_hold = writers(
+          'NONE', [], baseline='2026-11-12T00:05:00Z', receipt=claimed)
+      result['pre_baseline_claim_hold'] = pre_baseline_claim_hold
+      _, pre_baseline_member_claim_hold = writers(
+          'MEMBER', [], baseline='2026-11-12T00:05:00Z', receipt=claimed)
+      result['pre_baseline_member_claim_hold'] = pre_baseline_member_claim_hold
+      _, post_baseline_legacy_claim_hold = writers(
+          'MEMBER', [], baseline='2026-11-11T00:00:00Z', receipt=claimed)
+      result['post_baseline_legacy_claim_hold'] = post_baseline_legacy_claim_hold
+      _, post_baseline_legacy_dispatch_hold = writers(
+          'MEMBER', [], baseline='2026-11-11T00:00:00Z')
+      result['post_baseline_legacy_dispatch_hold'] = (
+          post_baseline_legacy_dispatch_hold)
+      _, post_baseline_legacy_claim_ignored = writers(
+          'NONE', [], baseline='2026-11-11T00:00:00Z', receipt=claimed)
+      result['post_baseline_legacy_claim_ignored'] = (
+          post_baseline_legacy_claim_ignored)
+      _, post_baseline_legacy_dispatch_ignored = writers(
+          'NONE', [], baseline='2026-11-11T00:00:00Z')
+      result['post_baseline_legacy_dispatch_ignored'] = (
+          post_baseline_legacy_dispatch_ignored)
+      _, post_baseline_none_overlap_hold = writers(
+          'NONE', [], baseline='2026-11-11T00:00:00Z', legacy_retired=None)
+      result['post_baseline_none_overlap_hold'] = post_baseline_none_overlap_hold
+      _, post_baseline_none_before_retirement_hold = writers(
+          'NONE',
+          [],
+          baseline='2026-11-11T00:00:00Z',
+          legacy_retired='2026-11-12T00:00:00Z',
+      )
+      result['post_baseline_none_before_retirement_hold'] = (
+          post_baseline_none_before_retirement_hold)
+      _, post_baseline_none_claim_overlap_hold = writers(
+          'NONE', [], baseline='2026-11-11T00:00:00Z',
+          receipt=claimed, legacy_retired=None)
+      result['post_baseline_none_claim_overlap_hold'] = (
+          post_baseline_none_claim_overlap_hold)
+      _, post_baseline_none_retired_lookalike = writers(
+          'NONE',
+          [],
+          baseline='2026-11-11T00:00:00Z',
+          receipt=claimed,
+          legacy_retired='2026-11-11T00:00:00Z',
+      )
+      result['post_baseline_none_retired_lookalike'] = (
+          post_baseline_none_retired_lookalike)
+      print(json.dumps(result))
+    PY
+    stdout, stderr, status = Open3.capture3(
+      {
+        'PYTHONDONTWRITEBYTECODE' => '1',
+        'PYTHONPATH' => File.join(ROOT, 'src')
+      },
+      'python3', '-c', script, chdir: ROOT
+    )
+    assert status.success?, stderr
+    result = JSON.parse(stdout)
+    assert result.fetch('legacy'),
+           'a legacy unmarked repair run must prove its historical writer'
+    refute result.fetch('wrong_pr'),
+           'a different PR title must never prove the historical writer'
+    assert_equal ['old-automation'], result.fetch('verified')
+    refute result.fetch('verified_hold')
+    assert_empty result.fetch('same_writer_rejection_verified'),
+                 'a same-writer rejection must clear its claimed receipt'
+    refute result.fetch('same_writer_rejection_hold'),
+           'a same-writer rejected attempt must not hold admission'
+    assert_empty result.fetch('different_writer_rejection_verified'),
+                 'a rejection from another author must not verify the claim'
+    assert result.fetch('different_writer_rejection_hold'),
+           'a rejection from another author must not clear the claimed receipt'
+    assert result.fetch('member_hold'),
+           'an unproved collaborator receipt must hold admission'
+    refute result.fetch('none_hold'),
+           'a post-baseline lookalike from an unrelated commenter must not ' \
+           'suppress a repair'
+    assert result.fetch('missing_baseline_hold'),
+           'a receipt with no established writer baseline must hold admission'
+    assert result.fetch('pre_baseline_dispatch_hold'),
+           'a pre-baseline dispatched receipt with a deleted run must hold admission'
+    assert result.fetch('equal_baseline_hold'),
+           'a receipt at the second-precision baseline must hold admission'
+    assert result.fetch('pre_baseline_claim_hold'),
+           'a pre-baseline claim can be the only trace of an accepted dispatch ' \
+           'whose outcome was not persisted and whose run was deleted, so it ' \
+           'must hold admission'
+    assert result.fetch('pre_baseline_member_claim_hold'),
+           'a pre-baseline claim from a plausible writer must hold admission'
+    assert result.fetch('post_baseline_legacy_claim_hold'),
+           'a post-baseline claim from an overlapping older controller with ' \
+           'repository write access must hold admission'
+    assert result.fetch('post_baseline_legacy_dispatch_hold'),
+           'a post-baseline dispatch from an overlapping older controller with ' \
+           'repository write access must hold admission'
+    refute result.fetch('post_baseline_legacy_claim_ignored'),
+           'a post-baseline legacy claim lookalike must not suppress a repair'
+    refute result.fetch('post_baseline_legacy_dispatch_ignored'),
+           'a post-baseline legacy dispatch lookalike must not suppress a repair'
+    assert result.fetch('post_baseline_none_overlap_hold'),
+           'a post-baseline NONE-association legacy dispatch with a deleted run ' \
+           'must hold until older controllers are retired'
+    assert result.fetch('post_baseline_none_claim_overlap_hold'),
+           'a post-baseline NONE-association legacy claim with a deleted run ' \
+           'must hold until older controllers are retired'
+    assert result.fetch('post_baseline_none_before_retirement_hold'),
+           'a receipt created at the retirement boundary must hold admission'
+    refute result.fetch('post_baseline_none_retired_lookalike'),
+           'after the retirement record an unrelated NONE lookalike must not ' \
+           'suppress a repair'
+  end
+
+  # The executor cannot repair a mutable branch tip. Every non-recovery ci-fix
+  # run must prove its admitted SHA before any agent step, and a missing or
+  # malformed SHA fails closed instead of skipping the binding.
+  def test_ci_repair_executor_fails_closed_without_the_admitted_head
+    workflow = yaml(File.join(ROOT, '.github/workflows/continuum-opencode.yml'))
+    steps = workflow.fetch('jobs').values.flat_map { |job| job['steps'] || [] }
+    binding_index = steps.index { |step| step['name'] == 'Bind CI repair to the admitted exact HEAD' }
+    refute_nil binding_index, 'the CI-repair HEAD binding step is missing'
+    binding = steps.fetch(binding_index)
+    condition = binding.fetch('if')
+    assert_includes condition, "inputs.mode == 'ci-fix'"
+    refute_includes condition, "inputs.ci_head_sha != ''",
+                    'an empty admitted SHA must fail closed, not skip the binding'
+    assert_includes condition, "steps.recovery_restore.outputs.resumed != 'true'"
+
+    body = binding.fetch('run')
+    assert_includes body, 'CI-repair dispatch carried no usable admitted HEAD SHA'
+    assert_includes body, 'exit 1'
+    assert_includes body, 'git checkout --force --detach "$admitted"'
+    assert_includes body, 'git rev-parse HEAD'
+
+    repair_index = steps.index { |step| step['name'] == 'Run OpenCode' }
+    refute_nil repair_index, 'the OpenCode execution step is missing'
+    assert_operator binding_index, :<, repair_index,
+                    'HEAD binding must run before any repair work'
+  end
+
+  # The self-dogfood caller must forward the packed identity exactly like the
+  # installed consumer stub, or its admitted run can never correlate or bind.
+  def test_self_dogfood_opencode_caller_forwards_ci_repair_identity
+    caller = yaml(File.join(ROOT, '.github/workflows/opencode.yml'))
+    inputs = events(caller).fetch('workflow_dispatch').fetch('inputs')
+    assert inputs.key?('ci_repair_identity'),
+           'the self-dogfood caller must declare the packed CI-repair identity'
+    refute inputs.key?('packaging_repair_label'),
+           'the packed identity replaces a presentation-only dispatch slot'
+    assert_match(/\[ci-attempt:\{1\}\]/,
+                 caller.fetch('run-name').to_s,
+                 'the dogfood run name must carry the correlation attempt marker')
+
+    with = caller.fetch('jobs').fetch('call').fetch('with')
+    %w[ci_attempt_id ci_head_sha].each do |key|
+      assert_includes with.fetch(key), "inputs.ci_repair_identity",
+                      "the self-dogfood caller must unpack #{key} from ci_repair_identity"
+    end
+    refute with.key?('packaging_repair_label'),
+           'the removed dispatch input must not be forwarded as an empty override'
+  end
+
   # ---------------------------------------------------------------- watchdog
 
   WATCHDOG = 'continuum-opencode-watchdog.yml'
@@ -4205,10 +4734,10 @@ class ContinuumTest < Minitest::Test
     end
   end
 
-  # The dispatch path's guards, stale check, lock, and repair dispatch are the
-  # whole mechanism this change ports. Assert the behaviour, not the shape: a
-  # body that merely compares the conclusion and then falls through would pass
-  # a presence check while changing nothing and repairing nothing.
+  # The dispatch path's guards and admission delegation are the whole
+  # mechanism this change ports. Assert the behaviour, not the shape: a body
+  # that merely compares the conclusion and then falls through would pass a
+  # presence check while changing nothing and repairing nothing.
   def test_opencode_repair_dispatch_body_guards_locks_and_repairs
     body = workflow_body('continuum-opencode-repair.yml')
     job = body[/^  ci-repair-dispatch:\n(.*?)(?=^  \S|\z)/m, 1]
@@ -4227,20 +4756,35 @@ class ContinuumTest < Minitest::Test
     assert_operator 4, :<=, script.scan('exit 0').size,
                     'each guard must be a skip, not a fall-through'
 
-    # The lock is one attempt per head: check before add, and the ci-fix
-    # dispatch happens only after the label is on the PR.
-    lock_check = script.index('grep -Fxq "$CI_REPAIR_LABEL"')
-    lock_add = script.index(%(-f "labels[]=$CI_REPAIR_LABEL"))
-    ci_fix = script.index('inputs[mode]=ci-fix')
-    refute_nil lock_check, 'the lock check is gone: repair would repeat on every report'
-    refute_nil lock_add, 'the lock is never taken'
-    refute_nil ci_fix, 'no ci-fix dispatch remains on the dispatch path'
-    assert_operator lock_check, :<, ci_fix, 'the lock must be checked before repair is dispatched'
-    assert_operator lock_add, :<, ci_fix, 'the lock must be taken before repair is dispatched'
+    # kodmial/continuum#446: admission and the ci-fix dispatch belong to the
+    # single serialized receipt owner. The shell may not mutate a label to
+    # decide, and it may not dispatch directly.
+    refute_includes script, 'grep -Fxq "$CI_REPAIR_LABEL"',
+                    'a mutable label must never decide CI-repair admission'
+    refute_includes script, %(-f "labels[]=$CI_REPAIR_LABEL"),
+                    'a mutable label must never authorize CI-repair admission'
+    refute_includes script, 'inputs[mode]=ci-fix',
+                    'the serialized admission helper must remain the only dispatcher'
 
-    # A green state clears the lock and wakes the reconciler only after the
-    # latest approved-workflow state is known to be green.
-    assert_includes script, 'All approved workflows passed for $REPORTED_HEAD_SHA; repair lock cleared and auto-merge reconciler woken.'
+    admission = script.index('"$REPAIR_ADMISSION_HELPER"')
+    refute_nil admission, 'the exact-HEAD admission helper must own the repair decision'
+    assert_operator admission, :>, script.index('"$head_sha" != "$REPORTED_HEAD_SHA"'),
+                    'the helper must run only after the stale-head guard'
+    [
+      '--repository "$GITHUB_REPOSITORY"',
+      '--pull-number "$PR_NUMBER"',
+      '--head-sha "$REPORTED_HEAD_SHA"',
+      '--head-ref "$head_ref"',
+      '--workflow "$OPENCODE_WORKFLOW"',
+      '--failing-run-id "${failing_run_id:-}"',
+      '--reported-run-id "$REPORTED_RUN_ID"',
+      '--label "$CI_REPAIR_LABEL"',
+      '--owner-login "$OWNER_LOGIN"'
+    ].each { |argument| assert_includes script, argument, "missing admission argument: #{argument}" }
+
+    # A green state clears the presentation label and wakes the reconciler only
+    # after the latest approved-workflow state is known to be green.
+    assert_includes script, 'All approved workflows passed for $REPORTED_HEAD_SHA; presentation label cleared and auto-merge reconciler woken.'
     assert_includes script, 'actions/workflows/$AUTO_MERGE_WORKFLOW/dispatches',
                     'a green head must wake the auto-merge reconciler'
 
@@ -4249,16 +4793,11 @@ class ContinuumTest < Minitest::Test
     assert_includes script, 'Latest approved workflow',
                     'the surviving event must reconcile the latest failure, not only its own'
 
-    # A non-repairable conclusion must not consume the one attempt the head has.
-    assert_includes script, '"$REPORTED_CONCLUSION" != "success" && "$REPORTED_CONCLUSION" != "failure" && "$REPORTED_CONCLUSION" != "timed_out"'
-
-    # A failed dispatch must release the lock, or the head can never retry.
-    tail = script[ci_fix..]
-    assert_includes tail, 'labels/$CI_REPAIR_LABEL', 'a failed repair dispatch must clear the lock'
-
-    # The failing run id is what ci-fix reruns; the reported id is only the
-    # fallback when the state helper cannot name a newer failing run.
-    assert_includes script, '-f "inputs[run_id]=${failing_run_id:-$REPORTED_RUN_ID}"'
+    # A non-repairable conclusion must not reach the admission owner.
+    conclusion_guard = script.index('"$REPORTED_CONCLUSION" != "success" && "$REPORTED_CONCLUSION" != "failure" && "$REPORTED_CONCLUSION" != "timed_out"')
+    refute_nil conclusion_guard, 'a non-repairable conclusion must be ignored'
+    assert_operator conclusion_guard, :<, admission,
+                    'a cancellation must not consume the attempt'
 
     # The PAT, not GITHUB_TOKEN: the whole point of this path is that the
     # reporting CI may live outside this repository's default token scope.
@@ -4266,11 +4805,14 @@ class ContinuumTest < Minitest::Test
 
     # A dispatch target reached by path must be an env var, never a literal file
     # name, so it can carry the `continuum-` prefix that survives installation.
-    %w[$OPENCODE_WORKFLOW $AUTO_MERGE_WORKFLOW].each do |target|
-      bare = target.delete('$')
-      assert_includes script, "actions/workflows/#{target}/dispatches", "#{target} is never dispatched"
-      assert_match(/^\s+#{bare}: \$\{\{ inputs\./, job, "#{target} must be an env var bound to an input")
-    end
+    # AUTO_MERGE stays a direct shell dispatch; OPENCODE is passed to the
+    # admission owner, which owns the ci-fix dispatch and its run correlation.
+    assert_includes script, 'actions/workflows/$AUTO_MERGE_WORKFLOW/dispatches',
+                    'the auto-merge reconciler is never woken'
+    assert_match(/^\s+AUTO_MERGE_WORKFLOW: \$\{\{ inputs\./, job,
+                 'AUTO_MERGE_WORKFLOW must be an env var bound to an input')
+    assert_match(/^\s+OPENCODE_WORKFLOW: \$\{\{ inputs\./, job,
+                 'OPENCODE_WORKFLOW must be an env var bound to an input')
   end
 
   # Every knob the dispatch path introduced must fall back to the value this
@@ -4334,14 +4876,19 @@ class ContinuumTest < Minitest::Test
       assert_equal "\${{ inputs.#{key} }}", with.fetch(key), "#{key} must be a bare passthrough"
     end
 
-    # Both per-HEAD locks are reset on synchronize/reopen. A stale conflict
-    # label from an older HEAD must never suppress repair of the new HEAD.
-    assert_includes body, '"repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/labels/$CI_REPAIR_LABEL"',
-                    'the per-head reset must clear the configured CI lock'
-    assert_includes body, '"repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/labels/opencode-conflict-repair"',
+    # The synchronize/reopen reset owns the unrelated conflict episode only.
+    # CI-repair admission is a durable exact-HEAD receipt, so a mutable CI
+    # label must never be cleared, restored, or inferred by this reset.
+    reset = step_body(body, 'Update branch or dispatch conflict repair')
+    refute_nil reset, 'the synchronize reset step is missing'
+    assert_includes reset, '"repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/labels/opencode-conflict-repair"',
                     'the per-head reset must clear the stale conflict lock'
-    assert_includes body, 'Reset per-head CI/conflict repair locks',
+    assert_includes reset, 'Reset per-head conflict-repair episode',
                     'synchronize/reopen must start a fresh conflict-repair episode'
+    refute_includes reset, 'CI_REPAIR_LABEL',
+                    'the synchronize reset must not touch CI-repair presentation labels'
+    refute_includes reset, 'opencode-ci-repair',
+                    'the synchronize reset must not hardcode the CI-repair label'
     # The workflow_run path keeps its looser `opencode/*` guard: tightening it
     # would stop repairing heads this controller repaired before.
     assert_includes body, '"$head_ref" != opencode/*'
@@ -4428,6 +4975,8 @@ class ContinuumTest < Minitest::Test
     concurrency = yaml(File.join(ROOT, '.github/workflows/continuum-opencode-repair.yml'))
                   .fetch('concurrency')
     group = concurrency.fetch('group')
+    assert_includes group, 'github.repository',
+                    'the exact-HEAD owner must be per repository'
     assert_includes group, 'github.event.workflow_run.head_sha',
                     'completed-workflow runs must key on their reported head'
     assert_includes group, 'inputs.head_sha',
@@ -4441,6 +4990,8 @@ class ContinuumTest < Minitest::Test
     assert_includes group, "github.event_name == 'workflow_run'"
     assert_includes group, 'unapproved-'
     assert_equal false, concurrency.fetch('cancel-in-progress')
+    assert_equal 'max', concurrency.fetch('queue'),
+                 'a burst must queue behind the owner instead of dropping an admission pass'
   end
 
   def repair_ci_script
@@ -4482,9 +5033,48 @@ class ContinuumTest < Minitest::Test
     exit 0
   BASH
 
-  # Run the real ci-repair shell body with a deterministic fake `gh`, so the
-  # admission, exact-HEAD, fork, PR-association, lock and success-state rules
-  # are exercised as a unit rather than asserted by string presence.
+  # The production admission owner is a Python module. The shell contract
+  # under test is that it delegates every decision and the ci-fix dispatch to
+  # that owner, so this stand-in records its arguments and performs the same
+  # dispatch the real owner would. Receipt/claim semantics have their own
+  # Python suites; here the workflow shell is the unit under test.
+  REPAIR_FAKE_ADMISSION = <<~'PY'
+    import os
+    import subprocess
+    import sys
+
+    args = sys.argv[1:]
+    with open(os.environ['FAKE_ADMISSION_LOG'], 'a', encoding='utf-8') as log:
+        log.write(' '.join(args) + '\n')
+
+
+    def option(name):
+        try:
+            return args[args.index(name) + 1]
+        except (ValueError, IndexError):
+            return ''
+
+
+    failing = option('--failing-run-id') or option('--reported-run-id')
+    workflow = option('--workflow')
+    repo = os.environ['GITHUB_REPOSITORY']
+    subprocess.run(
+        [
+            'gh', 'api', '--method', 'POST',
+            f'repos/{repo}/actions/workflows/{workflow}/dispatches',
+            '-f', 'ref=main',
+            '-f', 'inputs[mode]=ci-fix',
+            '-f', f'inputs[run_id]={failing}',
+        ],
+        check=False,
+        env=os.environ,
+    )
+  PY
+
+  # Run the real ci-repair shell body with a deterministic fake `gh` and
+  # admission owner, so the admission delegation, exact-HEAD, fork,
+  # PR-association, presentation-label and success-state rules are exercised
+  # as a unit rather than asserted by string presence.
   def run_repair_ci_job(run_name:, conclusion:, pr_number:, run_head_sha:,
                         pr_json:, workflows: 'CI', run_id: '39777697375',
                         repo: 'kodmial/nanodictate',
@@ -4496,6 +5086,8 @@ class ContinuumTest < Minitest::Test
       gh = File.join(bin, 'gh')
       File.write(gh, REPAIR_FAKE_GH)
       FileUtils.chmod(0o755, gh)
+      admission = File.join(dir, 'ci_repair_admission.py')
+      File.write(admission, REPAIR_FAKE_ADMISSION)
       script = File.join(dir, 'ci-repair.sh')
       File.write(script, repair_ci_script)
       pr_file = File.join(dir, 'pr.json')
@@ -4504,12 +5096,16 @@ class ContinuumTest < Minitest::Test
       File.write(runs_file, JSON.generate(runs_json))
       log = File.join(dir, 'gh.log')
       File.write(log, '')
+      admission_log = File.join(dir, 'admission.log')
+      File.write(admission_log, '')
 
       env = {
         'PATH' => "#{bin}:#{ENV.fetch('PATH', '')}",
         'GH_TOKEN' => 'test-token',
         'REPAIR_STATE_HELPER' => File.join(ROOT, '.github/scripts/opencode_repair_state.py'),
+        'REPAIR_ADMISSION_HELPER' => admission,
         'GITHUB_REPOSITORY' => repo,
+        'OWNER_LOGIN' => repo.split('/').first,
         'RUN_ID' => run_id,
         'RUN_NAME' => run_name,
         'RUN_HEAD_SHA' => run_head_sha,
@@ -4523,7 +5119,8 @@ class ContinuumTest < Minitest::Test
         'FAKE_GH_PR_OPEN' => pr_json.fetch('state', 'open') == 'open' ? '1' : '0',
         'FAKE_GH_PR_JSON' => pr_file,
         'FAKE_GH_RUNS_JSON' => runs_file,
-        'FAKE_GH_RUNS_FAIL' => runs_fail ? '1' : '0'
+        'FAKE_GH_RUNS_FAIL' => runs_fail ? '1' : '0',
+        'FAKE_ADMISSION_LOG' => admission_log
       }
       output, status = Open3.capture2e(env, 'bash', script)
       assert status.success?, "ci-repair exited #{status.exitstatus}:\n#{output}"
@@ -4534,6 +5131,7 @@ class ContinuumTest < Minitest::Test
         dispatches: lines.select do |line|
           line.include?('/dispatches') && line.include?('inputs[mode]=ci-fix')
         end,
+        admissions: File.readlines(admission_log, chomp: true),
         lock_adds: lines.select do |line|
           line.include?('--method POST') && line.include?("/issues/#{pr_number}/labels")
         end,
@@ -4567,6 +5165,8 @@ class ContinuumTest < Minitest::Test
       gh = File.join(bin, 'gh')
       File.write(gh, REPAIR_FAKE_GH)
       FileUtils.chmod(0o755, gh)
+      admission = File.join(dir, 'ci_repair_admission.py')
+      File.write(admission, REPAIR_FAKE_ADMISSION)
       script = File.join(dir, 'ci-repair-dispatch.sh')
       File.write(script, repair_dispatch_script)
       pr_file = File.join(dir, 'pr.json')
@@ -4575,12 +5175,16 @@ class ContinuumTest < Minitest::Test
       File.write(runs_file, JSON.generate(runs_json))
       log = File.join(dir, 'gh.log')
       File.write(log, '')
+      admission_log = File.join(dir, 'admission.log')
+      File.write(admission_log, '')
 
       env = {
         'PATH' => "#{bin}:#{ENV.fetch('PATH', '')}",
         'GH_TOKEN' => 'test-token',
         'REPAIR_STATE_HELPER' => File.join(ROOT, '.github/scripts/opencode_repair_state.py'),
+        'REPAIR_ADMISSION_HELPER' => admission,
         'GITHUB_REPOSITORY' => repo,
+        'OWNER_LOGIN' => repo.split('/').first,
         'PR_NUMBER' => pr_number.to_s,
         'REPORTED_HEAD_SHA' => head_sha,
         'REPORTED_CONCLUSION' => conclusion,
@@ -4595,7 +5199,8 @@ class ContinuumTest < Minitest::Test
         'FAKE_GH_PR_OPEN' => pr_json.fetch('state', 'open') == 'open' ? '1' : '0',
         'FAKE_GH_PR_JSON' => pr_file,
         'FAKE_GH_RUNS_JSON' => runs_file,
-        'FAKE_GH_RUNS_FAIL' => runs_fail ? '1' : '0'
+        'FAKE_GH_RUNS_FAIL' => runs_fail ? '1' : '0',
+        'FAKE_ADMISSION_LOG' => admission_log
       }
       output, status = Open3.capture2e(env, 'bash', script)
       assert status.success?, "ci-repair-dispatch exited #{status.exitstatus}:\n#{output}"
@@ -4606,6 +5211,7 @@ class ContinuumTest < Minitest::Test
         dispatches: lines.select do |line|
           line.include?('/dispatches') && line.include?('inputs[mode]=ci-fix')
         end,
+        admissions: File.readlines(admission_log, chomp: true),
         lock_deletes: lines.select do |line|
           line.include?('--method DELETE') && line.include?('/labels/opencode-ci-repair')
         end
@@ -4645,8 +5251,14 @@ class ContinuumTest < Minitest::Test
     assert_equal 1, failed.fetch(:dispatches).size,
                  'the approved Windows host failure must trigger exactly one ci-fix'
     assert_includes failed.fetch(:dispatches).first, 'inputs[run_id]=39777697375'
-    assert_equal 1, failed.fetch(:lock_adds).size,
-                 'the one-attempt-per-head lock must be taken through the configured label'
+    assert_equal 1, failed.fetch(:admissions).size,
+                 'the exact-HEAD admission owner must be called exactly once'
+    assert_includes failed.fetch(:admissions).first,
+                    "--head-sha #{head} --head-ref opencode/issue237-1 " \
+                    '--workflow continuum-opencode.yml --failing-run-id 39777697375 ' \
+                    '--reported-run-id 39777697375 --label opencode-ci-repair'
+    assert_empty failed.fetch(:lock_adds),
+                 'labels are presentation only and must never authorize admission'
   end
 
   def test_opencode_repair_still_repairs_a_ci_failure_by_default
@@ -4674,7 +5286,7 @@ class ContinuumTest < Minitest::Test
       run_head_sha: head, pr_json: pr, workflows: 'CI, Windows host'
     )
     assert_empty cancelled.fetch(:dispatches), 'cancellation is not a defect to repair'
-    assert_empty cancelled.fetch(:lock_adds), 'cancellation must not consume the attempt'
+    assert_empty cancelled.fetch(:admissions), 'cancellation must not consume the attempt'
   end
 
   def test_opencode_repair_ignores_unapproved_stale_unrelated_own_and_non_pr_runs
@@ -4737,13 +5349,19 @@ class ContinuumTest < Minitest::Test
     )
     assert_empty closed.fetch(:dispatches), 'a closed PR must not dispatch'
 
+    # kodmial/continuum#446: a stale presentation label is not admission
+    # evidence. The exact-HEAD receipt owns repeat suppression, so this shell
+    # must still hand the head to that owner instead of trusting the label.
     repeated = run_repair_ci_job(
       run_name: 'Windows host', conclusion: 'failure', pr_number: 238,
       run_head_sha: head,
       pr_json: repair_pr_json(head_sha: head, labels: ['opencode-ci-repair']),
       workflows: approved
     )
-    assert_empty repeated.fetch(:dispatches), 'a repeated event for the same head must not dispatch'
+    assert_equal 1, repeated.fetch(:admissions).size,
+                 'a stale label must never block the durable exact-HEAD owner'
+    assert_equal 1, repeated.fetch(:dispatches).size,
+                 'repeat suppression belongs to the receipt owner, not the label'
   end
 
   # A PR that advertises a pinned snapshot is not repairable when the durable
@@ -4762,14 +5380,15 @@ class ContinuumTest < Minitest::Test
     )
     assert_empty result.fetch(:dispatches),
                  'an unverifiable snapshot contract must not dispatch a repair'
-    assert_empty result.fetch(:lock_adds),
+    assert_empty result.fetch(:admissions),
                  'an unverifiable snapshot contract must not consume the attempt'
     assert_includes result.fetch(:output), 'No trusted task snapshot comment found'
   end
 
-  # Requirement #3: one shared per-head lock across approved workflows. A green
-  # CI result must not clear the lock a failing Windows host took, and the
-  # reverse must hold too.
+  # Requirement #3: one shared per-head decision across approved workflows. A
+  # green result for one workflow is not evidence that the head is green: it
+  # must not clear the presentation marker while another approved workflow
+  # fails, and it must hand the head to the exact-HEAD receipt owner.
   def test_opencode_repair_green_ci_keeps_a_failing_windows_host_lock
     head = 'fa0c1c6e24a15a5f00ef613fef29cf8139c0915f'
     runs = {
@@ -4785,9 +5404,11 @@ class ContinuumTest < Minitest::Test
       pr_json: repair_pr_json(head_sha: head, labels: ['opencode-ci-repair']),
       workflows: 'CI,Windows host', runs_json: runs
     )
-    assert_empty result.fetch(:dispatches), 'green CI must never dispatch a repair'
     assert_empty result.fetch(:lock_deletes),
                  'green CI must not clear a live lock for a failing Windows host'
+    assert_equal 1, result.fetch(:admissions).size,
+                 'the failing approved workflow still owns the exact-HEAD decision'
+    assert_includes result.fetch(:admissions).first, '--failing-run-id 39777697375'
   end
 
   def test_opencode_repair_green_windows_keeps_a_failing_ci_lock
@@ -4805,9 +5426,11 @@ class ContinuumTest < Minitest::Test
       pr_json: repair_pr_json(head_sha: head, labels: ['opencode-ci-repair']),
       workflows: 'CI,Windows host', runs_json: runs
     )
-    assert_empty result.fetch(:dispatches), 'green Windows host must never dispatch a repair'
     assert_empty result.fetch(:lock_deletes),
                  'green Windows host must not clear a live lock for a failing CI'
+    assert_equal 1, result.fetch(:admissions).size,
+                 'the failing approved workflow still owns the exact-HEAD decision'
+    assert_includes result.fetch(:admissions).first, '--failing-run-id 39777697376'
   end
 
   def test_opencode_repair_green_workflow_clears_the_lock_only_when_all_approved_are_green
@@ -4865,8 +5488,8 @@ class ContinuumTest < Minitest::Test
     assert_equal 1, result.fetch(:dispatches).size,
                  'the surviving green event must recover the superseded failure'
     assert_includes result.fetch(:dispatches).first, 'inputs[run_id]=39777697375'
-    assert_equal 1, result.fetch(:lock_adds).size,
-                 'the recovered failure must consume the one attempt for the head'
+    assert_equal 1, result.fetch(:admissions).size,
+                 'the recovered failure must consume the one exact-HEAD admission'
   end
 
   def test_opencode_repair_reported_green_recovers_a_superseded_failure
@@ -4947,9 +5570,11 @@ class ContinuumTest < Minitest::Test
       pr_json: repair_pr_json(head_sha: head, labels: ['opencode-ci-repair']),
       workflows: 'CI,Windows host', runs_json: runs
     )
-    assert_empty result.fetch(:dispatches), 'a reported green result must not dispatch'
     assert_empty result.fetch(:lock_deletes),
                  'a reported green CI result must not clear a failing Windows host lock'
+    assert_equal 1, result.fetch(:admissions).size,
+                 'the failing approved workflow still owns the reported exact-HEAD decision'
+    assert_includes result.fetch(:admissions).first, '--failing-run-id 39777697375'
   end
 
   def test_opencode_repair_success_ignores_unapproved_failures
@@ -5594,7 +6219,7 @@ class ContinuumTest < Minitest::Test
       pause_marker max_dispatch_attempts pause_on_failure ci_repair_label
       packaging_repair_label capability_number qualification_number required_sha
       recovery_operation_id recovery_checkpoint_ref recovery_checkpoint_sha
-      recovery_stage recovery_generation
+      recovery_stage recovery_generation ci_attempt_id ci_head_sha
     ],
     'continuum-opencode-repair.yml' => %w[
       continuum_ref pr_number head_sha conclusion run_id ci_repair_label
@@ -5676,6 +6301,14 @@ class ContinuumTest < Minitest::Test
           assert_match(/\A\$\{\{ inputs\.recovery_identity && fromJSON\(inputs\.recovery_identity\)\.#{key} \|\| '' \}\}\z/,
                        value.to_s,
                        "#{base}: `#{key}` must unpack inputs.recovery_identity, got #{value.inspect}")
+          next
+        end
+        # kodmial/continuum#446: the exact-HEAD CI-repair correlation fields
+        # share the same 25-input packing rule as recovery identity.
+        if base == 'continuum-opencode.yml' && %w[ci_attempt_id ci_head_sha].include?(key)
+          assert_match(/\A\$\{\{ inputs\.ci_repair_identity && fromJSON\(inputs\.ci_repair_identity\)\.#{key} \|\| '' \}\}\z/,
+                       value.to_s,
+                       "#{base}: `#{key}` must unpack inputs.ci_repair_identity, got #{value.inspect}")
           next
         end
 
@@ -8124,77 +8757,77 @@ class ContinuumTest < Minitest::Test
                     'fork PRs have no label-write token and must be skipped'
   end
 
-  # Label discovery is the only way a successor event can find a repair lock
-  # whose label came from a dispatch-only override. A transient API failure must
-  # be retried, and an exhausted failure must still remove the known labels
-  # before failing so the incomplete reset is visible for a rerun.
-  def test_remove_review_label_reset_retries_and_fails_after_removing_known_labels
+  # kodmial/continuum#446: this reset is review/CodeRabbit readiness only.
+  # CI-repair admission is a durable exact-HEAD receipt, so the review reset
+  # must not list labels, touch CI-repair state, or swallow a real failure.
+  def test_remove_review_label_reset_is_review_only_and_surfaces_failures
+    body = workflow_body('continuum-remove-review-label.yml')
+    refute_includes body, 'opencode-ci-repair',
+                    'the review reset must never name the CI-repair label'
+    refute_includes body, 'CI_REPAIR_LABEL',
+                    'the review reset must not read a CI-repair knob'
+    refute_includes body, 'listLabelsOnIssue',
+                    'the review reset removes known labels directly; discovery is CI-repair state'
+    refute_includes body, 'addLabels',
+                    'the review reset never restores a label'
+    refute_includes body, 'createComment',
+                    'the review reset never records CI-repair state'
+
     script = script_body('continuum-remove-review-label.yml')
-    lock_description = 'One automatic OpenCode CI repair attempt per failing PR head.'
     harness = <<~'JS'.sub('__SCRIPT__', script)
       const calls = [];
-      const listCalls = [];
-      const attached = JSON.parse(process.env.TEST_ATTACHED_LABELS || '[]');
-      const failures = Number(process.env.TEST_LIST_FAILURES || '0');
-      global.setTimeout = (callback) => { callback(); return 0; };
+      const unexpected = [];
+      const failure = Number(process.env.TEST_REMOVE_FAILURE || '0');
       global.context = { issue: { owner: 'owner', repo: 'repo', number: 7 } };
       global.github = {
-        paginate: async (method, params) => method(params),
+        paginate: async () => { unexpected.push('paginate'); return []; },
         rest: { issues: {
           listLabelsOnIssue: async () => {
-            listCalls.push(listCalls.length + 1);
-            if (listCalls.length <= failures) {
-              throw Object.assign(new Error('label API unavailable'), { status: 502 });
-            }
-            return attached;
+            unexpected.push('listLabelsOnIssue');
+            return [];
           },
+          addLabels: async ({ labels }) => {
+            unexpected.push(`addLabels:${(labels || []).join(',')}`);
+          },
+          createComment: async () => { unexpected.push('createComment'); },
           removeLabel: async ({ name }) => {
             calls.push(name);
-            throw Object.assign(new Error('not found'), { status: 404 });
+            if (failure) {
+              throw Object.assign(new Error('label API unavailable'), { status: failure });
+            }
           },
         } },
       };
       console.log = () => {};
       (async () => {
       __SCRIPT__
-        process.stdout.write(JSON.stringify({ calls, listCalls }));
+        process.stdout.write(JSON.stringify({ calls, unexpected }));
       })().catch((error) => {
-        process.stdout.write(JSON.stringify({ calls, listCalls, error: error.message }));
+        process.stdout.write(JSON.stringify({ calls, unexpected, error: error.message }));
         process.exitCode = 1;
       });
     JS
-    run = lambda do |failures:, attached: []|
-      environment = {
-        'TEST_ATTACHED_LABELS' => JSON.generate(attached),
-        'TEST_LIST_FAILURES' => failures.to_s,
-        'CI_REPAIR_LABEL' => 'opencode-ci-repair',
-        'CI_REPAIR_LOCK_DESCRIPTION' => lock_description,
-      }
-      Open3.capture3(environment, 'node', '-e', harness)
+
+    run = lambda do |failure|
+      Open3.capture3(
+        { 'TEST_REMOVE_FAILURE' => failure.to_s },
+        'node', '-e', harness
+      )
     end
 
-    stdout, stderr, status = run.call(
-      failures: 2,
-      attached: [{name: 'dispatch-only-lock', description: lock_description}]
-    )
+    stdout, stderr, status = run.call(404)
     assert status.success?, stderr
     outcome = JSON.parse(stdout)
-    assert_equal 3, outcome.fetch('listCalls').length,
-                 'a transient label-discovery failure must be retried'
-    assert_equal %w[coderabbit-review-requested dispatch-only-lock opencode-ci-repair review-ready],
-                 outcome.fetch('calls').sort,
-                 'the retry must remove the dispatch-only lock and every known label'
+    assert_equal %w[coderabbit-review-requested review-ready], outcome.fetch('calls').sort,
+                 'only the review-readiness labels may be reset'
+    assert_empty outcome.fetch('unexpected'),
+                 'the reset must not discover, add, comment, or paginate'
 
-    stdout, stderr, status = run.call(failures: 3)
-    refute status.success?, 'an exhausted label-discovery failure must fail the job'
+    stdout, stderr, status = run.call(500)
+    refute status.success?, 'a non-404 label failure must fail the job'
     outcome = JSON.parse(stdout)
-    assert_equal 3, outcome.fetch('listCalls').length,
-                 'label discovery must be attempted exactly three times'
-    assert_equal %w[coderabbit-review-requested opencode-ci-repair review-ready],
-                 outcome.fetch('calls').sort,
-                 'known labels must be removed before the failed reset is reported'
-    assert_includes outcome.fetch('error'), 'Rerun',
-                    'the failure must tell the operator that a rerun is required'
+    assert_includes outcome.fetch('error'), 'label API unavailable',
+                    'a real API failure must stay visible instead of being swallowed'
   end
 
   def test_contract_gate_disables_status_publishing_for_fork_and_dependabot_pull_requests
@@ -9270,22 +9903,31 @@ class ContinuumTest < Minitest::Test
     assert_includes retry_step, 'actions/runs?event=pull_request&head_sha='
   end
 
+  # Both admission paths must reuse the single pulls.get representation
+  # instead of a second labels-list read, and neither may make a mutable label
+  # part of the decision: the serialized receipt owner decides.
   def test_api_budget_opencode_repair_coalesces_pr_and_label_reads
     body = workflow_body('continuum-opencode-repair.yml')
 
     dispatch_job = body[/^  ci-repair-dispatch:\n(.*?)(?=^  \S|\z)/m, 1]
     refute_nil dispatch_job, 'the dispatch job is missing'
     assert_includes dispatch_job, 'PR_JSON="$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER")"'
-    assert_includes dispatch_job, 'grep -Fxq "$CI_REPAIR_LABEL" <<<"$PR_LABELS"'
+    refute_includes dispatch_job, 'grep -Fxq "$CI_REPAIR_LABEL"',
+                    'the presentation label must never gate admission'
     refute_includes dispatch_job, 'gh api "repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/labels"',
-                    'the lock check must reuse the pulls.get labels instead of a second read'
+                    'the admission path must not spend a second read on labels'
+    assert_includes dispatch_job, 'python3 -B "$REPAIR_ADMISSION_HELPER"',
+                    'the exact-HEAD owner must be the dispatch path'
 
     repair_job = body[/^  ci-repair:\n(.*?)(?=^  \S|\z)/m, 1]
     refute_nil repair_job, 'the ci-repair job is missing'
     assert_includes repair_job, 'PR_JSON="$(gh api "repos/$GITHUB_REPOSITORY/pulls/$pr")"'
-    assert_includes repair_job, 'grep -Fxq "$lock_label" <<<"$PR_LABELS"'
+    refute_includes repair_job, 'grep -Fxq "$lock_label" <<<"$PR_LABELS"',
+                    'the presentation label must never gate admission'
     refute_includes repair_job, 'gh api "repos/$GITHUB_REPOSITORY/issues/$pr/labels"',
-                    'the lock check must reuse the pulls.get labels instead of a second read'
+                    'the admission path must not spend a second read on labels'
+    assert_includes repair_job, 'python3 -B "$REPAIR_ADMISSION_HELPER"',
+                    'the exact-HEAD owner must be the workflow_run path'
   end
 
   def test_api_budget_shell_pagination_is_bounded_everywhere

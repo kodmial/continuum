@@ -149,18 +149,48 @@ APPROVED_433_OPENCODE_SHA256 = (
 # #450 (main 25273b4) additionally caps post-repair inline CodeRabbit
 # verification at one request per OpenCode run; the serialized auto-merge owner
 # handles the remaining exact-HEAD findings after its shared chat-quota wait.
-# Pin the complete resulting bytes. Tests below and test_comment_attribution
-# independently enforce the recovery contract and its diagnostic provenance;
-# do not replace this pin with an allowlist or ignore workflow differences.
+# This pin records the #442 + #450 artifact for audit; the active pin below
+# covers the merged #442 + #446 + #449 + #450 bytes. Tests below and
+# test_comment_attribution independently enforce the recovery contract and its
+# diagnostic provenance; do not replace this pin with an allowlist or ignore
+# workflow differences.
 APPROVED_PROVIDER_RECOVERY_OPENCODE_SHA256 = (
     "61c6f4d0b8c0ac6d179750096606ecc14a488933dbda5ac51defd465dc44006d"
+)
+
+# kodmial/continuum#446: the serialized exact-HEAD CI-repair admission owner
+# adds only the attempt/head correlation inputs and the dispatched-receipt
+# acknowledgement step. The merge with main's #442 checkpoint-resume extension
+# keeps both reviewed changes, so this active pin covers the combined bytes.
+# Keep the earlier pins above for audit; later drift outside these reviewed
+# changes still fails closed.
+APPROVED_446_OPENCODE_SHA256 = (
+    "0d1c0fbc41dfb3003ac04c5d308550ce1b4fee57655d87a1ff52b6758fdd0a61"
+)
+
+# kodmial/continuum#449 (CodeRabbit review 5870362881): the reviewed #446 pin
+# above stays for audit. The repair allows a run correlation only from verified
+# dispatch evidence (never the live PR HEAD), keeps an admitted ci-fix bound to
+# its exact HEAD, treats correlation read failures as warnings, folds attempt
+# state to its latest observation, and requires a usable run title before an
+# inventory may prove that no repair run exists. Unrelated drift still fails
+# closed. This repair additionally binds every ci-fix run to its admitted HEAD
+# (an empty identity fails closed) and requires the dispatched attempt identity
+# before correlation may record a receipt. The merge with main's reviewed
+# one-inline-request cap (25273b4) keeps both changes, so the active pin covers
+# the combined bytes; any drift outside them still fails closed.
+APPROVED_449_OPENCODE_SHA256 = (
+    "648a79711d211909f4c54972f82a9afb5406f31a39728fea55d70bbf33e37ddc"
+)
+APPROVED_446_CALLER_SHA256 = (
+    "b7f3df118bc436526f48443b8f068372204073eb134c98e4a1543d025f314686"
 )
 
 # Additional reviewed self-caller change: owner-only CodeRabbit repair dispatch
 # preserves the exact workflow_dispatch path and the no-auto-merge hold.
 # This pins the full file, not a permissive allowlist for workflow drift.
 APPROVED_350_SELF_CALLER_SHA256 = (
-    "f158c2e694fb77172c8955d301981d67bafaed4099c0a34f96f05cd9054c13c8"
+    "c676f9c9781ac5d4f083188d47680ec8f5fa1c7dfac106912e9d452f77fc1c0a"
 )
 APPROVED_350_CALLER_SHA256 = (
     "a595362c8353001d5f7af138ab848df8fac3a6c924d5d337f6819084f79b3938"
@@ -2577,7 +2607,7 @@ class ProtectedBaselineTests(unittest.TestCase):
                     # explicitly tested optional-attestation no-key branch.
                     self.assertEqual(
                         protected_file_digest(path),
-                        APPROVED_PROVIDER_RECOVERY_OPENCODE_SHA256,
+                        APPROVED_449_OPENCODE_SHA256,
                         f"{path}: unexpected drift outside reviewed wording cleanup",
                     )
                 else:
@@ -2604,8 +2634,8 @@ class ProtectedBaselineTests(unittest.TestCase):
             protected_file_digest(
                 ".github/caller-stubs/continuum-opencode.yml"
             ),
-            APPROVED_350_CALLER_SHA256,
-            "consumer caller stub: unexpected drift outside reviewed #350 patch",
+            APPROVED_446_CALLER_SHA256,
+            "consumer caller stub: unexpected drift outside reviewed #446 patch",
         )
 
     def test_provider_error_exit_preserves_dirty_coding_work_across_all_modes(self):
@@ -2648,7 +2678,7 @@ class ProtectedBaselineTests(unittest.TestCase):
         # therefore be dirty in this pre-commit worktree; any unapproved byte
         # change still fails the exact digest assertions above.
         approved = {
-            ".github/workflows/continuum-opencode.yml": APPROVED_PROVIDER_RECOVERY_OPENCODE_SHA256,
+            ".github/workflows/continuum-opencode.yml": APPROVED_449_OPENCODE_SHA256,
             ".github/workflows/opencode.yml": APPROVED_350_SELF_CALLER_SHA256,
         }
         for path in PROTECTED_FILES:

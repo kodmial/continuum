@@ -1019,8 +1019,8 @@ jobs:
           function parseChatQuotaDelayMs(body = '') {
             const text = String(body || '');
             if (!CHAT_RATE_LIMIT_HEADING_RE.test(text) &&
-                (!CHAT_RATE_LIMIT_PROSE_RE.test(text) ||
-                 CHAT_RATE_LIMIT_NEGATED_RE.test(text))) {
+              (!CHAT_RATE_LIMIT_PROSE_RE.test(text) ||
+               CHAT_RATE_LIMIT_NEGATED_RE.test(text))) {
               return null;
             }
             const match = text.match(CHAT_COUNTDOWN_RE);
