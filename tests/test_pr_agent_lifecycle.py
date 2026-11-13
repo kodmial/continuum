@@ -207,6 +207,14 @@ APPROVED_448_OPENCODE_SHA256 = (
 APPROVED_448_REPAIR_OPENCODE_SHA256 = (
     "886bc666915623c2e3caabfb482586aedbd23b479756175c2a0f235e617fe942"
 )
+# kodmial/continuum#450: intentional provider-chat ownership change.
+# OpenCode no longer sends inline verification POSTs after repairs; the
+# serialized auto-merge owner rechecks exact HEAD after successful CI and
+# enforces one shared chat quota. Historical #448 repair digest above remains
+# immutable for audit. Pin the complete new workflow, not an exception list.
+APPROVED_450_SERIALIZED_OPENCODE_SHA256 = (
+    "b4d13f665705ab0b1131d05161f4441155627dc9b13d44dbd664b47833adb10d"
+)
 APPROVED_446_CALLER_SHA256 = (
     "b7f3df118bc436526f48443b8f068372204073eb134c98e4a1543d025f314686"
 )
@@ -2628,12 +2636,12 @@ class ProtectedBaselineTests(unittest.TestCase):
                     self.assertIn("CONTINUUM_OPENCODE_PUBLISH_RACE_RETRY_REQUIRED", original)
                     self.assertIn("steps.model_route.outputs.model", original)
                 if path == ".github/workflows/continuum-opencode.yml":
-                    # #433 advances the protected artifact only for the
-                    # explicitly tested optional-attestation no-key branch.
+                    # #450 deliberately changes chat-ownership behavior,
+                    # with a full-file digest and executable regression tests.
                     self.assertEqual(
                         protected_file_digest(path),
-                        APPROVED_448_REPAIR_OPENCODE_SHA256,
-                        f"{path}: unexpected drift outside reviewed wording cleanup",
+                        APPROVED_450_SERIALIZED_OPENCODE_SHA256,
+                        f"{path}: unexpected drift outside #450 serialized CodeRabbit chat owner",
                     )
                 else:
                     # The self-dogfood caller is the dispatchable surface
@@ -2651,6 +2659,16 @@ class ProtectedBaselineTests(unittest.TestCase):
                                   "migration must retain 429 stop-the-runner protection")
                     self.assertIn("Check issue Definition of Ready", read_repo(path),
                                   "migration must preserve task-admission gate")
+                    self.assertNotIn(
+                        "'POST /repos/{owner}/{repo}/pulls/{pull_number}/comments/{comment_id}/replies'",
+                        read_repo(path),
+                        "OpenCode must not bypass the serialized CodeRabbit chat owner",
+                    )
+                    self.assertIn(
+                        "to serialized auto-merge after exact-HEAD CI.",
+                        read_repo(path),
+                        "the removed inline chat paths must delegate to auto-merge",
+                    )
 
         # The installed consumer caller stub is a separate protected artifact:
         # pin it explicitly so its recovery run-name/dispatch contract cannot
