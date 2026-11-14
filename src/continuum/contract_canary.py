@@ -763,6 +763,7 @@ def _visible_markdown(body: object) -> str:
     list_content_column = None
     list_quote_depth = None
     list_inner_quote_depth = 0
+    reference_continuation_line = -1
     while index < len(text):
         if line_start and text[index] != "\n":
             line_end = text.find("\n", index)
@@ -874,6 +875,7 @@ def _visible_markdown(body: object) -> str:
             if (
                 (block_boundary or inner_boundary)
                 and _leading_columns(content) >= required_indent
+                and index != reference_continuation_line
             ):
                 end = _consume_indented_code(
                     text,
@@ -917,6 +919,14 @@ def _visible_markdown(body: object) -> str:
                 if reference is not None:
                     _, end = reference
                     visible.append(_blank_markdown(text[index:end]))
+                    next_line = text.find("\n", end)
+                    # A reference definition is extracted from its paragraph,
+                    # so an immediately following indented line is a lazy
+                    # paragraph continuation, not an indented code block. A
+                    # blank line must separate them before code can start.
+                    reference_continuation_line = (
+                        next_line + 1 if next_line != -1 else -1
+                    )
                     index = end
                     line_start = False
                     block_boundary = True

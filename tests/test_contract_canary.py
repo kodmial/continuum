@@ -599,6 +599,8 @@ class CompletionEvidenceTest(unittest.TestCase):
             "[doc]: https://example.com\n'Closes #100' trailing text\n",
             "[doc]: https://example.com\n(Closes #100) trailing text\n",
             '[doc]: https://example.com\n"Closes\n#100" trailing text\n',
+            '[doc]: https://example.com\n    "Closes #100" trailing text\n',
+            '[doc]: https://example.com\n\t"Closes #100" trailing text\n',
         ]
         for body in bodies:
             with self.subTest(body=body):
@@ -609,6 +611,26 @@ class CompletionEvidenceTest(unittest.TestCase):
                         candidate, exact_head_runs(), 100
                     )
                 )
+
+    def test_reference_link_title_trailing_text_keeps_branch_attribution(self):
+        candidate = pr(
+            body=(
+                '[doc]: https://example.com\n'
+                '"Closes #100" trailing text\n'
+            )
+        )
+        candidate["headRefName"] = "opencode/issue100-canary"
+        self.assertIsNone(
+            canary.validate_completed_canary(candidate, exact_head_runs(), 100)
+        )
+
+    def test_indented_code_after_reference_definition_stays_inert(self):
+        candidate = pr(body='[doc]: https://example.com\n\n    Closes #100\n')
+        candidate["headRefName"] = "feature/unrelated"
+        problem = canary.validate_completed_canary(
+            candidate, exact_head_runs(), 100
+        )
+        self.assertIn("not attributed", problem)
 
     def test_reference_link_label_closing_reference_is_completion_evidence(self):
         candidate = pr(
