@@ -494,6 +494,22 @@ class CompletionEvidenceTest(unittest.TestCase):
                 now=NOW,
             )
 
+    def test_list_item_unclosed_pre_cannot_replace_closed_canary(self):
+        issue = canary_issue(
+            state="closed", created=8 * 24 * 60 * 60, closed=30
+        )
+        unrelated = pr(body="- <pre>\n  Closes #100\n", updated=10)
+        unrelated["headRefName"] = "feature/unrelated"
+        with self.assertRaisesRegex(
+            canary.CanaryBootstrapError, "not trustworthy"
+        ):
+            canary.resolve_canary(
+                [issue],
+                pull_requests=[unrelated],
+                runs=exact_head_runs(),
+                now=NOW,
+            )
+
     def test_lifecycle_branch_attributes_completion_without_keyword(self):
         candidate = pr(body="Automated implementation for #100.")
         self.assertIsNone(
@@ -959,6 +975,29 @@ class CompletionEvidenceTest(unittest.TestCase):
             candidate, exact_head_runs(), 100
         )
         self.assertIn("not attributed", problem)
+
+    def test_list_item_unclosed_html_pre_is_not_completion_evidence(self):
+        candidate = pr(body="- <pre>\n  Closes #100\n")
+        candidate["headRefName"] = "feature/unrelated"
+        problem = canary.validate_completed_canary(
+            candidate, exact_head_runs(), 100
+        )
+        self.assertIn("not attributed", problem)
+
+    def test_list_item_unclosed_html_pre_is_inert_only_inside_the_item(self):
+        candidate = pr(
+            body="- <pre>\n  Closes #100\n- unrelated\n\nCloses #100\n"
+        )
+        candidate["headRefName"] = "feature/unrelated"
+        self.assertIsNone(
+            canary.validate_completed_canary(candidate, exact_head_runs(), 100)
+        )
+
+    def test_list_item_unclosed_html_pre_keeps_branch_attribution(self):
+        candidate = pr(body="- <pre>\n  Closes #100\n")
+        self.assertIsNone(
+            canary.validate_completed_canary(candidate, exact_head_runs(), 100)
+        )
 
     def test_html_code_and_block_quote_pre_examples_keep_branch_attribution(self):
         for body in ("<code>Closes #100</code>\n", "> <pre>\n> Closes #100\n"):

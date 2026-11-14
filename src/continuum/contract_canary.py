@@ -329,7 +329,8 @@ def _visible_markdown(body: object) -> str:
     non-whitespace sentinel keeps them from matching and prevents adjacent
     visible text from joining into a new closing reference. GitHub renders
     ``<pre>`` content as inert preformatted text and ``<code>`` content as code,
-    so a closing keyword there never closes the issue.
+    so a closing keyword there never closes the issue. An unclosed block-level
+    ``<pre>`` stays inert to the end of its block quote or list item container.
 
     An indented line opens a code block only at a block boundary, because GFM
     renders a four-space or tab-indented line that directly follows a paragraph
@@ -529,31 +530,38 @@ def _visible_markdown(body: object) -> str:
                         end = closing.end()
                     else:
                         line_begin = text.rfind("\n", 0, index) + 1
-                        _, prefix = _strip_block_quotes(text[line_begin:index])
-                        if not prefix.strip() and len(prefix) <= 3:
+                        _, prefix = _strip_block_quotes(
+                            text[line_begin:index],
+                            list_quote_depth
+                            if list_content_column is not None
+                            else None,
+                        )
+                        if list_content_column is not None and len(
+                            prefix
+                        ) >= list_content_column:
+                            _, prefix = _strip_block_quotes(
+                                prefix[list_content_column:]
+                            )
+                        if not prefix.strip() and _leading_columns(prefix) <= 3:
                             # A block-level <pre> without a closing tag runs to
                             # the end of its container, just as GFM renders it.
-                            # Quote markers are stripped first, so a block quote
-                            # cannot hide the block-level opening.
-                            end = len(text)
-                            cursor = (
-                                line_end + 1 if line_end < len(text) else len(text)
+                            # Container markers are stripped first, so a block
+                            # quote or list item cannot hide the block-level
+                            # opening.
+                            required_indent = (
+                                0
+                                if inner_depth
+                                else (list_content_column or 0)
                             )
-                            while quote_depth and cursor < len(text):
-                                next_end = text.find("\n", cursor)
-                                if next_end == -1:
-                                    next_end = len(text)
-                                depth, _ = _strip_block_quotes(
-                                    text[cursor:next_end]
-                                )
-                                if depth < quote_depth:
-                                    end = cursor - 1
-                                    break
-                                cursor = (
-                                    next_end + 1
-                                    if next_end < len(text)
-                                    else len(text)
-                                )
+                            end = _consume_indented_code(
+                                text,
+                                line_end,
+                                line_end + 1 if line_end < len(text) else len(text),
+                                quote_depth,
+                                required_indent,
+                                list_content_column,
+                                inner_depth,
+                            )
                 visible.append(_blank_markdown(text[index:end]))
                 line_begin = text.rfind("\n", 0, index) + 1
                 rest_end = text.find("\n", end)
