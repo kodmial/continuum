@@ -593,6 +593,23 @@ class CompletionEvidenceTest(unittest.TestCase):
                 )
                 self.assertIn("not attributed", problem)
 
+    def test_reference_link_title_with_trailing_text_stays_visible(self):
+        bodies = [
+            '[doc]: https://example.com\n"Closes #100" trailing text\n',
+            "[doc]: https://example.com\n'Closes #100' trailing text\n",
+            "[doc]: https://example.com\n(Closes #100) trailing text\n",
+            '[doc]: https://example.com\n"Closes\n#100" trailing text\n',
+        ]
+        for body in bodies:
+            with self.subTest(body=body):
+                candidate = pr(body=body)
+                candidate["headRefName"] = "feature/unrelated"
+                self.assertIsNone(
+                    canary.validate_completed_canary(
+                        candidate, exact_head_runs(), 100
+                    )
+                )
+
     def test_reference_link_label_closing_reference_is_completion_evidence(self):
         candidate = pr(
             body=(

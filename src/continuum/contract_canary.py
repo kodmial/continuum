@@ -611,12 +611,14 @@ def _reference_definition_end(text: str) -> Optional[int]:
                 continue
             if char == closer:
                 cursor += 1
-                if not title_after_line_break:
-                    rest = cursor
-                    while rest < length and text[rest] in " \t":
-                        rest += 1
-                    if rest < length and text[rest] != "\n":
-                        return None
+                rest = cursor
+                while rest < length and text[rest] in " \t":
+                    rest += 1
+                if rest < length and text[rest] != "\n":
+                    # A title must be followed only by whitespace. Otherwise
+                    # GitHub ends the definition at its destination and renders
+                    # the title text as ordinary prose, so it stays visible.
+                    return destination_end if title_after_line_break else None
                 return cursor
             if char == "\n":
                 look = cursor + 1
