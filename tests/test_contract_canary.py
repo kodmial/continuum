@@ -545,6 +545,29 @@ class CompletionEvidenceTest(unittest.TestCase):
         )
         self.assertIn("not attributed", problem)
 
+    def test_indented_code_example_after_heading_is_not_completion_evidence(self):
+        candidate = pr(body="# Example\n    Closes #100\n")
+        candidate["headRefName"] = "feature/unrelated"
+        problem = canary.validate_completed_canary(
+            candidate, exact_head_runs(), 100
+        )
+        self.assertIn("not attributed", problem)
+
+    def test_tab_indented_code_example_after_thematic_break_is_not_evidence(self):
+        candidate = pr(body="Example only:\n\n* * *\n\tCloses #100\n")
+        candidate["headRefName"] = "feature/unrelated"
+        problem = canary.validate_completed_canary(
+            candidate, exact_head_runs(), 100
+        )
+        self.assertIn("not attributed", problem)
+
+    def test_operative_closing_reference_after_heading_is_completion_evidence(self):
+        candidate = pr(body="# Example\n\nCloses #100\n")
+        candidate["headRefName"] = "feature/unrelated"
+        self.assertIsNone(
+            canary.validate_completed_canary(candidate, exact_head_runs(), 100)
+        )
+
     def test_paragraph_indented_continuation_keeps_operative_reference(self):
         candidate = pr(body="See the notes below\n    Closes #100\n")
         candidate["headRefName"] = "feature/unrelated"

@@ -78,6 +78,10 @@ _CLOSING_REFERENCE_RE = re.compile(
 _FENCE_OPEN_RE = re.compile(r"^[ \t]{0,3}(?P<fence>`{3,}|~{3,})")
 _FENCE_CLOSE_RE = re.compile(r"^[ \t]{0,3}(?P<fence>`{3,}|~{3,})[ \t]*$")
 _INDENTED_CODE_RE = re.compile(r"^(?: {4}| {0,3}\t)")
+_ATX_HEADING_RE = re.compile(r"^[ \t]{0,3}#{1,6}(?:[ \t]|$)")
+_THEMATIC_BREAK_RE = re.compile(
+    r"^[ \t]{0,3}(?:(?:\*[ \t]*){3,}|(?:-[ \t]*){3,}|(?:_[ \t]*){3,})[ \t]*$"
+)
 
 
 def _blank_markdown(text: str) -> str:
@@ -96,8 +100,10 @@ def _visible_markdown(body: object) -> str:
 
     An indented line opens a code block only at a block boundary, because GFM
     renders a four-space or tab-indented line that directly follows a paragraph
-    line as a lazy paragraph continuation. Once opened, the block continues
-    across blank lines and still-indented lines, just as GFM renders it.
+    line as a lazy paragraph continuation. A heading or thematic break ends its
+    block too, so an indented line directly after one is already code. Once
+    opened, the block continues across blank lines and still-indented lines,
+    just as GFM renders it.
     """
     text = str(body or "")
     visible = []
@@ -105,11 +111,16 @@ def _visible_markdown(body: object) -> str:
     line_start = True
     block_boundary = True
     line_blank = True
+    line_ends_block = False
     while index < len(text):
         if line_start and text[index] != "\n":
             line_end = text.find("\n", index)
             if line_end == -1:
                 line_end = len(text)
+            line_ends_block = (
+                _ATX_HEADING_RE.match(text[index:line_end]) is not None
+                or _THEMATIC_BREAK_RE.match(text[index:line_end]) is not None
+            )
             opener = _FENCE_OPEN_RE.match(text[index:line_end])
             if opener is not None:
                 fence = opener.group("fence")
@@ -206,8 +217,9 @@ def _visible_markdown(body: object) -> str:
         visible.append(char)
         index += 1
         if char == "\n":
-            block_boundary = line_blank
+            block_boundary = line_blank or line_ends_block
             line_blank = True
+            line_ends_block = False
             line_start = True
         else:
             if not char.isspace():
