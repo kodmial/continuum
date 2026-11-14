@@ -475,6 +475,22 @@ class CompletionEvidenceTest(unittest.TestCase):
             canary.validate_completed_canary(candidate, exact_head_runs(), 100)
         )
 
+    def test_bare_closing_number_is_not_completion_evidence(self):
+        candidate = pr(body="Closes 100. Related to #100.")
+        candidate["headRefName"] = "feature/unrelated"
+        problem = canary.validate_completed_canary(
+            candidate, exact_head_runs(), 100
+        )
+        self.assertIn("not attributed", problem)
+
+    def test_cross_repository_closing_reference_is_not_completion_evidence(self):
+        candidate = pr(body="Closes other/repo#100. Related to #100.")
+        candidate["headRefName"] = "feature/unrelated"
+        problem = canary.validate_completed_canary(
+            candidate, exact_head_runs(), 100
+        )
+        self.assertIn("not attributed", problem)
+
     def test_newer_unrelated_pr_does_not_shadow_attributed_pr(self):
         attributed = pr(number=41, body="Closes #100", updated=60)
         unrelated = pr(number=42, body="Mentions #100 only", updated=10)

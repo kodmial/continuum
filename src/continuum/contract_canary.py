@@ -58,13 +58,21 @@ _MARKER_RE = re.compile(
     r"task=(?P<task>[A-Za-z0-9_.-]+) -->\Z"
 )
 _SAFE_TOKEN_RE = re.compile(r"\A[A-Za-z0-9._-]{1,120}\Z")
-#: GitHub auto-close keywords pointing at an issue number. The lifecycle writes
-#: ``Closes #<issue>`` in its implementation PR, so this is the only body shape
-#: that may attribute a merged PR to the canary issue.
+#: GitHub auto-close keywords pointing at an issue in this repository. The
+#: lifecycle writes ``Closes #<issue>`` in its implementation PR, so this is the
+#: only body shape that may attribute a merged PR to the canary issue. A bare
+#: number (``Closes 100``) and a reference to another repository are not
+#: closing references to this repository's issue.
 _CLOSING_REFERENCE_RE = re.compile(
-    r"\b(?:close|closes|closed|fix|fixes|fixed|resolve|resolves|resolved)"
-    r"\s*:?\s*(?:[\w.-]+/[\w.-]+#|https?://github\.com/[\w.-]+/[\w.-]+/issues/|#)?"
-    r"(?P<issue>\d+)\b",
+    r"\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\b"
+    r"\s*:?\s*"
+    r"(?:"
+    r"#(?P<issue>\d+)"
+    r"|(?P<repo>[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)#(?P<cross_issue>\d+)"
+    r"|https?://github\.com/(?P<url_repo>[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)"
+    r"/issues/(?P<url_issue>\d+)"
+    r")"
+    r"(?![\w/-])",
     re.IGNORECASE,
 )
 
@@ -290,10 +298,19 @@ def _pr_attributes_issue(pr: Mapping[str, Any], issue_number: int) -> bool:
     if branch.startswith("opencode/issue{}-".format(issue_number)):
         return True
     body = str(pr.get("body") or "")
-    return any(
-        int(match.group("issue")) == issue_number
-        for match in _CLOSING_REFERENCE_RE.finditer(body)
-    )
+    expected_repo = CANARY_OWNER_REPO.lower()
+    for match in _CLOSING_REFERENCE_RE.finditer(body):
+        number = (
+            match.group("issue")
+            or match.group("cross_issue")
+            or match.group("url_issue")
+        )
+        if int(number) != issue_number:
+            continue
+        repo = match.group("repo") or match.group("url_repo")
+        if repo is None or repo.lower() == expected_repo:
+            return True
+    return False
 
 
 def select_implementation_pr(
