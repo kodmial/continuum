@@ -3709,13 +3709,13 @@ class ContinuumTest < Minitest::Test
     assert_includes body, 'process.env.IN_PROGRESS_LABEL'
     assert_includes body, 'process.env.PAUSE_LABEL'
 
-    # The env mapping above is only half the contract: the recovery job's `if:`
-    # filters on the same value. Asserting only the env string would let a guard
-    # that reads the old hardcoded default pass, and a consumer that set
-    # AUTOMATION_DISPATCH_MARKER would get a job that never filters true.
-    assert_includes body,
-                    "contains(github.event.comment.body, inputs.dispatch_marker || vars.AUTOMATION_DISPATCH_MARKER || '<!-- issue-scheduler-dispatch -->')",
-                    'recover-scheduled-issue must filter on the consumer-configured dispatch marker'
+    # The admission job owns command identity. A user can quote a public marker;
+    # recovery must not classify event origin by substring matching.
+    recover = body[/  recover-scheduled-issue:.*/m]
+    assert_includes recover, "needs.admit.outputs.route == 'issue'"
+    refute_includes recover, 'contains(github.event.comment.body'
+    assert_includes recover, 'comments.filter(isCanonicalSchedulerDispatch).length'
+    assert_includes body, "const marker = process.env.DISPATCH_MARKER || '<!-- issue-scheduler-dispatch -->'";
 
     assert_match(/gh workflow run "\$CI_WORKFLOW_ID"/, body)
   end
@@ -8700,7 +8700,7 @@ class ContinuumTest < Minitest::Test
     # expires.
     recover = body[/  recover-scheduled-issue:.*/m]
     refute_nil recover
-    assert_includes recover, "github.event_name == 'workflow_dispatch' &&\n        inputs.issue_number != ''",
+    assert_includes recover, "github.event_name == 'workflow_dispatch' &&\n        inputs.mode == 'issue' &&\n        inputs.issue_number != ''",
                     'the recovery job must also cover an issue-mode workflow_dispatch run'
     assert_includes recover, 'ISSUE_NUMBER: ${{ inputs.issue_number }}'
     assert_includes recover, 'Number(process.env.ISSUE_NUMBER || context.payload.issue?.number || 0)'
