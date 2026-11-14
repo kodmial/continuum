@@ -680,9 +680,13 @@ def _reference_definition_span(
         break
 
     first = remainder[extra_start:]
+    leading = 0
+    while leading < 3 and leading < len(first) and first[leading] == " ":
+        leading += 1
+    first = first[leading:]
     if not first.startswith("["):
         return None
-    first_abs = line_end - len(remainder) + extra_start
+    first_abs = line_end - len(remainder) + extra_start + leading
     all_containers = list(containers) + extra_containers
     parts = [first]
     starts = [first_abs]

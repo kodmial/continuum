@@ -577,6 +577,12 @@ class CompletionEvidenceTest(unittest.TestCase):
             '[Documentation][doc]\n\n[doc]: https://example.com "Closes\n#100"',
             '[doc]: https://example.com "Closes #100"\n\n[Documentation][doc]',
             '- [Documentation][doc]\n\n  [doc]: https://example.com "Closes #100"',
+            ' [doc]: https://example.com "Closes #100"\n\n[Documentation][doc]',
+            '  [doc]: https://example.com "Closes #100"\n\n[Documentation][doc]',
+            '   [doc]: https://example.com "Closes #100"\n\n[Documentation][doc]',
+            '> [Documentation][doc]\n>\n>  [doc]: https://example.com "Closes #100"',
+            '- [Documentation][doc]\n\n   [doc]: https://example.com "Closes #100"',
+            '- [Documentation][doc]\n\n    [doc]: https://example.com "Closes #100"',
         ]
         for body in bodies:
             with self.subTest(body=body):
