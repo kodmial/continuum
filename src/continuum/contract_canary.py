@@ -1534,11 +1534,19 @@ def resolve_canary(
             age_seconds=age,
             completed=False,
         )
+    implementation_pr = select_implementation_pr(issue.number, pull_requests)
+    # A closed canary's completion must be judged from its lifecycle-attributed
+    # implementation PR. The looser liveness matcher may select a newer
+    # unrelated PR that only mentions the issue, which would hide a valid
+    # completion (or let an unrelated merged PR stand in for it).
+    completion_prs = (
+        [implementation_pr] if implementation_pr is not None else pull_requests
+    )
     try:
         observed = observe_canary(
             issue.raw,
             runs=runs,
-            pull_requests=pull_requests,
+            pull_requests=completion_prs,
             now=now,
             repository=expected_repo,
         )
@@ -1559,7 +1567,7 @@ def resolve_canary(
             )
         )
     problem = validate_completed_canary(
-        select_implementation_pr(issue.number, pull_requests), runs, issue.number
+        implementation_pr, runs, issue.number
     )
     if problem:
         raise CanaryBootstrapError(

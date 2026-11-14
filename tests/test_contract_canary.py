@@ -1462,6 +1462,29 @@ class CompletionEvidenceTest(unittest.TestCase):
         selected = canary.select_implementation_pr(100, [unrelated, attributed])
         self.assertEqual(selected["number"], 41)
 
+    def test_closed_canary_completion_uses_attributed_pr_not_newer_unrelated_pr(self):
+        issue = canary_issue(
+            state="closed", created=2 * 24 * 60 * 60, closed=30
+        )
+        attributed = pr(number=41, body="Closes #100", updated=60)
+        unrelated = pr(
+            number=42,
+            body="Related to #100 only",
+            state="open",
+            merged_at="",
+            updated=10,
+        )
+        unrelated["headRefName"] = "feature/unrelated"
+        decision = canary.resolve_canary(
+            [issue],
+            pull_requests=[unrelated, attributed],
+            runs=exact_head_runs(),
+            now=NOW,
+        )
+        self.assertEqual(decision.action, "observe")
+        self.assertTrue(decision.completed)
+        self.assertEqual(decision.issue_number, 100)
+
 
 class ExactHeadRunsTest(unittest.TestCase):
     def test_replaces_only_the_target_head_snapshot_records(self):
