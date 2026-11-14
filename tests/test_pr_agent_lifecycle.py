@@ -240,16 +240,22 @@ APPROVED_448_REPAIR_OPENCODE_SHA256 = (
 APPROVED_450_SERIALIZED_OPENCODE_SHA256 = (
     "236978024396822de9ee242f532aef9b4e10c81b1d1a46f548f5b2ceb441f38a"
 )
-# kodmial/continuum#454: the reviewed #448 repair and #450 serialized-chat
-# pins above stay for audit. This task deliberately adds one bounded,
-# privacy-safe telemetry artifact upload step (always(), continue-on-error,
+# 2026-11-14: intentional scheduler-origin recovery correction in Continuum main.
+# Pin the full protected workflow after canonical receipt validation and
+# explicit quoted-owner-marker handling. Retain #450 historical digest above
+# and reject any further unauthorized byte drift.
+APPROVED_SCHEDULER_ORIGIN_OPENCODE_SHA256 = (
+    "b2bd86557d1050607e958698a75dae6ce234587f8934fac20a302587cb84ba4e"
+)
+# kodmial/continuum#454: the reviewed #448, #450, and scheduler-origin pins
+# above stay for audit. This task deliberately adds one bounded, privacy-safe
+# telemetry artifact upload step (always(), continue-on-error,
 # upload-artifact v4, runner-temp telemetry directory) so per-attempt OpenCode
 # usage survives the runner without making observability failure a task
-# failure. Merging main's #450 chat-ownership change keeps both reviewed
-# behaviors in the artifact, so this active pin covers the combined bytes;
-# unrelated drift still fails closed.
+# failure. The active pin covers the combined scheduler-origin bytes plus that
+# #454 step; unrelated drift still fails closed.
 APPROVED_454_TELEMETRY_OPENCODE_SHA256 = (
-    "21ab18877e9605ee8c680ca8a5e6acdd5dd27f6390e6751c9de17d816ca76c74"
+    "dcad5bdf774a416d40412b1dbd620b6a4a2f2466fd9f949aeb1ce6743c46c75a"
 )
 APPROVED_446_CALLER_SHA256 = (
     "b7f3df118bc436526f48443b8f068372204073eb134c98e4a1543d025f314686"
@@ -2672,13 +2678,14 @@ class ProtectedBaselineTests(unittest.TestCase):
                     self.assertIn("CONTINUUM_OPENCODE_PUBLISH_RACE_RETRY_REQUIRED", original)
                     self.assertIn("steps.model_route.outputs.model", original)
                 if path == ".github/workflows/continuum-opencode.yml":
-                    # #454 adds bounded telemetry on top of #450's deliberate
+                    # #454 adds bounded telemetry on top of the deliberate
+                    # scheduler-origin recovery correction and #450's
                     # chat-ownership change, with full-file digests and
                     # executable regression tests.
                     self.assertEqual(
                         protected_file_digest(path),
                         APPROVED_454_TELEMETRY_OPENCODE_SHA256,
-                        f"{path}: unexpected drift outside #454 telemetry on the #450 serialized CodeRabbit chat owner",
+                        f"{path}: unexpected drift outside #454 telemetry on the scheduler-origin #450 serialized CodeRabbit chat owner",
                     )
                 else:
                     # The self-dogfood caller is the dispatchable surface
