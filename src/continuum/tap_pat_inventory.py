@@ -486,6 +486,14 @@ ENTRIES = (
     # -- automation / router / bootstrap / render / docker ---------------
     {
         "workflow": "continuum-contract-canary.yml",
+        "step": "Resolve or bootstrap the live canary task",
+        "capability": CHAINING,
+        "same_repo": True,
+        "reason": "Bootstrap creation of the labelled canary issue must emit an issues/label event so the scheduler observes the new task; GITHUB_TOKEN issue writes are suppressed, and the same actor resolves the existing marker and starts the canary through the scheduler rather than simulating it.",
+        "evidence": ("GH_TOKEN: ${{ secrets.TAP_PAT }}", "gh issue create", "automation:ready"),
+    },
+    {
+        "workflow": "continuum-contract-canary.yml",
         "step": "Observe the live canary task",
         "capability": CHAINING,
         "same_repo": True,
