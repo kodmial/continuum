@@ -259,6 +259,25 @@ module.exports = async function runIssueScheduler({ github, context, core }) {
   const qualifyingLabel = process.env.QUALIFYING_LABEL || 'automation:qualifying';
   const blockedLabel = process.env.BLOCKED_LABEL || 'automation:blocked';
   const dispatchMarker = process.env.DISPATCH_MARKER || '<!-- issue-scheduler-dispatch -->';
+  function isCanonicalSchedulerDispatch(comment) {
+    const author = String(comment?.user?.login || '').toLowerCase();
+    if (author !== String(owner).toLowerCase() && author !== 'github-actions[bot]') {
+      return false;
+    }
+    const body = String(comment?.body || '').replace(/\r\n/g, '\n').trimEnd();
+    // The scheduler emits exactly this four-line receipt. A comment-mode
+    // dispatch prepends "/oc\n\n"; workflow-mode emits the receipt alone.
+    // Substring markers inside a manual reply or a Markdown quote are not
+    // scheduler attempts, even when the owner authored the reply.
+    const receipt = body.startsWith('/oc\n\n') ? body.slice(5) : body;
+    const lines = receipt.split('\n');
+    return lines.length === 4 &&
+      lines[0] === dispatchMarker &&
+      lines[1] === '⚡ **Continuum · issue-scheduler**' &&
+      lines[2] === '<!-- continuum-origin role=continuum component=issue-scheduler -->' &&
+      /^Automatically dispatched by the issue scheduler \((?:priority:p[0-2]|no explicit priority)\)\.$/.test(lines[3]);
+  }
+
   const postPauseComment =
     (process.env.POST_PAUSE_COMMENT || 'true') !== 'false';
   const resetMarkers =
@@ -1055,7 +1074,7 @@ module.exports = async function runIssueScheduler({ github, context, core }) {
       const trustedFencer =
         login === 'github-actions[bot]' ||
         login === owner.toLowerCase();
-      if (trustedFencer && body.includes(dispatchMarker)) return true;
+      if (trustedFencer && isCanonicalSchedulerDispatch(comment)) return true;
       if (trustedFencer && ownerResumeRecoveryRe.test(body)) return true;
       return (
         login === owner.toLowerCase() &&
@@ -3616,7 +3635,7 @@ module.exports = async function runIssueScheduler({ github, context, core }) {
         const ownerOpenCodeCommand =
           comment.user?.login === owner &&
           commentClasses[index] === 'run';
-        return body.includes(dispatchMarker) || ownerOpenCodeCommand;
+        return isCanonicalSchedulerDispatch(comment) || ownerOpenCodeCommand;
       })
       .sort(
         (a, b) =>
@@ -3625,9 +3644,7 @@ module.exports = async function runIssueScheduler({ github, context, core }) {
       );
     // Only the scheduler's own dispatches consume the attempt budget;
     // a manual owner /oc must never burn one.
-    const schedulerDispatches = comments.filter(comment =>
-      (comment.body || '').includes(dispatchMarker)
-    );
+    const schedulerDispatches = comments.filter(isCanonicalSchedulerDispatch);
     // A verified owner marker scopes a fresh, bounded retry budget
     // for this exact target. Pre-marker infrastructure attempts are
     // history; attempts after admission remain bounded.
@@ -4429,7 +4446,7 @@ module.exports = async function runIssueScheduler({ github, context, core }) {
           }
         );
         for (const comment of previous) {
-          if ((comment.body || '').includes(dispatchMarker)) {
+          if (isCanonicalSchedulerDispatch(comment)) {
             await github.rest.issues.deleteComment({
               owner,
               repo,

@@ -61,3 +61,22 @@ assert.equal(isCanonicalSchedulerDispatch(trusted(valid)), false);
         check=False,
     )
     assert result.returncode == 0, result.stderr
+
+
+def test_issue_scheduler_uses_the_same_canonical_receipt_in_every_control_path() -> None:
+    workflow = WORKFLOW.read_text(encoding="utf-8")
+    scheduler = (ROOT / ".github/scripts/issue_scheduler.js").read_text(encoding="utf-8")
+    start = "            function isCanonicalSchedulerDispatch(comment) {"
+    end = "            const attempts = comments.filter(isCanonicalSchedulerDispatch).length;"
+    workflow_fn = textwrap.dedent(start + workflow.split(start, 1)[1].split(end, 1)[0]).strip()
+    scheduler_start = "  function isCanonicalSchedulerDispatch(comment) {"
+    scheduler_end = "\n  const postPauseComment"
+    scheduler_fn = textwrap.dedent(
+        scheduler_start + scheduler.split(scheduler_start, 1)[1].split(scheduler_end, 1)[0]
+    ).strip()
+    assert scheduler_fn == workflow_fn.replace("lines[0] === marker", "lines[0] === dispatchMarker")
+    assert "body.includes(dispatchMarker)" not in scheduler
+    assert "comments.filter(isCanonicalSchedulerDispatch)" in scheduler
+    assert "if (isCanonicalSchedulerDispatch(comment)) {" in scheduler
+    assert "return isCanonicalSchedulerDispatch(comment) || ownerOpenCodeCommand;" in scheduler
+    assert "if (trustedFencer && isCanonicalSchedulerDispatch(comment)) return true;" in scheduler
