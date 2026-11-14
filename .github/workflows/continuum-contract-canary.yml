@@ -143,7 +143,6 @@ jobs:
           import subprocess
           from datetime import datetime, timezone
           from continuum import contract_canary as canary
-          from continuum import contract_observation as observation
 
           root = os.environ["OBSERVATION_DIR"]
           def load(name):
@@ -164,7 +163,7 @@ jobs:
           # rather than trusting a bounded global run page.
           candidate = canary.select_canary_issue(issues, expected_repo=repo)
           if candidate is not None and candidate.state == "closed":
-              latest = observation._latest_pr(candidate.number, pulls)
+              latest = canary.select_implementation_pr(candidate.number, pulls)
               head = str((latest or {}).get("headRefOid") or "").strip().lower()
               if head:
                   proc = subprocess.run(
@@ -175,7 +174,9 @@ jobs:
                       ],
                       check=True, capture_output=True, text=True,
                   )
-                  runs = runs + json.loads(proc.stdout)
+                  runs = canary.merge_exact_head_runs(
+                      runs, head, json.loads(proc.stdout)
+                  )
 
           decision = canary.resolve_canary(
               issues,
@@ -363,7 +364,7 @@ jobs:
           if observed.failure:
               raise SystemExit("live canary failed: " + observed.failure)
           if observed.completed:
-              latest = observation._latest_pr(issue_number, pulls)
+              latest = canary.select_implementation_pr(issue_number, pulls)
               head = str((latest or {}).get("headRefOid") or "").strip().lower()
               if head:
                   proc = subprocess.run(
@@ -374,8 +375,10 @@ jobs:
                       ],
                       check=True, capture_output=True, text=True,
                   )
-                  runs = runs + json.loads(proc.stdout)
-              problem = canary.validate_completed_canary(latest, runs)
+                  runs = canary.merge_exact_head_runs(
+                      runs, head, json.loads(proc.stdout)
+                  )
+              problem = canary.validate_completed_canary(latest, runs, issue_number)
               if problem:
                   raise SystemExit("live canary completion is not trustworthy: " + problem)
               merge = (latest or {}).get("mergeCommit") or {}

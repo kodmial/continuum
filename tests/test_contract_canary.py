@@ -386,33 +386,47 @@ class DiscoveryTest(unittest.TestCase):
 
 class CompletionEvidenceTest(unittest.TestCase):
     def test_exact_head_ci_and_contract_evidence_passes(self):
-        self.assertIsNone(canary.validate_completed_canary(pr(), exact_head_runs()))
+        self.assertIsNone(
+            canary.validate_completed_canary(pr(), exact_head_runs(), 100)
+        )
 
     def test_missing_merged_pr_fails(self):
-        self.assertIn("no merged implementation PR", canary.validate_completed_canary(None, []))
+        self.assertIn(
+            "no merged implementation PR",
+            canary.validate_completed_canary(None, [], 100),
+        )
 
     def test_unmerged_pr_fails(self):
         candidate = pr(merged_at="")
-        self.assertIn("not merged", canary.validate_completed_canary(candidate, exact_head_runs()))
+        self.assertIn(
+            "not merged",
+            canary.validate_completed_canary(candidate, exact_head_runs(), 100),
+        )
 
     def test_missing_full_head_fails(self):
         candidate = pr(head="a" * 7)
-        self.assertIn("full headRefOid", canary.validate_completed_canary(candidate, exact_head_runs()))
+        self.assertIn(
+            "full headRefOid",
+            canary.validate_completed_canary(candidate, exact_head_runs(), 100),
+        )
 
     def test_missing_full_merge_commit_fails(self):
         candidate = pr()
         candidate["mergeCommit"] = {"oid": "b" * 7}
-        self.assertIn("full merge commit", canary.validate_completed_canary(candidate, exact_head_runs()))
+        self.assertIn(
+            "full merge commit",
+            canary.validate_completed_canary(candidate, exact_head_runs(), 100),
+        )
 
     def test_ci_evidence_at_another_head_fails(self):
         candidate = pr()
         runs = [run("CI", head=OTHER_HEAD), run(contract.CONTRACT_WORKFLOW_NAME)]
-        problem = canary.validate_completed_canary(candidate, runs)
+        problem = canary.validate_completed_canary(candidate, runs, 100)
         self.assertIn("stale", problem)
 
     def test_missing_contract_evidence_fails(self):
         candidate = pr()
-        problem = canary.validate_completed_canary(candidate, [run("CI")])
+        problem = canary.validate_completed_canary(candidate, [run("CI")], 100)
         self.assertIn("contract-evidence-absent", problem)
 
     def test_failed_ci_evidence_fails(self):
@@ -421,8 +435,77 @@ class CompletionEvidenceTest(unittest.TestCase):
             run("CI", conclusion="failure"),
             run(contract.CONTRACT_WORKFLOW_NAME),
         ]
-        problem = canary.validate_completed_canary(candidate, runs)
+        problem = canary.validate_completed_canary(candidate, runs, 100)
         self.assertIn("regression-evidence-completed-failure", problem)
+
+    def test_unrelated_mention_is_not_completion_evidence(self):
+        candidate = pr(body="Related to #100 but this PR does not close it.")
+        candidate["headRefName"] = "feature/unrelated"
+        problem = canary.validate_completed_canary(
+            candidate, exact_head_runs(), 100
+        )
+        self.assertIn("not attributed", problem)
+
+    def test_unrelated_pr_cannot_satisfy_closed_canary(self):
+        issue = canary_issue(
+            state="closed", created=8 * 24 * 60 * 60, closed=30
+        )
+        unrelated = pr(body="See #100", updated=10)
+        unrelated["headRefName"] = "feature/unrelated"
+        with self.assertRaisesRegex(
+            canary.CanaryBootstrapError, "not trustworthy"
+        ):
+            canary.resolve_canary(
+                [issue],
+                pull_requests=[unrelated],
+                runs=exact_head_runs(),
+                now=NOW,
+            )
+
+    def test_lifecycle_branch_attributes_completion_without_keyword(self):
+        candidate = pr(body="Automated implementation for #100.")
+        self.assertIsNone(
+            canary.validate_completed_canary(candidate, exact_head_runs(), 100)
+        )
+
+    def test_closing_keyword_attributes_completion(self):
+        candidate = pr(body="Closes #100")
+        candidate["headRefName"] = "feature/noncanonical"
+        self.assertIsNone(
+            canary.validate_completed_canary(candidate, exact_head_runs(), 100)
+        )
+
+    def test_newer_unrelated_pr_does_not_shadow_attributed_pr(self):
+        attributed = pr(number=41, body="Closes #100", updated=60)
+        unrelated = pr(number=42, body="Mentions #100 only", updated=10)
+        unrelated["headRefName"] = "feature/unrelated"
+        selected = canary.select_implementation_pr(100, [unrelated, attributed])
+        self.assertEqual(selected["number"], 41)
+
+
+class ExactHeadRunsTest(unittest.TestCase):
+    def test_replaces_only_the_target_head_snapshot_records(self):
+        snapshot = [
+            run("CI", head=HEAD, conclusion="success"),
+            run("CI", head=OTHER_HEAD, conclusion="success"),
+            {
+                "name": "CI",
+                "head_sha": " {}".format(HEAD.upper()),
+                "status": "completed",
+                "conclusion": "success",
+            },
+        ]
+        fresh = [run("CI", conclusion="failure")]
+        merged = canary.merge_exact_head_runs(snapshot, HEAD, fresh)
+        self.assertEqual(merged[0]["headSha"], OTHER_HEAD)
+        self.assertEqual(merged[-1]["conclusion"], "failure")
+        self.assertEqual(len(merged), 2)
+
+    def test_no_target_head_only_appends_fresh_evidence(self):
+        snapshot = [run("CI", head=OTHER_HEAD)]
+        fresh = [run("CI", conclusion="failure")]
+        merged = canary.merge_exact_head_runs(snapshot, "", fresh)
+        self.assertEqual(merged, snapshot + fresh)
 
 
 class CanaryIssueBodyTest(unittest.TestCase):
@@ -472,6 +555,20 @@ class WorkflowContractTest(unittest.TestCase):
         self.assertIn("PUBLISH_STATUS", workflow)
         self.assertIn("continuum-canary-recovery", workflow)
         self.assertIn("GITHUB_STEP_SUMMARY", workflow)
+
+    def test_both_exact_head_fetches_replace_stale_snapshot_evidence(self):
+        """Fresh exact-HEAD runs must not be shadowed by a snapshot record.
+
+        ``evaluate_regression_gate`` consumes the first record for the target
+        head, so both the resolver and observation paths replace that head's
+        snapshot records instead of appending after them.
+        """
+        workflow = (
+            ROOT / ".github/workflows/continuum-contract-canary.yml"
+        ).read_text(encoding="utf-8")
+        self.assertEqual(workflow.count("canary.merge_exact_head_runs("), 2)
+        self.assertNotIn("runs = runs + json.loads(proc.stdout)", workflow)
+        self.assertEqual(workflow.count("select_implementation_pr("), 2)
 
     def test_workflow_preserves_review_decision_for_the_merge_stage(self):
         """The REST pulls inventory must still carry the review decision.

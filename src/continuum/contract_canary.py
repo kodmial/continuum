@@ -58,6 +58,15 @@ _MARKER_RE = re.compile(
     r"task=(?P<task>[A-Za-z0-9_.-]+) -->\Z"
 )
 _SAFE_TOKEN_RE = re.compile(r"\A[A-Za-z0-9._-]{1,120}\Z")
+#: GitHub auto-close keywords pointing at an issue number. The lifecycle writes
+#: ``Closes #<issue>`` in its implementation PR, so this is the only body shape
+#: that may attribute a merged PR to the canary issue.
+_CLOSING_REFERENCE_RE = re.compile(
+    r"\b(?:close|closes|closed|fix|fixes|fixed|resolve|resolves|resolved)"
+    r"\s*:?\s*(?:[\w.-]+/[\w.-]+#|https?://github\.com/[\w.-]+/[\w.-]+/issues/|#)?"
+    r"(?P<issue>\d+)\b",
+    re.IGNORECASE,
+)
 
 
 class CanaryBootstrapError(ValueError):
@@ -267,19 +276,87 @@ def _configured_number(value: object) -> int:
     return int(text)
 
 
+def _pr_attributes_issue(pr: Mapping[str, Any], issue_number: int) -> bool:
+    """Whether the lifecycle itself attributed ``pr`` to ``issue_number``.
+
+    Completion is stricter than ordinary liveness: the implementation PR must
+    use the lifecycle's canonical ``opencode/issue<N>-`` branch or carry a
+    GitHub auto-close keyword for the issue. A PR that merely mentions the
+    issue number is not completion evidence.
+    """
+    branch = str(
+        pr.get("headRefName") or pr.get("head_ref_name") or ""
+    ).strip()
+    if branch.startswith("opencode/issue{}-".format(issue_number)):
+        return True
+    body = str(pr.get("body") or "")
+    return any(
+        int(match.group("issue")) == issue_number
+        for match in _CLOSING_REFERENCE_RE.finditer(body)
+    )
+
+
+def select_implementation_pr(
+    issue_number: int,
+    pull_requests: Sequence[Mapping[str, Any]],
+) -> Optional[Mapping[str, Any]]:
+    """Return the newest lifecycle-attributed implementation PR for the issue."""
+    attributed = [
+        pr
+        for pr in pull_requests or []
+        if isinstance(pr, Mapping) and _pr_attributes_issue(pr, issue_number)
+    ]
+    return _latest_pr(issue_number, attributed)
+
+
+def merge_exact_head_runs(
+    runs: Sequence[Mapping[str, Any]],
+    head_sha: object,
+    exact_head_runs: Sequence[Mapping[str, Any]],
+) -> list:
+    """Replace snapshot run records for one head with an exact-HEAD fetch.
+
+    ``evaluate_regression_gate`` consumes the newest record for the target
+    head, so a stale snapshot success must never shadow a fresher exact-HEAD
+    failure. Records for other heads are preserved.
+    """
+    target = str(head_sha or "").strip().lower()
+    snapshot = list(runs or [])
+    if target:
+        snapshot = [
+            run
+            for run in snapshot
+            if not (
+                isinstance(run, Mapping)
+                and str(run.get("headSha") or run.get("head_sha") or "")
+                .strip()
+                .lower()
+                == target
+            )
+        ]
+    return snapshot + list(exact_head_runs or [])
+
+
 def validate_completed_canary(
     pull_request: Optional[Mapping[str, Any]],
     runs: Sequence[Mapping[str, Any]],
+    issue_number: int,
 ) -> Optional[str]:
     """Return a failure reason unless a completed canary PR has exact-HEAD evidence.
 
     A closed canary issue only proves a live E2E run when its implementation PR
-    is merged, carries a full head and merge commit, and has completed
-    successful ``CI`` and ``Contract qualification`` runs for that exact head.
-    Evidence for any other SHA is stale and never satisfies the check.
+    is attributed to that issue by the lifecycle, is merged, carries a full
+    head and merge commit, and has completed successful ``CI`` and ``Contract
+    qualification`` runs for that exact head. Evidence for any other SHA is
+    stale and never satisfies the check.
     """
     if not pull_request:
         return "no merged implementation PR references the canary issue"
+    if not _pr_attributes_issue(pull_request, issue_number):
+        return (
+            "implementation PR is not attributed to canary issue #{}"
+            .format(issue_number)
+        )
     merged_at = pull_request.get("mergedAt") or pull_request.get("merged_at")
     if not merged_at:
         return "implementation PR is not merged"
@@ -405,7 +482,7 @@ def resolve_canary(
             )
         )
     problem = validate_completed_canary(
-        _latest_pr(issue.number, pull_requests), runs
+        select_implementation_pr(issue.number, pull_requests), runs, issue.number
     )
     if problem:
         raise CanaryBootstrapError(
