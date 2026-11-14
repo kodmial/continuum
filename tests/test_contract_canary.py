@@ -552,6 +552,62 @@ class CompletionEvidenceTest(unittest.TestCase):
         )
         self.assertIn("not attributed", problem)
 
+    def test_link_title_closing_example_is_not_completion_evidence(self):
+        bodies = [
+            '[Documentation](https://example.com "Closes #100")',
+            "[Documentation](https://example.com 'Closes #100')",
+            "[Documentation](https://example.com (Closes #100))",
+            '[Documentation](https://example.com\n "Closes #100")',
+        ]
+        for body in bodies:
+            with self.subTest(body=body):
+                candidate = pr(body=body)
+                candidate["headRefName"] = "feature/unrelated"
+                problem = canary.validate_completed_canary(
+                    candidate, exact_head_runs(), 100
+                )
+                self.assertIn("not attributed", problem)
+
+    def test_link_title_example_cannot_replace_closed_canary(self):
+        issue = canary_issue(
+            state="closed", created=8 * 24 * 60 * 60, closed=30
+        )
+        unrelated = pr(
+            body='[Documentation](https://example.com "Closes #100")',
+            updated=10,
+        )
+        unrelated["headRefName"] = "feature/unrelated"
+        with self.assertRaisesRegex(
+            canary.CanaryBootstrapError, "not trustworthy"
+        ):
+            canary.resolve_canary(
+                [issue],
+                pull_requests=[unrelated],
+                runs=exact_head_runs(),
+                now=NOW,
+            )
+
+    def test_link_label_closing_reference_is_completion_evidence(self):
+        candidate = pr(
+            body='[Closes #100](https://example.com "Documentation")'
+        )
+        candidate["headRefName"] = "feature/unrelated"
+        self.assertIsNone(
+            canary.validate_completed_canary(candidate, exact_head_runs(), 100)
+        )
+
+    def test_operative_closing_reference_after_link_title(self):
+        candidate = pr(
+            body=(
+                '[Documentation](https://example.com "Closes #100")\n\n'
+                "Closes #100\n"
+            )
+        )
+        candidate["headRefName"] = "feature/unrelated"
+        self.assertIsNone(
+            canary.validate_completed_canary(candidate, exact_head_runs(), 100)
+        )
+
     def test_fenced_code_closing_example_is_not_completion_evidence(self):
         candidate = pr(
             body="Example only:\n\n```text\nCloses #100\n```\n"

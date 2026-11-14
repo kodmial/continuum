@@ -427,17 +427,93 @@ def _blank_markdown(text: str) -> str:
     return "".join("\n" if char == "\n" else "\x00" for char in text)
 
 
+def _inline_link_tail_end(text: str, index: int) -> Optional[int]:
+    """Return the end of a well-formed inline link tail starting at ``](``.
+
+    GitHub renders only a link's label. Its destination and optional title are
+    not operative prose, so a closing keyword in a title must not attribute a
+    PR. A malformed tail returns ``None`` so its text stays visible rather than
+    hiding a possible reference.
+    """
+    length = len(text)
+    if not text.startswith("](", index):
+        return None
+
+    def skip_space(position: int) -> int:
+        while position < length and text[position] in " \t\n":
+            position += 1
+        return position
+
+    cursor = skip_space(index + 2)
+    if cursor >= length:
+        return None
+    if text[cursor] == "<":
+        cursor += 1
+        while cursor < length:
+            char = text[cursor]
+            if char == "\\" and cursor + 1 < length:
+                cursor += 2
+                continue
+            if char == ">":
+                cursor += 1
+                break
+            if char == "\n":
+                return None
+            cursor += 1
+        else:
+            return None
+    elif text[cursor] not in ")\"'":
+        depth = 0
+        while cursor < length:
+            char = text[cursor]
+            if char == "\\" and cursor + 1 < length:
+                cursor += 2
+                continue
+            if char in " \t\n" and depth == 0:
+                break
+            if char == "(":
+                depth += 1
+            elif char == ")":
+                if depth == 0:
+                    break
+                depth -= 1
+            cursor += 1
+
+    cursor = skip_space(cursor)
+    if cursor < length and text[cursor] in "\"'(":
+        opener = text[cursor]
+        closer = ")" if opener == "(" else opener
+        cursor += 1
+        while cursor < length:
+            char = text[cursor]
+            if char == "\\" and cursor + 1 < length:
+                cursor += 2
+                continue
+            if char == closer:
+                cursor += 1
+                break
+            cursor += 1
+        else:
+            return None
+        cursor = skip_space(cursor)
+    if cursor < length and text[cursor] == ")":
+        return cursor + 1
+    return None
+
+
 def _visible_markdown(body: object) -> str:
     """Return the part of a PR body where GitHub acts on closing keywords.
 
     Closing phrases inside HTML comments, HTML ``<pre>`` and ``<code>``
     elements, fenced code blocks, indented code blocks, and inline code spans
-    are examples, not operative references. Blanking those spans with a
-    non-whitespace sentinel keeps them from matching and prevents adjacent
-    visible text from joining into a new closing reference. GitHub renders
-    ``<pre>`` content as inert preformatted text and ``<code>`` content as code,
-    so a closing keyword there never closes the issue. An unclosed block-level
-    ``<pre>`` stays inert to the end of its block quote or list item container.
+    are examples, not operative references. A Markdown link's destination and
+    title are also inert, because GitHub renders only its label. Blanking those
+    spans with a non-whitespace sentinel keeps them from matching and prevents
+    adjacent visible text from joining into a new closing reference. GitHub
+    renders ``<pre>`` content as inert preformatted text and ``<code>`` content
+    as code, so a closing keyword there never closes the issue. An unclosed
+    block-level ``<pre>`` stays inert to the end of its block quote or list item
+    container.
 
     An indented line opens a code block only at a block boundary, because GFM
     renders a four-space or tab-indented line that directly follows a paragraph
@@ -460,6 +536,7 @@ def _visible_markdown(body: object) -> str:
     """
     text = _expand_tabs_in_text(str(body or ""))
     visible = []
+    brackets = []
     index = 0
     line_start = True
     block_boundary = True
@@ -757,6 +834,19 @@ def _visible_markdown(body: object) -> str:
             line_blank = False
             continue
         char = text[index]
+        if char == "[" and (index == 0 or text[index - 1] != "\\"):
+            brackets.append(index)
+        elif char == "]" and (index == 0 or text[index - 1] != "\\"):
+            opener = brackets.pop() if brackets else None
+            if opener is not None:
+                end = _inline_link_tail_end(text, index)
+                if end is not None:
+                    visible.append(char)
+                    visible.append(_blank_markdown(text[index + 1:end]))
+                    index = end
+                    line_start = False
+                    line_blank = False
+                    continue
         visible.append(char)
         index += 1
         if char == "\n":
