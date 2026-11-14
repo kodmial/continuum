@@ -23,7 +23,7 @@ def script_for_step():
 
 @unittest.skipUnless(shutil.which("node"), "Node.js unavailable")
 class CodeRabbitExecutorAdmissionTests(unittest.TestCase):
-    def run_case(self, resolved=False, newer_verification=False):
+    def run_case(self, resolved=False, newer_verification=False, quota_reply=False):
         node = """
 const head='a'.repeat(40);
 const find=101;
@@ -40,6 +40,11 @@ process.env.BATCH_JSON=JSON.stringify([{review_id:review,finding_id:find,
  unresolved_id:301,verified_head:head}]);
 const comments=[verification,reply];
 if (process.env.TEST_NEWER==='true') comments.push(newer);
+if (process.env.TEST_QUOTA==='true') comments.push({
+ id:351,in_reply_to_id:find, user:{login:'coderabbitai[bot]'},
+ body:'### Rate Limit Exceeded\\n' +
+  '`@kodmial` have exceeded the limit for the number of chat messages per hour. ' +
+  'Please wait **14 minutes and 56 seconds** before sending another message.'});
 const out={};
 const core={setOutput:(k,v)=>out[k]=String(v),notice:()=>{}};
 const context={repo:{owner:'kodmial',repo:'nanodictate'}};
@@ -71,7 +76,8 @@ const github={
             ["node", "-"], input=code, text=True, capture_output=True, check=False,
             env={**__import__("os").environ,
                  "TEST_RESOLVED": str(resolved).lower(),
-                 "TEST_NEWER": str(newer_verification).lower()}
+                 "TEST_NEWER": str(newer_verification).lower(),
+                 "TEST_QUOTA": str(quota_reply).lower()}
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         return json.loads(result.stdout)
@@ -86,6 +92,11 @@ const github={
 
     def test_newer_verification_must_not_repair_stale_answer(self):
         self.assertEqual(self.run_case(newer_verification=True)["skip"], "true")
+
+    def test_newer_chat_quota_reply_does_not_supersede_admitted_answer(self):
+        result = self.run_case(quota_reply=True)
+        self.assertEqual(result["skip"], "false")
+        self.assertEqual(json.loads(result["items_json"])[0]["unresolved_id"], 301)
 
 
 if __name__ == "__main__":

@@ -407,6 +407,10 @@ jobs:
           // Reconcile at a bounded cadence; the existing 17/47 safety-net wakeups will
           // retry only after this timeout instead of spamming the external reviewer.
           const CODERABBIT_THREAD_VERIFICATION_TIMEOUT_MS = 30 * 60_000;
+          // The inline CodeRabbit chat quota is account-wide. A reconciliation
+          // pass may send at most one chat-quota retry so simultaneous PRs and
+          // threads cannot produce a chat storm; the next wakeup continues.
+          const MAX_CHAT_QUOTA_VERIFICATION_SENDS_PER_RUN = 1;
           const CONFLICT_LOCK_LABEL = 'opencode-conflict-repair';
           // Self-healing conflict recovery (issue #246). Every
           // reconciliation pass rediscovers every open dirty PR, including
@@ -933,41 +937,281 @@ jobs:
             return false;
           }
 
+          const REVIEW_QUOTA_SIGNAL_RE =
+            /Review rate limited|Review limit reached/i;
+
+          // Markdown emphasis may wrap a countdown ("**13 minutes**").
+          // Remove only delimiter runs adjacent to whitespace or a window
+          // boundary, so an unrecognized token such as "1_hour" stays
+          // rejected.
+          const MARKDOWN_EMPHASIS_RE =
+            /(^|\s)(?:\*{1,3}|_{1,3}|~~)|(?:\*{1,3}|_{1,3}|~~)(?=\s|$)/g;
+
+          function stripMarkdownEmphasis(text = '') {
+            return String(text).replace(MARKDOWN_EMPHASIS_RE, '$1').trim();
+          }
+
           function retryWindowText(body = '') {
+            const quotaSignalled = REVIEW_QUOTA_SIGNAL_RE.test(body);
+            // The generic "try again" phrase also appears in ordinary
+            // finding answers, so it needs an explicit quota signal; the
+            // "next review ... available ... in" form is unambiguous.
             const patterns = [
-              /next\s+(?:included\s+)?review\b[^\n<.]{0,120}?\bavailable\b[^\n<.]{0,40}?\b(?:in|after)\s+([^\n<.]+)/i,
-              /(?:try|retry)\s+again\b[^\n<.]{0,40}?\b(?:in|after)\s+([^\n<.]+)/i,
+              [
+                /next\s+(?:included\s+)?review\b[^\n<.]{0,120}?\bavailable\b[^\n<.]{0,40}?\b(?:in|after)\s+([^\n<.]+)/i,
+                false,
+              ],
+              [
+                /(?:try|retry)\s+again\b[^\n<.]{0,40}?\b(?:in|after)\s+([^\n<.]+)/i,
+                true,
+              ],
             ];
-            for (const pattern of patterns) {
+            for (const [pattern, requiresQuotaSignal] of patterns) {
+              if (requiresQuotaSignal && !quotaSignalled) continue;
               const match = body.match(pattern);
-              if (match) return match[1];
+              if (match) return stripMarkdownEmphasis(match[1]);
             }
             return null;
           }
 
           function parseDurationMs(text = '') {
-            if (/less than\s+(?:a|one)\s+minute/i.test(text)) {
-              return 60_000;
-            }
-
+            // Only a complete countdown parses. A window with an
+            // unrecognized token ("1h 30 seconds") must fall back to the
+            // provider quota fallback instead of retrying after its short
+            // suffix.
+            const value = stripMarkdownEmphasis(text);
+            const token =
+              /(?<less>less\s+than\s+(?:a|one)\s+minute)|(?<amount>\d+)\s*(?<unit>hours?|hrs?|minutes?|mins?|seconds?|secs?)/gi;
+            const separator = /^[\s,.]*(?:and[\s,.]*)?$/i;
             let totalMs = 0;
             let found = false;
-            for (const part of text.matchAll(
-              /(\d+)\s*(hours?|hrs?|minutes?|mins?|seconds?|secs?)/gi
-            )) {
+            let cursor = 0;
+            for (const part of value.matchAll(token)) {
+              if (!separator.test(value.slice(cursor, part.index))) return null;
+              cursor = part.index + part[0].length;
               found = true;
-              const value = Number(part[1]);
-              const unit = part[2].toLowerCase();
+              if (part.groups?.less) {
+                totalMs += 60_000;
+                continue;
+              }
+              const amount = Number(part.groups?.amount);
+              const unit = String(part.groups?.unit || '').toLowerCase();
               if (unit.startsWith('hour') || unit.startsWith('hr')) {
-                totalMs += value * 60 * 60_000;
+                totalMs += amount * 60 * 60_000;
               } else if (unit.startsWith('minute') || unit.startsWith('min')) {
-                totalMs += value * 60_000;
+                totalMs += amount * 60_000;
               } else {
-                totalMs += value * 1_000;
+                totalMs += amount * 1_000;
               }
             }
-            return found ? totalMs : null;
+            if (!found || !separator.test(value.slice(cursor))) return null;
+            return totalMs;
           }
+
+          // Continuum CodeRabbit reply classification (#450): trusted author,
+          // inline chat-message quota vs full-review quota vs finding verdict.
+          // Keep this block byte-identical in continuum-auto-merge.yml and
+          // continuum-coderabbit-unresolved.yml; tests execute it and compare
+          // it with continuum.coderabbit_adapter.
+          // continuum-coderabbit-chat-quota:start
+          const CODERABBIT_BOT_LOGIN = 'coderabbitai[bot]';
+          const CHAT_QUOTA_FALLBACK_MS = 65 * 60_000;
+          const CHAT_RETRY_SAFETY_PADDING_MS = 30_000;
+          const CHAT_RATE_LIMIT_HEADING_RE =
+            /^[ \t]{0,3}#{1,6}[ \t]*Rate[ \t]+Limit[ \t]+Exceeded[ \t]*\r?$/im;
+          const CHAT_RATE_LIMIT_PROSE_RE =
+            /^(?![ \t]*>)[^\n]*\b(?:exceeded|reached)\b[^\n]*\blimit\b[^\n]*\bchat messages? per hour\b[^\n]*$/im;
+          const CHAT_RATE_LIMIT_NEGATED_RE =
+            /(?:\b(?:not|never|no)\b|n['’]t)[^\n]*\b(?:exceeded|reached)\b/i;
+          const CHAT_COUNTDOWN_RE =
+            /please\s+wait\s+\*{0,2}\s*((?:less\s+than\s+(?:a|one)\s+minute)|[0-9][^\n*]*?)\s*\*{0,2}\s+before\s+sending\s+another\s+message/i;
+
+          function isTrustedCodeRabbitAuthor(login) {
+            return String(login || '').trim().toLowerCase() === CODERABBIT_BOT_LOGIN;
+          }
+
+          // Markdown emphasis may wrap a full-review countdown
+          // ("**13 minutes**"). Remove only delimiter runs adjacent to
+          // whitespace or a window boundary, so an unrecognized token such as
+          // "1_hour" stays rejected.
+          const QUOTA_EMPHASIS_RE =
+            /(^|\s)(?:\*{1,3}|_{1,3}|~~)|(?:\*{1,3}|_{1,3}|~~)(?=\s|$)/g;
+
+          function stripQuotaEmphasis(text = '') {
+            return String(text).replace(QUOTA_EMPHASIS_RE, '$1').trim();
+          }
+
+          function parseChatDurationMs(text = '') {
+            // Only a complete countdown parses; a partially recognized
+            // window falls back to CHAT_QUOTA_FALLBACK_MS at the caller.
+            const value = stripQuotaEmphasis(text);
+            const token =
+              /(?<less>less\s+than\s+(?:a|one)\s+minute)|(?<amount>\d+)\s*(?<unit>hours?|hrs?|minutes?|mins?|seconds?|secs?)/gi;
+            const separator = /^[\s,.]*(?:and[\s,.]*)?$/i;
+            let totalMs = 0;
+            let found = false;
+            let cursor = 0;
+            for (const part of value.matchAll(token)) {
+              if (!separator.test(value.slice(cursor, part.index))) return null;
+              cursor = part.index + part[0].length;
+              found = true;
+              if (part.groups?.less) {
+                totalMs += 60_000;
+                continue;
+              }
+              const amount = Number(part.groups?.amount);
+              const unit = String(part.groups?.unit || '').toLowerCase();
+              if (unit.startsWith('hour') || unit.startsWith('hr')) {
+                totalMs += amount * 60 * 60_000;
+              } else if (unit.startsWith('minute') || unit.startsWith('min')) {
+                totalMs += amount * 60_000;
+              } else {
+                totalMs += amount * 1_000;
+              }
+            }
+            if (!found || !separator.test(value.slice(cursor))) return null;
+            return totalMs;
+          }
+
+          function quotaVisibleMarkdown(body = '') {
+            let fenceChar = '';
+            let fenceLength = 0;
+            return String(body || '').split(/\r?\n/).map(line => {
+              const marker = line.match(/^[ \t]{0,3}(\x60{3,}|~{3,})/);
+              if (fenceChar) {
+                if (marker && marker[1][0] === fenceChar &&
+                    marker[1].length >= fenceLength &&
+                    line.slice(marker[0].length).trim() === '') {
+                  fenceChar = '';
+                  fenceLength = 0;
+                }
+                return '';
+              }
+              if (marker) {
+                fenceChar = marker[1][0];
+                fenceLength = marker[1].length;
+                return '';
+              }
+              return /^[ \t]*>/.test(line) ? '' : line;
+            }).join('\n');
+          }
+
+          function parseChatQuotaDelayMs(body = '') {
+            const text = quotaVisibleMarkdown(body);
+            if (!CHAT_RATE_LIMIT_HEADING_RE.test(text) &&
+              (!CHAT_RATE_LIMIT_PROSE_RE.test(text) ||
+               CHAT_RATE_LIMIT_NEGATED_RE.test(text))) {
+              return null;
+            }
+            const match = text.match(CHAT_COUNTDOWN_RE);
+            if (!match) return CHAT_QUOTA_FALLBACK_MS;
+            const parsed = parseChatDurationMs(match[1]);
+            return parsed === null ? CHAT_QUOTA_FALLBACK_MS : parsed;
+          }
+
+          function parseReviewQuotaDelayMs(body = '') {
+            // Findings often quote provider wording in fences or
+            // blockquotes; only visible evidence is a quota signal.
+            const text = quotaVisibleMarkdown(body);
+            const quotaSignalled =
+              /Review rate limited|Review limit reached/i.test(text);
+            // The generic "try again" phrase is only a full-review quota
+            // window with an explicit quota signal; the "next review ...
+            // available ... in" form remains unambiguous on its own.
+            const patterns = [
+              [
+                /next\s+(?:included\s+)?review\b[^\n<.]{0,120}?\bavailable\b[^\n<.]{0,40}?\b(?:in|after)\s+([^\n<.]+)/i,
+                false,
+              ],
+              [
+                /(?:try|retry)\s+again\b[^\n<.]{0,40}?\b(?:in|after)\s+([^\n<.]+)/i,
+                true,
+              ],
+            ];
+            for (const [pattern, requiresQuotaSignal] of patterns) {
+              if (requiresQuotaSignal && !quotaSignalled) continue;
+              const match = text.match(pattern);
+              if (!match) continue;
+              const parsed = parseChatDurationMs(match[1]);
+              if (parsed !== null) return parsed;
+            }
+            return quotaSignalled ? 65 * 60_000 : null;
+          }
+
+          function classifyCodeRabbitReply(reply = {}) {
+            const login = String(
+              reply.user?.login || reply.author?.login || ''
+            );
+            if (login && !isTrustedCodeRabbitAuthor(login)) {
+              return { kind: 'untrusted', delayMs: null };
+            }
+            const chatDelayMs = parseChatQuotaDelayMs(reply.body || '');
+            if (chatDelayMs !== null) {
+              return { kind: 'chat_rate_limit', delayMs: chatDelayMs };
+            }
+            const reviewDelayMs = parseReviewQuotaDelayMs(reply.body || '');
+            if (reviewDelayMs !== null) {
+              return { kind: 'review_rate_limit', delayMs: reviewDelayMs };
+            }
+            return { kind: 'verdict', delayMs: null };
+          }
+
+          function isCodeRabbitQuotaReply(reply = {}) {
+            const kind = classifyCodeRabbitReply(reply).kind;
+            return kind === 'chat_rate_limit' || kind === 'review_rate_limit';
+          }
+
+          function chatQuotaNotBeforeMs(reply = {}) {
+            const delayMs = parseChatQuotaDelayMs(reply.body || '');
+            if (delayMs === null) return null;
+            const createdAt = Date.parse(reply.created_at || '');
+            if (!Number.isFinite(createdAt)) return null;
+            return createdAt + delayMs + CHAT_RETRY_SAFETY_PADDING_MS;
+          }
+
+          function latestChatQuotaReply(comments, rootCommentId) {
+            return (comments || [])
+              .filter(comment =>
+                (rootCommentId === undefined || rootCommentId === null ||
+                 comment.in_reply_to_id === rootCommentId) &&
+                isTrustedCodeRabbitAuthor(
+                  comment.user?.login || comment.author?.login
+                ) &&
+                classifyCodeRabbitReply(comment).kind === 'chat_rate_limit'
+              )
+              .sort((a, b) => Number(b.id) - Number(a.id))[0] || null;
+          }
+
+          function chatQuotaRetryMarker(findingId, headSha, limitedCommentId) {
+            return '<!-- auto-merge-coderabbit-chat-quota-retry ' +
+              `finding=${findingId} head=${String(headSha || '').toLowerCase()} ` +
+              `limited=${limitedCommentId} -->`;
+          }
+
+          function chatQuotaRetryAcknowledged(
+            comments, findingId, headSha, limitedCommentId, rootCommentId,
+            trustedAuthors = []
+          ) {
+            const allowed = new Set(
+              Array.from(trustedAuthors || [])
+                .map(login => String(login || '').trim().toLowerCase())
+                .filter(Boolean)
+            );
+            if (!allowed.size) return false;
+            const marker = chatQuotaRetryMarker(
+              findingId, headSha, limitedCommentId
+            );
+            return (comments || []).some(comment =>
+              (rootCommentId === undefined || rootCommentId === null ||
+               comment.in_reply_to_id === rootCommentId) &&
+              allowed.has(
+                String(comment.user?.login || comment.author?.login || '')
+                  .trim().toLowerCase()
+              ) &&
+              String(comment.body || '').includes(marker)
+            );
+          }
+          // continuum-coderabbit-chat-quota:end
 
           function parseCodeRabbitRetryDelayMs(body = '') {
             const windowText = retryWindowText(body);
@@ -976,7 +1220,7 @@ jobs:
               : parseDurationMs(windowText);
             if (parsed !== null) return parsed;
 
-            if (/Review rate limited|Review limit reached/i.test(body)) {
+            if (REVIEW_QUOTA_SIGNAL_RE.test(body)) {
               core.warning(
                 'Could not parse CodeRabbit quota countdown; using 65-minute fallback.'
               );
@@ -1002,6 +1246,24 @@ jobs:
               'Review rate limited. Try again in less than a minute.',
               60_000,
             ],
+            [
+              'Review rate limited. Next included review available in **13 minutes**.',
+              13 * 60_000,
+            ],
+            [
+              'Review rate limited. Next included review available in **1 hour 5 minutes**.',
+              65 * 60_000,
+            ],
+            // Markdown emphasis must not turn a partially recognized window
+            // into a short-suffix retry.
+            [
+              'Review rate limited. Next included review available in **1h 30 seconds**.',
+              65 * 60_000,
+            ],
+            // A bare "try again" phrase is ordinary prose, not a quota
+            // window; the unambiguous "next review ... available" form is.
+            ['Try again in 13 minutes.', null],
+            ['Next review available in 13 minutes.', 13 * 60_000],
           ];
           for (const [sample, expected] of retryParserCases) {
             const actual = parseCodeRabbitRetryDelayMs(sample);
@@ -1608,42 +1870,27 @@ jobs:
           // Never send one inline verification per unresolved finding in
           // the same wake. Full-review quota stays a separate shared queue.
           const CODERABBIT_CHAT_MIN_GAP_MS = 5 * 60_000;
-          const CODERABBIT_CHAT_FALLBACK_MS = 65 * 60_000;
-          const CODERABBIT_CHAT_PADDING_MS = 30_000;
           let codeRabbitChatSentThisPass = false;
           let codeRabbitChatNextAllowedAt = null;
 
           function isCodeRabbitChatLimitReply(comment) {
-            const body = String(comment?.body || '');
+            const body = quotaVisibleMarkdown(comment?.body || '');
             return comment?.user?.login === 'coderabbitai[bot]' &&
               /(?:^|\n)\s*###\s*Rate Limit Exceeded\b/i.test(body) &&
               /\bnumber of chat messages per hour\b/i.test(body);
           }
 
           function codeRabbitChatLimitNotBefore(comment) {
-            if (!isCodeRabbitChatLimitReply(comment)) return null;
-            const body = String(comment.body || '');
-            const countdown = body.match(
-              /please wait\s+\*\*([^*\n]{1,90})\*\*\s+before sending another message/i
-            );
-            let delay = 0;
-            if (countdown) {
-              for (const part of countdown[1].matchAll(
-                /(\d+)\s*(hours?|minutes?|seconds?)/gi
-              )) {
-                const amount = Number(part[1]);
-                const unit = part[2].toLowerCase();
-                delay += amount * (unit.startsWith('hour') ? 3_600_000 :
-                  unit.startsWith('minute') ? 60_000 : 1_000);
-              }
+            const login = comment?.user?.login || comment?.author?.login || '';
+            if (!isTrustedCodeRabbitAuthor(login)) return null;
+            if (classifyCodeRabbitReply(comment).kind !== 'chat_rate_limit') {
+              return null;
             }
-            if (!(delay > 0 && delay <= 24 * 3_600_000)) {
-              delay = CODERABBIT_CHAT_FALLBACK_MS;
-            }
-            const at = Date.parse(comment.created_at || '');
-            return Number.isFinite(at)
-              ? at + delay + CODERABBIT_CHAT_PADDING_MS
-              : Number.MAX_SAFE_INTEGER;
+            // Reuse the exact inline-chat deadline calculation so a
+            // heading-only reply with a countdown longer than the fallback
+            // still raises the account-wide floor. Invalid timestamps fail
+            // closed at the largest representable deadline.
+            return chatQuotaNotBeforeMs(comment) ?? Number.MAX_SAFE_INTEGER;
           }
 
           function isTrustedContinuumChatRequest(comment) {
@@ -1655,8 +1902,7 @@ jobs:
                body.includes('<!-- opencode-coderabbit-verification review='));
           }
 
-          async function allowOneCodeRabbitChatRequest() {
-            if (codeRabbitChatSentThisPass) return false;
+          async function codeRabbitChatBudgetAllowsSend() {
             if (codeRabbitChatNextAllowedAt === null) {
               let notBefore = 0;
               // Scan the newest verified comments of *all* open PRs, not
@@ -1725,8 +1971,20 @@ jobs:
               );
               return false;
             }
+            return true;
+          }
+
+          // Consume the single legal send only after every live check has
+          // passed. A skipped stale finding must not burn the pass's slot.
+          function consumeCodeRabbitChatSendSlot() {
+            if (codeRabbitChatSentThisPass) return false;
             codeRabbitChatSentThisPass = true;
             return true;
+          }
+
+          async function allowOneCodeRabbitChatRequest() {
+            if (!(await codeRabbitChatBudgetAllowsSend())) return false;
+            return consumeCodeRabbitChatSendSlot();
           }
 
           function shouldRecheckCodeRabbitAfterCi(answer, ci, alreadyRequested) {
@@ -1748,7 +2006,9 @@ jobs:
               .test(String(answer.body || ''));
           }
 
-          async function requestCodeRabbitThreadVerification(pr, threads, ci) {
+          async function requestCodeRabbitThreadVerification(
+            pr, threads, ci, sharedChatQuota
+          ) {
             if (!threads.length) return 0;
 
             const comments = await withReadFallback(client =>
@@ -1765,6 +2025,101 @@ jobs:
 
             let requested = 0;
             let repairReconciliationDispatched = false;
+            const chatQuotaState =
+              sharedChatQuota || { remaining: 1, notBeforeMs: 0 };
+            // Only the account that posts this workflow's verification
+            // replies may acknowledge a chat-quota retry or establish a
+            // verification request. Resolve the PAT-authenticated login once
+            // per pass; github-actions[bot] remains trusted for run-scoped
+            // verification markers. The whole thread decision is deferred while
+            // the posting login remains unknown, because neither its
+            // acknowledgement nor its handoff could be distinguished from a
+            // foreign marker.
+            const trustedChatRetryAuthors = new Set(['github-actions[bot]']);
+            let chatRetryAuthorResolved = false;
+            try {
+              const { data: authenticated } =
+                await github.rest.users.getAuthenticated();
+              const login = String(authenticated?.login || '').trim().toLowerCase();
+              if (login) {
+                trustedChatRetryAuthors.add(login);
+                chatRetryAuthorResolved = true;
+              }
+            } catch (err) {
+              core.warning(
+                `PR #${pr.number}: could not resolve the verification-reply author; deferring CodeRabbit verification decisions until the next wakeup: ${err.message || err}`
+              );
+            }
+            // A handoff or verification marker is authoritative only when it
+            // was published by the resolved posting account. While that
+            // identity is unknown, a PAT-authored handoff is indistinguishable
+            // from a foreign marker; deciding now could dispatch another repair
+            // batch over an already-completed repair and leave the finding
+            // without the fresh verification that handoff requires.
+            if (!chatRetryAuthorResolved) {
+              core.notice(
+                `PR #${pr.number}: posting identity is unresolved; deferring CodeRabbit thread verification decisions to the next wakeup.`
+              );
+              return 0;
+            }
+
+            // OpenCode never writes into the CodeRabbit inline chat. After a
+            // repair batch it publishes a completion handoff as an issue
+            // comment instead. Consume that handoff so a repair that leaves
+            // HEAD unchanged still triggers a fresh verification of its
+            // outcome, rather than the earlier UNRESOLVED answer selecting
+            // another repair batch forever.
+            //
+            // Read every issue comment instead of a bounded newest window:
+            // an older handoff can predate later chatter, and missing it
+            // would dispatch another repair batch instead of requesting the
+            // fresh verification that handoff already requires. A truncated
+            // or failed read is therefore a failed read.
+            let repairHandoffs = [];
+            let repairHandoffReadFailed = false;
+            try {
+              repairHandoffs = await withReadFallback(client =>
+                client.paginate(
+                  client.rest.issues.listComments,
+                  {
+                    owner,
+                    repo,
+                    issue_number: pr.number,
+                    per_page: 100,
+                  }
+                )
+              );
+            } catch (err) {
+              // Without the handoff list a repair that left HEAD unchanged is
+              // indistinguishable from no repair at all. Defer the repair
+              // decision instead of re-selecting the batch from the older
+              // answer; the next scheduled reconciliation re-reads the list.
+              repairHandoffReadFailed = true;
+              core.warning(
+                `PR #${pr.number}: could not read CodeRabbit repair handoffs; deferring repair decisions until the next reconciliation: ${err.message || err}`
+              );
+            }
+            const pendingRepairHandoff = (findingId, headSha) => {
+              const pattern =
+                /<!-- opencode-coderabbit-verification-pending head=([0-9a-f]{40}) findings=([0-9,]+)(?: answers=[0-9,]+)? -->/;
+              let newest = null;
+              for (const comment of repairHandoffs) {
+                const login = String(
+                  comment.user?.login || comment.author?.login || ''
+                ).trim().toLowerCase();
+                if (!trustedChatRetryAuthors.has(login)) continue;
+                const match = String(comment.body || '').match(pattern);
+                if (!match || match[1] !== headSha) continue;
+                if (!match[2].split(',').map(Number).includes(findingId)) {
+                  continue;
+                }
+                if (!newest || Number(comment.id) > Number(newest.id)) {
+                  newest = comment;
+                }
+              }
+              return newest;
+            };
+
             for (const thread of threads) {
               if (!thread.commentId) continue;
 
@@ -1774,6 +2129,10 @@ jobs:
               const verificationRequests = comments
                 .filter(comment =>
                   comment.in_reply_to_id === thread.commentId &&
+                  trustedChatRetryAuthors.has(
+                    String(comment.user?.login || comment.author?.login || '')
+                      .trim().toLowerCase()
+                  ) &&
                   comment.body?.includes(marker)
                 )
                 .sort(
@@ -1782,6 +2141,25 @@ jobs:
                     new Date(a.created_at || 0).getTime()
                 );
               const latestVerification = verificationRequests[0] || null;
+              const repairHandoff = pendingRepairHandoff(
+                thread.commentId, pr.head.sha
+              );
+              // A CodeRabbit "### Rate Limit Exceeded" reply is an inline
+              // chat-message/hour rejection, not a finding verdict. Only a
+              // trusted bot reply in this exact thread can establish it, and
+              // it always outranks the generic unanswered-verification
+              // timeout: never send before the parsed deadline.
+              const chatLimit = latestChatQuotaReply(
+                comments, thread.commentId
+              );
+              const pendingChatLimit =
+                chatLimit &&
+                (!latestVerification ||
+                 Number(chatLimit.id) > Number(latestVerification.id))
+                  ? chatLimit
+                  : null;
+              let chatRetryLimitedId = null;
+              let chatRetryDueAt = null;
               if (latestVerification) {
                 const verificationAt =
                   new Date(latestVerification.created_at || 0).getTime();
@@ -1793,13 +2171,33 @@ jobs:
                 const latestAnswer = comments
                   .filter(comment =>
                     comment.in_reply_to_id === thread.commentId &&
-                    comment.user?.login?.startsWith('coderabbitai') &&
+                    isTrustedCodeRabbitAuthor(comment.user?.login) &&
                     Number(comment.id) > Number(latestVerification.id) &&
-                    !/Review rate limited|Review limit reached/i.test(comment.body || '') &&
+                    // The shared classifier rejects both the inline-chat and
+                    // the full-review quota replies; the explicit chat-quota
+                    // helper keeps the serialized budget owner's canonical
+                    // shape as a second guard.
+                    !isCodeRabbitQuotaReply(comment) &&
                     !isCodeRabbitChatLimitReply(comment)
                   )
                   .sort((a, b) => Number(b.id) - Number(a.id))[0] || null;
-                if (latestAnswer) {
+                // A repair handoff newer than the latest verification means
+                // the canonical repair finished without a new commit. Ask
+                // CodeRabbit to judge that outcome instead of treating the
+                // older answer as still awaiting repair.
+                const handoffAt = repairHandoff
+                  ? Date.parse(repairHandoff.created_at || '') : NaN;
+                const repairHandoffPending =
+                  !!latestAnswer &&
+                  Number.isFinite(handoffAt) &&
+                  (!Number.isFinite(verificationAt) ||
+                   handoffAt > verificationAt);
+                if (repairHandoffPending) {
+                  core.info(
+                    `PR #${pr.number}: consuming OpenCode repair handoff for finding #${thread.commentId}; requesting a fresh exact-HEAD verification.`
+                  );
+                }
+                if (latestAnswer && !repairHandoffPending) {
                   const postCiMarker =
                     `<!-- auto-merge-coderabbit-post-ci-verification finding=${thread.commentId} head=${pr.head.sha} -->`;
                   const alreadyRequested = comments.some(comment =>
@@ -1844,6 +2242,12 @@ jobs:
                       }
                     );
                     requested += 1;
+                    continue;
+                  }
+                  if (repairHandoffReadFailed) {
+                    core.notice(
+                      `PR #${pr.number}: CodeRabbit repair handoffs are unreadable; deferring the repair decision for thread #${thread.commentId} until the next reconciliation.`
+                    );
                     continue;
                   }
                   if (!repairReconciliationDispatched &&
@@ -1919,31 +2323,159 @@ jobs:
                   }
                   continue;
                 }
-                if (
+                if (pendingChatLimit) {
+                  chatRetryDueAt = chatQuotaNotBeforeMs(pendingChatLimit);
+                  if (chatRetryDueAt === null) {
+                    core.warning(
+                      `PR #${pr.number}: CodeRabbit chat-rate-limit reply #${pendingChatLimit.id} on thread #${thread.commentId} has no reliable timestamp; failing closed without a verification send.`
+                    );
+                    continue;
+                  }
+                  // The inline chat quota is shared by every PR and thread. A
+                  // later observed countdown raises the floor for this whole
+                  // pass so simultaneous wakeups cannot chat-storm.
+                  chatQuotaState.notBeforeMs = Math.max(
+                    Number(chatQuotaState.notBeforeMs || 0), chatRetryDueAt
+                  );
+                  if (chatQuotaState.notBeforeMs - Date.now() > 0) {
+                    core.info(
+                      `PR #${pr.number}: shared CodeRabbit chat quota resets at ${new Date(chatQuotaState.notBeforeMs).toISOString()}; waiting for thread #${thread.commentId}.`
+                    );
+                    continue;
+                  }
+                  if (chatQuotaRetryAcknowledged(
+                    comments, thread.commentId, pr.head.sha,
+                    pendingChatLimit.id, thread.commentId,
+                    trustedChatRetryAuthors
+                  )) {
+                    core.info(
+                      `PR #${pr.number}: CodeRabbit chat-quota retry for finding #${thread.commentId} was already sent for HEAD ${pr.head.sha}.`
+                    );
+                    continue;
+                  }
+                  chatRetryLimitedId = pendingChatLimit.id;
+                } else if (
+                  !repairHandoffPending &&
                   Date.now() - verificationAt <
                   CODERABBIT_THREAD_VERIFICATION_TIMEOUT_MS
                 ) {
                   continue;
+                } else if (!repairHandoffPending) {
+                  core.warning(
+                    `PR #${pr.number}: CodeRabbit did not answer thread verification #${thread.commentId} within the bounded timeout; retrying the same exact-HEAD verification.`
+                  );
                 }
-                core.warning(
-                  `PR #${pr.number}: CodeRabbit did not answer thread verification #${thread.commentId} within the bounded timeout; retrying the same exact-HEAD verification.`
+              } else if (pendingChatLimit) {
+                // No verification marker exists for this HEAD yet (for
+                // example a HEAD change during the quota window). Respect the
+                // same account-wide deadline before the first send.
+                chatRetryDueAt = chatQuotaNotBeforeMs(pendingChatLimit);
+                if (chatRetryDueAt === null) {
+                  core.warning(
+                    `PR #${pr.number}: CodeRabbit chat-rate-limit reply #${pendingChatLimit.id} on thread #${thread.commentId} has no reliable timestamp; failing closed without a verification send.`
+                  );
+                  continue;
+                }
+                chatQuotaState.notBeforeMs = Math.max(
+                  Number(chatQuotaState.notBeforeMs || 0), chatRetryDueAt
                 );
+                if (chatQuotaState.notBeforeMs - Date.now() > 0) {
+                  core.info(
+                    `PR #${pr.number}: shared CodeRabbit chat quota resets at ${new Date(chatQuotaState.notBeforeMs).toISOString()}; waiting for thread #${thread.commentId}.`
+                  );
+                  continue;
+                }
+                if (chatQuotaRetryAcknowledged(
+                  comments, thread.commentId, pr.head.sha,
+                  pendingChatLimit.id, thread.commentId,
+                  trustedChatRetryAuthors
+                )) {
+                  core.info(
+                    `PR #${pr.number}: CodeRabbit chat-quota retry for finding #${thread.commentId} was already sent for HEAD ${pr.head.sha}.`
+                  );
+                  continue;
+                }
+                chatRetryLimitedId = pendingChatLimit.id;
+              }
+
+              // A pending chat limit observed for any PR/thread in this pass
+              // also gates an otherwise ordinary first/verification send:
+              // the shared chat quota must not be burned before its reset.
+              if (chatRetryLimitedId === null &&
+                  chatQuotaState.notBeforeMs - Date.now() > 0) {
+                core.info(
+                  `PR #${pr.number}: shared CodeRabbit chat quota is active until ${new Date(chatQuotaState.notBeforeMs).toISOString()}; deferring verification for thread #${thread.commentId}.`
+                );
+                continue;
+              }
+
+              if (chatRetryLimitedId !== null) {
+                if (Number(chatQuotaState.remaining || 0) <= 0) {
+                  core.notice(
+                    `PR #${pr.number}: shared CodeRabbit chat quota already consumed its retry in this reconciliation; deferring thread #${thread.commentId} to the next wakeup.`
+                  );
+                  continue;
+                }
               }
 
               const body = [
                 marker,
+                ...(chatRetryLimitedId !== null
+                  ? [
+                      chatQuotaRetryMarker(
+                        thread.commentId, pr.head.sha, chatRetryLimitedId
+                      ),
+                    ]
+                  : []),
                 '⚡ **Continuum · auto-merge**',
                 '<!-- continuum-origin role=continuum component=auto-merge -->',
                 '@coderabbitai Re-check this unresolved original finding against the current PR HEAD.',
                 '',
                 `Current PR HEAD: \`${pr.head.sha}\``,
+                ...(chatRetryLimitedId !== null
+                  ? [
+                      '',
+                      'The previous reply was a CodeRabbit chat-message quota rejection, not a finding verdict.',
+                      `The chat quota window has elapsed (not before ${new Date(chatRetryDueAt).toISOString()}).`,
+                      'Answer the original verification question for this exact finding.',
+                    ]
+                  : []),
                 '',
                 'Inspect the current code itself, not only the incremental diff.',
                 'Resolve this thread only if the underlying issue is fully fixed.',
                 'Otherwise explain exactly what remains unresolved.',
               ].join('\n');
 
-              if (!(await allowOneCodeRabbitChatRequest())) continue;
+              if (!(await codeRabbitChatBudgetAllowsSend())) continue;
+              if (codeRabbitChatSentThisPass) continue;
+              if (chatRetryLimitedId !== null) {
+                // Deadline reached: after the shared chat-budget scan,
+                // re-read live state and retry only the same still-open,
+                // still-unresolved finding on this HEAD.
+                const live = await getPullWithAuthoritativeHead(pr.number);
+                if (live.state !== 'open' ||
+                    live.head.sha !== pr.head.sha) {
+                  core.info(
+                    `PR #${pr.number}: PR/HEAD changed before the CodeRabbit chat-quota retry; skipping stale finding #${thread.commentId}.`
+                  );
+                  continue;
+                }
+                const liveThreads = await unresolvedCodeRabbitThreads(pr);
+                if (!liveThreads.some(candidate =>
+                  candidate.commentId === thread.commentId)) {
+                  core.info(
+                    `PR #${pr.number}: finding #${thread.commentId} is no longer unresolved; skipping stale CodeRabbit chat-quota retry.`
+                  );
+                  continue;
+                }
+              }
+              // Consume the single send slot only after the live checks pass,
+              // so a stale finding cannot block another thread in this pass.
+              if (!consumeCodeRabbitChatSendSlot()) continue;
+              if (chatRetryLimitedId !== null) {
+                chatQuotaState.remaining =
+                  Number(chatQuotaState.remaining || 0) - 1;
+              }
               await github.request(
                 'POST /repos/{owner}/{repo}/pulls/{pull_number}/comments/{comment_id}/replies',
                 {
@@ -3616,6 +4148,13 @@ jobs:
           );
 
           let codeRabbitRetryControllerDispatched = false;
+          // The inline CodeRabbit chat quota is account-wide. One shared
+          // budget and deadline floor serialize chat-quota retries across all
+          // open PRs/threads scanned by this reconciliation pass.
+          const sharedChatQuota = {
+            remaining: MAX_CHAT_QUOTA_VERIFICATION_SENDS_PER_RUN,
+            notBeforeMs: 0,
+          };
           // Deterministic per-PR failures must not strand healthy PRs
           // behind one bad PR: record loudly and continue the loop.
           let deterministicFailure = null;
@@ -3885,6 +4424,37 @@ jobs:
               }
             }
 
+            // Never lose an old CodeRabbit finding just because its diff is
+            // now outdated. Thread convergence must run before the generic
+            // "completed review" status wait: CodeRabbit can overwrite a
+            // completed-review status with "Review skipped" while an
+            // exact-head finding still needs verification. Waiting first
+            // creates a deadlock where no verifier is ever re-requested.
+            // It must also run before the full-review quota return below:
+            // OpenCode publishes repair completion as a handoff, so a
+            // rate-limited status alone would otherwise strand the finding
+            // and the controller refuses this PR until it is verified.
+            const unresolvedThreads = requireCodeRabbit
+              ? await unresolvedCodeRabbitThreads(pr)
+              : [];
+            if (unresolvedThreads.length > 0) {
+              const requested = await requestCodeRabbitThreadVerification(
+                pr,
+                unresolvedThreads,
+                ci,
+                sharedChatQuota
+              );
+              core.info(
+                `PR #${pr.number}: waiting for ${unresolvedThreads.length} unresolved CodeRabbit thread(s); requested ${requested} fresh verification(s) for head ${pr.head.sha}: ` +
+                unresolvedThreads
+                  .map(thread =>
+                    `#${thread.commentId || thread.id} ${thread.path}${thread.outdated ? ' (outdated)' : ''}`
+                  )
+                  .join(', ')
+              );
+              continue;
+            }
+
             // Rate-limit recovery applies only when this HEAD still needs its
             // own review. A safely carried approval must not burn another
             // included CodeRabbit review merely because the merge SHA changed.
@@ -3925,32 +4495,6 @@ jobs:
                   );
                 }
               }
-              continue;
-            }
-
-            // Never lose an old CodeRabbit finding just because its diff is
-            // now outdated. Thread convergence must run before the generic
-            // "completed review" status wait: CodeRabbit can overwrite a
-            // completed-review status with "Review skipped" while an
-            // exact-head finding still needs verification. Waiting first
-            // creates a deadlock where no verifier is ever re-requested.
-            const unresolvedThreads = requireCodeRabbit
-              ? await unresolvedCodeRabbitThreads(pr)
-              : [];
-            if (unresolvedThreads.length > 0) {
-              const requested = await requestCodeRabbitThreadVerification(
-                pr,
-                unresolvedThreads,
-                ci
-              );
-              core.info(
-                `PR #${pr.number}: waiting for ${unresolvedThreads.length} unresolved CodeRabbit thread(s); requested ${requested} fresh verification(s) for head ${pr.head.sha}: ` +
-                unresolvedThreads
-                  .map(thread =>
-                    `#${thread.commentId || thread.id} ${thread.path}${thread.outdated ? ' (outdated)' : ''}`
-                  )
-                  .join(', ')
-              );
               continue;
             }
 

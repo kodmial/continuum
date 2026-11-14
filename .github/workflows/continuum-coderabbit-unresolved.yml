@@ -90,6 +90,206 @@ jobs:
             const autoMergeVerificationPattern =
               /<!-- auto-merge-coderabbit-verification finding=(\d+) head=([0-9a-f]{40}) -->/;
 
+            // continuum-coderabbit-chat-quota:start
+            const CODERABBIT_BOT_LOGIN = 'coderabbitai[bot]';
+            const CHAT_QUOTA_FALLBACK_MS = 65 * 60_000;
+            const CHAT_RETRY_SAFETY_PADDING_MS = 30_000;
+            const CHAT_RATE_LIMIT_HEADING_RE =
+              /^[ \t]{0,3}#{1,6}[ \t]*Rate[ \t]+Limit[ \t]+Exceeded[ \t]*\r?$/im;
+            const CHAT_RATE_LIMIT_PROSE_RE =
+              /^(?![ \t]*>)[^\n]*\b(?:exceeded|reached)\b[^\n]*\blimit\b[^\n]*\bchat messages? per hour\b[^\n]*$/im;
+            const CHAT_RATE_LIMIT_NEGATED_RE =
+              /(?:\b(?:not|never|no)\b|n['’]t)[^\n]*\b(?:exceeded|reached)\b/i;
+            const CHAT_COUNTDOWN_RE =
+              /please\s+wait\s+\*{0,2}\s*((?:less\s+than\s+(?:a|one)\s+minute)|[0-9][^\n*]*?)\s*\*{0,2}\s+before\s+sending\s+another\s+message/i;
+
+            function isTrustedCodeRabbitAuthor(login) {
+              return String(login || '').trim().toLowerCase() === CODERABBIT_BOT_LOGIN;
+            }
+
+            // Markdown emphasis may wrap a full-review countdown
+            // ("**13 minutes**"). Remove only delimiter runs adjacent to
+            // whitespace or a window boundary, so an unrecognized token such as
+            // "1_hour" stays rejected.
+            const QUOTA_EMPHASIS_RE =
+              /(^|\s)(?:\*{1,3}|_{1,3}|~~)|(?:\*{1,3}|_{1,3}|~~)(?=\s|$)/g;
+
+            function stripQuotaEmphasis(text = '') {
+              return String(text).replace(QUOTA_EMPHASIS_RE, '$1').trim();
+            }
+
+            function parseChatDurationMs(text = '') {
+              // Only a complete countdown parses; a partially recognized
+              // window falls back to CHAT_QUOTA_FALLBACK_MS at the caller.
+              const value = stripQuotaEmphasis(text);
+              const token =
+                /(?<less>less\s+than\s+(?:a|one)\s+minute)|(?<amount>\d+)\s*(?<unit>hours?|hrs?|minutes?|mins?|seconds?|secs?)/gi;
+              const separator = /^[\s,.]*(?:and[\s,.]*)?$/i;
+              let totalMs = 0;
+              let found = false;
+              let cursor = 0;
+              for (const part of value.matchAll(token)) {
+                if (!separator.test(value.slice(cursor, part.index))) return null;
+                cursor = part.index + part[0].length;
+                found = true;
+                if (part.groups?.less) {
+                  totalMs += 60_000;
+                  continue;
+                }
+                const amount = Number(part.groups?.amount);
+                const unit = String(part.groups?.unit || '').toLowerCase();
+                if (unit.startsWith('hour') || unit.startsWith('hr')) {
+                  totalMs += amount * 60 * 60_000;
+                } else if (unit.startsWith('minute') || unit.startsWith('min')) {
+                  totalMs += amount * 60_000;
+                } else {
+                  totalMs += amount * 1_000;
+                }
+              }
+              if (!found || !separator.test(value.slice(cursor))) return null;
+              return totalMs;
+            }
+
+            function quotaVisibleMarkdown(body = '') {
+              let fenceChar = '';
+              let fenceLength = 0;
+              return String(body || '').split(/\r?\n/).map(line => {
+                const marker = line.match(/^[ \t]{0,3}(\x60{3,}|~{3,})/);
+                if (fenceChar) {
+                  if (marker && marker[1][0] === fenceChar &&
+                      marker[1].length >= fenceLength &&
+                      line.slice(marker[0].length).trim() === '') {
+                    fenceChar = '';
+                    fenceLength = 0;
+                  }
+                  return '';
+                }
+                if (marker) {
+                  fenceChar = marker[1][0];
+                  fenceLength = marker[1].length;
+                  return '';
+                }
+                return /^[ \t]*>/.test(line) ? '' : line;
+              }).join('\n');
+            }
+
+            function parseChatQuotaDelayMs(body = '') {
+              const text = quotaVisibleMarkdown(body);
+              if (!CHAT_RATE_LIMIT_HEADING_RE.test(text) &&
+                (!CHAT_RATE_LIMIT_PROSE_RE.test(text) ||
+                 CHAT_RATE_LIMIT_NEGATED_RE.test(text))) {
+                return null;
+              }
+              const match = text.match(CHAT_COUNTDOWN_RE);
+              if (!match) return CHAT_QUOTA_FALLBACK_MS;
+              const parsed = parseChatDurationMs(match[1]);
+              return parsed === null ? CHAT_QUOTA_FALLBACK_MS : parsed;
+            }
+
+            function parseReviewQuotaDelayMs(body = '') {
+              // Findings often quote provider wording in fences or
+              // blockquotes; only visible evidence is a quota signal.
+              const text = quotaVisibleMarkdown(body);
+              const quotaSignalled =
+                /Review rate limited|Review limit reached/i.test(text);
+              // The generic "try again" phrase is only a full-review quota
+              // window with an explicit quota signal; the "next review ...
+              // available ... in" form remains unambiguous on its own.
+              const patterns = [
+                [
+                  /next\s+(?:included\s+)?review\b[^\n<.]{0,120}?\bavailable\b[^\n<.]{0,40}?\b(?:in|after)\s+([^\n<.]+)/i,
+                  false,
+                ],
+                [
+                  /(?:try|retry)\s+again\b[^\n<.]{0,40}?\b(?:in|after)\s+([^\n<.]+)/i,
+                  true,
+                ],
+              ];
+              for (const [pattern, requiresQuotaSignal] of patterns) {
+                if (requiresQuotaSignal && !quotaSignalled) continue;
+                const match = text.match(pattern);
+                if (!match) continue;
+                const parsed = parseChatDurationMs(match[1]);
+                if (parsed !== null) return parsed;
+              }
+              return quotaSignalled ? 65 * 60_000 : null;
+            }
+
+            function classifyCodeRabbitReply(reply = {}) {
+              const login = String(
+                reply.user?.login || reply.author?.login || ''
+              );
+              if (login && !isTrustedCodeRabbitAuthor(login)) {
+                return { kind: 'untrusted', delayMs: null };
+              }
+              const chatDelayMs = parseChatQuotaDelayMs(reply.body || '');
+              if (chatDelayMs !== null) {
+                return { kind: 'chat_rate_limit', delayMs: chatDelayMs };
+              }
+              const reviewDelayMs = parseReviewQuotaDelayMs(reply.body || '');
+              if (reviewDelayMs !== null) {
+                return { kind: 'review_rate_limit', delayMs: reviewDelayMs };
+              }
+              return { kind: 'verdict', delayMs: null };
+            }
+
+            function isCodeRabbitQuotaReply(reply = {}) {
+              const kind = classifyCodeRabbitReply(reply).kind;
+              return kind === 'chat_rate_limit' || kind === 'review_rate_limit';
+            }
+
+            function chatQuotaNotBeforeMs(reply = {}) {
+              const delayMs = parseChatQuotaDelayMs(reply.body || '');
+              if (delayMs === null) return null;
+              const createdAt = Date.parse(reply.created_at || '');
+              if (!Number.isFinite(createdAt)) return null;
+              return createdAt + delayMs + CHAT_RETRY_SAFETY_PADDING_MS;
+            }
+
+            function latestChatQuotaReply(comments, rootCommentId) {
+              return (comments || [])
+                .filter(comment =>
+                  (rootCommentId === undefined || rootCommentId === null ||
+                   comment.in_reply_to_id === rootCommentId) &&
+                  isTrustedCodeRabbitAuthor(
+                    comment.user?.login || comment.author?.login
+                  ) &&
+                  classifyCodeRabbitReply(comment).kind === 'chat_rate_limit'
+                )
+                .sort((a, b) => Number(b.id) - Number(a.id))[0] || null;
+            }
+
+            function chatQuotaRetryMarker(findingId, headSha, limitedCommentId) {
+              return '<!-- auto-merge-coderabbit-chat-quota-retry ' +
+                `finding=${findingId} head=${String(headSha || '').toLowerCase()} ` +
+                `limited=${limitedCommentId} -->`;
+            }
+
+            function chatQuotaRetryAcknowledged(
+              comments, findingId, headSha, limitedCommentId, rootCommentId,
+              trustedAuthors = []
+            ) {
+              const allowed = new Set(
+                Array.from(trustedAuthors || [])
+                  .map(login => String(login || '').trim().toLowerCase())
+                  .filter(Boolean)
+              );
+              if (!allowed.size) return false;
+              const marker = chatQuotaRetryMarker(
+                findingId, headSha, limitedCommentId
+              );
+              return (comments || []).some(comment =>
+                (rootCommentId === undefined || rootCommentId === null ||
+                 comment.in_reply_to_id === rootCommentId) &&
+                allowed.has(
+                  String(comment.user?.login || comment.author?.login || '')
+                    .trim().toLowerCase()
+                ) &&
+                String(comment.body || '').includes(marker)
+              );
+            }
+            // continuum-coderabbit-chat-quota:end
+
             // Bounded newest-first scan (#254): batching only needs the
             // latest verification per finding and replies newer than it,
             // so ten newest-first pages bound the cost. The review-comment
@@ -295,12 +495,16 @@ jobs:
                     comment.user?.login === 'coderabbitai[bot]' &&
                     getRootId(comment) === verification.findingId &&
                     comment.id > verification.comment.id &&
-                    !/Review rate limited|Review limit reached/i.test(comment.body ?? '') &&
                     // CodeRabbit inline-chat quota is distinct from full-review
                     // quota. A rejected reply is not UNRESOLVED evidence and
                     // must never dispatch OpenCode to 'fix' a valid finding.
-                    !(/(?:^|\n)\s*###\s*Rate Limit Exceeded\b/i.test(comment.body ?? '') &&
-                      /\bnumber of chat messages per hour\b/i.test(comment.body ?? ''))
+                    // The shared classifier rejects both quota forms; keep the
+                    // explicit chat-quota shape as a second guard.
+                    !isCodeRabbitQuotaReply(comment) &&
+                    !(/(?:^|\n)\s*###\s*Rate Limit Exceeded\b/i.test(
+                      quotaVisibleMarkdown(comment.body ?? '')) &&
+                      /\bnumber of chat messages per hour\b/i.test(
+                        quotaVisibleMarkdown(comment.body ?? '')))
                 )
                 .sort((a, b) => b.id - a.id);
 
@@ -348,9 +552,6 @@ jobs:
               return;
             }
 
-            core.notice(
-              `Batching ${active.length} unresolved CodeRabbit finding(s) in one OpenCode run.`
-            );
             let headSha = pr.data.head.sha;
             if (pr.data.head.repo?.full_name === `${owner}/${repo}`) {
               const { data: headRef } = await github.rest.git.getRef({
@@ -361,11 +562,110 @@ jobs:
               if (headRef?.object?.sha) headSha = headRef.object.sha;
             }
 
+            // A completed repair publishes an issue-comment handoff instead
+            // of writing into the CodeRabbit inline chat. Until auto-merge
+            // turns that handoff into a fresh exact-HEAD verification, the
+            // older UNRESOLVED answer must not select the same finding again.
+            // Read every issue comment, not just a bounded newest window: an
+            // older pending handoff can predate newer chatter, and skipping
+            // it would re-select the repaired finding. A truncated read is
+            // therefore also a failed read.
+            let repairHandoffs = [];
+            let repairHandoffReadFailed = false;
+            try {
+              repairHandoffs = await github.paginate(
+                github.rest.issues.listComments,
+                {
+                  owner,
+                  repo,
+                  issue_number: pullNumber,
+                  per_page: 100,
+                }
+              );
+            } catch (err) {
+              repairHandoffReadFailed = true;
+              core.warning(
+                `PR #${pullNumber}: could not read CodeRabbit repair handoffs; deferring the batch decision until the next reconciliation: ${err.message || err}`
+              );
+            }
+            if (repairHandoffReadFailed) {
+              core.setOutput('should_run', 'false');
+              core.setOutput('items_json', '[]');
+              return;
+            }
+            // Any handoff published after this scan has a larger issue-comment
+            // id. The dispatcher re-reads handoffs against this cutoff right
+            // before dispatch so a repair that finishes during the active-run
+            // check cannot select its own finding again.
+            const repairHandoffCutoff = repairHandoffs.reduce(
+              (max, comment) => Math.max(max, Number(comment.id) || 0),
+              0
+            );
+            const repairHandoffPattern =
+              /<!-- opencode-coderabbit-verification-pending head=([0-9a-f]{40}) findings=([0-9,]+)(?: answers=[0-9,]+)? -->/;
+            const newestRepairHandoff = findingId => {
+              let newest = null;
+              for (const comment of repairHandoffs) {
+                if (!trustedMarkerAuthors.has(
+                  comment.user?.login || comment.author?.login || ''
+                )) {
+                  continue;
+                }
+                const match = String(comment.body || '').match(
+                  repairHandoffPattern
+                );
+                if (!match || match[1] !== headSha) continue;
+                if (!match[2].split(',').map(Number).includes(findingId)) {
+                  continue;
+                }
+                if (!newest || Number(comment.id) > Number(newest.id)) {
+                  newest = comment;
+                }
+              }
+              return newest;
+            };
+
+            const dispatchable = active.filter(item => {
+              const verification = latestVerification.get(item.finding_id);
+              const handoff = newestRepairHandoff(item.finding_id);
+              if (!verification || !handoff) return true;
+              const handoffAt = Date.parse(handoff.created_at || '');
+              const verificationAt = Date.parse(
+                verification.comment.created_at || ''
+              );
+              // The handoff is pending until a verification request is newer
+              // than the repair completion. Only then can CodeRabbit judge
+              // the repair outcome on the current HEAD.
+              return !(
+                Number.isFinite(handoffAt) &&
+                (!Number.isFinite(verificationAt) ||
+                 handoffAt > verificationAt)
+              );
+            });
+            if (dispatchable.length !== active.length) {
+              core.notice(
+                `PR #${pullNumber}: deferring ${active.length - dispatchable.length} CodeRabbit finding(s) with a pending repair handoff until fresh verification.`
+              );
+            }
+            if (dispatchable.length === 0) {
+              core.notice(
+                'No unresolved CodeRabbit findings are dispatchable before fresh verification.'
+              );
+              core.setOutput('should_run', 'false');
+              core.setOutput('items_json', '[]');
+              return;
+            }
+
+            core.notice(
+              `Batching ${dispatchable.length} unresolved CodeRabbit finding(s) in one OpenCode run.`
+            );
+
             core.setOutput('should_run', 'true');
             core.setOutput('pr_number', String(pullNumber));
             core.setOutput('head_ref', pr.data.head.ref);
             core.setOutput('head_sha', headSha);
-            core.setOutput('items_json', JSON.stringify(active));
+            core.setOutput('handoff_cutoff', String(repairHandoffCutoff));
+            core.setOutput('items_json', JSON.stringify(dispatchable));
 
       - name: Dispatch one batched repair to canonical OpenCode
         if: steps.context.outputs.should_run == 'true'
@@ -374,6 +674,7 @@ jobs:
           PR_NUMBER: ${{ steps.context.outputs.pr_number }}
           HEAD_REF: ${{ steps.context.outputs.head_ref }}
           COLLECTED_HEAD: ${{ steps.context.outputs.head_sha }}
+          HANDOFF_CUTOFF: ${{ steps.context.outputs.handoff_cutoff }}
           UNRESOLVED_ITEMS_JSON: ${{ steps.context.outputs.items_json }}
           CONTINUUM_OPENCODE_WORKFLOW: ${{ inputs.opencode_workflow || vars.CONTINUUM_OPENCODE_WORKFLOW || 'continuum-opencode.yml' }}
         with:
@@ -410,6 +711,16 @@ jobs:
             const pullNumber = Number(process.env.PR_NUMBER);
             const head = String(process.env.COLLECTED_HEAD || '');
             const headRef = String(process.env.HEAD_REF || '');
+            const handoffCutoffText = String(
+              process.env.HANDOFF_CUTOFF || ''
+            ).trim();
+            const handoffCutoff = Number(handoffCutoffText);
+            if (!/^\d+$/.test(handoffCutoffText) ||
+                !Number.isSafeInteger(handoffCutoff)) {
+              throw new Error(
+                'Invalid CodeRabbit repair handoff cutoff; refusing dispatch.'
+              );
+            }
             const items = JSON.parse(process.env.UNRESOLVED_ITEMS_JSON || '[]');
             if (!Number.isInteger(pullNumber) || pullNumber <= 0 ||
                 !/^[0-9a-f]{40}$/.test(head) ||
@@ -516,6 +827,59 @@ jobs:
               core.warning(
                 `CodeRabbit batch remains unresolved on identical HEAD after ${attempts.length} dispatch(es). Re-dispatching through canonical OpenCode with bounded backoff.`
               );
+            }
+
+            // The collector read handoffs before the active-run check above.
+            // A repair can publish its completion handoff during that window
+            // and finish before the check sees it. Re-read every handoff
+            // immediately before dispatch and defer if a handoff newer than
+            // the collector's cutoff now covers any finding in this batch.
+            let liveIssueComments = [];
+            try {
+              liveIssueComments = await github.paginate(
+                github.rest.issues.listComments,
+                { owner, repo, issue_number: pullNumber, per_page: 100 }
+              );
+            } catch (err) {
+              core.notice(
+                `PR #${pullNumber}: could not re-read CodeRabbit repair handoffs before dispatch; deferring until the next reconciliation: ${err.message || err}`
+              );
+              return;
+            }
+            const trustedHandoffAuthors = new Set(['github-actions[bot]']);
+            trustedHandoffAuthors.add(
+              String(
+                (await github.rest.users.getAuthenticated()).data.login || ''
+              ).trim().toLowerCase()
+            );
+            const repairHandoffPattern =
+              /<!-- opencode-coderabbit-verification-pending head=([0-9a-f]{40}) findings=([0-9,]+)(?: answers=[0-9,]+)? -->/;
+            const batchFindingIds = new Set(
+              items.map(item => item.finding_id)
+            );
+            const handoffPublishedDuringDispatch = liveIssueComments.some(
+              comment => {
+                if (Number(comment.id) <= handoffCutoff) return false;
+                const login = String(
+                  comment.user?.login || comment.author?.login || ''
+                ).trim().toLowerCase();
+                if (!trustedHandoffAuthors.has(login)) return false;
+                const match = String(comment.body || '').match(
+                  repairHandoffPattern
+                );
+                return Boolean(
+                  match && match[1] === head &&
+                  match[2].split(',').map(Number).some(
+                    findingId => batchFindingIds.has(findingId)
+                  )
+                );
+              }
+            );
+            if (handoffPublishedDuringDispatch) {
+              core.notice(
+                `PR #${pullNumber}: a CodeRabbit repair handoff was published after collection; deferring this batch until fresh verification.`
+              );
+              return;
             }
 
             // The optional batch input is an additive consumer API. An
