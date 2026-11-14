@@ -270,6 +270,21 @@ def _alternating_code_indent(line: str, block_boundary: bool) -> Optional[int]:
     return None
 
 
+def _fence_open(line: str) -> Optional[re.Match]:
+    """Return a valid GFM fence opener for one line, or ``None``.
+
+    A backtick fence's info string may not contain a backtick. GitHub renders
+    such a line as ordinary prose, so treating it as a fence would hide an
+    operative closing reference that follows it.
+    """
+    opener = _FENCE_OPEN_RE.match(line)
+    if opener is None:
+        return None
+    if opener.group("fence")[0] == "`" and "`" in line[opener.end():]:
+        return None
+    return opener
+
+
 def _parse_fence_chain(
     text: str, block_boundary: bool
 ) -> Tuple[Optional[re.Match], list]:
@@ -297,7 +312,7 @@ def _parse_fence_chain(
             cursor += len(text[cursor:]) - len(stripped)
             continue
         break
-    opener = _FENCE_OPEN_RE.match(text[cursor:])
+    opener = _fence_open(text[cursor:])
     if opener is None:
         return None, containers
     return opener, containers
@@ -711,6 +726,19 @@ def _visible_markdown(body: object) -> str:
                     (candidate == 0 or text[candidate - 1] != "`")
                     and (candidate_end == len(text) or text[candidate_end] != "`")
                 ):
+                    line_begin = text.rfind("\n", 0, candidate) + 1
+                    line_end = text.find("\n", candidate)
+                    if line_end == -1:
+                        line_end = len(text)
+                    prefix = text[line_begin:candidate]
+                    if (
+                        not prefix.strip()
+                        and _leading_columns(prefix) <= 3
+                        and _fence_open(text[line_begin:line_end]) is not None
+                    ):
+                        # A block-level fence interrupts the paragraph, so its
+                        # backticks cannot close an inline code span above it.
+                        break
                     close = candidate
                     break
                 search = candidate_end

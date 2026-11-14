@@ -562,6 +562,30 @@ class CompletionEvidenceTest(unittest.TestCase):
         )
         self.assertIn("not attributed", problem)
 
+    def test_backtick_in_backtick_fence_info_string_is_not_a_fence(self):
+        bodies = [
+            "```bad`text\nCloses #100\n",
+            "```bad`text\nCloses #100\n```\n",
+            "````bad`text\nCloses #100\n````\n",
+        ]
+        for body in bodies:
+            with self.subTest(body=body):
+                candidate = pr(body=body)
+                candidate["headRefName"] = "feature/unrelated"
+                self.assertIsNone(
+                    canary.validate_completed_canary(
+                        candidate, exact_head_runs(), 100
+                    )
+                )
+
+    def test_tilde_fence_info_string_may_contain_a_backtick(self):
+        candidate = pr(body="~~~bad`text\nCloses #100\n~~~\n")
+        candidate["headRefName"] = "feature/unrelated"
+        problem = canary.validate_completed_canary(
+            candidate, exact_head_runs(), 100
+        )
+        self.assertIn("not attributed", problem)
+
     def test_list_item_fenced_code_closing_example_is_not_completion_evidence(self):
         bodies = [
             "- ```text\n  Closes #100\n",
