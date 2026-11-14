@@ -77,6 +77,7 @@ _CLOSING_REFERENCE_RE = re.compile(
 )
 _FENCE_OPEN_RE = re.compile(r"^[ \t]{0,3}(?P<fence>`{3,}|~{3,})")
 _FENCE_CLOSE_RE = re.compile(r"^[ \t]{0,3}(?P<fence>`{3,}|~{3,})[ \t]*$")
+_INDENTED_CODE_RE = re.compile(r"^(?: {4}| {0,3}\t)")
 
 
 def _blank_markdown(text: str) -> str:
@@ -87,15 +88,23 @@ def _blank_markdown(text: str) -> str:
 def _visible_markdown(body: object) -> str:
     """Return the part of a PR body where GitHub acts on closing keywords.
 
-    Closing phrases inside HTML comments, fenced code blocks, and inline code
-    spans are examples, not operative references. Blanking those spans with a
-    non-whitespace sentinel keeps them from matching and prevents adjacent
-    visible text from joining into a new closing reference.
+    Closing phrases inside HTML comments, fenced code blocks, indented code
+    blocks, and inline code spans are examples, not operative references.
+    Blanking those spans with a non-whitespace sentinel keeps them from
+    matching and prevents adjacent visible text from joining into a new
+    closing reference.
+
+    An indented line opens a code block only at a block boundary, because GFM
+    renders a four-space or tab-indented line that directly follows a paragraph
+    line as a lazy paragraph continuation. Once opened, the block continues
+    across blank lines and still-indented lines, just as GFM renders it.
     """
     text = str(body or "")
     visible = []
     index = 0
     line_start = True
+    block_boundary = True
+    line_blank = True
     while index < len(text):
         if line_start and text[index] != "\n":
             line_end = text.find("\n", index)
@@ -123,11 +132,40 @@ def _visible_markdown(body: object) -> str:
                 visible.append(_blank_markdown(text[index:end]))
                 index = end
                 line_start = False
+                block_boundary = True
+                line_blank = True
+                continue
+            if block_boundary and _INDENTED_CODE_RE.match(text[index:line_end]):
+                end = line_end
+                cursor = line_end + 1 if line_end < len(text) else len(text)
+                while cursor < len(text):
+                    next_end = text.find("\n", cursor)
+                    if next_end == -1:
+                        next_end = len(text)
+                    candidate = text[cursor:next_end]
+                    if _INDENTED_CODE_RE.match(candidate) or not candidate.strip():
+                        end = next_end
+                        cursor = next_end + 1 if next_end < len(text) else len(text)
+                        continue
+                    break
+                visible.append(_blank_markdown(text[index:end]))
+                index = end
+                line_start = False
+                block_boundary = True
+                line_blank = True
                 continue
         if text.startswith("<!--", index):
             close = text.find("-->", index + 4)
             end = len(text) if close == -1 else close + 3
             visible.append(_blank_markdown(text[index:end]))
+            line_begin = text.rfind("\n", 0, index) + 1
+            rest_end = text.find("\n", end)
+            if rest_end == -1:
+                rest_end = len(text)
+            line_blank = (
+                not text[line_begin:index].strip()
+                and not text[end:rest_end].strip()
+            )
             index = end
             line_start = index > 0 and text[index - 1] == "\n"
             continue
@@ -157,15 +195,24 @@ def _visible_markdown(body: object) -> str:
                 visible.append(_blank_markdown(text[index:end]))
                 index = end
                 line_start = index > 0 and text[index - 1] == "\n"
+                line_blank = False
                 continue
             visible.append(run)
             index = run_end
             line_start = False
+            line_blank = False
             continue
         char = text[index]
         visible.append(char)
         index += 1
-        line_start = char == "\n"
+        if char == "\n":
+            block_boundary = line_blank
+            line_blank = True
+            line_start = True
+        else:
+            if not char.isspace():
+                line_blank = False
+            line_start = False
     return "".join(visible)
 
 
