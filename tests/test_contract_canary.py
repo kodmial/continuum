@@ -942,6 +942,52 @@ class CompletionEvidenceTest(unittest.TestCase):
         )
         self.assertIn("not attributed", problem)
 
+    def test_inline_html_code_closing_example_is_not_completion_evidence(self):
+        candidate = pr(
+            body="The docs render <code>Closes #100</code> verbatim.\n"
+        )
+        candidate["headRefName"] = "feature/unrelated"
+        problem = canary.validate_completed_canary(
+            candidate, exact_head_runs(), 100
+        )
+        self.assertIn("not attributed", problem)
+
+    def test_block_quote_unclosed_html_pre_is_not_completion_evidence(self):
+        candidate = pr(body="> <pre>\n> Closes #100\n")
+        candidate["headRefName"] = "feature/unrelated"
+        problem = canary.validate_completed_canary(
+            candidate, exact_head_runs(), 100
+        )
+        self.assertIn("not attributed", problem)
+
+    def test_html_code_and_block_quote_pre_examples_keep_branch_attribution(self):
+        for body in ("<code>Closes #100</code>\n", "> <pre>\n> Closes #100\n"):
+            with self.subTest(body=body):
+                candidate = pr(body=body)
+                self.assertIsNone(
+                    canary.validate_completed_canary(
+                        candidate, exact_head_runs(), 100
+                    )
+                )
+
+    def test_operative_closing_reference_after_html_code_example(self):
+        candidate = pr(
+            body="<code>Closes #100</code>\n\nCloses #100\n"
+        )
+        candidate["headRefName"] = "feature/unrelated"
+        self.assertIsNone(
+            canary.validate_completed_canary(candidate, exact_head_runs(), 100)
+        )
+
+    def test_operative_closing_reference_after_block_quote_pre_example(self):
+        candidate = pr(
+            body="> <pre>\n> Closes #100\n\nCloses #100\n"
+        )
+        candidate["headRefName"] = "feature/unrelated"
+        self.assertIsNone(
+            canary.validate_completed_canary(candidate, exact_head_runs(), 100)
+        )
+
     def test_operative_closing_reference_after_html_pre_example(self):
         candidate = pr(
             body="<pre>\nCloses #100\n</pre>\n\nCloses #100\n"
