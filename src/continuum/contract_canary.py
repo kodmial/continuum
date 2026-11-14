@@ -83,6 +83,7 @@ _THEMATIC_BREAK_RE = re.compile(
 )
 _BLOCK_QUOTE_RE = re.compile(r" {0,3}>[ \t]?")
 _LIST_MARKER_RE = re.compile(r"(?:[-+*]|(?P<number>\d{1,9})[.)])")
+_TASK_CHECKBOX_RE = re.compile(r"\[[ xX]\](?:[ \t]+|$)")
 _HTML_PRE_OPEN_RE = re.compile(r"<pre(?=[\s/>])", re.IGNORECASE)
 _HTML_PRE_CLOSE_RE = re.compile(r"</pre\s*>", re.IGNORECASE)
 _HTML_CODE_OPEN_RE = re.compile(r"<code(?=[\s/>])", re.IGNORECASE)
@@ -277,14 +278,17 @@ def _consume_indented_code(
     required_indent: int,
     list_content_column: Optional[int] = None,
     inner_depth: int = 0,
+    strip_quotes: bool = True,
 ) -> int:
-    """Return the last offset of an indented code block's continuation lines.
+    """Return the last offset of a code block's continuation lines.
 
     ``end`` is the end of the opening line and ``cursor`` the start of the next
     line. Lines continue while they stay inside the same quote depth and keep
     the required indentation, or are blank. With ``inner_depth`` the quote
     markers start at the list item's content column, so they are stripped from
-    there instead of from column zero.
+    there instead of from column zero. ``strip_quotes`` is false for an HTML
+    ``<pre>`` block, where only the enclosing container's quote markers are
+    structural and any further markers are inert preformatted text.
     """
     while cursor < len(text):
         next_end = text.find("\n", cursor)
@@ -301,7 +305,9 @@ def _consume_indented_code(
             if next_inner < inner_depth and raw.strip():
                 break
         else:
-            depth, content = _strip_block_quotes(raw)
+            depth, content = _strip_block_quotes(
+                raw, quote_depth if not strip_quotes else None
+            )
             if depth < quote_depth:
                 break
         if (
@@ -524,44 +530,48 @@ def _visible_markdown(body: object) -> str:
             tag_end = text.find(">", pre_open.end())
             if tag_end != -1:
                 end = tag_end + 1
-                if text[tag_end - 1] != "/":
-                    closing = _HTML_PRE_CLOSE_RE.search(text, end)
-                    if closing is not None:
-                        end = closing.end()
-                    else:
-                        line_begin = text.rfind("\n", 0, index) + 1
+                closing = _HTML_PRE_CLOSE_RE.search(text, end)
+                if closing is not None:
+                    end = closing.end()
+                else:
+                    line_begin = text.rfind("\n", 0, index) + 1
+                    _, prefix = _strip_block_quotes(
+                        text[line_begin:index],
+                        list_quote_depth
+                        if list_content_column is not None
+                        else None,
+                    )
+                    if list_content_column is not None and len(
+                        prefix
+                    ) >= list_content_column:
                         _, prefix = _strip_block_quotes(
-                            text[line_begin:index],
-                            list_quote_depth
-                            if list_content_column is not None
-                            else None,
+                            prefix[list_content_column:]
                         )
-                        if list_content_column is not None and len(
-                            prefix
-                        ) >= list_content_column:
-                            _, prefix = _strip_block_quotes(
-                                prefix[list_content_column:]
-                            )
-                        if not prefix.strip() and _leading_columns(prefix) <= 3:
-                            # A block-level <pre> without a closing tag runs to
-                            # the end of its container, just as GFM renders it.
-                            # Container markers are stripped first, so a block
-                            # quote or list item cannot hide the block-level
-                            # opening.
-                            required_indent = (
-                                0
-                                if inner_depth
-                                else (list_content_column or 0)
-                            )
-                            end = _consume_indented_code(
-                                text,
-                                line_end,
-                                line_end + 1 if line_end < len(text) else len(text),
-                                quote_depth,
-                                required_indent,
-                                list_content_column,
-                                inner_depth,
-                            )
+                        checkbox = _TASK_CHECKBOX_RE.match(prefix)
+                        if checkbox is not None:
+                            prefix = prefix[checkbox.end():]
+                    if not prefix.strip() and _leading_columns(prefix) <= 3:
+                        # A block-level <pre> without a closing tag runs to
+                        # the end of its container, just as GFM renders it.
+                        # Container markers are stripped first, so a block
+                        # quote or list item cannot hide the block-level
+                        # opening. A task-list checkbox is item syntax, not
+                        # content, so it does not hide the opening either.
+                        required_indent = (
+                            0
+                            if inner_depth
+                            else (list_content_column or 0)
+                        )
+                        end = _consume_indented_code(
+                            text,
+                            line_end,
+                            line_end + 1 if line_end < len(text) else len(text),
+                            quote_depth,
+                            required_indent,
+                            list_content_column,
+                            inner_depth,
+                            strip_quotes=False,
+                        )
                 visible.append(_blank_markdown(text[index:end]))
                 line_begin = text.rfind("\n", 0, index) + 1
                 rest_end = text.find("\n", end)
