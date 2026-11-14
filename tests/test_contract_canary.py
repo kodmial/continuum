@@ -1353,6 +1353,59 @@ class CompletionEvidenceTest(unittest.TestCase):
             canary.validate_completed_canary(candidate, exact_head_runs(), 100)
         )
 
+    def test_html_attribute_closing_example_is_not_completion_evidence(self):
+        bodies = [
+            '<span title="Closes #100">Documentation</span>',
+            "<span title='Closes #100'>Documentation</span>",
+            '<span data-note="Closes #100">Documentation</span>',
+            '<a href="https://example.com" title="Closes #100">Documentation</a>',
+            '<span title="first > second" data-note="Closes #100">Documentation</span>',
+            '<img alt="Closes #100" />',
+            '<span\ntitle="Closes #100">Documentation</span>',
+        ]
+        for body in bodies:
+            with self.subTest(body=body):
+                candidate = pr(body=body)
+                candidate["headRefName"] = "feature/unrelated"
+                problem = canary.validate_completed_canary(
+                    candidate, exact_head_runs(), 100
+                )
+                self.assertIn("not attributed", problem)
+
+    def test_html_text_closing_reference_is_completion_evidence(self):
+        bodies = [
+            "<span>Closes #100</span>",
+            '<a href="https://example.com">Closes #100</a>',
+        ]
+        for body in bodies:
+            with self.subTest(body=body):
+                candidate = pr(body=body)
+                candidate["headRefName"] = "feature/unrelated"
+                self.assertIsNone(
+                    canary.validate_completed_canary(
+                        candidate, exact_head_runs(), 100
+                    )
+                )
+
+    def test_html_attribute_example_cannot_replace_closed_canary(self):
+        issue = canary_issue(
+            state="closed", created=8 * 24 * 60 * 60, closed=30
+        )
+        unrelated = pr(
+            body='<span title="Closes #100">Documentation</span>',
+            updated=10,
+        )
+        unrelated["headRefName"] = "feature/unrelated"
+        with self.assertRaisesRegex(
+            canary.CanaryBootstrapError, "not trustworthy"
+        ):
+            canary.resolve_canary(
+                [issue],
+                pull_requests=[unrelated],
+                runs=exact_head_runs(),
+                now=NOW,
+            )
+
     def test_operative_closing_reference_survives_code_example(self):
         candidate = pr(
             body="The example `Closes #100` is inert.\n\nCloses #100"

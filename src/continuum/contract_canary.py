@@ -88,6 +88,15 @@ _HTML_PRE_OPEN_RE = re.compile(r"<pre(?=[\s/>])", re.IGNORECASE)
 _HTML_PRE_CLOSE_RE = re.compile(r"</pre\s*>", re.IGNORECASE)
 _HTML_CODE_OPEN_RE = re.compile(r"<code(?=[\s/>])", re.IGNORECASE)
 _HTML_CODE_CLOSE_RE = re.compile(r"</code\s*>", re.IGNORECASE)
+#: A raw HTML start or end tag. Attributes are tag syntax, not rendered text,
+#: so a closing keyword inside one never closes an issue. Quoted attribute
+#: values may contain ``>`` without ending the tag.
+_HTML_TAG_RE = re.compile(
+    r"</?[A-Za-z][A-Za-z0-9-]*"
+    r"(?:\s+[A-Za-z_:][A-Za-z0-9_.:-]*"
+    r"(?:\s*=\s*(?:[^\"'=<>`\x00-\x20]+|'[^']*'|\"[^\"]*\"))?"
+    r")*\s*/?>"
+)
 
 
 def _expand_tabs(line: str) -> str:
@@ -723,9 +732,12 @@ def _visible_markdown(body: object) -> str:
 
     Closing phrases inside HTML comments, HTML ``<pre>`` and ``<code>``
     elements, fenced code blocks, indented code blocks, and inline code spans
-    are examples, not operative references. A Markdown link's destination and
-    title are also inert, because GitHub renders only its label. A reference
-    definition renders nothing at all. Blanking those spans with a
+    are examples, not operative references. Raw HTML tag syntax is inert too:
+    GitHub renders an attribute value as markup, not visible text, so a closing
+    keyword there never closes an issue, while text between tags stays
+    operative. A Markdown link's destination and title are also inert, because
+    GitHub renders only its label. A reference definition renders nothing at
+    all. Blanking those spans with a
     non-whitespace sentinel keeps them from matching and prevents adjacent
     visible text from joining into a new closing reference. GitHub renders
     ``<pre>`` content as inert preformatted text and ``<code>`` content as code,
@@ -1031,6 +1043,21 @@ def _visible_markdown(body: object) -> str:
                 index = end
                 line_start = index > 0 and text[index - 1] == "\n"
                 continue
+        tag = _HTML_TAG_RE.match(text, index)
+        if tag is not None:
+            end = tag.end()
+            visible.append(_blank_markdown(text[index:end]))
+            line_begin = text.rfind("\n", 0, index) + 1
+            rest_end = text.find("\n", end)
+            if rest_end == -1:
+                rest_end = len(text)
+            line_blank = (
+                not text[line_begin:index].strip()
+                and not text[end:rest_end].strip()
+            )
+            index = end
+            line_start = index > 0 and text[index - 1] == "\n"
+            continue
         if text[index] == "`":
             run_end = index
             while run_end < len(text) and text[run_end] == "`":
