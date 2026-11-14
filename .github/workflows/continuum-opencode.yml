@@ -5583,7 +5583,7 @@ jobs:
             const marker = process.env.DISPATCH_MARKER || '<!-- issue-scheduler-dispatch -->';
             const inProgress = process.env.IN_PROGRESS_LABEL || 'automation:in-progress';
             const paused = process.env.PAUSE_LABEL || 'automation:paused';
-            const pauseOnFailure =
+            let pauseOnFailure =
               (process.env.PAUSE_ON_FAILURE || 'true') !== 'false';
             const maxAttempts = Number.parseInt(
               process.env.MAX_DISPATCH_ATTEMPTS || '2',
@@ -5656,6 +5656,16 @@ jobs:
                 lines[1] === '⚡ **Continuum · issue-scheduler**' &&
                 lines[2] === '<!-- continuum-origin role=continuum component=issue-scheduler -->' &&
                 /^Automatically dispatched by the issue scheduler \((?:priority:p[0-2]|no explicit priority)\)\.$/.test(lines[3]);
+            }
+            // Local consumers may still derive pause_on_failure from public
+            // comment markers. A manual /oc quoting a scheduler receipt must
+            // never inherit the non-terminal policy of an actual dispatch.
+            // This fail-closed guard is enforced by the shared engine.
+            const triggeringBody = String(context.payload.comment?.body || '');
+            if (triggeringBody.includes(marker) &&
+                !isCanonicalSchedulerDispatch(context.payload.comment)) {
+              pauseOnFailure = true;
+              core.warning('Ignoring non-canonical scheduler marker in owner comment; enforcing terminal manual pause policy.');
             }
             const attempts = comments.filter(isCanonicalSchedulerDispatch).length;
 

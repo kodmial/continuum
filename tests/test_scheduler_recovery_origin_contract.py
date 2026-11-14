@@ -80,3 +80,14 @@ def test_issue_scheduler_uses_the_same_canonical_receipt_in_every_control_path()
     assert "if (isCanonicalSchedulerDispatch(comment)) {" in scheduler
     assert "return isCanonicalSchedulerDispatch(comment) || ownerOpenCodeCommand;" in scheduler
     assert "if (trustedFencer && isCanonicalSchedulerDispatch(comment)) return true;" in scheduler
+
+
+def test_quoted_marker_cannot_force_nonterminal_manual_recovery() -> None:
+    body = WORKFLOW.read_text(encoding="utf-8")
+    script = body.split("  recover-scheduled-issue:", 1)[1]
+    assert "let pauseOnFailure =" in script
+    assert "const triggeringBody = String(context.payload.comment?.body || '');" in script
+    assert "triggeringBody.includes(marker) &&" in script
+    assert "!isCanonicalSchedulerDispatch(context.payload.comment)" in script
+    assert "pauseOnFailure = true;" in script
+    assert "const attempts = comments.filter(isCanonicalSchedulerDispatch).length;" in script
