@@ -49,7 +49,9 @@ write_telemetry() {
   telemetry_sequence=$((telemetry_sequence + 1))
   timestamp="$(date -u +%Y%m%dT%H%M%SZ 2>/dev/null || echo unknown)"
   output="$output_dir/opencode-${mode}-${timestamp}-$$-${telemetry_sequence}.json"
-  model="${OPENCODE_MODEL:-}"
+  # ``run`` executors export OPENCODE_MODEL; the interactive ``github run``
+  # path exports the same frozen route as MODEL. Persist whichever is set.
+  model="${OPENCODE_MODEL:-${MODEL:-}}"
   local args=(
     telemetry --mode "$mode" --log "$log_path" --exit "$status"
     --classification "$classification" --model "$model" --output "$output"

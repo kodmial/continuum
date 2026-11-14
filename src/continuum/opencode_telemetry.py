@@ -19,11 +19,19 @@ Schema notes (verified against the pinned 2.2.6 binary and its emitted events):
   state updates for one id are not unique calls;
 * terminal ``error`` events carry a structured ``error`` object;
 * ``retry`` records the scheduled retry attempt but is not treated as a new HTTP
-  request, because the stream exposes no HTTP request counter.
+  request, because the stream exposes no HTTP request counter;
+* the 2.2.6 ``run --format json`` stream does not emit the selected
+  provider/model per event, so provenance records the model supplied by the
+  shared wrapper (the frozen route) instead of inventing one from event text.
 
 The event stream is therefore *not* an HTTP request log.  A step is reported as
 a step, a retry as a retry, and the provider request count is reported as
 ``unknown`` rather than inferred from step or ``[tool]`` line totals.
+
+Finished attempts whose raw JSON stream was not retained cannot be
+reconstructed.  They have no artifact here, or their summary reports
+``unknown``/``missing_fields``; nothing is backfilled from log-line counts or
+tool totals.
 """
 
 from __future__ import annotations
@@ -339,8 +347,10 @@ def _bounded_provenance(
     """
 
     source = provenance if isinstance(provenance, Mapping) else {}
-    model_value = source.get("model") if source.get("model") not in (None, "") else model
-    model_value = _safe_model(model_value)
+    source_model = source.get("model")
+    if not isinstance(source_model, str) or not source_model.strip() or source_model == UNKNOWN:
+        source_model = model
+    model_value = _safe_model(source_model)
     provider = source.get("provider")
     if not isinstance(provider, str) or not provider.strip() or provider == UNKNOWN:
         provider = model_value.split("/", 1)[0] if "/" in model_value else UNKNOWN
@@ -579,7 +589,10 @@ def summarize_event_stream(
             if not isinstance(call_id, str) or not call_id.strip():
                 tool_missing_id += 1
                 continue
-            key = (_event_session(event), call_id.strip()[:512])
+            # Deduplicate strictly by the stable call ID. A repeated state
+            # update (or the same provider call observed in a resumed session)
+            # is one invocation, never one HTTP request or one 429 signal.
+            key = call_id.strip()[:512]
             if key in unique_tools:
                 duplicate_tool_events += 1
             unique_tools[key] = {
@@ -919,34 +932,44 @@ def format_human_summary(summary: Mapping[str, Any]) -> str:
     attempt = summary.get("attempt", {}) if isinstance(summary.get("attempt"), Mapping) else {}
     usage = summary.get("usage", {}) if isinstance(summary.get("usage"), Mapping) else {}
     tools = summary.get("tools", {}) if isinstance(summary.get("tools"), Mapping) else {}
+    requests = (
+        summary.get("requests", {})
+        if isinstance(summary.get("requests"), Mapping)
+        else {}
+    )
     provider = (
         summary.get("provider_error", {})
         if isinstance(summary.get("provider_error"), Mapping)
         else {}
     )
-    return (
-        "OpenCode telemetry: mode={mode} exit={exit} classification={classification} "
-        "steps={steps} usage_steps={usage_steps}/{steps} "
-        "input_tokens={input_tokens} output_tokens={output_tokens} "
-        "unique_tools={unique_tools} tool_events={tool_events} "
-        "provider={provider_classification} provider_kind={provider_kind} "
-        "provider_status={provider_status} "
-        "first_provider_429_at={first_429} last_step_at={last_step}"
-    ).format(
-        mode=attempt.get("mode", UNKNOWN),
-        exit=attempt.get("exit_code", UNKNOWN),
-        classification=attempt.get("classification", UNKNOWN),
-        steps=usage.get("steps", UNKNOWN),
-        usage_steps=usage.get("steps_with_usage", UNKNOWN),
-        input_tokens=usage.get("input_tokens", UNKNOWN),
-        output_tokens=usage.get("output_tokens", UNKNOWN),
-        unique_tools=tools.get("unique_calls", UNKNOWN),
-        tool_events=tools.get("events", UNKNOWN),
-        provider_classification=provider.get("classification", UNKNOWN),
-        provider_kind=provider.get("kind", UNKNOWN),
-        provider_status=provider.get("http_status", UNKNOWN),
-        first_429=provider.get("first_provider_429_at", UNKNOWN),
-        last_step=attempt.get("last_step_at", UNKNOWN),
+    return " ".join(
+        (
+            "OpenCode telemetry: mode={mode} exit={exit} classification={classification} "
+            "steps={steps} usage_steps={usage_steps}/{steps} "
+            "input_tokens={input_tokens} output_tokens={output_tokens} "
+            "http_requests={http_requests} ({requests_measurement}) "
+            "unique_tools={unique_tools} tool_events={tool_events} "
+            "provider={provider_classification} provider_kind={provider_kind} "
+            "provider_status={provider_status} "
+            "first_provider_429_at={first_429} last_step_at={last_step}"
+        ).format(
+            mode=attempt.get("mode", UNKNOWN),
+            exit=attempt.get("exit_code", UNKNOWN),
+            classification=attempt.get("classification", UNKNOWN),
+            steps=usage.get("steps", UNKNOWN),
+            usage_steps=usage.get("steps_with_usage", UNKNOWN),
+            input_tokens=usage.get("input_tokens", UNKNOWN),
+            output_tokens=usage.get("output_tokens", UNKNOWN),
+            http_requests=requests.get("http_requests", UNKNOWN),
+            requests_measurement=requests.get("measurement", UNKNOWN),
+            unique_tools=tools.get("unique_calls", UNKNOWN),
+            tool_events=tools.get("events", UNKNOWN),
+            provider_classification=provider.get("classification", UNKNOWN),
+            provider_kind=provider.get("kind", UNKNOWN),
+            provider_status=provider.get("http_status", UNKNOWN),
+            first_429=provider.get("first_provider_429_at", UNKNOWN),
+            last_step=attempt.get("last_step_at", UNKNOWN),
+        ).split()
     )
 
 

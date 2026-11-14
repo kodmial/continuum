@@ -124,6 +124,27 @@ class TelemetryAggregationTests(unittest.TestCase):
         self.assertEqual(summary["requests"]["step_finish_events"], 0)
         self.assertEqual(summary["requests"]["retry_events"], 0)
 
+    def test_tool_calls_are_unique_by_stable_call_id_across_sessions(self):
+        lines = [
+            tool("call_shared", "read", "running", session="ses_a"),
+            tool("call_shared", "read", "completed", session="ses_b"),
+            tool("call_other", "bash", "completed", session="ses_b"),
+        ]
+
+        summary = summarize(lines)
+
+        self.assertEqual(summary["sessions"]["count"], 2)
+        self.assertEqual(summary["tools"]["events"], 3)
+        self.assertEqual(summary["tools"]["unique_calls"], 2)
+        self.assertEqual(summary["tools"]["duplicate_events"], 1)
+        self.assertEqual(
+            summary["tools"]["names"],
+            [
+                {"name": "bash", "unique_calls": 1},
+                {"name": "read", "unique_calls": 1},
+            ],
+        )
+
     def test_usage_full_partial_and_missing_are_not_interpolated(self):
         lines = [
             start(BASE_TS, message="msg_full"),
@@ -325,6 +346,61 @@ class TelemetryAggregationTests(unittest.TestCase):
         self.assertEqual(steps["items"][-1]["index"], MAX_STEPS)
         self.assertEqual(summarize(lines)["usage"]["input_tokens"], total_steps)
 
+    def test_v2_envelope_snapshots_are_not_stored_and_full_usage_is_complete(self):
+        # Exact sanitized 2.2.6 envelope shape: both step records carry
+        # part.id/sessionID/messageID/type, and snapshots are user-visible
+        # state that telemetry must never persist.
+        lines = [
+            event(
+                "step_start",
+                BASE_TS,
+                session="ses_v2",
+                part={
+                    "id": "prt_step",
+                    "sessionID": "ses_v2",
+                    "messageID": "msg_v2",
+                    "type": "step_start",
+                    "snapshot": {"start": "SECRET_START_SNAPSHOT"},
+                },
+            ),
+            event(
+                "step_finish",
+                BASE_TS + 25,
+                session="ses_v2",
+                part={
+                    "id": "prt_step",
+                    "sessionID": "ses_v2",
+                    "messageID": "msg_v2",
+                    "type": "step-finish",
+                    "reason": "tool-calls",
+                    "snapshot": {"end": "SECRET_END_SNAPSHOT"},
+                    "cost": 0.001,
+                    "tokens": {
+                        "input": 10,
+                        "output": 2,
+                        "reasoning": 1,
+                        "cache": {"read": 3, "write": 4},
+                    },
+                },
+            ),
+        ]
+
+        summary = summarize(lines, exit_code=0)
+
+        self.assertEqual(summary["usage"]["steps"], 1)
+        self.assertTrue(summary["usage"]["complete"])
+        self.assertTrue(summary["usage"]["cost_complete"])
+        self.assertEqual(summary["usage"]["input_tokens"], 10)
+        self.assertEqual(summary["usage"]["output_tokens"], 2)
+        self.assertEqual(summary["usage"]["reasoning_tokens"], 1)
+        self.assertEqual(summary["usage"]["cache_read_tokens"], 3)
+        self.assertEqual(summary["usage"]["cache_write_tokens"], 4)
+        self.assertEqual(summary["steps"]["items"][0]["elapsed_ms"], 25)
+        raw = json.dumps(summary, sort_keys=True)
+        self.assertNotIn("SECRET_START_SNAPSHOT", raw)
+        self.assertNotIn("SECRET_END_SNAPSHOT", raw)
+        self.assertNotIn('"snapshot"', raw)
+
 
 class TelemetryClassificationTests(unittest.TestCase):
     def test_top_level_provider_429_is_recorded_from_actual_event_only(self):
@@ -411,6 +487,21 @@ class TelemetryClassificationTests(unittest.TestCase):
         self.assertEqual(provider["terminal_error_events"], 2)
         self.assertEqual(provider["http_status"], 422)
         self.assertEqual(provider["first_provider_429_at"], UNKNOWN)
+
+    def test_v2_rate_limit_type_with_http_429_is_typed_quota(self):
+        summary = summarize(
+            [typed_error("RateLimit", status=429, timestamp=BASE_TS + 7)],
+            exit_code=1,
+        )
+
+        provider = summary["provider_error"]
+        self.assertEqual(summary["attempt"]["classification"], "quota_429")
+        self.assertEqual(provider["classification"], "quota_429")
+        self.assertEqual(provider["kind"], "RateLimit")
+        self.assertEqual(provider["http_status"], 429)
+        self.assertEqual(
+            provider["first_provider_429_at"], "2023-11-14T22:13:20.007Z"
+        )
 
     def test_provider_error_metadata_reflects_the_last_typed_event(self):
         lines = [
@@ -546,11 +637,30 @@ class TelemetryParsingAndPersistenceTests(unittest.TestCase):
             "SECRET_TOOL_OUTPUT",
             "SECRET_ERROR_MESSAGE",
             "ghp_SECRETTOKENVALUE",
+            "SECRET_STEP_SNAPSHOT",
         )
         lines = [
             event(
+                "step_start",
+                part={
+                    "type": "step_start",
+                    "messageID": "msg_1",
+                    "snapshot": {"start": secrets[5]},
+                },
+            ),
+            event(
                 "text",
                 part={"type": "text", "text": "prompt " + secrets[0]},
+            ),
+            event(
+                "step_finish",
+                part={
+                    "type": "step-finish",
+                    "messageID": "msg_1",
+                    "reason": "stop",
+                    "snapshot": {"end": secrets[5]},
+                    "tokens": {"input": 1, "output": 1},
+                },
             ),
             event(
                 "tool_use",
@@ -589,6 +699,7 @@ class TelemetryParsingAndPersistenceTests(unittest.TestCase):
         human = format_human_summary(summary)
         self.assertIn("provider=fail_closed", human)
         self.assertIn("provider_kind=ProviderAuthError", human)
+        self.assertIn("http_requests=unknown (unavailable)", human)
         self.assertNotIn("SECRET", human)
 
     def test_write_summary_is_atomic_and_creates_parent(self):
@@ -686,6 +797,31 @@ class TelemetryParsingAndPersistenceTests(unittest.TestCase):
         )
         self.assertEqual(fallback["provenance"]["model"], "openrouter/free-model")
         self.assertNotIn("SECRET_PROVENANCE", json.dumps(fallback))
+
+    def test_unknown_provenance_model_falls_back_to_the_selected_route(self):
+        # build_provenance intentionally emits "unknown" when the environment
+        # does not carry a model. The wrapper may still pass the frozen route
+        # explicitly, so an unknown sentinel must not shadow it.
+        absent_env = build_provenance(mode="run", env={})
+        self.assertEqual(absent_env["model"], UNKNOWN)
+
+        for provenance in (
+            absent_env,
+            {"model": UNKNOWN, "mode": "run"},
+            {"model": "", "mode": "run"},
+            {"model": 123, "mode": "run"},
+        ):
+            with self.subTest(provenance=provenance):
+                summary = summarize(
+                    [finish(tokens={"input": 1})],
+                    model="openrouter/free-model#variant",
+                    provenance=provenance,
+                )
+                self.assertEqual(
+                    summary["provenance"]["model"],
+                    "openrouter/free-model#variant",
+                )
+                self.assertEqual(summary["provenance"]["provider"], "openrouter")
 
 
 class TelemetryCliTests(unittest.TestCase):
@@ -890,6 +1026,7 @@ class TelemetryWorkflowContractTests(unittest.TestCase):
         )
         self.assertIn("telemetry --mode", wrapper)
         self.assertIn("--print-summary", wrapper)
+        self.assertIn('model="${OPENCODE_MODEL:-${MODEL:-}}"', wrapper)
         self.assertGreaterEqual(wrapper.count('write_telemetry "run"'), 3)
         self.assertGreaterEqual(wrapper.count('write_telemetry "github"'), 2)
 
