@@ -24,7 +24,7 @@ def test_recovery_admission_is_not_a_marker_substring_gate() -> None:
 def test_scheduler_attempts_are_canonical_and_not_quoted_markers() -> None:
     body = WORKFLOW.read_text(encoding="utf-8")
     start = "            function isCanonicalSchedulerDispatch(comment) {"
-    end = "            const attempts = comments.filter(isCanonicalSchedulerDispatch).length;"
+    end = "            // Local consumers may still derive pause_on_failure from public"
     assert start in body and end in body
     snippet = body.split(start, 1)[1].split(end, 1)[0]
     source = start + snippet
@@ -67,7 +67,7 @@ def test_issue_scheduler_uses_the_same_canonical_receipt_in_every_control_path()
     workflow = WORKFLOW.read_text(encoding="utf-8")
     scheduler = (ROOT / ".github/scripts/issue_scheduler.js").read_text(encoding="utf-8")
     start = "            function isCanonicalSchedulerDispatch(comment) {"
-    end = "            const attempts = comments.filter(isCanonicalSchedulerDispatch).length;"
+    end = "            // Local consumers may still derive pause_on_failure from public"
     workflow_fn = textwrap.dedent(start + workflow.split(start, 1)[1].split(end, 1)[0]).strip()
     scheduler_start = "  function isCanonicalSchedulerDispatch(comment) {"
     scheduler_end = "\n  const postPauseComment"
