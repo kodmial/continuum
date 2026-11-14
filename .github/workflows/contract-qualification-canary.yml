@@ -10,6 +10,12 @@ on:
 
 permissions: {}
 
+# Serialize scheduled/manual canary passes so two deliveries can never both
+# observe an empty inventory and create duplicate owned canary issues.
+concurrency:
+  group: continuum-contract-canary
+  cancel-in-progress: false
+
 jobs:
   qualify:
     uses: ./.github/workflows/continuum-contract-qualification.yml
