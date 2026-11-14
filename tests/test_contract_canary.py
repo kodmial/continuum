@@ -918,6 +918,39 @@ class CompletionEvidenceTest(unittest.TestCase):
         )
         self.assertIn("not attributed", problem)
 
+    def test_html_pre_closing_example_is_not_completion_evidence(self):
+        candidate = pr(body="<pre>\nCloses #100\n</pre>\n")
+        candidate["headRefName"] = "feature/unrelated"
+        problem = canary.validate_completed_canary(
+            candidate, exact_head_runs(), 100
+        )
+        self.assertIn("not attributed", problem)
+
+    def test_inline_html_pre_closing_example_is_not_completion_evidence(self):
+        candidate = pr(body="The docs render <pre>Closes #100</pre> verbatim.\n")
+        candidate["headRefName"] = "feature/unrelated"
+        problem = canary.validate_completed_canary(
+            candidate, exact_head_runs(), 100
+        )
+        self.assertIn("not attributed", problem)
+
+    def test_unclosed_block_html_pre_is_not_completion_evidence(self):
+        candidate = pr(body="<PRE>\nCloses #100\n")
+        candidate["headRefName"] = "feature/unrelated"
+        problem = canary.validate_completed_canary(
+            candidate, exact_head_runs(), 100
+        )
+        self.assertIn("not attributed", problem)
+
+    def test_operative_closing_reference_after_html_pre_example(self):
+        candidate = pr(
+            body="<pre>\nCloses #100\n</pre>\n\nCloses #100\n"
+        )
+        candidate["headRefName"] = "feature/unrelated"
+        self.assertIsNone(
+            canary.validate_completed_canary(candidate, exact_head_runs(), 100)
+        )
+
     def test_operative_closing_reference_survives_code_example(self):
         candidate = pr(
             body="The example `Closes #100` is inert.\n\nCloses #100"

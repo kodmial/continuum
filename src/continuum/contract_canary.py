@@ -83,6 +83,8 @@ _THEMATIC_BREAK_RE = re.compile(
 )
 _BLOCK_QUOTE_RE = re.compile(r" {0,3}>[ \t]?")
 _LIST_MARKER_RE = re.compile(r"(?:[-+*]|(?P<number>\d{1,9})[.)])")
+_HTML_PRE_OPEN_RE = re.compile(r"<pre(?=[\s/>])", re.IGNORECASE)
+_HTML_PRE_CLOSE_RE = re.compile(r"</pre\s*>", re.IGNORECASE)
 
 
 def _expand_tabs(line: str) -> str:
@@ -319,11 +321,12 @@ def _blank_markdown(text: str) -> str:
 def _visible_markdown(body: object) -> str:
     """Return the part of a PR body where GitHub acts on closing keywords.
 
-    Closing phrases inside HTML comments, fenced code blocks, indented code
-    blocks, and inline code spans are examples, not operative references.
-    Blanking those spans with a non-whitespace sentinel keeps them from
-    matching and prevents adjacent visible text from joining into a new
-    closing reference.
+    Closing phrases inside HTML comments, HTML ``<pre>`` elements, fenced code
+    blocks, indented code blocks, and inline code spans are examples, not
+    operative references. Blanking those spans with a non-whitespace sentinel
+    keeps them from matching and prevents adjacent visible text from joining
+    into a new closing reference. GitHub renders ``<pre>`` content as inert
+    preformatted text, so a closing keyword there never closes the issue.
 
     An indented line opens a code block only at a block boundary, because GFM
     renders a four-space or tab-indented line that directly follows a paragraph
@@ -512,6 +515,34 @@ def _visible_markdown(body: object) -> str:
             index = end
             line_start = index > 0 and text[index - 1] == "\n"
             continue
+        pre_open = _HTML_PRE_OPEN_RE.match(text, index)
+        if pre_open is not None:
+            tag_end = text.find(">", pre_open.end())
+            if tag_end != -1:
+                end = tag_end + 1
+                if text[tag_end - 1] != "/":
+                    closing = _HTML_PRE_CLOSE_RE.search(text, end)
+                    if closing is not None:
+                        end = closing.end()
+                    else:
+                        line_begin = text.rfind("\n", 0, index) + 1
+                        prefix = text[line_begin:index]
+                        if not prefix.strip() and len(prefix) <= 3:
+                            # A block-level <pre> without a closing tag runs to
+                            # the end of the document, just as GFM renders it.
+                            end = len(text)
+                visible.append(_blank_markdown(text[index:end]))
+                line_begin = text.rfind("\n", 0, index) + 1
+                rest_end = text.find("\n", end)
+                if rest_end == -1:
+                    rest_end = len(text)
+                line_blank = (
+                    not text[line_begin:index].strip()
+                    and not text[end:rest_end].strip()
+                )
+                index = end
+                line_start = index > 0 and text[index - 1] == "\n"
+                continue
         if text[index] == "`":
             run_end = index
             while run_end < len(text) and text[run_end] == "`":
