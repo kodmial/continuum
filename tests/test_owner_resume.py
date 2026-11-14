@@ -1706,11 +1706,13 @@ class ExecutableProductionWorkflowTests(unittest.TestCase):
                 self.assertEqual(outcome["state"], "NOOP")
 
     def test_production_js_untrusted_markers_do_not_fence_retry(self):
+        # Noncanonical scheduler-marker quotes are not dispatch receipts,
+        # even when a bot posts them. Only authenticated recovery events fence.
         bodies = (
-            "<!-- issue-scheduler-dispatch -->\n/oc",
-            "<!-- continuum-429-recovery op=x gen=1 state=observed -->",
+            ("<!-- issue-scheduler-dispatch -->\\n/oc", "RESUME"),
+            ("<!-- continuum-429-recovery op=x gen=1 state=observed -->", "NOOP"),
         )
-        for body in bodies:
+        for body, trusted_expected in bodies:
             with self.subTest(body=body):
                 untrusted = self.decision_scenario(
                     commentsByIssue={
@@ -1741,7 +1743,7 @@ class ExecutableProductionWorkflowTests(unittest.TestCase):
                     },
                 )
                 self.assertEqual(
-                    self.run_workflow(trusted)["state"], "NOOP"
+                    self.run_workflow(trusted)["state"], trusted_expected
                 )
 
     def test_production_js_truncated_comment_window_fails_closed(self):
