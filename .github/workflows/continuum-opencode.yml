@@ -5525,18 +5525,22 @@ jobs:
           echo "Released workflow-repair lock '$lock_label' for PR #$PR_NUMBER."
 
   recover-scheduled-issue:
-    name: Recover failed scheduled issue dispatch
-    needs: opencode
+    name: Recover failed admitted issue command
+    needs: [admit, opencode]
+    # A marker in user-visible text is NOT an origin signal: a manual owner
+    # /oc can quote the scheduler's comment. Admit based on the canonical
+    # command route, and recover explicit issue-mode dispatches separately.
     if: >-
       always() &&
+      needs.admit.result == 'success' &&
       needs.opencode.outputs.restart_required != 'true' &&
       needs.opencode.result != 'success' &&
       needs.opencode.result != 'skipped' &&
       ((github.event_name == 'issue_comment' &&
-        github.actor == github.repository_owner &&
-        !github.event.issue.pull_request &&
-        contains(github.event.comment.body, inputs.dispatch_marker || vars.AUTOMATION_DISPATCH_MARKER || '<!-- issue-scheduler-dispatch -->')) ||
+        needs.admit.outputs.route == 'issue' &&
+        !github.event.issue.pull_request) ||
        (github.event_name == 'workflow_dispatch' &&
+        inputs.mode == 'issue' &&
         inputs.issue_number != ''))
     runs-on: ubuntu-latest
     timeout-minutes: ${{ fromJSON(vars.AUTOMATION_ATTEMPTS_TIMEOUT_MINUTES || '10') }}
@@ -5635,9 +5639,25 @@ jobs:
                 per_page: 100,
               }
             );
-            const attempts = comments.filter(comment =>
-              (comment.body || '').includes(marker)
-            ).length;
+            function isCanonicalSchedulerDispatch(comment) {
+              const author = String(comment?.user?.login || '').toLowerCase();
+              if (author !== String(owner).toLowerCase() && author !== 'github-actions[bot]') {
+                return false;
+              }
+              const body = String(comment?.body || '').replace(/\r\n/g, '\n').trimEnd();
+              // The scheduler emits exactly this four-line receipt. A comment-mode
+              // dispatch prepends "/oc\n\n"; workflow-mode emits the receipt alone.
+              // Substring markers inside a manual reply or a Markdown quote are not
+              // scheduler attempts, even when the owner authored the reply.
+              const receipt = body.startsWith('/oc\n\n') ? body.slice(5) : body;
+              const lines = receipt.split('\n');
+              return lines.length === 4 &&
+                lines[0] === marker &&
+                lines[1] === '⚡ **Continuum · issue-scheduler**' &&
+                lines[2] === '<!-- continuum-origin role=continuum component=issue-scheduler -->' &&
+                /^Automatically dispatched by the issue scheduler \((?:priority:p[0-2]|no explicit priority)\)\.$/.test(lines[3]);
+            }
+            const attempts = comments.filter(isCanonicalSchedulerDispatch).length;
 
             // Mandatory qualification must never strand behind a terminal
             // human-gated pause: exhausted immediate retries fall back to a
