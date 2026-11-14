@@ -183,22 +183,92 @@ def _list_item_layout(
     return (content_column, None)
 
 
-def _strip_block_quotes(line: str) -> Tuple[int, str]:
+def _strip_block_quotes(
+    line: str, limit: Optional[int] = None
+) -> Tuple[int, str]:
     """Return the block-quote depth and the remaining line content.
 
     GFM removes each leading ``>`` marker (plus one optional following space or
     tab) before deciding whether the content starts with four spaces of code
     indentation. Nested quotes therefore need every marker stripped, not just
     the outermost one.
+
+    ``limit`` stops after that many markers. An active list item uses it so a
+    quote nested at the item's content column is not mistaken for another
+    enclosing quote.
     """
     depth = 0
     position = 0
+    while limit is None or depth < limit:
+        match = _BLOCK_QUOTE_RE.match(line, position)
+        if match is None:
+            break
+        depth += 1
+        position = match.end()
+    return depth, line[position:]
+
+
+def _strip_block_quotes_from(line: str, start: int) -> Tuple[int, str]:
+    """Strip block-quote markers beginning at ``start`` in ``line``.
+
+    A list item's content column can start its own block quote, so the markers
+    then begin after the item's indentation instead of at column zero. The
+    returned content starts at the innermost quote's content.
+    """
+    depth = 0
+    position = start
     while True:
         match = _BLOCK_QUOTE_RE.match(line, position)
         if match is None:
             return depth, line[position:]
         depth += 1
         position = match.end()
+
+
+def _consume_indented_code(
+    text: str,
+    end: int,
+    cursor: int,
+    quote_depth: int,
+    required_indent: int,
+    list_content_column: Optional[int] = None,
+    inner_depth: int = 0,
+) -> int:
+    """Return the last offset of an indented code block's continuation lines.
+
+    ``end`` is the end of the opening line and ``cursor`` the start of the next
+    line. Lines continue while they stay inside the same quote depth and keep
+    the required indentation, or are blank. With ``inner_depth`` the quote
+    markers start at the list item's content column, so they are stripped from
+    there instead of from column zero.
+    """
+    while cursor < len(text):
+        next_end = text.find("\n", cursor)
+        if next_end == -1:
+            next_end = len(text)
+        raw = text[cursor:next_end]
+        if inner_depth:
+            outer_depth, content = _strip_block_quotes(raw, quote_depth)
+            if outer_depth < quote_depth:
+                break
+            next_inner, content = _strip_block_quotes_from(
+                content, list_content_column
+            )
+            if next_inner < inner_depth and raw.strip():
+                break
+        else:
+            depth, content = _strip_block_quotes(raw)
+            if depth < quote_depth:
+                break
+        if (
+            _leading_columns(content) >= required_indent
+            or not content.strip()
+        ):
+            end = next_end
+            cursor = next_end + 1 if next_end < len(text) else len(text)
+            continue
+        break
+    return end
 
 
 def _blank_markdown(text: str) -> str:
@@ -222,8 +292,10 @@ def _visible_markdown(body: object) -> str:
     opened, the block continues across blank lines and still-indented lines,
     just as GFM renders it. Block-quote markers are stripped before those
     decisions, so an indented code block nested in a quote is inert too. A
-    list marker hides its item's content column, so five or more spaces after
-    the marker open an indented code block inside the list item.
+    block quote can also start at a list item's content column, so its markers
+    are stripped there before the same decisions. A list marker hides its
+    item's content column, so five or more spaces after the marker open an
+    indented code block inside the list item.
     """
     text = str(body or "")
     visible = []
@@ -235,13 +307,17 @@ def _visible_markdown(body: object) -> str:
     structural_prefix_end = 0
     list_content_column = None
     list_quote_depth = None
+    list_inner_quote_depth = 0
     while index < len(text):
         if line_start and text[index] != "\n":
             line_end = text.find("\n", index)
             if line_end == -1:
                 line_end = len(text)
             line = text[index:line_end]
-            quote_depth, content = _strip_block_quotes(line)
+            quote_limit = (
+                list_quote_depth if list_content_column is not None else None
+            )
+            quote_depth, content = _strip_block_quotes(line, quote_limit)
             structural_prefix_end = index + len(line) - len(content)
             line_ends_block = (
                 _ATX_HEADING_RE.match(content) is not None
@@ -253,6 +329,7 @@ def _visible_markdown(body: object) -> str:
             ):
                 list_content_column = None
                 list_quote_depth = None
+                list_inner_quote_depth = 0
             layout = (
                 None
                 if line_ends_block
@@ -263,6 +340,7 @@ def _visible_markdown(body: object) -> str:
             if layout is not None:
                 list_content_column, list_code_indent = layout
                 list_quote_depth = quote_depth
+                list_inner_quote_depth = 0
             else:
                 list_code_indent = None
                 if (
@@ -272,6 +350,26 @@ def _visible_markdown(body: object) -> str:
                 ):
                     list_content_column = None
                     list_quote_depth = None
+                    list_inner_quote_depth = 0
+            previous_inner_depth = list_inner_quote_depth
+            inner_depth = 0
+            if list_content_column is not None:
+                inner_depth, inner_content = _strip_block_quotes_from(
+                    content, list_content_column
+                )
+                if inner_depth:
+                    content = inner_content
+                    structural_prefix_end = index + len(line) - len(content)
+                    list_code_indent = None
+            list_inner_quote_depth = inner_depth
+            if inner_depth:
+                line_ends_block = (
+                    _ATX_HEADING_RE.match(content) is not None
+                    or _THEMATIC_BREAK_RE.match(content) is not None
+                )
+            inner_boundary = (
+                inner_depth > 0 and inner_depth != previous_inner_depth
+            )
             opener = _FENCE_OPEN_RE.match(content)
             if opener is not None:
                 fence = opener.group("fence")
@@ -304,32 +402,23 @@ def _visible_markdown(body: object) -> str:
                 line_blank = True
                 continue
             required_indent = (
-                4 if list_content_column is None
+                4
+                if list_content_column is None or inner_depth
                 else list_content_column + 4
             )
             if (
-                block_boundary
+                (block_boundary or inner_boundary)
                 and _leading_columns(content) >= required_indent
             ):
-                end = line_end
-                cursor = line_end + 1 if line_end < len(text) else len(text)
-                while cursor < len(text):
-                    next_end = text.find("\n", cursor)
-                    if next_end == -1:
-                        next_end = len(text)
-                    next_depth, next_content = _strip_block_quotes(
-                        text[cursor:next_end]
-                    )
-                    if next_depth < quote_depth:
-                        break
-                    if (
-                        _leading_columns(next_content) >= required_indent
-                        or not next_content.strip()
-                    ):
-                        end = next_end
-                        cursor = next_end + 1 if next_end < len(text) else len(text)
-                        continue
-                    break
+                end = _consume_indented_code(
+                    text,
+                    line_end,
+                    line_end + 1 if line_end < len(text) else len(text),
+                    quote_depth,
+                    required_indent,
+                    list_content_column,
+                    inner_depth,
+                )
                 visible.append(_blank_markdown(text[index:end]))
                 index = end
                 line_start = False
@@ -337,25 +426,14 @@ def _visible_markdown(body: object) -> str:
                 line_blank = True
                 continue
             if list_code_indent is not None:
-                end = line_end
-                cursor = line_end + 1 if line_end < len(text) else len(text)
-                while cursor < len(text):
-                    next_end = text.find("\n", cursor)
-                    if next_end == -1:
-                        next_end = len(text)
-                    next_depth, next_content = _strip_block_quotes(
-                        text[cursor:next_end]
-                    )
-                    if next_depth < quote_depth:
-                        break
-                    if (
-                        _leading_columns(next_content) >= list_code_indent
-                        or not next_content.strip()
-                    ):
-                        end = next_end
-                        cursor = next_end + 1 if next_end < len(text) else len(text)
-                        continue
-                    break
+                end = _consume_indented_code(
+                    text,
+                    line_end,
+                    line_end + 1 if line_end < len(text) else len(text),
+                    quote_depth,
+                    list_code_indent,
+                    list_content_column,
+                )
                 visible.append(_blank_markdown(text[index:end]))
                 index = end
                 line_start = False
