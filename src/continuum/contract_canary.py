@@ -77,12 +77,104 @@ _CLOSING_REFERENCE_RE = re.compile(
 )
 _FENCE_OPEN_RE = re.compile(r"^[ \t]{0,3}(?P<fence>`{3,}|~{3,})")
 _FENCE_CLOSE_RE = re.compile(r"^[ \t]{0,3}(?P<fence>`{3,}|~{3,})[ \t]*$")
-_INDENTED_CODE_RE = re.compile(r"^(?: {4}| {0,3}\t)")
 _ATX_HEADING_RE = re.compile(r"^[ \t]{0,3}#{1,6}(?:[ \t]|$)")
 _THEMATIC_BREAK_RE = re.compile(
     r"^[ \t]{0,3}(?:(?:\*[ \t]*){3,}|(?:-[ \t]*){3,}|(?:_[ \t]*){3,})[ \t]*$"
 )
 _BLOCK_QUOTE_RE = re.compile(r" {0,3}>[ \t]?")
+_LIST_MARKER_RE = re.compile(r"(?:[-+*]|(?P<number>\d{1,9})[.)])")
+
+
+def _expand_tabs(line: str) -> str:
+    """Expand tabs to GFM's four-column tab stops."""
+    expanded = []
+    column = 0
+    for char in line:
+        if char == "\t":
+            width = 4 - (column % 4)
+            expanded.append(" " * width)
+            column += width
+        else:
+            expanded.append(char)
+            column += 1
+    return "".join(expanded)
+
+
+def _leading_columns(line: str) -> int:
+    """Return the column width of the line's leading whitespace."""
+    column = 0
+    for char in line:
+        if char == " ":
+            column += 1
+        elif char == "\t":
+            column += 4 - (column % 4)
+        else:
+            break
+    return column
+
+
+def _list_item_layout(
+    line: str,
+    block_boundary: bool,
+    list_content_column: Optional[int] = None,
+) -> Optional[Tuple[int, Optional[int]]]:
+    """Return a list item's content column and its code-block continuation column.
+
+    GFM consumes a list marker plus one space, so five or more spaces after the
+    marker leave at least four columns of indentation. Such content is an
+    indented code block nested in the list item, not operative prose, and the
+    second tuple item is then the minimum column of its continuation lines.
+
+    An ordered list that starts with a number other than 1 cannot interrupt a
+    paragraph, so it is only a list item at a block boundary. A marker nested
+    in an open list item may be indented up to three columns past that item's
+    content column.
+    """
+    text = _expand_tabs(line)
+    leading = _leading_columns(text)
+    if list_content_column is not None and leading >= list_content_column:
+        base = list_content_column
+    else:
+        base = 0
+    position = base
+    nested = False
+    content_column = None
+    while position < len(text):
+        marker_start = position
+        spaces = 0
+        while spaces < 3 and marker_start < len(text) and text[marker_start] == " ":
+            marker_start += 1
+            spaces += 1
+        match = _LIST_MARKER_RE.match(text, marker_start)
+        if match is None:
+            if content_column is None:
+                return None
+            return (content_column, None)
+        number = match.group("number")
+        if (
+            number is not None
+            and int(number) != 1
+            and not nested
+            and not block_boundary
+        ):
+            return None
+        marker_end = match.end()
+        whitespace_end = marker_end
+        while whitespace_end < len(text) and text[whitespace_end] == " ":
+            whitespace_end += 1
+        if whitespace_end == marker_end:
+            if content_column is None:
+                return None
+            return (content_column, None)
+        if whitespace_end - marker_end >= 5:
+            content_column = marker_end + 1
+            return (content_column, content_column + 4)
+        content_column = whitespace_end
+        position = whitespace_end
+        nested = True
+    if content_column is None:
+        return None
+    return (content_column, None)
 
 
 def _strip_block_quotes(line: str) -> Tuple[int, str]:
@@ -123,7 +215,9 @@ def _visible_markdown(body: object) -> str:
     block too, so an indented line directly after one is already code. Once
     opened, the block continues across blank lines and still-indented lines,
     just as GFM renders it. Block-quote markers are stripped before those
-    decisions, so an indented code block nested in a quote is inert too.
+    decisions, so an indented code block nested in a quote is inert too. A
+    list marker hides its item's content column, so five or more spaces after
+    the marker open an indented code block inside the list item.
     """
     text = str(body or "")
     visible = []
@@ -133,6 +227,8 @@ def _visible_markdown(body: object) -> str:
     line_blank = True
     line_ends_block = False
     structural_prefix_end = 0
+    list_content_column = None
+    list_quote_depth = None
     while index < len(text):
         if line_start and text[index] != "\n":
             line_end = text.find("\n", index)
@@ -145,6 +241,31 @@ def _visible_markdown(body: object) -> str:
                 _ATX_HEADING_RE.match(content) is not None
                 or _THEMATIC_BREAK_RE.match(content) is not None
             )
+            if (
+                list_content_column is not None
+                and quote_depth != list_quote_depth
+            ):
+                list_content_column = None
+                list_quote_depth = None
+            layout = (
+                None
+                if line_ends_block
+                else _list_item_layout(
+                    content, block_boundary, list_content_column
+                )
+            )
+            if layout is not None:
+                list_content_column, list_code_indent = layout
+                list_quote_depth = quote_depth
+            else:
+                list_code_indent = None
+                if (
+                    content.strip()
+                    and list_content_column is not None
+                    and _leading_columns(content) < list_content_column
+                ):
+                    list_content_column = None
+                    list_quote_depth = None
             opener = _FENCE_OPEN_RE.match(content)
             if opener is not None:
                 fence = opener.group("fence")
@@ -176,7 +297,14 @@ def _visible_markdown(body: object) -> str:
                 block_boundary = True
                 line_blank = True
                 continue
-            if block_boundary and _INDENTED_CODE_RE.match(content):
+            required_indent = (
+                4 if list_content_column is None
+                else list_content_column + 4
+            )
+            if (
+                block_boundary
+                and _leading_columns(content) >= required_indent
+            ):
                 end = line_end
                 cursor = line_end + 1 if line_end < len(text) else len(text)
                 while cursor < len(text):
@@ -189,7 +317,33 @@ def _visible_markdown(body: object) -> str:
                     if next_depth < quote_depth:
                         break
                     if (
-                        _INDENTED_CODE_RE.match(next_content)
+                        _leading_columns(next_content) >= required_indent
+                        or not next_content.strip()
+                    ):
+                        end = next_end
+                        cursor = next_end + 1 if next_end < len(text) else len(text)
+                        continue
+                    break
+                visible.append(_blank_markdown(text[index:end]))
+                index = end
+                line_start = False
+                block_boundary = True
+                line_blank = True
+                continue
+            if list_code_indent is not None:
+                end = line_end
+                cursor = line_end + 1 if line_end < len(text) else len(text)
+                while cursor < len(text):
+                    next_end = text.find("\n", cursor)
+                    if next_end == -1:
+                        next_end = len(text)
+                    next_depth, next_content = _strip_block_quotes(
+                        text[cursor:next_end]
+                    )
+                    if next_depth < quote_depth:
+                        break
+                    if (
+                        _leading_columns(next_content) >= list_code_indent
                         or not next_content.strip()
                     ):
                         end = next_end
