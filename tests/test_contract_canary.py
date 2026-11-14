@@ -611,6 +611,49 @@ class CompletionEvidenceTest(unittest.TestCase):
                     )
                 )
 
+    def test_nested_list_and_quote_fenced_example_is_not_evidence(self):
+        bodies = [
+            "- > - ```text\n  >   Closes #100\n",
+            "- > - > - ```text\n  >   >   Closes #100\n",
+            "- > - ```text\n  >   Closes #100\n  >   ```\n",
+        ]
+        for body in bodies:
+            with self.subTest(body=body):
+                candidate = pr(body=body)
+                candidate["headRefName"] = "feature/unrelated"
+                problem = canary.validate_completed_canary(
+                    candidate, exact_head_runs(), 100
+                )
+                self.assertIn("not attributed", problem)
+
+    def test_nested_list_and_quote_fenced_example_keeps_branch_attribution(self):
+        for body in (
+            "- > - ```text\n  >   Closes #100\n",
+            "- > - > - ```text\n  >   >   Closes #100\n",
+        ):
+            with self.subTest(body=body):
+                candidate = pr(body=body)
+                self.assertIsNone(
+                    canary.validate_completed_canary(
+                        candidate, exact_head_runs(), 100
+                    )
+                )
+
+    def test_list_item_quote_fence_ends_when_the_quote_ends(self):
+        bodies = [
+            "- > ```text\n  > example\n\nCloses #100\n",
+            "- > ```text\n  > example\n  Closes #100\n",
+        ]
+        for body in bodies:
+            with self.subTest(body=body):
+                candidate = pr(body=body)
+                candidate["headRefName"] = "feature/unrelated"
+                self.assertIsNone(
+                    canary.validate_completed_canary(
+                        candidate, exact_head_runs(), 100
+                    )
+                )
+
     def test_indented_code_closing_example_is_not_completion_evidence(self):
         candidate = pr(body="Example only:\n\n    Closes #100\n")
         candidate["headRefName"] = "feature/unrelated"

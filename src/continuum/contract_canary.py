@@ -270,33 +270,80 @@ def _alternating_code_indent(line: str, block_boundary: bool) -> Optional[int]:
     return None
 
 
-def _consume_list_fence(
+def _parse_fence_chain(
+    text: str, block_boundary: bool
+) -> Tuple[Optional[re.Match], list]:
+    """Return a fence opener and its alternating list/quote containers.
+
+    ``text`` starts after every container already consumed by the caller. The
+    remainder may still contain list items and block quotes whose markers hide
+    a fence opener, so walk them in order. Each descriptor is either
+    ``("list", content_column)`` or ``("quote", 0)``. Five or more spaces after
+    a list marker open an indented code block, so that is not a fence.
+    """
+    containers = []
+    cursor = 0
+    while cursor < len(text):
+        layout = _list_item_layout(text[cursor:], block_boundary)
+        if layout is not None:
+            content_column, code_indent = layout
+            if code_indent is not None:
+                return None, containers
+            containers.append(("list", content_column))
+            cursor += content_column
+        depth, stripped = _strip_block_quotes_from(text, cursor)
+        if depth:
+            containers.extend(("quote", 0) for _ in range(depth))
+            cursor += len(text[cursor:]) - len(stripped)
+            continue
+        break
+    opener = _FENCE_OPEN_RE.match(text[cursor:])
+    if opener is None:
+        return None, containers
+    return opener, containers
+
+
+def _consume_container_fence(
     text: str,
     end: int,
     cursor: int,
     fence: str,
-    quote_depth: int,
-    list_content_column: int,
+    containers: Sequence[Tuple[str, int]],
 ) -> int:
-    """Return the last offset of a fenced code block inside a list item.
+    """Return the last offset of a fenced code block inside its containers.
 
-    The fence opener follows the item's list marker, so continuation lines are
-    measured from the item's content column rather than from column zero. The
-    block ends at its closing fence or, when the fence is unclosed, where the
-    item's container ends. A blank line does not leave the item.
+    Every continuation line must still belong to the opener's list items and
+    block quotes. A list item accepts indentation from its content column, or a
+    blank line, while a block quote requires its own marker; a blank line
+    without that marker ends the quote and therefore the fence. The block also
+    ends at its closing fence.
     """
     while cursor < len(text):
         next_end = text.find("\n", cursor)
         if next_end == -1:
             next_end = len(text)
         raw = text[cursor:next_end]
-        depth, content = _strip_block_quotes(raw, quote_depth)
-        if depth < quote_depth:
+        position = 0
+        inside = True
+        for kind, column in containers:
+            if kind == "quote":
+                marker = _BLOCK_QUOTE_RE.match(raw, position)
+                if marker is None:
+                    inside = False
+                    break
+                position = marker.end()
+                continue
+            content = raw[position:]
+            if not content.strip():
+                position = len(raw)
+                continue
+            if _leading_columns(content) < column:
+                inside = False
+                break
+            position += column
+        if not inside:
             break
-        if content.strip() and _leading_columns(content) < list_content_column:
-            break
-        item_content = content[list_content_column:]
-        closing = _FENCE_CLOSE_RE.match(item_content)
+        closing = _FENCE_CLOSE_RE.match(raw[position:])
         if (
             closing is not None
             and closing.group("fence")[0] == fence[0]
@@ -481,52 +528,29 @@ def _visible_markdown(body: object) -> str:
                 )
                 if nested_code_indent is not None:
                     list_code_indent = nested_code_indent
-            list_fence_indent = None
-            opener = _FENCE_OPEN_RE.match(content)
-            if (
-                opener is None
-                and list_content_column is not None
-                and inner_depth == 0
-            ):
-                opener = _FENCE_OPEN_RE.match(
-                    content[list_content_column:]
-                )
-                if opener is not None:
-                    list_fence_indent = list_content_column
-            if opener is not None:
-                fence = opener.group("fence")
-                if list_fence_indent is not None:
-                    end = _consume_list_fence(
-                        text,
-                        line_end,
-                        line_end + 1 if line_end < len(text) else len(text),
-                        fence,
-                        quote_depth,
-                        list_fence_indent,
-                    )
+            containers = [("quote", 0)] * quote_depth
+            if list_content_column is not None:
+                containers.append(("list", list_content_column))
+                if inner_depth:
+                    containers.extend([("quote", 0)] * inner_depth)
+                    remainder = content
                 else:
-                    cursor = line_end
-                    end = len(text)
-                    while cursor < len(text):
-                        next_start = cursor + 1
-                        next_end = text.find("\n", next_start)
-                        if next_end == -1:
-                            next_end = len(text)
-                        next_depth, next_content = _strip_block_quotes(
-                            text[next_start:next_end]
-                        )
-                        if next_depth < quote_depth:
-                            end = cursor
-                            break
-                        closing = _FENCE_CLOSE_RE.match(next_content)
-                        if (
-                            closing is not None
-                            and closing.group("fence")[0] == fence[0]
-                            and len(closing.group("fence")) >= len(fence)
-                        ):
-                            end = next_end
-                            break
-                        cursor = next_end
+                    remainder = content[list_content_column:]
+            else:
+                remainder = content
+            opener, extra_containers = _parse_fence_chain(
+                remainder, block_boundary or inner_boundary
+            )
+            if opener is not None:
+                containers.extend(extra_containers)
+                fence = opener.group("fence")
+                end = _consume_container_fence(
+                    text,
+                    line_end,
+                    line_end + 1 if line_end < len(text) else len(text),
+                    fence,
+                    containers,
+                )
                 visible.append(_blank_markdown(text[index:end]))
                 index = end
                 line_start = False
