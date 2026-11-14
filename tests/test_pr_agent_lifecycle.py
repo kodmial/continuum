@@ -240,6 +240,17 @@ APPROVED_448_REPAIR_OPENCODE_SHA256 = (
 APPROVED_450_SERIALIZED_OPENCODE_SHA256 = (
     "236978024396822de9ee242f532aef9b4e10c81b1d1a46f548f5b2ceb441f38a"
 )
+# kodmial/continuum#454: the reviewed #448 repair and #450 serialized-chat
+# pins above stay for audit. This task deliberately adds one bounded,
+# privacy-safe telemetry artifact upload step (always(), continue-on-error,
+# upload-artifact v4, runner-temp telemetry directory) so per-attempt OpenCode
+# usage survives the runner without making observability failure a task
+# failure. Merging main's #450 chat-ownership change keeps both reviewed
+# behaviors in the artifact, so this active pin covers the combined bytes;
+# unrelated drift still fails closed.
+APPROVED_454_TELEMETRY_OPENCODE_SHA256 = (
+    "21ab18877e9605ee8c680ca8a5e6acdd5dd27f6390e6751c9de17d816ca76c74"
+)
 APPROVED_446_CALLER_SHA256 = (
     "b7f3df118bc436526f48443b8f068372204073eb134c98e4a1543d025f314686"
 )
@@ -2661,12 +2672,13 @@ class ProtectedBaselineTests(unittest.TestCase):
                     self.assertIn("CONTINUUM_OPENCODE_PUBLISH_RACE_RETRY_REQUIRED", original)
                     self.assertIn("steps.model_route.outputs.model", original)
                 if path == ".github/workflows/continuum-opencode.yml":
-                    # #450 deliberately changes chat-ownership behavior,
-                    # with a full-file digest and executable regression tests.
+                    # #454 adds bounded telemetry on top of #450's deliberate
+                    # chat-ownership change, with full-file digests and
+                    # executable regression tests.
                     self.assertEqual(
                         protected_file_digest(path),
-                        APPROVED_450_SERIALIZED_OPENCODE_SHA256,
-                        f"{path}: unexpected drift outside #450 serialized CodeRabbit chat owner",
+                        APPROVED_454_TELEMETRY_OPENCODE_SHA256,
+                        f"{path}: unexpected drift outside #454 telemetry on the #450 serialized CodeRabbit chat owner",
                     )
                 else:
                     # The self-dogfood caller is the dispatchable surface
@@ -2751,7 +2763,7 @@ class ProtectedBaselineTests(unittest.TestCase):
         # therefore be dirty in this pre-commit worktree; any unapproved byte
         # change still fails the exact digest assertions above.
         approved = {
-            ".github/workflows/continuum-opencode.yml": APPROVED_450_SERIALIZED_OPENCODE_SHA256,
+            ".github/workflows/continuum-opencode.yml": APPROVED_454_TELEMETRY_OPENCODE_SHA256,
             ".github/workflows/opencode.yml": APPROVED_350_SELF_CALLER_SHA256,
         }
         for path in PROTECTED_FILES:

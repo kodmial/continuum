@@ -1249,6 +1249,18 @@ jobs:
           echo "published=true" >> "$GITHUB_OUTPUT"
           echo "Pushed one bounded repair to refs/heads/$HEAD_REF for PR #$PR_NUMBER."
 
+      # kodmial/continuum#454: durable, bounded, privacy-safe per-attempt
+      # telemetry from the shared wrapper, including failed/interrupted runs.
+      - name: Publish OpenCode telemetry artifact
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: continuum-opencode-telemetry-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/continuum-opencode-telemetry
+          if-no-files-found: warn
+          retention-days: 30
+
       - name: Attest successful published OpenCode repair
         if: steps.model_route.outcome == 'success' && steps.repair_pass.outputs.published == 'true'
         uses: kodmial/continuum/.github/actions/model-route@main

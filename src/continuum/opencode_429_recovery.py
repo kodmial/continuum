@@ -236,11 +236,10 @@ _SHA_RE = re.compile(r"\b[0-9a-f]{40}\b", re.IGNORECASE)
 #: ``type=text``; neither is provider evidence.
 _OPENCODE_EVENT_ERROR = "error"
 
-#: ``opencode github run`` has no JSON mode (verified against the pinned
-#: 1.19.3 CLI). It writes the provider error object to stderr immediately
-#: before throwing, prefixed with one of these runtime-owned markers. The
-#: agent's own final response goes to stdout instead, so only diagnostics on
-#: stderr are ever inspected.
+#: The legacy ``opencode github run`` path has no JSON mode. It writes the
+#: provider error object to stderr immediately before throwing, prefixed with
+#: one of these runtime-owned markers. The agent's own final response goes to
+#: stdout instead, so only diagnostics on stderr are ever inspected.
 _GITHUB_ERROR_PREFIXES = ("Agent error:", "Summary agent error:")
 _GITHUB_NAME_RE = re.compile(
     r"['\"]?name['\"]?\s*:\s*['\"]?([A-Za-z0-9_.-]+)"
@@ -399,6 +398,36 @@ def _classify_error_event(event: Mapping[str, Any]) -> str:
     )
 
 
+def classify_opencode_error_event(event: Any) -> str:
+    """Classify one parsed top-level ``type=error`` event.
+
+    Returns the same classification vocabulary as
+    :func:`classify_opencode_events`.  Non-error records and non-provider
+    session failures are ``inconclusive``; callers must not treat that as a
+    provider quota signal.
+    """
+
+    if not isinstance(event, Mapping) or event.get("type") != _OPENCODE_EVENT_ERROR:
+        return "inconclusive"
+    return _classify_error_event(event)
+
+
+def describe_opencode_error(error: Any) -> Dict[str, Any]:
+    """Return allowlisted metadata for one parsed provider error object.
+
+    Only the provider error name/type and HTTP status are exposed.  Message
+    text, response bodies, and arbitrary nested values are never returned.
+    """
+
+    if not isinstance(error, Mapping):
+        return {"provider": False, "kind": "", "status": None}
+    return {
+        "provider": bool(_is_provider_error_event(error)),
+        "kind": _event_name(error),
+        "status": _event_status(error),
+    }
+
+
 def _select_event_classification(classes: list, exit_code: Any) -> str:
     if "quota_429" in classes:
         return "quota_429"
@@ -442,10 +471,10 @@ def classify_opencode_events(log_text: Any, exit_code: Any = 1) -> str:
 def _github_error_blocks(log_text: Any) -> list:
     """Extract runtime-owned provider-error blocks from ``github run`` stderr.
 
-    The pinned CLI (1.19.3) has no ``--format json`` for ``github run``. It
-    does print the full provider error object to stderr with ``console.error``
-    before throwing. Only those prefixed blocks are inspected; stdout (the
-    agent's final response) and arbitrary transcript text are never evidence.
+    The legacy ``github run`` path has no ``--format json``. It does print the
+    full provider error object to stderr with ``console.error`` before
+    throwing. Only those prefixed blocks are inspected; stdout (the agent's
+    final response) and arbitrary transcript text are never evidence.
     """
 
     if not isinstance(log_text, str):
@@ -1268,9 +1297,11 @@ __all__ = [
     "already_resumed",
     "checkpoint_ref",
     "classify_agent_error",
+    "classify_opencode_error_event",
     "classify_opencode_events",
     "classify_opencode_github_events",
     "consumes_task_budget",
+    "describe_opencode_error",
     "cooldown_comment",
     "infra_backoff_seconds",
     "is_opencode_429",

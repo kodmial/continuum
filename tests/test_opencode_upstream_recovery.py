@@ -12,8 +12,10 @@ import json
 import os
 import re
 import shutil
+import signal
 import subprocess
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -83,6 +85,7 @@ class ProductionWrapperTests(unittest.TestCase):
             "printf '%s' \"${FAKE_OPENCODE_STDOUT:-}\"\n"
             "printf '%s' \"${FAKE_OPENCODE_STDERR:-}\" >&2\n"
             "printf '%s\\n' \"$*\" > \"${FAKE_ARGS_FILE:-/dev/null}\"\n"
+            "if [[ -n \"${FAKE_OPENCODE_SLEEP:-}\" ]]; then sleep \"$FAKE_OPENCODE_SLEEP\"; fi\n"
             "exit \"${FAKE_OPENCODE_EXIT:-0}\"\n",
             encoding="utf-8",
         )
@@ -354,6 +357,68 @@ class ProductionWrapperTests(unittest.TestCase):
                 self.assertEqual(result["rc"], expected_rc, result["output"])
                 self.assertEqual(result["classification"], expected_class)
                 self.assertEqual(result["quota"], expected_class == "quota_429")
+
+    def test_cancelled_attempt_persists_one_inconclusive_telemetry_record(self):
+        cases = (
+            (("run", "--auto"), "run", signal.SIGTERM, 143),
+            (("run", "--auto"), "run", signal.SIGINT, 130),
+            (("run", "--auto"), "run", signal.SIGHUP, 129),
+            (("github", "run"), "github", signal.SIGTERM, 143),
+        )
+        for argv, expected_mode, received, expected_status in cases:
+            with self.subTest(mode=expected_mode, signal=received.name):
+                if self.args_file.exists():
+                    self.args_file.unlink()
+                telemetry_dir = self.runner / "continuum-opencode-telemetry"
+                shutil.rmtree(telemetry_dir, ignore_errors=True)
+                env = dict(os.environ)
+                env.update(
+                    RUNNER_TEMP=str(self.runner),
+                    CONTINUUM_429_CLASSIFIER=str(CLASSIFIER),
+                    FAKE_OPENCODE_STDOUT=text_event("working"),
+                    FAKE_OPENCODE_STDERR="",
+                    FAKE_OPENCODE_EXIT="0",
+                    FAKE_OPENCODE_SLEEP="30",
+                    FAKE_ARGS_FILE=str(self.args_file),
+                    PATH=str(self.bin) + os.pathsep + env.get("PATH", ""),
+                )
+                process = subprocess.Popen(
+                    [str(WRAPPER), *argv],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    env=env,
+                    start_new_session=True,
+                )
+                try:
+                    deadline = time.monotonic() + 20
+                    while time.monotonic() < deadline and not self.args_file.exists():
+                        time.sleep(0.05)
+                    self.assertTrue(self.args_file.exists(), "fake opencode never ran")
+                    # The runner cancels the whole step process group, so the
+                    # trap runs once the interrupted CLI and renderer exit.
+                    os.killpg(process.pid, received)
+                    stdout, stderr = process.communicate(timeout=30)
+                finally:
+                    if process.poll() is None:
+                        os.killpg(process.pid, signal.SIGKILL)
+                        process.wait(timeout=30)
+
+                output = stdout + stderr
+                self.assertEqual(process.returncode, expected_status, output)
+                artifacts = sorted(telemetry_dir.glob("*.json"))
+                self.assertEqual(len(artifacts), 1, output)
+                summary = json.loads(artifacts[0].read_text(encoding="utf-8"))
+                self.assertEqual(summary["attempt"]["mode"], expected_mode)
+                self.assertEqual(
+                    summary["attempt"]["classification"], "inconclusive"
+                )
+                self.assertEqual(summary["attempt"]["exit_code"], expected_status)
+                self.assertIn(
+                    "interrupted by {}; recording an inconclusive telemetry "
+                    "record".format(received.name),
+                    output,
+                )
 
 
 class WorkflowContractTests(unittest.TestCase):
