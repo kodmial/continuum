@@ -507,6 +507,29 @@ class ExactHeadRunsTest(unittest.TestCase):
         merged = canary.merge_exact_head_runs(snapshot, "", fresh)
         self.assertEqual(merged, snapshot + fresh)
 
+    def test_fresh_exact_head_failure_masks_the_snapshot_success(self):
+        """The completion gate must consume the fresh exact-HEAD evidence.
+
+        A bounded global snapshot can still hold an older success for the same
+        head after a re-run fails. ``evaluate_regression_gate`` reads the first
+        matching record, so merging must replace those snapshot records instead
+        of appending after them.
+        """
+        snapshot = [
+            run("CI", head=HEAD),
+            run(contract.CONTRACT_WORKFLOW_NAME, head=HEAD),
+        ]
+        self.assertIsNone(
+            canary.validate_completed_canary(pr(), snapshot, 100)
+        )
+        fresh = [
+            run("CI", conclusion="failure"),
+            run(contract.CONTRACT_WORKFLOW_NAME, head=HEAD),
+        ]
+        merged = canary.merge_exact_head_runs(snapshot, HEAD, fresh)
+        problem = canary.validate_completed_canary(pr(), merged, 100)
+        self.assertIn("regression-evidence-completed-failure", problem)
+
 
 class CanaryIssueBodyTest(unittest.TestCase):
     def test_body_is_marked_bounded_and_harmless(self):
