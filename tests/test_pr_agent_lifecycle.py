@@ -232,8 +232,13 @@ APPROVED_448_REPAIR_OPENCODE_SHA256 = (
 # classifier now normalizes fenced examples and blockquotes before parsing, so
 # a trusted UNRESOLVED answer that quotes provider quota wording stays a
 # verdict instead of being discarded as a retry.
+# kodmial/continuum#451 repair (review 5900018093): the shared chat-quota block
+# strips recognized Markdown emphasis before validating the full-review
+# countdown separator, so "**13 minutes**" keeps its exact window instead of
+# falling back to 65 minutes. The workflow-local retry parsers carry the same
+# normalization.
 APPROVED_450_SERIALIZED_OPENCODE_SHA256 = (
-    "56ec91f0a9f0270c0199b6132a8f011b1ce9f107e9c24fd775f92ce2bd3772ba"
+    "236978024396822de9ee242f532aef9b4e10c81b1d1a46f548f5b2ceb441f38a"
 )
 APPROVED_446_CALLER_SHA256 = (
     "b7f3df118bc436526f48443b8f068372204073eb134c98e4a1543d025f314686"

@@ -93,6 +93,13 @@ _DURATION_SEPARATOR_RE = re.compile(
     r"[\s,.]*(?:and[\s,.]*)?", re.IGNORECASE
 )
 
+# Markdown emphasis may wrap a countdown ("**13 minutes**"). Remove only
+# delimiter runs adjacent to whitespace or a window boundary, so an
+# unrecognized token such as ``1_hour`` stays rejected.
+_MARKDOWN_EMPHASIS_RE = re.compile(
+    r"(^|\s)(?:\*{1,3}|_{1,3}|~~)|(?:\*{1,3}|_{1,3}|~~)(?=\s|$)"
+)
+
 # Inline chat-message quota lives in a PR review-comment thread. Its heading
 # and prose are matched only on unquoted Markdown lines, so a human comment
 # that pastes the provider text can never be mistaken for a quota reply. The
@@ -129,6 +136,12 @@ _REVIEW_COMMAND_RE = re.compile(
 )
 
 
+def _strip_markdown_emphasis(text: Any) -> str:
+    """Remove Markdown emphasis delimiters around a countdown window."""
+
+    return _MARKDOWN_EMPHASIS_RE.sub(r"\1", str(text or "")).strip()
+
+
 def retry_window_text(body: Any) -> Optional[str]:
     """Extract the quota-countdown window text from a bot comment.
 
@@ -142,7 +155,7 @@ def retry_window_text(body: Any) -> Optional[str]:
             continue
         match = pattern.search(text)
         if match:
-            return match.group(1)
+            return _strip_markdown_emphasis(match.group(1))
     return None
 
 
@@ -154,7 +167,7 @@ def parse_duration_ms(text: Any) -> Optional[int]:
     its provider quota fallback instead of retrying after the short suffix.
     """
 
-    value = str(text or "")
+    value = _strip_markdown_emphasis(text)
     total = 0
     found = False
     cursor = 0

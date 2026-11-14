@@ -603,6 +603,42 @@ class ChatQuotaWorkflowContractTests(unittest.TestCase):
             13 * 60_000,
         )
 
+    def test_emphasized_full_review_countdowns_parse_exact_window(self):
+        # CodeRabbit may bold the countdown ("**13 minutes**"). The emphasis
+        # delimiters must not force the 65-minute fallback.
+        vectors = {
+            "Review rate limited. Next included review available in **13 minutes**.": 13 * 60_000,
+            "Review rate limited. Your next included review will be available in **13 minutes**.": 13 * 60_000,
+            "Review rate limited. Next included review available in **1 hour 5 minutes**.": 65 * 60_000,
+            "Review rate limited. Try again in **13 minutes**.": 13 * 60_000,
+            "Next review available in __13 minutes__.": 13 * 60_000,
+        }
+        for body, expected in vectors.items():
+            with self.subTest(body=body):
+                self.assertEqual(rabbit.parse_retry_delay_ms(body), expected)
+        self.assertEqual(
+            rabbit.retry_window_text(
+                "Review rate limited. Next included review available in "
+                "**13 minutes**."
+            ),
+            "13 minutes",
+        )
+        self.assertEqual(rabbit.parse_duration_ms("**13 minutes**"), 13 * 60_000)
+        # A partially recognized emphasized window stays rejected so it
+        # cannot retry after the short suffix.
+        emphasized_partial = (
+            "Review rate limited. Next included review available in "
+            "**1h 30 seconds**."
+        )
+        self.assertEqual(
+            rabbit.retry_window_text(emphasized_partial), "1h 30 seconds"
+        )
+        self.assertIsNone(rabbit.parse_duration_ms("**1h 30 seconds**"))
+        self.assertEqual(
+            rabbit.parse_retry_delay_ms(emphasized_partial),
+            rabbit.QUOTA_FALLBACK_MS,
+        )
+
     def test_full_review_queue_parser_and_regex_are_unchanged(self):
         retry = RETRY.read_text(encoding="utf-8")
         self.assertIn("/Review rate limited|Review limit reached/i", retry)
@@ -611,6 +647,12 @@ class ChatQuotaWorkflowContractTests(unittest.TestCase):
         self.assertIn("['Try again in 13 minutes.', null]", retry)
         self.assertNotIn("CHAT_QUOTA", retry)
         self.assertNotIn("chat messages per hour", retry)
+        for workflow in (AUTO_MERGE, RETRY):
+            source = workflow.read_text(encoding="utf-8")
+            with self.subTest(workflow=workflow.name):
+                self.assertIn("function stripMarkdownEmphasis", source)
+                self.assertIn("return stripMarkdownEmphasis(match[1]);", source)
+                self.assertIn("**13 minutes**", source)
         # The existing full-review countdown vectors still pass.
         for body, expected in (
             (
@@ -623,6 +665,16 @@ class ChatQuotaWorkflowContractTests(unittest.TestCase):
                 65 * 60_000,
             ),
             ("Review rate limited. Try again in less than a minute.", 60_000),
+            (
+                "Review rate limited. Next included review available in "
+                "**13 minutes**.",
+                13 * 60_000,
+            ),
+            (
+                "Review rate limited. Next included review available in "
+                "**1h 30 seconds**.",
+                65 * 60_000,
+            ),
         ):
             with self.subTest(body=body):
                 self.assertEqual(rabbit.parse_retry_delay_ms(body), expected)
@@ -650,6 +702,8 @@ class ChatQuotaRuntimeParityTests(unittest.TestCase):
         bodies = [reply["body"] for reply in data["threads"][0]["replies"]]
         bodies += [
             "Review rate limited. Next included review available in 13 minutes.",
+            "Review rate limited. Next included review available in **13 minutes**.",
+            "Review rate limited. Next included review available in **1h 30 seconds**.",
             "Review limit reached. Your next review is available after 1 hour 5 minutes.",
             "Next review available in 13 minutes.",
             "Try again in 13 minutes.",

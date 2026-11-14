@@ -4166,10 +4166,21 @@ jobs:
               return String(login || '').trim().toLowerCase() === CODERABBIT_BOT_LOGIN;
             }
 
+            // Markdown emphasis may wrap a full-review countdown
+            // ("**13 minutes**"). Remove only delimiter runs adjacent to
+            // whitespace or a window boundary, so an unrecognized token such as
+            // "1_hour" stays rejected.
+            const QUOTA_EMPHASIS_RE =
+              /(^|\s)(?:\*{1,3}|_{1,3}|~~)|(?:\*{1,3}|_{1,3}|~~)(?=\s|$)/g;
+
+            function stripQuotaEmphasis(text = '') {
+              return String(text).replace(QUOTA_EMPHASIS_RE, '$1').trim();
+            }
+
             function parseChatDurationMs(text = '') {
               // Only a complete countdown parses; a partially recognized
               // window falls back to CHAT_QUOTA_FALLBACK_MS at the caller.
-              const value = String(text);
+              const value = stripQuotaEmphasis(text);
               const token =
                 /(?<less>less\s+than\s+(?:a|one)\s+minute)|(?<amount>\d+)\s*(?<unit>hours?|hrs?|minutes?|mins?|seconds?|secs?)/gi;
               const separator = /^[\s,.]*(?:and[\s,.]*)?$/i;
