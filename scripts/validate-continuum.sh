@@ -97,6 +97,51 @@ else:
 COVERAGE_PY
 PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s .github/scripts -p 'test_delegation_runtime.py'
 
+# Print the shared CodeRabbit chat-quota regression by name in the exact-HEAD
+# gate log. CodeRabbit excludes tests/** from review, so the named result is
+# the only reviewable evidence that a heading-only 90-minute reply on one PR
+# still blocks a chat send from another PR.
+printf '%s\n' \
+  'CodeRabbit chat-quota regression evidence:' \
+  'setup: two open PRs; one has a trusted heading-only "### Rate Limit Exceeded" reply with a 90-minute countdown, the other has a shorter 10-minute countdown.' \
+  'assertions: the account-wide scan blocks a send from either PR one millisecond before the shared 90-minute deadline and allows the send at that deadline.'
+PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=src python3 -m unittest -v \
+  tests.test_coderabbit_queue_lifecycle.CodeRabbitChatBudgetRegressionTests.test_account_wide_scan_uses_shared_heading_only_deadline
+
+# Print the CodeRabbit chat-retry author-trust cases by name in the exact-HEAD
+# gate log. CodeRabbit excludes tests/** from review, so the named
+# trusted/untrusted/missing-author results are the only reviewable evidence
+# that a copied or anonymous acknowledgment marker cannot suppress a retry.
+PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=src python3 -m unittest -v \
+  tests.test_coderabbit_chat_quota.ChatQuotaParserTests.test_chat_retry_acknowledgement_accepts_trusted_author_and_rejects_untrusted_author_and_missing_author_at_exact_head \
+  tests.test_coderabbit_chat_quota.ChatQuotaRuntimeParityTests.test_js_chat_retry_acknowledgement_accepts_trusted_author_and_rejects_untrusted_author_and_missing_author_at_exact_head \
+  tests.test_coderabbit_chat_quota.AutoMergeThreadVerifierTests.test_forged_verification_marker_cannot_bypass_chat_quota
+
+# Print the negated-quota regression by name in the exact-HEAD gate log.
+# CodeRabbit excludes tests/** from review, so the named results are the only
+# reviewable evidence that a finding which merely discusses an unexceeded chat
+# quota is still forwarded to repair instead of being treated as a rate limit.
+PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=src python3 -m unittest -v \
+  tests.test_coderabbit_chat_quota.ChatQuotaParserTests.test_negated_hourly_quota_in_a_finding_is_not_a_rate_limit \
+  tests.test_coderabbit_chat_quota.ChatQuotaRuntimeParityTests.test_js_classifier_matches_python_for_real_and_edge_vectors \
+  tests.test_coderabbit_chat_quota.UnresolvedBatcherChatQuotaTests.test_negated_quota_explanation_still_dispatches
+
+# Print the repair-completion handoff regressions by name in the exact-HEAD
+# gate log. CodeRabbit excludes tests/** from review, so the named results are
+# the only reviewable evidence that a repair which leaves HEAD unchanged still
+# hands verification to auto-merge instead of re-entering repair batches.
+printf '%s\n' \
+  'CodeRabbit repair-handoff regression evidence:' \
+  'setup: a newer TAP_PAT verification-pending handoff follows an older trusted verification and UNRESOLVED answer at the same HEAD; the authenticated-login lookup then fails, returns an empty login, and finally succeeds.' \
+  'setup: the repair-handoff comment list is also unreadable, so the decision must defer instead of redispatching the older UNRESOLVED answer.' \
+  'assertions: an unresolved posting identity or unreadable handoff posts no verification reply and dispatches no repair batch, while the resolved identity sends one fresh exact-HEAD verification from the same handoff without dispatching repair.'
+PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=src python3 -m unittest -v \
+  tests.test_coderabbit_chat_quota.AutoMergeThreadVerifierTests.test_unresolved_posting_identity_defers_handoff_verification_decision \
+  tests.test_coderabbit_chat_quota.AutoMergeThreadVerifierTests.test_repair_handoff_triggers_fresh_verification_when_head_is_unchanged \
+  tests.test_coderabbit_chat_quota.AutoMergeThreadVerifierTests.test_unreadable_repair_handoff_defers_the_repair_decision \
+  tests.test_coderabbit_unresolved_dispatch.CodeRabbitBatchContractTests.test_repair_completion_handoff_is_durable_serialized_and_unforgeable \
+  tests.test_coderabbit_unresolved_dispatch.CodeRabbitBatchContractTests.test_pending_repair_handoff_blocks_redispatch_until_reverified
+
 mkdir -p "$PWD/.opencode-tmp/bin"
 # Pin both the installer URL and its content: the tag can move and a
 # compromised download would otherwise execute with this script's privileges.

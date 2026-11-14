@@ -645,6 +645,14 @@ class ProviderBoundaryTests(unittest.TestCase):
             rabbit.parse_retry_delay_ms("Review rate limited, no countdown."),
             rabbit.QUOTA_FALLBACK_MS,
         )
+        # A generic "try/retry again in" phrase is not a quota window unless
+        # the reply also carries an explicit full-review quota signal.
+        self.assertIsNone(rabbit.parse_retry_delay_ms("Try again in 13 minutes."))
+        self.assertIsNone(rabbit.parse_retry_delay_ms("Retry again in 5 minutes."))
+        self.assertEqual(
+            rabbit.parse_retry_delay_ms("Next review available in 13 minutes."),
+            13 * 60_000,
+        )
         self.assertIsNone(rabbit.parse_retry_delay_ms("All good."))
 
     def test_coderabbit_review_commands_and_approval(self):

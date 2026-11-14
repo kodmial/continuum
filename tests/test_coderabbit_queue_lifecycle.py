@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import textwrap
 import unittest
 from dataclasses import dataclass
 from pathlib import Path
@@ -778,12 +779,31 @@ class CodeRabbitChatBudgetRegressionTests(unittest.TestCase):
         if not shutil.which("node"):
             self.skipTest("Node.js unavailable")
         source = self._workflow()
+        quota_start = source.index(
+            "          // continuum-coderabbit-chat-quota:start"
+        )
+        quota_end = source.index(
+            "          // continuum-coderabbit-chat-quota:end", quota_start
+        )
+        quota_end = source.find("\n", quota_end)
+        quota_lines = source[quota_start:quota_end].splitlines()
+        quota_indent = min(
+            len(line) - len(line.lstrip(" "))
+            for line in quota_lines
+            if line.strip()
+        )
+        quota_block = textwrap.dedent(
+            "\n".join(
+                line[quota_indent:] if line.strip() else ""
+                for line in quota_lines
+            )
+        )
         begin = source.index("          // Installed consumers use this single canonical")
         end = source.index(
             "          function shouldRecheckCodeRabbitAfterCi(", begin
         )
         helper = source[begin:end]
-        harness = r"""
+        harness = quota_block + "\n" + r"""
 const assert = require('node:assert/strict');
 const owner = 'kodmial', repo = 'continuum';
 const pulls = [{number:448}, {number:449}];
@@ -822,6 +842,12 @@ global.Date = Clock;
     RealDate.parse('2026-11-12T08:08:41Z'));
   const spoof = {...rows[448][0], user:{login:'someone-else'}};
   assert.equal(codeRabbitChatLimitNotBefore(spoof), null);
+  const headingOnly = {...rows[448][0],
+    body:'### Rate Limit Exceeded\n' +
+      'Please wait **5 minutes** before sending another message.'};
+  assert.equal(codeRabbitChatLimitNotBefore(headingOnly),
+    RealDate.parse('2026-11-12T07:58:45Z'),
+    'heading-only trusted quota replies still set the shared deadline');
   const reviewQuota = {...rows[448][0],body:'Review rate limited. Next included review available in 41 minutes.'};
   assert.equal(codeRabbitChatLimitNotBefore(reviewQuota), null);
   assert.equal(await allowOneCodeRabbitChatRequest(), false,
@@ -859,14 +885,109 @@ global.Date = Clock;
         self.assertEqual(completed.returncode, 0, completed.stderr)
         self.assertIn("coderabbit-chat-budget PASS", completed.stdout)
 
+    def test_account_wide_scan_uses_shared_heading_only_deadline(self):
+        import shutil
+        import subprocess
+
+        if not shutil.which("node"):
+            self.skipTest("Node.js unavailable")
+        source = self._workflow()
+        quota_start = source.index(
+            "          // continuum-coderabbit-chat-quota:start"
+        )
+        quota_end = source.index(
+            "          // continuum-coderabbit-chat-quota:end", quota_start
+        )
+        quota_end = source.find("\n", quota_end)
+        quota_lines = source[quota_start:quota_end].splitlines()
+        quota_indent = min(
+            len(line) - len(line.lstrip(" "))
+            for line in quota_lines
+            if line.strip()
+        )
+        quota_block = textwrap.dedent(
+            "\n".join(
+                line[quota_indent:] if line.strip() else ""
+                for line in quota_lines
+            )
+        )
+        begin = source.index("          // Installed consumers use this single canonical")
+        end = source.index(
+            "          function shouldRecheckCodeRabbitAfterCi(", begin
+        )
+        helper = source[begin:end]
+        harness = quota_block + "\n" + r"""
+const assert = require('node:assert/strict');
+const owner = 'kodmial', repo = 'continuum';
+const pulls = [{number:448}, {number:449}];
+const core = {info: () => {}, warning: () => {}};
+const heading = (id, created, wait) => ({
+  id, created_at: created, user: {login:'coderabbitai[bot]'},
+  body: '### Rate Limit Exceeded\n' +
+    'Please wait **' + wait + '** before sending another message.'
+});
+const rows = {
+  // PR #448's heading-only 90-minute reply is the only long deadline.
+  448: [heading(1, '2026-11-12T07:53:15Z', '90 minutes')],
+  // PR #449's own quota expires much earlier, so it cannot mask a
+  // regression that ignores #448's heading-only reply.
+  449: [heading(2, '2026-11-12T07:58:00Z', '10 minutes')]
+};
+const client = {rest:{pulls:{
+  get: async ({pull_number}) => ({data:{review_comments:rows[pull_number].length}}),
+  listReviewComments: async ({pull_number}) => ({data:rows[pull_number]})
+}}};
+const withReadFallback = callback => callback(client);
+const RealDate = Date;
+let now = RealDate.parse('2026-11-12T08:10:00Z');
+class Clock extends RealDate {static now() {return now;}}
+global.Date = Clock;
+""" + helper + r"""
+(async () => {
+  assert.equal(codeRabbitChatLimitNotBefore(rows[448][0]),
+    RealDate.parse('2026-11-12T09:23:45Z'));
+  assert.equal(codeRabbitChatLimitNotBefore(rows[449][0]),
+    RealDate.parse('2026-11-12T08:08:30Z'));
+  const anonymous = {...rows[448][0], user: null};
+  assert.equal(codeRabbitChatLimitNotBefore(anonymous), null,
+    'missing author identity must not set the shared deadline');
+  // #449's own quota has expired, but the scan must still apply #448's
+  // heading-only 90-minute deadline to the whole account.
+  assert.equal(await allowOneCodeRabbitChatRequest(), false,
+    'the other PR heading-only 90-minute reply still blocks the account');
+  now = RealDate.parse('2026-11-12T09:23:44Z');
+  assert.equal(await allowOneCodeRabbitChatRequest(), false,
+    'the other PR deadline still blocks one millisecond early');
+  now = RealDate.parse('2026-11-12T09:23:45Z');
+  assert.equal(await allowOneCodeRabbitChatRequest(), true,
+    'send only after the other PR heading-only deadline');
+  console.log('coderabbit-heading-only-budget PASS');
+})().catch(e => {console.error(e); process.exitCode = 1;});
+"""
+        completed = subprocess.run(
+            ["node", "-e", harness], capture_output=True,
+            text=True, timeout=30, check=False,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertIn("coderabbit-heading-only-budget PASS", completed.stdout)
+
     def test_both_chat_mutations_are_guarded_and_quota_is_not_a_repair(self):
         source = self._workflow()
         start = source.index("          async function requestCodeRabbitThreadVerification(")
         end = source.index("          async function cancelObsoleteRuns(", start)
         scope = source[start:end]
         self.assertEqual(
-            scope.count("await allowOneCodeRabbitChatRequest()"), 2,
-            "both post-CI and initial CodeRabbit replies must pass the budget",
+            scope.count("await allowOneCodeRabbitChatRequest()"), 1,
+            "the post-CI reply must pass the serialized chat budget",
+        )
+        self.assertEqual(
+            scope.count("if (!(await codeRabbitChatBudgetAllowsSend())) continue;"),
+            1,
+            "the chat-quota retry must scan the budget before its live checks",
+        )
+        self.assertEqual(
+            scope.count("if (!consumeCodeRabbitChatSendSlot()) continue;"), 1,
+            "the retry must consume its send slot only after the live checks",
         )
         self.assertIn("!isCodeRabbitChatLimitReply(comment)", scope)
         self.assertIn("codeRabbitChatSentThisPass = true", source)

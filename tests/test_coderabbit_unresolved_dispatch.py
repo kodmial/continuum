@@ -51,23 +51,208 @@ class CodeRabbitBatchContractTests(unittest.TestCase):
         self.assertIn("UNRESOLVED_ITEMS_JSON", canonical)
         self.assertIn("unresolved_items_json:", STUB.read_text(encoding="utf-8"))
 
-    def test_post_repair_chat_is_one_at_a_time_not_an_inline_fanout(self):
-        # Both the canonical unresolved batch and legacy single-review mode
-        # may ask the provider, but no OpenCode run can fan out five requests.
-        # The remaining threads are handled by the serialized auto-merge owner.
+    def test_post_repair_chat_has_one_serialized_sender_after_ci(self):
+        # OpenCode must not bypass the account-wide chat cooldown by posting
+        # its own inline verification immediately after a repair. The
+        # auto-merge controller owns all original-finding chat requests.
         code = js_for_step(OPENCODE, "Ask CodeRabbit to verify every original finding")
-        import re
-        requests = re.findall(
-            r"requested \+= 1;\s*// One inline request per run;"
-            r"[\s\S]*?break;", code
+        self.assertNotIn(
+            "POST /repos/{owner}/{repo}/pulls/{pull_number}/comments/{comment_id}/replies",
+            code,
         )
-        self.assertEqual(len(requests), 2)
-        self.assertEqual(code.count("One inline request per run"), 2)
+        self.assertIn("if (batchItems.length)", code)
+        self.assertIn("if (findings.length > 0)", code)
+        self.assertEqual(
+            code.count("to serialized auto-merge after exact-HEAD CI."), 2
+        )
+        # Preserve the existing no-inline-findings full-review fallback.
+        self.assertIn("@coderabbitai full review", code)
+        # A completed repair persists a durable handoff outside the review
+        # thread. Without it an unchanged HEAD would keep selecting repair
+        # batches and never reach a fresh provider verification.
+        self.assertIn("opencode-coderabbit-verification-pending", code)
+        self.assertIn("handOffRepairVerification(", code)
+        self.assertIn(
+            "'<!-- continuum-origin role=continuum component=opencode -->'",
+            code,
+        )
         merge = (ROOT / ".github/workflows/continuum-auto-merge.yml").read_text(
             encoding="utf-8"
         )
-        self.assertEqual(merge.count("await allowOneCodeRabbitChatRequest()"), 2)
+        self.assertIn("pendingRepairHandoff(", merge)
+        self.assertIn("repairHandoffPending", merge)
+        self.assertEqual(
+            merge.count("await allowOneCodeRabbitChatRequest()") +
+            merge.count("if (!(await codeRabbitChatBudgetAllowsSend())) continue;"),
+            2,
+            "both post-CI and retry replies must pass the shared chat budget",
+        )
+        self.assertIn("if (!consumeCodeRabbitChatSendSlot()) continue;", merge)
         self.assertIn("codeRabbitChatLimitNotBefore(comment)", merge)
+
+    def test_auto_merge_reads_every_repair_handoff_not_a_bounded_window(self):
+        # A pending handoff can be older than the newest issue comments. A
+        # bounded newest-page scan can miss it, dispatch another repair batch,
+        # and leave the finding without the fresh verification the handoff
+        # requires. Auto-merge must paginate every issue comment instead.
+        merge = (ROOT / ".github/workflows/continuum-auto-merge.yml").read_text(
+            encoding="utf-8"
+        )
+        scan = merge.split("const pendingRepairHandoff", 1)[0].split(
+            "// OpenCode never writes into the CodeRabbit inline chat", 1
+        )[1]
+        self.assertIn("client.paginate(", scan)
+        self.assertIn("client.rest.issues.listComments", scan)
+        self.assertIsNone(
+            re.search(r"(?m)^\s+page:", scan),
+            "the handoff scan must not request one bounded page",
+        )
+        self.assertNotIn("lastHandoffPage", scan)
+        self.assertIn("repairHandoffReadFailed = true", scan)
+
+    @unittest.skipUnless(shutil.which("node"), "Node.js unavailable")
+    def test_repair_completion_handoff_is_durable_serialized_and_unforgeable(self):
+        # Execute the production deferral branch. A repair that leaves HEAD
+        # unchanged must publish one durable verification-pending handoff so
+        # auto-merge can request verification without writing into the
+        # CodeRabbit inline chat. A foreign comment carrying the same marker
+        # must not suppress that handoff: auto-merge trusts only the PAT owner
+        # and github-actions[bot], so OpenCode must deduplicate the same way.
+        code = js_for_step(OPENCODE, "Ask CodeRabbit to verify every original finding")
+        head = "a" * 40
+        harness = (
+            "const posted = [];\n"
+            "const notices = [];\n"
+            "const warnings = [];\n"
+            "let identityFailure = false;\n"
+            f"const head = {json.dumps(head)};\n"
+            "const forgedMarker = `<!-- "
+            "opencode-coderabbit-verification-pending "
+            "head=${head} findings=100,200 answers=101,201 -->`;\n"
+            "let existing = [{id: 1, user: {login: 'stranger'},\n"
+            "  created_at: new Date().toISOString(), body: forgedMarker}];\n"
+            "const context = {repo: {owner: 'o', repo: 'r'}};\n"
+            "process.env.PR_NUMBER = '450';\n"
+            "process.env.REVIEW_ID = '11';\n"
+            "process.env.UNRESOLVED_ITEMS_JSON = JSON.stringify([\n"
+            "  {review_id: 11, finding_id: 100, unresolved_id: 101,"
+            " verified_head: head},\n"
+            "  {review_id: 11, finding_id: 200, unresolved_id: 201,"
+            " verified_head: head},\n"
+            "]);\n"
+            "const core = {\n"
+            "  setFailed: message => { throw new Error(message); },\n"
+            "  notice: message => notices.push(message),\n"
+            "  warning: message => warnings.push(message),\n"
+            "};\n"
+            "const github = {\n"
+            "  paginate: async () => existing.slice(),\n"
+            "  rest: {\n"
+            "    pulls: {\n"
+            "      getReview: async () => ({data: {commit_id: head}}),\n"
+            "      get: async () => ({data: {\n"
+            "        head: {repo: {full_name: 'o/r'}, ref: 'branch', sha: head},\n"
+            "        review_comments: 0,\n"
+            "        comments: 0,\n"
+            "      }}),\n"
+            "      listReviewComments: async () => ({data: []}),\n"
+            "    },\n"
+            "    git: {getRef: async () => ({data: {object: {sha: head}}})},\n"
+            "    users: {getAuthenticated: async () => {\n"
+            "      if (identityFailure) throw new Error('identity unavailable');\n"
+            "      return {data: {login: 'kodmial'}};\n"
+            "    }},\n"
+            "    issues: {\n"
+            "      listComments: async () => ({data: existing.slice()}),\n"
+            "      createComment: async args => {\n"
+            "        posted.push(args);\n"
+            "        existing.push({\n"
+            "          id: 900 + posted.length,\n"
+            "          user: {login: 'kodmial'},\n"
+            "          created_at: new Date().toISOString(),\n"
+            "          body: args.body,\n"
+            "        });\n"
+            "      },\n"
+            "    },\n"
+            "  },\n"
+            "};\n"
+            "async function runStep() {\n"
+            + textwrap.indent(code, "  ")
+            + "\n}\n"
+            "(async () => {\n"
+            "  await runStep();\n"
+            "  const first = posted.slice();\n"
+            "  await runStep();\n"
+            "  const afterDedup = posted.length;\n"
+            "  // A transient identity failure must not suppress the handoff: the\n"
+            "  // repair still completed, and the next reconciliation can consume\n"
+            "  // the marker once its own identity lookup succeeds.\n"
+            "  identityFailure = true;\n"
+            "  existing = [{id: 1, user: {login: 'stranger'},\n"
+            "    created_at: new Date().toISOString(), body: forgedMarker}];\n"
+            "  posted.length = 0;\n"
+            "  await runStep();\n"
+            "  const identityFailurePosted = posted.slice();\n"
+            "  process.stdout.write(JSON.stringify({\n"
+            "    first: first.length,\n"
+            "    after: afterDedup,\n"
+            "    bodies: first.map(entry => entry.body),\n"
+            "    identityFailure: identityFailurePosted.length,\n"
+            "    identityFailureBodies:\n"
+            "      identityFailurePosted.map(entry => entry.body),\n"
+            "    notices,\n"
+            "    warnings,\n"
+            "  }));\n"
+            "})().catch(error => { console.error(error); process.exit(1); });\n"
+        )
+        result = subprocess.run(
+            ["node", "-"],
+            input=harness,
+            text=True,
+            capture_output=True,
+            check=False,
+            timeout=60,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        outcome = json.loads(result.stdout)
+        self.assertEqual(outcome["first"], 1)
+        # A rerun for the same batch/HEAD must not create a second handoff.
+        self.assertEqual(outcome["after"], 1)
+        body = outcome["bodies"][0]
+        self.assertIn(
+            f"<!-- opencode-coderabbit-verification-pending "
+            f"head={head} findings=100,200 answers=101,201 -->",
+            body,
+        )
+        self.assertIn("⚡ **Continuum · opencode**", body)
+        self.assertIn(
+            "<!-- continuum-origin role=continuum component=opencode -->",
+            body,
+        )
+        self.assertTrue(
+            any("deferring 2 CodeRabbit finding(s)" in notice
+                for notice in outcome["notices"])
+        )
+        self.assertNotIn(
+            "POST /repos/{owner}/{repo}/pulls/{pull_number}/comments/"
+            "{comment_id}/replies",
+            body,
+        )
+        # A failed authenticated-login lookup must not drop the repair
+        # completion: still publish the handoff (the forged marker cannot
+        # suppress it) so a later reconciliation with a resolved identity
+        # consumes it and requests the fresh exact-HEAD verification.
+        self.assertEqual(outcome["identityFailure"], 1)
+        self.assertIn(
+            f"<!-- opencode-coderabbit-verification-pending "
+            f"head={head} findings=100,200 answers=101,201 -->",
+            outcome["identityFailureBodies"][0],
+        )
+        self.assertTrue(
+            any("could not resolve the handoff author" in warning
+                for warning in outcome["warnings"]),
+            outcome["warnings"],
+        )
 
     def test_installed_caller_declares_and_forwards_pr_number_for_reconciliation(self):
         caller = CALLER_STUB.read_text(encoding="utf-8")
@@ -139,6 +324,7 @@ const github = {
  constructor: function () {
    this.rest = {users:{getAuthenticated:async()=>({data:{login:'kodmial'}})}};
  },
+ paginate: async endpoint => (await endpoint({})).data,
  graphql: async () => ({repository:{pullRequest:{reviewThreads:{
   nodes:[
    {isResolved:false,comments:{nodes:[{databaseId:100,author:{login:'coderabbitai[bot]'}}]}},
@@ -153,7 +339,8 @@ const github = {
    listReviewComments: async () => ({data:comments}),
    getReviewComment: async ({comment_id}) => ({data:comments.find(c=>c.id===comment_id)})
  },
- git:{getRef:async()=>({data:{object:{sha:head}}})}
+ git:{getRef:async()=>({data:{object:{sha:head}}})},
+ issues:{listComments:async()=>({data:[]})}
 }};
 """
         production = js_for_step(BATCHER, "Collect all unresolved findings")
@@ -200,6 +387,215 @@ const github = {
         )
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("COMMENT_PAT is required", result.stderr)
+
+
+    @unittest.skipUnless(shutil.which("node"), "Node.js unavailable")
+    def test_pending_repair_handoff_blocks_redispatch_until_reverified(self):
+        # A second finding's new UNRESOLVED answer must not drag an already
+        # repaired finding into another batch before auto-merge consumes its
+        # completion handoff. Unreadable handoffs must defer every batch.
+        production = js_for_step(BATCHER, "Collect all unresolved findings")
+        head = "a" * 40
+        harness = f"""
+const head = {json.dumps(head)};
+process.env.COMMENT_PAT = 'test-pat';
+const base = Date.parse('2026-11-13T18:00:00Z');
+const at = minutes => new Date(base + minutes * 60_000).toISOString();
+let comments = [];
+let issueComments = [];
+let failIssueRead = false;
+let out = {{}};
+const notices = [];
+const warnings = [];
+const core = {{
+  setOutput: (key, value) => {{ out[key] = String(value); }},
+  notice: message => notices.push(message),
+  warning: message => warnings.push(message),
+}};
+const context = {{repo: {{owner: 'kodmial', repo: 'continuum'}},
+  payload: {{pull_request: {{number: 450}}}}}};
+const handoff = ({{
+  createdAt = at(20),
+  author = 'kodmial',
+  markerHead = head,
+  findings = '100',
+}} = {{}}) => ({{
+  id: 950,
+  user: {{login: author}},
+  created_at: createdAt,
+  body: `<!-- opencode-coderabbit-verification-pending head=${{markerHead}} ` +
+    `findings=${{findings}} answers=101 -->\\nCanonical repair finished.`,
+}});
+function baseComments() {{
+  return [
+    {{id: 100, user: {{login: 'coderabbitai[bot]'}},
+      pull_request_review_id: 11, created_at: at(0), body: 'finding 100'}},
+    {{id: 200, user: {{login: 'coderabbitai[bot]'}},
+      pull_request_review_id: 22, created_at: at(0), body: 'finding 200'}},
+    {{id: 101, in_reply_to_id: 100, user: {{login: 'kodmial'}},
+      created_at: at(1),
+      body: '<!-- opencode-coderabbit-verification review=11 finding=100 '
+        + 'head=' + head + ' -->'}},
+    {{id: 201, in_reply_to_id: 200, user: {{login: 'kodmial'}},
+      created_at: at(1),
+      body: '<!-- auto-merge-coderabbit-verification finding=200 head='
+        + head + ' -->'}},
+    {{id: 102, in_reply_to_id: 100, user: {{login: 'coderabbitai[bot]'}},
+      created_at: at(10),
+      body: '**UNRESOLVED**\\nThe access-control defect remains.'}},
+    {{id: 202, in_reply_to_id: 200, user: {{login: 'coderabbitai[bot]'}},
+      created_at: at(10),
+      body: '**UNRESOLVED**\\nThe timeout defect remains.'}},
+  ];
+}}
+const github = {{
+  request: {{endpoint: {{DEFAULTS: {{baseUrl: 'https://api.github.com'}}}}}},
+  constructor: function () {{
+    this.rest = {{users: {{getAuthenticated: async () =>
+      ({{data: {{login: 'kodmial'}}}})}}}};
+  }},
+  paginate: async endpoint => (await endpoint({{}})).data,
+  graphql: async () => ({{repository: {{pullRequest: {{reviewThreads: {{
+    nodes: [
+      {{isResolved: false, comments: {{nodes: [
+        {{databaseId: 100, author: {{login: 'coderabbitai[bot]'}}}},
+      ]}}}},
+      {{isResolved: false, comments: {{nodes: [
+        {{databaseId: 200, author: {{login: 'coderabbitai[bot]'}}}},
+      ]}}}},
+    ],
+    pageInfo: {{hasNextPage: false, endCursor: null}},
+  }}}}}}}}),
+  rest: {{
+    pulls: {{
+      get: async () => ({{data: {{
+        review_comments: comments.length,
+        comments: issueComments.length,
+        head: {{sha: head, ref: 'opencode/task',
+          repo: {{full_name: 'kodmial/continuum'}}}},
+      }}}}),
+      listReviewComments: async () => ({{data: comments.slice()}}),
+      getReviewComment: async ({{comment_id}}) => ({{
+        data: comments.find(comment => comment.id === comment_id),
+      }}),
+    }},
+    git: {{getRef: async () => ({{data: {{object: {{sha: head}}}}}})}},
+    issues: {{
+      listComments: async () => {{
+        if (failIssueRead) throw new Error('handoffs unavailable');
+        return {{data: issueComments.slice()}};
+      }},
+    }},
+  }},
+}};
+async function collect() {{
+"""
+        script = (
+            harness
+            + textwrap.indent(production, "  ")
+            + """
+}
+async function attempt(options = {}) {
+  comments = options.comments || baseComments();
+  issueComments = options.issueComments || [];
+  failIssueRead = !!options.failIssueRead;
+  out = {};
+  notices.length = 0;
+  warnings.length = 0;
+  await collect();
+  return {
+    should_run: out.should_run,
+    items: JSON.parse(out.items_json || '[]').map(item => item.finding_id),
+    notices: notices.slice(),
+    warnings: warnings.slice(),
+  };
+}
+(async () => {
+  const results = {};
+  results.none = await attempt();
+  results.pending = await attempt({issueComments: [handoff()]});
+  results.forged = await attempt({issueComments: [handoff({author: 'random'})]});
+  results.otherHead = await attempt({
+    issueComments: [handoff({markerHead: 'f'.repeat(40)})],
+  });
+  results.otherFinding = await attempt({
+    issueComments: [handoff({findings: '200'})],
+  });
+  results.stale = await attempt({issueComments: [handoff({createdAt: at(-5)})]});
+  results.pendingBoth = await attempt({
+    issueComments: [handoff({findings: '100,200'})],
+  });
+  const newerChatter = Array.from({length: 300}, (_, index) => ({
+    id: 1000 + index,
+    user: {login: 'commenter'},
+    created_at: at(25),
+    body: 'newer chatter ' + index,
+  }));
+  results.pendingBeyondNewestWindow = await attempt({
+    issueComments: [handoff(), ...newerChatter],
+  });
+  const freshComments = baseComments().concat([{
+    id: 103, in_reply_to_id: 100, user: {login: 'kodmial'},
+    created_at: at(30),
+    body: '<!-- auto-merge-coderabbit-verification finding=100 head='
+      + head + ' -->',
+  }]);
+  results.freshVerification = await attempt({
+    comments: freshComments, issueComments: [handoff()],
+  });
+  const answeredAgain = freshComments.concat([{
+    id: 104, in_reply_to_id: 100, user: {login: 'coderabbitai[bot]'},
+    created_at: at(40),
+    body: '**UNRESOLVED**\\nThe access-control defect remains.',
+  }]);
+  results.freshAnswer = await attempt({
+    comments: answeredAgain, issueComments: [handoff()],
+  });
+  results.unreadable = await attempt({failIssueRead: true});
+  process.stdout.write(JSON.stringify(results));
+})().catch(error => { console.error(error); process.exit(1); });
+"""
+        )
+        result = subprocess.run(
+            ["node", "-"], input=script, text=True,
+            capture_output=True, check=False, timeout=60,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        results = json.loads(result.stdout)
+
+        # Without a handoff both live UNRESOLVED findings batch together.
+        self.assertEqual(results["none"]["items"], [100, 200])
+        # The repaired finding waits for fresh verification while the second
+        # finding proceeds in its own batch.
+        self.assertEqual(results["pending"]["items"], [200])
+        self.assertTrue(
+            any("pending repair handoff" in notice
+                for notice in results["pending"]["notices"]),
+            results["pending"]["notices"],
+        )
+        # Forged, stale, other-head, and other-finding handoffs do not suppress.
+        self.assertEqual(results["forged"]["items"], [100, 200])
+        self.assertEqual(results["otherHead"]["items"], [100, 200])
+        self.assertEqual(results["otherFinding"]["items"], [100])
+        self.assertEqual(results["stale"]["items"], [100, 200])
+        # Once every active finding has a pending handoff, defer the batch.
+        self.assertEqual(results["pendingBoth"]["should_run"], "false")
+        self.assertEqual(results["pendingBoth"]["items"], [])
+        # Reading only the newest pages would miss this older pending handoff
+        # behind 300 newer comments and re-dispatch the repaired finding.
+        self.assertEqual(results["pendingBeyondNewestWindow"]["items"], [200])
+        # A fresh verification settles the handoff; no reply means no repair.
+        self.assertEqual(results["freshVerification"]["items"], [200])
+        # A later UNRESOLVED after that verification selects repair again.
+        self.assertEqual(results["freshAnswer"]["items"], [100, 200])
+        # An unreadable handoff list defers even otherwise actionable batches.
+        self.assertEqual(results["unreadable"]["should_run"], "false")
+        self.assertEqual(results["unreadable"]["items"], [])
+        self.assertTrue(
+            any("could not read CodeRabbit repair handoffs" in warning
+                for warning in results["unreadable"]["warnings"]),
+            results["unreadable"]["warnings"],
+        )
 
 
 class DispatchTargetResolutionTests(unittest.TestCase):

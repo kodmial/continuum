@@ -146,14 +146,18 @@ APPROVED_433_OPENCODE_SHA256 = (
 # all five guarded executor paths; unrelated workflow drift remains forbidden.
 # #442 (main 7e4da5d) deliberately extends this exact protected workflow with
 # an issue-checkpoint identity check and isolated original-base verification.
+# #450 (main 25273b4) additionally caps post-repair inline CodeRabbit
+# verification at one request per OpenCode run; the serialized auto-merge owner
+# handles the remaining exact-HEAD findings after its shared chat-quota wait.
 # The PR #448 repair additionally retries and confirms publication of the
 # deterministic checkpoint-resume hold marker instead of swallowing a failed
 # write, and main 25273b42's one-inline-request guard is part of the same
 # reviewed artifact; this is the actual full-workflow digest, not an exclusion.
 # This pin records the pre-merge artifact for audit; the active #448 pin below
-# covers the merged bytes. Tests below and test_comment_attribution
-# independently enforce the recovery contract and its diagnostic provenance;
-# do not replace this pin with an allowlist or ignore workflow differences.
+# covers the merged #448-repair + #450 bytes. Tests below and
+# test_comment_attribution independently enforce the recovery contract and its
+# diagnostic provenance; do not replace this pin with an allowlist or ignore
+# workflow differences.
 APPROVED_PROVIDER_RECOVERY_OPENCODE_SHA256 = (
     "a35ebb39e4410be9b7709bf856470c352acd01efffc076cb4a0a5e776c1ee210"
 )
@@ -202,6 +206,39 @@ APPROVED_448_OPENCODE_SHA256 = (
 # this reviewed change still fails closed.
 APPROVED_448_REPAIR_OPENCODE_SHA256 = (
     "886bc666915623c2e3caabfb482586aedbd23b479756175c2a0f235e617fe942"
+)
+# kodmial/continuum#450: intentional provider-chat ownership change.
+# OpenCode no longer sends inline verification POSTs after repairs; the
+# serialized auto-merge owner rechecks exact HEAD after successful CI and
+# enforces one shared chat quota. Historical #448 repair digest above remains
+# immutable for audit. Pin the complete new workflow, not an exception list.
+# kodmial/continuum#451 repair (review 5895998761): a repaired batch also
+# publishes a durable verification-pending handoff outside the review thread
+# so an unchanged HEAD still reaches CodeRabbit verification instead of
+# another repair batch. Deduplication trusts only the PAT owner and
+# github-actions[bot], matching the authors auto-merge accepts, so a forged
+# marker from another commenter cannot suppress the real handoff.
+# kodmial/continuum#451 repair (review 5898694060): live batch admission now
+# reuses the canonical chat-quota classifier, so a newer CodeRabbit
+# "Rate Limit Exceeded" reply cannot supersede the admitted finding answer.
+# Baseline advance after merging main: main's reviewed 145f6d3 ("reuse
+# noninteractive OpenCode websearch defaults in consumer coding runners")
+# adds exactly the 29-line opencode.json sparse-checkout plus
+# OPENCODE_CONFIG merge block below and nothing else, so the #450 full-file
+# pin moves to the merged artifact instead of rejecting a legitimate main
+# change. The pin stays a full-file digest; any further byte drift still
+# fails closed, and the websearch block is asserted separately.
+# kodmial/continuum#451 repair (review 5899393557): the full-review quota
+# classifier now normalizes fenced examples and blockquotes before parsing, so
+# a trusted UNRESOLVED answer that quotes provider quota wording stays a
+# verdict instead of being discarded as a retry.
+# kodmial/continuum#451 repair (review 5900018093): the shared chat-quota block
+# strips recognized Markdown emphasis before validating the full-review
+# countdown separator, so "**13 minutes**" keeps its exact window instead of
+# falling back to 65 minutes. The workflow-local retry parsers carry the same
+# normalization.
+APPROVED_450_SERIALIZED_OPENCODE_SHA256 = (
+    "236978024396822de9ee242f532aef9b4e10c81b1d1a46f548f5b2ceb441f38a"
 )
 APPROVED_446_CALLER_SHA256 = (
     "b7f3df118bc436526f48443b8f068372204073eb134c98e4a1543d025f314686"
@@ -2624,12 +2661,12 @@ class ProtectedBaselineTests(unittest.TestCase):
                     self.assertIn("CONTINUUM_OPENCODE_PUBLISH_RACE_RETRY_REQUIRED", original)
                     self.assertIn("steps.model_route.outputs.model", original)
                 if path == ".github/workflows/continuum-opencode.yml":
-                    # #433 advances the protected artifact only for the
-                    # explicitly tested optional-attestation no-key branch.
+                    # #450 deliberately changes chat-ownership behavior,
+                    # with a full-file digest and executable regression tests.
                     self.assertEqual(
                         protected_file_digest(path),
-                        APPROVED_448_REPAIR_OPENCODE_SHA256,
-                        f"{path}: unexpected drift outside reviewed wording cleanup",
+                        APPROVED_450_SERIALIZED_OPENCODE_SHA256,
+                        f"{path}: unexpected drift outside #450 serialized CodeRabbit chat owner",
                     )
                 else:
                     # The self-dogfood caller is the dispatchable surface
@@ -2647,6 +2684,21 @@ class ProtectedBaselineTests(unittest.TestCase):
                                   "migration must retain 429 stop-the-runner protection")
                     self.assertIn("Check issue Definition of Ready", read_repo(path),
                                   "migration must preserve task-admission gate")
+                    self.assertNotIn(
+                        "'POST /repos/{owner}/{repo}/pulls/{pull_number}/comments/{comment_id}/replies'",
+                        read_repo(path),
+                        "OpenCode must not bypass the serialized CodeRabbit chat owner",
+                    )
+                    self.assertIn(
+                        "to serialized auto-merge after exact-HEAD CI.",
+                        read_repo(path),
+                        "the removed inline chat paths must delegate to auto-merge",
+                    )
+                    self.assertIn(
+                        "opencode-coder-websearch.json",
+                        read_repo(path),
+                        "merged main 145f6d3 websearch defaults must stay in the pinned artifact",
+                    )
 
         # The installed consumer caller stub is a separate protected artifact:
         # pin it explicitly so its recovery run-name/dispatch contract cannot
@@ -2699,7 +2751,7 @@ class ProtectedBaselineTests(unittest.TestCase):
         # therefore be dirty in this pre-commit worktree; any unapproved byte
         # change still fails the exact digest assertions above.
         approved = {
-            ".github/workflows/continuum-opencode.yml": APPROVED_448_REPAIR_OPENCODE_SHA256,
+            ".github/workflows/continuum-opencode.yml": APPROVED_450_SERIALIZED_OPENCODE_SHA256,
             ".github/workflows/opencode.yml": APPROVED_350_SELF_CALLER_SHA256,
         }
         for path in PROTECTED_FILES:

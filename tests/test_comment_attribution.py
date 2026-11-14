@@ -83,7 +83,7 @@ MUTATION_COUNTS = {
     "continuum-issue-scheduler.yml": 11,
     "continuum-opencode-repair.yml": 2,
     "continuum-opencode-watchdog.yml": 4,
-    "continuum-opencode.yml": 14,  # #446 dispatched-receipt + #442 checkpoint-resume diagnostic
+    "continuum-opencode.yml": 13,  # #450 moved two inline CodeRabbit replies into serialized auto-merge; #451 adds the repair-completion handoff
     "continuum-pr-agent-auto-merge.yml": 1,
     "continuum-pr-agent-canary.yml": 4,
     "continuum-pr-agent-recovery.yml": 4,
@@ -198,8 +198,7 @@ FUNCTIONAL_ANCHORS = {
     "continuum-opencode.yml": (
         "Continuum classified this CodeRabbit",
         "@coderabbitai full review",
-        "Re-check this exact original finding after the OpenCode fixes.",
-        "Re-check this exact original finding after the batched OpenCode repair.",
+        "opencode-coderabbit-verification-pending",
         "Automation produced no code changes",
         "Qualification attempted product changes",
         "produced no trusted pass/fail evidence",
@@ -751,6 +750,32 @@ class WorkflowAttributionTests(unittest.TestCase):
                     "a new call means a new comment path that must be classified, "
                     "and attribution must never add a call",
                 )
+
+    def test_removed_opencode_chat_mutations_keep_attributed_single_owner(self):
+        # #450 deliberately removes two formerly attributed inline POST
+        # paths from OpenCode. That does not remove provider verification:
+        # the serialized auto-merge workflow owns the same action, with
+        # its established visible header and provenance marker.
+        agent = read_workflow("continuum-opencode.yml")
+        merger = read_workflow("continuum-auto-merge.yml")
+        request_path = (
+            "POST /repos/{owner}/{repo}/pulls/{pull_number}/comments/"
+            "{comment_id}/replies"
+        )
+        self.assertEqual(agent.count(request_path), 0)
+        self.assertIn("to serialized auto-merge after exact-HEAD CI.", agent)
+        self.assertIn("requestCodeRabbitThreadVerification(", merger)
+        self.assertEqual(merger.count("'"+request_path+"'"), 2)
+        for anchor in (
+            "Re-check this unresolved original finding",
+            "Re-check this exact finding now that the current HEAD passed CI",
+        ):
+            self.assertIn(anchor, merger)
+        self.assertIn(
+            "<!-- continuum-origin role=continuum component=auto-merge -->",
+            merger,
+        )
+        self.assertIn("⚡ **Continuum · auto-merge**", merger)
 
     def test_every_mutation_site_uses_the_contract(self):
         for name, identities in sorted(EXPECTED_IDENTITIES.items()):
