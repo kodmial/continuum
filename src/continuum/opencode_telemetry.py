@@ -206,8 +206,16 @@ def _as_int(value: Any) -> Optional[int]:
         return value
     if isinstance(value, float) and math.isfinite(value) and value.is_integer():
         return int(value)
-    if isinstance(value, str) and value.strip().lstrip("-").isdigit():
-        return int(value.strip())
+    if isinstance(value, str):
+        text = value.strip()
+        if text.lstrip("-").isdigit():
+            try:
+                return int(text)
+            except ValueError:
+                # Malformed numeric strings such as "--1" pass the digit
+                # pre-check but are not integers; treat them as unknown rather
+                # than aborting telemetry generation.
+                return None
     return None
 
 
@@ -285,7 +293,13 @@ def _extract_usage(
 ) -> Tuple[Dict[str, Optional[int]], Optional[float], bool]:
     tokens = part.get("tokens")
     if not isinstance(tokens, Mapping):
-        return {field: None for field in _TOKEN_FIELDS}, None, False
+        # A step may report cost without any token counters; keep the cost so
+        # cost-known steps are counted even when token fields stay unknown.
+        return (
+            {field: None for field in _TOKEN_FIELDS},
+            _as_number(part.get("cost")),
+            False,
+        )
     values: Dict[str, Optional[int]] = {}
     for field, keys in _TOKEN_KEYS.items():
         values[field] = _as_int(tokens.get(keys[0]))
@@ -692,6 +706,12 @@ def summarize_event_stream(
     else:
         classification_match = "unknown"
 
+    # Per-event counters are only authoritative when the JSON event stream was
+    # actually consumed. ``github run`` has no JSON mode, so its provider
+    # evidence comes from the CLI diagnostics and its event-derived counts are
+    # unknown rather than zero.
+    event_stream_observed = mode == "run" and source_readable
+
     missing_fields = []
     partial_fields = []
     for field in _TOKEN_FIELDS:
@@ -735,11 +755,24 @@ def summarize_event_stream(
         for name, count in sorted(name_counts.items())[:MAX_TOOL_NAMES]
     ]
 
+    provider_classification = _strongest_provider_classification(provider_classes)
+    if provider_classification == "none" and not event_stream_observed:
+        # The diagnostics classifier is the only provider evidence available
+        # for ``github run``; do not report "none" for a classified failure.
+        if selected_classification in _PROVIDER_CLASSIFICATION_ORDER:
+            provider_classification = selected_classification
+
     provider_error = {
-        "classification": _strongest_provider_classification(provider_classes),
-        "typed_provider_error_events": len(provider_classes),
-        "non_provider_error_events": non_provider_errors,
-        "terminal_error_events": terminal_error_events,
+        "classification": provider_classification,
+        "typed_provider_error_events": (
+            len(provider_classes) if event_stream_observed else UNKNOWN
+        ),
+        "non_provider_error_events": (
+            non_provider_errors if event_stream_observed else UNKNOWN
+        ),
+        "terminal_error_events": (
+            terminal_error_events if event_stream_observed else UNKNOWN
+        ),
         "kind": last_typed_kind if last_typed_kind else UNKNOWN,
         "http_status": last_typed_status if last_typed_status is not None else UNKNOWN,
         "first_provider_429_at": _iso_timestamp(first_provider_429_at),

@@ -68,6 +68,45 @@ write_telemetry() {
   return 0
 }
 
+# An interrupted attempt must still leave exactly one telemetry record, because
+# #454 compares provider-429 attempts including the ones that were cancelled.
+# The handlers are installed only after the telemetry mode and log paths exist,
+# and the normal completion paths clear them first so a finished attempt keeps
+# its existing classification and never writes a second record.
+telemetry_mode=""
+telemetry_log=""
+telemetry_diagnostics=""
+telemetry_live_pid=""
+
+# Invoked indirectly by the TERM/INT/HUP traps below, which shellcheck cannot
+# follow through the quoted trap actions.
+# shellcheck disable=SC2329
+record_interruption() {
+  local signal="$1" signal_status="$2"
+  trap - TERM INT HUP
+  if [[ -n "$telemetry_mode" && -n "$telemetry_log" ]]; then
+    echo "::warning::OpenCode attempt interrupted by SIG${signal}; recording an inconclusive telemetry record." >&2
+    write_telemetry "$telemetry_mode" "$telemetry_log" "$signal_status" "inconclusive" "$telemetry_diagnostics"
+  fi
+  if [[ -n "$telemetry_live_pid" ]]; then
+    kill "$telemetry_live_pid" 2>/dev/null || true
+    wait "$telemetry_live_pid" 2>/dev/null || true
+  fi
+  if [[ -n "$telemetry_log" ]]; then rm -f "$telemetry_log"; fi
+  if [[ -n "$telemetry_diagnostics" ]]; then rm -f "$telemetry_diagnostics"; fi
+  exit "$signal_status"
+}
+
+install_signal_handlers() {
+  trap 'record_interruption TERM 143' TERM
+  trap 'record_interruption INT 130' INT
+  trap 'record_interruption HUP 129' HUP
+}
+
+clear_signal_handlers() {
+  trap - TERM INT HUP
+}
+
 fail_provider() {
   local classification="$1" status="$2"
   write_classification "$classification"
@@ -116,6 +155,10 @@ if [[ "$command" == "run" ]]; then
   fi
 
   log="$(mktemp "$runner_temp/continuum-opencode-run.XXXXXX")"
+  telemetry_mode="run"
+  telemetry_log="$log"
+  telemetry_diagnostics=""
+  install_signal_handlers
   # Live status contains only safe JSON event metadata, never source or prompts.
   # The shared workflow already copies src/continuum into this wrapper's root.
   # Reuse the existing job credential without changing protected workflow YAML.
@@ -126,6 +169,7 @@ if [[ "$command" == "run" ]]; then
   if [[ -f "$live_script" && -n "$live_token" && -n "$live_issue" ]]; then
     CONTINUUM_LIVE_LOG_TOKEN="$live_token" CONTINUUM_LIVE_LOG_ISSUE="$live_issue" python3 "$live_script" watch --log "$log" >/dev/null 2>&1 &
     live_pid=$!
+    telemetry_live_pid="$live_pid"
   fi
   set +e
   env -u CONTINUUM_LIVE_LOG_TOKEN -u CONTINUUM_LIVE_LOG_ISSUE opencode "${args[@]}" 2>&1 | python3 "$classifier" render --log "$log"
@@ -136,9 +180,11 @@ if [[ "$command" == "run" ]]; then
   if [[ -n "$live_pid" ]]; then
     kill "$live_pid" 2>/dev/null || true
     wait "$live_pid" 2>/dev/null || true
+    telemetry_live_pid=""
     CONTINUUM_LIVE_LOG_TOKEN="$live_token" CONTINUUM_LIVE_LOG_ISSUE="$live_issue" python3 "$live_script" once --log "$log" --state finished >/dev/null 2>&1 || true
   fi
   if [[ "$render_status" -ne 0 ]]; then
+    clear_signal_handlers
     write_telemetry "run" "$log" "$status" "inconclusive"
     rm -f "$log"
     echo "::error::OpenCode event rendering failed; refusing to infer provider health." >&2
@@ -149,11 +195,13 @@ if [[ "$command" == "run" ]]; then
   classifier_status=$?
   set -e
   if [[ "$classifier_status" -ne 0 ]]; then
+    clear_signal_handlers
     write_telemetry "run" "$log" "$status" "inconclusive"
     rm -f "$log"
     echo "::error::OpenCode event classification failed; refusing to infer provider health." >&2
     exit "$classifier_status"
   fi
+  clear_signal_handlers
   write_telemetry "run" "$log" "$status" "$classification"
   rm -f "$log"
   write_classification "$classification"
@@ -176,6 +224,10 @@ if [[ "$command" == "github" && "${2:-}" == "run" ]]; then
   # stdout carries the agent response, stderr carries runtime diagnostics.
   stdout_log="$(mktemp "$runner_temp/continuum-opencode-github-out.XXXXXX")"
   stderr_log="$(mktemp "$runner_temp/continuum-opencode-github-err.XXXXXX")"
+  telemetry_mode="github"
+  telemetry_log="$stdout_log"
+  telemetry_diagnostics="$stderr_log"
+  install_signal_handlers
   set +e
   opencode "$@" > >(tee "$stdout_log") 2> >(tee "$stderr_log" >&2)
   status=$?
@@ -186,11 +238,13 @@ if [[ "$command" == "github" && "${2:-}" == "run" ]]; then
   classifier_status=$?
   set -e
   if [[ "$classifier_status" -ne 0 ]]; then
+    clear_signal_handlers
     write_telemetry "github" "$stdout_log" "$status" "inconclusive" "$stderr_log"
     rm -f "$stdout_log" "$stderr_log"
     echo "::error::OpenCode diagnostics classification failed; refusing to infer provider health." >&2
     exit "$classifier_status"
   fi
+  clear_signal_handlers
   write_telemetry "github" "$stdout_log" "$status" "$classification" "$stderr_log"
   rm -f "$stdout_log" "$stderr_log"
   write_classification "$classification"

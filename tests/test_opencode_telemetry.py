@@ -241,6 +241,65 @@ class TelemetryAggregationTests(unittest.TestCase):
         )
         self.assertEqual(usage["partial_fields"], [])
 
+    def test_cost_without_tokens_stays_known_and_tokens_stay_unknown(self):
+        lines = [
+            finish(BASE_TS, message="msg_cost", cost=0.02),
+            finish(
+                BASE_TS + 10,
+                message="msg_full",
+                tokens={"input": 5, "output": 2},
+                cost=0.01,
+            ),
+        ]
+
+        summary = summarize(lines)
+        usage = summary["usage"]
+        steps = summary["steps"]["items"]
+
+        self.assertEqual(usage["steps"], 2)
+        self.assertEqual(usage["steps_with_usage"], 1)
+        self.assertEqual(usage["steps_without_usage"], 1)
+        self.assertAlmostEqual(usage["cost"], 0.03)
+        self.assertEqual(usage["cost_known_steps"], 2)
+        self.assertTrue(usage["cost_complete"])
+        self.assertEqual(usage["input_tokens"], 5)
+        # The cost-only step never invents token counts.
+        self.assertEqual(steps[0]["cost"], 0.02)
+        self.assertEqual(steps[0]["input_tokens"], UNKNOWN)
+        self.assertEqual(steps[0]["cache_write_tokens"], UNKNOWN)
+        self.assertFalse(steps[0]["usage_present"])
+
+    def test_malformed_numeric_strings_are_unknown_instead_of_fatal(self):
+        malformed = {
+            "input": "--1",
+            "output": "1e3",
+            "reasoning": 2.5,
+            "cache": {"read": "--2", "write": None},
+        }
+        lines = [
+            event("step_start", "--1", part={"messageID": "msg_a"}),
+            finish(BASE_TS, message="msg_a", tokens=malformed, cost="--3"),
+            event("retry", BASE_TS + 10, attempt="--4"),
+        ]
+
+        summary = summarize(lines, exit_code=1)
+        usage = summary["usage"]
+        step = summary["steps"]["items"][0]
+
+        self.assertEqual(usage["input_tokens"], UNKNOWN)
+        self.assertEqual(usage["output_tokens"], UNKNOWN)
+        self.assertEqual(usage["reasoning_tokens"], UNKNOWN)
+        self.assertEqual(usage["cache_read_tokens"], UNKNOWN)
+        self.assertEqual(usage["cache_write_tokens"], UNKNOWN)
+        self.assertEqual(usage["cost"], UNKNOWN)
+        self.assertEqual(usage["cost_known_steps"], 0)
+        self.assertEqual(step["input_tokens"], UNKNOWN)
+        self.assertEqual(step["cost"], UNKNOWN)
+        # A malformed timestamp/attempt never aborts aggregation either.
+        self.assertEqual(step["started_at"], UNKNOWN)
+        self.assertEqual(summary["retries"]["max_attempt"], UNKNOWN)
+        self.assertEqual(summary["attempt"]["elapsed_ms"], 10)
+
     def test_multiple_sessions_and_step_elapsed_are_paired(self):
         lines = [
             start(BASE_TS, session="ses_a", message="msg_a"),
@@ -582,7 +641,14 @@ class TelemetryClassificationTests(unittest.TestCase):
         self.assertEqual(summary["events"]["json_events"], 0)
         self.assertEqual(summary["usage"]["steps"], 0)
         self.assertEqual(summary["sessions"]["count"], 0)
-        self.assertEqual(summary["provider_error"]["classification"], "none")
+        # Diagnostics remain provider evidence even though no JSON events exist;
+        # per-event counters are unavailable rather than zero.
+        provider = summary["provider_error"]
+        self.assertEqual(provider["classification"], "quota_429")
+        self.assertEqual(provider["typed_provider_error_events"], UNKNOWN)
+        self.assertEqual(provider["non_provider_error_events"], UNKNOWN)
+        self.assertEqual(provider["terminal_error_events"], UNKNOWN)
+        self.assertIn("provider=quota_429", format_human_summary(summary))
 
     def test_wrapper_authoritative_classification_parity_is_explicit(self):
         summary = summarize(
@@ -1060,6 +1126,21 @@ class TelemetryWorkflowContractTests(unittest.TestCase):
         self.assertIn("provider classification and exit status are unchanged", wrapper)
         self.assertIn("return 0", wrapper)
         self.assertIn("exit \"$status\"", wrapper)
+        # Interrupted attempts persist one inconclusive record and keep the
+        # signal exit status; every normal completion path clears the handlers
+        # first so a finished attempt never writes a second record.
+        self.assertIn("trap 'record_interruption TERM 143' TERM", wrapper)
+        self.assertIn("trap 'record_interruption INT 130' INT", wrapper)
+        self.assertIn("trap 'record_interruption HUP 129' HUP", wrapper)
+        self.assertIn(
+            'write_telemetry "$telemetry_mode" "$telemetry_log" "$signal_status" '
+            '"inconclusive" "$telemetry_diagnostics"',
+            wrapper,
+        )
+        self.assertEqual(run_branch.count("install_signal_handlers"), 1)
+        self.assertEqual(run_branch.count("clear_signal_handlers"), 3)
+        self.assertEqual(github_branch.count("install_signal_handlers"), 1)
+        self.assertEqual(github_branch.count("clear_signal_handlers"), 2)
 
     def test_both_agent_workflows_publish_durable_telemetry_artifact(self):
         for workflow in (OPENCODE_WORKFLOW, REPAIR_WORKFLOW):
