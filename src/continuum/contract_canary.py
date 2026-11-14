@@ -501,19 +501,230 @@ def _inline_link_tail_end(text: str, index: int) -> Optional[int]:
     return None
 
 
+def _reference_definition_end(text: str) -> Optional[int]:
+    """Return the end of a link reference definition starting at index zero.
+
+    A reference definition is block-level and renders nothing, including its
+    label, destination, and optional title. A malformed definition returns
+    ``None`` so its text stays visible rather than hiding a possible reference.
+    Titles may follow the destination on the next line and may span lines, but
+    never cross a blank line.
+    """
+    length = len(text)
+    if not text.startswith("["):
+        return None
+
+    cursor = 1
+    label_has_content = False
+    while cursor < length:
+        char = text[cursor]
+        if char == "\\" and cursor + 1 < length:
+            label_has_content = True
+            cursor += 2
+            continue
+        if char == "[":
+            return None
+        if char == "]":
+            break
+        if not char.isspace():
+            label_has_content = True
+        cursor += 1
+    else:
+        return None
+    if not label_has_content or cursor - 1 > 999:
+        return None
+
+    cursor += 1
+    while cursor < length and text[cursor] in " \t":
+        cursor += 1
+    if cursor >= length or text[cursor] != ":":
+        return None
+    cursor += 1
+    while cursor < length and text[cursor] in " \t":
+        cursor += 1
+    if cursor < length and text[cursor] == "\n":
+        cursor += 1
+        while cursor < length and text[cursor] in " \t":
+            cursor += 1
+        if cursor >= length or text[cursor] == "\n":
+            return None
+    if cursor >= length:
+        return None
+
+    if text[cursor] == "<":
+        cursor += 1
+        while cursor < length:
+            char = text[cursor]
+            if char == "\\" and cursor + 1 < length:
+                cursor += 2
+                continue
+            if char == ">":
+                cursor += 1
+                break
+            if char in "\n<":
+                return None
+            cursor += 1
+        else:
+            return None
+    else:
+        start = cursor
+        depth = 0
+        while cursor < length:
+            char = text[cursor]
+            if char == "\\" and cursor + 1 < length:
+                cursor += 2
+                continue
+            if char in " \t\n":
+                break
+            if char == "(":
+                depth += 1
+            elif char == ")":
+                if depth == 0:
+                    return None
+                depth -= 1
+            cursor += 1
+        if cursor == start or depth:
+            return None
+    destination_end = cursor
+
+    title_start = cursor
+    while title_start < length and text[title_start] in " \t":
+        title_start += 1
+    title_after_line_break = False
+    if title_start < length and text[title_start] == "\n":
+        look = title_start + 1
+        while look < length and text[look] in " \t":
+            look += 1
+        if look < length and text[look] in "\"'(":
+            title_start = look
+            title_after_line_break = True
+        else:
+            return destination_end
+    if title_start < length and text[title_start] in "\"'(":
+        opener = text[title_start]
+        closer = ")" if opener == "(" else opener
+        cursor = title_start + 1
+        while cursor < length:
+            char = text[cursor]
+            if char == "\\" and cursor + 1 < length:
+                cursor += 2
+                continue
+            if char == closer:
+                cursor += 1
+                if not title_after_line_break:
+                    rest = cursor
+                    while rest < length and text[rest] in " \t":
+                        rest += 1
+                    if rest < length and text[rest] != "\n":
+                        return None
+                return cursor
+            if char == "\n":
+                look = cursor + 1
+                while look < length and text[look] in " \t":
+                    look += 1
+                if look >= length or text[look] == "\n":
+                    return None
+            cursor += 1
+        return None
+    if title_start < length and text[title_start] != "\n":
+        return None
+    return destination_end
+
+
+def _container_line_content(
+    raw: str, containers: Sequence[Tuple[str, int]]
+) -> Optional[str]:
+    """Return a line's content after its active container markers."""
+    position = 0
+    for kind, column in containers:
+        if kind == "quote":
+            marker = _BLOCK_QUOTE_RE.match(raw, position)
+            if marker is None:
+                return None
+            position = marker.end()
+            continue
+        content = raw[position:]
+        if not content.strip():
+            position = len(raw)
+            continue
+        if _leading_columns(content) < column:
+            return None
+        position += column
+    return raw[position:]
+
+
+def _reference_definition_span(
+    text: str,
+    line_end: int,
+    cursor: int,
+    remainder: str,
+    containers: Sequence[Tuple[str, int]],
+    block_boundary: bool,
+) -> Optional[Tuple[int, int]]:
+    """Return absolute start and end offsets for a reference definition."""
+    extra_start = 0
+    extra_containers = []
+    while extra_start < len(remainder):
+        layout = _list_item_layout(remainder[extra_start:], block_boundary)
+        if layout is not None:
+            content_column, code_indent = layout
+            if code_indent is not None:
+                return None
+            extra_containers.append(("list", content_column))
+            extra_start += content_column
+        depth, stripped = _strip_block_quotes_from(remainder, extra_start)
+        if depth:
+            extra_containers.extend(("quote", 0) for _ in range(depth))
+            extra_start += len(remainder[extra_start:]) - len(stripped)
+            continue
+        break
+
+    first = remainder[extra_start:]
+    if not first.startswith("["):
+        return None
+    first_abs = line_end - len(remainder) + extra_start
+    all_containers = list(containers) + extra_containers
+    parts = [first]
+    starts = [first_abs]
+    while cursor < len(text):
+        next_end = text.find("\n", cursor)
+        if next_end == -1:
+            next_end = len(text)
+        raw = text[cursor:next_end]
+        content = _container_line_content(raw, all_containers)
+        if content is None or not content.strip():
+            break
+        parts.append(content)
+        starts.append(cursor + len(raw) - len(content))
+        cursor = next_end + 1 if next_end < len(text) else len(text)
+
+    logical = "\n".join(parts)
+    end = _reference_definition_end(logical)
+    if end is None:
+        return None
+    line_index = logical.count("\n", 0, end)
+    line_start = logical.rfind("\n", 0, end) + 1
+    if line_index >= len(starts):
+        return None
+    end_abs = starts[line_index] + (end - line_start)
+    if end_abs <= first_abs:
+        return None
+    return first_abs, end_abs
+
+
 def _visible_markdown(body: object) -> str:
     """Return the part of a PR body where GitHub acts on closing keywords.
 
     Closing phrases inside HTML comments, HTML ``<pre>`` and ``<code>``
     elements, fenced code blocks, indented code blocks, and inline code spans
     are examples, not operative references. A Markdown link's destination and
-    title are also inert, because GitHub renders only its label. Blanking those
-    spans with a non-whitespace sentinel keeps them from matching and prevents
-    adjacent visible text from joining into a new closing reference. GitHub
-    renders ``<pre>`` content as inert preformatted text and ``<code>`` content
-    as code, so a closing keyword there never closes the issue. An unclosed
-    block-level ``<pre>`` stays inert to the end of its block quote or list item
-    container.
+    title are also inert, because GitHub renders only its label. A reference
+    definition renders nothing at all. Blanking those spans with a
+    non-whitespace sentinel keeps them from matching and prevents adjacent
+    visible text from joining into a new closing reference. GitHub renders
+    ``<pre>`` content as inert preformatted text and ``<code>`` content as code,
+    so a closing keyword there never closes the issue. An unclosed block-level
+    ``<pre>`` stays inert to the end of its block quote or list item container.
 
     An indented line opens a code block only at a block boundary, because GFM
     renders a four-space or tab-indented line that directly follows a paragraph
@@ -688,6 +899,23 @@ def _visible_markdown(body: object) -> str:
                 block_boundary = True
                 line_blank = True
                 continue
+            if block_boundary or inner_boundary or layout is not None:
+                reference = _reference_definition_span(
+                    text,
+                    line_end,
+                    line_end + 1 if line_end < len(text) else len(text),
+                    remainder,
+                    containers,
+                    block_boundary or inner_boundary,
+                )
+                if reference is not None:
+                    _, end = reference
+                    visible.append(_blank_markdown(text[index:end]))
+                    index = end
+                    line_start = False
+                    block_boundary = True
+                    line_blank = True
+                    continue
         if text.startswith("<!--", index):
             close = text.find("-->", index + 4)
             end = len(text) if close == -1 else close + 3
