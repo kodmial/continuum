@@ -553,6 +553,57 @@ class CompletionEvidenceTest(unittest.TestCase):
         )
         self.assertIn("not attributed", problem)
 
+    def test_block_quote_indented_code_example_is_not_completion_evidence(self):
+        candidate = pr(body="> Example:\n>\n>     Closes #100\n")
+        candidate["headRefName"] = "feature/unrelated"
+        problem = canary.validate_completed_canary(
+            candidate, exact_head_runs(), 100
+        )
+        self.assertIn("not attributed", problem)
+
+    def test_block_quote_indented_code_continues_across_blank_lines(self):
+        candidate = pr(
+            body=(
+                "> Example:\n>\n"
+                ">     first line\n>\n"
+                ">     Closes #100\n"
+            )
+        )
+        candidate["headRefName"] = "feature/unrelated"
+        problem = canary.validate_completed_canary(
+            candidate, exact_head_runs(), 100
+        )
+        self.assertIn("not attributed", problem)
+
+    def test_nested_block_quote_indented_code_example_is_not_evidence(self):
+        candidate = pr(body="> > Example:\n> >\n> >     Closes #100\n")
+        candidate["headRefName"] = "feature/unrelated"
+        problem = canary.validate_completed_canary(
+            candidate, exact_head_runs(), 100
+        )
+        self.assertIn("not attributed", problem)
+
+    def test_block_quote_tab_indented_code_example_is_not_evidence(self):
+        candidate = pr(body="> Example:\n>\n>   \tCloses #100\n")
+        candidate["headRefName"] = "feature/unrelated"
+        problem = canary.validate_completed_canary(
+            candidate, exact_head_runs(), 100
+        )
+        self.assertIn("not attributed", problem)
+
+    def test_block_quote_prose_closing_reference_is_completion_evidence(self):
+        candidate = pr(body="> Closes #100\n")
+        candidate["headRefName"] = "feature/unrelated"
+        self.assertIsNone(
+            canary.validate_completed_canary(candidate, exact_head_runs(), 100)
+        )
+
+    def test_block_quote_indented_example_does_not_shadow_lifecycle_branch(self):
+        candidate = pr(body="> Example:\n>\n>     Closes #100\n")
+        self.assertIsNone(
+            canary.validate_completed_canary(candidate, exact_head_runs(), 100)
+        )
+
     def test_tab_indented_code_example_after_thematic_break_is_not_evidence(self):
         candidate = pr(body="Example only:\n\n* * *\n\tCloses #100\n")
         candidate["headRefName"] = "feature/unrelated"

@@ -82,6 +82,25 @@ _ATX_HEADING_RE = re.compile(r"^[ \t]{0,3}#{1,6}(?:[ \t]|$)")
 _THEMATIC_BREAK_RE = re.compile(
     r"^[ \t]{0,3}(?:(?:\*[ \t]*){3,}|(?:-[ \t]*){3,}|(?:_[ \t]*){3,})[ \t]*$"
 )
+_BLOCK_QUOTE_RE = re.compile(r" {0,3}>[ \t]?")
+
+
+def _strip_block_quotes(line: str) -> Tuple[int, str]:
+    """Return the block-quote depth and the remaining line content.
+
+    GFM removes each leading ``>`` marker (plus one optional following space or
+    tab) before deciding whether the content starts with four spaces of code
+    indentation. Nested quotes therefore need every marker stripped, not just
+    the outermost one.
+    """
+    depth = 0
+    position = 0
+    while True:
+        match = _BLOCK_QUOTE_RE.match(line, position)
+        if match is None:
+            return depth, line[position:]
+        depth += 1
+        position = match.end()
 
 
 def _blank_markdown(text: str) -> str:
@@ -103,7 +122,8 @@ def _visible_markdown(body: object) -> str:
     line as a lazy paragraph continuation. A heading or thematic break ends its
     block too, so an indented line directly after one is already code. Once
     opened, the block continues across blank lines and still-indented lines,
-    just as GFM renders it.
+    just as GFM renders it. Block-quote markers are stripped before those
+    decisions, so an indented code block nested in a quote is inert too.
     """
     text = str(body or "")
     visible = []
@@ -112,16 +132,20 @@ def _visible_markdown(body: object) -> str:
     block_boundary = True
     line_blank = True
     line_ends_block = False
+    structural_prefix_end = 0
     while index < len(text):
         if line_start and text[index] != "\n":
             line_end = text.find("\n", index)
             if line_end == -1:
                 line_end = len(text)
+            line = text[index:line_end]
+            quote_depth, content = _strip_block_quotes(line)
+            structural_prefix_end = index + len(line) - len(content)
             line_ends_block = (
-                _ATX_HEADING_RE.match(text[index:line_end]) is not None
-                or _THEMATIC_BREAK_RE.match(text[index:line_end]) is not None
+                _ATX_HEADING_RE.match(content) is not None
+                or _THEMATIC_BREAK_RE.match(content) is not None
             )
-            opener = _FENCE_OPEN_RE.match(text[index:line_end])
+            opener = _FENCE_OPEN_RE.match(content)
             if opener is not None:
                 fence = opener.group("fence")
                 cursor = line_end
@@ -131,7 +155,13 @@ def _visible_markdown(body: object) -> str:
                     next_end = text.find("\n", next_start)
                     if next_end == -1:
                         next_end = len(text)
-                    closing = _FENCE_CLOSE_RE.match(text[next_start:next_end])
+                    next_depth, next_content = _strip_block_quotes(
+                        text[next_start:next_end]
+                    )
+                    if next_depth < quote_depth:
+                        end = cursor
+                        break
+                    closing = _FENCE_CLOSE_RE.match(next_content)
                     if (
                         closing is not None
                         and closing.group("fence")[0] == fence[0]
@@ -146,15 +176,22 @@ def _visible_markdown(body: object) -> str:
                 block_boundary = True
                 line_blank = True
                 continue
-            if block_boundary and _INDENTED_CODE_RE.match(text[index:line_end]):
+            if block_boundary and _INDENTED_CODE_RE.match(content):
                 end = line_end
                 cursor = line_end + 1 if line_end < len(text) else len(text)
                 while cursor < len(text):
                     next_end = text.find("\n", cursor)
                     if next_end == -1:
                         next_end = len(text)
-                    candidate = text[cursor:next_end]
-                    if _INDENTED_CODE_RE.match(candidate) or not candidate.strip():
+                    next_depth, next_content = _strip_block_quotes(
+                        text[cursor:next_end]
+                    )
+                    if next_depth < quote_depth:
+                        break
+                    if (
+                        _INDENTED_CODE_RE.match(next_content)
+                        or not next_content.strip()
+                    ):
                         end = next_end
                         cursor = next_end + 1 if next_end < len(text) else len(text)
                         continue
@@ -222,7 +259,7 @@ def _visible_markdown(body: object) -> str:
             line_ends_block = False
             line_start = True
         else:
-            if not char.isspace():
+            if not char.isspace() and index > structural_prefix_end:
                 line_blank = False
             line_start = False
     return "".join(visible)
