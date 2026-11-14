@@ -306,6 +306,12 @@ jobs:
             "repos/$GITHUB_REPOSITORY/pulls?state=all&per_page=100&sort=updated&direction=desc" \
             | jq -s 'add // [] | map({number, state, body, title, headRefName: .head.ref, headRefOid: .head.sha, updatedAt: .updated_at, mergedAt: .merged_at, mergeCommit: (if .merge_commit_sha then {oid: .merge_commit_sha} else null end), url: .html_url})' \
             > "$observation_dir/pulls.json"
+          # REST pull objects do not carry reviewDecision. Enrich the small
+          # open-PR set so the canary still distinguishes review from merge;
+          # closed history stays fully paginated above so old canary PRs are
+          # never hidden by a bounded page.
+          gh pr list --repo "$GITHUB_REPOSITORY" --state open --limit 1000 \
+            --json number,reviewDecision > "$observation_dir/review-decisions.json"
           PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=src OBSERVATION_DIR="$observation_dir" \
             CANARY_ISSUE="$CANARY_ISSUE" CANARY_CREATED="$CANARY_CREATED" \
             SCHEDULER_WORKFLOW="$SCHEDULER_WORKFLOW" \
@@ -337,6 +343,15 @@ jobs:
           runs = load("runs.json")
           pulls = load("pulls.json")
           comments = load("comments.json")
+          review_decisions = {
+              int(item["number"]): item.get("reviewDecision")
+              for item in load("review-decisions.json")
+              if str(item.get("number") or "").isdigit()
+          }
+          for pull in pulls:
+              number = str(pull.get("number") or "")
+              if number.isdigit():
+                  pull["reviewDecision"] = review_decisions.get(int(number))
 
           observed = observation.observe_canary(
               issue,

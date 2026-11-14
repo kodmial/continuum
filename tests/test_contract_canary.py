@@ -473,6 +473,23 @@ class WorkflowContractTest(unittest.TestCase):
         self.assertIn("continuum-canary-recovery", workflow)
         self.assertIn("GITHUB_STEP_SUMMARY", workflow)
 
+    def test_workflow_preserves_review_decision_for_the_merge_stage(self):
+        """The REST pulls inventory must still carry the review decision.
+
+        ``observe_canary`` distinguishes ``review`` from ``merge`` with the
+        PR-level ``reviewDecision`` field, which the REST pulls endpoint does
+        not return. The workflow therefore enriches the bounded open-PR set
+        instead of silently reporting an approved, merge-waiting canary as
+        ``review``.
+        """
+        workflow = (
+            ROOT / ".github/workflows/continuum-contract-canary.yml"
+        ).read_text(encoding="utf-8")
+        self.assertIn(
+            '--json number,reviewDecision', workflow
+        )
+        self.assertIn('pull["reviewDecision"] = review_decisions.get', workflow)
+
     def test_workflow_does_not_leak_credentials_or_direct_write_main(self):
         workflow = (
             ROOT / ".github/workflows/continuum-contract-canary.yml"
