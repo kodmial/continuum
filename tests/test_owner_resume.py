@@ -1709,7 +1709,7 @@ class ExecutableProductionWorkflowTests(unittest.TestCase):
         # Noncanonical scheduler-marker quotes are not dispatch receipts,
         # even when a bot posts them. Only authenticated recovery events fence.
         bodies = (
-            ("<!-- issue-scheduler-dispatch -->\\n/oc", "RESUME"),
+            ("<!-- issue-scheduler-dispatch -->\n/oc", "RESUME"),
             ("<!-- continuum-429-recovery op=x gen=1 state=observed -->", "NOOP"),
         )
         for body, trusted_expected in bodies:
