@@ -75,6 +75,98 @@ _CLOSING_REFERENCE_RE = re.compile(
     r"(?![\w/-])",
     re.IGNORECASE,
 )
+_FENCE_OPEN_RE = re.compile(r"^[ \t]{0,3}(?P<fence>`{3,}|~{3,})")
+_FENCE_CLOSE_RE = re.compile(r"^[ \t]{0,3}(?P<fence>`{3,}|~{3,})[ \t]*$")
+
+
+def _blank_markdown(text: str) -> str:
+    """Replace an inert Markdown span while preserving its line breaks."""
+    return "".join("\n" if char == "\n" else "\x00" for char in text)
+
+
+def _visible_markdown(body: object) -> str:
+    """Return the part of a PR body where GitHub acts on closing keywords.
+
+    Closing phrases inside HTML comments, fenced code blocks, and inline code
+    spans are examples, not operative references. Blanking those spans with a
+    non-whitespace sentinel keeps them from matching and prevents adjacent
+    visible text from joining into a new closing reference.
+    """
+    text = str(body or "")
+    visible = []
+    index = 0
+    line_start = True
+    while index < len(text):
+        if line_start and text[index] != "\n":
+            line_end = text.find("\n", index)
+            if line_end == -1:
+                line_end = len(text)
+            opener = _FENCE_OPEN_RE.match(text[index:line_end])
+            if opener is not None:
+                fence = opener.group("fence")
+                cursor = line_end
+                end = len(text)
+                while cursor < len(text):
+                    next_start = cursor + 1
+                    next_end = text.find("\n", next_start)
+                    if next_end == -1:
+                        next_end = len(text)
+                    closing = _FENCE_CLOSE_RE.match(text[next_start:next_end])
+                    if (
+                        closing is not None
+                        and closing.group("fence")[0] == fence[0]
+                        and len(closing.group("fence")) >= len(fence)
+                    ):
+                        end = next_end
+                        break
+                    cursor = next_end
+                visible.append(_blank_markdown(text[index:end]))
+                index = end
+                line_start = False
+                continue
+        if text.startswith("<!--", index):
+            close = text.find("-->", index + 4)
+            end = len(text) if close == -1 else close + 3
+            visible.append(_blank_markdown(text[index:end]))
+            index = end
+            line_start = index > 0 and text[index - 1] == "\n"
+            continue
+        if text[index] == "`":
+            run_end = index
+            while run_end < len(text) and text[run_end] == "`":
+                run_end += 1
+            run = text[index:run_end]
+            search = run_end
+            close = -1
+            while True:
+                candidate = text.find(run, search)
+                if candidate == -1:
+                    break
+                candidate_end = candidate + len(run)
+                if (
+                    (candidate == 0 or text[candidate - 1] != "`")
+                    and (candidate_end == len(text) or text[candidate_end] != "`")
+                ):
+                    close = candidate
+                    break
+                search = candidate_end
+                while search < len(text) and text[search] == "`":
+                    search += 1
+            if close != -1:
+                end = close + len(run)
+                visible.append(_blank_markdown(text[index:end]))
+                index = end
+                line_start = index > 0 and text[index - 1] == "\n"
+                continue
+            visible.append(run)
+            index = run_end
+            line_start = False
+            continue
+        char = text[index]
+        visible.append(char)
+        index += 1
+        line_start = char == "\n"
+    return "".join(visible)
 
 
 class CanaryBootstrapError(ValueError):
@@ -288,16 +380,17 @@ def _pr_attributes_issue(pr: Mapping[str, Any], issue_number: int) -> bool:
     """Whether the lifecycle itself attributed ``pr`` to ``issue_number``.
 
     Completion is stricter than ordinary liveness: the implementation PR must
-    use the lifecycle's canonical ``opencode/issue<N>-`` branch or carry a
-    GitHub auto-close keyword for the issue. A PR that merely mentions the
-    issue number is not completion evidence.
+    use the lifecycle's canonical ``opencode/issue<N>-`` branch or carry an
+    operative GitHub auto-close keyword for the issue. A PR that merely mentions
+    the issue number, or only shows the keyword in a Markdown example, is not
+    completion evidence.
     """
     branch = str(
         pr.get("headRefName") or pr.get("head_ref_name") or ""
     ).strip()
     if branch.startswith("opencode/issue{}-".format(issue_number)):
         return True
-    body = str(pr.get("body") or "")
+    body = _visible_markdown(pr.get("body"))
     expected_repo = CANARY_OWNER_REPO.lower()
     for match in _CLOSING_REFERENCE_RE.finditer(body):
         number = (

@@ -491,6 +491,46 @@ class CompletionEvidenceTest(unittest.TestCase):
         )
         self.assertIn("not attributed", problem)
 
+    def test_inline_code_closing_example_is_not_completion_evidence(self):
+        candidate = pr(
+            body=(
+                "This change documents the syntax `Closes #100`; "
+                "it does not implement the canary."
+            )
+        )
+        candidate["headRefName"] = "feature/unrelated"
+        problem = canary.validate_completed_canary(
+            candidate, exact_head_runs(), 100
+        )
+        self.assertIn("not attributed", problem)
+
+    def test_fenced_code_closing_example_is_not_completion_evidence(self):
+        candidate = pr(
+            body="Example only:\n\n```text\nCloses #100\n```\n"
+        )
+        candidate["headRefName"] = "feature/unrelated"
+        problem = canary.validate_completed_canary(
+            candidate, exact_head_runs(), 100
+        )
+        self.assertIn("not attributed", problem)
+
+    def test_html_comment_closing_example_is_not_completion_evidence(self):
+        candidate = pr(body="<!-- Closes #100 -->")
+        candidate["headRefName"] = "feature/unrelated"
+        problem = canary.validate_completed_canary(
+            candidate, exact_head_runs(), 100
+        )
+        self.assertIn("not attributed", problem)
+
+    def test_operative_closing_reference_survives_code_example(self):
+        candidate = pr(
+            body="The example `Closes #100` is inert.\n\nCloses #100"
+        )
+        candidate["headRefName"] = "feature/unrelated"
+        self.assertIsNone(
+            canary.validate_completed_canary(candidate, exact_head_runs(), 100)
+        )
+
     def test_newer_unrelated_pr_does_not_shadow_attributed_pr(self):
         attributed = pr(number=41, body="Closes #100", updated=60)
         unrelated = pr(number=42, body="Mentions #100 only", updated=10)
