@@ -360,6 +360,7 @@ jobs:
               pull_requests=pulls,
               comments=comments,
               canary_id="canary-main",
+              repository=os.environ["GITHUB_REPOSITORY"],
           )
           if observed.failure:
               raise SystemExit("live canary failed: " + observed.failure)

@@ -1379,7 +1379,7 @@ def select_implementation_pr(
         for pr in pull_requests or []
         if isinstance(pr, Mapping) and _pr_attributes_issue(pr, issue_number)
     ]
-    return _latest_pr(issue_number, attributed)
+    return _latest_pr(issue_number, attributed, repository=CANARY_OWNER_REPO)
 
 
 def merge_exact_head_runs(
@@ -1536,7 +1536,11 @@ def resolve_canary(
         )
     try:
         observed = observe_canary(
-            issue.raw, runs=runs, pull_requests=pull_requests, now=now
+            issue.raw,
+            runs=runs,
+            pull_requests=pull_requests,
+            now=now,
+            repository=expected_repo,
         )
     except ContractQualificationError as exc:
         raise CanaryBootstrapError(

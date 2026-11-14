@@ -171,6 +171,46 @@ class DiscoveryTest(unittest.TestCase):
         self.assertEqual(decision.issue_number, 100)
         self.assertGreaterEqual(decision.age_seconds, 2 * 24 * 60 * 60)
 
+    def test_completed_canary_recognizes_repository_qualified_reference(self):
+        issue = canary_issue(state="closed", created=2 * 24 * 60 * 60, closed=30)
+        candidate = pr(body="Closes kodmial/continuum#100")
+        candidate["headRefName"] = "feature/noncanonical"
+        observed = observation.observe_canary(
+            issue,
+            pull_requests=[candidate],
+            now=NOW,
+            repository="kodmial/continuum",
+        )
+        self.assertTrue(observed.completed)
+        self.assertEqual(
+            canary.select_implementation_pr(100, [candidate])["number"], 41
+        )
+        decision = canary.resolve_canary(
+            [issue], pull_requests=[candidate], runs=exact_head_runs(), now=NOW
+        )
+        self.assertTrue(decision.completed)
+
+    def test_completed_canary_recognizes_issue_url_reference(self):
+        issue = canary_issue(state="closed", created=2 * 24 * 60 * 60, closed=30)
+        candidate = pr(
+            body="Closes https://github.com/kodmial/continuum/issues/100"
+        )
+        candidate["headRefName"] = "feature/noncanonical"
+        observed = observation.observe_canary(
+            issue,
+            pull_requests=[candidate],
+            now=NOW,
+            repository="kodmial/continuum",
+        )
+        self.assertTrue(observed.completed)
+        self.assertEqual(
+            canary.select_implementation_pr(100, [candidate])["number"], 41
+        )
+        decision = canary.resolve_canary(
+            [issue], pull_requests=[candidate], runs=exact_head_runs(), now=NOW
+        )
+        self.assertTrue(decision.completed)
+
     def test_completed_canary_after_window_bootstraps_one_fresh_issue(self):
         issue = canary_issue(
             state="closed", created=8 * 24 * 60 * 60, closed=30
