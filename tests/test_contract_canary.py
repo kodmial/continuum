@@ -620,6 +620,37 @@ class CompletionEvidenceTest(unittest.TestCase):
         )
         self.assertIn("not attributed", problem)
 
+    def test_empty_list_item_indented_code_is_not_completion_evidence(self):
+        candidate = pr(body="-\n      Closes #100\n")
+        candidate["headRefName"] = "feature/unrelated"
+        problem = canary.validate_completed_canary(
+            candidate, exact_head_runs(), 100
+        )
+        self.assertIn("not attributed", problem)
+
+    def test_empty_list_item_with_trailing_whitespace_code_is_not_evidence(self):
+        candidate = pr(body="- \t\n      Closes #100\n")
+        candidate["headRefName"] = "feature/unrelated"
+        problem = canary.validate_completed_canary(
+            candidate, exact_head_runs(), 100
+        )
+        self.assertIn("not attributed", problem)
+
+    def test_empty_ordered_list_item_indented_code_is_not_evidence(self):
+        candidate = pr(body="1.\n       Closes #100\n")
+        candidate["headRefName"] = "feature/unrelated"
+        problem = canary.validate_completed_canary(
+            candidate, exact_head_runs(), 100
+        )
+        self.assertIn("not attributed", problem)
+
+    def test_empty_list_item_indented_prose_keeps_reference_operative(self):
+        candidate = pr(body="-\n    Closes #100\n")
+        candidate["headRefName"] = "feature/unrelated"
+        self.assertIsNone(
+            canary.validate_completed_canary(candidate, exact_head_runs(), 100)
+        )
+
     def test_list_item_indented_code_block_continues_across_lines(self):
         candidate = pr(body="-     first line\n      Closes #100\n")
         candidate["headRefName"] = "feature/unrelated"

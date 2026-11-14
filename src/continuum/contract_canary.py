@@ -162,6 +162,12 @@ def _list_item_layout(
         whitespace_end = marker_end
         while whitespace_end < len(text) and text[whitespace_end] == " ":
             whitespace_end += 1
+        if whitespace_end == len(text):
+            # A bare marker, or a marker followed only by whitespace, is an
+            # empty list item. Its content column is one past the marker, so
+            # content indented four more columns is a code block in the item.
+            content_column = marker_end + 1
+            return (content_column, content_column + 4)
         if whitespace_end == marker_end:
             if content_column is None:
                 return None
