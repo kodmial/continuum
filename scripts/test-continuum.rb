@@ -6662,7 +6662,7 @@ class ContinuumTest < Minitest::Test
 
     # A manual command must not consume the scheduler's own attempt budget, or
     # two manual runs would pause an issue the scheduler never dispatched.
-    assert_includes scheduler, 'const schedulerDispatches = comments.filter(comment =>'
+    assert_includes scheduler, 'const schedulerDispatches = comments.filter(isCanonicalSchedulerDispatch);'
     assert_includes scheduler, 'const countedSchedulerDispatches ='
     assert_includes scheduler, 'countedSchedulerDispatches.length >= maxDispatchAttempts'
     assert_includes scheduler, 'schedulerDispatches.filter(comment =>'
