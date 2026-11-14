@@ -240,6 +240,13 @@ APPROVED_448_REPAIR_OPENCODE_SHA256 = (
 APPROVED_450_SERIALIZED_OPENCODE_SHA256 = (
     "236978024396822de9ee242f532aef9b4e10c81b1d1a46f548f5b2ceb441f38a"
 )
+# 2026-11-14: intentional scheduler-origin recovery correction in Continuum main.
+# Pin the full protected workflow after canonical receipt validation and
+# explicit quoted-owner-marker handling. Retain #450 historical digest above
+# and reject any further unauthorized byte drift.
+APPROVED_SCHEDULER_ORIGIN_OPENCODE_SHA256 = (
+    "b2bd86557d1050607e958698a75dae6ce234587f8934fac20a302587cb84ba4e"
+)
 APPROVED_446_CALLER_SHA256 = (
     "b7f3df118bc436526f48443b8f068372204073eb134c98e4a1543d025f314686"
 )
@@ -2665,7 +2672,7 @@ class ProtectedBaselineTests(unittest.TestCase):
                     # with a full-file digest and executable regression tests.
                     self.assertEqual(
                         protected_file_digest(path),
-                        APPROVED_450_SERIALIZED_OPENCODE_SHA256,
+                        APPROVED_SCHEDULER_ORIGIN_OPENCODE_SHA256,
                         f"{path}: unexpected drift outside #450 serialized CodeRabbit chat owner",
                     )
                 else:

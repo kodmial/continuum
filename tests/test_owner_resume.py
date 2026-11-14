@@ -65,6 +65,10 @@ const start = body.indexOf('const ownerResumeMarkerRe =');
 const end = body.indexOf('async function openDeclaredBlockers(', start);
 if (start < 0 || end < 0) throw new Error('owner-resume block missing');
 const segment = body.slice(start, end);
+const canonicalStart = body.indexOf('  function isCanonicalSchedulerDispatch(comment) {');
+const canonicalEnd = body.indexOf('  const postPauseComment', canonicalStart);
+if (canonicalStart < 0 || canonicalEnd < 0) throw new Error('canonical scheduler helper missing');
+const canonical = body.slice(canonicalStart, canonicalEnd);
 const logs = [];
 const core = {
   notice(m) { logs.push({ level: 'notice', msg: String(m) }); },
@@ -161,7 +165,7 @@ const factory = new Function(
   'labelsByIssue', 'pausedLabel', 'readyLabel', 'blockedLabel',
   'openPrIssues', 'activeRunIssues', 'pulls', 'dispatchMarker',
   'generationStopMarkerRe', 'generationRecoverMarkerRe', 'stopOrderKey',
-  segment + `
+  canonical + '\n' + segment + `
   return {
     ownerResumeScan, ownerResumeDecision, ownerResumeIssueComments,
     ownerResumeBaselineNumber, ownerResumeActivityAfter,

@@ -893,6 +893,16 @@ class WorkflowAttributionTests(unittest.TestCase):
             policy = handle.read()
         for name in sorted(EXPECTED_IDENTITIES):
             text = read_workflow(name)
+            if name == "continuum-opencode.yml":
+                # This is a receipt comparison, not a marker emitted by
+                # OpenCode. Assert precisely this lookup exists; an extra
+                # foreign-origin marker still fails comment attribution.
+                scheduler_lookup = (
+                    "lines[2] === "
+                    "'<!-- continuum-origin role=continuum component=issue-scheduler -->'"
+                )
+                self.assertEqual(text.count(scheduler_lookup), 1)
+                text = text.replace(scheduler_lookup, "lines[2] === '<scheduler-receipt-lookup>'")
             found = origin_re.findall(text)
             if not found:
                 # Bodies assembled at runtime by the shared policy bundle
