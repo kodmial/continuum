@@ -203,6 +203,15 @@ APPROVED_448_OPENCODE_SHA256 = (
 APPROVED_448_REPAIR_OPENCODE_SHA256 = (
     "886bc666915623c2e3caabfb482586aedbd23b479756175c2a0f235e617fe942"
 )
+# kodmial/continuum#454: the reviewed #448 repair pin above stays for audit.
+# This task deliberately adds one bounded, privacy-safe telemetry artifact
+# upload step (always(), continue-on-error, upload-artifact v4, runner-temp
+# telemetry directory) so per-attempt OpenCode usage survives the runner
+# without making observability failure a task failure. This active pin covers
+# the combined reviewed bytes; unrelated drift still fails closed.
+APPROVED_454_TELEMETRY_OPENCODE_SHA256 = (
+    "91b6aba3a5eb0c77620237d45c97e894be67dc8fc6dcddd2d9793f9af4061b40"
+)
 APPROVED_446_CALLER_SHA256 = (
     "b7f3df118bc436526f48443b8f068372204073eb134c98e4a1543d025f314686"
 )
@@ -2628,7 +2637,7 @@ class ProtectedBaselineTests(unittest.TestCase):
                     # explicitly tested optional-attestation no-key branch.
                     self.assertEqual(
                         protected_file_digest(path),
-                        APPROVED_448_REPAIR_OPENCODE_SHA256,
+                        APPROVED_454_TELEMETRY_OPENCODE_SHA256,
                         f"{path}: unexpected drift outside reviewed wording cleanup",
                     )
                 else:
@@ -2699,7 +2708,7 @@ class ProtectedBaselineTests(unittest.TestCase):
         # therefore be dirty in this pre-commit worktree; any unapproved byte
         # change still fails the exact digest assertions above.
         approved = {
-            ".github/workflows/continuum-opencode.yml": APPROVED_448_REPAIR_OPENCODE_SHA256,
+            ".github/workflows/continuum-opencode.yml": APPROVED_454_TELEMETRY_OPENCODE_SHA256,
             ".github/workflows/opencode.yml": APPROVED_350_SELF_CALLER_SHA256,
         }
         for path in PROTECTED_FILES:

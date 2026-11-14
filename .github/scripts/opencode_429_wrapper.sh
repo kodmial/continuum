@@ -13,6 +13,8 @@ runner_temp="${RUNNER_TEMP:-/tmp}"
 marker="$runner_temp/continuum-opencode-429"
 upstream_marker="$runner_temp/continuum-opencode-upstream-unavailable"
 classification_file="${CONTINUUM_429_CLASSIFICATION_FILE:-$runner_temp/continuum-opencode-classification}"
+telemetry_dir="${CONTINUUM_OPENCODE_TELEMETRY_DIR:-$runner_temp/continuum-opencode-telemetry}"
+telemetry_sequence=0
 
 if [[ -f "$marker" ]]; then
   echo "::error::CONTINUUM_OPENCODE_429_RESTART_REQUIRED (runner already burned; refusing a second model invocation on this VM)."
@@ -34,6 +36,34 @@ fi
 write_classification() {
   local value="$1"
   printf '%s\n' "$value" >"$classification_file" 2>/dev/null || true
+}
+
+write_telemetry() {
+  local mode="$1" log_path="$2" status="$3" classification="$4" diagnostics="${5:-}"
+  local output_dir output model timestamp
+  output_dir="$telemetry_dir"
+  if ! mkdir -p "$output_dir" 2>/dev/null; then
+    echo "::warning::Cannot create OpenCode telemetry directory; provider classification and exit status are unchanged." >&2
+    return 0
+  fi
+  telemetry_sequence=$((telemetry_sequence + 1))
+  timestamp="$(date -u +%Y%m%dT%H%M%SZ 2>/dev/null || echo unknown)"
+  output="$output_dir/opencode-${mode}-${timestamp}-$$-${telemetry_sequence}.json"
+  model="${OPENCODE_MODEL:-}"
+  local args=(
+    telemetry --mode "$mode" --log "$log_path" --exit "$status"
+    --classification "$classification" --model "$model" --output "$output"
+    --print-summary
+  )
+  if [[ -n "$diagnostics" ]]; then
+    args+=(--diagnostics "$diagnostics")
+  fi
+  if python3 "$classifier" "${args[@]}" >&2; then
+    echo "::notice::OpenCode telemetry persisted as $(basename "$output")." >&2
+  else
+    echo "::warning::OpenCode telemetry summary could not be persisted; provider classification and exit status are unchanged." >&2
+  fi
+  return 0
 }
 
 fail_provider() {
@@ -107,6 +137,7 @@ if [[ "$command" == "run" ]]; then
     CONTINUUM_LIVE_LOG_TOKEN="$live_token" CONTINUUM_LIVE_LOG_ISSUE="$live_issue" python3 "$live_script" once --log "$log" --state finished >/dev/null 2>&1 || true
   fi
   if [[ "$render_status" -ne 0 ]]; then
+    write_telemetry "run" "$log" "$status" "inconclusive"
     rm -f "$log"
     echo "::error::OpenCode event rendering failed; refusing to infer provider health." >&2
     exit "$render_status"
@@ -115,11 +146,14 @@ if [[ "$command" == "run" ]]; then
   classification="$(python3 "$classifier" classify --mode run --log "$log" --exit "$status")"
   classifier_status=$?
   set -e
-  rm -f "$log"
   if [[ "$classifier_status" -ne 0 ]]; then
+    write_telemetry "run" "$log" "$status" "inconclusive"
+    rm -f "$log"
     echo "::error::OpenCode event classification failed; refusing to infer provider health." >&2
     exit "$classifier_status"
   fi
+  write_telemetry "run" "$log" "$status" "$classification"
+  rm -f "$log"
   write_classification "$classification"
   case "$classification" in
     quota_429|unavailable|upstream|timeout|fail_closed|provider_error)
@@ -149,11 +183,14 @@ if [[ "$command" == "github" && "${2:-}" == "run" ]]; then
   classification="$(python3 "$classifier" classify --mode github --log "$stdout_log" --diagnostics "$stderr_log" --exit "$status")"
   classifier_status=$?
   set -e
-  rm -f "$stdout_log" "$stderr_log"
   if [[ "$classifier_status" -ne 0 ]]; then
+    write_telemetry "github" "$stdout_log" "$status" "inconclusive" "$stderr_log"
+    rm -f "$stdout_log" "$stderr_log"
     echo "::error::OpenCode diagnostics classification failed; refusing to infer provider health." >&2
     exit "$classifier_status"
   fi
+  write_telemetry "github" "$stdout_log" "$status" "$classification" "$stderr_log"
+  rm -f "$stdout_log" "$stderr_log"
   write_classification "$classification"
   case "$classification" in
     quota_429|unavailable|upstream|timeout|fail_closed|provider_error)

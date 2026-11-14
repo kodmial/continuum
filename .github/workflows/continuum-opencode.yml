@@ -5242,6 +5242,19 @@ jobs:
           if-no-files-found: error
           retention-days: 1
 
+      # kodmial/continuum#454: durable, bounded, privacy-safe per-attempt
+      # telemetry for 429/usage comparison. The wrapper writes only allowlisted
+      # numeric/enumerated fields; this step keeps them after the runner dies.
+      - name: Publish OpenCode telemetry artifact
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: continuum-opencode-telemetry-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/continuum-opencode-telemetry
+          if-no-files-found: warn
+          retention-days: 30
+
       - name: Clear conflict-repair lock
         if: >-
           always() &&
