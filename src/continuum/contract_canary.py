@@ -225,6 +225,41 @@ def _strip_block_quotes_from(line: str, start: int) -> Tuple[int, str]:
         position = match.end()
 
 
+def _alternating_code_indent(line: str, block_boundary: bool) -> Optional[int]:
+    """Return continuation indentation for code after alternating containers.
+
+    A list item's content may itself contain a block quote whose content is
+    another list item, and so on. The list marker hides its content column, so
+    five or more spaces after any marker in that chain open an indented code
+    block rather than operative prose. The returned value is the indentation a
+    continuation line needs after the active list item's own quote markers have
+    been stripped, matching ``_consume_indented_code``'s measurement.
+    """
+    cursor = 0
+    pending = 0
+    saw_list = False
+    saw_quote = False
+    while cursor < len(line):
+        layout = _list_item_layout(line[cursor:], block_boundary)
+        if layout is not None:
+            content_column, code_indent = layout
+            saw_list = True
+            if code_indent is not None:
+                return pending + code_indent
+            pending += content_column
+            cursor += content_column
+        depth, stripped = _strip_block_quotes_from(line, cursor)
+        if depth:
+            saw_quote = True
+            pending = 0
+            cursor += len(line[cursor:]) - len(stripped)
+            continue
+        break
+    if saw_list and saw_quote and _leading_columns(line[cursor:]) >= 4:
+        return pending + 4
+    return None
+
+
 def _consume_indented_code(
     text: str,
     end: int,
@@ -295,7 +330,9 @@ def _visible_markdown(body: object) -> str:
     block quote can also start at a list item's content column, so its markers
     are stripped there before the same decisions. A list marker hides its
     item's content column, so five or more spaces after the marker open an
-    indented code block inside the list item.
+    indented code block inside the list item. Quote and list containers may
+    alternate inside a list item; each list marker in that chain hides its own
+    content column.
     """
     text = str(body or "")
     visible = []
@@ -370,6 +407,12 @@ def _visible_markdown(body: object) -> str:
             inner_boundary = (
                 inner_depth > 0 and inner_depth != previous_inner_depth
             )
+            if inner_depth and list_content_column is not None:
+                nested_code_indent = _alternating_code_indent(
+                    content, block_boundary or inner_boundary
+                )
+                if nested_code_indent is not None:
+                    list_code_indent = nested_code_indent
             opener = _FENCE_OPEN_RE.match(content)
             if opener is not None:
                 fence = opener.group("fence")

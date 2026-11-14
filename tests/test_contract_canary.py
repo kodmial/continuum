@@ -478,6 +478,22 @@ class CompletionEvidenceTest(unittest.TestCase):
                 now=NOW,
             )
 
+    def test_alternating_list_and_quote_example_cannot_replace_closed_canary(self):
+        issue = canary_issue(
+            state="closed", created=8 * 24 * 60 * 60, closed=30
+        )
+        unrelated = pr(body="- > -     Closes #100\n", updated=10)
+        unrelated["headRefName"] = "feature/unrelated"
+        with self.assertRaisesRegex(
+            canary.CanaryBootstrapError, "not trustworthy"
+        ):
+            canary.resolve_canary(
+                [issue],
+                pull_requests=[unrelated],
+                runs=exact_head_runs(),
+                now=NOW,
+            )
+
     def test_lifecycle_branch_attributes_completion_without_keyword(self):
         candidate = pr(body="Automated implementation for #100.")
         self.assertIsNone(
@@ -724,6 +740,46 @@ class CompletionEvidenceTest(unittest.TestCase):
             candidate, exact_head_runs(), 100
         )
         self.assertIn("not attributed", problem)
+
+    def test_alternating_list_and_quote_containers_are_not_evidence(self):
+        bodies = [
+            "- > -     Closes #100\n",
+            "- > - >     Closes #100\n",
+            "> - > -     Closes #100\n",
+            "- > > -     Closes #100\n",
+            "- - > -     Closes #100\n",
+        ]
+        for body in bodies:
+            with self.subTest(body=body):
+                candidate = pr(body=body)
+                candidate["headRefName"] = "feature/unrelated"
+                problem = canary.validate_completed_canary(
+                    candidate, exact_head_runs(), 100
+                )
+                self.assertIn("not attributed", problem)
+
+    def test_alternating_list_and_quote_code_continues_across_lines(self):
+        candidate = pr(
+            body="- > -     first line\n  >       Closes #100\n"
+        )
+        candidate["headRefName"] = "feature/unrelated"
+        problem = canary.validate_completed_canary(
+            candidate, exact_head_runs(), 100
+        )
+        self.assertIn("not attributed", problem)
+
+    def test_alternating_list_and_quote_prose_is_completion_evidence(self):
+        candidate = pr(body="- > - Closes #100\n")
+        candidate["headRefName"] = "feature/unrelated"
+        self.assertIsNone(
+            canary.validate_completed_canary(candidate, exact_head_runs(), 100)
+        )
+
+    def test_alternating_list_and_quote_example_does_not_shadow_branch(self):
+        candidate = pr(body="- > -     Closes #100\n")
+        self.assertIsNone(
+            canary.validate_completed_canary(candidate, exact_head_runs(), 100)
+        )
 
     def test_list_item_block_quote_prose_closing_reference_is_evidence(self):
         candidate = pr(body="- > Closes #100\n")
