@@ -530,6 +530,26 @@ class ExactHeadRunsTest(unittest.TestCase):
         problem = canary.validate_completed_canary(pr(), merged, 100)
         self.assertIn("regression-evidence-completed-failure", problem)
 
+    def test_fresh_exact_head_pending_masks_the_snapshot_success(self):
+        """A still-running exact-HEAD run must shadow a stale success too."""
+        snapshot = [
+            run("CI", head=HEAD),
+            run(contract.CONTRACT_WORKFLOW_NAME, head=HEAD),
+        ]
+        self.assertIsNone(
+            canary.validate_completed_canary(pr(), snapshot, 100)
+        )
+        fresh = [
+            run("CI", status="in_progress", conclusion=None),
+            run(contract.CONTRACT_WORKFLOW_NAME, head=HEAD),
+        ]
+        merged = canary.merge_exact_head_runs(snapshot, HEAD, fresh)
+        self.assertEqual(
+            [item for item in merged if item["name"] == "CI"], [fresh[0]]
+        )
+        problem = canary.validate_completed_canary(pr(), merged, 100)
+        self.assertIn("regression-evidence-in_progress-pending", problem)
+
 
 class CanaryIssueBodyTest(unittest.TestCase):
     def test_body_is_marked_bounded_and_harmless(self):
