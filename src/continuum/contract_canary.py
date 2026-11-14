@@ -100,6 +100,11 @@ def _expand_tabs(line: str) -> str:
     return "".join(expanded)
 
 
+def _expand_tabs_in_text(text: str) -> str:
+    """Expand tabs per line so columns and string indexes stay aligned."""
+    return "\n".join(_expand_tabs(line) for line in text.split("\n"))
+
+
 def _leading_columns(line: str) -> int:
     """Return the column width of the line's leading whitespace."""
     column = 0
@@ -332,9 +337,12 @@ def _visible_markdown(body: object) -> str:
     item's content column, so five or more spaces after the marker open an
     indented code block inside the list item. Quote and list containers may
     alternate inside a list item; each list marker in that chain hides its own
-    content column.
+    content column. Tabs are expanded at their GFM column before these decisions
+    so a tab-indented container is measured in its Markdown context. A line that
+    leaves an active list item ends that item, so its quote markers are stripped
+    again and its content starts at a block boundary.
     """
-    text = str(body or "")
+    text = _expand_tabs_in_text(str(body or ""))
     visible = []
     index = 0
     line_start = True
@@ -351,43 +359,49 @@ def _visible_markdown(body: object) -> str:
             if line_end == -1:
                 line_end = len(text)
             line = text[index:line_end]
-            quote_limit = (
-                list_quote_depth if list_content_column is not None else None
-            )
-            quote_depth, content = _strip_block_quotes(line, quote_limit)
-            structural_prefix_end = index + len(line) - len(content)
-            line_ends_block = (
-                _ATX_HEADING_RE.match(content) is not None
-                or _THEMATIC_BREAK_RE.match(content) is not None
-            )
-            if (
-                list_content_column is not None
-                and quote_depth != list_quote_depth
-            ):
-                list_content_column = None
-                list_quote_depth = None
-                list_inner_quote_depth = 0
-            layout = (
-                None
-                if line_ends_block
-                else _list_item_layout(
-                    content, block_boundary, list_content_column
+            while True:
+                quote_limit = (
+                    list_quote_depth if list_content_column is not None else None
                 )
-            )
-            if layout is not None:
-                list_content_column, list_code_indent = layout
-                list_quote_depth = quote_depth
-                list_inner_quote_depth = 0
-            else:
-                list_code_indent = None
+                quote_depth, content = _strip_block_quotes(line, quote_limit)
+                structural_prefix_end = index + len(line) - len(content)
+                line_ends_block = (
+                    _ATX_HEADING_RE.match(content) is not None
+                    or _THEMATIC_BREAK_RE.match(content) is not None
+                )
                 if (
-                    content.strip()
-                    and list_content_column is not None
-                    and _leading_columns(content) < list_content_column
+                    list_content_column is not None
+                    and quote_depth != list_quote_depth
                 ):
                     list_content_column = None
                     list_quote_depth = None
                     list_inner_quote_depth = 0
+                    block_boundary = True
+                    continue
+                layout = (
+                    None
+                    if line_ends_block
+                    else _list_item_layout(
+                        content, block_boundary, list_content_column
+                    )
+                )
+                if layout is not None:
+                    list_content_column, list_code_indent = layout
+                    list_quote_depth = quote_depth
+                    list_inner_quote_depth = 0
+                else:
+                    list_code_indent = None
+                    if (
+                        content.strip()
+                        and list_content_column is not None
+                        and _leading_columns(content) < list_content_column
+                    ):
+                        list_content_column = None
+                        list_quote_depth = None
+                        list_inner_quote_depth = 0
+                        block_boundary = True
+                        continue
+                break
             previous_inner_depth = list_inner_quote_depth
             inner_depth = 0
             if list_content_column is not None:
