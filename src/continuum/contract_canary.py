@@ -270,6 +270,45 @@ def _alternating_code_indent(line: str, block_boundary: bool) -> Optional[int]:
     return None
 
 
+def _consume_list_fence(
+    text: str,
+    end: int,
+    cursor: int,
+    fence: str,
+    quote_depth: int,
+    list_content_column: int,
+) -> int:
+    """Return the last offset of a fenced code block inside a list item.
+
+    The fence opener follows the item's list marker, so continuation lines are
+    measured from the item's content column rather than from column zero. The
+    block ends at its closing fence or, when the fence is unclosed, where the
+    item's container ends. A blank line does not leave the item.
+    """
+    while cursor < len(text):
+        next_end = text.find("\n", cursor)
+        if next_end == -1:
+            next_end = len(text)
+        raw = text[cursor:next_end]
+        depth, content = _strip_block_quotes(raw, quote_depth)
+        if depth < quote_depth:
+            break
+        if content.strip() and _leading_columns(content) < list_content_column:
+            break
+        item_content = content[list_content_column:]
+        closing = _FENCE_CLOSE_RE.match(item_content)
+        if (
+            closing is not None
+            and closing.group("fence")[0] == fence[0]
+            and len(closing.group("fence")) >= len(fence)
+        ):
+            end = next_end
+            break
+        end = next_end
+        cursor = next_end + 1 if next_end < len(text) else len(text)
+    return end
+
+
 def _consume_indented_code(
     text: str,
     end: int,
@@ -348,7 +387,9 @@ def _visible_markdown(body: object) -> str:
     block quote can also start at a list item's content column, so its markers
     are stripped there before the same decisions. A list marker hides its
     item's content column, so five or more spaces after the marker open an
-    indented code block inside the list item. Quote and list containers may
+    indented code block inside the list item, and a fence immediately after the
+    marker stays inert until its closing fence or the end of the item. Quote
+    and list containers may
     alternate inside a list item; each list marker in that chain hides its own
     content column. Tabs are expanded at their GFM column before these decisions
     so a tab-indented container is measured in its Markdown context. A line that
@@ -440,31 +481,52 @@ def _visible_markdown(body: object) -> str:
                 )
                 if nested_code_indent is not None:
                     list_code_indent = nested_code_indent
+            list_fence_indent = None
             opener = _FENCE_OPEN_RE.match(content)
+            if (
+                opener is None
+                and list_content_column is not None
+                and inner_depth == 0
+            ):
+                opener = _FENCE_OPEN_RE.match(
+                    content[list_content_column:]
+                )
+                if opener is not None:
+                    list_fence_indent = list_content_column
             if opener is not None:
                 fence = opener.group("fence")
-                cursor = line_end
-                end = len(text)
-                while cursor < len(text):
-                    next_start = cursor + 1
-                    next_end = text.find("\n", next_start)
-                    if next_end == -1:
-                        next_end = len(text)
-                    next_depth, next_content = _strip_block_quotes(
-                        text[next_start:next_end]
+                if list_fence_indent is not None:
+                    end = _consume_list_fence(
+                        text,
+                        line_end,
+                        line_end + 1 if line_end < len(text) else len(text),
+                        fence,
+                        quote_depth,
+                        list_fence_indent,
                     )
-                    if next_depth < quote_depth:
-                        end = cursor
-                        break
-                    closing = _FENCE_CLOSE_RE.match(next_content)
-                    if (
-                        closing is not None
-                        and closing.group("fence")[0] == fence[0]
-                        and len(closing.group("fence")) >= len(fence)
-                    ):
-                        end = next_end
-                        break
-                    cursor = next_end
+                else:
+                    cursor = line_end
+                    end = len(text)
+                    while cursor < len(text):
+                        next_start = cursor + 1
+                        next_end = text.find("\n", next_start)
+                        if next_end == -1:
+                            next_end = len(text)
+                        next_depth, next_content = _strip_block_quotes(
+                            text[next_start:next_end]
+                        )
+                        if next_depth < quote_depth:
+                            end = cursor
+                            break
+                        closing = _FENCE_CLOSE_RE.match(next_content)
+                        if (
+                            closing is not None
+                            and closing.group("fence")[0] == fence[0]
+                            and len(closing.group("fence")) >= len(fence)
+                        ):
+                            end = next_end
+                            break
+                        cursor = next_end
                 visible.append(_blank_markdown(text[index:end]))
                 index = end
                 line_start = False

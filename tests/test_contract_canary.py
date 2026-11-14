@@ -562,6 +562,55 @@ class CompletionEvidenceTest(unittest.TestCase):
         )
         self.assertIn("not attributed", problem)
 
+    def test_list_item_fenced_code_closing_example_is_not_completion_evidence(self):
+        bodies = [
+            "- ```text\n  Closes #100\n",
+            "- ```text\n  Closes #100\n  ```\n",
+            "- - ```text\n    Closes #100\n",
+        ]
+        for body in bodies:
+            with self.subTest(body=body):
+                candidate = pr(body=body)
+                candidate["headRefName"] = "feature/unrelated"
+                problem = canary.validate_completed_canary(
+                    candidate, exact_head_runs(), 100
+                )
+                self.assertIn("not attributed", problem)
+
+    def test_list_item_fenced_code_ends_at_the_item_boundary(self):
+        candidate = pr(
+            body="- ```text\n  Closes #100\n- unrelated\n\nCloses #100\n"
+        )
+        candidate["headRefName"] = "feature/unrelated"
+        self.assertIsNone(
+            canary.validate_completed_canary(candidate, exact_head_runs(), 100)
+        )
+
+    def test_operative_closing_reference_after_list_item_fenced_code(self):
+        bodies = [
+            "- ```text\n  Closes #100\n  ```\n\nCloses #100\n",
+            "- ```text\n  Closes #100\n  ```\n  Closes #100\n",
+        ]
+        for body in bodies:
+            with self.subTest(body=body):
+                candidate = pr(body=body)
+                candidate["headRefName"] = "feature/unrelated"
+                self.assertIsNone(
+                    canary.validate_completed_canary(
+                        candidate, exact_head_runs(), 100
+                    )
+                )
+
+    def test_list_item_fenced_code_does_not_shadow_lifecycle_branch(self):
+        for body in ("- ```text\n  Closes #100\n", "- - ```text\n    Closes #100\n"):
+            with self.subTest(body=body):
+                candidate = pr(body=body)
+                self.assertIsNone(
+                    canary.validate_completed_canary(
+                        candidate, exact_head_runs(), 100
+                    )
+                )
+
     def test_indented_code_closing_example_is_not_completion_evidence(self):
         candidate = pr(body="Example only:\n\n    Closes #100\n")
         candidate["headRefName"] = "feature/unrelated"
