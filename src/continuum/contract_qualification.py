@@ -43,6 +43,9 @@ CONTRACT_WORKFLOW_NAME = "Contract qualification"
 #: Workflow name of the primary regression suite (project-owned CI entry).
 REGRESSION_WORKFLOW_NAME = "CI"
 
+#: Exact display title the lifecycle worker writes for one implementation issue.
+_WORKER_ISSUE_TITLE_RE = re.compile(r"\AOpenCode issue #(?P<issue>\d+)\Z")
+
 #: Lifecycle label holding an implementation reservation.
 IN_PROGRESS_LABEL = "automation:in-progress"
 
@@ -111,12 +114,19 @@ def is_full_sha(value: object) -> bool:
 
 @dataclass(frozen=True)
 class GateEvidence:
-    """One workflow-run evidence record for a PR HEAD."""
+    """One workflow-run evidence record for a PR HEAD.
+
+    ``run_id``, ``display_title`` and ``head_branch`` are optional provenance
+    for lifecycle-worker evidence. Exact-HEAD CI/contract checks ignore them.
+    """
 
     workflow_name: str
     head_sha: str
     status: str  # completed | in_progress | queued | waiting | ...
     conclusion: Optional[str] = None  # success | failure | skipped | ...
+    run_id: Optional[int] = None
+    display_title: str = ""
+    head_branch: str = ""
 
 
 @dataclass(frozen=True)
@@ -148,11 +158,62 @@ def _has_any_evidence(
     return any(item.workflow_name == workflow_name for item in evidence)
 
 
+def _is_worker_evidence(item: GateEvidence) -> bool:
+    name = str(item.workflow_name or "").strip().lower()
+    return "opencode" in name or "worker" in name
+
+
+def worker_evidence_for_issue(
+    evidence: Sequence[GateEvidence],
+    issue_number: object,
+    run_id: Optional[int] = None,
+) -> Optional[GateEvidence]:
+    """Newest OpenCode worker evidence bound to ``issue_number``.
+
+    The lifecycle worker's stable display title carries the exact task issue
+    number. When ``run_id`` is supplied (the id embedded in the implementation
+    branch), that exact worker run is authoritative even if it uses a recovery
+    display title. A run from another issue, another workflow, or a title that
+    only mentions the issue is not completion evidence.
+    """
+    try:
+        target = int(issue_number)
+    except (TypeError, ValueError):
+        return None
+    expected: Optional[int] = None
+    if run_id is not None:
+        try:
+            expected = int(run_id)
+        except (TypeError, ValueError):
+            return None
+        if expected < 1:
+            return None
+    candidates = []
+    for item in evidence:
+        if not _is_worker_evidence(item):
+            continue
+        if expected is not None:
+            if item.run_id != expected:
+                continue
+            candidates.append(item)
+            continue
+        match = _WORKER_ISSUE_TITLE_RE.match(str(item.display_title or "").strip())
+        if match is None or int(match.group("issue")) != target:
+            continue
+        candidates.append(item)
+    if not candidates:
+        return None
+    candidates.sort(key=lambda item: item.run_id or 0, reverse=True)
+    return candidates[0]
+
+
 def evaluate_regression_gate(
     pr_head_sha: object,
     evidence: Sequence[GateEvidence],
     contract_workflow_name: str = CONTRACT_WORKFLOW_NAME,
     regression_workflow_name: str = REGRESSION_WORKFLOW_NAME,
+    worker_issue_number: Optional[int] = None,
+    worker_run_id: Optional[int] = None,
 ) -> RegressionVerdict:
     """Layer-1 verdict: exact-HEAD regression + contract evidence.
 
@@ -162,6 +223,13 @@ def evaluate_regression_gate(
     non-completed status, or non-success conclusion — returns ``block``
     with a fail-closed reason naming the deficient leg. No merge path may
     bypass this gate.
+
+    When ``worker_issue_number`` is supplied, the same verdict additionally
+    requires a completed ``success`` OpenCode worker run whose stable display
+    title names that issue, or whose ``worker_run_id`` matches the id embedded
+    in the implementation branch. Canary completion uses this to reject a
+    manually implemented PR that never exercised the real worker lifecycle;
+    ordinary PR merge paths leave it disabled.
     """
     try:
         head = normalize_sha(pr_head_sha)
@@ -199,6 +267,25 @@ def evaluate_regression_gate(
                 contract.status, contract.conclusion or "pending"
             ),
         )
+    if worker_issue_number is not None:
+        try:
+            worker_issue = int(worker_issue_number)
+        except (TypeError, ValueError):
+            return RegressionVerdict(GATE_BLOCK, "worker-issue-invalid")
+        worker = worker_evidence_for_issue(
+            evidence, worker_issue, run_id=worker_run_id
+        )
+        if worker is None:
+            return RegressionVerdict(GATE_BLOCK, "worker-evidence-absent")
+        if worker.run_id is None:
+            return RegressionVerdict(GATE_BLOCK, "worker-evidence-missing-run-id")
+        if worker.status != "completed" or worker.conclusion != "success":
+            return RegressionVerdict(
+                GATE_BLOCK,
+                "worker-evidence-{}-{}".format(
+                    worker.status, worker.conclusion or "pending"
+                ),
+            )
     return RegressionVerdict(GATE_PASS, "exact-head-evidence-green")
 
 

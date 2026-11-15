@@ -74,11 +74,13 @@ The probe explicitly verifies:
   opens a pull request or writes to `main`.
 - A fresh canary issue is created only when the previous one is conclusively
   complete (closed through a merged PR with exact-HEAD `CI` and `Contract
-  qualification` evidence) and the documented seven-day window measured from
-  its creation has elapsed. A completed canary inside that window is observed
-  and reported with its age instead of being replaced. Older completed canaries
-  remain closed history; only more than one *open* owned canary is an ownership
-  conflict.
+  qualification` evidence plus a successful attributable OpenCode worker run
+  for the issue) and the documented seven-day window measured from its creation
+  has elapsed. The completion record includes that worker run ID; a manually
+  implemented PR with no worker run never counts as live lifecycle proof. A
+  completed canary inside that window is observed and reported with its age
+  instead of being replaced. Older completed canaries remain closed history;
+  only more than one *open* owned canary is an ownership conflict.
 - Duplicate, malformed, or misplaced markers, missing labels, untrusted
   authors, more than one open owned canary, incomplete pagination, and every
   GitHub read failure
@@ -96,9 +98,10 @@ The probe explicitly verifies:
   the stalled stage, triggers bounded autonomous recovery where safe
   (`MAX_CANARY_RECOVERY_ATTEMPTS`), and otherwise fails loudly.
 - The commit status is `success` only after the real canary issue is closed
-  through a merged PR with exact-HEAD CI/contract evidence. A live lifecycle
-  that is still progressing publishes `pending` with its observed stage and
-  age; it is not counted as a completed end-to-end pass. The first post-merge
+  through a merged PR with exact-HEAD CI/contract evidence and an attributable
+  successful OpenCode worker run tied to that issue. A live lifecycle that is
+  still progressing publishes `pending` with its observed stage and age; it is
+  not counted as a completed end-to-end pass. The first post-merge
   run therefore reports `bootstrapped`/`pending`; only the subsequent recorded
   issue/PR/HEAD/merge/run sequence is live end-to-end proof.
 

@@ -382,6 +382,8 @@ jobs:
                   runs = canary.merge_exact_head_runs(
                       runs, head, json.loads(proc.stdout)
                   )
+              worker = canary.completion_worker_run(issue_number, runs, latest) or {}
+              worker_run_id = worker.get("databaseId") or worker.get("id")
               problem = canary.validate_completed_canary(latest, runs, issue_number)
               if problem:
                   raise SystemExit("live canary completion is not trustworthy: " + problem)
@@ -391,20 +393,22 @@ jobs:
                   issue.get("createdAt") or issue.get("created_at"), None
               )
               print(
-                  "Completed live canary issue #%d PR #%s head=%s merge=%s age_seconds=%s"
+                  "Completed live canary issue #%d PR #%s head=%s merge=%s worker_run=%s age_seconds=%s"
                   % (
                       issue_number,
                       (latest or {}).get("number", "-"),
                       head or "-",
                       merge_sha or "-",
+                      worker_run_id or "-",
                       age if age is not None else "-",
                   )
               )
               outcome(
                   "completed",
-                  "merged PR with exact-HEAD CI/contract evidence",
+                  "merged PR with exact-HEAD CI/contract and OpenCode worker evidence",
                   issue=issue_number,
                   pr=(latest or {}).get("number"),
+                  run=worker_run_id,
                   head_sha=head,
                   merge_sha=merge_sha,
                   age_seconds=age,

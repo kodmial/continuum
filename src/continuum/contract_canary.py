@@ -25,6 +25,7 @@ from .contract_qualification import (
     GateEvidence,
     evaluate_regression_gate,
     is_full_sha,
+    worker_evidence_for_issue,
 )
 
 #: Only Continuum's own dogfood repository may bootstrap a canary issue.
@@ -58,6 +59,9 @@ _MARKER_RE = re.compile(
     r"task=(?P<task>[A-Za-z0-9_.-]+) -->\Z"
 )
 _SAFE_TOKEN_RE = re.compile(r"\A[A-Za-z0-9._-]{1,120}\Z")
+_IMPLEMENTATION_BRANCH_RE = re.compile(
+    r"\Aopencode/issue(?P<issue>\d+)-(?P<run>\d+)\Z"
+)
 #: GitHub auto-close keywords pointing at an issue in this repository. The
 #: lifecycle writes ``Closes #<issue>`` in its implementation PR, so this is the
 #: only body shape that may attribute a merged PR to the canary issue. A bare
@@ -1377,6 +1381,18 @@ def _pr_attributes_issue(pr: Mapping[str, Any], issue_number: int) -> bool:
     return False
 
 
+def _implementation_worker_run_id(
+    pr: Mapping[str, Any], issue_number: int
+) -> Optional[int]:
+    branch = str(
+        pr.get("headRefName") or pr.get("head_ref_name") or ""
+    ).strip()
+    match = _IMPLEMENTATION_BRANCH_RE.match(branch)
+    if match is None or int(match.group("issue")) != issue_number:
+        return None
+    return int(match.group("run"))
+
+
 def select_implementation_pr(
     issue_number: int,
     pull_requests: Sequence[Mapping[str, Any]],
@@ -1439,6 +1455,76 @@ def merge_exact_head_runs(
     return snapshot + list(exact_head_runs or [])
 
 
+def _evidence_run_id(run: Mapping[str, Any]) -> Optional[int]:
+    for key in ("databaseId", "id"):
+        try:
+            value = int(run.get(key))
+        except (TypeError, ValueError):
+            continue
+        if value > 0:
+            return value
+    return None
+
+
+def _gate_evidence(runs: Sequence[Mapping[str, Any]]) -> list:
+    evidence = []
+    for run in runs or []:
+        if not isinstance(run, Mapping):
+            continue
+        name = str(run.get("name") or run.get("workflowName") or "").strip()
+        sha = str(run.get("headSha") or run.get("head_sha") or "").strip().lower()
+        if not name or not sha:
+            continue
+        conclusion = run.get("conclusion")
+        evidence.append(
+            GateEvidence(
+                name,
+                sha,
+                str(run.get("status") or "").strip().lower(),
+                str(conclusion).strip().lower() if conclusion is not None else None,
+                run_id=_evidence_run_id(run),
+                display_title=str(
+                    run.get("displayTitle") or run.get("display_title") or ""
+                ).strip(),
+                head_branch=str(
+                    run.get("headBranch") or run.get("head_branch") or ""
+                ).strip(),
+            )
+        )
+    return evidence
+
+
+def completion_worker_run(
+    issue_number: int,
+    runs: Sequence[Mapping[str, Any]],
+    pull_request: Optional[Mapping[str, Any]] = None,
+) -> Optional[Mapping[str, Any]]:
+    """Return the raw worker run whose evidence validates completion.
+
+    Completion records this run's id, so selection must use the same
+    issue-bound OpenCode worker evidence as :func:`validate_completed_canary`.
+    An implementation branch embeds the worker run id, which also binds
+    recovery runs whose display title is not the canonical issue title.
+    """
+    expected = (
+        _implementation_worker_run_id(pull_request, issue_number)
+        if pull_request
+        else None
+    )
+    selected = worker_evidence_for_issue(
+        _gate_evidence(runs), issue_number, run_id=expected
+    )
+    if selected is None or selected.run_id is None:
+        return None
+    for run in runs or []:
+        if (
+            isinstance(run, Mapping)
+            and _evidence_run_id(run) == selected.run_id
+        ):
+            return run
+    return None
+
+
 def validate_completed_canary(
     pull_request: Optional[Mapping[str, Any]],
     runs: Sequence[Mapping[str, Any]],
@@ -1448,9 +1534,11 @@ def validate_completed_canary(
 
     A closed canary issue only proves a live E2E run when its implementation PR
     is attributed to that issue by the lifecycle, is merged, carries a full
-    head and merge commit, and has completed successful ``CI`` and ``Contract
-    qualification`` runs for that exact head. Evidence for any other SHA is
-    stale and never satisfies the check.
+    head and merge commit, has completed successful ``CI`` and ``Contract
+    qualification`` runs for that exact head, and has a completed successful
+    OpenCode worker run bound to the canary issue. Evidence for any other SHA
+    is stale and never satisfies the check; a manually implemented PR with no
+    worker run is not live lifecycle proof.
     """
     if not pull_request:
         return "no merged implementation PR references the canary issue"
@@ -1475,28 +1563,18 @@ def validate_completed_canary(
     )
     if not is_full_sha(merge_oid):
         return "merged implementation PR has no full merge commit"
-    evidence = []
-    for run in runs or []:
-        if not isinstance(run, Mapping):
-            continue
-        name = str(run.get("name") or run.get("workflowName") or "").strip()
-        sha = str(run.get("headSha") or run.get("head_sha") or "").strip().lower()
-        if not name or not sha:
-            continue
-        conclusion = run.get("conclusion")
-        evidence.append(
-            GateEvidence(
-                name,
-                sha,
-                str(run.get("status") or "").strip().lower(),
-                str(conclusion).strip().lower() if conclusion is not None else None,
-            )
-        )
-    verdict = evaluate_regression_gate(head, evidence)
+    evidence = _gate_evidence(runs)
+    worker_run_id = _implementation_worker_run_id(pull_request, issue_number)
+    verdict = evaluate_regression_gate(
+        head,
+        evidence,
+        worker_issue_number=issue_number,
+        worker_run_id=worker_run_id,
+    )
     if verdict.outcome != GATE_PASS:
         return (
-            "merged implementation PR lacks exact-HEAD CI/contract evidence: "
-            + verdict.reason
+            "merged implementation PR lacks exact-HEAD CI/contract and "
+            "worker evidence: " + verdict.reason
         )
     return None
 

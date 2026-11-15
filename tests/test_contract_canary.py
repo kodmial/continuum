@@ -19,6 +19,8 @@ NOW = datetime(2026, 11, 14, 12, 0, tzinfo=timezone.utc)
 HEAD = "a" * 40
 MERGE = "b" * 40
 OTHER_HEAD = "c" * 40
+WORKER_HEAD = "d" * 40
+WORKER_RUN_ID = 9001
 ROOT = Path(__file__).resolve().parents[1]
 
 
@@ -90,20 +92,53 @@ def pr(
     }
 
 
-def run(name, head=HEAD, status="completed", conclusion="success"):
-    return {
+def run(
+    name,
+    head=HEAD,
+    status="completed",
+    conclusion="success",
+    run_id=None,
+    display_title="",
+    head_branch="",
+):
+    payload = {
         "name": name,
         "workflowName": name,
         "headSha": head,
         "status": status,
         "conclusion": conclusion,
     }
+    if run_id is not None:
+        payload["databaseId"] = run_id
+    if display_title:
+        payload["displayTitle"] = display_title
+    if head_branch:
+        payload["headBranch"] = head_branch
+    return payload
 
 
-def exact_head_runs(head=HEAD):
+def worker_run(
+    issue=100,
+    run_id=WORKER_RUN_ID,
+    status="completed",
+    conclusion="success",
+):
+    return run(
+        "OpenCode agent",
+        head=WORKER_HEAD,
+        status=status,
+        conclusion=conclusion,
+        run_id=run_id,
+        display_title="OpenCode issue #{}".format(issue),
+        head_branch="main",
+    )
+
+
+def exact_head_runs(head=HEAD, issue=100):
     return [
         run("CI", head=head),
         run(contract.CONTRACT_WORKFLOW_NAME, head=head),
+        worker_run(issue=issue),
     ]
 
 
@@ -267,7 +302,10 @@ class DiscoveryTest(unittest.TestCase):
             pr(number=42, body="Closes #101", updated=30),
         ]
         decision = canary.resolve_canary(
-            [older, newer], pull_requests=pulls, runs=exact_head_runs(), now=NOW
+            [older, newer],
+            pull_requests=pulls,
+            runs=exact_head_runs(issue=101),
+            now=NOW,
         )
         self.assertEqual(decision.action, "observe")
         self.assertEqual(decision.issue_number, 101)
@@ -302,7 +340,10 @@ class DiscoveryTest(unittest.TestCase):
             pr(number=42, body="Closes #101", updated=30),
         ]
         decision = canary.resolve_canary(
-            [older, newer], pull_requests=pulls, runs=exact_head_runs(), now=NOW
+            [older, newer],
+            pull_requests=pulls,
+            runs=exact_head_runs(issue=101),
+            now=NOW,
         )
         self.assertEqual(decision.action, "create")
         self.assertEqual(decision.reason, "window-elapsed")
@@ -437,6 +478,81 @@ class CompletionEvidenceTest(unittest.TestCase):
         self.assertIsNone(
             canary.validate_completed_canary(pr(), exact_head_runs(), 100)
         )
+
+    def test_missing_worker_evidence_fails(self):
+        runs = [run("CI"), run(contract.CONTRACT_WORKFLOW_NAME)]
+        problem = canary.validate_completed_canary(pr(), runs, 100)
+        self.assertIn("worker-evidence-absent", problem)
+
+    def test_worker_evidence_for_another_issue_fails(self):
+        runs = [
+            run("CI"),
+            run(contract.CONTRACT_WORKFLOW_NAME),
+            worker_run(issue=999),
+        ]
+        problem = canary.validate_completed_canary(pr(), runs, 100)
+        self.assertIn("worker-evidence-absent", problem)
+
+    def test_failed_worker_evidence_fails(self):
+        runs = [
+            run("CI"),
+            run(contract.CONTRACT_WORKFLOW_NAME),
+            worker_run(conclusion="failure"),
+        ]
+        problem = canary.validate_completed_canary(pr(), runs, 100)
+        self.assertIn("worker-evidence-completed-failure", problem)
+
+    def test_completion_worker_run_id_is_recorded(self):
+        selected = canary.completion_worker_run(100, exact_head_runs())
+        self.assertEqual(selected["databaseId"], WORKER_RUN_ID)
+
+    def test_recovery_worker_run_is_tied_by_implementation_branch(self):
+        candidate = pr()
+        candidate["headRefName"] = "opencode/issue100-{}".format(WORKER_RUN_ID)
+        recovery = run(
+            "OpenCode 429 recovery opencode-429-issue-issue100 gen 1",
+            head=WORKER_HEAD,
+            run_id=WORKER_RUN_ID,
+            display_title=(
+                "OpenCode 429 recovery opencode-429-issue-issue100 gen 1"
+            ),
+            head_branch="main",
+        )
+        runs = [
+            run("CI"),
+            run(contract.CONTRACT_WORKFLOW_NAME),
+            recovery,
+        ]
+        self.assertIsNone(
+            canary.validate_completed_canary(candidate, runs, 100)
+        )
+        selected = canary.completion_worker_run(100, runs, candidate)
+        self.assertEqual(selected["databaseId"], WORKER_RUN_ID)
+
+    def test_worker_run_from_another_branch_generation_fails(self):
+        candidate = pr()
+        candidate["headRefName"] = "opencode/issue100-7777"
+        runs = [
+            run("CI"),
+            run(contract.CONTRACT_WORKFLOW_NAME),
+            worker_run(),
+        ]
+        problem = canary.validate_completed_canary(candidate, runs, 100)
+        self.assertIn("worker-evidence-absent", problem)
+
+    def test_closed_canary_without_worker_evidence_fails_closed(self):
+        issue = canary_issue(
+            state="closed", created=2 * 24 * 60 * 60, closed=30
+        )
+        with self.assertRaisesRegex(
+            canary.CanaryBootstrapError, "worker-evidence-absent"
+        ):
+            canary.resolve_canary(
+                [issue],
+                pull_requests=[pr()],
+                runs=[run("CI"), run(contract.CONTRACT_WORKFLOW_NAME)],
+                now=NOW,
+            )
 
     def test_missing_merged_pr_fails(self):
         self.assertIn(
@@ -1564,6 +1680,18 @@ class ExactHeadRunsTest(unittest.TestCase):
         merged = canary.merge_exact_head_runs(snapshot, "", fresh)
         self.assertEqual(merged, snapshot + fresh)
 
+    def test_exact_head_refresh_preserves_worker_completion_evidence(self):
+        merged = canary.merge_exact_head_runs(
+            exact_head_runs(),
+            HEAD,
+            [run("CI"), run(contract.CONTRACT_WORKFLOW_NAME)],
+        )
+        self.assertIsNone(canary.validate_completed_canary(pr(), merged, 100))
+        self.assertEqual(
+            canary.completion_worker_run(100, merged)["databaseId"],
+            WORKER_RUN_ID,
+        )
+
     def test_fresh_exact_head_failure_masks_the_snapshot_success(self):
         """The completion gate must consume the fresh exact-HEAD evidence.
 
@@ -1572,10 +1700,7 @@ class ExactHeadRunsTest(unittest.TestCase):
         matching record, so merging must replace those snapshot records instead
         of appending after them.
         """
-        snapshot = [
-            run("CI", head=HEAD),
-            run(contract.CONTRACT_WORKFLOW_NAME, head=HEAD),
-        ]
+        snapshot = exact_head_runs()
         self.assertIsNone(
             canary.validate_completed_canary(pr(), snapshot, 100)
         )
@@ -1589,10 +1714,7 @@ class ExactHeadRunsTest(unittest.TestCase):
 
     def test_fresh_exact_head_pending_masks_the_snapshot_success(self):
         """A still-running exact-HEAD run must shadow a stale success too."""
-        snapshot = [
-            run("CI", head=HEAD),
-            run(contract.CONTRACT_WORKFLOW_NAME, head=HEAD),
-        ]
+        snapshot = exact_head_runs()
         self.assertIsNone(
             canary.validate_completed_canary(pr(), snapshot, 100)
         )
@@ -1676,6 +1798,14 @@ class WorkflowContractTest(unittest.TestCase):
         ).read_text(encoding="utf-8")
         self.assertIn("canary.observation_pull_requests(", workflow)
         self.assertIn("pull_requests=observation_pulls", workflow)
+
+    def test_workflow_records_completion_worker_run_id(self):
+        workflow = (
+            ROOT / ".github/workflows/continuum-contract-canary.yml"
+        ).read_text(encoding="utf-8")
+        self.assertIn("canary.completion_worker_run(", workflow)
+        self.assertIn("run=worker_run_id", workflow)
+        self.assertIn("OpenCode worker evidence", workflow)
 
     def test_workflow_preserves_review_decision_for_the_merge_stage(self):
         """The REST pulls inventory must still carry the review decision.
