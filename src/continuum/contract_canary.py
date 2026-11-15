@@ -53,25 +53,22 @@ CANARY_TITLE = "[continuum-canary] live contract qualification (automated, do no
 #: id to look like live lifecycle evidence.
 CANARY_PUBLICATION_ARTIFACT_PREFIX = "continuum-task-publication"
 
+#: Commit-status context a workflow-owned repair sets through the authenticated
+#: API after it pushes a new commit. Git author/committer fields are forgeable;
+#: a status on the exact commit is not part of the commit object a manual
+#: author can spoof.
+CANARY_REPAIR_STATUS_CONTEXT = "continuum/repair-publication"
+
 #: Exact marker prefix. A body containing this prefix is treated as canary
 #: metadata and must therefore be valid, owned, and single.
 CANARY_MARKER_PREFIX = "<!-- continuum-contract-canary"
 
 _TRUSTED_ASSOCIATIONS = frozenset({"OWNER", "MEMBER", "COLLABORATOR"})
 _TRUSTED_LOGINS = frozenset({"github-actions[bot]"})
-#: Committers allowed to extend a worker-published commit before completion.
-#: ``github-actions[bot]`` owns every Continuum repair commit, while
-#: ``web-flow`` is the GitHub merge actor used for native main-sync commits.
-_TRUSTED_COMMIT_LOGINS = frozenset({"github-actions[bot]", "web-flow"})
-_TRUSTED_COMMIT_IDENTITIES = frozenset(
-    {
-        (
-            "github-actions[bot]",
-            "41898282+github-actions[bot]@users.noreply.github.com",
-        ),
-        ("GitHub", "noreply@github.com"),
-    }
-)
+#: GitHub's own signed commit actor. Native main-sync merge commits are created
+#: server-side and carry a verified signature; an ordinary web-editor commit
+#: also uses ``web-flow`` but has a single parent, so it is not a merge.
+_MAIN_SYNC_COMMIT_LOGIN = "web-flow"
 _MARKER_RE = re.compile(
     r"\A<!-- continuum-contract-canary "
     r"repo=(?P<repo>[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+) "
@@ -1463,27 +1460,108 @@ def _commit_person(
     return login, name, email
 
 
-def _is_trusted_automation_commit(commit: object) -> bool:
+def _commit_verified(commit: Mapping[str, Any]) -> bool:
+    payload = commit.get("commit")
+    verification = (
+        payload.get("verification") if isinstance(payload, Mapping) else None
+    )
+    if not isinstance(verification, Mapping):
+        verification = commit.get("verification")
+    return bool(
+        isinstance(verification, Mapping)
+        and verification.get("verified") is True
+    )
+
+
+def _commit_parent_count(commit: Mapping[str, Any]) -> int:
+    parents = commit.get("parents")
+    return len(parents) if isinstance(parents, Sequence) else 0
+
+
+def _is_authenticated_main_sync_commit(commit: object) -> bool:
+    """Whether GitHub itself signed this commit as a native main-sync merge.
+
+    The PR commit history is the only ordering authority, but its author and
+    committer name/email fields are user-controlled. Only a server-signed,
+    two-parent ``web-flow`` merge is trusted here; ordinary web-editor commits
+    also use ``web-flow`` yet have one parent, and Actions commits are unsigned
+    and require the authenticated repair status instead.
+    """
     if not isinstance(commit, Mapping):
         return False
-    login, name, email = _commit_person(commit, "committer")
-    if login in _TRUSTED_COMMIT_LOGINS:
+    committer_login, _, _ = _commit_person(commit, "committer")
+    return (
+        committer_login == _MAIN_SYNC_COMMIT_LOGIN
+        and _commit_parent_count(commit) >= 2
+        and _commit_verified(commit)
+    )
+
+
+def _commit_has_repair_status(
+    commit: Mapping[str, Any],
+    base_sha: str,
+    pr_number: Optional[int],
+    expected_repo: str,
+) -> bool:
+    """Whether an authenticated repair workflow attested this exact commit.
+
+    The status is written through GitHub's API after the repair pushes, and its
+    description binds the direct parent, this commit, and the PR. A manual
+    commit can copy the bot name and email but cannot create this status without
+    first running the authenticated repair workflow that owns the push. The
+    creator must be the repository owner's PAT identity (or the Actions bot),
+    so an unrelated collaborator cannot authorize a manual commit.
+    """
+    statuses = commit.get("statuses")
+    if not isinstance(statuses, Sequence):
+        return False
+    sha = _commit_sha(commit)
+    expected = "pr={} base={} head={}".format(
+        pr_number, base_sha[:12], sha[:12]
+    )
+    owner = str(expected_repo or "").split("/", 1)[0].strip().lower()
+    trusted_creators = {owner, "github-actions[bot]"}
+    for status in statuses:
+        if not isinstance(status, Mapping):
+            continue
+        if str(status.get("context") or "") != CANARY_REPAIR_STATUS_CONTEXT:
+            continue
+        if str(status.get("state") or "") != "success":
+            continue
+        if str(status.get("description") or "").strip() != expected:
+            continue
+        creator = status.get("creator")
+        login = (
+            str(creator.get("login") or "").strip().lower()
+            if isinstance(creator, Mapping)
+            else ""
+        )
+        if login not in trusted_creators:
+            continue
+        target = str(status.get("target_url") or "").strip()
+        if "/actions/runs/" not in target:
+            continue
         return True
-    return (name, email) in _TRUSTED_COMMIT_IDENTITIES
+    return False
 
 
 def _validate_publication_continuity(
     head: str,
     published: str,
     commits: Sequence[Mapping[str, Any]],
+    pr_number: Optional[int] = None,
+    expected_repo: str = CANARY_OWNER_REPO,
 ) -> Optional[str]:
-    """Return a failure reason unless trusted commits connect published to head.
+    """Return a failure reason unless authenticated commits connect published to head.
 
     The worker receipt names the commit the worker actually published. A later
     CodeRabbit/CI repair or a native main-sync may advance the same PR branch
     before merge. Completion may only cross that gap through the PR's own
-    commit history, and every commit after the published one must be a trusted
-    automation commit (the Actions bot or GitHub's ``web-flow`` merge actor).
+    commit history. A commit after the published one is trusted only when
+    GitHub signed it as a two-parent ``web-flow`` merge, or when the repair
+    workflow published an authenticated status binding its direct parent, this
+    exact commit, and the PR. A plain commit that merely copies the Actions bot
+    identity is not evidence.
     """
     entries = [
         commit for commit in commits or [] if isinstance(commit, Mapping)
@@ -1515,12 +1593,22 @@ def _validate_publication_continuity(
             "worker publication receipt published a commit that is not behind "
             "the final head"
         )
-    for commit in entries[start + 1 : end + 1]:
-        if not _is_trusted_automation_commit(commit):
-            return (
-                "worker publication receipt has untrusted commit {} after "
-                "publication".format(_commit_sha(commit) or "<unknown>")
-            )
+    previous = entries[start]
+    for index in range(start + 1, end + 1):
+        commit = entries[index]
+        sha = _commit_sha(commit)
+        if _is_authenticated_main_sync_commit(commit):
+            previous = commit
+            continue
+        if _commit_has_repair_status(
+            commit, _commit_sha(previous), pr_number, expected_repo
+        ):
+            previous = commit
+            continue
+        return (
+            "worker publication receipt has unauthenticated commit {} after "
+            "publication".format(sha or "<unknown>")
+        )
     return None
 
 
@@ -1541,10 +1629,12 @@ def validate_worker_publication(
     The receipt binds the run id, canonical task branch, issue, PR number, and
     published commit; only the owning run can attach an artifact to itself, so
     a manual PR that merely reuses a run id in its branch name is not lifecycle
-    evidence. The published commit may sit behind the final head when trusted
-    automation added repair or main-sync commits afterwards. In that case the
-    PR's commit history must prove continuity from the published commit to the
-    final head, with every later commit authored by trusted automation; the
+    evidence. The published commit may sit behind the final head when automation
+    added repair or main-sync commits afterwards. In that case the PR's commit
+    history must prove continuity from the published commit to the final head:
+    a later commit is accepted only when GitHub signed it as a native main-sync
+    merge, or when the authenticated repair workflow status attests it and its
+    direct parent for this PR. Commit-name spoofing alone never qualifies. The
     exact-head CI and contract checks still target the final head. A published
     commit that cannot be connected that way never satisfies the receipt.
     """
@@ -1585,7 +1675,11 @@ def validate_worker_publication(
         return "worker publication receipt has no full published commit"
     if published != head:
         continuity = _validate_publication_continuity(
-            head, published, pull_request_commits
+            head,
+            published,
+            pull_request_commits,
+            _positive_int(pull_request.get("number")),
+            expected_repo,
         )
         if continuity:
             return continuity
@@ -1777,8 +1871,10 @@ def validate_completed_canary(
     neither a manual PR with only a closing keyword, a PR reusing an unrelated
     issue's run id, nor a PR borrowing the id of a successful no-op run ever
     satisfies it. A worker-published commit may sit behind the final head when
-    trusted automation later repairs the branch; ``pull_request_commits`` must
-    then prove that every intervening commit is trusted automation. Evidence
+    automation later repairs the branch; ``pull_request_commits`` must then
+    prove that every intervening commit is either a GitHub-signed main-sync
+    merge or carries the authenticated repair-publication status. A plain
+    commit that copies the bot identity is not automation evidence. Evidence
     for any other SHA is stale and never satisfies the check; a manually
     implemented PR with no worker run is not live lifecycle proof.
     """
@@ -1854,9 +1950,9 @@ def resolve_canary(
     closed and never creates a duplicate issue. ``worker_publication`` is the
     run-scoped publication receipt fetched from the bound worker run; without
     it a closed canary is not trustworthy completion evidence.
-    ``pull_request_commits`` is that implementation PR's commit history, used
-    to prove trusted continuity when automation repaired the branch after the
-    worker published it.
+    ``pull_request_commits`` is that implementation PR's commit history; its
+    authenticated repair-publication statuses prove continuity when automation
+    repaired the branch after the worker published it.
     """
     if read_error not in (None, ""):
         raise CanaryBootstrapError(

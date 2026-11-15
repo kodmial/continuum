@@ -252,11 +252,13 @@ APPROVED_SCHEDULER_ORIGIN_OPENCODE_SHA256 = (
 # PR, not just that a run with a matching branch id and title succeeded: a
 # no-op run exits successfully. The worker now writes and uploads a run-scoped
 # publication receipt immediately after it creates or updates the task PR, and
-# the canary consumes that receipt as completion evidence. Keep the scheduler
-# origin digest above for audit and pin the full current artifact; any further
-# drift still fails closed.
+# the canary consumes that receipt as completion evidence. Later automation
+# repairs now publish an authenticated commit status binding their exact base,
+# head, and PR, so a manual commit cannot impersonate the bot identity. Keep
+# the scheduler origin digest above for audit and pin the full current
+# artifact; any further drift still fails closed.
 APPROVED_458_PUBLICATION_OPENCODE_SHA256 = (
-    "1cc7697950d139de8cb63684b68578144d366da8363c34f9d17c2d5fc9da8d5b"
+    "f15cf425b825e51dad011b3454abfb3d48a98b826be8f7010a0ae150091ff325"
 )
 APPROVED_446_CALLER_SHA256 = (
     "b7f3df118bc436526f48443b8f068372204073eb134c98e4a1543d025f314686"

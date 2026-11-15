@@ -347,6 +347,14 @@ ENTRIES = (
     },
     {
         "workflow": "continuum-opencode.yml",
+        "step": "Record authenticated repair publication",
+        "capability": PUSH_FANOUT,
+        "same_repo": True,
+        "reason": "Commit-status publication binds the pushed repair commit to the authenticated automation identity; the job grants no statuses:write, so the classic PAT supplies the required same-repo status scope.",
+        "evidence": ("GH_TOKEN: ${{ secrets.TAP_PAT }}",),
+    },
+    {
+        "workflow": "continuum-opencode.yml",
         "step": "Re-run the consumer blocking CI workflow for this head",
         "capability": DISPATCH,
         "same_repo": True,

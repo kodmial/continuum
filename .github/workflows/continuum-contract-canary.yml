@@ -157,9 +157,11 @@ jobs:
           def implementation_commits(number):
               """Return the implementation PR's full commit history.
 
-              Trusted continuity is judged from GitHub's own PR commit order, so
-              a failed or malformed read is fatal instead of silently accepting
-              a receipt that only names an older commit.
+              Trusted continuity is judged from GitHub's own PR commit order,
+              and each commit carries the API-written repair statuses that
+              authenticate later automation. A failed or malformed read is
+              fatal instead of silently accepting a receipt that only names an
+              older commit.
               """
               if not number:
                   return []
@@ -192,6 +194,42 @@ jobs:
                       commits.extend(page)
                   elif isinstance(page, dict):
                       commits.append(page)
+              repo = os.environ["GITHUB_REPOSITORY"]
+              for commit in commits:
+                  sha = str(commit.get("sha") or "").strip()
+                  if not sha:
+                      continue
+                  statuses = subprocess.run(
+                      [
+                          "gh", "api", "--paginate", "--slurp",
+                          "repos/{}/commits/{}/statuses?per_page=100".format(
+                              repo, sha
+                          ),
+                      ],
+                      check=False, capture_output=True, text=True,
+                  )
+                  if statuses.returncode != 0:
+                      raise SystemExit(
+                          "could not read commit statuses for {}; refusing "
+                          "incomplete publication continuity: {}".format(
+                              sha, (statuses.stderr or "").strip()[:500]
+                          )
+                      )
+                  try:
+                      pages = json.loads(statuses.stdout)
+                  except ValueError:
+                      raise SystemExit(
+                          "commit statuses for {} could not be parsed".format(
+                              sha
+                          )
+                      )
+                  parsed_statuses = []
+                  for page in pages if isinstance(pages, list) else [pages]:
+                      if isinstance(page, list):
+                          parsed_statuses.extend(page)
+                      elif isinstance(page, dict):
+                          parsed_statuses.append(page)
+                  commit["statuses"] = parsed_statuses
               return commits
 
           def worker_publication(run_id):
@@ -477,9 +515,11 @@ jobs:
           def implementation_commits(number):
               """Return the implementation PR's full commit history.
 
-              Trusted continuity is judged from GitHub's own PR commit order, so
-              a failed or malformed read is fatal instead of silently accepting
-              a receipt that only names an older commit.
+              Trusted continuity is judged from GitHub's own PR commit order,
+              and each commit carries the API-written repair statuses that
+              authenticate later automation. A failed or malformed read is
+              fatal instead of silently accepting a receipt that only names an
+              older commit.
               """
               if not number:
                   return []
@@ -512,6 +552,42 @@ jobs:
                       commits.extend(page)
                   elif isinstance(page, dict):
                       commits.append(page)
+              repo = os.environ["GITHUB_REPOSITORY"]
+              for commit in commits:
+                  sha = str(commit.get("sha") or "").strip()
+                  if not sha:
+                      continue
+                  statuses = subprocess.run(
+                      [
+                          "gh", "api", "--paginate", "--slurp",
+                          "repos/{}/commits/{}/statuses?per_page=100".format(
+                              repo, sha
+                          ),
+                      ],
+                      check=False, capture_output=True, text=True,
+                  )
+                  if statuses.returncode != 0:
+                      raise SystemExit(
+                          "could not read commit statuses for {}; refusing "
+                          "incomplete publication continuity: {}".format(
+                              sha, (statuses.stderr or "").strip()[:500]
+                          )
+                      )
+                  try:
+                      pages = json.loads(statuses.stdout)
+                  except ValueError:
+                      raise SystemExit(
+                          "commit statuses for {} could not be parsed".format(
+                              sha
+                          )
+                      )
+                  parsed_statuses = []
+                  for page in pages if isinstance(pages, list) else [pages]:
+                      if isinstance(page, list):
+                          parsed_statuses.extend(page)
+                      elif isinstance(page, dict):
+                          parsed_statuses.append(page)
+                  commit["statuses"] = parsed_statuses
               return commits
 
           def worker_publication(run_id):

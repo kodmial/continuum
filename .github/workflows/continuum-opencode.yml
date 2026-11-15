@@ -4727,6 +4727,8 @@ jobs:
               echo "changed=false" >> "$GITHUB_OUTPUT"
             fi
           fi
+          echo "base_sha=${REPAIR_BASE_SHA}" >> "$GITHUB_OUTPUT"
+          echo "head_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
       - name: Ask CodeRabbit to verify every original finding
         if: github.event_name == 'workflow_dispatch' && inputs.mode == 'coderabbit-fix' && steps.unresolved_batch.outputs.skip != 'true'
@@ -4984,6 +4986,7 @@ jobs:
             }
 
       - name: Resolve merge conflict with main
+        id: resolve_conflict
         if: github.event_name == 'workflow_dispatch' && inputs.mode == 'resolve-conflict' && steps.recovery_restore.outputs.skip_opencode != 'true'
         env:
           OPENCODE_MODEL: ${{ steps.model_route.outputs.model }}
@@ -5198,18 +5201,28 @@ jobs:
           # kodmial/continuum#413: exclude only workflow-owned artifacts at
           # the publish boundary; legitimate merge edits and declared
           # submodules stay intact, and an unknown Gitlink fails closed.
+          CONFLICT_BASE_SHA="$(git rev-parse HEAD)"
           continuum_stage_publishable || exit 1
           if ! git diff --cached --quiet; then
             git commit -m "fix: resolve merge conflict with main for PR #${PR_NUMBER}" -m "Continuum-Component: opencode"
           fi
+          CONFLICT_HEAD_SHA="$(git rev-parse HEAD)"
           if [[ "$(git rev-list --count "origin/${HEAD_REF}"..HEAD)" -gt 0 ]]; then
             # kodmial/continuum#302: conflict repair publishes only to the
             # proven non-default PR head asserted on entry.
             continuum_assert_safe_push "${HEAD_REF}" || exit 1
             git push origin "HEAD:${HEAD_REF}"
           fi
+          if [[ "$CONFLICT_HEAD_SHA" != "$CONFLICT_BASE_SHA" ]]; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          fi
+          echo "base_sha=$CONFLICT_BASE_SHA" >> "$GITHUB_OUTPUT"
+          echo "head_sha=$CONFLICT_HEAD_SHA" >> "$GITHUB_OUTPUT"
 
       - name: Fix failed blocking workflow
+        id: ci_fix
         if: github.event_name == 'workflow_dispatch' && inputs.mode == 'ci-fix' && steps.recovery_restore.outputs.skip_opencode != 'true'
         env:
           OPENCODE_MODEL: ${{ steps.model_route.outputs.model }}
@@ -5429,6 +5442,13 @@ jobs:
             git push origin "HEAD:${HEAD_REF}"
           fi
           AFTER_SHA=$(git rev-parse HEAD)
+          if [[ "$AFTER_SHA" != "$BEFORE_SHA" ]]; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          fi
+          echo "base_sha=$BEFORE_SHA" >> "$GITHUB_OUTPUT"
+          echo "head_sha=$AFTER_SHA" >> "$GITHUB_OUTPUT"
 
           # If the agent correctly decided there is no code fix to make (for
           # example a transient runner/network failure), retry the evaluated
@@ -5439,6 +5459,51 @@ jobs:
             echo "OpenCode produced no new commit; retrying the evaluated workflow."
             gh run rerun "$RUN_ID" --failed || gh run rerun "$RUN_ID"
           fi
+
+      - name: Record authenticated repair publication
+        if: >-
+          success() &&
+          (steps.coderabbit_repair.outputs.changed == 'true' ||
+           steps.resolve_conflict.outputs.changed == 'true' ||
+           steps.ci_fix.outputs.changed == 'true')
+        env:
+          GH_TOKEN: ${{ secrets.TAP_PAT }}
+          CODERABBIT_BASE_SHA: ${{ steps.coderabbit_repair.outputs.base_sha }}
+          CODERABBIT_HEAD_SHA: ${{ steps.coderabbit_repair.outputs.head_sha }}
+          CONFLICT_BASE_SHA: ${{ steps.resolve_conflict.outputs.base_sha }}
+          CONFLICT_HEAD_SHA: ${{ steps.resolve_conflict.outputs.head_sha }}
+          CI_BASE_SHA: ${{ steps.ci_fix.outputs.base_sha }}
+          CI_HEAD_SHA: ${{ steps.ci_fix.outputs.head_sha }}
+          PR_NUMBER: ${{ inputs.pr_number }}
+          HEAD_REF: ${{ inputs.head_ref }}
+        run: |
+          set -euo pipefail
+          base="${CODERABBIT_BASE_SHA:-}"
+          head="${CODERABBIT_HEAD_SHA:-}"
+          if [[ -z "$base" ]]; then
+            base="${CONFLICT_BASE_SHA:-}"
+            head="${CONFLICT_HEAD_SHA:-}"
+          fi
+          if [[ -z "$base" ]]; then
+            base="${CI_BASE_SHA:-}"
+            head="${CI_HEAD_SHA:-}"
+          fi
+          [[ "$base" =~ ^[0-9a-f]{40}$ && "$head" =~ ^[0-9a-f]{40}$ ]] \
+            || { echo "::error::Repair publication has no full base/head commit; refusing to attest continuity."; exit 1; }
+          [[ "$base" != "$head" ]] \
+            || { echo "::error::Repair publication reported no new commit; refusing to attest continuity."; exit 1; }
+          [[ "$PR_NUMBER" =~ ^[1-9][0-9]*$ && -n "$HEAD_REF" ]] \
+            || { echo "::error::Repair publication has no PR or branch identity; refusing to attest continuity."; exit 1; }
+          # Commit author/committer fields are user-controlled. This status is
+          # API-authenticated and bound to the direct parent and exact pushed
+          # commit, so a manual commit cannot impersonate an automation repair.
+          gh api --method POST "repos/$GITHUB_REPOSITORY/statuses/$head" \
+            -f state=success \
+            -f context=continuum/repair-publication \
+            -f description="pr=${PR_NUMBER} base=${base:0:12} head=${head:0:12}" \
+            -f target_url="https://github.com/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
+            >/dev/null
+          echo "CREATED_REPAIR_STATUS=$head" >> "$GITHUB_OUTPUT"
 
       - name: Re-run the consumer blocking CI workflow for this head
         if: >-

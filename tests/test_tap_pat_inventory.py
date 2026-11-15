@@ -108,7 +108,9 @@ class CoverageTests(unittest.TestCase):
         # kodmial/continuum#458 adds the canary resolve/bootstrap step, which
         # creates the labelled task through the same fan-out actor the
         # scheduler observes.
-        self.assertEqual(len(bindings), 128)
+        # Authenticated repair-publication statuses add one same-repo PAT
+        # binding beside the repair push it attests.
+        self.assertEqual(len(bindings), 129)
         gaps = inventory.coverage_gaps(WORKFLOWS_DIR)
         self.assertEqual(gaps, [], f"uninventoried TAP_PAT bindings: {gaps}")
 

@@ -168,11 +168,36 @@ def publication(
     }
 
 
+def repair_status(
+    base,
+    head,
+    pr_number=41,
+    state="success",
+    context=canary.CANARY_REPAIR_STATUS_CONTEXT,
+    creator="kodmial",
+    target="https://github.com/{}/actions/runs/9001".format(
+        canary.CANARY_OWNER_REPO
+    ),
+):
+    return {
+        "context": context,
+        "state": state,
+        "description": "pr={} base={} head={}".format(
+            pr_number, base[:12], head[:12]
+        ),
+        "creator": {"login": creator},
+        "target_url": target,
+    }
+
+
 def pr_commit(
     sha,
     author="github-actions[bot]",
     committer="github-actions[bot]",
     message="fix: canary implementation",
+    parents=1,
+    verified=False,
+    statuses=(),
 ):
     identities = {
         "github-actions[bot]": (
@@ -188,18 +213,28 @@ def pr_commit(
         )
         return {"login": login, "name": name, "email": email}
 
+    commit_author = person(author) if author else {"name": "", "email": ""}
+    commit_committer = (
+        person(committer) if committer else {"name": "", "email": ""}
+    )
     return {
         "sha": sha,
         "author": person(author) if author else None,
         "committer": person(committer) if committer else None,
         "commit": {
-            "author": person(author) if author else {"name": "", "email": ""},
-            "committer": (
-                person(committer) if committer else {"name": "", "email": ""}
-            ),
+            "author": commit_author,
+            "committer": commit_committer,
             "message": message,
+            "verification": {
+                "verified": verified,
+                "reason": "valid" if verified else "unsigned",
+            },
         },
-        "parents": [],
+        "parents": [
+            {"sha": "{:040x}".format(index + 1)}
+            for index in range(parents)
+        ],
+        "statuses": list(statuses),
     }
 
 
@@ -771,19 +806,99 @@ class CompletionEvidenceTest(unittest.TestCase):
         receipt = publication(head=published)
         commits = [
             pr_commit(published, message="fix: implement issue #100"),
-            pr_commit(OTHER_HEAD, message="fix: address CodeRabbit findings"),
+            pr_commit(
+                OTHER_HEAD,
+                message="fix: address CodeRabbit findings",
+                statuses=[repair_status(published, OTHER_HEAD)],
+            ),
             pr_commit(
                 WORKER_HEAD,
+                author="kodmial",
                 committer="web-flow",
+                parents=2,
+                verified=True,
                 message="Merge branch 'main' into opencode/issue100-9001",
             ),
-            pr_commit(HEAD, message="fix: repair blocking workflow"),
+            pr_commit(
+                HEAD,
+                message="fix: repair blocking workflow",
+                statuses=[repair_status(WORKER_HEAD, HEAD)],
+            ),
         ]
         self.assertIsNone(
             canary.validate_completed_canary(
                 pr(), exact_head_runs(), 100, receipt, commits
             )
         )
+
+    def test_bot_identity_without_repair_status_fails(self):
+        published = "e" * 40
+        receipt = publication(head=published)
+        commits = [
+            pr_commit(published, message="fix: implement issue #100"),
+            pr_commit(
+                OTHER_HEAD,
+                author="github-actions[bot]",
+                committer="github-actions[bot]",
+                message="fix: manually spoofed as automation",
+            ),
+            pr_commit(HEAD),
+        ]
+        problem = canary.validate_completed_canary(
+            pr(), exact_head_runs(), 100, receipt, commits
+        )
+        self.assertIn("unauthenticated commit", problem)
+
+    def test_repair_status_must_bind_the_exact_base_and_head(self):
+        published = "e" * 40
+        receipt = publication(head=published)
+        cases = [
+            repair_status(published, HEAD),
+            repair_status(OTHER_HEAD, HEAD, pr_number=999),
+            repair_status(OTHER_HEAD, HEAD, state="pending"),
+            repair_status(OTHER_HEAD, HEAD, context="some/other-check"),
+            repair_status(OTHER_HEAD, HEAD, creator="unrelated-collaborator"),
+            repair_status(OTHER_HEAD, HEAD, target=""),
+        ]
+        for repair in cases:
+            with self.subTest(repair=repair):
+                commits = [
+                    pr_commit(published, message="fix: implement issue #100"),
+                    pr_commit(
+                        OTHER_HEAD,
+                        message="fix: address CodeRabbit findings",
+                        statuses=[repair_status(published, OTHER_HEAD)],
+                    ),
+                    pr_commit(
+                        HEAD,
+                        message="fix: repair blocking workflow",
+                        statuses=[repair],
+                    ),
+                ]
+                problem = canary.validate_completed_canary(
+                    pr(), exact_head_runs(), 100, receipt, commits
+                )
+                self.assertIn("unauthenticated commit", problem)
+
+    def test_web_editor_commit_is_not_a_main_sync_merge(self):
+        published = "e" * 40
+        receipt = publication(head=published)
+        commits = [
+            pr_commit(published, message="fix: implement issue #100"),
+            pr_commit(
+                OTHER_HEAD,
+                author="kodmial",
+                committer="web-flow",
+                parents=1,
+                verified=True,
+                message="edit from the GitHub web editor",
+            ),
+            pr_commit(HEAD),
+        ]
+        problem = canary.validate_completed_canary(
+            pr(), exact_head_runs(), 100, receipt, commits
+        )
+        self.assertIn("unauthenticated commit", problem)
 
     def test_untrusted_commit_after_publication_fails(self):
         published = "e" * 40
@@ -796,7 +911,7 @@ class CompletionEvidenceTest(unittest.TestCase):
         problem = canary.validate_completed_canary(
             pr(), exact_head_runs(), 100, receipt, commits
         )
-        self.assertIn("untrusted commit", problem)
+        self.assertIn("unauthenticated commit", problem)
 
     def test_publication_commit_must_be_in_pr_history(self):
         receipt = publication(head=OTHER_HEAD)
@@ -827,7 +942,12 @@ class CompletionEvidenceTest(unittest.TestCase):
             runs=exact_head_runs(),
             now=NOW,
             worker_publication=publication(head=published),
-            pull_request_commits=[pr_commit(published), pr_commit(HEAD)],
+            pull_request_commits=[
+                pr_commit(published),
+                pr_commit(
+                    HEAD, statuses=[repair_status(published, HEAD)]
+                ),
+            ],
         )
         self.assertTrue(decision.completed)
         self.assertEqual(decision.reason, "completed-canary")
@@ -2074,9 +2194,42 @@ class WorkflowContractTest(unittest.TestCase):
         self.assertEqual(workflow.count("def implementation_commits("), 2)
         self.assertEqual(workflow.count("implementation_commits("), 4)
         self.assertEqual(workflow.count("pulls/{}/commits?per_page=100"), 2)
-        self.assertEqual(workflow.count("--slurp"), 2)
+        self.assertEqual(workflow.count("--slurp"), 4)
         self.assertEqual(workflow.count("could not read commits"), 2)
         self.assertEqual(workflow.count("pull_request_commits=commits"), 2)
+
+    def test_workflow_reads_authenticated_repair_statuses(self):
+        """Repair commits need API-written statuses, not forgeable git fields."""
+        workflow = (
+            ROOT / ".github/workflows/continuum-contract-canary.yml"
+        ).read_text(encoding="utf-8")
+        self.assertEqual(workflow.count("commits/{}/statuses?per_page=100"), 2)
+        self.assertEqual(workflow.count("could not read commit statuses"), 2)
+        self.assertEqual(
+            workflow.count('commit["statuses"] = parsed_statuses'), 2
+        )
+
+    def test_repair_paths_publish_authenticated_status(self):
+        workflow = (
+            ROOT / ".github/workflows/continuum-opencode.yml"
+        ).read_text(encoding="utf-8")
+        self.assertIn("name: Record authenticated repair publication", workflow)
+        self.assertIn("repos/$GITHUB_REPOSITORY/statuses/$head", workflow)
+        self.assertIn("context=continuum/repair-publication", workflow)
+        self.assertIn("state=success", workflow)
+        self.assertIn("CREATED_REPAIR_STATUS", workflow)
+        for step_id in ("coderabbit_repair", "resolve_conflict", "ci_fix"):
+            self.assertIn("id: {}".format(step_id), workflow)
+            self.assertIn(
+                "steps.{}.outputs.changed".format(step_id), workflow
+            )
+            self.assertIn(
+                "steps.{}.outputs.base_sha".format(step_id), workflow
+            )
+            self.assertIn(
+                "steps.{}.outputs.head_sha".format(step_id), workflow
+            )
+        self.assertIn("pr=${PR_NUMBER} base=${base:0:12} head=${head:0:12}", workflow)
 
     def test_workflow_fails_closed_on_unreadable_worker_evidence(self):
         """A failed direct read must never fall back to the bounded snapshot.
