@@ -75,14 +75,17 @@ The probe explicitly verifies:
 - A fresh canary issue is created only when the previous one is conclusively
   complete (closed through a merged PR with exact-HEAD `CI` and `Contract
   qualification` evidence plus a successful OpenCode worker run whose id is
-  embedded in that PR's canonical implementation branch) and the documented
-  seven-day window measured from its creation has elapsed. The completion
-  record includes that worker run ID; a manually implemented PR with a closing
-  keyword alone, or whose only worker link is a matching issue title, never
-  counts as live lifecycle proof. A completed canary inside that window is
-  observed and reported with its age instead of being replaced. Older completed
-  canaries remain closed history; only more than one *open* owned canary is an
-  ownership conflict.
+  embedded in that PR's canonical implementation branch and whose own
+  canonical `OpenCode issue #N`/429-recovery title names the same issue) and
+  the documented seven-day window measured from its creation has elapsed. The
+  completion record includes that worker run ID, and the workflow fetches that
+  run directly by id so a bounded global run page cannot hide it. A manually
+  implemented PR with a closing keyword alone, or whose only worker link is a
+  matching issue title, never counts as live lifecycle proof. A delegated
+  parent/child title never binds a local canary issue. A completed canary
+  inside that window is observed and reported with its age instead of being
+  replaced. Older completed canaries remain closed history; only more than one
+  *open* owned canary is an ownership conflict.
 - Duplicate, malformed, or misplaced markers, missing labels, untrusted
   authors, more than one open owned canary, incomplete pagination, and every
   GitHub read failure
@@ -101,9 +104,9 @@ The probe explicitly verifies:
   (`MAX_CANARY_RECOVERY_ATTEMPTS`), and otherwise fails loudly.
 - The commit status is `success` only after the real canary issue is closed
   through a merged PR with exact-HEAD CI/contract evidence and a successful
-  OpenCode worker run bound to that implementation branch. A live lifecycle
-  that is
-  still progressing publishes `pending` with its observed stage and age; it is
+  OpenCode worker run whose canonical identity is bound to the issue and whose
+  id is embedded in that implementation branch. A live lifecycle that is still
+  progressing publishes `pending` with its observed stage and age; it is
   not counted as a completed end-to-end pass. The first post-merge
   run therefore reports `bootstrapped`/`pending`; only the subsequent recorded
   issue/PR/HEAD/merge/run sequence is live end-to-end proof.

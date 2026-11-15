@@ -162,6 +162,24 @@ class WorkerEvidenceTest(unittest.TestCase):
         self.assertEqual(verdict.outcome, contract.GATE_BLOCK)
         self.assertIn("worker-evidence-absent", verdict.reason)
 
+    def test_delegated_worker_run_does_not_bind_a_local_canary_issue(self):
+        evidence = self.green() + [
+            gate_evidence(
+                "Worker task [child] #100",
+                SHA_B,
+                run_id=9001,
+                display_title="Worker task [child] #100",
+            )
+        ]
+        verdict = contract.evaluate_regression_gate(
+            SHA_A,
+            evidence,
+            worker_issue_number=100,
+            worker_run_id=9001,
+        )
+        self.assertEqual(verdict.outcome, contract.GATE_BLOCK)
+        self.assertIn("worker-evidence-absent", verdict.reason)
+
     def test_recovery_worker_run_matches_the_implementation_run_id(self):
         evidence = self.green() + [
             gate_evidence(

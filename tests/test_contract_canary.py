@@ -567,6 +567,26 @@ class CompletionEvidenceTest(unittest.TestCase):
         self.assertIn("worker-evidence-absent", problem)
         self.assertIsNone(canary.completion_worker_run(100, runs, candidate))
 
+    def test_delegated_worker_run_cannot_authorize_canary_completion(self):
+        """A delegated child task's title names another repository's issue.
+
+        Only the canonical OpenCode issue/recovery identity may bind the worker
+        run to this repository's canary issue.
+        """
+        candidate = pr()
+        candidate["headRefName"] = "opencode/issue100-7777"
+        delegated = run(
+            "Worker task [child] #100",
+            head=WORKER_HEAD,
+            run_id=7777,
+            display_title="Worker task [child] #100",
+            head_branch="main",
+        )
+        runs = [run("CI"), run(contract.CONTRACT_WORKFLOW_NAME), delegated]
+        problem = canary.validate_completed_canary(candidate, runs, 100)
+        self.assertIn("worker-evidence-absent", problem)
+        self.assertIsNone(canary.completion_worker_run(100, runs, candidate))
+
     def test_another_issue_worker_run_cannot_authorize_replacement(self):
         issue = canary_issue(
             state="closed", created=8 * 24 * 60 * 60, closed=30

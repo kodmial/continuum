@@ -157,6 +157,12 @@ def _has_any_evidence(
     return any(item.workflow_name == workflow_name for item in evidence)
 
 
+#: Canonical OpenCode identities that may bind a worker run to a canary issue.
+#: Delegated parent/child titles (``Worker task [...] #N``) name another
+#: repository's issue number, so they must never bind a local canary issue.
+_WORKER_BINDING_KINDS = frozenset({"issue", "recovery"})
+
+
 def _is_worker_evidence(item: GateEvidence) -> bool:
     name = str(item.workflow_name or "").strip().lower()
     return "opencode" in name or "worker" in name
@@ -166,11 +172,17 @@ def _worker_run_binds_issue(item: GateEvidence, issue_number: int) -> bool:
     """Whether the run's own canonical title binds it to ``issue_number``.
 
     The implementation branch only proves which run id the PR claims. The run
-    itself must also be attributable to the canary issue, otherwise a manual PR
-    could reuse the id of an unrelated successful worker run.
+    itself must also be attributable to the canary issue through its canonical
+    OpenCode identity, otherwise a manual PR could reuse the id of an unrelated
+    successful worker run. A delegated parent/child title carries a different
+    repository's issue number, so it never binds this repository's canary.
     """
     binding = bind_run_to_issue({"display_title": item.display_title})
-    return binding is not None and binding.issue == issue_number
+    return (
+        binding is not None
+        and binding.kind in _WORKER_BINDING_KINDS
+        and binding.issue == issue_number
+    )
 
 
 def worker_evidence_for_issue(
@@ -181,10 +193,12 @@ def worker_evidence_for_issue(
     """Newest OpenCode worker evidence bound to ``issue_number``.
 
     A worker run proves the lifecycle only when both bindings hold: its id is
-    the id embedded in the implementation branch, and its stable display title
-    names this exact issue (or its 429 recovery). Either half alone is
-    forgeable — a title-only match never identifies the PR, and a branch-only
-    match could reuse another issue's run id — so neither is evidence.
+    the id embedded in the implementation branch, and its own canonical
+    ``OpenCode issue #N``/429-recovery title names this exact issue. Either half
+    alone is forgeable — a title-only match never identifies the PR, and a
+    branch-only match could reuse another issue's run id — so neither is
+    evidence. Delegated parent/child titles name another repository's issue and
+    never bind a local canary issue.
     """
     try:
         target = int(issue_number)
