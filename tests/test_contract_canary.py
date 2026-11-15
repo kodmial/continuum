@@ -358,6 +358,14 @@ class DiscoveryTest(unittest.TestCase):
         with self.assertRaisesRegex(canary.CanaryBootstrapError, "duplicated"):
             canary.resolve_canary([issue], now=NOW)
 
+    def test_misplaced_marker_fails_closed(self):
+        # A marker that is embedded in other text is malformed metadata. It
+        # must not be skipped, because skipping it would return
+        # "initial-bootstrap" and authorize creating another canary issue.
+        issue = canary_issue(body="metadata: " + marker())
+        with self.assertRaisesRegex(canary.CanaryBootstrapError, "misplaced"):
+            canary.resolve_canary([issue], now=NOW)
+
     def test_missing_ready_label_fails_closed(self):
         issue = canary_issue(labels=())
         with self.assertRaisesRegex(

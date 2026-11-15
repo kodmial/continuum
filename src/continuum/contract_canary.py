@@ -1205,16 +1205,24 @@ def _labels(issue: Mapping[str, Any]) -> Tuple[str, ...]:
 def _marker(body: object, expected_repo: str) -> Optional[Tuple[str, str]]:
     """Return ``(repo, task)`` for exactly one valid marker line, or ``None``.
 
-    A body with no marker at all is not canary metadata. Once any line starts
-    with the canary marker prefix, however, the body must carry exactly one
-    well-formed marker for this repository and task. Anything else is forged,
-    stale, or ambiguous metadata and fails closed.
+    A body with no marker at all is not canary metadata. Once the canary marker
+    prefix appears anywhere in the body, however, the body must carry exactly
+    one well-formed marker line that starts with that prefix, for this
+    repository and task. A prefix embedded in other text is misplaced
+    metadata, so it is rejected instead of skipped: a malformed marker must
+    never be ignored in a way that authorizes creating another canary. Anything
+    else is forged, stale, or ambiguous metadata and fails closed.
     """
-    lines = [
-        line.strip()
-        for line in str(body or "").splitlines()
-        if line.strip().startswith(CANARY_MARKER_PREFIX)
-    ]
+    lines = []
+    for raw_line in str(body or "").splitlines():
+        line = raw_line.strip()
+        if CANARY_MARKER_PREFIX not in line:
+            continue
+        if not line.startswith(CANARY_MARKER_PREFIX):
+            raise CanaryBootstrapError(
+                "canary marker is misplaced; refusing to ignore forged metadata"
+            )
+        lines.append(line)
     if not lines:
         return None
     if len(lines) != 1:

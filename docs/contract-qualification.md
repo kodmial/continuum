@@ -79,8 +79,9 @@ The probe explicitly verifies:
   and reported with its age instead of being replaced. Older completed canaries
   remain closed history; only more than one *open* owned canary is an ownership
   conflict.
-- Duplicate or malformed markers, missing labels, untrusted authors, more than
-  one open owned canary, incomplete pagination, and every GitHub read failure
+- Duplicate, malformed, or misplaced markers, missing labels, untrusted
+  authors, more than one open owned canary, incomplete pagination, and every
+  GitHub read failure
   (403/404/429/422/5xx) fail closed. Issue and pull-request inventories are
   fully paginated; a completed canary refetches runs for its exact PR HEAD so a
   bounded global run page cannot hide the evidence. The workflow never creates a
