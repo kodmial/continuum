@@ -168,6 +168,41 @@ def publication(
     }
 
 
+def pr_commit(
+    sha,
+    author="github-actions[bot]",
+    committer="github-actions[bot]",
+    message="fix: canary implementation",
+):
+    identities = {
+        "github-actions[bot]": (
+            "github-actions[bot]",
+            "41898282+github-actions[bot]@users.noreply.github.com",
+        ),
+        "web-flow": ("GitHub", "noreply@github.com"),
+    }
+
+    def person(login):
+        name, email = identities.get(
+            login, (login or "", "{}@example.com".format(login or ""))
+        )
+        return {"login": login, "name": name, "email": email}
+
+    return {
+        "sha": sha,
+        "author": person(author) if author else None,
+        "committer": person(committer) if committer else None,
+        "commit": {
+            "author": person(author) if author else {"name": "", "email": ""},
+            "committer": (
+                person(committer) if committer else {"name": "", "email": ""}
+            ),
+            "message": message,
+        },
+        "parents": [],
+    }
+
+
 def completed(candidate, runs=None, issue=100, publication_payload=None):
     """Validate canary completion with the run-scoped publication receipt."""
     pull = candidate or {}
@@ -730,6 +765,72 @@ class CompletionEvidenceTest(unittest.TestCase):
                 )
                 self.assertIsNotNone(problem)
                 self.assertIn(reason, problem)
+
+    def test_trusted_repair_commits_after_publication_pass(self):
+        published = "e" * 40
+        receipt = publication(head=published)
+        commits = [
+            pr_commit(published, message="fix: implement issue #100"),
+            pr_commit(OTHER_HEAD, message="fix: address CodeRabbit findings"),
+            pr_commit(
+                WORKER_HEAD,
+                committer="web-flow",
+                message="Merge branch 'main' into opencode/issue100-9001",
+            ),
+            pr_commit(HEAD, message="fix: repair blocking workflow"),
+        ]
+        self.assertIsNone(
+            canary.validate_completed_canary(
+                pr(), exact_head_runs(), 100, receipt, commits
+            )
+        )
+
+    def test_untrusted_commit_after_publication_fails(self):
+        published = "e" * 40
+        receipt = publication(head=published)
+        commits = [
+            pr_commit(published, message="fix: implement issue #100"),
+            pr_commit(OTHER_HEAD, committer="kodmial", author="kodmial"),
+            pr_commit(HEAD),
+        ]
+        problem = canary.validate_completed_canary(
+            pr(), exact_head_runs(), 100, receipt, commits
+        )
+        self.assertIn("untrusted commit", problem)
+
+    def test_publication_commit_must_be_in_pr_history(self):
+        receipt = publication(head=OTHER_HEAD)
+        commits = [
+            pr_commit("e" * 40),
+            pr_commit(HEAD),
+        ]
+        problem = canary.validate_completed_canary(
+            pr(), exact_head_runs(), 100, receipt, commits
+        )
+        self.assertIn("outside the final PR history", problem)
+
+    def test_publication_repair_without_commit_history_fails(self):
+        receipt = publication(head=OTHER_HEAD)
+        problem = canary.validate_completed_canary(
+            pr(), exact_head_runs(), 100, receipt
+        )
+        self.assertIn("without a PR commit history", problem)
+
+    def test_closed_canary_completion_accepts_trusted_repair_history(self):
+        issue = canary_issue(
+            state="closed", created=2 * 24 * 60 * 60, closed=30
+        )
+        published = "e" * 40
+        decision = canary.resolve_canary(
+            [issue],
+            pull_requests=[pr()],
+            runs=exact_head_runs(),
+            now=NOW,
+            worker_publication=publication(head=published),
+            pull_request_commits=[pr_commit(published), pr_commit(HEAD)],
+        )
+        self.assertTrue(decision.completed)
+        self.assertEqual(decision.reason, "completed-canary")
 
     def test_bound_worker_run_fetch_replaces_the_snapshot_record(self):
         snapshot = [
@@ -1964,6 +2065,18 @@ class WorkflowContractTest(unittest.TestCase):
         self.assertEqual(
             workflow.count("CANARY_PUBLICATION_ARTIFACT_PREFIX"), 2
         )
+
+    def test_workflow_reads_pr_commits_for_trusted_continuity(self):
+        """A worker-published commit may be followed by trusted repairs."""
+        workflow = (
+            ROOT / ".github/workflows/continuum-contract-canary.yml"
+        ).read_text(encoding="utf-8")
+        self.assertEqual(workflow.count("def implementation_commits("), 2)
+        self.assertEqual(workflow.count("implementation_commits("), 4)
+        self.assertEqual(workflow.count("pulls/{}/commits?per_page=100"), 2)
+        self.assertEqual(workflow.count("--slurp"), 2)
+        self.assertEqual(workflow.count("could not read commits"), 2)
+        self.assertEqual(workflow.count("pull_request_commits=commits"), 2)
 
     def test_workflow_fails_closed_on_unreadable_worker_evidence(self):
         """A failed direct read must never fall back to the bounded snapshot.

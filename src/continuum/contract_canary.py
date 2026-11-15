@@ -59,6 +59,19 @@ CANARY_MARKER_PREFIX = "<!-- continuum-contract-canary"
 
 _TRUSTED_ASSOCIATIONS = frozenset({"OWNER", "MEMBER", "COLLABORATOR"})
 _TRUSTED_LOGINS = frozenset({"github-actions[bot]"})
+#: Committers allowed to extend a worker-published commit before completion.
+#: ``github-actions[bot]`` owns every Continuum repair commit, while
+#: ``web-flow`` is the GitHub merge actor used for native main-sync commits.
+_TRUSTED_COMMIT_LOGINS = frozenset({"github-actions[bot]", "web-flow"})
+_TRUSTED_COMMIT_IDENTITIES = frozenset(
+    {
+        (
+            "github-actions[bot]",
+            "41898282+github-actions[bot]@users.noreply.github.com",
+        ),
+        ("GitHub", "noreply@github.com"),
+    }
+)
 _MARKER_RE = re.compile(
     r"\A<!-- continuum-contract-canary "
     r"repo=(?P<repo>[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+) "
@@ -1421,12 +1434,103 @@ def _positive_int(value: object) -> Optional[int]:
     return number if number > 0 else None
 
 
+def _commit_sha(commit: object) -> str:
+    if not isinstance(commit, Mapping):
+        return ""
+    return str(commit.get("sha") or commit.get("oid") or "").strip().lower()
+
+
+def _commit_person(
+    commit: Mapping[str, Any], role: str
+) -> Tuple[str, str, str]:
+    """Return normalized ``(login, name, email)`` for one commit identity."""
+    direct = commit.get(role)
+    login = name = email = ""
+    if isinstance(direct, Mapping):
+        login = str(direct.get("login") or "").strip().lower()
+        name = str(direct.get("name") or "").strip()
+        email = str(direct.get("email") or "").strip().lower()
+    else:
+        login = str(commit.get(role + "_login") or "").strip().lower()
+        name = str(commit.get(role + "_name") or "").strip()
+        email = str(commit.get(role + "_email") or "").strip().lower()
+    payload = commit.get("commit")
+    if isinstance(payload, Mapping):
+        nested = payload.get(role)
+        if isinstance(nested, Mapping):
+            name = name or str(nested.get("name") or "").strip()
+            email = email or str(nested.get("email") or "").strip().lower()
+    return login, name, email
+
+
+def _is_trusted_automation_commit(commit: object) -> bool:
+    if not isinstance(commit, Mapping):
+        return False
+    login, name, email = _commit_person(commit, "committer")
+    if login in _TRUSTED_COMMIT_LOGINS:
+        return True
+    return (name, email) in _TRUSTED_COMMIT_IDENTITIES
+
+
+def _validate_publication_continuity(
+    head: str,
+    published: str,
+    commits: Sequence[Mapping[str, Any]],
+) -> Optional[str]:
+    """Return a failure reason unless trusted commits connect published to head.
+
+    The worker receipt names the commit the worker actually published. A later
+    CodeRabbit/CI repair or a native main-sync may advance the same PR branch
+    before merge. Completion may only cross that gap through the PR's own
+    commit history, and every commit after the published one must be a trusted
+    automation commit (the Actions bot or GitHub's ``web-flow`` merge actor).
+    """
+    entries = [
+        commit for commit in commits or [] if isinstance(commit, Mapping)
+    ]
+    if not entries:
+        return (
+            "worker publication receipt published another commit without a "
+            "PR commit history to prove trusted continuity"
+        )
+    indices = {}
+    for index, commit in enumerate(entries):
+        sha = _commit_sha(commit)
+        if sha:
+            indices.setdefault(sha, index)
+    if head not in indices:
+        return (
+            "worker publication receipt PR history does not contain the final "
+            "head"
+        )
+    if published not in indices:
+        return (
+            "worker publication receipt published a commit outside the final "
+            "PR history"
+        )
+    start = indices[published]
+    end = indices[head]
+    if start >= end:
+        return (
+            "worker publication receipt published a commit that is not behind "
+            "the final head"
+        )
+    for commit in entries[start + 1 : end + 1]:
+        if not _is_trusted_automation_commit(commit):
+            return (
+                "worker publication receipt has untrusted commit {} after "
+                "publication".format(_commit_sha(commit) or "<unknown>")
+            )
+    return None
+
+
 def validate_worker_publication(
     pull_request: Optional[Mapping[str, Any]],
     worker_run: Optional[Mapping[str, Any]],
     publication: object,
     issue_number: int,
     expected_repo: str = CANARY_OWNER_REPO,
+    pull_request_commits: Sequence[Mapping[str, Any]] = (),
 ) -> Optional[str]:
     """Return a failure reason unless the worker run published this PR.
 
@@ -1437,8 +1541,12 @@ def validate_worker_publication(
     The receipt binds the run id, canonical task branch, issue, PR number, and
     published commit; only the owning run can attach an artifact to itself, so
     a manual PR that merely reuses a run id in its branch name is not lifecycle
-    evidence, and a run that published an older commit cannot stand in for the
-    exact head the completion checks target.
+    evidence. The published commit may sit behind the final head when trusted
+    automation added repair or main-sync commits afterwards. In that case the
+    PR's commit history must prove continuity from the published commit to the
+    final head, with every later commit authored by trusted automation; the
+    exact-head CI and contract checks still target the final head. A published
+    commit that cannot be connected that way never satisfies the receipt.
     """
     if not pull_request:
         return "no implementation PR carries the worker publication receipt"
@@ -1476,7 +1584,11 @@ def validate_worker_publication(
     if not is_full_sha(published):
         return "worker publication receipt has no full published commit"
     if published != head:
-        return "worker publication receipt published another commit"
+        continuity = _validate_publication_continuity(
+            head, published, pull_request_commits
+        )
+        if continuity:
+            return continuity
     return None
 
 
@@ -1649,6 +1761,7 @@ def validate_completed_canary(
     runs: Sequence[Mapping[str, Any]],
     issue_number: int,
     worker_publication: object = None,
+    pull_request_commits: Sequence[Mapping[str, Any]] = (),
 ) -> Optional[str]:
     """Return a failure reason unless a completed canary PR has exact-HEAD evidence.
 
@@ -1663,9 +1776,11 @@ def validate_completed_canary(
     receipt that the worker uploads only when it publishes this exact PR. So
     neither a manual PR with only a closing keyword, a PR reusing an unrelated
     issue's run id, nor a PR borrowing the id of a successful no-op run ever
-    satisfies it. Evidence for any other SHA is stale and never satisfies the
-    check; a manually implemented PR with no worker run is not live lifecycle
-    proof.
+    satisfies it. A worker-published commit may sit behind the final head when
+    trusted automation later repairs the branch; ``pull_request_commits`` must
+    then prove that every intervening commit is trusted automation. Evidence
+    for any other SHA is stale and never satisfies the check; a manually
+    implemented PR with no worker run is not live lifecycle proof.
     """
     if not pull_request:
         return "no merged implementation PR references the canary issue"
@@ -1713,6 +1828,7 @@ def validate_completed_canary(
         completion_worker_run(issue_number, runs, pull_request),
         worker_publication,
         issue_number,
+        pull_request_commits=pull_request_commits,
     )
     if publication_problem:
         return publication_problem
@@ -1729,6 +1845,7 @@ def resolve_canary(
     read_error: object = None,
     pagination_complete: bool = True,
     worker_publication: object = None,
+    pull_request_commits: Sequence[Mapping[str, Any]] = (),
 ) -> CanaryDecision:
     """Decide whether to observe the existing canary or create a fresh one.
 
@@ -1737,6 +1854,9 @@ def resolve_canary(
     closed and never creates a duplicate issue. ``worker_publication`` is the
     run-scoped publication receipt fetched from the bound worker run; without
     it a closed canary is not trustworthy completion evidence.
+    ``pull_request_commits`` is that implementation PR's commit history, used
+    to prove trusted continuity when automation repaired the branch after the
+    worker published it.
     """
     if read_error not in (None, ""):
         raise CanaryBootstrapError(
@@ -1817,7 +1937,11 @@ def resolve_canary(
             )
         )
     problem = validate_completed_canary(
-        implementation_pr, runs, issue.number, worker_publication
+        implementation_pr,
+        runs,
+        issue.number,
+        worker_publication,
+        pull_request_commits,
     )
     if problem:
         raise CanaryBootstrapError(

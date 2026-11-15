@@ -154,6 +154,46 @@ jobs:
               with open(os.path.join(root, name), "w", encoding="utf-8") as handle:
                   json.dump(payload, handle, sort_keys=True)
 
+          def implementation_commits(number):
+              """Return the implementation PR's full commit history.
+
+              Trusted continuity is judged from GitHub's own PR commit order, so
+              a failed or malformed read is fatal instead of silently accepting
+              a receipt that only names an older commit.
+              """
+              if not number:
+                  return []
+              proc = subprocess.run(
+                  [
+                      "gh", "api", "--paginate", "--slurp",
+                      "repos/{}/pulls/{}/commits?per_page=100".format(
+                          os.environ["GITHUB_REPOSITORY"], number
+                      ),
+                  ],
+                  check=False, capture_output=True, text=True,
+              )
+              if proc.returncode != 0:
+                  raise SystemExit(
+                      "could not read commits for implementation PR #{}; "
+                      "refusing incomplete publication continuity: {}".format(
+                          number, (proc.stderr or "").strip()[:500]
+                      )
+                  )
+              try:
+                  pages = json.loads(proc.stdout)
+              except ValueError:
+                  raise SystemExit(
+                      "implementation PR #{} commit history could not be "
+                      "parsed".format(number)
+                  )
+              commits = []
+              for page in pages if isinstance(pages, list) else [pages]:
+                  if isinstance(page, list):
+                      commits.extend(page)
+                  elif isinstance(page, dict):
+                      commits.append(page)
+              return commits
+
           def worker_publication(run_id):
               """Return the run-scoped publication receipt, or None when absent.
 
@@ -230,8 +270,10 @@ jobs:
           # rather than trusting a bounded global run page.
           candidate = canary.select_canary_issue(issues, expected_repo=repo)
           publication = None
+          commits = []
           if candidate is not None and candidate.state == "closed":
               latest = canary.select_implementation_pr(candidate.number, pulls)
+              commits = implementation_commits((latest or {}).get("number"))
               head = str((latest or {}).get("headRefOid") or "").strip().lower()
               if head:
                   proc = subprocess.run(
@@ -281,6 +323,7 @@ jobs:
               expected_repo=repo,
               now=datetime.now(timezone.utc),
               worker_publication=publication,
+              pull_request_commits=commits,
           )
           payload = {
               "action": decision.action,
@@ -431,6 +474,46 @@ jobs:
               with open(os.path.join(root, name), "w", encoding="utf-8") as handle:
                   json.dump(payload, handle, sort_keys=True)
 
+          def implementation_commits(number):
+              """Return the implementation PR's full commit history.
+
+              Trusted continuity is judged from GitHub's own PR commit order, so
+              a failed or malformed read is fatal instead of silently accepting
+              a receipt that only names an older commit.
+              """
+              if not number:
+                  return []
+              proc = subprocess.run(
+                  [
+                      "gh", "api", "--paginate", "--slurp",
+                      "repos/{}/pulls/{}/commits?per_page=100".format(
+                          os.environ["GITHUB_REPOSITORY"], number
+                      ),
+                  ],
+                  check=False, capture_output=True, text=True,
+              )
+              if proc.returncode != 0:
+                  raise SystemExit(
+                      "could not read commits for implementation PR #{}; "
+                      "refusing incomplete publication continuity: {}".format(
+                          number, (proc.stderr or "").strip()[:500]
+                      )
+                  )
+              try:
+                  pages = json.loads(proc.stdout)
+              except ValueError:
+                  raise SystemExit(
+                      "implementation PR #{} commit history could not be "
+                      "parsed".format(number)
+                  )
+              commits = []
+              for page in pages if isinstance(pages, list) else [pages]:
+                  if isinstance(page, list):
+                      commits.extend(page)
+                  elif isinstance(page, dict):
+                      commits.append(page)
+              return commits
+
           def worker_publication(run_id):
               """Return the run-scoped publication receipt, or None when absent.
 
@@ -533,6 +616,7 @@ jobs:
               raise SystemExit("live canary failed: " + observed.failure)
           if observed.completed:
               latest = canary.select_implementation_pr(issue_number, pulls)
+              commits = implementation_commits((latest or {}).get("number"))
               head = str((latest or {}).get("headRefOid") or "").strip().lower()
               if head:
                   proc = subprocess.run(
@@ -578,7 +662,8 @@ jobs:
               worker = canary.completion_worker_run(issue_number, runs, latest) or {}
               worker_run_id = worker.get("databaseId") or worker.get("id")
               problem = canary.validate_completed_canary(
-                  latest, runs, issue_number, publication
+                  latest, runs, issue_number, publication,
+                  pull_request_commits=commits,
               )
               if problem:
                   raise SystemExit("live canary completion is not trustworthy: " + problem)

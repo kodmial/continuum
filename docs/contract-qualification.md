@@ -78,9 +78,10 @@ The probe explicitly verifies:
   embedded in that PR's canonical implementation branch, whose own canonical
   `OpenCode issue #N`/429-recovery title names the same issue, and whose
   run-scoped publication receipt names that exact branch, pull request, and
-  published head commit) and
-  the documented seven-day window measured from its creation has elapsed. The
-  completion record includes that worker run ID, and the workflow fetches that
+  published head commit; later repair or main-sync commits may advance that
+  head only when the PR's commit history proves they are trusted automation)
+  and the documented seven-day window measured from its creation has elapsed.
+  The completion record includes that worker run ID, and the workflow fetches that
   run directly by id so a bounded global run page cannot hide it. The worker
   uploads the publication receipt as a workflow artifact only when it publishes
   the task PR; the canary downloads it from the bound run, so a successful run
@@ -113,7 +114,9 @@ The probe explicitly verifies:
   through a merged PR with exact-HEAD CI/contract evidence and a successful
   OpenCode worker run whose canonical identity is bound to the issue, whose id
   is embedded in that implementation branch, and whose run-scoped publication
-  receipt names that branch, pull request, and published head commit. A live
+  receipt names that branch, pull request, and published head commit; any later
+  repair or main-sync commit must be trusted automation in the PR's own commit
+  history. A live
   lifecycle that is still
   progressing publishes `pending` with its observed stage and age; it is
   not counted as a completed end-to-end pass. The first post-merge
