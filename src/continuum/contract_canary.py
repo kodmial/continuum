@@ -1393,6 +1393,20 @@ def _implementation_worker_run_id(
     return int(match.group("run"))
 
 
+def completion_worker_run_id(
+    pull_request: Optional[Mapping[str, Any]], issue_number: int
+) -> Optional[int]:
+    """Worker run id bound by the implementation branch, if it carries one.
+
+    Completion callers use this to fetch the bound run directly, so a worker
+    run that falls outside a bounded global inventory is still retrievable by
+    its trusted id instead of looking absent.
+    """
+    if not pull_request:
+        return None
+    return _implementation_worker_run_id(pull_request, issue_number)
+
+
 def select_implementation_pr(
     issue_number: int,
     pull_requests: Sequence[Mapping[str, Any]],
@@ -1466,6 +1480,34 @@ def _evidence_run_id(run: Mapping[str, Any]) -> Optional[int]:
     return None
 
 
+def merge_bound_worker_run(
+    runs: Sequence[Mapping[str, Any]],
+    worker_run: Mapping[str, Any],
+) -> list:
+    """Replace one snapshot worker record with a direct by-id fetch.
+
+    The bounded global run inventory can omit a worker run that finished before
+    the implementation commit existed, where an exact-HEAD lookup cannot find
+    it either. Completion therefore fetches the run id embedded in the
+    implementation branch directly. Keeping exactly one record per run id
+    prevents a stale snapshot row from shadowing the fetched evidence.
+    """
+    snapshot = list(runs or [])
+    if not isinstance(worker_run, Mapping):
+        return snapshot
+    bound = _evidence_run_id(worker_run)
+    if bound is None:
+        return snapshot
+    snapshot = [
+        run
+        for run in snapshot
+        if not (
+            isinstance(run, Mapping) and _evidence_run_id(run) == bound
+        )
+    ]
+    return snapshot + [worker_run]
+
+
 def _gate_evidence(runs: Sequence[Mapping[str, Any]]) -> list:
     evidence = []
     for run in runs or []:
@@ -1503,10 +1545,10 @@ def completion_worker_run(
 
     Completion records this run's id, so selection must use the same
     issue-bound OpenCode worker evidence as :func:`validate_completed_canary`.
-    The implementation branch embeds the publishing run id, which binds the
-    run to this PR even when a recovery run uses a non-canonical display
-    title. A PR without that binding has no worker evidence to record, so a
-    run whose title merely names the issue is never selected.
+    The implementation branch embeds the publishing run id, and the run's own
+    canonical title must bind that id to this issue. A PR without that binding
+    has no worker evidence to record, so a run whose title merely names the
+    issue is never selected.
     """
     expected = (
         _implementation_worker_run_id(pull_request, issue_number)
@@ -1540,12 +1582,13 @@ def validate_completed_canary(
     is attributed to that issue by the lifecycle, is merged, carries a full
     head and merge commit, has completed successful ``CI`` and ``Contract
     qualification`` runs for that exact head, and has a completed successful
-    OpenCode worker run bound to the canary issue. The binding is the worker
-    run id embedded in the canonical ``opencode/issue<N>-<run>`` branch, so a
-    manual PR with only a closing keyword never satisfies it even when an
-    unrelated worker run carries the issue title. Evidence for any other SHA
-    is stale and never satisfies the check; a manually implemented PR with no
-    worker run is not live lifecycle proof.
+    OpenCode worker run bound to the canary issue. The binding has two halves:
+    the run id embedded in the canonical ``opencode/issue<N>-<run>`` branch and
+    the run's own canonical title naming this issue (its ``OpenCode issue #N``
+    or 429 recovery identity), so neither a manual PR with only a closing
+    keyword nor a PR reusing an unrelated issue's run id ever satisfies it.
+    Evidence for any other SHA is stale and never satisfies the check; a
+    manually implemented PR with no worker run is not live lifecycle proof.
     """
     if not pull_request:
         return "no merged implementation PR references the canary issue"

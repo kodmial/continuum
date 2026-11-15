@@ -35,6 +35,8 @@ import re
 from dataclasses import dataclass
 from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
+from .opencode_cancel import bind_run_to_issue
+
 #: Workflow name surfaced by the reusable contract-qualification workflow.
 #: Both merge reconcilers require a successful run of exactly this workflow
 #: for the exact PR HEAD. The name is part of the merge contract.
@@ -160,6 +162,17 @@ def _is_worker_evidence(item: GateEvidence) -> bool:
     return "opencode" in name or "worker" in name
 
 
+def _worker_run_binds_issue(item: GateEvidence, issue_number: int) -> bool:
+    """Whether the run's own canonical title binds it to ``issue_number``.
+
+    The implementation branch only proves which run id the PR claims. The run
+    itself must also be attributable to the canary issue, otherwise a manual PR
+    could reuse the id of an unrelated successful worker run.
+    """
+    binding = bind_run_to_issue({"display_title": item.display_title})
+    return binding is not None and binding.issue == issue_number
+
+
 def worker_evidence_for_issue(
     evidence: Sequence[GateEvidence],
     issue_number: object,
@@ -167,10 +180,11 @@ def worker_evidence_for_issue(
 ) -> Optional[GateEvidence]:
     """Newest OpenCode worker evidence bound to ``issue_number``.
 
-    A worker run proves the lifecycle only when its id is the id embedded in
-    the implementation branch. The stable display title alone mentions an
-    issue; it does not establish that the run produced the implementation PR,
-    so a title-only match is never evidence.
+    A worker run proves the lifecycle only when both bindings hold: its id is
+    the id embedded in the implementation branch, and its stable display title
+    names this exact issue (or its 429 recovery). Either half alone is
+    forgeable — a title-only match never identifies the PR, and a branch-only
+    match could reuse another issue's run id — so neither is evidence.
     """
     try:
         target = int(issue_number)
@@ -187,7 +201,9 @@ def worker_evidence_for_issue(
     candidates = [
         item
         for item in evidence
-        if _is_worker_evidence(item) and item.run_id == expected
+        if _is_worker_evidence(item)
+        and item.run_id == expected
+        and _worker_run_binds_issue(item, target)
     ]
     if not candidates:
         return None
@@ -214,12 +230,13 @@ def evaluate_regression_gate(
 
     When ``worker_issue_number`` is supplied, the same verdict additionally
     requires a completed ``success`` OpenCode worker run whose id matches
-    ``worker_run_id``, the id embedded in the implementation branch. The
-    worker's display title is metadata only: a title that names the issue
-    never binds a run to the implementation PR, so completion stays blocked
-    until the branch itself proves the run. Canary completion uses this to
-    reject a manually implemented PR that never exercised the real worker
-    lifecycle; ordinary PR merge paths leave it disabled.
+    ``worker_run_id`` (the id embedded in the implementation branch) and whose
+    canonical title binds it to ``worker_issue_number``. A title that merely
+    names the issue never binds a run to the implementation PR, and a branch id
+    alone could reuse another issue's run, so completion stays blocked until
+    both halves of the binding hold. Canary completion uses this to reject a
+    manually implemented PR that never exercised the real worker lifecycle;
+    ordinary PR merge paths leave it disabled.
     """
     try:
         head = normalize_sha(pr_head_sha)

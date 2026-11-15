@@ -177,6 +177,24 @@ jobs:
                   runs = canary.merge_exact_head_runs(
                       runs, head, json.loads(proc.stdout)
                   )
+              # The bounded global run page can miss the worker run, and an
+              # exact-HEAD lookup cannot find a run that finished before the
+              # implementation commit existed. Fetch the id embedded in the
+              # implementation branch directly.
+              bound = canary.completion_worker_run_id(latest, candidate.number)
+              if bound is not None:
+                  proc = subprocess.run(
+                      [
+                          "gh", "run", "view", str(bound),
+                          "--repo", os.environ["GITHUB_REPOSITORY"],
+                          "--json", "databaseId,status,conclusion,createdAt,startedAt,headBranch,displayTitle,name,workflowName,headSha,event",
+                      ],
+                      check=False, capture_output=True, text=True,
+                  )
+                  if proc.returncode == 0:
+                      runs = canary.merge_bound_worker_run(
+                          runs, json.loads(proc.stdout)
+                      )
 
           decision = canary.resolve_canary(
               issues,
@@ -382,6 +400,24 @@ jobs:
                   runs = canary.merge_exact_head_runs(
                       runs, head, json.loads(proc.stdout)
                   )
+              # The bounded global run page can miss the worker run, and an
+              # exact-HEAD lookup cannot find a run that finished before the
+              # implementation commit existed. Fetch the id embedded in the
+              # implementation branch directly.
+              bound = canary.completion_worker_run_id(latest, issue_number)
+              if bound is not None:
+                  proc = subprocess.run(
+                      [
+                          "gh", "run", "view", str(bound),
+                          "--repo", os.environ["GITHUB_REPOSITORY"],
+                          "--json", "databaseId,status,conclusion,createdAt,startedAt,headBranch,displayTitle,name,workflowName,headSha,event",
+                      ],
+                      check=False, capture_output=True, text=True,
+                  )
+                  if proc.returncode == 0:
+                      runs = canary.merge_bound_worker_run(
+                          runs, json.loads(proc.stdout)
+                      )
               worker = canary.completion_worker_run(issue_number, runs, latest) or {}
               worker_run_id = worker.get("databaseId") or worker.get("id")
               problem = canary.validate_completed_canary(latest, runs, issue_number)

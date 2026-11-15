@@ -509,6 +509,13 @@ class CompletionEvidenceTest(unittest.TestCase):
         selected = canary.completion_worker_run(100, exact_head_runs(), pr())
         self.assertEqual(selected["databaseId"], WORKER_RUN_ID)
 
+    def test_completion_worker_run_id_is_read_from_the_branch(self):
+        self.assertEqual(
+            canary.completion_worker_run_id(pr(), 100), WORKER_RUN_ID
+        )
+        self.assertIsNone(canary.completion_worker_run_id(pr(), 999))
+        self.assertIsNone(canary.completion_worker_run_id(None, 100))
+
     def test_recovery_worker_run_is_tied_by_implementation_branch(self):
         candidate = pr()
         candidate["headRefName"] = "opencode/issue100-{}".format(WORKER_RUN_ID)
@@ -542,6 +549,77 @@ class CompletionEvidenceTest(unittest.TestCase):
         ]
         problem = canary.validate_completed_canary(candidate, runs, 100)
         self.assertIn("worker-evidence-absent", problem)
+
+    def test_branch_bound_run_of_another_issue_is_not_completion_evidence(self):
+        """A manual PR must not reuse another issue's successful run id.
+
+        The implementation branch can claim any run id, so the run itself has
+        to bind to the canary issue through its own canonical title.
+        """
+        candidate = pr()
+        candidate["headRefName"] = "opencode/issue100-7777"
+        runs = [
+            run("CI"),
+            run(contract.CONTRACT_WORKFLOW_NAME),
+            worker_run(issue=999, run_id=7777),
+        ]
+        problem = canary.validate_completed_canary(candidate, runs, 100)
+        self.assertIn("worker-evidence-absent", problem)
+        self.assertIsNone(canary.completion_worker_run(100, runs, candidate))
+
+    def test_another_issue_worker_run_cannot_authorize_replacement(self):
+        issue = canary_issue(
+            state="closed", created=8 * 24 * 60 * 60, closed=30
+        )
+        candidate = pr()
+        candidate["headRefName"] = "opencode/issue100-7777"
+        with self.assertRaisesRegex(
+            canary.CanaryBootstrapError, "not trustworthy"
+        ):
+            canary.resolve_canary(
+                [issue],
+                pull_requests=[candidate],
+                runs=[
+                    run("CI"),
+                    run(contract.CONTRACT_WORKFLOW_NAME),
+                    worker_run(issue=999, run_id=7777),
+                ],
+                now=NOW,
+            )
+
+    def test_bound_worker_run_is_retrievable_by_id_outside_the_snapshot(self):
+        """Completion must fetch the branch-bound run instead of trusting a page.
+
+        The bounded global inventory can omit a worker run that finished before
+        the implementation commit existed, where the exact-HEAD lookup cannot
+        find it either.
+        """
+        snapshot = [run("CI"), run(contract.CONTRACT_WORKFLOW_NAME)]
+        problem = canary.validate_completed_canary(pr(), snapshot, 100)
+        self.assertIn("worker-evidence-absent", problem)
+        merged = canary.merge_bound_worker_run(snapshot, worker_run())
+        self.assertIsNone(canary.validate_completed_canary(pr(), merged, 100))
+        self.assertEqual(
+            canary.completion_worker_run(100, merged, pr())["databaseId"],
+            WORKER_RUN_ID,
+        )
+
+    def test_bound_worker_run_fetch_replaces_the_snapshot_record(self):
+        snapshot = [
+            run("CI"),
+            run(contract.CONTRACT_WORKFLOW_NAME),
+            worker_run(status="in_progress", conclusion=None),
+        ]
+        merged = canary.merge_bound_worker_run(snapshot, worker_run())
+        self.assertEqual(
+            [
+                item
+                for item in merged
+                if item.get("databaseId") == WORKER_RUN_ID
+            ],
+            [worker_run()],
+        )
+        self.assertIsNone(canary.validate_completed_canary(pr(), merged, 100))
 
     def test_closed_canary_without_worker_evidence_fails_closed(self):
         issue = canary_issue(
@@ -1761,6 +1839,9 @@ class WorkflowContractTest(unittest.TestCase):
         self.assertIn("canary.completion_worker_run(", workflow)
         self.assertIn("run=worker_run_id", workflow)
         self.assertIn("OpenCode worker evidence", workflow)
+        self.assertEqual(workflow.count("canary.completion_worker_run_id("), 2)
+        self.assertEqual(workflow.count("canary.merge_bound_worker_run("), 2)
+        self.assertIn('"run", "view"', workflow)
 
     def test_workflow_preserves_review_decision_for_the_merge_stage(self):
         """The REST pulls inventory must still carry the review decision.
