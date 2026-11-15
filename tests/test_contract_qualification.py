@@ -113,12 +113,12 @@ class WorkerEvidenceTest(unittest.TestCase):
 
     def test_required_worker_evidence_absent_blocks(self):
         verdict = contract.evaluate_regression_gate(
-            SHA_A, self.green(), worker_issue_number=100
+            SHA_A, self.green(), worker_issue_number=100, worker_run_id=9001
         )
         self.assertEqual(verdict.outcome, contract.GATE_BLOCK)
         self.assertIn("worker-evidence-absent", verdict.reason)
 
-    def test_required_worker_evidence_success_passes(self):
+    def test_worker_title_alone_does_not_bind_a_run(self):
         evidence = self.green() + [
             gate_evidence(
                 "OpenCode agent",
@@ -130,6 +130,21 @@ class WorkerEvidenceTest(unittest.TestCase):
         verdict = contract.evaluate_regression_gate(
             SHA_A, evidence, worker_issue_number=100
         )
+        self.assertEqual(verdict.outcome, contract.GATE_BLOCK)
+        self.assertIn("worker-evidence-unbound", verdict.reason)
+
+    def test_required_worker_evidence_success_passes(self):
+        evidence = self.green() + [
+            gate_evidence(
+                "OpenCode agent",
+                SHA_B,
+                run_id=9001,
+                display_title="OpenCode issue #100",
+            )
+        ]
+        verdict = contract.evaluate_regression_gate(
+            SHA_A, evidence, worker_issue_number=100, worker_run_id=9001
+        )
         self.assertEqual(verdict.outcome, contract.GATE_PASS)
 
     def test_worker_evidence_from_another_issue_does_not_pass(self):
@@ -137,12 +152,12 @@ class WorkerEvidenceTest(unittest.TestCase):
             gate_evidence(
                 "OpenCode agent",
                 SHA_B,
-                run_id=9001,
+                run_id=9999,
                 display_title="OpenCode issue #999",
             )
         ]
         verdict = contract.evaluate_regression_gate(
-            SHA_A, evidence, worker_issue_number=100
+            SHA_A, evidence, worker_issue_number=100, worker_run_id=9001
         )
         self.assertEqual(verdict.outcome, contract.GATE_BLOCK)
         self.assertIn("worker-evidence-absent", verdict.reason)

@@ -1503,14 +1503,18 @@ def completion_worker_run(
 
     Completion records this run's id, so selection must use the same
     issue-bound OpenCode worker evidence as :func:`validate_completed_canary`.
-    An implementation branch embeds the worker run id, which also binds
-    recovery runs whose display title is not the canonical issue title.
+    The implementation branch embeds the publishing run id, which binds the
+    run to this PR even when a recovery run uses a non-canonical display
+    title. A PR without that binding has no worker evidence to record, so a
+    run whose title merely names the issue is never selected.
     """
     expected = (
         _implementation_worker_run_id(pull_request, issue_number)
         if pull_request
         else None
     )
+    if expected is None:
+        return None
     selected = worker_evidence_for_issue(
         _gate_evidence(runs), issue_number, run_id=expected
     )
@@ -1536,7 +1540,10 @@ def validate_completed_canary(
     is attributed to that issue by the lifecycle, is merged, carries a full
     head and merge commit, has completed successful ``CI`` and ``Contract
     qualification`` runs for that exact head, and has a completed successful
-    OpenCode worker run bound to the canary issue. Evidence for any other SHA
+    OpenCode worker run bound to the canary issue. The binding is the worker
+    run id embedded in the canonical ``opencode/issue<N>-<run>`` branch, so a
+    manual PR with only a closing keyword never satisfies it even when an
+    unrelated worker run carries the issue title. Evidence for any other SHA
     is stale and never satisfies the check; a manually implemented PR with no
     worker run is not live lifecycle proof.
     """
@@ -1565,6 +1572,11 @@ def validate_completed_canary(
         return "merged implementation PR has no full merge commit"
     evidence = _gate_evidence(runs)
     worker_run_id = _implementation_worker_run_id(pull_request, issue_number)
+    if worker_run_id is None:
+        return (
+            "merged implementation PR has no worker run binding; expected the "
+            "canonical opencode/issue{}-<run> branch".format(issue_number)
+        )
     verdict = evaluate_regression_gate(
         head,
         evidence,

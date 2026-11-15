@@ -77,13 +77,14 @@ def pr(
     head=HEAD,
     merge=MERGE,
     updated=30,
+    issue=100,
 ):
     return {
         "number": number,
         "state": state,
         "body": body,
         "title": "fix: canary fixture",
-        "headRefName": "opencode/issue100-canary",
+        "headRefName": "opencode/issue{}-{}".format(issue, WORKER_RUN_ID),
         "headRefOid": head,
         "mergeCommit": {"oid": merge},
         "mergedAt": iso(updated) if merged_at is None else merged_at,
@@ -220,6 +221,7 @@ class DiscoveryTest(unittest.TestCase):
         self.assertEqual(
             canary.select_implementation_pr(100, [candidate])["number"], 41
         )
+        candidate["headRefName"] = "opencode/issue100-{}".format(WORKER_RUN_ID)
         decision = canary.resolve_canary(
             [issue], pull_requests=[candidate], runs=exact_head_runs(), now=NOW
         )
@@ -241,6 +243,7 @@ class DiscoveryTest(unittest.TestCase):
         self.assertEqual(
             canary.select_implementation_pr(100, [candidate])["number"], 41
         )
+        candidate["headRefName"] = "opencode/issue100-{}".format(WORKER_RUN_ID)
         decision = canary.resolve_canary(
             [issue], pull_requests=[candidate], runs=exact_head_runs(), now=NOW
         )
@@ -299,7 +302,7 @@ class DiscoveryTest(unittest.TestCase):
         )
         pulls = [
             pr(number=41, body="Closes #100", updated=60),
-            pr(number=42, body="Closes #101", updated=30),
+            pr(number=42, body="Closes #101", updated=30, issue=101),
         ]
         decision = canary.resolve_canary(
             [older, newer],
@@ -337,7 +340,7 @@ class DiscoveryTest(unittest.TestCase):
         )
         pulls = [
             pr(number=41, body="Closes #100", updated=60),
-            pr(number=42, body="Closes #101", updated=30),
+            pr(number=42, body="Closes #101", updated=30, issue=101),
         ]
         decision = canary.resolve_canary(
             [older, newer],
@@ -488,7 +491,7 @@ class CompletionEvidenceTest(unittest.TestCase):
         runs = [
             run("CI"),
             run(contract.CONTRACT_WORKFLOW_NAME),
-            worker_run(issue=999),
+            worker_run(issue=999, run_id=7777),
         ]
         problem = canary.validate_completed_canary(pr(), runs, 100)
         self.assertIn("worker-evidence-absent", problem)
@@ -503,7 +506,7 @@ class CompletionEvidenceTest(unittest.TestCase):
         self.assertIn("worker-evidence-completed-failure", problem)
 
     def test_completion_worker_run_id_is_recorded(self):
-        selected = canary.completion_worker_run(100, exact_head_runs())
+        selected = canary.completion_worker_run(100, exact_head_runs(), pr())
         self.assertEqual(selected["databaseId"], WORKER_RUN_ID)
 
     def test_recovery_worker_run_is_tied_by_implementation_branch(self):
@@ -680,12 +683,38 @@ class CompletionEvidenceTest(unittest.TestCase):
             canary.validate_completed_canary(candidate, exact_head_runs(), 100)
         )
 
-    def test_closing_keyword_attributes_completion(self):
+    def test_closing_keyword_attributes_pr_without_completing_it(self):
         candidate = pr(body="Closes #100")
         candidate["headRefName"] = "feature/noncanonical"
-        self.assertIsNone(
-            canary.validate_completed_canary(candidate, exact_head_runs(), 100)
+        self.assertTrue(canary._pr_attributes_issue(candidate, 100))
+        problem = canary.validate_completed_canary(
+            candidate, exact_head_runs(), 100
         )
+        self.assertIn("no worker run binding", problem)
+
+    def test_manual_pr_with_unrelated_worker_run_is_not_completion_evidence(self):
+        candidate = pr(body="Closes #100")
+        candidate["headRefName"] = "feature/manual"
+        runs = exact_head_runs()  # worker title names issue #100
+        problem = canary.validate_completed_canary(candidate, runs, 100)
+        self.assertIn("no worker run binding", problem)
+        self.assertIsNone(canary.completion_worker_run(100, runs, candidate))
+
+    def test_manual_pr_with_unrelated_worker_run_cannot_authorize_replacement(self):
+        issue = canary_issue(
+            state="closed", created=8 * 24 * 60 * 60, closed=30
+        )
+        candidate = pr(body="Closes #100")
+        candidate["headRefName"] = "feature/manual"
+        with self.assertRaisesRegex(
+            canary.CanaryBootstrapError, "not trustworthy"
+        ):
+            canary.resolve_canary(
+                [issue],
+                pull_requests=[candidate],
+                runs=exact_head_runs(),
+                now=NOW,
+            )
 
     def test_bare_closing_number_is_not_completion_evidence(self):
         candidate = pr(body="Closes 100. Related to #100.")
@@ -770,11 +799,7 @@ class CompletionEvidenceTest(unittest.TestCase):
             with self.subTest(body=body):
                 candidate = pr(body=body)
                 candidate["headRefName"] = "feature/unrelated"
-                self.assertIsNone(
-                    canary.validate_completed_canary(
-                        candidate, exact_head_runs(), 100
-                    )
-                )
+                self.assertTrue(canary._pr_attributes_issue(candidate, 100))
 
     def test_reference_link_title_trailing_text_keeps_branch_attribution(self):
         candidate = pr(
@@ -783,7 +808,7 @@ class CompletionEvidenceTest(unittest.TestCase):
                 '"Closes #100" trailing text\n'
             )
         )
-        candidate["headRefName"] = "opencode/issue100-canary"
+        candidate["headRefName"] = "opencode/issue100-{}".format(WORKER_RUN_ID)
         self.assertIsNone(
             canary.validate_completed_canary(candidate, exact_head_runs(), 100)
         )
@@ -804,9 +829,7 @@ class CompletionEvidenceTest(unittest.TestCase):
             )
         )
         candidate["headRefName"] = "feature/unrelated"
-        self.assertIsNone(
-            canary.validate_completed_canary(candidate, exact_head_runs(), 100)
-        )
+        self.assertTrue(canary._pr_attributes_issue(candidate, 100))
 
     def test_operative_closing_reference_after_reference_link_title(self):
         candidate = pr(
@@ -817,9 +840,7 @@ class CompletionEvidenceTest(unittest.TestCase):
             )
         )
         candidate["headRefName"] = "feature/unrelated"
-        self.assertIsNone(
-            canary.validate_completed_canary(candidate, exact_head_runs(), 100)
-        )
+        self.assertTrue(canary._pr_attributes_issue(candidate, 100))
 
     def test_reference_definition_after_paragraph_stays_visible(self):
         candidate = pr(
@@ -829,9 +850,7 @@ class CompletionEvidenceTest(unittest.TestCase):
             )
         )
         candidate["headRefName"] = "feature/unrelated"
-        self.assertIsNone(
-            canary.validate_completed_canary(candidate, exact_head_runs(), 100)
-        )
+        self.assertTrue(canary._pr_attributes_issue(candidate, 100))
 
     def test_link_title_example_cannot_replace_closed_canary(self):
         issue = canary_issue(
@@ -857,9 +876,7 @@ class CompletionEvidenceTest(unittest.TestCase):
             body='[Closes #100](https://example.com "Documentation")'
         )
         candidate["headRefName"] = "feature/unrelated"
-        self.assertIsNone(
-            canary.validate_completed_canary(candidate, exact_head_runs(), 100)
-        )
+        self.assertTrue(canary._pr_attributes_issue(candidate, 100))
 
     def test_operative_closing_reference_after_link_title(self):
         candidate = pr(
@@ -869,9 +886,7 @@ class CompletionEvidenceTest(unittest.TestCase):
             )
         )
         candidate["headRefName"] = "feature/unrelated"
-        self.assertIsNone(
-            canary.validate_completed_canary(candidate, exact_head_runs(), 100)
-        )
+        self.assertTrue(canary._pr_attributes_issue(candidate, 100))
 
     def test_fenced_code_closing_example_is_not_completion_evidence(self):
         candidate = pr(
@@ -893,11 +908,7 @@ class CompletionEvidenceTest(unittest.TestCase):
             with self.subTest(body=body):
                 candidate = pr(body=body)
                 candidate["headRefName"] = "feature/unrelated"
-                self.assertIsNone(
-                    canary.validate_completed_canary(
-                        candidate, exact_head_runs(), 100
-                    )
-                )
+                self.assertTrue(canary._pr_attributes_issue(candidate, 100))
 
     def test_tilde_fence_info_string_may_contain_a_backtick(self):
         candidate = pr(body="~~~bad`text\nCloses #100\n~~~\n")
@@ -927,9 +938,7 @@ class CompletionEvidenceTest(unittest.TestCase):
             body="- ```text\n  Closes #100\n- unrelated\n\nCloses #100\n"
         )
         candidate["headRefName"] = "feature/unrelated"
-        self.assertIsNone(
-            canary.validate_completed_canary(candidate, exact_head_runs(), 100)
-        )
+        self.assertTrue(canary._pr_attributes_issue(candidate, 100))
 
     def test_operative_closing_reference_after_list_item_fenced_code(self):
         bodies = [
@@ -940,11 +949,7 @@ class CompletionEvidenceTest(unittest.TestCase):
             with self.subTest(body=body):
                 candidate = pr(body=body)
                 candidate["headRefName"] = "feature/unrelated"
-                self.assertIsNone(
-                    canary.validate_completed_canary(
-                        candidate, exact_head_runs(), 100
-                    )
-                )
+                self.assertTrue(canary._pr_attributes_issue(candidate, 100))
 
     def test_list_item_fenced_code_does_not_shadow_lifecycle_branch(self):
         for body in ("- ```text\n  Closes #100\n", "- - ```text\n    Closes #100\n"):
@@ -993,11 +998,7 @@ class CompletionEvidenceTest(unittest.TestCase):
             with self.subTest(body=body):
                 candidate = pr(body=body)
                 candidate["headRefName"] = "feature/unrelated"
-                self.assertIsNone(
-                    canary.validate_completed_canary(
-                        candidate, exact_head_runs(), 100
-                    )
-                )
+                self.assertTrue(canary._pr_attributes_issue(candidate, 100))
 
     def test_indented_code_closing_example_is_not_completion_evidence(self):
         candidate = pr(body="Example only:\n\n    Closes #100\n")
@@ -1079,9 +1080,7 @@ class CompletionEvidenceTest(unittest.TestCase):
     def test_block_quote_prose_closing_reference_is_completion_evidence(self):
         candidate = pr(body="> Closes #100\n")
         candidate["headRefName"] = "feature/unrelated"
-        self.assertIsNone(
-            canary.validate_completed_canary(candidate, exact_head_runs(), 100)
-        )
+        self.assertTrue(canary._pr_attributes_issue(candidate, 100))
 
     def test_block_quote_indented_example_does_not_shadow_lifecycle_branch(self):
         candidate = pr(body="> Example:\n>\n>     Closes #100\n")
@@ -1132,9 +1131,7 @@ class CompletionEvidenceTest(unittest.TestCase):
     def test_empty_list_item_indented_prose_keeps_reference_operative(self):
         candidate = pr(body="-\n    Closes #100\n")
         candidate["headRefName"] = "feature/unrelated"
-        self.assertIsNone(
-            canary.validate_completed_canary(candidate, exact_head_runs(), 100)
-        )
+        self.assertTrue(canary._pr_attributes_issue(candidate, 100))
 
     def test_list_item_indented_code_block_continues_across_lines(self):
         candidate = pr(body="-     first line\n      Closes #100\n")
@@ -1224,9 +1221,7 @@ class CompletionEvidenceTest(unittest.TestCase):
     def test_alternating_list_and_quote_prose_is_completion_evidence(self):
         candidate = pr(body="- > - Closes #100\n")
         candidate["headRefName"] = "feature/unrelated"
-        self.assertIsNone(
-            canary.validate_completed_canary(candidate, exact_head_runs(), 100)
-        )
+        self.assertTrue(canary._pr_attributes_issue(candidate, 100))
 
     def test_alternating_list_and_quote_example_does_not_shadow_branch(self):
         candidate = pr(body="- > -     Closes #100\n")
@@ -1258,11 +1253,7 @@ class CompletionEvidenceTest(unittest.TestCase):
             with self.subTest(body=body):
                 candidate = pr(body=body)
                 candidate["headRefName"] = "feature/unrelated"
-                self.assertIsNone(
-                    canary.validate_completed_canary(
-                        candidate, exact_head_runs(), 100
-                    )
-                )
+                self.assertTrue(canary._pr_attributes_issue(candidate, 100))
 
     def test_leaving_a_list_item_still_evaluates_nested_quote_code(self):
         bodies = [
@@ -1281,16 +1272,12 @@ class CompletionEvidenceTest(unittest.TestCase):
     def test_leaving_a_list_item_keeps_quote_prose_evidence(self):
         candidate = pr(body="- item\n> - Closes #100\n")
         candidate["headRefName"] = "feature/unrelated"
-        self.assertIsNone(
-            canary.validate_completed_canary(candidate, exact_head_runs(), 100)
-        )
+        self.assertTrue(canary._pr_attributes_issue(candidate, 100))
 
     def test_list_item_block_quote_prose_closing_reference_is_evidence(self):
         candidate = pr(body="- > Closes #100\n")
         candidate["headRefName"] = "feature/unrelated"
-        self.assertIsNone(
-            canary.validate_completed_canary(candidate, exact_head_runs(), 100)
-        )
+        self.assertTrue(canary._pr_attributes_issue(candidate, 100))
 
     def test_list_item_block_quote_indented_example_does_not_shadow_branch(self):
         candidate = pr(body="- >     Closes #100\n")
@@ -1301,23 +1288,17 @@ class CompletionEvidenceTest(unittest.TestCase):
     def test_list_item_prose_closing_reference_is_completion_evidence(self):
         candidate = pr(body="- Closes #100\n")
         candidate["headRefName"] = "feature/unrelated"
-        self.assertIsNone(
-            canary.validate_completed_canary(candidate, exact_head_runs(), 100)
-        )
+        self.assertTrue(canary._pr_attributes_issue(candidate, 100))
 
     def test_list_item_code_continuation_boundary_keeps_prose_operative(self):
         candidate = pr(body="-     first line\n    Closes #100\n")
         candidate["headRefName"] = "feature/unrelated"
-        self.assertIsNone(
-            canary.validate_completed_canary(candidate, exact_head_runs(), 100)
-        )
+        self.assertTrue(canary._pr_attributes_issue(candidate, 100))
 
     def test_ordered_list_cannot_interrupt_paragraph_with_non_one_start(self):
         candidate = pr(body="See the notes below\n2.     Closes #100\n")
         candidate["headRefName"] = "feature/unrelated"
-        self.assertIsNone(
-            canary.validate_completed_canary(candidate, exact_head_runs(), 100)
-        )
+        self.assertTrue(canary._pr_attributes_issue(candidate, 100))
 
     def test_list_item_indented_example_does_not_shadow_lifecycle_branch(self):
         candidate = pr(body="-     Closes #100\n")
@@ -1328,34 +1309,26 @@ class CompletionEvidenceTest(unittest.TestCase):
     def test_operative_closing_reference_after_heading_is_completion_evidence(self):
         candidate = pr(body="# Example\n\nCloses #100\n")
         candidate["headRefName"] = "feature/unrelated"
-        self.assertIsNone(
-            canary.validate_completed_canary(candidate, exact_head_runs(), 100)
-        )
+        self.assertTrue(canary._pr_attributes_issue(candidate, 100))
 
     def test_paragraph_indented_continuation_keeps_operative_reference(self):
         candidate = pr(body="See the notes below\n    Closes #100\n")
         candidate["headRefName"] = "feature/unrelated"
-        self.assertIsNone(
-            canary.validate_completed_canary(candidate, exact_head_runs(), 100)
-        )
+        self.assertTrue(canary._pr_attributes_issue(candidate, 100))
 
     def test_trailing_inline_comment_does_not_open_indented_code_block(self):
         candidate = pr(
             body="See the notes below <!-- trailing note -->\n    Closes #100\n"
         )
         candidate["headRefName"] = "feature/unrelated"
-        self.assertIsNone(
-            canary.validate_completed_canary(candidate, exact_head_runs(), 100)
-        )
+        self.assertTrue(canary._pr_attributes_issue(candidate, 100))
 
     def test_operative_closing_reference_after_indented_code_block(self):
         candidate = pr(
             body="Example only:\n\n    Closes #100\n\nCloses #100\n"
         )
         candidate["headRefName"] = "feature/unrelated"
-        self.assertIsNone(
-            canary.validate_completed_canary(candidate, exact_head_runs(), 100)
-        )
+        self.assertTrue(canary._pr_attributes_issue(candidate, 100))
 
     def test_indented_example_does_not_shadow_lifecycle_branch_attribution(self):
         candidate = pr(body="Example only:\n\n    Closes #100\n")
@@ -1426,9 +1399,7 @@ class CompletionEvidenceTest(unittest.TestCase):
             body="- <pre>\n  Closes #100\n- unrelated\n\nCloses #100\n"
         )
         candidate["headRefName"] = "feature/unrelated"
-        self.assertIsNone(
-            canary.validate_completed_canary(candidate, exact_head_runs(), 100)
-        )
+        self.assertTrue(canary._pr_attributes_issue(candidate, 100))
 
     def test_list_item_unclosed_html_pre_keeps_branch_attribution(self):
         candidate = pr(body="- <pre>\n  Closes #100\n")
@@ -1449,9 +1420,7 @@ class CompletionEvidenceTest(unittest.TestCase):
             body="- [ ] <pre>\n      Closes #100\n\nCloses #100\n"
         )
         candidate["headRefName"] = "feature/unrelated"
-        self.assertIsNone(
-            canary.validate_completed_canary(candidate, exact_head_runs(), 100)
-        )
+        self.assertTrue(canary._pr_attributes_issue(candidate, 100))
 
     def test_list_item_unclosed_html_pre_keeps_quote_marker_inert(self):
         candidate = pr(body="- <pre>\n  > Closes #100\n")
@@ -1466,9 +1435,7 @@ class CompletionEvidenceTest(unittest.TestCase):
             body="- <pre>\n  > Closes #100\n\nCloses #100\n"
         )
         candidate["headRefName"] = "feature/unrelated"
-        self.assertIsNone(
-            canary.validate_completed_canary(candidate, exact_head_runs(), 100)
-        )
+        self.assertTrue(canary._pr_attributes_issue(candidate, 100))
 
     def test_self_closing_list_item_html_pre_is_not_completion_evidence(self):
         for body in ("- <pre/>\n  Closes #100\n", "- <pre />\n  Closes #100\n"):
@@ -1495,27 +1462,21 @@ class CompletionEvidenceTest(unittest.TestCase):
             body="<code>Closes #100</code>\n\nCloses #100\n"
         )
         candidate["headRefName"] = "feature/unrelated"
-        self.assertIsNone(
-            canary.validate_completed_canary(candidate, exact_head_runs(), 100)
-        )
+        self.assertTrue(canary._pr_attributes_issue(candidate, 100))
 
     def test_operative_closing_reference_after_block_quote_pre_example(self):
         candidate = pr(
             body="> <pre>\n> Closes #100\n\nCloses #100\n"
         )
         candidate["headRefName"] = "feature/unrelated"
-        self.assertIsNone(
-            canary.validate_completed_canary(candidate, exact_head_runs(), 100)
-        )
+        self.assertTrue(canary._pr_attributes_issue(candidate, 100))
 
     def test_operative_closing_reference_after_html_pre_example(self):
         candidate = pr(
             body="<pre>\nCloses #100\n</pre>\n\nCloses #100\n"
         )
         candidate["headRefName"] = "feature/unrelated"
-        self.assertIsNone(
-            canary.validate_completed_canary(candidate, exact_head_runs(), 100)
-        )
+        self.assertTrue(canary._pr_attributes_issue(candidate, 100))
 
     def test_html_attribute_closing_example_is_not_completion_evidence(self):
         bodies = [
@@ -1545,11 +1506,7 @@ class CompletionEvidenceTest(unittest.TestCase):
             with self.subTest(body=body):
                 candidate = pr(body=body)
                 candidate["headRefName"] = "feature/unrelated"
-                self.assertIsNone(
-                    canary.validate_completed_canary(
-                        candidate, exact_head_runs(), 100
-                    )
-                )
+                self.assertTrue(canary._pr_attributes_issue(candidate, 100))
 
     def test_html_attribute_example_cannot_replace_closed_canary(self):
         issue = canary_issue(
@@ -1575,9 +1532,7 @@ class CompletionEvidenceTest(unittest.TestCase):
             body="The example `Closes #100` is inert.\n\nCloses #100"
         )
         candidate["headRefName"] = "feature/unrelated"
-        self.assertIsNone(
-            canary.validate_completed_canary(candidate, exact_head_runs(), 100)
-        )
+        self.assertTrue(canary._pr_attributes_issue(candidate, 100))
 
     def test_newer_unrelated_pr_does_not_shadow_attributed_pr(self):
         attributed = pr(number=41, body="Closes #100", updated=60)
@@ -1688,7 +1643,7 @@ class ExactHeadRunsTest(unittest.TestCase):
         )
         self.assertIsNone(canary.validate_completed_canary(pr(), merged, 100))
         self.assertEqual(
-            canary.completion_worker_run(100, merged)["databaseId"],
+            canary.completion_worker_run(100, merged, pr())["databaseId"],
             WORKER_RUN_ID,
         )
 
