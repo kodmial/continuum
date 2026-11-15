@@ -1485,6 +1485,52 @@ class CompletionEvidenceTest(unittest.TestCase):
         self.assertTrue(decision.completed)
         self.assertEqual(decision.issue_number, 100)
 
+    def test_closed_canary_observation_uses_attributed_pr_not_newer_unrelated_pr(self):
+        issue = canary_issue(
+            state="closed", created=2 * 24 * 60 * 60, closed=30
+        )
+        attributed = pr(number=41, body="Closes #100", updated=60)
+        unrelated = pr(
+            number=42,
+            body="Related to #100 only",
+            state="open",
+            merged_at="",
+            updated=10,
+        )
+        unrelated["headRefName"] = "feature/unrelated"
+        observation_pulls = canary.observation_pull_requests(
+            100, issue["state"], [unrelated, attributed]
+        )
+        self.assertEqual([item["number"] for item in observation_pulls], [41])
+        observed = observation.observe_canary(
+            issue,
+            pull_requests=observation_pulls,
+            now=NOW,
+            repository=canary.CANARY_OWNER_REPO,
+        )
+        self.assertTrue(observed.completed)
+
+    def test_open_canary_observation_preserves_loose_liveness_inventory(self):
+        current = pr(
+            number=41,
+            body="Closes #100",
+            state="open",
+            merged_at="",
+            updated=60,
+        )
+        unrelated = pr(
+            number=42,
+            body="Related to #100 only",
+            state="open",
+            merged_at="",
+            updated=10,
+        )
+        unrelated["headRefName"] = "feature/unrelated"
+        observation_pulls = canary.observation_pull_requests(
+            100, "open", [unrelated, current]
+        )
+        self.assertEqual([item["number"] for item in observation_pulls], [42, 41])
+
 
 class ExactHeadRunsTest(unittest.TestCase):
     def test_replaces_only_the_target_head_snapshot_records(self):
@@ -1615,6 +1661,13 @@ class WorkflowContractTest(unittest.TestCase):
         self.assertEqual(workflow.count("canary.merge_exact_head_runs("), 2)
         self.assertNotIn("runs = runs + json.loads(proc.stdout)", workflow)
         self.assertEqual(workflow.count("select_implementation_pr("), 2)
+
+    def test_workflow_observes_closed_canary_with_attributed_pr_only(self):
+        workflow = (
+            ROOT / ".github/workflows/continuum-contract-canary.yml"
+        ).read_text(encoding="utf-8")
+        self.assertIn("canary.observation_pull_requests(", workflow)
+        self.assertIn("pull_requests=observation_pulls", workflow)
 
     def test_workflow_preserves_review_decision_for_the_merge_stage(self):
         """The REST pulls inventory must still carry the review decision.

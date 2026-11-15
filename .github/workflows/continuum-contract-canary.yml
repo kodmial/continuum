@@ -354,10 +354,13 @@ jobs:
               if number.isdigit():
                   pull["reviewDecision"] = review_decisions.get(int(number))
 
+          observation_pulls = canary.observation_pull_requests(
+              issue_number, issue.get("state"), pulls
+          )
           observed = observation.observe_canary(
               issue,
               runs=runs,
-              pull_requests=pulls,
+              pull_requests=observation_pulls,
               comments=comments,
               canary_id="canary-main",
               repository=os.environ["GITHUB_REPOSITORY"],

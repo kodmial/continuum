@@ -1382,6 +1382,27 @@ def select_implementation_pr(
     return _latest_pr(issue_number, attributed, repository=CANARY_OWNER_REPO)
 
 
+def observation_pull_requests(
+    issue_number: int,
+    issue_state: object,
+    pull_requests: Sequence[Mapping[str, Any]] = (),
+) -> Sequence[Mapping[str, Any]]:
+    """Return the pull-request inventory ``observe_canary`` should inspect.
+
+    An open canary keeps the full inventory so the loose liveness matcher can
+    find its current implementation PR. A closed canary must use only the
+    lifecycle-attributed implementation PR; otherwise a newer PR that merely
+    mentions the issue can hide a valid completion. When no PR is attributed,
+    retain the full inventory so observation still fails closed with the
+    existing unmerged-PR diagnostic.
+    """
+    pulls = list(pull_requests or ())
+    if str(issue_state or "").strip().lower() != "closed":
+        return pulls
+    attributed = select_implementation_pr(issue_number, pulls)
+    return [attributed] if attributed is not None else pulls
+
+
 def merge_exact_head_runs(
     runs: Sequence[Mapping[str, Any]],
     head_sha: object,
@@ -1539,8 +1560,8 @@ def resolve_canary(
     # implementation PR. The looser liveness matcher may select a newer
     # unrelated PR that only mentions the issue, which would hide a valid
     # completion (or let an unrelated merged PR stand in for it).
-    completion_prs = (
-        [implementation_pr] if implementation_pr is not None else pull_requests
+    completion_prs = observation_pull_requests(
+        issue.number, issue.state, pull_requests
     )
     try:
         observed = observe_canary(
