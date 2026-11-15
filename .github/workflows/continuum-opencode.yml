@@ -3051,7 +3051,24 @@ jobs:
             BODY="$(printf '%s\n%s\n\nRecovered automatically after the OpenCode agent changed branches during issue #%s execution.\n\nCloses #%s' "$TASK_MARKER" "$RECOVER_SNAPSHOT_REF" "$ISSUE_NUMBER" "$ISSUE_NUMBER")"
           fi
           continuum_assert_no_stop "$GITHUB_REPOSITORY" "$ISSUE_NUMBER" || exit 1
-          gh pr create --repo "$GITHUB_REPOSITORY" --base main --head "$CURRENT_BRANCH" --title "$TITLE" --body "$BODY"
+          RECOVER_PR_URL="$(gh pr create --repo "$GITHUB_REPOSITORY" --base main --head "$CURRENT_BRANCH" --title "$TITLE" --body "$BODY")"
+          RECOVER_PR_NUMBER="$(gh pr view "$RECOVER_PR_URL" --repo "$GITHUB_REPOSITORY" --json number --jq .number)"
+          # kodmial/continuum#458: bind this recovered publication to this run
+          # with the same run-scoped receipt the normal publish path uploads.
+          [[ "$ISSUE_NUMBER" =~ ^[1-9][0-9]*$ ]] || { echo "::error::Could not determine the recovered issue number; refusing to attest publication."; exit 1; }
+          [[ "$RECOVER_PR_NUMBER" =~ ^[1-9][0-9]*$ ]] || { echo "::error::Could not determine the recovered pull-request number; refusing to attest publication."; exit 1; }
+          PUBLICATION_DIR="${RUNNER_TEMP:-/tmp}/continuum-task-publication"
+          mkdir -p "$PUBLICATION_DIR"
+          jq -n \
+            --arg repo "$GITHUB_REPOSITORY" \
+            --arg issue "$ISSUE_NUMBER" \
+            --arg run "$GITHUB_RUN_ID" \
+            --arg attempt "$GITHUB_RUN_ATTEMPT" \
+            --arg branch "$CURRENT_BRANCH" \
+            --arg pr "$RECOVER_PR_NUMBER" \
+            --arg head "$(git rev-parse HEAD)" \
+            '{schema_version: 1, repo: $repo, issue: ($issue | tonumber), run_id: $run, run_attempt: $attempt, branch: $branch, pr_number: ($pr | tonumber), head_sha: $head}' \
+            > "$PUBLICATION_DIR/publication.json"
 
       - name: Implement issue
         if: >-
@@ -3793,6 +3810,39 @@ jobs:
             "repos/$GITHUB_REPOSITORY/git/refs/heads/$CHECKPOINT_BRANCH" \
             >/dev/null 2>&1 || true
           echo "Created/updated PR #$PR_NUMBER for issue #$ISSUE_NUMBER."
+
+          # kodmial/continuum#458: a successful run is not by itself proof that
+          # it published this PR (the worker also exits successfully when it
+          # has nothing to publish). Upload a run-scoped publication receipt so
+          # canary completion can bind this exact run to this exact PR. Only
+          # the owning run can attach an artifact to itself, so a manual PR
+          # that merely reuses this run id in its branch name cannot pass.
+          [[ "$ISSUE_NUMBER" =~ ^[1-9][0-9]*$ ]] || { echo "::error::Could not determine the published issue number; refusing to attest publication."; exit 1; }
+          [[ "$PR_NUMBER" =~ ^[1-9][0-9]*$ ]] || { echo "::error::Could not determine the published pull-request number; refusing to attest publication."; exit 1; }
+          PUBLICATION_DIR="${RUNNER_TEMP:-/tmp}/continuum-task-publication"
+          mkdir -p "$PUBLICATION_DIR"
+          jq -n \
+            --arg repo "$GITHUB_REPOSITORY" \
+            --arg issue "$ISSUE_NUMBER" \
+            --arg run "$GITHUB_RUN_ID" \
+            --arg attempt "$GITHUB_RUN_ATTEMPT" \
+            --arg branch "$BRANCH" \
+            --arg pr "$PR_NUMBER" \
+            --arg head "$TASK_COMMIT" \
+            '{schema_version: 1, repo: $repo, issue: ($issue | tonumber), run_id: $run, run_attempt: $attempt, branch: $branch, pr_number: ($pr | tonumber), head_sha: $head}' \
+            > "$PUBLICATION_DIR/publication.json"
+
+      - name: Upload OpenCode publication receipt
+        if: >-
+          success() &&
+          steps.duplicate_guard.outputs.skip != 'true' &&
+          ((github.event_name == 'workflow_dispatch' && inputs.mode == 'issue') ||
+           needs.admit.outputs.route == 'issue')
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: continuum-task-publication-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/continuum-task-publication/publication.json
+          if-no-files-found: ignore
 
       - name: Attest successful OpenCode issue execution
         if: >-

@@ -143,6 +143,50 @@ def exact_head_runs(head=HEAD, issue=100):
     ]
 
 
+def publication(
+    issue=100,
+    run_id=WORKER_RUN_ID,
+    pr_number=41,
+    branch=None,
+    head=HEAD,
+    repo=canary.CANARY_OWNER_REPO,
+    schema_version=1,
+):
+    return {
+        "schema_version": schema_version,
+        "repo": repo,
+        "issue": issue,
+        "run_id": str(run_id),
+        "run_attempt": "1",
+        "branch": (
+            branch
+            if branch is not None
+            else "opencode/issue{}-{}".format(issue, run_id)
+        ),
+        "pr_number": pr_number,
+        "head_sha": head,
+    }
+
+
+def completed(candidate, runs=None, issue=100, publication_payload=None):
+    """Validate canary completion with the run-scoped publication receipt."""
+    pull = candidate or {}
+    return canary.validate_completed_canary(
+        candidate,
+        exact_head_runs(issue=issue) if runs is None else runs,
+        issue,
+        (
+            publication(
+                issue=issue,
+                pr_number=pull.get("number", 41),
+                branch=pull.get("headRefName"),
+            )
+            if publication_payload is None
+            else publication_payload
+        ),
+    )
+
+
 class DiscoveryTest(unittest.TestCase):
     def test_captured_missing_variable_run_now_bootstraps(self):
         captured = json.loads(
@@ -200,7 +244,11 @@ class DiscoveryTest(unittest.TestCase):
     def test_completed_canary_inside_window_is_observed(self):
         issue = canary_issue(state="closed", created=2 * 24 * 60 * 60, closed=30)
         decision = canary.resolve_canary(
-            [issue], pull_requests=[pr()], runs=exact_head_runs(), now=NOW
+            [issue],
+            pull_requests=[pr()],
+            runs=exact_head_runs(),
+            now=NOW,
+            worker_publication=publication(),
         )
         self.assertEqual(decision.action, "observe")
         self.assertTrue(decision.completed)
@@ -223,7 +271,11 @@ class DiscoveryTest(unittest.TestCase):
         )
         candidate["headRefName"] = "opencode/issue100-{}".format(WORKER_RUN_ID)
         decision = canary.resolve_canary(
-            [issue], pull_requests=[candidate], runs=exact_head_runs(), now=NOW
+            [issue],
+            pull_requests=[candidate],
+            runs=exact_head_runs(),
+            now=NOW,
+            worker_publication=publication(),
         )
         self.assertTrue(decision.completed)
 
@@ -245,7 +297,11 @@ class DiscoveryTest(unittest.TestCase):
         )
         candidate["headRefName"] = "opencode/issue100-{}".format(WORKER_RUN_ID)
         decision = canary.resolve_canary(
-            [issue], pull_requests=[candidate], runs=exact_head_runs(), now=NOW
+            [issue],
+            pull_requests=[candidate],
+            runs=exact_head_runs(),
+            now=NOW,
+            worker_publication=publication(),
         )
         self.assertTrue(decision.completed)
 
@@ -254,7 +310,11 @@ class DiscoveryTest(unittest.TestCase):
             state="closed", created=8 * 24 * 60 * 60, closed=30
         )
         decision = canary.resolve_canary(
-            [issue], pull_requests=[pr()], runs=exact_head_runs(), now=NOW
+            [issue],
+            pull_requests=[pr()],
+            runs=exact_head_runs(),
+            now=NOW,
+            worker_publication=publication(),
         )
         self.assertEqual(decision.action, "create")
         self.assertEqual(decision.reason, "window-elapsed")
@@ -309,6 +369,7 @@ class DiscoveryTest(unittest.TestCase):
             pull_requests=pulls,
             runs=exact_head_runs(issue=101),
             now=NOW,
+            worker_publication=publication(issue=101, pr_number=42),
         )
         self.assertEqual(decision.action, "observe")
         self.assertEqual(decision.issue_number, 101)
@@ -347,6 +408,7 @@ class DiscoveryTest(unittest.TestCase):
             pull_requests=pulls,
             runs=exact_head_runs(issue=101),
             now=NOW,
+            worker_publication=publication(issue=101, pr_number=42),
         )
         self.assertEqual(decision.action, "create")
         self.assertEqual(decision.reason, "window-elapsed")
@@ -479,7 +541,9 @@ class DiscoveryTest(unittest.TestCase):
 class CompletionEvidenceTest(unittest.TestCase):
     def test_exact_head_ci_and_contract_evidence_passes(self):
         self.assertIsNone(
-            canary.validate_completed_canary(pr(), exact_head_runs(), 100)
+            canary.validate_completed_canary(
+                pr(), exact_head_runs(), 100, publication()
+            )
         )
 
     def test_missing_worker_evidence_fails(self):
@@ -534,7 +598,7 @@ class CompletionEvidenceTest(unittest.TestCase):
             recovery,
         ]
         self.assertIsNone(
-            canary.validate_completed_canary(candidate, runs, 100)
+            canary.validate_completed_canary(candidate, runs, 100, publication())
         )
         selected = canary.completion_worker_run(100, runs, candidate)
         self.assertEqual(selected["databaseId"], WORKER_RUN_ID)
@@ -618,11 +682,54 @@ class CompletionEvidenceTest(unittest.TestCase):
         problem = canary.validate_completed_canary(pr(), snapshot, 100)
         self.assertIn("worker-evidence-absent", problem)
         merged = canary.merge_bound_worker_run(snapshot, worker_run())
-        self.assertIsNone(canary.validate_completed_canary(pr(), merged, 100))
+        self.assertIsNone(
+            canary.validate_completed_canary(pr(), merged, 100, publication())
+        )
         self.assertEqual(
             canary.completion_worker_run(100, merged, pr())["databaseId"],
             WORKER_RUN_ID,
         )
+
+    def test_successful_noop_worker_run_is_not_publication_evidence(self):
+        """A run that published nothing cannot authorize completion.
+
+        The worker exits successfully when it has nothing to publish, so a
+        branch-embedded run id plus a matching issue title are not enough: the
+        run must also carry the run-scoped publication receipt it uploads only
+        after creating or updating the task PR.
+        """
+        self.assertIn(
+            "worker publication receipt is absent",
+            canary.validate_completed_canary(pr(), exact_head_runs(), 100),
+        )
+        issue = canary_issue(
+            state="closed", created=8 * 24 * 60 * 60, closed=30
+        )
+        with self.assertRaisesRegex(
+            canary.CanaryBootstrapError, "worker publication receipt is absent"
+        ):
+            canary.resolve_canary(
+                [issue], pull_requests=[pr()], runs=exact_head_runs(), now=NOW
+            )
+
+    def test_publication_receipt_must_bind_the_exact_run_and_pr(self):
+        cases = [
+            (publication(schema_version=2), "unsupported schema"),
+            (publication(repo="someone/else"), "another repository"),
+            (publication(issue=999), "another issue"),
+            (publication(run_id=7777), "another run"),
+            (publication(branch="opencode/issue100-7777"), "another branch"),
+            (publication(pr_number=42), "another pull request"),
+            (publication(head="deadbeef"), "no full published commit"),
+            (publication(head=OTHER_HEAD), "published another commit"),
+        ]
+        for receipt, reason in cases:
+            with self.subTest(reason=reason):
+                problem = canary.validate_completed_canary(
+                    pr(), exact_head_runs(), 100, receipt
+                )
+                self.assertIsNotNone(problem)
+                self.assertIn(reason, problem)
 
     def test_bound_worker_run_fetch_replaces_the_snapshot_record(self):
         snapshot = [
@@ -639,7 +746,9 @@ class CompletionEvidenceTest(unittest.TestCase):
             ],
             [worker_run()],
         )
-        self.assertIsNone(canary.validate_completed_canary(pr(), merged, 100))
+        self.assertIsNone(
+            canary.validate_completed_canary(pr(), merged, 100, publication())
+        )
 
     def test_closed_canary_without_worker_evidence_fails_closed(self):
         issue = canary_issue(
@@ -665,14 +774,14 @@ class CompletionEvidenceTest(unittest.TestCase):
         candidate = pr(merged_at="")
         self.assertIn(
             "not merged",
-            canary.validate_completed_canary(candidate, exact_head_runs(), 100),
+            completed(candidate),
         )
 
     def test_missing_full_head_fails(self):
         candidate = pr(head="a" * 7)
         self.assertIn(
             "full headRefOid",
-            canary.validate_completed_canary(candidate, exact_head_runs(), 100),
+            completed(candidate),
         )
 
     def test_missing_full_merge_commit_fails(self):
@@ -680,7 +789,7 @@ class CompletionEvidenceTest(unittest.TestCase):
         candidate["mergeCommit"] = {"oid": "b" * 7}
         self.assertIn(
             "full merge commit",
-            canary.validate_completed_canary(candidate, exact_head_runs(), 100),
+            completed(candidate),
         )
 
     def test_ci_evidence_at_another_head_fails(self):
@@ -778,7 +887,7 @@ class CompletionEvidenceTest(unittest.TestCase):
     def test_lifecycle_branch_attributes_completion_without_keyword(self):
         candidate = pr(body="Automated implementation for #100.")
         self.assertIsNone(
-            canary.validate_completed_canary(candidate, exact_head_runs(), 100)
+            completed(candidate)
         )
 
     def test_closing_keyword_attributes_pr_without_completing_it(self):
@@ -908,7 +1017,7 @@ class CompletionEvidenceTest(unittest.TestCase):
         )
         candidate["headRefName"] = "opencode/issue100-{}".format(WORKER_RUN_ID)
         self.assertIsNone(
-            canary.validate_completed_canary(candidate, exact_head_runs(), 100)
+            completed(candidate)
         )
 
     def test_indented_code_after_reference_definition_stays_inert(self):
@@ -1053,11 +1162,7 @@ class CompletionEvidenceTest(unittest.TestCase):
         for body in ("- ```text\n  Closes #100\n", "- - ```text\n    Closes #100\n"):
             with self.subTest(body=body):
                 candidate = pr(body=body)
-                self.assertIsNone(
-                    canary.validate_completed_canary(
-                        candidate, exact_head_runs(), 100
-                    )
-                )
+                self.assertIsNone(completed(candidate))
 
     def test_nested_list_and_quote_fenced_example_is_not_evidence(self):
         bodies = [
@@ -1081,11 +1186,7 @@ class CompletionEvidenceTest(unittest.TestCase):
         ):
             with self.subTest(body=body):
                 candidate = pr(body=body)
-                self.assertIsNone(
-                    canary.validate_completed_canary(
-                        candidate, exact_head_runs(), 100
-                    )
-                )
+                self.assertIsNone(completed(candidate))
 
     def test_list_item_quote_fence_ends_when_the_quote_ends(self):
         bodies = [
@@ -1183,7 +1284,7 @@ class CompletionEvidenceTest(unittest.TestCase):
     def test_block_quote_indented_example_does_not_shadow_lifecycle_branch(self):
         candidate = pr(body="> Example:\n>\n>     Closes #100\n")
         self.assertIsNone(
-            canary.validate_completed_canary(candidate, exact_head_runs(), 100)
+            completed(candidate)
         )
 
     def test_tab_indented_code_example_after_thematic_break_is_not_evidence(self):
@@ -1324,7 +1425,7 @@ class CompletionEvidenceTest(unittest.TestCase):
     def test_alternating_list_and_quote_example_does_not_shadow_branch(self):
         candidate = pr(body="- > -     Closes #100\n")
         self.assertIsNone(
-            canary.validate_completed_canary(candidate, exact_head_runs(), 100)
+            completed(candidate)
         )
 
     def test_tab_separated_alternating_containers_are_not_evidence(self):
@@ -1380,7 +1481,7 @@ class CompletionEvidenceTest(unittest.TestCase):
     def test_list_item_block_quote_indented_example_does_not_shadow_branch(self):
         candidate = pr(body="- >     Closes #100\n")
         self.assertIsNone(
-            canary.validate_completed_canary(candidate, exact_head_runs(), 100)
+            completed(candidate)
         )
 
     def test_list_item_prose_closing_reference_is_completion_evidence(self):
@@ -1401,7 +1502,7 @@ class CompletionEvidenceTest(unittest.TestCase):
     def test_list_item_indented_example_does_not_shadow_lifecycle_branch(self):
         candidate = pr(body="-     Closes #100\n")
         self.assertIsNone(
-            canary.validate_completed_canary(candidate, exact_head_runs(), 100)
+            completed(candidate)
         )
 
     def test_operative_closing_reference_after_heading_is_completion_evidence(self):
@@ -1431,7 +1532,7 @@ class CompletionEvidenceTest(unittest.TestCase):
     def test_indented_example_does_not_shadow_lifecycle_branch_attribution(self):
         candidate = pr(body="Example only:\n\n    Closes #100\n")
         self.assertIsNone(
-            canary.validate_completed_canary(candidate, exact_head_runs(), 100)
+            completed(candidate)
         )
 
     def test_html_comment_closing_example_is_not_completion_evidence(self):
@@ -1502,7 +1603,7 @@ class CompletionEvidenceTest(unittest.TestCase):
     def test_list_item_unclosed_html_pre_keeps_branch_attribution(self):
         candidate = pr(body="- <pre>\n  Closes #100\n")
         self.assertIsNone(
-            canary.validate_completed_canary(candidate, exact_head_runs(), 100)
+            completed(candidate)
         )
 
     def test_task_list_item_unclosed_html_pre_is_not_completion_evidence(self):
@@ -1549,11 +1650,7 @@ class CompletionEvidenceTest(unittest.TestCase):
         for body in ("<code>Closes #100</code>\n", "> <pre>\n> Closes #100\n"):
             with self.subTest(body=body):
                 candidate = pr(body=body)
-                self.assertIsNone(
-                    canary.validate_completed_canary(
-                        candidate, exact_head_runs(), 100
-                    )
-                )
+                self.assertIsNone(completed(candidate))
 
     def test_operative_closing_reference_after_html_code_example(self):
         candidate = pr(
@@ -1657,6 +1754,7 @@ class CompletionEvidenceTest(unittest.TestCase):
             pull_requests=[unrelated, attributed],
             runs=exact_head_runs(),
             now=NOW,
+            worker_publication=publication(),
         )
         self.assertEqual(decision.action, "observe")
         self.assertTrue(decision.completed)
@@ -1739,7 +1837,7 @@ class ExactHeadRunsTest(unittest.TestCase):
             HEAD,
             [run("CI"), run(contract.CONTRACT_WORKFLOW_NAME)],
         )
-        self.assertIsNone(canary.validate_completed_canary(pr(), merged, 100))
+        self.assertIsNone(completed(pr(), runs=merged))
         self.assertEqual(
             canary.completion_worker_run(100, merged, pr())["databaseId"],
             WORKER_RUN_ID,
@@ -1754,9 +1852,7 @@ class ExactHeadRunsTest(unittest.TestCase):
         of appending after them.
         """
         snapshot = exact_head_runs()
-        self.assertIsNone(
-            canary.validate_completed_canary(pr(), snapshot, 100)
-        )
+        self.assertIsNone(completed(pr(), runs=snapshot))
         fresh = [
             run("CI", conclusion="failure"),
             run(contract.CONTRACT_WORKFLOW_NAME, head=HEAD),
@@ -1768,9 +1864,7 @@ class ExactHeadRunsTest(unittest.TestCase):
     def test_fresh_exact_head_pending_masks_the_snapshot_success(self):
         """A still-running exact-HEAD run must shadow a stale success too."""
         snapshot = exact_head_runs()
-        self.assertIsNone(
-            canary.validate_completed_canary(pr(), snapshot, 100)
-        )
+        self.assertIsNone(completed(pr(), runs=snapshot))
         fresh = [
             run("CI", status="in_progress", conclusion=None),
             run(contract.CONTRACT_WORKFLOW_NAME, head=HEAD),
@@ -1862,6 +1956,57 @@ class WorkflowContractTest(unittest.TestCase):
         self.assertEqual(workflow.count("canary.completion_worker_run_id("), 2)
         self.assertEqual(workflow.count("canary.merge_bound_worker_run("), 2)
         self.assertIn('"run", "view"', workflow)
+        self.assertEqual(workflow.count("worker_publication(bound)"), 2)
+        self.assertEqual(workflow.count("worker_publication=publication"), 1)
+        self.assertEqual(
+            workflow.count("latest, runs, issue_number, publication"), 1
+        )
+        self.assertEqual(
+            workflow.count("CANARY_PUBLICATION_ARTIFACT_PREFIX"), 2
+        )
+
+    def test_workflow_fails_closed_on_unreadable_worker_evidence(self):
+        """A failed direct read must never fall back to the bounded snapshot.
+
+        The snapshot can still hold an older successful worker record after a
+        re-run or a deletion, so both completion paths abort instead of
+        accepting stale evidence, and a missing or unreadable publication
+        receipt is never treated as publication.
+        """
+        workflow = (
+            ROOT / ".github/workflows/continuum-contract-canary.yml"
+        ).read_text(encoding="utf-8")
+        self.assertEqual(workflow.count("could not read bound worker run"), 2)
+        self.assertEqual(workflow.count("if proc.returncode == 0"), 0)
+        self.assertEqual(
+            workflow.count("could not read publication artifacts"), 2
+        )
+        self.assertEqual(
+            workflow.count("could not download publication receipt"), 2
+        )
+        self.assertEqual(
+            workflow.count("is unreadable"), 2
+        )
+        self.assertIn("worker publication receipt is absent", (
+            ROOT / "src/continuum/contract_canary.py"
+        ).read_text(encoding="utf-8"))
+
+    def test_worker_uploads_the_run_scoped_publication_receipt(self):
+        """Only the publishing run can attach the receipt it is judged by."""
+        workflow = (
+            ROOT / ".github/workflows/continuum-opencode.yml"
+        ).read_text(encoding="utf-8")
+        self.assertIn("name: Upload OpenCode publication receipt", workflow)
+        self.assertIn("actions/upload-artifact@", workflow)
+        self.assertIn("continuum-task-publication-${{ github.run_attempt }}", workflow)
+        self.assertIn("if-no-files-found: ignore", workflow)
+        self.assertIn("branch: $branch", workflow)
+        self.assertIn("pr_number: ($pr | tonumber)", workflow)
+        self.assertIn("head_sha: $head", workflow)
+        # Both publish paths (normal and branch-recovery) must attest.
+        self.assertEqual(workflow.count("PUBLICATION_DIR="), 2)
+        self.assertEqual(workflow.count("schema_version: 1, repo: $repo"), 2)
+        self.assertGreaterEqual(workflow.count("publication.json"), 3)
 
     def test_workflow_preserves_review_decision_for_the_merge_stage(self):
         """The REST pulls inventory must still carry the review decision.

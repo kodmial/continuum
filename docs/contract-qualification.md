@@ -75,13 +75,18 @@ The probe explicitly verifies:
 - A fresh canary issue is created only when the previous one is conclusively
   complete (closed through a merged PR with exact-HEAD `CI` and `Contract
   qualification` evidence plus a successful OpenCode worker run whose id is
-  embedded in that PR's canonical implementation branch and whose own
-  canonical `OpenCode issue #N`/429-recovery title names the same issue) and
+  embedded in that PR's canonical implementation branch, whose own canonical
+  `OpenCode issue #N`/429-recovery title names the same issue, and whose
+  run-scoped publication receipt names that exact branch, pull request, and
+  published head commit) and
   the documented seven-day window measured from its creation has elapsed. The
   completion record includes that worker run ID, and the workflow fetches that
-  run directly by id so a bounded global run page cannot hide it. A manually
-  implemented PR with a closing keyword alone, or whose only worker link is a
-  matching issue title, never counts as live lifecycle proof. A delegated
+  run directly by id so a bounded global run page cannot hide it. The worker
+  uploads the publication receipt as a workflow artifact only when it publishes
+  the task PR; the canary downloads it from the bound run, so a successful run
+  that published nothing cannot be reused. A manually implemented PR with a
+  closing keyword alone, or whose only worker link is a matching issue title or
+  a reused branch run id, never counts as live lifecycle proof. A delegated
   parent/child title never binds a local canary issue. A completed canary
   inside that window is observed and reported with its age instead of being
   replaced. Older completed canaries remain closed history; only more than one
@@ -93,7 +98,9 @@ The probe explicitly verifies:
   fully paginated; a completed canary refetches runs for its exact PR HEAD so a
   bounded global run page cannot hide the evidence. The workflow never creates a
   duplicate from uncertain metadata. The scheduled entry also serializes canary
-  runs so two deliveries cannot race an empty inventory.
+  runs so two deliveries cannot race an empty inventory. A failed direct read of
+  the bound worker run or its publication receipt is fatal rather than silently
+  falling back to the earlier bounded run inventory.
 - Bootstrap is allowed only in `kodmial/continuum`. No repository
   administration/settings API, new PAT permission, new secret, consumer write,
   or child write is used.
@@ -104,8 +111,10 @@ The probe explicitly verifies:
   (`MAX_CANARY_RECOVERY_ATTEMPTS`), and otherwise fails loudly.
 - The commit status is `success` only after the real canary issue is closed
   through a merged PR with exact-HEAD CI/contract evidence and a successful
-  OpenCode worker run whose canonical identity is bound to the issue and whose
-  id is embedded in that implementation branch. A live lifecycle that is still
+  OpenCode worker run whose canonical identity is bound to the issue, whose id
+  is embedded in that implementation branch, and whose run-scoped publication
+  receipt names that branch, pull request, and published head commit. A live
+  lifecycle that is still
   progressing publishes `pending` with its observed stage and age; it is
   not counted as a completed end-to-end pass. The first post-merge
   run therefore reports `bootstrapped`/`pending`; only the subsequent recorded

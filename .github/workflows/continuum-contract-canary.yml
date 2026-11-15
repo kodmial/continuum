@@ -141,6 +141,7 @@ jobs:
           import json
           import os
           import subprocess
+          import tempfile
           from datetime import datetime, timezone
           from continuum import contract_canary as canary
 
@@ -153,6 +154,72 @@ jobs:
               with open(os.path.join(root, name), "w", encoding="utf-8") as handle:
                   json.dump(payload, handle, sort_keys=True)
 
+          def worker_publication(run_id):
+              """Return the run-scoped publication receipt, or None when absent.
+
+              A failed read is fatal: a stale snapshot must never stand in for
+              the run's own publication evidence.
+              """
+              repo = os.environ["GITHUB_REPOSITORY"]
+              listing = subprocess.run(
+                  [
+                      "gh", "api", "--paginate", "--jq",
+                      ".artifacts[] | [.id, .name, .expired] | @tsv",
+                      "repos/{}/actions/runs/{}/artifacts?per_page=100".format(
+                          repo, run_id
+                      ),
+                  ],
+                  check=False, capture_output=True, text=True,
+              )
+              if listing.returncode != 0:
+                  raise SystemExit(
+                      "could not read publication artifacts for worker run {}: {}".format(
+                          run_id, (listing.stderr or "").strip()[:500]
+                      )
+                  )
+              candidates = []
+              for line in listing.stdout.splitlines():
+                  fields = line.split("\t")
+                  if len(fields) != 3 or not fields[0].isdigit():
+                      continue
+                  artifact_id, name, expired = fields
+                  if str(expired).strip().lower() == "true":
+                      continue
+                  if not name.startswith(canary.CANARY_PUBLICATION_ARTIFACT_PREFIX):
+                      continue
+                  candidates.append((int(artifact_id), name))
+              if not candidates:
+                  return None
+              _, name = max(candidates)
+              target = tempfile.mkdtemp(
+                  prefix="continuum-publication-",
+                  dir=os.environ.get("RUNNER_TEMP") or None,
+              )
+              download = subprocess.run(
+                  [
+                      "gh", "run", "download", str(run_id),
+                      "--repo", repo, "--name", name, "--dir", target,
+                  ],
+                  check=False, capture_output=True, text=True,
+              )
+              if download.returncode != 0:
+                  raise SystemExit(
+                      "could not download publication receipt {} from worker run {}: {}".format(
+                          name, run_id, (download.stderr or "").strip()[:500]
+                      )
+                  )
+              try:
+                  with open(
+                      os.path.join(target, "publication.json"), encoding="utf-8"
+                  ) as handle:
+                      return json.load(handle)
+              except (OSError, ValueError):
+                  raise SystemExit(
+                      "publication receipt {} from worker run {} is unreadable".format(
+                          name, run_id
+                      )
+                  )
+
           issues = load("issues.json")
           pulls = load("pulls.json")
           runs = load("runs.json")
@@ -162,6 +229,7 @@ jobs:
           # exact-HEAD CI/contract evidence. Fetch runs for that exact head
           # rather than trusting a bounded global run page.
           candidate = canary.select_canary_issue(issues, expected_repo=repo)
+          publication = None
           if candidate is not None and candidate.state == "closed":
               latest = canary.select_implementation_pr(candidate.number, pulls)
               head = str((latest or {}).get("headRefOid") or "").strip().lower()
@@ -180,7 +248,8 @@ jobs:
               # The bounded global run page can miss the worker run, and an
               # exact-HEAD lookup cannot find a run that finished before the
               # implementation commit existed. Fetch the id embedded in the
-              # implementation branch directly.
+              # implementation branch directly, and fail closed when that
+              # direct read fails instead of trusting a stale snapshot row.
               bound = canary.completion_worker_run_id(latest, candidate.number)
               if bound is not None:
                   proc = subprocess.run(
@@ -191,10 +260,19 @@ jobs:
                       ],
                       check=False, capture_output=True, text=True,
                   )
-                  if proc.returncode == 0:
-                      runs = canary.merge_bound_worker_run(
-                          runs, json.loads(proc.stdout)
+                  if proc.returncode != 0:
+                      raise SystemExit(
+                          "could not read bound worker run {} for canary issue #{}; "
+                          "refusing stale evidence: {}".format(
+                              bound,
+                              candidate.number,
+                              (proc.stderr or "").strip()[:500],
+                          )
                       )
+                  runs = canary.merge_bound_worker_run(
+                      runs, json.loads(proc.stdout)
+                  )
+                  publication = worker_publication(bound)
 
           decision = canary.resolve_canary(
               issues,
@@ -202,6 +280,7 @@ jobs:
               runs=runs,
               expected_repo=repo,
               now=datetime.now(timezone.utc),
+              worker_publication=publication,
           )
           payload = {
               "action": decision.action,
@@ -338,6 +417,7 @@ jobs:
           import json
           import os
           import subprocess
+          import tempfile
           from continuum import contract_canary as canary
           from continuum import contract_observation as observation
           from continuum import contract_qualification as contract
@@ -350,6 +430,72 @@ jobs:
           def save(name, payload):
               with open(os.path.join(root, name), "w", encoding="utf-8") as handle:
                   json.dump(payload, handle, sort_keys=True)
+
+          def worker_publication(run_id):
+              """Return the run-scoped publication receipt, or None when absent.
+
+              A failed read is fatal: a stale snapshot must never stand in for
+              the run's own publication evidence.
+              """
+              repo = os.environ["GITHUB_REPOSITORY"]
+              listing = subprocess.run(
+                  [
+                      "gh", "api", "--paginate", "--jq",
+                      ".artifacts[] | [.id, .name, .expired] | @tsv",
+                      "repos/{}/actions/runs/{}/artifacts?per_page=100".format(
+                          repo, run_id
+                      ),
+                  ],
+                  check=False, capture_output=True, text=True,
+              )
+              if listing.returncode != 0:
+                  raise SystemExit(
+                      "could not read publication artifacts for worker run {}: {}".format(
+                          run_id, (listing.stderr or "").strip()[:500]
+                      )
+                  )
+              candidates = []
+              for line in listing.stdout.splitlines():
+                  fields = line.split("\t")
+                  if len(fields) != 3 or not fields[0].isdigit():
+                      continue
+                  artifact_id, name, expired = fields
+                  if str(expired).strip().lower() == "true":
+                      continue
+                  if not name.startswith(canary.CANARY_PUBLICATION_ARTIFACT_PREFIX):
+                      continue
+                  candidates.append((int(artifact_id), name))
+              if not candidates:
+                  return None
+              _, name = max(candidates)
+              target = tempfile.mkdtemp(
+                  prefix="continuum-publication-",
+                  dir=os.environ.get("RUNNER_TEMP") or None,
+              )
+              download = subprocess.run(
+                  [
+                      "gh", "run", "download", str(run_id),
+                      "--repo", repo, "--name", name, "--dir", target,
+                  ],
+                  check=False, capture_output=True, text=True,
+              )
+              if download.returncode != 0:
+                  raise SystemExit(
+                      "could not download publication receipt {} from worker run {}: {}".format(
+                          name, run_id, (download.stderr or "").strip()[:500]
+                      )
+                  )
+              try:
+                  with open(
+                      os.path.join(target, "publication.json"), encoding="utf-8"
+                  ) as handle:
+                      return json.load(handle)
+              except (OSError, ValueError):
+                  raise SystemExit(
+                      "publication receipt {} from worker run {} is unreadable".format(
+                          name, run_id
+                      )
+                  )
 
           def outcome(evidence, detail, **fields):
               payload = {"evidence": evidence, "detail": detail}
@@ -403,7 +549,9 @@ jobs:
               # The bounded global run page can miss the worker run, and an
               # exact-HEAD lookup cannot find a run that finished before the
               # implementation commit existed. Fetch the id embedded in the
-              # implementation branch directly.
+              # implementation branch directly, and fail closed when that
+              # direct read fails instead of trusting a stale snapshot row.
+              publication = None
               bound = canary.completion_worker_run_id(latest, issue_number)
               if bound is not None:
                   proc = subprocess.run(
@@ -414,13 +562,24 @@ jobs:
                       ],
                       check=False, capture_output=True, text=True,
                   )
-                  if proc.returncode == 0:
-                      runs = canary.merge_bound_worker_run(
-                          runs, json.loads(proc.stdout)
+                  if proc.returncode != 0:
+                      raise SystemExit(
+                          "could not read bound worker run {} for canary issue #{}; "
+                          "refusing stale evidence: {}".format(
+                              bound,
+                              issue_number,
+                              (proc.stderr or "").strip()[:500],
+                          )
                       )
+                  runs = canary.merge_bound_worker_run(
+                      runs, json.loads(proc.stdout)
+                  )
+                  publication = worker_publication(bound)
               worker = canary.completion_worker_run(issue_number, runs, latest) or {}
               worker_run_id = worker.get("databaseId") or worker.get("id")
-              problem = canary.validate_completed_canary(latest, runs, issue_number)
+              problem = canary.validate_completed_canary(
+                  latest, runs, issue_number, publication
+              )
               if problem:
                   raise SystemExit("live canary completion is not trustworthy: " + problem)
               merge = (latest or {}).get("mergeCommit") or {}

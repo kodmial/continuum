@@ -247,6 +247,17 @@ APPROVED_450_SERIALIZED_OPENCODE_SHA256 = (
 APPROVED_SCHEDULER_ORIGIN_OPENCODE_SHA256 = (
     "b2bd86557d1050607e958698a75dae6ce234587f8934fac20a302587cb84ba4e"
 )
+# 2026-11-15: deliberate kodmial/continuum#458 publication-attestation change.
+# Completion evidence must prove the worker run published the implementation
+# PR, not just that a run with a matching branch id and title succeeded: a
+# no-op run exits successfully. The worker now writes and uploads a run-scoped
+# publication receipt immediately after it creates or updates the task PR, and
+# the canary consumes that receipt as completion evidence. Keep the scheduler
+# origin digest above for audit and pin the full current artifact; any further
+# drift still fails closed.
+APPROVED_458_PUBLICATION_OPENCODE_SHA256 = (
+    "1cc7697950d139de8cb63684b68578144d366da8363c34f9d17c2d5fc9da8d5b"
+)
 APPROVED_446_CALLER_SHA256 = (
     "b7f3df118bc436526f48443b8f068372204073eb134c98e4a1543d025f314686"
 )
@@ -2672,8 +2683,8 @@ class ProtectedBaselineTests(unittest.TestCase):
                     # with a full-file digest and executable regression tests.
                     self.assertEqual(
                         protected_file_digest(path),
-                        APPROVED_SCHEDULER_ORIGIN_OPENCODE_SHA256,
-                        f"{path}: unexpected drift outside #450 serialized CodeRabbit chat owner",
+                        APPROVED_458_PUBLICATION_OPENCODE_SHA256,
+                        f"{path}: unexpected drift outside #458 publication attestation",
                     )
                 else:
                     # The self-dogfood caller is the dispatchable surface
@@ -2758,7 +2769,7 @@ class ProtectedBaselineTests(unittest.TestCase):
         # therefore be dirty in this pre-commit worktree; any unapproved byte
         # change still fails the exact digest assertions above.
         approved = {
-            ".github/workflows/continuum-opencode.yml": APPROVED_450_SERIALIZED_OPENCODE_SHA256,
+            ".github/workflows/continuum-opencode.yml": APPROVED_458_PUBLICATION_OPENCODE_SHA256,
             ".github/workflows/opencode.yml": APPROVED_350_SELF_CALLER_SHA256,
         }
         for path in PROTECTED_FILES:

@@ -47,6 +47,12 @@ CANARY_FIXTURE_PATH = "docs/contract-canary-fixture.txt"
 #: Stable title prefix for the owned canary issue.
 CANARY_TITLE = "[continuum-canary] live contract qualification (automated, do not edit)"
 
+#: Artifact name prefix of the run-scoped publication receipt the OpenCode
+#: worker uploads when it publishes the task pull request. Only the owning run
+#: can attach an artifact to itself, so a manual PR cannot borrow another run's
+#: id to look like live lifecycle evidence.
+CANARY_PUBLICATION_ARTIFACT_PREFIX = "continuum-task-publication"
+
 #: Exact marker prefix. A body containing this prefix is treated as canary
 #: metadata and must therefore be valid, owned, and single.
 CANARY_MARKER_PREFIX = "<!-- continuum-contract-canary"
@@ -1407,6 +1413,73 @@ def completion_worker_run_id(
     return _implementation_worker_run_id(pull_request, issue_number)
 
 
+def _positive_int(value: object) -> Optional[int]:
+    try:
+        number = int(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None
+    return number if number > 0 else None
+
+
+def validate_worker_publication(
+    pull_request: Optional[Mapping[str, Any]],
+    worker_run: Optional[Mapping[str, Any]],
+    publication: object,
+    issue_number: int,
+    expected_repo: str = CANARY_OWNER_REPO,
+) -> Optional[str]:
+    """Return a failure reason unless the worker run published this PR.
+
+    A successful worker run is not by itself proof that it published the
+    implementation PR: the worker exits successfully when it has nothing to
+    publish. The worker therefore uploads a run-scoped publication receipt as a
+    workflow artifact when (and only when) it creates or updates the task PR.
+    The receipt binds the run id, canonical task branch, issue, PR number, and
+    published commit; only the owning run can attach an artifact to itself, so
+    a manual PR that merely reuses a run id in its branch name is not lifecycle
+    evidence, and a run that published an older commit cannot stand in for the
+    exact head the completion checks target.
+    """
+    if not pull_request:
+        return "no implementation PR carries the worker publication receipt"
+    if not isinstance(worker_run, Mapping):
+        return "worker run for the publication receipt is absent"
+    if not isinstance(publication, Mapping):
+        return "worker publication receipt is absent"
+    if _positive_int(publication.get("schema_version")) != 1:
+        return "worker publication receipt has an unsupported schema"
+    repo = str(publication.get("repo") or "").strip().lower()
+    if repo != str(expected_repo or "").strip().lower():
+        return "worker publication receipt names another repository"
+    if _positive_int(publication.get("issue")) != int(issue_number):
+        return "worker publication receipt names another issue"
+    run_id = _evidence_run_id(worker_run)
+    if run_id is None:
+        return "worker publication receipt has no run identity"
+    if _positive_int(publication.get("run_id")) != run_id:
+        return "worker publication receipt belongs to another run"
+    branch = str(
+        pull_request.get("headRefName") or pull_request.get("head_ref_name") or ""
+    ).strip()
+    if not branch or str(publication.get("branch") or "").strip() != branch:
+        return "worker publication receipt belongs to another branch"
+    if _positive_int(publication.get("pr_number")) != _positive_int(
+        pull_request.get("number")
+    ):
+        return "worker publication receipt belongs to another pull request"
+    head = str(
+        pull_request.get("headRefOid") or pull_request.get("head_sha") or ""
+    ).strip().lower()
+    if not is_full_sha(head):
+        return "implementation PR has no full head for the publication receipt"
+    published = str(publication.get("head_sha") or "").strip().lower()
+    if not is_full_sha(published):
+        return "worker publication receipt has no full published commit"
+    if published != head:
+        return "worker publication receipt published another commit"
+    return None
+
+
 def select_implementation_pr(
     issue_number: int,
     pull_requests: Sequence[Mapping[str, Any]],
@@ -1575,6 +1648,7 @@ def validate_completed_canary(
     pull_request: Optional[Mapping[str, Any]],
     runs: Sequence[Mapping[str, Any]],
     issue_number: int,
+    worker_publication: object = None,
 ) -> Optional[str]:
     """Return a failure reason unless a completed canary PR has exact-HEAD evidence.
 
@@ -1582,13 +1656,16 @@ def validate_completed_canary(
     is attributed to that issue by the lifecycle, is merged, carries a full
     head and merge commit, has completed successful ``CI`` and ``Contract
     qualification`` runs for that exact head, and has a completed successful
-    OpenCode worker run bound to the canary issue. The binding has two halves:
-    the run id embedded in the canonical ``opencode/issue<N>-<run>`` branch and
-    the run's own canonical title naming this issue (its ``OpenCode issue #N``
-    or 429 recovery identity), so neither a manual PR with only a closing
-    keyword nor a PR reusing an unrelated issue's run id ever satisfies it.
-    Evidence for any other SHA is stale and never satisfies the check; a
-    manually implemented PR with no worker run is not live lifecycle proof.
+    OpenCode worker run bound to the canary issue. The binding has three
+    halves: the run id embedded in the canonical ``opencode/issue<N>-<run>``
+    branch, the run's own canonical title naming this issue (its ``OpenCode
+    issue #N`` or 429 recovery identity), and the run-scoped publication
+    receipt that the worker uploads only when it publishes this exact PR. So
+    neither a manual PR with only a closing keyword, a PR reusing an unrelated
+    issue's run id, nor a PR borrowing the id of a successful no-op run ever
+    satisfies it. Evidence for any other SHA is stale and never satisfies the
+    check; a manually implemented PR with no worker run is not live lifecycle
+    proof.
     """
     if not pull_request:
         return "no merged implementation PR references the canary issue"
@@ -1631,6 +1708,14 @@ def validate_completed_canary(
             "merged implementation PR lacks exact-HEAD CI/contract and "
             "worker evidence: " + verdict.reason
         )
+    publication_problem = validate_worker_publication(
+        pull_request,
+        completion_worker_run(issue_number, runs, pull_request),
+        worker_publication,
+        issue_number,
+    )
+    if publication_problem:
+        return publication_problem
     return None
 
 
@@ -1643,12 +1728,15 @@ def resolve_canary(
     now: Optional[datetime] = None,
     read_error: object = None,
     pagination_complete: bool = True,
+    worker_publication: object = None,
 ) -> CanaryDecision:
     """Decide whether to observe the existing canary or create a fresh one.
 
     ``read_error`` and ``pagination_complete`` model an unreadable inventory:
     every read failure (403/429/422/5xx, timeout, truncated pagination) fails
-    closed and never creates a duplicate issue.
+    closed and never creates a duplicate issue. ``worker_publication`` is the
+    run-scoped publication receipt fetched from the bound worker run; without
+    it a closed canary is not trustworthy completion evidence.
     """
     if read_error not in (None, ""):
         raise CanaryBootstrapError(
@@ -1729,7 +1817,7 @@ def resolve_canary(
             )
         )
     problem = validate_completed_canary(
-        implementation_pr, runs, issue.number
+        implementation_pr, runs, issue.number, worker_publication
     )
     if problem:
         raise CanaryBootstrapError(
