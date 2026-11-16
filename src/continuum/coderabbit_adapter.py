@@ -5,6 +5,7 @@ nothing else:
 
 - approval / review basis;
 - unresolved / nitpick state;
+- evidence-only verdicts that cannot be satisfied by a code repair;
 - quota / rate-limit semantics, including the distinction between the
   shared full-review quota and the inline chat-message/hour quota;
 - CodeRabbit review commands;
@@ -349,6 +350,199 @@ def is_provider_quota_reply(
     )["kind"] in ("chat_rate_limit", "review_rate_limit")
 
 
+# ---------------------------------------------------------------------------
+# Evidence-only verdicts (kodmial/continuum#463)
+# ---------------------------------------------------------------------------
+
+#: Durable marker published when an unresolved finding needs live
+#: operational evidence that a coding agent cannot synthesize.
+EXTERNAL_EVIDENCE_MARKER = "continuum-coderabbit-external-evidence-required"
+
+#: Verdict kinds returned by :func:`classify_unresolved_verdict`.
+VERDICT_CODE_DEFECT = "code_defect"
+VERDICT_EXTERNAL_EVIDENCE = "external_evidence"
+VERDICT_VERIFICATION_EVIDENCE = "verification_evidence"
+VERDICT_UNVERIFIABLE = "unverifiable"
+
+_NO_DEFECT_RE = re.compile(
+    r"\bno\s+(?:specific\s+|confirmed\s+|remaining\s+|actionable\s+|"
+    r"reproducible\s+|further\s+)*(?:code\s+|implementation\s+)?"
+    r"(?:defect|bug|issue|problem|change)s?\b|"
+    r"\bnot\s+a\s+confirmed\s+(?:code\s+)?defect\b|"
+    r"\bappears?\s+(?:to\s+be\s+)?(?:fully\s+)?addressed\b",
+    re.IGNORECASE,
+)
+
+_ACTIONABLE_DEFECT_RE = re.compile(
+    r"\b(?:defect|bug|regression|vulnerability)\b[^.]{0,60}"
+    r"\b(?:remains?|persists?|still)\b"
+    r"|\b(?:remains?|persists?|still)\b[^.]{0,60}"
+    r"\b(?:code\s+|implementation\s+)?"
+    r"(?:defect|bug|regression|vulnerability|failure|error)\b"
+    r"|\b(?:still|continues?\s+to)\b[^.]{0,90}"
+    r"\b(?:fails?|broken|missing|incorrect|wrong|unsafe|unfixed|"
+    r"unaddressed|vulnerable|dereferences?|crashes?|throws?|leaks?)\b"
+    r"|\b(?:requires?|needs?)\s+(?:a\s+)?(?:code\s+)?(?:fix|change)\b"
+    r"|\b(?:please|must|should|needs?\s+to|required?\s+to)\b[^.]{0,120}"
+    r"\b(?:fix|change|update|remove|add|handle|validate|guard|replace|"
+    r"correct|cover|implement)\b"
+    r"|\b(?:add|extend|update|write)\b[^.]{0,60}"
+    r"\b(?:test|regression|coverage)\b"
+    r"|\b(?:test|coverage|regression)\b[^.]{0,60}"
+    r"\b(?:missing|absent|required|needed|insufficient)\b"
+    r"|\b(?:auth(?:entication|orization)?|access[- ]control|security)\s+"
+    r"(?:bypass|hole|issue|vulnerability)\b",
+    re.IGNORECASE,
+)
+
+_EXTERNAL_EVIDENCE_RE = re.compile(
+    r"\b(?:live|operational|empirical|external|runtime)\b[^.]{0,80}"
+    r"\b(?:evidence|proof|verification|check|receipt|artifact|run)\b"
+    r"|\b(?:artifact|receipt)s?\b[^.]{0,80}"
+    r"\b(?:retrieval|retrieve|download|downloaded|id|bound|binding|"
+    r"commit|run|attempt)s?\b"
+    r"|\b(?:retrieve|download)\b[^.]{0,60}\b(?:artifact|receipt)s?\b"
+    r"|\bexact\s+commit\s+bindings?\b"
+    r"|\bmatched?\s+to\s+(?:their|the|its)\s+commits?\b"
+    r"|\bverify\b[^.]{0,80}\b(?:receipts?|artifacts?|run\s+id|commit)\b"
+    r"|\bdo\s+not\s+(?:repeat|rerun|re-run)\b[^.]{0,50}"
+    r"\b(?:no-change|no\s+change|no-op)\b"
+    r"|\b(?:provide|supply|show|present|attach)\b[^.]{0,60}"
+    r"\b(?:live|operational|runtime)\s+"
+    r"(?:evidence|proof|receipt|artifact|run)\b",
+    re.IGNORECASE,
+)
+
+_CI_EVIDENCE_ONLY_RE = re.compile(
+    r"\bverification\s+(?:is|remains)\s+incomplete\b", re.IGNORECASE
+)
+_CI_EVIDENCE_CONTEXT_RE = re.compile(
+    r"\b(?:ci|checks?|tests?|validation|actionlint|contract\s+gate|"
+    r"qualification)\b",
+    re.IGNORECASE,
+)
+
+#: Clause-boundary split for verdict prose. Splitting on sentences,
+#: semicolons, newlines, and blank runs keeps an actionable statement in a
+#: different sentence from a no-defect summary while preserving the words
+#: that make a single clause meaningful.
+_VERDICT_CLAUSE_RE = re.compile(r"[.!?;\n]+|\s{2,}")
+
+
+def _has_actionable_defect(verdict: str) -> bool:
+    """Whether a clause positively asserts a remaining code defect.
+
+    A negated phrase such as "remains unverified, not a confirmed defect"
+    satisfies both the actionable and the no-defect patterns. Within one
+    clause, a no-defect phrase that starts before the actionable match
+    negates it; a defect phrase later in the clause (for example
+    "no remaining code defect, but the null dereference remains") still
+    outranks that summary.
+    """
+
+    for clause in _VERDICT_CLAUSE_RE.split(verdict):
+        actionable = _ACTIONABLE_DEFECT_RE.search(clause)
+        if actionable is None:
+            continue
+        no_defect = _NO_DEFECT_RE.search(clause)
+        if no_defect is not None and actionable.start() < no_defect.start():
+            continue
+        return True
+    return False
+
+
+def code_rabbit_verdict_text(body: Any) -> str:
+    """Return only the visible CodeRabbit verdict.
+
+    The provider's analysis chain and learnings footer quote arbitrary
+    command output and repository text. Only text after the last closed
+    ``<details>`` block, before the generated-reply footer, is the verdict.
+    """
+
+    text = str(body or "")
+    close = text.rfind("</details>")
+    if close >= 0:
+        text = text[close + len("</details>"):]
+    text = re.split(r"<sub>", text, maxsplit=1, flags=re.IGNORECASE)[0]
+    text = re.split(
+        r"<!--\s*This is an auto-generated reply",
+        text,
+        maxsplit=1,
+        flags=re.IGNORECASE,
+    )[0]
+    return text.strip()
+
+
+def classify_unresolved_verdict(body: Any) -> Dict[str, Any]:
+    """Classify one live CodeRabbit answer to an original finding.
+
+    ``external_evidence`` means the reviewer explicitly reports no
+    remaining actionable code defect but withholds a verdict pending live
+    operational evidence (a real run/artifact bound to exact commits).
+    ``verification_evidence`` covers the narrower exact-HEAD CI/test
+    evidence case. ``code_defect`` is the default and deliberately fails
+    open to normal repair: an unclear or truncated answer must never
+    silently suppress a real code fix. An entirely empty answer is
+    ``unverifiable`` so the caller defers instead of guessing.
+    """
+
+    verdict = code_rabbit_verdict_text(body)
+    if not verdict:
+        return {"kind": VERDICT_UNVERIFIABLE, "verdict": verdict}
+    no_defect = _NO_DEFECT_RE.search(verdict) is not None
+    # A positively asserted defect always outranks a no-defect summary, but
+    # a negated defect ("not a confirmed defect") is a summary, not an
+    # actionable request. Clause-aware matching keeps evidence-only answers
+    # from being misread as code defects.
+    if _has_actionable_defect(verdict):
+        return {"kind": VERDICT_CODE_DEFECT, "verdict": verdict}
+    if no_defect and _EXTERNAL_EVIDENCE_RE.search(verdict):
+        return {"kind": VERDICT_EXTERNAL_EVIDENCE, "verdict": verdict}
+    if no_defect and (
+        _CI_EVIDENCE_ONLY_RE.search(verdict)
+        or _CI_EVIDENCE_CONTEXT_RE.search(verdict)
+    ):
+        return {"kind": VERDICT_VERIFICATION_EVIDENCE, "verdict": verdict}
+    return {"kind": VERDICT_CODE_DEFECT, "verdict": verdict}
+
+
+def external_evidence_marker(
+    head_sha: Any, finding_id: Any, digest: Any
+) -> str:
+    """Durable exact-HEAD/finding/digest evidence-required marker."""
+
+    return (
+        "<!-- {} head={} finding={} digest={} -->".format(
+            EXTERNAL_EVIDENCE_MARKER,
+            str(head_sha or "").strip().lower(),
+            int(finding_id),
+            str(digest or "").strip().lower(),
+        )
+    )
+
+
+def repair_handoff_changed(body: Any) -> Optional[bool]:
+    """Return the repair outcome recorded on a completion handoff.
+
+    Older handoffs carry no ``changed`` token; ``None`` means unknown and
+    the caller must not claim a no-change repair it cannot prove.
+    """
+
+    match = re.search(
+        r"<!--\s*opencode-coderabbit-verification-pending\s+"
+        r"head=[0-9a-f]{40}\s+findings=[0-9,]+"
+        r"(?:\s+answers=[0-9,]+)?"
+        r"(?:\s+changed=(true|false))?"
+        r"(?:\s+run=[0-9]+)?"
+        r"(?:\s+attempt=[0-9]+)?\s*-->",
+        str(body or ""),
+        re.IGNORECASE,
+    )
+    if not match or match.group(1) is None:
+        return None
+    return match.group(1).lower() == "true"
+
+
 def latest_chat_rate_limit(
     comments: Sequence[Mapping[str, Any]],
     *,
@@ -555,15 +749,23 @@ __all__ = [
     "CHAT_QUOTA_FALLBACK_MS",
     "CHAT_RETRY_SAFETY_PADDING_MS",
     "CODERABBIT_BOT_LOGIN",
+    "EXTERNAL_EVIDENCE_MARKER",
     "QUOTA_FALLBACK_MS",
     "RETRY_SAFETY_PADDING_MS",
     "THREAD_VERIFICATION_TIMEOUT_MS",
+    "VERDICT_CODE_DEFECT",
+    "VERDICT_EXTERNAL_EVIDENCE",
+    "VERDICT_UNVERIFIABLE",
+    "VERDICT_VERIFICATION_EVIDENCE",
     "approval_basis",
     "carried_approval_valid",
     "chat_retry_acknowledged",
     "chat_retry_marker",
     "chat_retry_not_before_ms",
     "classify_coderabbit_reply",
+    "classify_unresolved_verdict",
+    "code_rabbit_verdict_text",
+    "external_evidence_marker",
     "is_provider_quota_reply",
     "is_rate_limited_status",
     "is_trusted_coderabbit_author",
@@ -572,6 +774,7 @@ __all__ = [
     "parse_chat_retry_delay_ms",
     "parse_duration_ms",
     "parse_retry_delay_ms",
+    "repair_handoff_changed",
     "retry_due_at_ms",
     "retry_window_text",
     "review_command_posted_after",

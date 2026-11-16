@@ -77,6 +77,7 @@ jobs:
           # from an arbitrary commenter can never suppress a finding.
           github-token: ${{ github.token }}
           script: |
+            const crypto = require('crypto');
             const owner = context.repo.owner;
             const repo = context.repo.repo;
             const pullNumber = Number(
@@ -85,6 +86,8 @@ jobs:
             if (!Number.isInteger(pullNumber) || pullNumber <= 0) {
               throw new Error('No valid PR number for CodeRabbit reconciliation.');
             }
+            core.setOutput('evidence_required_json', '[]');
+            core.setOutput('pr_number', String(pullNumber));
             const opencodeVerificationPattern =
               /<!-- opencode-coderabbit-verification review=(\d+) finding=(\d+) head=([0-9a-f]{40}) -->/;
             const autoMergeVerificationPattern =
@@ -487,7 +490,160 @@ jobs:
                 /\bverification (?:is|remains) incomplete\b/i.test(verdict);
             }
 
+            // continuum-coderabbit-external-evidence:start
+            // Provider semantics for an evidence-only answer: CodeRabbit
+            // states that no actionable code defect remains but withholds
+            // its verdict until it receives live operational evidence (a
+            // real run/artifact bound to exact commits). A coding agent
+            // cannot synthesize that evidence, so another repair run can
+            // only burn a model request. This block is mirrored by
+            // continuum.coderabbit_adapter and decides only what a verdict
+            // *is*; dispatch policy remains in the batcher below.
+            const EXTERNAL_EVIDENCE_MARKER =
+              'continuum-coderabbit-external-evidence-required';
+            const EXTERNAL_EVIDENCE_NO_DEFECT_RE = new RegExp(
+              '\\bno\\s+(?:specific\\s+|confirmed\\s+|remaining\\s+|' +
+              'actionable\\s+|reproducible\\s+|further\\s+)*' +
+              '(?:code\\s+|implementation\\s+)?' +
+              '(?:defect|bug|issue|problem|change)s?\\b|' +
+              '\\bnot\\s+a\\s+confirmed\\s+(?:code\\s+)?defect\\b|' +
+              '\\bappears?\\s+(?:to\\s+be\\s+)?(?:fully\\s+)?addressed\\b',
+              'i'
+            );
+            const EXTERNAL_EVIDENCE_ACTIONABLE_RE = new RegExp(
+              '\\b(?:defect|bug|regression|vulnerability)\\b[^.]{0,60}' +
+              '\\b(?:remains?|persists?|still)\\b|' +
+              '\\b(?:remains?|persists?|still)\\b[^.]{0,60}' +
+              '\\b(?:code\\s+|implementation\\s+)?' +
+              '(?:defect|bug|regression|vulnerability|failure|error)\\b|' +
+              '\\b(?:still|continues?\\s+to)\\b[^.]{0,90}' +
+              '\\b(?:fails?|broken|missing|incorrect|wrong|unsafe|' +
+              'unfixed|unaddressed|vulnerable|dereferences?|crashes?|' +
+              'throws?|leaks?)\\b|' +
+              '\\b(?:requires?|needs?)\\s+(?:a\\s+)?(?:code\\s+)?' +
+              '(?:fix|change)\\b|' +
+              '\\b(?:please|must|should|needs?\\s+to|required?\\s+to)\\b' +
+              '[^.]{0,120}\\b(?:fix|change|update|remove|add|handle|' +
+              'validate|guard|replace|correct|cover|implement)\\b|' +
+              '\\b(?:add|extend|update|write)\\b[^.]{0,60}' +
+              '\\b(?:test|regression|coverage)\\b|' +
+              '\\b(?:test|coverage|regression)\\b[^.]{0,60}' +
+              '\\b(?:missing|absent|required|needed|insufficient)\\b|' +
+              '\\b(?:auth(?:entication|orization)?|access[- ]control|' +
+              'security)\\s+(?:bypass|hole|issue|vulnerability)\\b',
+              'i'
+            );
+            const EXTERNAL_EVIDENCE_RE = new RegExp(
+              '\\b(?:live|operational|empirical|external|runtime)\\b' +
+              '[^.]{0,80}\\b(?:evidence|proof|verification|check|' +
+              'receipt|artifact|run)\\b|' +
+              '\\b(?:artifact|receipt)s?\\b[^.]{0,80}' +
+              '\\b(?:retrieval|retrieve|download|downloaded|id|bound|' +
+              'binding|commit|run|attempt)s?\\b|' +
+              '\\b(?:retrieve|download)\\b[^.]{0,60}' +
+              '\\b(?:artifact|receipt)s?\\b|' +
+              '\\bexact\\s+commit\\s+bindings?\\b|' +
+              '\\bmatched?\\s+to\\s+(?:their|the|its)\\s+commits?\\b|' +
+              '\\bverify\\b[^.]{0,80}' +
+              '\\b(?:receipts?|artifacts?|run\\s+id|commit)\\b|' +
+              '\\bdo\\s+not\\s+(?:repeat|rerun|re-run)\\b[^.]{0,50}' +
+              '\\b(?:no-change|no\\s+change|no-op)\\b|' +
+              '\\b(?:provide|supply|show|present|attach)\\b[^.]{0,60}' +
+              '\\b(?:live|operational|runtime)\\s+' +
+              '(?:evidence|proof|receipt|artifact|run)\\b',
+              'i'
+            );
+            const EXTERNAL_CI_EVIDENCE_ONLY_RE =
+              /\bverification\s+(?:is|remains)\s+incomplete\b/i;
+            const EXTERNAL_CI_CONTEXT_RE = new RegExp(
+              '\\b(?:ci|checks?|tests?|validation|actionlint|' +
+              'contract\\s+gate|qualification)\\b',
+              'i'
+            );
+            // Clause-boundary split for verdict prose. Splitting on
+            // sentences, semicolons, newlines, and blank runs keeps an
+            // actionable statement in a different sentence from a no-defect
+            // summary while preserving the words that make one clause
+            // meaningful.
+            const EXTERNAL_VERDICT_CLAUSE_RE = /[.!?;\n]+|\s{2,}/;
+
+            function hasActionableDefect(verdict) {
+              for (const clause of String(verdict || '').split(
+                EXTERNAL_VERDICT_CLAUSE_RE
+              )) {
+                const actionable =
+                  EXTERNAL_EVIDENCE_ACTIONABLE_RE.exec(clause);
+                if (!actionable) continue;
+                const noDefect =
+                  EXTERNAL_EVIDENCE_NO_DEFECT_RE.exec(clause);
+                // A no-defect phrase that starts before the actionable match
+                // negates a phrase such as "remains unverified, not a
+                // confirmed defect". A defect phrase later in the clause
+                // ("no remaining code defect, but the null dereference
+                // remains") still outranks that summary.
+                if (noDefect && actionable.index < noDefect.index) continue;
+                return true;
+              }
+              return false;
+            }
+
+            function codeRabbitVerdictText(body) {
+              let text = String(body || '');
+              // The analysis chain and learnings footer quote arbitrary
+              // command output and repository text. Only text after the last
+              // closed details block is the provider's visible verdict.
+              const close = text.lastIndexOf('</details>');
+              if (close >= 0) text = text.slice(close + '</details>'.length);
+              text = text.split(/<sub>/i)[0];
+              text = text.split(/<!--\s*This is an auto-generated reply/i)[0];
+              return text.trim();
+            }
+
+            function classifyUnresolvedVerdict(body) {
+              const verdict = codeRabbitVerdictText(body);
+              if (!verdict) return { kind: 'unverifiable', verdict };
+              const noDefect = EXTERNAL_EVIDENCE_NO_DEFECT_RE.test(verdict);
+              // A later actionable sentence always outranks a no-defect
+              // summary. Unknown answers fail open to normal repair so a
+              // real code fix is never silently suppressed.
+              if (EXTERNAL_EVIDENCE_ACTIONABLE_RE.test(verdict)) {
+                return { kind: 'code_defect', verdict };
+              }
+              if (noDefect && EXTERNAL_EVIDENCE_RE.test(verdict)) {
+                return { kind: 'external_evidence', verdict };
+              }
+              if (noDefect && (
+                EXTERNAL_CI_EVIDENCE_ONLY_RE.test(verdict) ||
+                EXTERNAL_CI_CONTEXT_RE.test(verdict)
+              )) {
+                return { kind: 'verification_evidence', verdict };
+              }
+              return { kind: 'code_defect', verdict };
+            }
+
+            function evidenceRequirementExcerpt(verdict) {
+              const sentences = String(verdict || '')
+                .replace(/\s+/g, ' ')
+                .match(/[^.!?]+[.!?]?/g) || [];
+              const relevant = sentences.filter(sentence =>
+                EXTERNAL_EVIDENCE_RE.test(sentence) ||
+                /\b(?:verify|confirm|provide|supply)\b/i.test(sentence)
+              );
+              return relevant.slice(0, 4).join(' ').trim()
+                .replace(/<!--[\s\S]*?-->/g, '')
+                .replace(/[<>]/g, '')
+                .slice(0, 1000);
+            }
+
+            function findingDigest(reviewId, findingId, headSha) {
+              return crypto.createHash('sha256')
+                .update(headSha + '\n' + JSON.stringify([[reviewId, findingId]]))
+                .digest('hex');
+            }
+            // continuum-coderabbit-external-evidence:end
+
             const active = [];
+            const externalEvidence = [];
             for (const verification of latestVerification.values()) {
               const replies = comments
                 .filter(
@@ -529,6 +685,38 @@ jobs:
                 continue;
               }
 
+              const verdict = classifyUnresolvedVerdict(latestReply.body);
+              if (verdict.kind === 'unverifiable') {
+                core.warning(
+                  `PR #${pullNumber}: CodeRabbit answer #${latestReply.id} for finding #${verification.findingId} has no readable verdict; deferring repair dispatch instead of guessing.`
+                );
+                continue;
+              }
+              if (verdict.kind === 'verification_evidence') {
+                core.notice(
+                  `PR #${pullNumber}: finding #${verification.findingId} awaits exact-HEAD verification evidence; no code repair is dispatchable.`
+                );
+                continue;
+              }
+              if (verdict.kind === 'external_evidence') {
+                // #463: this is not a code defect. A repair leaves HEAD
+                // unchanged, can never produce the requested historical
+                // run/artifact evidence, and repeated dispatch only burns
+                // model requests. Keep the review blocking and publish a
+                // truthful durable diagnostic instead.
+                externalEvidence.push({
+                  review_id: verification.reviewId,
+                  finding_id: verification.findingId,
+                  unresolved_id: latestReply.id,
+                  verified_head: verification.verifiedHead,
+                  required_evidence: evidenceRequirementExcerpt(verdict.verdict),
+                });
+                core.notice(
+                  `PR #${pullNumber}: finding #${verification.findingId} states no actionable code defect but requires live operational evidence; repair dispatch is suppressed.`
+                );
+                continue;
+              }
+
               active.push({
                 review_id: verification.reviewId,
                 finding_id: verification.findingId,
@@ -538,6 +726,7 @@ jobs:
             }
 
             active.sort((a, b) => a.finding_id - b.finding_id);
+            externalEvidence.sort((a, b) => a.finding_id - b.finding_id);
 
             const pr = await github.rest.pulls.get({
               owner,
@@ -545,7 +734,7 @@ jobs:
               pull_number: pullNumber,
             });
 
-            if (active.length === 0) {
+            if (active.length === 0 && externalEvidence.length === 0) {
               core.notice('No currently unresolved CodeRabbit findings remain to batch.');
               core.setOutput('should_run', 'false');
               core.setOutput('items_json', '[]');
@@ -561,6 +750,8 @@ jobs:
               });
               if (headRef?.object?.sha) headSha = headRef.object.sha;
             }
+            core.setOutput('pr_number', String(pullNumber));
+            core.setOutput('head_sha', headSha);
 
             // A completed repair publishes an issue-comment handoff instead
             // of writing into the CodeRabbit inline chat. Until auto-merge
@@ -591,6 +782,7 @@ jobs:
             if (repairHandoffReadFailed) {
               core.setOutput('should_run', 'false');
               core.setOutput('items_json', '[]');
+              core.setOutput('evidence_required_json', '[]');
               return;
             }
             // Any handoff published after this scan has a larger issue-comment
@@ -602,7 +794,7 @@ jobs:
               0
             );
             const repairHandoffPattern =
-              /<!-- opencode-coderabbit-verification-pending head=([0-9a-f]{40}) findings=([0-9,]+)(?: answers=[0-9,]+)? -->/;
+              /<!-- opencode-coderabbit-verification-pending head=([0-9a-f]{40}) findings=([0-9,]+)(?: answers=[0-9,]+)?(?: changed=(true|false))?(?: run=([0-9]+))?(?: attempt=([0-9]+))? -->/;
             const newestRepairHandoff = findingId => {
               let newest = null;
               for (const comment of repairHandoffs) {
@@ -624,6 +816,110 @@ jobs:
               }
               return newest;
             };
+
+            // #463: publish exactly one durable diagnostic per
+            // HEAD/finding/digest. The digest is the same single-finding
+            // identity the dispatcher uses, so the production no-op loop
+            // (same HEAD, same finding, changed answer id) cannot repost
+            // or re-dispatch. A forged marker from an untrusted author is
+            // never ownership evidence.
+            const externalEvidencePattern = new RegExp(
+              '<!--\\s*' + EXTERNAL_EVIDENCE_MARKER +
+              '\\s+head=([0-9a-f]{40})\\s+finding=([0-9]+)' +
+              '\\s+digest=([0-9a-f]{64})\\s*-->'
+            );
+            const externalEvidenceDiagnostics = [];
+            for (const item of externalEvidence) {
+              const digest = findingDigest(
+                item.review_id, item.finding_id, headSha
+              );
+              const marker = `<!-- ${EXTERNAL_EVIDENCE_MARKER} ` +
+                `head=${headSha} finding=${item.finding_id} ` +
+                `digest=${digest} -->`;
+              const alreadyPublished = repairHandoffs.some(comment => {
+                if (!trustedMarkerAuthors.has(
+                  comment.user?.login || comment.author?.login || ''
+                )) {
+                  return false;
+                }
+                const match = String(comment.body || '').match(
+                  externalEvidencePattern
+                );
+                return Boolean(
+                  match && match[1] === headSha &&
+                  Number(match[2]) === item.finding_id &&
+                  match[3] === digest
+                );
+              });
+              if (alreadyPublished) continue;
+              const handoff = newestRepairHandoff(item.finding_id);
+              let changed = null;
+              let handoffRun = '';
+              let handoffAttempt = '';
+              if (handoff) {
+                const match = String(handoff.body || '').match(
+                  repairHandoffPattern
+                );
+                if (match && match[3] === 'true') changed = true;
+                else if (match && match[3] === 'false') changed = false;
+                if (match && match[4]) handoffRun = match[4];
+                if (match && match[5]) handoffAttempt = match[5];
+              }
+              // Independent, provenance-bound repair outcome. A handoff
+              // token is preferred; otherwise the exact commit range is
+              // authoritative. Failure to read it is reported as unknown,
+              // never turned into a fabricated no-change claim.
+              if (changed === null) {
+                try {
+                  const { data: comparison } =
+                    await github.rest.repos.compareCommits({
+                      owner,
+                      repo,
+                      base: item.verified_head,
+                      head: headSha,
+                    });
+                  const ahead = Number(comparison?.ahead_by);
+                  // ``ahead_by`` counts commits reachable from HEAD but not
+                  // from the verified base, so any positive count means the
+                  // repair did change the tree.
+                  if (Number.isInteger(ahead)) changed = ahead > 0;
+                } catch (err) {
+                  core.warning(
+                    `PR #${pullNumber}: could not establish the repair commit range for finding #${item.finding_id}; reporting unknown outcome: ${err.message || err}`
+                  );
+                }
+              }
+              externalEvidenceDiagnostics.push({
+                review_id: item.review_id,
+                finding_id: item.finding_id,
+                unresolved_id: item.unresolved_id,
+                head_sha: headSha,
+                digest,
+                marker,
+                required_evidence: item.required_evidence,
+                previous_repair_changed: changed,
+                previous_repair_run: handoffRun,
+                previous_repair_attempt: handoffAttempt,
+              });
+            }
+            if (externalEvidence.length) {
+              core.notice(
+                `PR #${pullNumber}: ${externalEvidence.length} unresolved CodeRabbit finding(s) require external evidence; ${externalEvidenceDiagnostics.length} new diagnostic(s) to publish.`
+              );
+            }
+            core.setOutput(
+              'evidence_required_json',
+              JSON.stringify(externalEvidenceDiagnostics)
+            );
+
+            if (active.length === 0) {
+              core.notice(
+                'No code-repairable unresolved CodeRabbit findings remain; external evidence requirements are recorded without an OpenCode run.'
+              );
+              core.setOutput('should_run', 'false');
+              core.setOutput('items_json', '[]');
+              return;
+            }
 
             const dispatchable = active.filter(item => {
               const verification = latestVerification.get(item.finding_id);
@@ -661,11 +957,178 @@ jobs:
             );
 
             core.setOutput('should_run', 'true');
-            core.setOutput('pr_number', String(pullNumber));
             core.setOutput('head_ref', pr.data.head.ref);
             core.setOutput('head_sha', headSha);
             core.setOutput('handoff_cutoff', String(repairHandoffCutoff));
             core.setOutput('items_json', JSON.stringify(dispatchable));
+
+      - name: Publish external evidence requirement
+        if: steps.context.outputs.evidence_required_json != '' && steps.context.outputs.evidence_required_json != '[]'
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
+        env:
+          PR_NUMBER: ${{ steps.context.outputs.pr_number }}
+          EVIDENCE_REQUIRED_JSON: ${{ steps.context.outputs.evidence_required_json }}
+        with:
+          # A diagnostic is not a repair dispatch. The read-only GITHUB_TOKEN
+          # is sufficient and makes the marker ownership auditable as
+          # github-actions[bot], which auto-merge and this batcher trust.
+          github-token: ${{ github.token }}
+          script: |
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const pullNumber = Number(process.env.PR_NUMBER);
+            let items = [];
+            try {
+              items = JSON.parse(
+                process.env.EVIDENCE_REQUIRED_JSON || '[]'
+              );
+            } catch (err) {
+              throw new Error(
+                `Malformed external evidence diagnostics: ${err.message || err}`
+              );
+            }
+            if (!Number.isInteger(pullNumber) || pullNumber <= 0 ||
+                !Array.isArray(items) || items.length === 0 ||
+                items.length > 80) {
+              throw new Error(
+                'Invalid external evidence diagnostic identity; refusing to publish.'
+              );
+            }
+            const markerPattern = new RegExp(
+              '<!--\\s*continuum-coderabbit-external-evidence-required\\s+' +
+              'head=([0-9a-f]{40})\\s+finding=([0-9]+)' +
+              '\\s+digest=([0-9a-f]{64})\\s*-->'
+            );
+            const trustedAuthors = new Set(['github-actions[bot]']);
+            trustedAuthors.add(
+              String(
+                (await github.rest.users.getAuthenticated()).data.login || ''
+              ).trim().toLowerCase()
+            );
+            let comments = [];
+            try {
+              comments = await github.paginate(
+                github.rest.issues.listComments,
+                {
+                  owner,
+                  repo,
+                  issue_number: pullNumber,
+                  per_page: 100,
+                }
+              );
+            } catch (err) {
+              core.warning(
+                `PR #${pullNumber}: could not read existing external evidence diagnostics; deferring publication to the next reconciliation: ${err.message || err}`
+              );
+              return;
+            }
+            for (const item of items) {
+              const head = String(item.head_sha || '').toLowerCase();
+              const findingId = Number(item.finding_id);
+              const unresolvedId = Number(item.unresolved_id);
+              const digest = String(item.digest || '').toLowerCase();
+              if (!/^[0-9a-f]{40}$/.test(head) ||
+                  !Number.isInteger(findingId) || findingId <= 0 ||
+                  !Number.isInteger(unresolvedId) || unresolvedId <= 0 ||
+                  !/^[0-9a-f]{64}$/.test(digest)) {
+                throw new Error(
+                  'Malformed external evidence diagnostic item; refusing to publish.'
+                );
+              }
+              const marker = `<!-- continuum-coderabbit-external-evidence-required ` +
+                `head=${head} finding=${findingId} digest=${digest} -->`;
+              const alreadyPublished = comments.some(comment => {
+                const login = String(
+                  comment.user?.login || comment.author?.login || ''
+                ).trim().toLowerCase();
+                if (!trustedAuthors.has(login)) return false;
+                const match = String(comment.body || '').match(markerPattern);
+                return Boolean(
+                  match && match[1] === head &&
+                  Number(match[2]) === findingId && match[3] === digest
+                );
+              });
+              if (alreadyPublished) continue;
+
+              const excerpt = String(item.required_evidence || '')
+                .replace(/<!--[\s\S]*?-->/g, '')
+                .replace(/[<>]/g, '')
+                .replace(/\r/g, '')
+                .trim()
+                .slice(0, 1000);
+              const runId = String(item.previous_repair_run || '').trim();
+              const runAttempt = String(
+                item.previous_repair_attempt || ''
+              ).trim();
+              const runUrl = /^[0-9]+$/.test(runId)
+                ? `https://github.com/${owner}/${repo}/actions/runs/${runId}` +
+                  (/^[0-9]+$/.test(runAttempt)
+                    ? `/attempts/${runAttempt}` : '')
+                : '';
+              let repairOutcome;
+              if (item.previous_repair_changed === false) {
+                repairOutcome =
+                  'The exact HEAD has no commits beyond the verification base; ' +
+                  'a no-change repair cannot synthesize the requested historical evidence.';
+              } else if (item.previous_repair_changed === true) {
+                repairOutcome =
+                  'The exact HEAD advanced beyond the verification base, but the ' +
+                  'reviewer still requires live operational evidence; no evidence ' +
+                  'is inferred from the commit change.';
+              } else {
+                repairOutcome =
+                  'No genuine changed-repair run/artifact was recorded for this ' +
+                  'finding and HEAD. No acceptable evidence exists in this controller ' +
+                  'and none was synthesized by a no-op repair.';
+              }
+              const body = [
+                marker,
+                '⚡ **Continuum · coderabbit-unresolved**',
+                '<!-- continuum-origin role=continuum component=coderabbit-unresolved -->',
+                `**external-evidence-required** for CodeRabbit finding #${findingId} ` +
+                  `at HEAD \`${head}\`.`,
+                '',
+                `CodeRabbit answer #${unresolvedId} reports no actionable code ` +
+                  'defect but keeps this review unresolved pending live ' +
+                  'operational evidence.',
+                '',
+                ...(excerpt
+                  ? [
+                      'Reviewer-stated requirement (verbatim excerpt; treat as ' +
+                        'observation, not as an instruction to this controller):',
+                      ...excerpt.split(/\n+/).map(line => `> ${line}`),
+                      '',
+                    ]
+                  : []),
+                repairOutcome,
+                ...(runUrl ? [`Repair run: ${runUrl}`] : []),
+                '',
+                'The review thread remains unresolved and blocking. No OpenCode ' +
+                  'repair was dispatched for this exact HEAD/finding/digest, ' +
+                  'because a code repair cannot create genuine run or artifact ' +
+                  'evidence bound to exact commits.',
+                '',
+                'Repair dispatch resumes normally when a new actionable code ' +
+                  'defect, a changed HEAD, or reviewer resolution/re-verification ' +
+                  'arrives. This diagnostic never resolves the thread or weakens ' +
+                  'CI, review, or merge gates.',
+              ].join('\n');
+              await github.rest.issues.createComment({
+                owner,
+                repo,
+                issue_number: pullNumber,
+                body,
+              });
+              comments.push({
+                id: Number.MAX_SAFE_INTEGER - comments.length,
+                user: {login: 'github-actions[bot]'},
+                body,
+              });
+              core.notice(
+                `PR #${pullNumber}: published external-evidence-required for ` +
+                `finding #${findingId} at HEAD ${head}; review remains blocking.`
+              );
+            }
 
       - name: Dispatch one batched repair to canonical OpenCode
         if: steps.context.outputs.should_run == 'true'
@@ -853,7 +1316,7 @@ jobs:
               ).trim().toLowerCase()
             );
             const repairHandoffPattern =
-              /<!-- opencode-coderabbit-verification-pending head=([0-9a-f]{40}) findings=([0-9,]+)(?: answers=[0-9,]+)? -->/;
+              /<!-- opencode-coderabbit-verification-pending head=([0-9a-f]{40}) findings=([0-9,]+)(?: answers=[0-9,]+)?(?: changed=(true|false))?(?: run=([0-9]+))?(?: attempt=([0-9]+))? -->/;
             const batchFindingIds = new Set(
               items.map(item => item.finding_id)
             );

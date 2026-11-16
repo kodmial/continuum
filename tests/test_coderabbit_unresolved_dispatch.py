@@ -280,6 +280,7 @@ class CodeRabbitBatchContractTests(unittest.TestCase):
     def test_all_github_script_steps_parse_as_javascript(self):
         sources = [
             (BATCHER, "Collect all unresolved findings"),
+            (BATCHER, "Publish external evidence requirement"),
             (BATCHER, "Dispatch one batched repair to canonical OpenCode"),
             (OPENCODE, "Qualify current CodeRabbit unresolved batch"),
             (OPENCODE, "Ask CodeRabbit to verify every original finding"),
