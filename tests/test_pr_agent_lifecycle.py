@@ -280,8 +280,34 @@ APPROVED_SCHEDULER_ORIGIN_OPENCODE_SHA256 = (
 # plus that single #462 hunk (the helper no longer dereferences the optional
 # variable under `set -u`), so the full-file pin advances to the combined
 # merged artifact. Any unrelated byte drift still fails closed.
-APPROVED_458_PUBLICATION_OPENCODE_SHA256 = (
-    "eff960722bef2db6578ddcbce9182e96981304078fe82483cfc5a3d5ad3e89c6"
+# 2026-11-16: intentional generation-2 checkpoint-resume correction
+# (kodmial/continuum#460). A validated generation-2+ legacy mirror may resume
+# only when its immutable metadata binds the same durable ref/operation/issue
+# and the local mirror resolves to the pinned commit; explicit 429 recovery is
+# also exempt from overlap duplicate fencing after its identity is validated.
+# Retain the scheduler-origin pin above for audit and reject any further drift.
+# Review 5920627423 repair: the pre-model duplicate guard now forwards the
+# restore step's verified checkpoint SHA, so an omitted recovery_checkpoint_sha
+# dispatch input still resumes instead of failing the explicit recovery identity.
+# Review 5921692569 repair: a resumed generation is carried into the same-step
+# 429 evacuation, and admission compares a recovery identity against the
+# durable checkpoint refs so a superseded generation cannot replay work.
+# Review 5921692569 follow-up: ordinary issue resumes also read the highest
+# durable generation after the legacy identity is known and fail closed before
+# the baseline; generation-2+ durable refs must be published by the expected
+# repository at the pinned SHA. The executable resumed-generation regression
+# lives in scripts/test_opencode_429_evacuator.py, which CodeRabbit reviews.
+# Merge with main cfd545c (#462): the optional CONTINUUM_429_LEGACY_REF mirror
+# is read with a default at the initial safety check so the CodeRabbit repair
+# evacuation path cannot crash under `set -u`; this pin covers the combined
+# #460 + #462 bytes, and the executable #462 legacies above run from the same
+# scripts module. The digest is re-pinned after the merge; no other byte changed.
+# 2026-11-16 merge: the protected workflow now carries both the reviewed
+# #458 publication-attestation bytes and main's #460 generation-2
+# checkpoint-resume bytes (including the #462 legacy-mirror default).
+# Pin the exact combined artifact; unrelated byte drift still fails closed.
+APPROVED_458_460_MERGED_OPENCODE_SHA256 = (
+    "c7f3fde52e3a6b97be8ce4713565277bdad9d04847a3084c228567f66d92d64b"
 )
 APPROVED_446_CALLER_SHA256 = (
     "b7f3df118bc436526f48443b8f068372204073eb134c98e4a1543d025f314686"
@@ -2708,8 +2734,8 @@ class ProtectedBaselineTests(unittest.TestCase):
                     # with a full-file digest and executable regression tests.
                     self.assertEqual(
                         protected_file_digest(path),
-                        APPROVED_458_PUBLICATION_OPENCODE_SHA256,
-                        f"{path}: unexpected drift outside #458 publication attestation",
+                        APPROVED_458_460_MERGED_OPENCODE_SHA256,
+                        f"{path}: unexpected drift outside #458/#460 merged protected workflow",
                     )
                 else:
                     # The self-dogfood caller is the dispatchable surface
@@ -2794,7 +2820,7 @@ class ProtectedBaselineTests(unittest.TestCase):
         # therefore be dirty in this pre-commit worktree; any unapproved byte
         # change still fails the exact digest assertions above.
         approved = {
-            ".github/workflows/continuum-opencode.yml": APPROVED_458_PUBLICATION_OPENCODE_SHA256,
+            ".github/workflows/continuum-opencode.yml": APPROVED_458_460_MERGED_OPENCODE_SHA256,
             ".github/workflows/opencode.yml": APPROVED_350_SELF_CALLER_SHA256,
         }
         for path in PROTECTED_FILES:

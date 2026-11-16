@@ -97,6 +97,7 @@ class ResumeRequest:
     snapshot_spec: str
     operation: str = ""
     mode: str = "issue"
+    latest_generation: int = 0
 
     @classmethod
     def from_mapping(cls, values: Mapping[str, Any]) -> "ResumeRequest":
@@ -125,6 +126,7 @@ class ResumeRequest:
             snapshot_spec=text("snapshot_spec").lower(),
             operation=text("operation"),
             mode=text("mode") or "issue",
+            latest_generation=integer("latest_generation"),
         )
 
     def as_dict(self) -> Dict[str, Any]:
@@ -138,6 +140,7 @@ class ResumeRequest:
             "base_sha": self.base_sha,
             "snapshot_spec": self.snapshot_spec,
             "mode": self.mode,
+            "latest_generation": self.latest_generation,
         }
 
 
@@ -249,6 +252,10 @@ def _validate_request(repo: Path | str, request: ResumeRequest) -> None:
         raise ResumeError("invalid-request", "resume issue number is malformed")
     if request.generation < 1:
         raise ResumeError("invalid-request", "resume generation is malformed")
+    if request.latest_generation < 0:
+        raise ResumeError(
+            "invalid-request", "resume latest durable generation is malformed"
+        )
     if not request.checkpoint_ref:
         raise ResumeError("invalid-request", "resume checkpoint ref is empty")
     if not _SHA_RE.fullmatch(request.checkpoint_sha or ""):
@@ -285,6 +292,27 @@ def _validate_request(repo: Path | str, request: ResumeRequest) -> None:
         )
 
 
+def _origin_repository_matches(
+    repo: Path | str, request: ResumeRequest
+) -> Optional[bool]:
+    """Whether the checkout origin names the expected repository.
+
+    ``None`` means the checkout has no origin at all; callers decide whether
+    that absence is binding evidence or a fail-closed rejection.
+    """
+
+    completed = _completed(repo, "remote", "get-url", "origin")
+    if completed.returncode != 0:
+        return None
+    origin = (completed.stdout or "").strip().lower().rstrip("/")
+    if origin.endswith(".git"):
+        origin = origin[:-4]
+    wanted = request.repository.lower()
+    # Bind the exact owner/repository slug at the end of the remote path.
+    # A plain substring test would accept ``evil/owner/repo-extra``.
+    return origin.endswith("/" + wanted) or origin.endswith(":" + wanted)
+
+
 def _check_repository(
     repo: Path | str, request: ResumeRequest, metadata: Mapping[str, Any]
 ) -> None:
@@ -301,34 +329,103 @@ def _check_repository(
     # Legacy metadata has no repository field.  When the checkout has an
     # origin, use it as an additional binding; a bare test repository has no
     # remote and is bound by issue/generation/operation below instead.
-    completed = _completed(repo, "remote", "get-url", "origin")
-    if completed.returncode != 0:
-        return
-    origin = (completed.stdout or "").strip().lower().rstrip("/")
-    if origin.endswith(".git"):
-        origin = origin[:-4]
-    wanted = request.repository.lower()
-    # Bind the exact owner/repository slug at the end of the remote path.
-    # A plain substring test would accept ``evil/owner/repo-extra``.
-    if not (origin.endswith("/" + wanted) or origin.endswith(":" + wanted)):
+    origin_matches = _origin_repository_matches(repo, request)
+    if origin_matches is False:
         raise ResumeError(
             "wrong-repository",
             "the checkpoint's origin is not the expected repository",
         )
 
 
+def _check_durable_repository_binding(
+    repo: Path | str, request: ResumeRequest, durable_ref: str
+) -> None:
+    """Bind a generation-2+ durable ref to the expected repository.
+
+    A durable checkpoint ref is authoritative only when the checkout origin is
+    the expected repository and that origin publishes the same ref at the
+    exact pinned commit.  This lets historical metadata without a repository
+    field resume through its durable ref without inheriting trust from a local
+    mirror or an unrelated checkout.
+    """
+
+    if _origin_repository_matches(repo, request) is not True:
+        raise ResumeError(
+            "wrong-repository",
+            "the durable checkpoint has no repository-bound origin",
+        )
+    completed = _completed(
+        repo, "ls-remote", "--exit-code", "origin", "refs/heads/" + durable_ref
+    )
+    if completed.returncode != 0:
+        raise ResumeError(
+            "wrong-repository",
+            "the durable checkpoint ref is not published by the expected repository",
+        )
+    published = (completed.stdout or "").split()
+    published_sha = published[0].lower() if published else ""
+    if published_sha != request.checkpoint_sha:
+        raise ResumeError(
+            "checkpoint-mismatch",
+            "the durable checkpoint ref does not publish the pinned commit",
+        )
+
+
+def _resolve_local_ref(repo: Path | str, ref: str) -> Optional[str]:
+    """Resolve a local mirror ref to its exact commit, or ``None`` when absent.
+
+    Workflow-owned mirrors may live as a local branch or as the fetched
+    remote-tracking branch. Every resolvable spelling must agree before the
+    alias can be trusted, so a stale local branch cannot hide a moved mirror.
+    """
+
+    resolved = set()
+    for candidate in (ref, "refs/heads/" + ref, "refs/remotes/origin/" + ref):
+        completed = _completed(
+            repo, "rev-parse", "--verify", "--quiet", candidate + "^{commit}"
+        )
+        if completed.returncode != 0:
+            continue
+        sha = (completed.stdout or "").strip().lower()
+        if sha:
+            resolved.add(sha)
+    if not resolved:
+        return None
+    if len(resolved) > 1:
+        return ""
+    return resolved.pop()
+
+
 def _check_checkpoint_ref(
-    request: ResumeRequest, metadata_checkpoint: str, operation: str
+    repo: Path | str,
+    request: ResumeRequest,
+    metadata: Mapping[str, Any],
+    operation: str,
 ) -> None:
     """Validate that the pinned ref names the same durable checkpoint.
 
     The durable 429 ref is the authoritative shape. Legacy interruption
     checkpoints may record the historical ``opencode/checkpoint-issueN`` ref
-    directly, so that shape is accepted for issue generation 1 as well. Any
-    other cross-ref combination is drift and fails closed.
+    directly, so that shape is accepted for issue generation 1 as well.
+
+    A workflow-owned legacy mirror may also carry a fully validated
+    generation-2+ checkpoint: the immutable commit metadata names the durable
+    generation-specific ref for the same operation and issue, names this
+    repository explicitly, and carries the saved verification evidence the
+    continuation contract requires. That evidence is untrusted input, so its
+    presence is only a requirement, never authentication. The expected
+    repository must also publish that exact durable ref at the pinned commit;
+    metadata fields and a local mirror are claims, not provenance. The local
+    mirror must then resolve to that exact pinned commit. The destination
+    checkout's ``origin`` alone is never the repository binding for an alias: a
+    copied mirror must not inherit trust from wherever it happens to be
+    fetched. This is still an alias, never proof by itself: every other
+    generation/operation/ancestry check applies, and a moved or missing
+    mirror fails closed. Any other cross-ref combination is drift.
     """
 
     expected = request.checkpoint_ref
+    metadata_checkpoint = str(metadata.get("checkpoint_ref") or "").strip()
     parsed = _429_CHECKPOINT_RE.match(metadata_checkpoint or "")
     if parsed is not None:
         recorded_operation, recorded_generation = parsed.group(1), int(
@@ -363,6 +460,8 @@ def _check_checkpoint_ref(
             )
 
     if expected == metadata_checkpoint:
+        if request.generation > 1:
+            _check_durable_repository_binding(repo, request, expected)
         return
     legacy_expected = _LEGACY_CHECKPOINT_RE.match(expected)
     if legacy_expected is None or int(legacy_expected.group(1)) != request.issue:
@@ -370,10 +469,58 @@ def _check_checkpoint_ref(
             "wrong-ref",
             "the resumed ref is neither the durable checkpoint nor the issue's legacy checkpoint",
         )
-    if request.generation != 1:
+    if request.generation == 1:
+        return
+    if parsed is None:
         raise ResumeError(
             "wrong-generation",
             "the legacy issue checkpoint only represents generation 1",
+        )
+    # A generation-2+ mirror is only an alias for the durable checkpoint. The
+    # expected repository must publish that exact durable ref at the pinned
+    # commit; the metadata ref and the local mirror cannot authenticate
+    # themselves. A missing or moved durable ref fails closed instead of
+    # falling back to the alias.
+    _check_durable_repository_binding(repo, request, metadata_checkpoint)
+    # An alias is only trusted when its immutable checkpoint content names this
+    # repository explicitly. _check_repository() accepts legacy metadata with
+    # no repository by falling back to the local origin, but that cannot show
+    # which repository produced a copied checkpoint.
+    recorded_repository = str(
+        metadata.get("repository") or metadata.get("repo") or ""
+    ).strip()
+    if not recorded_repository:
+        raise ResumeError(
+            "wrong-repository",
+            "the generation-2 checkpoint alias has no repository-bound recovery metadata",
+        )
+    if recorded_repository.lower() != request.repository.lower():
+        raise ResumeError(
+            "wrong-repository",
+            "the checkpoint recovery metadata belongs to a different repository",
+        )
+    # Saved verification evidence is writable and untrusted, so its presence
+    # is a required continuation signal, not authentication. Repository
+    # provenance comes from the published durable ref checked above; a missing
+    # file still blocks the alias because the continuation contract requires it.
+    if _show_file(repo, request.checkpoint_sha, EVIDENCE_FILE_NAME) is None:
+        raise ResumeError(
+            "evidence-missing",
+            "the generation-2 checkpoint alias has no saved verification evidence",
+        )
+    # The durable metadata ref above already proved this is the same
+    # generation and operation. The workflow mirror is only an alias for the
+    # pinned commit, so it must resolve locally to that exact immutable SHA.
+    mirror_sha = _resolve_local_ref(repo, expected)
+    if mirror_sha is None:
+        raise ResumeError(
+            "checkpoint-alias-missing",
+            "the legacy issue checkpoint mirror is not present at the pinned commit",
+        )
+    if mirror_sha != request.checkpoint_sha:
+        raise ResumeError(
+            "checkpoint-alias-mismatch",
+            "the legacy issue checkpoint mirror does not resolve to the pinned commit",
         )
 
 
@@ -508,8 +655,7 @@ def _validate_metadata(
             _metadata_record(request, operation=operation, base_ref=base_ref, base_sha=base_sha, reason="metadata-malformed"),
         )
 
-    metadata_checkpoint = str(metadata.get("checkpoint_ref") or "").strip()
-    _check_checkpoint_ref(request, metadata_checkpoint, operation)
+    _check_checkpoint_ref(repo, request, metadata, operation)
 
     # The original base must be an ancestor of the saved checkpoint.  A
     # current base that has advanced since the checkpoint is allowed, but the
@@ -610,6 +756,20 @@ def _validate_checkpoint(
     repo: Path | str, request: ResumeRequest, ignored: Tuple[str, ...]
 ) -> ValidatedCheckpoint:
     _validate_request(repo, request)
+
+    if (
+        request.latest_generation
+        and request.generation < request.latest_generation
+    ):
+        raise ResumeError(
+            "superseded-generation",
+            "checkpoint generation {} is superseded by durable generation {} "
+            "for {}".format(
+                request.generation,
+                request.latest_generation,
+                request.operation or "this operation",
+            ),
+        )
 
     dirty = dirty_worktree(repo, ignored)
     if dirty:
