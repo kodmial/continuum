@@ -249,14 +249,18 @@ APPROVED_448_REPAIR_OPENCODE_SHA256 = (
 # receipt, because a later repair run would snapshot the already pushed head as
 # its own base and could never attest the original commit.
 APPROVED_450_SERIALIZED_OPENCODE_SHA256 = (
-    "236978024396822de9ee242f532aef9b4e10c81b1d1a46f548f5b2ceb441f38a"
+    "bd629cdefde4e5a19156c925f52e91507dd056bb71c070f75ee07bd7ed5afb48"
 )
 # 2026-11-14: intentional scheduler-origin recovery correction in Continuum main.
 # Pin the full protected workflow after canonical receipt validation and
-# explicit quoted-owner-marker handling. Retain #450 historical digest above
-# and reject any further unauthorized byte drift.
+# explicit quoted-owner-marker handling. This constant tracks the current
+# reviewed artifact; any further unauthorized byte drift still fails closed.
+# 2026-11-16 (#462): the optional CONTINUUM_429_LEGACY_REF mirror is read with
+# a default at the initial safety check so the CodeRabbit repair evacuation
+# path cannot crash under `set -u`; both full-file pins advance to that exact
+# reviewed artifact and any further byte drift still fails closed.
 APPROVED_SCHEDULER_ORIGIN_OPENCODE_SHA256 = (
-    "b2bd86557d1050607e958698a75dae6ce234587f8934fac20a302587cb84ba4e"
+    "bd629cdefde4e5a19156c925f52e91507dd056bb71c070f75ee07bd7ed5afb48"
 )
 # 2026-11-15: deliberate kodmial/continuum#458 publication-attestation change.
 # Completion evidence must prove the worker run published the implementation
