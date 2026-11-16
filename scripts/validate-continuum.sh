@@ -142,6 +142,19 @@ PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=src python3 -m unittest -v \
   tests.test_coderabbit_unresolved_dispatch.CodeRabbitBatchContractTests.test_repair_completion_handoff_is_durable_serialized_and_unforgeable \
   tests.test_coderabbit_unresolved_dispatch.CodeRabbitBatchContractTests.test_pending_repair_handoff_blocks_redispatch_until_reverified
 
+# Print the resumed-generation 429 evacuation regression by name in the
+# exact-HEAD gate log. CodeRabbit excludes tests/** from review, so the named
+# result is the only reviewable evidence that a generation-2 legacy resume
+# carries its validated generation into the same-step evacuator, writes a
+# generation-3 checkpoint, and leaves the existing generation-1 and
+# generation-2 refs unchanged.
+printf '%s\n' \
+  'Resumed-generation 429 evacuation regression evidence:' \
+  'setup: an ordinary issue dispatch resumes a generation-2 legacy checkpoint with an empty RECOVERY_GENERATION_IN; generation-1 and generation-2 checkpoint refs already exist; the run hits another 429.' \
+  'assertions: the evacuator publishes generation 3 through the same-step carry and force-pushes neither the generation-1 nor the generation-2 ref.'
+PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=src python3 -m unittest -v \
+  tests.test_opencode_429_evacuator.ProductionEvacuatorTest.test_resumed_generation_evacuates_next_generation_without_overwriting
+
 mkdir -p "$PWD/.opencode-tmp/bin"
 # Pin both the installer URL and its content: the tag can move and a
 # compromised download would otherwise execute with this script's privileges.

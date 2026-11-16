@@ -194,10 +194,21 @@ class ProductionEvacuatorTest(unittest.TestCase):
         # A generation-2 legacy resume on an ordinary issue dispatch starts
         # with an empty RECOVERY_GENERATION_IN. The workflow must carry the
         # validated resume generation into the same-step evacuator so the next
-        # 429 writes generation 3 and leaves the existing generation-2
-        # checkpoint ref untouched.
+        # 429 writes generation 3 and leaves every earlier checkpoint ref,
+        # including generation 1 that the pre-fix code force-pushed over,
+        # untouched.
+        gen1_ref = "opencode/429-checkpoint-opencode-429-issue-issue350-gen-1"
         gen2_ref = "opencode/429-checkpoint-opencode-429-issue-issue350-gen-2"
         gen3_ref = "opencode/429-checkpoint-opencode-429-issue-issue350-gen-3"
+        gen1_sha = run_git(self.repo, "rev-parse", "HEAD")
+        run_git(
+            self.repo,
+            "push",
+            "origin",
+            "{}:refs/heads/{}".format(gen1_sha, gen1_ref),
+        )
+        (self.repo / "app.py").write_text("VALUE = 2\n", encoding="utf-8")
+        run_git(self.repo, "commit", "-am", "generation 2 checkpoint")
         gen2_sha = run_git(self.repo, "rev-parse", "HEAD")
         run_git(
             self.repo,
@@ -223,8 +234,10 @@ class ProductionEvacuatorTest(unittest.TestCase):
         for line in run_git(self.repo, "ls-remote", "origin").splitlines():
             sha, _, name = line.partition("\t")
             refs[name] = sha
+        self.assertEqual(gen1_sha, refs["refs/heads/" + gen1_ref])
         self.assertEqual(gen2_sha, refs["refs/heads/" + gen2_ref])
         self.assertIn("refs/heads/" + gen3_ref, refs)
+        self.assertNotEqual(gen1_sha, refs["refs/heads/" + gen3_ref])
         self.assertNotEqual(gen2_sha, refs["refs/heads/" + gen3_ref])
 
     def test_metadata_failure_preserves_raw_work_without_false_pointer(self):
