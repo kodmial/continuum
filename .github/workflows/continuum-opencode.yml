@@ -3421,8 +3421,9 @@ jobs:
               [[ "$RESUME_METADATA_GENERATION" =~ ^[1-9][0-9]*$ ]] && RESUME_GENERATION="$RESUME_METADATA_GENERATION"
               # Prefer the durable checkpoint ref named by the immutable
               # metadata over the workflow-owned legacy mirror. The ref must
-              # resolve to the exact pinned commit; otherwise the validated
-              # local mirror alias is used and the engine still proves it.
+              # resolve to the exact pinned commit; otherwise the local mirror
+              # alias is used only after the engine verifies that the expected
+              # repository publishes the durable ref at the same pinned SHA.
               case "$RESUME_METADATA_REF" in
                 opencode/429-checkpoint-*|opencode/infra-checkpoint-*)
                   if git fetch --no-tags origin "$RESUME_METADATA_REF" --quiet 2>/dev/null; then

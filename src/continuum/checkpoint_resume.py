@@ -411,9 +411,11 @@ def _check_checkpoint_ref(
     A workflow-owned legacy mirror may also carry a fully validated
     generation-2+ checkpoint: the immutable commit metadata names the durable
     generation-specific ref for the same operation and issue, names this
-    repository explicitly, and carries saved verification evidence. The local
-    mirror must then resolve to that exact pinned commit. The destination
-    checkout's ``origin`` is never the repository binding for an alias: a
+    repository explicitly, and carries saved verification evidence. The
+    expected repository must also publish that exact durable ref at the pinned
+    commit; metadata fields and a local mirror are claims, not provenance. The
+    local mirror must then resolve to that exact pinned commit. The destination
+    checkout's ``origin`` alone is never the repository binding for an alias: a
     copied mirror must not inherit trust from wherever it happens to be
     fetched. This is still an alias, never proof by itself: every other
     generation/operation/ancestry check applies, and a moved or missing
@@ -472,6 +474,12 @@ def _check_checkpoint_ref(
             "wrong-generation",
             "the legacy issue checkpoint only represents generation 1",
         )
+    # A generation-2+ mirror is only an alias for the durable checkpoint. The
+    # expected repository must publish that exact durable ref at the pinned
+    # commit; the metadata ref and the local mirror cannot authenticate
+    # themselves. A missing or moved durable ref fails closed instead of
+    # falling back to the alias.
+    _check_durable_repository_binding(repo, request, metadata_checkpoint)
     # An alias is only trusted when its immutable checkpoint content names this
     # repository explicitly. _check_repository() accepts legacy metadata with
     # no repository by falling back to the local origin, but that cannot show

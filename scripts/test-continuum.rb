@@ -3867,15 +3867,15 @@ class ContinuumTest < Minitest::Test
   end
 
   # Review 5921692569: the generation-2 legacy resume followed by another 429
-  # has executable assertions in the Python suite, which CodeRabbit excludes
-  # from review. Keep the scenario and exact expected outcomes reviewable here:
-  # an ordinary issue dispatch starts with an empty generation, resumes a
-  # generation-2 checkpoint through the workflow's own carry snippet, then hits
-  # another 429. The next checkpoint is generation 3 and the existing
-  # generation-1/generation-2 refs are byte-for-byte unchanged.
+  # is an executable regression in scripts/, which CodeRabbit reviews. Keep the
+  # scenario and exact expected outcomes asserted here as well: an ordinary
+  # issue dispatch starts with an empty generation, resumes a generation-2
+  # checkpoint through the workflow's own carry snippet, then hits another 429.
+  # The next checkpoint is generation 3 and the existing generation-1/generation-2
+  # refs are byte-for-byte unchanged.
   def test_resumed_generation_evacuation_assertions_are_reviewable
     test = File.read(
-      File.join(ROOT, 'tests/test_opencode_429_evacuator.py')
+      File.join(ROOT, 'scripts/test_opencode_429_evacuator.py')
     )
 
     assert_includes test,
