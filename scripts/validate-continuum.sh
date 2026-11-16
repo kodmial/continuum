@@ -157,6 +157,24 @@ PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=src python3 -m unittest -v \
   tests.test_contract_canary.ExactHeadRunsTest.test_fresh_exact_head_pending_masks_the_snapshot_success \
   tests.test_contract_canary.WorkflowContractTest.test_both_exact_head_fetches_replace_stale_snapshot_evidence
 
+# Print the contract-canary worker-evidence and repair-attempt regressions by
+# name in the exact-HEAD gate log. CodeRabbit excludes tests/** from review, so
+# the named results are the only reviewable evidence that completion records an
+# issue-bound worker run, rejects a closed owned issue with a merged PR and both
+# exact-HEAD checks but no worker evidence, and pairs each repair commit with
+# the receipt from its own attempt of the same run.
+printf '%s\n' \
+  'Contract canary worker-evidence regression evidence:' \
+  'setup: a closed owned canary issue has a merged implementation PR with successful exact-HEAD CI and Contract qualification runs.' \
+  'assertions: completion rejects the missing worker run with worker-evidence-absent, the selected worker run id is recorded in the completed outcome, two repair commits published by separate attempts of one repair run each keep the receipt matching their own base and head, and the workflow downloads repair receipts by artifact id instead of a same-named artifact from another attempt.'
+PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=src python3 -m unittest -v \
+  tests.test_contract_canary.CompletionEvidenceTest.test_missing_worker_evidence_fails \
+  tests.test_contract_canary.CompletionEvidenceTest.test_completion_worker_run_id_is_recorded \
+  tests.test_contract_canary.CompletionEvidenceTest.test_two_repair_commits_from_separate_attempts_of_one_run_pass \
+  tests.test_contract_canary.WorkflowContractTest.test_workflow_records_completion_worker_run_id \
+  tests.test_contract_canary.WorkflowContractTest.test_workflow_binds_each_repair_status_to_its_own_commit_receipt \
+  tests.test_contract_canary.WorkflowContractTest.test_repair_receipt_selection_matches_each_commit_from_a_rerun
+
 mkdir -p "$PWD/.opencode-tmp/bin"
 # Pin both the installer URL and its content: the tag can move and a
 # compromised download would otherwise execute with this script's privileges.
