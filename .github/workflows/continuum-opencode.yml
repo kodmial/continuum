@@ -2846,15 +2846,23 @@ jobs:
                   # Optional legacy-branch mirror so scheduler-native resume
                   # keeps working after infrastructure cooldown even without a
                   # recovery dispatch (best effort; never fails the evacuation).
-                  # kodmial/continuum#302: the mirror must still never alias
-                  # the default branch; a refused mirror is cleared and
+                  # The variable itself is optional: repair paths such as
+                  # CodeRabbit review repair invoke this helper without defining
+                  # it, and the caller shell runs under `set -u`. An omitted or
+                  # empty mirror skips only this optional push; the validated
+                  # primary checkpoint above stays published. kodmial/continuum#462
+                  # kodmial/continuum#302: a supplied mirror must still never
+                  # alias the default branch; a refused mirror is cleared and
                   # skipped while the primary checkpoint still evacuates.
-                  continuum_assert_safe_push "${CONTINUUM_429_LEGACY_REF}" || {
-                    echo "::error::Continuum branch safety: refusing legacy checkpoint mirror to '${CONTINUUM_429_LEGACY_REF}'." >&2
-                    CONTINUUM_429_LEGACY_REF=""
-                  }
-                  if [[ -n "${CONTINUUM_429_LEGACY_REF:-}" ]]; then
-                    git push --force origin "HEAD:refs/heads/${CONTINUUM_429_LEGACY_REF}" || true
+                  local legacy_ref="${CONTINUUM_429_LEGACY_REF:-}"
+                  if [[ -n "$legacy_ref" ]]; then
+                    continuum_assert_safe_push "$legacy_ref" || {
+                      echo "::error::Continuum branch safety: refusing legacy checkpoint mirror to '$legacy_ref'." >&2
+                      legacy_ref=""
+                    }
+                    if [[ -n "$legacy_ref" ]]; then
+                      git push --force origin "HEAD:refs/heads/${legacy_ref}" || true
+                    fi
                   fi
                 fi
               else
