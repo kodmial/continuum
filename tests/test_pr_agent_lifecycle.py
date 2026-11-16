@@ -251,6 +251,18 @@ APPROVED_450_SERIALIZED_OPENCODE_SHA256 = (
 APPROVED_SCHEDULER_ORIGIN_OPENCODE_SHA256 = (
     "bd629cdefde4e5a19156c925f52e91507dd056bb71c070f75ee07bd7ed5afb48"
 )
+# kodmial/continuum#454: the reviewed #448, #450, and scheduler-origin pins
+# above stay for audit. This task deliberately adds one bounded, privacy-safe
+# telemetry artifact upload step (always(), continue-on-error,
+# upload-artifact v4, runner-temp telemetry directory) so per-attempt OpenCode
+# usage survives the runner without making observability failure a task
+# failure. Merging main's #460 generation-2 checkpoint-resume correction keeps
+# both reviewed behaviors in the same artifact, so this active pin covers the
+# combined scheduler-origin, #454 telemetry, and #460 resume bytes; unrelated
+# drift still fails closed.
+APPROVED_454_TELEMETRY_OPENCODE_SHA256 = (
+    "c740682de530c242cc5904d0c53d8a2eed6cbb6900347ea453fbc03de4917249"
+)
 # 2026-11-16: intentional generation-2 checkpoint-resume correction
 # (kodmial/continuum#460). A validated generation-2+ legacy mirror may resume
 # only when its immutable metadata binds the same durable ref/operation/issue
@@ -273,6 +285,10 @@ APPROVED_SCHEDULER_ORIGIN_OPENCODE_SHA256 = (
 # evacuation path cannot crash under `set -u`; this pin covers the combined
 # #460 + #462 bytes, and the executable #462 legacies above run from the same
 # scripts module. The digest is re-pinned after the merge; no other byte changed.
+# Merging main into #455: the #454 telemetry upload step is additive to this
+# reviewed #460 + #462 artifact, so the merged bytes are pinned above by
+# APPROVED_454_TELEMETRY_OPENCODE_SHA256. This digest stays for audit and any
+# further byte drift still fails closed.
 APPROVED_460_RESUME_OPENCODE_SHA256 = (
     "cf4593df8d89f638986426f3dc48fe62544617c40e3d3bcccfe14113fa07de4e"
 )
@@ -2697,12 +2713,15 @@ class ProtectedBaselineTests(unittest.TestCase):
                     self.assertIn("CONTINUUM_OPENCODE_PUBLISH_RACE_RETRY_REQUIRED", original)
                     self.assertIn("steps.model_route.outputs.model", original)
                 if path == ".github/workflows/continuum-opencode.yml":
-                    # #450 deliberately changes chat-ownership behavior,
-                    # with a full-file digest and executable regression tests.
+                    # #454 adds bounded telemetry on top of the deliberate
+                    # scheduler-origin recovery correction, #450's
+                    # chat-ownership change, and main's #460 generation-2
+                    # resume repair, with full-file digests and executable
+                    # regression tests.
                     self.assertEqual(
                         protected_file_digest(path),
-                        APPROVED_460_RESUME_OPENCODE_SHA256,
-                        f"{path}: unexpected drift outside #460 generation-2 resume repair",
+                        APPROVED_454_TELEMETRY_OPENCODE_SHA256,
+                        f"{path}: unexpected drift outside #454 telemetry on the scheduler-origin #450 serialized CodeRabbit chat owner and #460 resume repair",
                     )
                 else:
                     # The self-dogfood caller is the dispatchable surface
@@ -2787,7 +2806,7 @@ class ProtectedBaselineTests(unittest.TestCase):
         # therefore be dirty in this pre-commit worktree; any unapproved byte
         # change still fails the exact digest assertions above.
         approved = {
-            ".github/workflows/continuum-opencode.yml": APPROVED_460_RESUME_OPENCODE_SHA256,
+            ".github/workflows/continuum-opencode.yml": APPROVED_454_TELEMETRY_OPENCODE_SHA256,
             ".github/workflows/opencode.yml": APPROVED_350_SELF_CALLER_SHA256,
         }
         for path in PROTECTED_FILES:
