@@ -243,7 +243,11 @@ APPROVED_448_REPAIR_OPENCODE_SHA256 = (
 # leaving the pushed commit unattested and blocking canary completion and
 # replacement. The receipt is written first, publication survives earlier step
 # failures, transient status failures are retried, and dedicated recovery steps
-# re-publish the status and receipt without a second repair run.
+# re-publish the status and receipt without a second repair run. When both
+# in-job retry budgets are exhausted, a fresh-runner post-failure job re-attests
+# the exact original base/head from the failed job's outputs and publishes a
+# receipt, because a later repair run would snapshot the already pushed head as
+# its own base and could never attest the original commit.
 APPROVED_450_SERIALIZED_OPENCODE_SHA256 = (
     "236978024396822de9ee242f532aef9b4e10c81b1d1a46f548f5b2ceb441f38a"
 )
@@ -267,7 +271,7 @@ APPROVED_SCHEDULER_ORIGIN_OPENCODE_SHA256 = (
 # digest above for audit and pin the full current artifact; any further drift
 # still fails closed.
 APPROVED_458_PUBLICATION_OPENCODE_SHA256 = (
-    "caf3615dc1ed946aa93882522e179edbff33b61a5e31729ac5389c4f643144db"
+    "9384d20341b74b25b335b476ac61b4ce919ca30e2327a52744ada67bb049cde2"
 )
 APPROVED_446_CALLER_SHA256 = (
     "b7f3df118bc436526f48443b8f068372204073eb134c98e4a1543d025f314686"

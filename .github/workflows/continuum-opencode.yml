@@ -913,6 +913,14 @@ jobs:
 
     outputs:
       restart_required: ${{ steps.runner_recovery.outputs.restart_required }}
+      # kodmial/continuum#458: a failed status publication must remain
+      # recoverable from the exact base/head this run pushed. Job outputs
+      # survive a failed job, so the recovery job never has to infer the
+      # original commit from a later repair run's base.
+      repair_base_sha: ${{ steps.repair_publication.outputs.base_sha }}
+      repair_head_sha: ${{ steps.repair_publication.outputs.head_sha }}
+      repair_pr_number: ${{ steps.repair_publication.outputs.pr_number }}
+      repair_branch: ${{ steps.repair_publication.outputs.branch }}
 
     steps:
       - name: Checkout repository
@@ -5250,6 +5258,10 @@ jobs:
             || { echo "::error::Repair publication has no PR or branch identity; refusing to attest continuity."; exit 1; }
           echo "base_sha=$base" >> "$GITHUB_OUTPUT"
           echo "head_sha=$head" >> "$GITHUB_OUTPUT"
+          # Keep the PR and branch with the commit identity so the post-failure
+          # recovery job can re-attest the exact original publication.
+          echo "pr_number=$PR_NUMBER" >> "$GITHUB_OUTPUT"
+          echo "branch=$HEAD_REF" >> "$GITHUB_OUTPUT"
 
           # The status alone names a run URL, which a repository owner could
           # copy onto a manual commit. The receipt is scoped to this very run
@@ -5702,6 +5714,82 @@ jobs:
           gh api --method DELETE \
             "repos/${GITHUB_REPOSITORY}/issues/${PR_NUMBER}/labels/opencode-conflict-repair" \
             >/dev/null 2>&1 || true
+
+  recover-repair-publication:
+    name: Recover authenticated repair publication
+    needs: opencode
+    # The primary status write and its in-job retry both target the commit
+    # this run already pushed. If both exhaust their budgets the job fails, and
+    # a later repair run cannot substitute: its snapshot base would be this
+    # run's head, so it would never attest the original commit. Re-attest the
+    # exact base/head from the failed job's outputs here, on a fresh runner.
+    if: >-
+      !cancelled() &&
+      needs.opencode.result == 'failure'
+    runs-on: ubuntu-latest
+    timeout-minutes: ${{ fromJSON(vars.AUTOMATION_ATTEMPTS_TIMEOUT_MINUTES || '10') }}
+
+    permissions: {}
+
+    steps:
+      - name: Republish authenticated repair publication after retry exhaustion
+        env:
+          GH_TOKEN: ${{ secrets.TAP_PAT }}
+          BASE_SHA: ${{ needs.opencode.outputs.repair_base_sha }}
+          HEAD_SHA: ${{ needs.opencode.outputs.repair_head_sha }}
+          PR_NUMBER: ${{ needs.opencode.outputs.repair_pr_number }}
+          HEAD_REF: ${{ needs.opencode.outputs.repair_branch }}
+        run: |
+          set -euo pipefail
+          base="$BASE_SHA"
+          head="$HEAD_SHA"
+          if [[ -z "$base" && -z "$head" ]]; then
+            echo "No repair publication was prepared for this run; nothing to recover."
+            exit 0
+          fi
+          [[ "$base" =~ ^[0-9a-f]{40}$ && "$head" =~ ^[0-9a-f]{40}$ ]] \
+            || { echo "::error::Recovered repair publication has no full base/head commit; refusing to attest continuity."; exit 1; }
+          [[ "$base" != "$head" ]] \
+            || { echo "::error::Recovered repair publication reported no new commit; refusing to attest continuity."; exit 1; }
+          [[ "$PR_NUMBER" =~ ^[1-9][0-9]*$ && -n "$HEAD_REF" ]] \
+            || { echo "::error::Recovered repair publication has no PR or branch identity; refusing to attest continuity."; exit 1; }
+          RECOVERY_DIR="${RUNNER_TEMP:-/tmp}/continuum-repair-publication-recovery"
+          mkdir -p "$RECOVERY_DIR"
+          jq -n \
+            --arg repo "$GITHUB_REPOSITORY" \
+            --arg run "$GITHUB_RUN_ID" \
+            --arg attempt "$GITHUB_RUN_ATTEMPT" \
+            --arg pr "$PR_NUMBER" \
+            --arg branch "$HEAD_REF" \
+            --arg base "$base" \
+            --arg head "$head" \
+            '{schema_version:1, repo:$repo, run_id:$run, run_attempt:$attempt, pr_number:($pr | tonumber), branch:$branch, base_sha: $base, head_sha: $head}' \
+            > "$RECOVERY_DIR/publication.json"
+          for attempt in 1 2 3; do
+            if gh api --method POST "repos/$GITHUB_REPOSITORY/statuses/$head" \
+              -f state=success \
+              -f context=continuum/repair-publication \
+              -f description="pr=${PR_NUMBER} base=${base:0:12} head=${head:0:12}" \
+              -f target_url="https://github.com/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
+              >/dev/null; then
+              exit 0
+            fi
+            [[ "$attempt" -eq 3 ]] && break
+            sleep $((attempt * 5))
+          done
+          echo "::error::CONTINUUM_REPAIR_PUBLICATION_RETRY_REQUIRED"
+          echo "::error::Continuum could not recover the authenticated repair status for $head after the retry budget."
+          exit 1
+
+      - name: Upload recovered authenticated repair publication receipt
+        if: >-
+          !cancelled() &&
+          needs.opencode.outputs.repair_head_sha != ''
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: continuum-repair-publication-${{ github.run_attempt }}-job-recovery
+          path: ${{ runner.temp }}/continuum-repair-publication-recovery/publication.json
+          if-no-files-found: error
 
   cleanup-workflow-repair-lock:
     name: Release workflow-repair lock

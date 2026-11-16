@@ -363,6 +363,14 @@ ENTRIES = (
     },
     {
         "workflow": "continuum-opencode.yml",
+        "step": "Republish authenticated repair publication after retry exhaustion",
+        "capability": PUSH_FANOUT,
+        "same_repo": True,
+        "reason": "A fresh-runner post-failure job re-attests the exact base/head from the failed job's outputs after both in-job retry budgets are exhausted; only the authenticated PAT can publish the status for the original pushed repair commit, and the job grants no statuses:write.",
+        "evidence": ("GH_TOKEN: ${{ secrets.TAP_PAT }}",),
+    },
+    {
+        "workflow": "continuum-opencode.yml",
         "step": "Re-run the consumer blocking CI workflow for this head",
         "capability": DISPATCH,
         "same_repo": True,

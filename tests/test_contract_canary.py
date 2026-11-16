@@ -2404,6 +2404,103 @@ class WorkflowContractTest(unittest.TestCase):
             "verification must stay fail-closed when publication failed",
         )
 
+    def test_repair_status_is_recovered_from_the_original_commit_after_retry_exhaustion(self):
+        """A failed status publication stays recoverable from its own run.
+
+        Both in-job retry loops target the commit this run pushed. A later
+        repair run snapshots that commit as its base, so only a post-failure
+        job carrying the original base/head can still attest it. The recovery
+        job consumes the failed job's outputs and uploads a receipt the canary
+        can read from the same status URL.
+        """
+        workflow = yaml.safe_load(
+            (ROOT / ".github/workflows/continuum-opencode.yml").read_text(
+                encoding="utf-8"
+            )
+        )
+        jobs = workflow["jobs"]
+        producer = jobs["opencode"]
+        self.assertEqual(
+            producer["outputs"]["repair_base_sha"],
+            "${{ steps.repair_publication.outputs.base_sha }}",
+        )
+        self.assertEqual(
+            producer["outputs"]["repair_head_sha"],
+            "${{ steps.repair_publication.outputs.head_sha }}",
+        )
+        self.assertEqual(
+            producer["outputs"]["repair_pr_number"],
+            "${{ steps.repair_publication.outputs.pr_number }}",
+        )
+        self.assertEqual(
+            producer["outputs"]["repair_branch"],
+            "${{ steps.repair_publication.outputs.branch }}",
+        )
+        prepare = next(
+            step
+            for step in producer["steps"]
+            if step.get("id") == "repair_publication"
+        )
+        self.assertIn(
+            'echo "pr_number=$PR_NUMBER" >> "$GITHUB_OUTPUT"', prepare["run"]
+        )
+        self.assertIn(
+            'echo "branch=$HEAD_REF" >> "$GITHUB_OUTPUT"', prepare["run"]
+        )
+
+        recovery = jobs["recover-repair-publication"]
+        self.assertEqual(recovery["needs"], "opencode")
+        self.assertIn("!cancelled()", recovery["if"])
+        self.assertIn("needs.opencode.result == 'failure'", recovery["if"])
+        self.assertNotIn("continue-on-error", recovery)
+
+        step = next(
+            item
+            for item in recovery["steps"]
+            if item.get("name")
+            == "Republish authenticated repair publication after retry exhaustion"
+        )
+        self.assertEqual(
+            step["env"]["BASE_SHA"],
+            "${{ needs.opencode.outputs.repair_base_sha }}",
+        )
+        self.assertEqual(
+            step["env"]["HEAD_SHA"],
+            "${{ needs.opencode.outputs.repair_head_sha }}",
+        )
+        self.assertEqual(
+            step["env"]["PR_NUMBER"],
+            "${{ needs.opencode.outputs.repair_pr_number }}",
+        )
+        self.assertEqual(
+            step["env"]["HEAD_REF"],
+            "${{ needs.opencode.outputs.repair_branch }}",
+        )
+        self.assertEqual(step["env"]["GH_TOKEN"], "${{ secrets.TAP_PAT }}")
+        script = step["run"]
+        self.assertIn('"repos/$GITHUB_REPOSITORY/statuses/$head"', script)
+        self.assertIn("context=continuum/repair-publication", script)
+        self.assertIn("target_url=", script)
+        self.assertIn("CONTINUUM_REPAIR_PUBLICATION_RETRY_REQUIRED", script)
+        self.assertIn("for attempt in 1 2 3; do", script)
+        self.assertIn("{schema_version:1, repo:$repo", script)
+        self.assertIn("base_sha: $base", script)
+        self.assertIn("head_sha: $head", script)
+
+        upload = next(
+            item
+            for item in recovery["steps"]
+            if item.get("name")
+            == "Upload recovered authenticated repair publication receipt"
+        )
+        artifact = upload["with"]["name"]
+        self.assertTrue(
+            artifact.startswith(
+                canary.CANARY_REPAIR_PUBLICATION_ARTIFACT_PREFIX
+            )
+        )
+        self.assertEqual(upload["with"]["if-no-files-found"], "error")
+
     def test_ordinary_coderabbit_repair_always_reports_publication(self):
         """A review-only repair must attest its pushed commit without a batch."""
         workflow = yaml.safe_load(
