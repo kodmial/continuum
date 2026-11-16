@@ -3868,9 +3868,11 @@ class ContinuumTest < Minitest::Test
 
   # Review 5921692569: the generation-2 legacy resume followed by another 429
   # has executable assertions in the Python suite, which CodeRabbit excludes
-  # from review. Keep the exact expected outcomes reviewable here: the next
-  # checkpoint is generation 3 and the existing generation-1/generation-2 refs
-  # are byte-for-byte unchanged.
+  # from review. Keep the scenario and exact expected outcomes reviewable here:
+  # an ordinary issue dispatch starts with an empty generation, resumes a
+  # generation-2 checkpoint through the workflow's own carry snippet, then hits
+  # another 429. The next checkpoint is generation 3 and the existing
+  # generation-1/generation-2 refs are byte-for-byte unchanged.
   def test_resumed_generation_evacuation_assertions_are_reviewable
     test = File.read(
       File.join(ROOT, 'tests/test_opencode_429_evacuator.py')
@@ -3879,11 +3881,27 @@ class ContinuumTest < Minitest::Test
     assert_includes test,
                     'test_resumed_generation_evacuates_next_generation_without_overwriting'
     assert_includes test,
+                    'self.script.write_text(extracted_evacuator(), encoding="utf-8")'
+    assert_includes test,
+                    'marker = "# kodmial/continuum#460: a resumed checkpoint carries"'
+    assert_includes test, 'return textwrap.dedent(script[start:end])'
+    assert_includes test, 'prefix=extracted_resume_generation_carry() + "\n",'
+    assert_includes test, 'generation="",'
+    assert_includes test, 'resume_active="true",'
+    assert_includes test, 'resume_generation="2",'
+    assert_includes test,
+                    'gen1_ref = "opencode/429-checkpoint-opencode-429-issue-issue350-gen-1"'
+    assert_includes test,
+                    'gen2_ref = "opencode/429-checkpoint-opencode-429-issue-issue350-gen-2"'
+    assert_includes test,
+                    'gen3_ref = "opencode/429-checkpoint-opencode-429-issue-issue350-gen-3"'
+    assert_includes test,
                     'self.assertIn("CONTINUUM_429_CHECKPOINT_REF={}".format(gen3_ref), env)'
     assert_includes test,
                     'self.assertEqual(gen1_sha, refs["refs/heads/" + gen1_ref])'
     assert_includes test,
                     'self.assertEqual(gen2_sha, refs["refs/heads/" + gen2_ref])'
+    assert_includes test, 'self.assertIn("refs/heads/" + gen3_ref, refs)'
     assert_includes test,
                     'self.assertNotEqual(gen1_sha, refs["refs/heads/" + gen3_ref])'
     assert_includes test,
