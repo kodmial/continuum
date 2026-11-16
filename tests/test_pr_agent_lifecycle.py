@@ -280,6 +280,18 @@ APPROVED_SCHEDULER_ORIGIN_OPENCODE_SHA256 = (
 # plus that single #462 hunk (the helper no longer dereferences the optional
 # variable under `set -u`), so the full-file pin advances to the combined
 # merged artifact. Any unrelated byte drift still fails closed.
+# kodmial/continuum#454: the reviewed #448, #450, and scheduler-origin pins
+# above stay for audit. This task deliberately adds one bounded, privacy-safe
+# telemetry artifact upload step (always(), continue-on-error,
+# upload-artifact v4, runner-temp telemetry directory) so per-attempt OpenCode
+# usage survives the runner without making observability failure a task
+# failure. Merging main's #460 generation-2 checkpoint-resume correction keeps
+# both reviewed behaviors in the same artifact, so this active pin covers the
+# combined scheduler-origin, #454 telemetry, and #460 resume bytes; unrelated
+# drift still fails closed.
+APPROVED_454_TELEMETRY_OPENCODE_SHA256 = (
+    "c740682de530c242cc5904d0c53d8a2eed6cbb6900347ea453fbc03de4917249"
+)
 # 2026-11-16: intentional generation-2 checkpoint-resume correction
 # (kodmial/continuum#460). A validated generation-2+ legacy mirror may resume
 # only when its immutable metadata binds the same durable ref/operation/issue
@@ -308,6 +320,18 @@ APPROVED_SCHEDULER_ORIGIN_OPENCODE_SHA256 = (
 # Pin the exact combined artifact; unrelated byte drift still fails closed.
 APPROVED_458_460_MERGED_OPENCODE_SHA256 = (
     "c7f3fde52e3a6b97be8ce4713565277bdad9d04847a3084c228567f66d92d64b"
+)
+# Merging main into #455: the #454 telemetry upload step is additive to the
+# reviewed #458 + #460 + #462 artifact, so this active pin covers the combined
+# bytes. The earlier #458/#460 and #454 pins stay for audit and any further
+# byte drift still fails closed.
+APPROVED_458_460_455_MERGED_OPENCODE_SHA256 = (
+    "43fe7886c93cfff2d0ebf646ed3744a32c083d433acaf5db6da20a40d2a7f196"
+)
+# The prior #460 resume pin stays for audit; any further byte drift still
+# fails closed.
+APPROVED_460_RESUME_OPENCODE_SHA256 = (
+    "cf4593df8d89f638986426f3dc48fe62544617c40e3d3bcccfe14113fa07de4e"
 )
 APPROVED_446_CALLER_SHA256 = (
     "b7f3df118bc436526f48443b8f068372204073eb134c98e4a1543d025f314686"
@@ -2730,12 +2754,13 @@ class ProtectedBaselineTests(unittest.TestCase):
                     self.assertIn("CONTINUUM_OPENCODE_PUBLISH_RACE_RETRY_REQUIRED", original)
                     self.assertIn("steps.model_route.outputs.model", original)
                 if path == ".github/workflows/continuum-opencode.yml":
-                    # #450 deliberately changes chat-ownership behavior,
-                    # with a full-file digest and executable regression tests.
+                    # #458 publication attestation, main's #460 resume repair,
+                    # and main's #454 telemetry upload all share this artifact,
+                    # with full-file digests and executable regression tests.
                     self.assertEqual(
                         protected_file_digest(path),
-                        APPROVED_458_460_MERGED_OPENCODE_SHA256,
-                        f"{path}: unexpected drift outside #458/#460 merged protected workflow",
+                        APPROVED_458_460_455_MERGED_OPENCODE_SHA256,
+                        f"{path}: unexpected drift outside #458 publication attestation, #460 resume repair, and #454 telemetry merged protected workflow",
                     )
                 else:
                     # The self-dogfood caller is the dispatchable surface
@@ -2820,7 +2845,7 @@ class ProtectedBaselineTests(unittest.TestCase):
         # therefore be dirty in this pre-commit worktree; any unapproved byte
         # change still fails the exact digest assertions above.
         approved = {
-            ".github/workflows/continuum-opencode.yml": APPROVED_458_460_MERGED_OPENCODE_SHA256,
+            ".github/workflows/continuum-opencode.yml": APPROVED_458_460_455_MERGED_OPENCODE_SHA256,
             ".github/workflows/opencode.yml": APPROVED_350_SELF_CALLER_SHA256,
         }
         for path in PROTECTED_FILES:
