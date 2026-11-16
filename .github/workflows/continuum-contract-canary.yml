@@ -154,7 +154,7 @@ jobs:
               with open(os.path.join(root, name), "w", encoding="utf-8") as handle:
                   json.dump(payload, handle, sort_keys=True)
 
-          def implementation_commits(number):
+          def implementation_commits(number, branch):
               """Return the implementation PR's full commit history.
 
               Trusted continuity is judged from GitHub's own PR commit order,
@@ -237,7 +237,9 @@ jobs:
                       run_id = canary.repair_status_run_id(status, repo)
                       if run_id is None:
                           continue
-                      status["publication"] = repair_publication(run_id)
+                      status["publication"] = repair_publication(
+                          run_id, commit, number, branch
+                      )
                   commit["statuses"] = parsed_statuses
               return commits
 
@@ -307,11 +309,15 @@ jobs:
                       )
                   )
 
-          def repair_publication(run_id):
-              """Return a repair run's own receipt for the status it published.
+          def repair_publication(run_id, commit, pr_number, branch):
+              """Return the receipt that attests this status's exact commit.
 
-              A failed read is fatal. An absent receipt leaves the status
-              unverified instead of falling back to the status URL alone.
+              A rerun of one repair workflow keeps its run id while it can push
+              another commit, so the newest receipt may describe a later commit
+              than the status being checked. Read every candidate receipt and
+              let the module select the one binding this run, PR, branch, direct
+              parent, and pushed commit. A failed read is fatal. An absent match
+              leaves the status unverified instead of falling back to URL alone.
               """
               repo = os.environ["GITHUB_REPOSITORY"]
               listing = subprocess.run(
@@ -345,35 +351,57 @@ jobs:
                   candidates.append((int(artifact_id), name))
               if not candidates:
                   return None
-              _, name = max(candidates)
-              target = tempfile.mkdtemp(
-                  prefix="continuum-repair-publication-",
-                  dir=os.environ.get("RUNNER_TEMP") or None,
+              parents = commit.get("parents")
+              parent = (
+                  parents[0]
+                  if isinstance(parents, list) and parents
+                  else {}
               )
-              download = subprocess.run(
-                  [
-                      "gh", "run", "download", str(run_id),
-                      "--repo", repo, "--name", name, "--dir", target,
-                  ],
-                  check=False, capture_output=True, text=True,
+              base = (
+                  str(parent.get("sha") or "").strip()
+                  if isinstance(parent, dict)
+                  else ""
               )
-              if download.returncode != 0:
-                  raise SystemExit(
-                      "could not download repair publication receipt {} from run {}: {}".format(
-                          name, run_id, (download.stderr or "").strip()[:500]
-                      )
+              receipts = []
+              for _, name in sorted(candidates, reverse=True):
+                  target = tempfile.mkdtemp(
+                      prefix="continuum-repair-publication-",
+                      dir=os.environ.get("RUNNER_TEMP") or None,
                   )
-              try:
-                  with open(
-                      os.path.join(target, "publication.json"), encoding="utf-8"
-                  ) as handle:
-                      return json.load(handle)
-              except (OSError, ValueError):
-                  raise SystemExit(
-                      "repair publication receipt {} from run {} cannot be read".format(
-                          name, run_id
-                      )
+                  download = subprocess.run(
+                      [
+                          "gh", "run", "download", str(run_id),
+                          "--repo", repo, "--name", name, "--dir", target,
+                      ],
+                      check=False, capture_output=True, text=True,
                   )
+                  if download.returncode != 0:
+                      raise SystemExit(
+                          "could not download repair publication receipt {} from run {}: {}".format(
+                              name, run_id, (download.stderr or "").strip()[:500]
+                          )
+                      )
+                  try:
+                      with open(
+                          os.path.join(target, "publication.json"),
+                          encoding="utf-8",
+                      ) as handle:
+                          receipts.append(json.load(handle))
+                  except (OSError, ValueError):
+                      raise SystemExit(
+                          "repair publication receipt {} from run {} cannot be read".format(
+                              name, run_id
+                          )
+                      )
+              return canary.select_repair_publication(
+                  receipts,
+                  run_id,
+                  base,
+                  str(commit.get("sha") or "").strip(),
+                  pr_number,
+                  repo,
+                  branch,
+              )
 
           issues = load("issues.json")
           pulls = load("pulls.json")
@@ -388,7 +416,9 @@ jobs:
           commits = []
           if candidate is not None and candidate.state == "closed":
               latest = canary.select_implementation_pr(candidate.number, pulls)
-              commits = implementation_commits((latest or {}).get("number"))
+              commits = implementation_commits(
+                  (latest or {}).get("number"), (latest or {}).get("headRefName")
+              )
               head = str((latest or {}).get("headRefOid") or "").strip().lower()
               if head:
                   proc = subprocess.run(
@@ -589,7 +619,7 @@ jobs:
               with open(os.path.join(root, name), "w", encoding="utf-8") as handle:
                   json.dump(payload, handle, sort_keys=True)
 
-          def implementation_commits(number):
+          def implementation_commits(number, branch):
               """Return the implementation PR's full commit history.
 
               Trusted continuity is judged from GitHub's own PR commit order,
@@ -672,7 +702,9 @@ jobs:
                       run_id = canary.repair_status_run_id(status, repo)
                       if run_id is None:
                           continue
-                      status["publication"] = repair_publication(run_id)
+                      status["publication"] = repair_publication(
+                          run_id, commit, number, branch
+                      )
                   commit["statuses"] = parsed_statuses
               return commits
 
@@ -742,11 +774,15 @@ jobs:
                       )
                   )
 
-          def repair_publication(run_id):
-              """Return a repair run's own receipt for the status it published.
+          def repair_publication(run_id, commit, pr_number, branch):
+              """Return the receipt that attests this status's exact commit.
 
-              A failed read is fatal. An absent receipt leaves the status
-              unverified instead of falling back to the status URL alone.
+              A rerun of one repair workflow keeps its run id while it can push
+              another commit, so the newest receipt may describe a later commit
+              than the status being checked. Read every candidate receipt and
+              let the module select the one binding this run, PR, branch, direct
+              parent, and pushed commit. A failed read is fatal. An absent match
+              leaves the status unverified instead of falling back to URL alone.
               """
               repo = os.environ["GITHUB_REPOSITORY"]
               listing = subprocess.run(
@@ -780,35 +816,57 @@ jobs:
                   candidates.append((int(artifact_id), name))
               if not candidates:
                   return None
-              _, name = max(candidates)
-              target = tempfile.mkdtemp(
-                  prefix="continuum-repair-publication-",
-                  dir=os.environ.get("RUNNER_TEMP") or None,
+              parents = commit.get("parents")
+              parent = (
+                  parents[0]
+                  if isinstance(parents, list) and parents
+                  else {}
               )
-              download = subprocess.run(
-                  [
-                      "gh", "run", "download", str(run_id),
-                      "--repo", repo, "--name", name, "--dir", target,
-                  ],
-                  check=False, capture_output=True, text=True,
+              base = (
+                  str(parent.get("sha") or "").strip()
+                  if isinstance(parent, dict)
+                  else ""
               )
-              if download.returncode != 0:
-                  raise SystemExit(
-                      "could not download repair publication receipt {} from run {}: {}".format(
-                          name, run_id, (download.stderr or "").strip()[:500]
-                      )
+              receipts = []
+              for _, name in sorted(candidates, reverse=True):
+                  target = tempfile.mkdtemp(
+                      prefix="continuum-repair-publication-",
+                      dir=os.environ.get("RUNNER_TEMP") or None,
                   )
-              try:
-                  with open(
-                      os.path.join(target, "publication.json"), encoding="utf-8"
-                  ) as handle:
-                      return json.load(handle)
-              except (OSError, ValueError):
-                  raise SystemExit(
-                      "repair publication receipt {} from run {} cannot be read".format(
-                          name, run_id
-                      )
+                  download = subprocess.run(
+                      [
+                          "gh", "run", "download", str(run_id),
+                          "--repo", repo, "--name", name, "--dir", target,
+                      ],
+                      check=False, capture_output=True, text=True,
                   )
+                  if download.returncode != 0:
+                      raise SystemExit(
+                          "could not download repair publication receipt {} from run {}: {}".format(
+                              name, run_id, (download.stderr or "").strip()[:500]
+                          )
+                      )
+                  try:
+                      with open(
+                          os.path.join(target, "publication.json"),
+                          encoding="utf-8",
+                      ) as handle:
+                          receipts.append(json.load(handle))
+                  except (OSError, ValueError):
+                      raise SystemExit(
+                          "repair publication receipt {} from run {} cannot be read".format(
+                              name, run_id
+                          )
+                      )
+              return canary.select_repair_publication(
+                  receipts,
+                  run_id,
+                  base,
+                  str(commit.get("sha") or "").strip(),
+                  pr_number,
+                  repo,
+                  branch,
+              )
 
           def outcome(evidence, detail, **fields):
               payload = {"evidence": evidence, "detail": detail}
@@ -846,7 +904,9 @@ jobs:
               raise SystemExit("live canary failed: " + observed.failure)
           if observed.completed:
               latest = canary.select_implementation_pr(issue_number, pulls)
-              commits = implementation_commits((latest or {}).get("number"))
+              commits = implementation_commits(
+                  (latest or {}).get("number"), (latest or {}).get("headRefName")
+              )
               head = str((latest or {}).get("headRefOid") or "").strip().lower()
               if head:
                   proc = subprocess.run(

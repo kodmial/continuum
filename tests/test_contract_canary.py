@@ -2522,24 +2522,79 @@ class WorkflowContractTest(unittest.TestCase):
             script,
         )
 
-    def test_workflow_binds_repair_status_to_run_receipt(self):
-        """The canary reads the receipt named by each repair status run."""
+    def test_workflow_binds_each_repair_status_to_its_own_commit_receipt(self):
+        """The canary reads the receipt that attests each status's exact commit.
+
+        A rerun of one repair workflow can push a second commit under the same
+        run id, so the newest artifact for that run may belong to a later
+        commit. Selecting by run URL alone would attach the newer receipt to
+        the earlier status and reject valid continuity.
+        """
         workflow = (
             ROOT / ".github/workflows/continuum-contract-canary.yml"
         ).read_text(encoding="utf-8")
-        self.assertEqual(workflow.count("def repair_publication(run_id):"), 2)
+        self.assertEqual(
+            workflow.count(
+                "def repair_publication(run_id, commit, pr_number, branch):"
+            ),
+            2,
+        )
         self.assertEqual(
             workflow.count("canary.repair_status_run_id(status, repo)"), 2
         )
         self.assertEqual(
-            workflow.count("status[\"publication\"] = repair_publication(run_id)"),
+            workflow.count(
+                'status["publication"] = repair_publication(\n'
+                "                          run_id, commit, number, branch\n"
+                "                      )"
+            ),
             2,
         )
+        self.assertEqual(
+            workflow.count("canary.select_repair_publication("), 2
+        )
+        # Only the worker path may assume a single newest receipt; a repair
+        # run can hold one receipt per attempt.
+        self.assertEqual(workflow.count("_, name = max(candidates)"), 2)
         self.assertEqual(
             workflow.count(
                 "canary.CANARY_REPAIR_PUBLICATION_ARTIFACT_PREFIX"
             ),
             2,
+        )
+
+    def test_repair_receipt_selection_matches_each_commit_from_a_rerun(self):
+        """A rerun's newer receipt must not stand in for an earlier commit."""
+        branch = "opencode/issue100-9001"
+        first_base = "e" * 40
+        first = repair_publication_receipt(
+            first_base, OTHER_HEAD, run_id=WORKER_RUN_ID, branch=branch
+        )
+        second = repair_publication_receipt(
+            OTHER_HEAD, HEAD, run_id=WORKER_RUN_ID, branch=branch
+        )
+        self.assertEqual(
+            canary.select_repair_publication(
+                [second, first],
+                WORKER_RUN_ID,
+                first_base,
+                OTHER_HEAD,
+                41,
+                canary.CANARY_OWNER_REPO,
+                branch,
+            ),
+            first,
+        )
+        self.assertIsNone(
+            canary.select_repair_publication(
+                [second],
+                WORKER_RUN_ID,
+                first_base,
+                OTHER_HEAD,
+                41,
+                canary.CANARY_OWNER_REPO,
+                branch,
+            )
         )
 
     def test_workflow_fails_closed_on_unreadable_worker_evidence(self):

@@ -1522,7 +1522,7 @@ def repair_status_run_id(
     return int(match.group("run"))
 
 
-def _repair_publication_matches(
+def repair_publication_matches(
     publication: object,
     run_id: int,
     base_sha: str,
@@ -1559,6 +1559,37 @@ def _repair_publication_matches(
     if head_branch and str(publication.get("branch") or "").strip() != head_branch:
         return False
     return True
+
+
+def select_repair_publication(
+    publications: Sequence[object],
+    run_id: int,
+    base_sha: str,
+    head_sha: str,
+    pr_number: Optional[int],
+    expected_repo: str = CANARY_OWNER_REPO,
+    head_branch: str = "",
+) -> Optional[Mapping[str, Any]]:
+    """Return the receipt that attests one status's exact commit.
+
+    A rerun of the same repair workflow keeps its run id while it can push
+    another commit. Its run artifacts then hold one receipt per attempt, so the
+    newest receipt can describe a later commit than the status being checked.
+    A receipt is eligible only when it binds this run, PR, branch, direct
+    parent, and pushed commit; the newest receipt is never assumed to match.
+    """
+    for publication in publications or ():
+        if isinstance(publication, Mapping) and repair_publication_matches(
+            publication,
+            run_id,
+            base_sha,
+            head_sha,
+            pr_number,
+            expected_repo,
+            head_branch,
+        ):
+            return publication
+    return None
 
 
 def _commit_has_repair_status(
@@ -1609,7 +1640,7 @@ def _commit_has_repair_status(
         run_id = repair_status_run_id(status, expected_repo)
         if run_id is None:
             continue
-        if not _repair_publication_matches(
+        if not repair_publication_matches(
             status.get("publication"),
             run_id,
             base_sha,
