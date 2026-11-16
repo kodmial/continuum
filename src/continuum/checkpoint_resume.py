@@ -345,7 +345,7 @@ def _resolve_local_ref(repo: Path | str, ref: str) -> Optional[str]:
 def _check_checkpoint_ref(
     repo: Path | str,
     request: ResumeRequest,
-    metadata_checkpoint: str,
+    metadata: Mapping[str, Any],
     operation: str,
 ) -> None:
     """Validate that the pinned ref names the same durable checkpoint.
@@ -356,14 +356,18 @@ def _check_checkpoint_ref(
 
     A workflow-owned legacy mirror may also carry a fully validated
     generation-2+ checkpoint: the immutable commit metadata names the durable
-    generation-specific ref for the same operation, issue and repository, and
-    the local mirror must resolve to that exact pinned commit. This is an
-    alias, never proof by itself: every other generation/operation/ancestry
-    check still applies, and a moved or missing mirror fails closed. Any other
-    cross-ref combination is drift.
+    generation-specific ref for the same operation and issue, names this
+    repository explicitly, and carries saved verification evidence. The local
+    mirror must then resolve to that exact pinned commit. The destination
+    checkout's ``origin`` is never the repository binding for an alias: a
+    copied mirror must not inherit trust from wherever it happens to be
+    fetched. This is still an alias, never proof by itself: every other
+    generation/operation/ancestry check applies, and a moved or missing
+    mirror fails closed. Any other cross-ref combination is drift.
     """
 
     expected = request.checkpoint_ref
+    metadata_checkpoint = str(metadata.get("checkpoint_ref") or "").strip()
     parsed = _429_CHECKPOINT_RE.match(metadata_checkpoint or "")
     if parsed is not None:
         recorded_operation, recorded_generation = parsed.group(1), int(
@@ -411,6 +415,31 @@ def _check_checkpoint_ref(
         raise ResumeError(
             "wrong-generation",
             "the legacy issue checkpoint only represents generation 1",
+        )
+    # An alias is only trusted when its immutable checkpoint content names this
+    # repository explicitly. _check_repository() accepts legacy metadata with
+    # no repository by falling back to the local origin, but that cannot show
+    # which repository produced a copied checkpoint.
+    recorded_repository = str(
+        metadata.get("repository") or metadata.get("repo") or ""
+    ).strip()
+    if not recorded_repository:
+        raise ResumeError(
+            "wrong-repository",
+            "the generation-2 checkpoint alias has no repository-bound recovery metadata",
+        )
+    if recorded_repository.lower() != request.repository.lower():
+        raise ResumeError(
+            "wrong-repository",
+            "the checkpoint recovery metadata belongs to a different repository",
+        )
+    # Repository-bound recovery metadata is authenticated only from the saved
+    # verification evidence carried by the same immutable commit. A missing
+    # file cannot prove the alias is a real continuation.
+    if _show_file(repo, request.checkpoint_sha, EVIDENCE_FILE_NAME) is None:
+        raise ResumeError(
+            "evidence-missing",
+            "the generation-2 checkpoint alias has no saved verification evidence",
         )
     # The durable metadata ref above already proved this is the same
     # generation and operation. The workflow mirror is only an alias for the
@@ -559,8 +588,7 @@ def _validate_metadata(
             _metadata_record(request, operation=operation, base_ref=base_ref, base_sha=base_sha, reason="metadata-malformed"),
         )
 
-    metadata_checkpoint = str(metadata.get("checkpoint_ref") or "").strip()
-    _check_checkpoint_ref(repo, request, metadata_checkpoint, operation)
+    _check_checkpoint_ref(repo, request, metadata, operation)
 
     # The original base must be an ancestor of the saved checkpoint.  A
     # current base that has advanced since the checkpoint is allowed, but the

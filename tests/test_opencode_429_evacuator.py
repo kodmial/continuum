@@ -37,6 +37,23 @@ def extracted_evacuator() -> str:
     return textwrap.dedent(body[start:end])
 
 
+def extracted_resume_generation_carry() -> str:
+    """The exact same-step assignment that carries a resumed generation."""
+
+    import yaml
+
+    data = yaml.safe_load(WORKFLOW.read_text(encoding="utf-8"))
+    for step in data["jobs"]["opencode"]["steps"]:
+        if step.get("name") != "Implement issue":
+            continue
+        script = step["run"]
+        marker = "# kodmial/continuum#460: a resumed checkpoint carries"
+        start = script.index(marker)
+        end = script.index("\nfi\n", start) + len("\nfi\n")
+        return textwrap.dedent(script[start:end])
+    raise AssertionError("Implement issue step not found")
+
+
 def run_git(repo: Path, *args: str) -> str:
     env = dict(os.environ)
     env.update(GIT_ENV)
@@ -95,10 +112,12 @@ class ProductionEvacuatorTest(unittest.TestCase):
         shutil.rmtree(self.workdir, ignore_errors=True)
 
     def invoke(self, operation="opencode-429-issue-issue350", mode="issue",
-               issue="350", pr=""):
+               issue="350", pr="", prefix="", generation="0",
+               resume_active="false", resume_generation="1"):
         call = self.workdir / "run-evacuator.sh"
         call.write_text(
-            self.script.read_text(encoding="utf-8")
+            prefix
+            + self.script.read_text(encoding="utf-8")
             + "\ncontinuum_infra_evacuate \"{}\" \"implementation-incomplete\" "
             "\"{}\" \"{}\" \"{}\" \"{}\" \"quota_429\"\n".format(
                 operation, mode, issue, pr, self.base_sha
@@ -114,7 +133,9 @@ class ProductionEvacuatorTest(unittest.TestCase):
                 "GITHUB_ENV": str(self.github_env),
                 "RUNNER_TEMP": str(self.runner),
                 "HEAD_REF": "opencode/issue350-test",
-                "RECOVERY_GENERATION_IN": "0",
+                "RECOVERY_GENERATION_IN": generation,
+                "RESUME_ACTIVE": resume_active,
+                "RESUME_GENERATION": resume_generation,
             }
         )
         return subprocess.run(
@@ -154,6 +175,7 @@ class ProductionEvacuatorTest(unittest.TestCase):
         text = metadata.read_text(encoding="utf-8")
         for field in (
             '"schema_version": 1',
+            '"repository": "owner/repo"',
             '"operation_id": "opencode-429-issue-issue350"',
             '"generation": 1',
             '"stage": "implementation-incomplete"',
@@ -167,6 +189,43 @@ class ProductionEvacuatorTest(unittest.TestCase):
         self.assertEqual(
             (checkout / "app.py").read_text(encoding="utf-8"), "VALUE = 2\n"
         )
+
+    def test_resumed_generation_evacuates_next_generation_without_overwriting(self):
+        # A generation-2 legacy resume on an ordinary issue dispatch starts
+        # with an empty RECOVERY_GENERATION_IN. The workflow must carry the
+        # validated resume generation into the same-step evacuator so the next
+        # 429 writes generation 3 and leaves the existing generation-2
+        # checkpoint ref untouched.
+        gen2_ref = "opencode/429-checkpoint-opencode-429-issue-issue350-gen-2"
+        gen3_ref = "opencode/429-checkpoint-opencode-429-issue-issue350-gen-3"
+        gen2_sha = run_git(self.repo, "rev-parse", "HEAD")
+        run_git(
+            self.repo,
+            "push",
+            "origin",
+            "{}:refs/heads/{}".format(gen2_sha, gen2_ref),
+        )
+        (self.repo / "app.py").write_text("VALUE = 4\n", encoding="utf-8")
+
+        completed = self.invoke(
+            prefix=extracted_resume_generation_carry() + "\n",
+            generation="",
+            resume_active="true",
+            resume_generation="2",
+        )
+        output = completed.stdout + completed.stderr
+        self.assertEqual(completed.returncode, 75, output)
+        self.assertIn("Evacuated 429 checkpoint", output)
+        env = self.github_env.read_text(encoding="utf-8")
+        self.assertIn("CONTINUUM_429_CHECKPOINT_REF={}".format(gen3_ref), env)
+
+        refs = {}
+        for line in run_git(self.repo, "ls-remote", "origin").splitlines():
+            sha, _, name = line.partition("\t")
+            refs[name] = sha
+        self.assertEqual(gen2_sha, refs["refs/heads/" + gen2_ref])
+        self.assertIn("refs/heads/" + gen3_ref, refs)
+        self.assertNotEqual(gen2_sha, refs["refs/heads/" + gen3_ref])
 
     def test_metadata_failure_preserves_raw_work_without_false_pointer(self):
         (self.repo / "app.py").write_text("VALUE = 3\n", encoding="utf-8")
@@ -347,6 +406,7 @@ class ProductionRestoreTest(unittest.TestCase):
             issue_number=350,
             workflow_name="OpenCode agent",
             recovery_identity=identity,
+            latest_recovery_generation=1,
         )
         self.assertFalse(admitted["skip"], admitted["reason"])
         self.assertIn("explicit 429 recovery", admitted["reason"])
@@ -357,6 +417,7 @@ class ProductionRestoreTest(unittest.TestCase):
             issue_number=350,
             workflow_name="OpenCode agent",
             recovery_identity=dict(identity, checkpoint_sha=""),
+            latest_recovery_generation=1,
         )
         self.assertTrue(omitted["skip"])
         self.assertIn("malformed", omitted["reason"])

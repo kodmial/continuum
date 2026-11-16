@@ -2392,6 +2392,83 @@ jobs:
               return all;
             }
 
+            async function listMatchingRefsWithPat(ref) {
+              if (!tapPat) throw new Error('TAP_PAT is unavailable for recovery-generation fallback.');
+              const encodedRef = ref.split('/').map(encodeURIComponent).join('/');
+              const response = await fetch(
+                `${apiBase}/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}` +
+                `/git/matching-refs/${encodedRef}?per_page=100`,
+                {
+                  headers: {
+                    accept: 'application/vnd.github+json',
+                    authorization: `Bearer ${tapPat}`,
+                    'x-github-api-version': '2022-11-28',
+                  },
+                }
+              );
+              if (!response.ok) {
+                const details = (await response.text()).slice(0, 500);
+                throw new Error(
+                  `Recovery-generation PAT fallback failed with HTTP ${response.status}` +
+                  (details ? `: ${details}` : '')
+                );
+              }
+              const payload = await response.json();
+              if (!Array.isArray(payload)) {
+                throw new Error('Unexpected recovery-generation response.');
+              }
+              return payload;
+            }
+
+            function checkpointGeneration(refName, operation) {
+              const name = String(refName || '').replace(/^refs\/heads\//, '');
+              for (const namespace of [
+                'opencode/429-checkpoint-',
+                'opencode/infra-checkpoint-',
+              ]) {
+                const prefix = `${namespace}${operation}-gen-`;
+                if (!name.startsWith(prefix)) continue;
+                const generation = name.slice(prefix.length);
+                return /^[0-9]+$/.test(generation) ? Number(generation) : null;
+              }
+              return null;
+            }
+
+            async function latestDurableRecoveryGeneration(operation) {
+              if (!operation) return 0;
+              let latest = 0;
+              for (const namespace of [
+                'opencode/429-checkpoint-',
+                'opencode/infra-checkpoint-',
+              ]) {
+                const ref = `heads/${namespace}${operation}`;
+                let refs;
+                try {
+                  refs = (await github.rest.git.listMatchingRefs({
+                    owner,
+                    repo,
+                    ref,
+                  })).data;
+                } catch (err) {
+                  const status = err ? (err.status ?? err.response?.status) : undefined;
+                  if (![401, 403, 429].includes(status)) throw err;
+                  core.warning(
+                    `Repository-token recovery-generation read failed (${status}); ` +
+                    'retrying with TAP_PAT for supersession.'
+                  );
+                  refs = await listMatchingRefsWithPat(ref);
+                }
+                if (!Array.isArray(refs)) {
+                  throw new Error('Unexpected recovery-generation ref response.');
+                }
+                for (const item of refs) {
+                  const generation = checkpointGeneration(item.ref, operation);
+                  if (generation !== null) latest = Math.max(latest, generation);
+                }
+              }
+              return latest;
+            }
+
             let openPrs;
             try {
               openPrs = await github.paginate(
@@ -2457,6 +2534,16 @@ jobs:
               runs = await listRunsWithPat(createdSince);
             }
 
+            // The recovery identity must not replay a generation that durable
+            // checkpoint refs already superseded. This listing is the
+            // authoritative generation state; a token failure retries with
+            // TAP_PAT, and any unreadable state fails closed below.
+            const latestRecoveryGeneration = recoveryIdentity
+              ? await latestDurableRecoveryGeneration(
+                  String(recoveryIdentity.operation_id || '').trim()
+                )
+              : 0;
+
             const parser = path.join(
               process.env.CONTINUUM_ENGINE_ROOT || '',
               '.github/scripts/opencode_command.py'
@@ -2473,6 +2560,7 @@ jobs:
                     issue_number: issueNumber,
                     workflow_name: context.workflow,
                     recovery_identity: recoveryIdentity,
+                    latest_recovery_generation: latestRecoveryGeneration,
                   }),
                   encoding: 'utf8',
                   maxBuffer: 16 * 1024 * 1024,
@@ -2769,6 +2857,7 @@ jobs:
           with open(path, "w", encoding="utf-8") as handle:
               json.dump({
                   "schema_version": 1,
+                  "repository": os.environ.get("GITHUB_REPOSITORY", ""),
                   "operation_id": operation,
                   "failure_kind": os.environ.get("CONTINUUM_INFRA_FAILURE_KIND", "quota_429"),
                   "generation": int(gen),
@@ -3328,6 +3417,15 @@ jobs:
           else
             git switch --detach "origin/$BASE_REF"
             git switch -c "$BRANCH"
+          fi
+
+          # kodmial/continuum#460: a resumed checkpoint carries its validated
+          # generation into a later 429 evacuation in this same step. The
+          # evacuator reads the shell variable, and this step's environment is
+          # fixed at start, so a GITHUB_ENV write would arrive too late. Fresh
+          # runs keep the dispatch input unchanged.
+          if [[ "$RESUME_ACTIVE" == "true" ]]; then
+            RECOVERY_GENERATION_IN="$RESUME_GENERATION"
           fi
 
           checkpoint_issue_progress() {

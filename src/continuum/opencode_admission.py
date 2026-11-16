@@ -256,6 +256,7 @@ def duplicate_run_decision(
     workflow_name="",
     legacy_title="",
     recovery_identity=None,
+    latest_recovery_generation=None,
 ):
     """Whether ``current`` is a queued duplicate of an earlier same-issue run.
 
@@ -269,7 +270,11 @@ def duplicate_run_decision(
     watchdog. That pinned continuation is not a duplicate of the run it
     replaces, so overlap fencing yields only when the identity is complete and
     internally consistent; a malformed recovery identity still fails closed.
-    An ordinary dispatch without that identity keeps the full duplicate fence.
+    The identity must also not be superseded: ``latest_recovery_generation``
+    is the highest durable checkpoint generation the caller found for the
+    same operation, and a lower identity generation could replay an agent
+    stage already completed by a newer generation. An ordinary dispatch
+    without a recovery identity keeps the full duplicate fence.
 
     ``legacy_title`` is accepted for caller compatibility but ignored: an
     issue title is not an identity, so two different issues with the same
@@ -295,6 +300,22 @@ def duplicate_run_decision(
     if recovery_identity is not None:
         if not _is_explicit_recovery_identity(recovery_identity, issue_number):
             return _skip("explicit recovery identity is malformed; refusing to start")
+        try:
+            durable_generation = int(latest_recovery_generation)
+        except (TypeError, ValueError):
+            return _skip(
+                "latest durable recovery generation is unavailable; refusing to start"
+            )
+        if durable_generation < 0:
+            return _skip(
+                "latest durable recovery generation is malformed; refusing to start"
+            )
+        identity_generation = int(recovery_identity.get("generation"))
+        if identity_generation < durable_generation:
+            return _skip(
+                "recovery identity generation {} is superseded by durable "
+                "generation {}".format(identity_generation, durable_generation)
+            )
         recovery_override = True
     else:
         recovery_override = False

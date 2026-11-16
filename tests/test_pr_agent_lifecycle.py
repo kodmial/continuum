@@ -256,9 +256,12 @@ APPROVED_SCHEDULER_ORIGIN_OPENCODE_SHA256 = (
 # Review 5920627423 repair: the pre-model duplicate guard now forwards the
 # restore step's verified checkpoint SHA, so an omitted recovery_checkpoint_sha
 # dispatch input still resumes instead of failing the explicit recovery identity.
-# The digest is re-pinned after that guarded correction; no other byte changed.
+# Review 5921692569 repair: a resumed generation is carried into the same-step
+# 429 evacuation, and admission compares a recovery identity against the
+# durable checkpoint refs so a superseded generation cannot replay work.
+# The digest is re-pinned after those guarded corrections; no other byte changed.
 APPROVED_460_RESUME_OPENCODE_SHA256 = (
-    "c04200c68bd3736f091395fc05a17a47a56eb8bed2c3d7ed0ec0ccef6f77d607"
+    "a35faed4012916c0cd18cb20ca50f381f79ccbdff6459b016352e39b87bc513c"
 )
 APPROVED_446_CALLER_SHA256 = (
     "b7f3df118bc436526f48443b8f068372204073eb134c98e4a1543d025f314686"

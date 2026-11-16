@@ -354,6 +354,7 @@ class DuplicateRunTests(unittest.TestCase):
             issue_number=234,
             workflow_name="OpenCode agent",
             recovery_identity=identity,
+            latest_recovery_generation=2,
         )
         self.assertFalse(result["skip"])
         self.assertIn("explicit 429 recovery", result["reason"])
@@ -383,6 +384,7 @@ class DuplicateRunTests(unittest.TestCase):
             issue_number=234,
             workflow_name="OpenCode agent",
             recovery_identity=identity,
+            latest_recovery_generation=2,
         )
         self.assertTrue(omitted["skip"])
         self.assertIn("malformed", omitted["reason"])
@@ -394,9 +396,59 @@ class DuplicateRunTests(unittest.TestCase):
             issue_number=234,
             workflow_name="OpenCode agent",
             recovery_identity=restored,
+            latest_recovery_generation=2,
         )
         self.assertFalse(admitted["skip"])
         self.assertIn("explicit 429 recovery", admitted["reason"])
+
+    def test_superseded_recovery_identity_fails_closed(self):
+        current = run(21, "OpenCode issue #234", status="in_progress",
+                      created="2026-01-01T10:06:00Z")
+        identity = {
+            "operation_id": "opencode-429-issue-issue234",
+            "checkpoint_ref": (
+                "opencode/429-checkpoint-opencode-429-issue-issue234-gen-2"
+            ),
+            "checkpoint_sha": "a" * 40,
+            "generation": 2,
+        }
+        result = admission.duplicate_run_decision(
+            current=current,
+            runs=[current],
+            issue_number=234,
+            workflow_name="OpenCode agent",
+            recovery_identity=identity,
+            latest_recovery_generation=3,
+        )
+        self.assertTrue(result["skip"])
+        self.assertIn("superseded", result["reason"])
+        self.assertIn("generation 3", result["reason"])
+
+    def test_recovery_identity_requires_durable_generation_state(self):
+        # Without the authoritative durable generation, admission cannot
+        # prove a recovery identity is current, so it must fail closed.
+        current = run(21, "OpenCode issue #234", status="in_progress",
+                      created="2026-01-01T10:06:00Z")
+        identity = {
+            "operation_id": "opencode-429-issue-issue234",
+            "checkpoint_ref": (
+                "opencode/429-checkpoint-opencode-429-issue-issue234-gen-2"
+            ),
+            "checkpoint_sha": "a" * 40,
+            "generation": 2,
+        }
+        for latest in (None, "", "not-a-generation", -1):
+            with self.subTest(latest=latest):
+                result = admission.duplicate_run_decision(
+                    current=current,
+                    runs=[current],
+                    issue_number=234,
+                    workflow_name="OpenCode agent",
+                    recovery_identity=identity,
+                    latest_recovery_generation=latest,
+                )
+                self.assertTrue(result["skip"])
+                self.assertIn("durable recovery generation", result["reason"])
 
     def test_malformed_explicit_recovery_identity_fails_closed(self):
         current = run(21, "OpenCode issue #234", status="in_progress",
@@ -444,6 +496,7 @@ class DuplicateRunTests(unittest.TestCase):
                     issue_number=234,
                     workflow_name="OpenCode agent",
                     recovery_identity=identity,
+                    latest_recovery_generation=2,
                 )
                 self.assertTrue(result["skip"])
                 self.assertIn("malformed", result["reason"])
@@ -486,6 +539,7 @@ class DuplicateRunTests(unittest.TestCase):
             issue_number=234,
             workflow_name="OpenCode agent",
             recovery_identity=identity,
+            latest_recovery_generation=2,
         )
         self.assertTrue(result["skip"])
         self.assertEqual(result["duplicate_run_id"], 20)

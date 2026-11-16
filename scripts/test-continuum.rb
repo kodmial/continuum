@@ -3825,6 +3825,47 @@ class ContinuumTest < Minitest::Test
                     'checkpoint_sha: String(process.env.RECOVERY_CHECKPOINT_SHA'
   end
 
+  # Review 5921692569: recovery admission must compare the dispatch identity
+  # generation with the durable checkpoint refs already published for the
+  # operation, and reject a superseded generation instead of re-running work
+  # from an older checkpoint.
+  def test_duplicate_guard_passes_the_latest_durable_recovery_generation
+    workflow = yaml(File.join(ROOT, '.github/workflows/continuum-opencode.yml'))
+    steps = workflow.fetch('jobs').fetch('opencode').fetch('steps')
+
+    guard = steps.find { |step| step['id'] == 'duplicate_guard' }
+    refute_nil guard, 'the duplicate guard step is missing'
+    script = guard.fetch('with').fetch('script')
+    assert_includes script, 'latestDurableRecoveryGeneration'
+    assert_includes script, 'github.rest.git.listMatchingRefs'
+    assert_includes script, 'listMatchingRefsWithPat'
+    assert_includes script, "'opencode/429-checkpoint-'"
+    assert_includes script, "'opencode/infra-checkpoint-'"
+    assert_includes script, 'latest_recovery_generation: latestRecoveryGeneration'
+  end
+
+  # Review 5921692569: a generation-2 legacy resume on an ordinary issue
+  # dispatch starts with an empty RECOVERY_GENERATION_IN. The validated resume
+  # generation must reach the evacuator in the same step, where the environment
+  # is already fixed, instead of being written to GITHUB_ENV too late.
+  def test_resumed_generation_reaches_the_same_step_evacuator
+    workflow = yaml(File.join(ROOT, '.github/workflows/continuum-opencode.yml'))
+    step = workflow.fetch('jobs').fetch('opencode').fetch('steps')
+                   .find { |entry| entry['name'] == 'Implement issue' }
+    refute_nil step, 'the issue implementation step is missing'
+    run = step.fetch('run')
+    carry = "if [[ \"$RESUME_ACTIVE\" == \"true\" ]]; then\n" \
+            "  RECOVERY_GENERATION_IN=\"$RESUME_GENERATION\"\n" \
+            'fi'
+    assert_includes run, carry
+    evacuation = run.index(
+      'continuum_infra_evacuate "opencode-429-issue-issue${ISSUE_NUMBER}"'
+    )
+    refute_nil evacuation, 'the issue-mode evacuation call is missing'
+    assert run.index(carry) < evacuation,
+           'the resumed generation must be set before the evacuator runs'
+  end
+
   # ------------------------------------------------- CI-repair correlation
 
   # The correlation step is the only place that turns a queued ci-fix run into
