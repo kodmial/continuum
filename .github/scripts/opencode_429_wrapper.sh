@@ -76,7 +76,63 @@ write_telemetry() {
 telemetry_mode=""
 telemetry_log=""
 telemetry_diagnostics=""
-telemetry_live_pid=""
+telemetry_child_pids=()
+telemetry_fifo_paths=()
+
+track_telemetry_child() {
+  telemetry_child_pids+=("$1")
+}
+
+untrack_telemetry_child() {
+  local target="$1" pid
+  local remaining=()
+  for pid in "${telemetry_child_pids[@]+"${telemetry_child_pids[@]}"}"; do
+    if [[ "$pid" != "$target" ]]; then
+      remaining+=("$pid")
+    fi
+  done
+  telemetry_child_pids=("${remaining[@]+"${remaining[@]}"}")
+}
+
+wait_telemetry_child() {
+  local pid="$1" child_status
+  wait "$pid" 2>/dev/null
+  child_status=$?
+  untrack_telemetry_child "$pid"
+  return "$child_status"
+}
+
+# Commands run in the background so a TERM/INT/HUP addressed only to this
+# wrapper interrupts ``wait`` immediately. The handler stops and reaps every
+# child before telemetry reads the log, so an interrupted attempt cannot be
+# lost behind a foreground CLI or leave a writer mutating the log behind it.
+# Invoked by the trap handler above, which shellcheck cannot follow.
+# shellcheck disable=SC2329
+stop_telemetry_children() {
+  local pid
+  for pid in "${telemetry_child_pids[@]+"${telemetry_child_pids[@]}"}"; do
+    kill "$pid" 2>/dev/null || true
+  done
+  for pid in "${telemetry_child_pids[@]+"${telemetry_child_pids[@]}"}"; do
+    wait "$pid" 2>/dev/null || true
+  done
+  telemetry_child_pids=()
+}
+
+new_telemetry_fifo() {
+  local fifo
+  fifo="$(mktemp -u "$runner_temp/continuum-opencode-pipe.XXXXXX")"
+  mkfifo "$fifo" || return 1
+  printf '%s\n' "$fifo"
+}
+
+remove_telemetry_fifos() {
+  local fifo
+  for fifo in "${telemetry_fifo_paths[@]+"${telemetry_fifo_paths[@]}"}"; do
+    rm -f "$fifo"
+  done
+  telemetry_fifo_paths=()
+}
 
 # Invoked indirectly by the TERM/INT/HUP traps below, which shellcheck cannot
 # follow through the quoted trap actions.
@@ -84,16 +140,14 @@ telemetry_live_pid=""
 record_interruption() {
   local signal="$1" signal_status="$2"
   trap - TERM INT HUP
+  stop_telemetry_children
   if [[ -n "$telemetry_mode" && -n "$telemetry_log" ]]; then
     echo "::warning::OpenCode attempt interrupted by SIG${signal}; recording an inconclusive telemetry record." >&2
     write_telemetry "$telemetry_mode" "$telemetry_log" "$signal_status" "inconclusive" "$telemetry_diagnostics"
   fi
-  if [[ -n "$telemetry_live_pid" ]]; then
-    kill "$telemetry_live_pid" 2>/dev/null || true
-    wait "$telemetry_live_pid" 2>/dev/null || true
-  fi
   if [[ -n "$telemetry_log" ]]; then rm -f "$telemetry_log"; fi
   if [[ -n "$telemetry_diagnostics" ]]; then rm -f "$telemetry_diagnostics"; fi
+  remove_telemetry_fifos
   exit "$signal_status"
 }
 
@@ -159,6 +213,12 @@ if [[ "$command" == "run" ]]; then
   telemetry_log="$log"
   telemetry_diagnostics=""
   install_signal_handlers
+  if ! render_pipe="$(new_telemetry_fifo)"; then
+    rm -f "$log"
+    echo "::error::Cannot create OpenCode event pipe; refusing provider-error classification." >&2
+    exit 2
+  fi
+  telemetry_fifo_paths+=("$render_pipe")
   # Live status contains only safe JSON event metadata, never source or prompts.
   # The shared workflow already copies src/continuum into this wrapper's root.
   # Reuse the existing job credential without changing protected workflow YAML.
@@ -169,18 +229,26 @@ if [[ "$command" == "run" ]]; then
   if [[ -f "$live_script" && -n "$live_token" && -n "$live_issue" ]]; then
     CONTINUUM_LIVE_LOG_TOKEN="$live_token" CONTINUUM_LIVE_LOG_ISSUE="$live_issue" python3 "$live_script" watch --log "$log" >/dev/null 2>&1 &
     live_pid=$!
-    telemetry_live_pid="$live_pid"
+    track_telemetry_child "$live_pid"
   fi
   set +e
-  env -u CONTINUUM_LIVE_LOG_TOKEN -u CONTINUUM_LIVE_LOG_ISSUE opencode "${args[@]}" 2>&1 | python3 "$classifier" render --log "$log"
-  pipe_status=("${PIPESTATUS[@]}")
-  status="${pipe_status[0]:-1}"
-  render_status="${pipe_status[1]:-1}"
+  # A FIFO keeps both pipeline members as direct children, so the interrupt
+  # handler can stop and reap the CLI and renderer before writing telemetry.
+  python3 "$classifier" render --log "$log" <"$render_pipe" &
+  render_pid=$!
+  track_telemetry_child "$render_pid"
+  env -u CONTINUUM_LIVE_LOG_TOKEN -u CONTINUUM_LIVE_LOG_ISSUE opencode "${args[@]}" >"$render_pipe" 2>&1 &
+  opencode_pid=$!
+  track_telemetry_child "$opencode_pid"
+  wait_telemetry_child "$opencode_pid"
+  status=$?
+  wait_telemetry_child "$render_pid"
+  render_status=$?
   set -e
+  remove_telemetry_fifos
   if [[ -n "$live_pid" ]]; then
     kill "$live_pid" 2>/dev/null || true
-    wait "$live_pid" 2>/dev/null || true
-    telemetry_live_pid=""
+    wait_telemetry_child "$live_pid" || true
     CONTINUUM_LIVE_LOG_TOKEN="$live_token" CONTINUUM_LIVE_LOG_ISSUE="$live_issue" python3 "$live_script" once --log "$log" --state finished >/dev/null 2>&1 || true
   fi
   if [[ "$render_status" -ne 0 ]]; then
@@ -228,11 +296,37 @@ if [[ "$command" == "github" && "${2:-}" == "run" ]]; then
   telemetry_log="$stdout_log"
   telemetry_diagnostics="$stderr_log"
   install_signal_handlers
+  if ! stdout_pipe="$(new_telemetry_fifo)"; then
+    rm -f "$stdout_log" "$stderr_log"
+    echo "::error::Cannot create OpenCode output pipe; refusing provider-error classification." >&2
+    exit 2
+  fi
+  telemetry_fifo_paths+=("$stdout_pipe")
+  if ! stderr_pipe="$(new_telemetry_fifo)"; then
+    remove_telemetry_fifos
+    rm -f "$stdout_log" "$stderr_log"
+    echo "::error::Cannot create OpenCode diagnostics pipe; refusing provider-error classification." >&2
+    exit 2
+  fi
+  telemetry_fifo_paths+=("$stderr_pipe")
   set +e
-  opencode "$@" > >(tee "$stdout_log") 2> >(tee "$stderr_log" >&2)
+  # Tee readers are reaped explicitly so telemetry only reads fully flushed
+  # logs, and a wrapper-only signal cannot leave the CLI running unattended.
+  tee "$stdout_log" <"$stdout_pipe" &
+  stdout_tee_pid=$!
+  track_telemetry_child "$stdout_tee_pid"
+  tee "$stderr_log" >&2 <"$stderr_pipe" &
+  stderr_tee_pid=$!
+  track_telemetry_child "$stderr_tee_pid"
+  opencode "$@" >"$stdout_pipe" 2>"$stderr_pipe" &
+  opencode_pid=$!
+  track_telemetry_child "$opencode_pid"
+  wait_telemetry_child "$opencode_pid"
   status=$?
-  wait
+  wait_telemetry_child "$stdout_tee_pid" || true
+  wait_telemetry_child "$stderr_tee_pid" || true
   set -e
+  remove_telemetry_fifos
   set +e
   classification="$(python3 "$classifier" classify --mode github --log "$stdout_log" --diagnostics "$stderr_log" --exit "$status")"
   classifier_status=$?

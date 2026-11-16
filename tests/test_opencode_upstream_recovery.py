@@ -366,59 +366,87 @@ class ProductionWrapperTests(unittest.TestCase):
             (("github", "run"), "github", signal.SIGTERM, 143),
         )
         for argv, expected_mode, received, expected_status in cases:
-            with self.subTest(mode=expected_mode, signal=received.name):
-                if self.args_file.exists():
-                    self.args_file.unlink()
-                telemetry_dir = self.runner / "continuum-opencode-telemetry"
-                shutil.rmtree(telemetry_dir, ignore_errors=True)
-                env = dict(os.environ)
-                env.update(
-                    RUNNER_TEMP=str(self.runner),
-                    CONTINUUM_429_CLASSIFIER=str(CLASSIFIER),
-                    FAKE_OPENCODE_STDOUT=text_event("working"),
-                    FAKE_OPENCODE_STDERR="",
-                    FAKE_OPENCODE_EXIT="0",
-                    FAKE_OPENCODE_SLEEP="30",
-                    FAKE_ARGS_FILE=str(self.args_file),
-                    PATH=str(self.bin) + os.pathsep + env.get("PATH", ""),
-                )
-                process = subprocess.Popen(
-                    [str(WRAPPER), *argv],
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    text=True,
-                    env=env,
-                    start_new_session=True,
-                )
-                try:
-                    deadline = time.monotonic() + 20
-                    while time.monotonic() < deadline and not self.args_file.exists():
-                        time.sleep(0.05)
-                    self.assertTrue(self.args_file.exists(), "fake opencode never ran")
-                    # The runner cancels the whole step process group, so the
-                    # trap runs once the interrupted CLI and renderer exit.
-                    os.killpg(process.pid, received)
-                    stdout, stderr = process.communicate(timeout=30)
-                finally:
-                    if process.poll() is None:
-                        os.killpg(process.pid, signal.SIGKILL)
-                        process.wait(timeout=30)
+            for target in ("wrapper", "process-group"):
+                with self.subTest(
+                    mode=expected_mode, signal=received.name, target=target
+                ):
+                    if self.args_file.exists():
+                        self.args_file.unlink()
+                    telemetry_dir = self.runner / "continuum-opencode-telemetry"
+                    shutil.rmtree(telemetry_dir, ignore_errors=True)
+                    env = dict(os.environ)
+                    env.update(
+                        RUNNER_TEMP=str(self.runner),
+                        CONTINUUM_429_CLASSIFIER=str(CLASSIFIER),
+                        FAKE_OPENCODE_STDOUT=text_event("working"),
+                        FAKE_OPENCODE_STDERR="",
+                        FAKE_OPENCODE_EXIT="0",
+                        FAKE_OPENCODE_SLEEP="60",
+                        FAKE_ARGS_FILE=str(self.args_file),
+                        PATH=str(self.bin) + os.pathsep + env.get("PATH", ""),
+                    )
+                    process = subprocess.Popen(
+                        [str(WRAPPER), *argv],
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        text=True,
+                        env=env,
+                        start_new_session=True,
+                    )
+                    try:
+                        deadline = time.monotonic() + 20
+                        while (
+                            time.monotonic() < deadline
+                            and not self.args_file.exists()
+                        ):
+                            time.sleep(0.05)
+                        self.assertTrue(
+                            self.args_file.exists(), "fake opencode never ran"
+                        )
+                        # GitHub can deliver a signal to the step wrapper only,
+                        # not necessarily to the whole process group. The trap
+                        # must interrupt the wrapper's wait and stop the CLI.
+                        if target == "wrapper":
+                            process.send_signal(received)
+                        else:
+                            os.killpg(process.pid, received)
+                        stdout, stderr = process.communicate(timeout=15)
+                    finally:
+                        # Reap any orphaned fake-CLI sleep left in the step
+                        # process group after the wrapper recorded its signal.
+                        try:
+                            os.killpg(process.pid, signal.SIGKILL)
+                        except OSError:
+                            pass
+                        if process.poll() is None:
+                            process.wait(timeout=30)
 
-                output = stdout + stderr
-                self.assertEqual(process.returncode, expected_status, output)
-                artifacts = sorted(telemetry_dir.glob("*.json"))
-                self.assertEqual(len(artifacts), 1, output)
-                summary = json.loads(artifacts[0].read_text(encoding="utf-8"))
-                self.assertEqual(summary["attempt"]["mode"], expected_mode)
-                self.assertEqual(
-                    summary["attempt"]["classification"], "inconclusive"
-                )
-                self.assertEqual(summary["attempt"]["exit_code"], expected_status)
-                self.assertIn(
-                    "interrupted by {}; recording an inconclusive telemetry "
-                    "record".format(received.name),
-                    output,
-                )
+                    output = stdout + stderr
+                    self.assertEqual(
+                        process.returncode, expected_status, output
+                    )
+                    artifacts = sorted(telemetry_dir.glob("*.json"))
+                    self.assertEqual(len(artifacts), 1, output)
+                    summary = json.loads(
+                        artifacts[0].read_text(encoding="utf-8")
+                    )
+                    self.assertEqual(summary["attempt"]["mode"], expected_mode)
+                    self.assertEqual(
+                        summary["attempt"]["classification"], "inconclusive"
+                    )
+                    self.assertEqual(
+                        summary["attempt"]["exit_code"], expected_status
+                    )
+                    self.assertIn(
+                        "interrupted by {}; recording an inconclusive telemetry "
+                        "record".format(received.name),
+                        output,
+                    )
+                    self.assertEqual(
+                        list(self.runner.glob("continuum-opencode-pipe.*")),
+                        [],
+                        "interrupted attempt leaked its event pipes",
+                    )
 
 
 class WorkflowContractTests(unittest.TestCase):
