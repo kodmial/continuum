@@ -290,5 +290,7 @@ evidence; avoid publishing unnecessary raw network-address data.
 
 No external-provider live evidence is linked in this repository generation.
 The [README live-status table](../README.md#what-has-been-live-qualified)
-therefore qualifies only hosted Linux toolchain cold/warm restore and a small
-inference, not a real external consumer or JIT provider E2E.
+records hosted Linux toolchain cold/warm restore and a small inference as
+historical evidence for OpenCode `1.19.3` only. That evidence does not qualify
+the current hosted pin, OpenCode `2.2.6`, and it is not a real external
+consumer or JIT provider E2E.

@@ -93,12 +93,22 @@ referenced or changed.
 
 ## Live rerun (maintainer, disposable only)
 
-1. Record the exact current-main SHA:
-   `git rev-parse HEAD`.
-2. Dispatch the installed canary caller above (preferred), or manually:
-   create a disposable branch/PR from that SHA containing only a known
-   blocking defect (for example `canary/blocking-fixture.py` with an
-   unguarded `None` dereference and an unsafe shell sink).
+1. Record the exact current `main` SHA in the **consumer** repository, not the
+   Continuum checkout used for the offline check: use
+   `gh api "repos/$CONSUMER_REPO/commits/main" --jq .sha`, or
+   `git rev-parse HEAD` from a consumer checkout at `main`.
+2. Choose the dispatch path (preferred) or the manual path:
+   * **Dispatch:** run the installed canary caller above with
+     `canary_enabled=true`, monitor that workflow run
+     (`gh run list --repo "$CONSUMER_REPO" --workflow continuum-pr-agent-canary.yml`
+     and `gh run view <run-id> --repo "$CONSUMER_REPO"`), and collect its
+     evidence, including the `pr-agent-canary-<run-id>` artifact and the
+     evidence comment. The workflow already posts the review and verification
+     commands, closes the PR, and deletes the branch; do not repeat steps 3-8.
+   * **Manual:** create a disposable branch/PR from the consumer `main` SHA
+     recorded above, containing only a known blocking defect (for example
+     `canary/blocking-fixture.py` with an unguarded `None` dereference and an
+     unsafe shell sink), then perform steps 3-8.
 3. Ensure `CONTINUUM_REVIEW_PROVIDER=pr-agent` in the same repository, then
    post `/review` as the repository owner. The installed router/recovery
    callers dispatch the event-driven `continuum-pr-agent.yml` run; do not

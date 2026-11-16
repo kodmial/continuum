@@ -70,7 +70,9 @@ Choose one ref policy for the first run:
 
 The steps below implement the reproducible path. The example `ci.yml` ships
 with the moving `main` references; the rewrite below changes both to the
-selected SHA.
+selected SHA. For the deliberately moving alternative, set
+`export CONTINUUM_REF=main` before downloading the installer so the downloaded
+script matches the selected ref.
 
 ```sh
 export CONTINUUM_REF="$(git -C "$CONTINUUM_DIR" rev-parse HEAD)"
@@ -119,9 +121,11 @@ PY
 The script fails instead of silently skipping a replacement when the example
 `ci.yml` drifts, so CI cannot be left unpinned by an unmatched constant.
 
-For the deliberate moving alternative, set `CONTINUUM_REF=main`, skip the
-`ci.yml` rewrite, and install with that same ref; the checked-in sample
-already contains `uses: ...@main` and `continuum_ref: main`.
+For the deliberate moving alternative, skip the `ci.yml` rewrite and install
+with that same ref. If `../continuum-install.sh` was already downloaded from a
+pinned checkout, re-download it after setting `CONTINUUM_REF=main` so the
+installer matches the selected ref; the checked-in sample already contains
+`uses: ...@main` and `continuum_ref: main`.
 
 You can also create the installer locally from the checkout and pass the ref
 explicitly:
