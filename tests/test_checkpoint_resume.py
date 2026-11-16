@@ -172,6 +172,17 @@ class CheckpointResumeTest(unittest.TestCase):
         self.assertEqual(reason, raised.exception.reason)
         return raised.exception
 
+    def add_origin(self, slug="kodmial/aa"):
+        origin = self.workdir / slug
+        origin.mkdir(parents=True)
+        subprocess.run(
+            ["git", "init", "--bare", "-q", str(origin)],
+            check=True,
+            capture_output=True,
+        )
+        run_git(self.repo, "remote", "add", "origin", str(origin))
+        return origin
+
     # -- the exact AA #454 reproduction ----------------------------------
     def test_advanced_legacy_checkpoint_rebaselines_without_losing_work(self):
         checkpoint = self.make_checkpoint()
@@ -287,8 +298,9 @@ class CheckpointResumeTest(unittest.TestCase):
     def test_generation_2_durable_ref_resumes_historical_checkpoint_without_repository(self):
         # kodmial/aa#534 predates the repository field in recovery metadata.
         # The workflow prefers the durable ref named by that immutable
-        # metadata, so the historical checkpoint still resumes without
-        # trusting the legacy mirror alias or the local origin.
+        # metadata, so the historical checkpoint still resumes when the
+        # expected repository publishes that exact ref/SHA.
+        self.add_origin()
         operation = "opencode-429-issue-issue534"
         durable = "opencode/429-checkpoint-{}-gen-2".format(operation)
         snapshot = "456f396895a33ec247e65308865c1728aad67e44a473a6f3d2f00b81d2babbb2"
@@ -299,6 +311,12 @@ class CheckpointResumeTest(unittest.TestCase):
             checkpoint_ref=durable,
             metadata_overrides={"stage": "implementation-complete"},
         )
+        run_git(
+            self.repo,
+            "push",
+            "origin",
+            "{}:refs/heads/{}".format(checkpoint, durable),
+        )
         request = self.request(
             checkpoint,
             issue=534,
@@ -306,6 +324,7 @@ class CheckpointResumeTest(unittest.TestCase):
             operation=operation,
             checkpoint_ref=durable,
             snapshot_spec=snapshot,
+            latest_generation=2,
         )
 
         data, reused = verification.ensure_baseline(
@@ -317,6 +336,77 @@ class CheckpointResumeTest(unittest.TestCase):
             checkpoint, data["resume_provenance"]["checkpoint_sha"]
         )
         self.assertEqual(durable, data["resume_provenance"]["checkpoint_ref"])
+
+    def test_generation_2_durable_ref_requires_repository_bound_provenance(self):
+        operation = "opencode-429-issue-issue534"
+        durable = "opencode/429-checkpoint-{}-gen-2".format(operation)
+        checkpoint = self.make_checkpoint(
+            issue=534,
+            operation=operation,
+            generation=2,
+            checkpoint_ref=durable,
+            metadata_overrides={"stage": "implementation-complete"},
+        )
+        self.assert_rejected(
+            "wrong-repository",
+            self.request(
+                checkpoint,
+                issue=534,
+                generation=2,
+                operation=operation,
+                checkpoint_ref=durable,
+            ),
+        )
+
+    def test_generation_2_durable_ref_rejects_an_unpublished_remote_ref(self):
+        self.add_origin()
+        operation = "opencode-429-issue-issue534"
+        durable = "opencode/429-checkpoint-{}-gen-2".format(operation)
+        checkpoint = self.make_checkpoint(
+            issue=534,
+            operation=operation,
+            generation=2,
+            checkpoint_ref=durable,
+            metadata_overrides={"stage": "implementation-complete"},
+        )
+        self.assert_rejected(
+            "wrong-repository",
+            self.request(
+                checkpoint,
+                issue=534,
+                generation=2,
+                operation=operation,
+                checkpoint_ref=durable,
+            ),
+        )
+
+    def test_generation_2_durable_ref_rejects_a_different_remote_repository(self):
+        self.add_origin("evil/not-aa")
+        operation = "opencode-429-issue-issue534"
+        durable = "opencode/429-checkpoint-{}-gen-2".format(operation)
+        checkpoint = self.make_checkpoint(
+            issue=534,
+            operation=operation,
+            generation=2,
+            checkpoint_ref=durable,
+            metadata_overrides={"stage": "implementation-complete"},
+        )
+        run_git(
+            self.repo,
+            "push",
+            "origin",
+            "{}:refs/heads/{}".format(checkpoint, durable),
+        )
+        self.assert_rejected(
+            "wrong-repository",
+            self.request(
+                checkpoint,
+                issue=534,
+                generation=2,
+                operation=operation,
+                checkpoint_ref=durable,
+            ),
+        )
 
     def test_generation_2_alias_rejects_metadata_without_repository_binding(self):
         # Matching issue, operation, generation and mirror SHA are not enough
@@ -628,6 +718,27 @@ class CheckpointResumeTest(unittest.TestCase):
         checkpoint = self.make_checkpoint()
         self.assert_rejected(
             "wrong-generation", self.request(checkpoint, generation=2)
+        )
+
+    def test_superseded_generation_is_rejected_before_checkpoint_work(self):
+        checkpoint = self.make_checkpoint()
+        self.assert_rejected(
+            "superseded-generation",
+            self.request(checkpoint, latest_generation=3),
+        )
+
+    def test_current_durable_generation_is_accepted(self):
+        checkpoint = self.make_checkpoint()
+        data, reused = verification.ensure_baseline(
+            self.repo,
+            self.evidence,
+            self.base,
+            self.env,
+            resume=self.request(checkpoint, latest_generation=1),
+        )
+        self.assertFalse(reused)
+        self.assertEqual(
+            checkpoint, data["resume_provenance"]["checkpoint_sha"]
         )
 
     def test_wrong_ref_is_rejected(self):

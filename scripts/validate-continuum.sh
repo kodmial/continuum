@@ -155,6 +155,27 @@ printf '%s\n' \
 PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=src python3 -m unittest -v \
   tests.test_opencode_429_evacuator.ProductionEvacuatorTest.test_resumed_generation_evacuates_next_generation_without_overwriting
 
+# Print the durable checkpoint supersession and repository-provenance
+# regressions by name in the exact-HEAD gate log. CodeRabbit excludes tests/**
+# from review, so the named results are the reviewable evidence that a stale
+# legacy-mirror generation is rejected before the baseline, the current
+# generation still resumes, and a generation-2 durable ref is trusted only
+# when the expected repository publishes the exact pinned SHA.
+printf '%s\n' \
+  'Durable checkpoint supersession and repository-provenance regression evidence:' \
+  'setup: a legacy checkpoint generation is older than, equal to, or newer than the durable refs; a generation-2 durable checkpoint has matching or missing repository metadata, with matching, unpublished, or wrong-origin refs.' \
+  'assertions: a superseded generation fails closed before checkpoint work, the current generation resumes, historical metadata-less generation 2 resumes only through an expected-repository durable ref at the pinned SHA, and missing/unpublished/wrong-origin provenance is rejected.'
+PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=src python3 -m unittest -v \
+  tests.test_checkpoint_resume.CheckpointResumeTest.test_superseded_generation_is_rejected_before_checkpoint_work \
+  tests.test_checkpoint_resume.CheckpointResumeTest.test_current_durable_generation_is_accepted \
+  tests.test_checkpoint_resume.CheckpointResumeTest.test_generation_2_durable_ref_resumes_historical_checkpoint_without_repository \
+  tests.test_checkpoint_resume.CheckpointResumeTest.test_generation_2_durable_ref_requires_repository_bound_provenance \
+  tests.test_checkpoint_resume.CheckpointResumeTest.test_generation_2_durable_ref_rejects_an_unpublished_remote_ref \
+  tests.test_checkpoint_resume.CheckpointResumeTest.test_generation_2_durable_ref_rejects_a_different_remote_repository \
+  tests.test_checkpoint_resume.CheckpointResumeTest.test_generation_2_alias_rejects_metadata_without_repository_binding \
+  tests.test_opencode_429_evacuator.LatestDurableGenerationTest.test_reads_the_highest_durable_generation \
+  tests.test_opencode_429_evacuator.LatestDurableGenerationTest.test_unreadable_durable_state_fails_closed
+
 mkdir -p "$PWD/.opencode-tmp/bin"
 # Pin both the installer URL and its content: the tag can move and a
 # compromised download would otherwise execute with this script's privileges.

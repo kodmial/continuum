@@ -54,6 +54,23 @@ def extracted_resume_generation_carry() -> str:
     raise AssertionError("Implement issue step not found")
 
 
+def extracted_latest_durable_generation() -> str:
+    """The exact durable-generation reader used before the baseline."""
+
+    import yaml
+
+    data = yaml.safe_load(WORKFLOW.read_text(encoding="utf-8"))
+    for step in data["jobs"]["opencode"]["steps"]:
+        if step.get("name") != "Implement issue":
+            continue
+        script = step["run"]
+        marker = "continuum_latest_durable_generation() {"
+        start = script.index(marker)
+        end = script.index("\n}\n", start) + len("\n}\n")
+        return textwrap.dedent(script[start:end])
+    raise AssertionError("Implement issue step not found")
+
+
 def run_git(repo: Path, *args: str) -> str:
     env = dict(os.environ)
     env.update(GIT_ENV)
@@ -457,3 +474,68 @@ class ProductionRestoreTest(unittest.TestCase):
         self.assertNotEqual(completed.returncode, 0, output)
         self.assertIn("head SHA is outside the checkpoint history", output)
         self.assertNotIn("Restored 429 checkpoint", output)
+
+
+class LatestDurableGenerationTest(unittest.TestCase):
+    def setUp(self):
+        TMP_PARENT.mkdir(parents=True, exist_ok=True)
+        self.workdir = Path(tempfile.mkdtemp(prefix="generation-", dir=str(TMP_PARENT)))
+        self.bin = self.workdir / "bin"
+        self.bin.mkdir()
+        gh = self.bin / "gh"
+        gh.write_text(
+            "#!/usr/bin/env bash\n"
+            "if [[ \"${FAKE_GH_FAIL:-}\" == \"true\" ]]; then exit 1; fi\n"
+            "case \"$*\" in\n"
+            "  *infra-checkpoint*) printf '%s\\n' \"${FAKE_INFRA_REFS:-}\" ;;\n"
+            "  *) printf '%s\\n' \"${FAKE_429_REFS:-}\" ;;\n"
+            "esac\n",
+            encoding="utf-8",
+        )
+        gh.chmod(0o755)
+        self.script = self.workdir / "latest-generation.sh"
+        self.script.write_text(
+            extracted_latest_durable_generation()
+            + '\ncontinuum_latest_durable_generation "opencode-429-issue-issue350"\n',
+            encoding="utf-8",
+        )
+
+    def tearDown(self):
+        shutil.rmtree(self.workdir, ignore_errors=True)
+
+    def invoke(self, **environment):
+        env = dict(os.environ)
+        env.update(
+            {
+                "PATH": str(self.bin) + os.pathsep + env.get("PATH", ""),
+                "GITHUB_REPOSITORY": "owner/repo",
+            }
+        )
+        env.update(environment)
+        return subprocess.run(
+            ["bash", str(self.script)],
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=120,
+        )
+
+    def test_reads_the_highest_durable_generation(self):
+        completed = self.invoke(
+            FAKE_429_REFS=(
+                "refs/heads/opencode/429-checkpoint-"
+                "opencode-429-issue-issue350-gen-1\n"
+                "refs/heads/opencode/429-checkpoint-"
+                "opencode-429-issue-issue350-gen-3"
+            ),
+            FAKE_INFRA_REFS=(
+                "refs/heads/opencode/infra-checkpoint-"
+                "opencode-429-issue-issue350-gen-2"
+            ),
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual("3", completed.stdout.strip())
+
+    def test_unreadable_durable_state_fails_closed(self):
+        completed = self.invoke(FAKE_GH_FAIL="true")
+        self.assertNotEqual(completed.returncode, 0)

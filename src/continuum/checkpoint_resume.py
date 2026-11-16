@@ -97,6 +97,7 @@ class ResumeRequest:
     snapshot_spec: str
     operation: str = ""
     mode: str = "issue"
+    latest_generation: int = 0
 
     @classmethod
     def from_mapping(cls, values: Mapping[str, Any]) -> "ResumeRequest":
@@ -125,6 +126,7 @@ class ResumeRequest:
             snapshot_spec=text("snapshot_spec").lower(),
             operation=text("operation"),
             mode=text("mode") or "issue",
+            latest_generation=integer("latest_generation"),
         )
 
     def as_dict(self) -> Dict[str, Any]:
@@ -138,6 +140,7 @@ class ResumeRequest:
             "base_sha": self.base_sha,
             "snapshot_spec": self.snapshot_spec,
             "mode": self.mode,
+            "latest_generation": self.latest_generation,
         }
 
 
@@ -249,6 +252,10 @@ def _validate_request(repo: Path | str, request: ResumeRequest) -> None:
         raise ResumeError("invalid-request", "resume issue number is malformed")
     if request.generation < 1:
         raise ResumeError("invalid-request", "resume generation is malformed")
+    if request.latest_generation < 0:
+        raise ResumeError(
+            "invalid-request", "resume latest durable generation is malformed"
+        )
     if not request.checkpoint_ref:
         raise ResumeError("invalid-request", "resume checkpoint ref is empty")
     if not _SHA_RE.fullmatch(request.checkpoint_sha or ""):
@@ -285,6 +292,27 @@ def _validate_request(repo: Path | str, request: ResumeRequest) -> None:
         )
 
 
+def _origin_repository_matches(
+    repo: Path | str, request: ResumeRequest
+) -> Optional[bool]:
+    """Whether the checkout origin names the expected repository.
+
+    ``None`` means the checkout has no origin at all; callers decide whether
+    that absence is binding evidence or a fail-closed rejection.
+    """
+
+    completed = _completed(repo, "remote", "get-url", "origin")
+    if completed.returncode != 0:
+        return None
+    origin = (completed.stdout or "").strip().lower().rstrip("/")
+    if origin.endswith(".git"):
+        origin = origin[:-4]
+    wanted = request.repository.lower()
+    # Bind the exact owner/repository slug at the end of the remote path.
+    # A plain substring test would accept ``evil/owner/repo-extra``.
+    return origin.endswith("/" + wanted) or origin.endswith(":" + wanted)
+
+
 def _check_repository(
     repo: Path | str, request: ResumeRequest, metadata: Mapping[str, Any]
 ) -> None:
@@ -301,19 +329,45 @@ def _check_repository(
     # Legacy metadata has no repository field.  When the checkout has an
     # origin, use it as an additional binding; a bare test repository has no
     # remote and is bound by issue/generation/operation below instead.
-    completed = _completed(repo, "remote", "get-url", "origin")
-    if completed.returncode != 0:
-        return
-    origin = (completed.stdout or "").strip().lower().rstrip("/")
-    if origin.endswith(".git"):
-        origin = origin[:-4]
-    wanted = request.repository.lower()
-    # Bind the exact owner/repository slug at the end of the remote path.
-    # A plain substring test would accept ``evil/owner/repo-extra``.
-    if not (origin.endswith("/" + wanted) or origin.endswith(":" + wanted)):
+    origin_matches = _origin_repository_matches(repo, request)
+    if origin_matches is False:
         raise ResumeError(
             "wrong-repository",
             "the checkpoint's origin is not the expected repository",
+        )
+
+
+def _check_durable_repository_binding(
+    repo: Path | str, request: ResumeRequest, durable_ref: str
+) -> None:
+    """Bind a generation-2+ durable ref to the expected repository.
+
+    A durable checkpoint ref is authoritative only when the checkout origin is
+    the expected repository and that origin publishes the same ref at the
+    exact pinned commit.  This lets historical metadata without a repository
+    field resume through its durable ref without inheriting trust from a local
+    mirror or an unrelated checkout.
+    """
+
+    if _origin_repository_matches(repo, request) is not True:
+        raise ResumeError(
+            "wrong-repository",
+            "the durable checkpoint has no repository-bound origin",
+        )
+    completed = _completed(
+        repo, "ls-remote", "--exit-code", "origin", "refs/heads/" + durable_ref
+    )
+    if completed.returncode != 0:
+        raise ResumeError(
+            "wrong-repository",
+            "the durable checkpoint ref is not published by the expected repository",
+        )
+    published = (completed.stdout or "").split()
+    published_sha = published[0].lower() if published else ""
+    if published_sha != request.checkpoint_sha:
+        raise ResumeError(
+            "checkpoint-mismatch",
+            "the durable checkpoint ref does not publish the pinned commit",
         )
 
 
@@ -402,6 +456,8 @@ def _check_checkpoint_ref(
             )
 
     if expected == metadata_checkpoint:
+        if request.generation > 1:
+            _check_durable_repository_binding(repo, request, expected)
         return
     legacy_expected = _LEGACY_CHECKPOINT_RE.match(expected)
     if legacy_expected is None or int(legacy_expected.group(1)) != request.issue:
@@ -689,6 +745,20 @@ def _validate_checkpoint(
     repo: Path | str, request: ResumeRequest, ignored: Tuple[str, ...]
 ) -> ValidatedCheckpoint:
     _validate_request(repo, request)
+
+    if (
+        request.latest_generation
+        and request.generation < request.latest_generation
+    ):
+        raise ResumeError(
+            "superseded-generation",
+            "checkpoint generation {} is superseded by durable generation {} "
+            "for {}".format(
+                request.generation,
+                request.latest_generation,
+                request.operation or "this operation",
+            ),
+        )
 
     dirty = dirty_worktree(repo, ignored)
     if dirty:

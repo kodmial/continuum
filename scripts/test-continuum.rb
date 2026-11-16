@@ -3866,6 +3866,73 @@ class ContinuumTest < Minitest::Test
            'the resumed generation must be set before the evacuator runs'
   end
 
+  # Review 5921692569: the generation-2 legacy resume followed by another 429
+  # has executable assertions in the Python suite, which CodeRabbit excludes
+  # from review. Keep the exact expected outcomes reviewable here: the next
+  # checkpoint is generation 3 and the existing generation-1/generation-2 refs
+  # are byte-for-byte unchanged.
+  def test_resumed_generation_evacuation_assertions_are_reviewable
+    test = File.read(
+      File.join(ROOT, 'tests/test_opencode_429_evacuator.py')
+    )
+
+    assert_includes test,
+                    'test_resumed_generation_evacuates_next_generation_without_overwriting'
+    assert_includes test,
+                    'self.assertIn("CONTINUUM_429_CHECKPOINT_REF={}".format(gen3_ref), env)'
+    assert_includes test,
+                    'self.assertEqual(gen1_sha, refs["refs/heads/" + gen1_ref])'
+    assert_includes test,
+                    'self.assertEqual(gen2_sha, refs["refs/heads/" + gen2_ref])'
+    assert_includes test,
+                    'self.assertNotEqual(gen1_sha, refs["refs/heads/" + gen3_ref])'
+    assert_includes test,
+                    'self.assertNotEqual(gen2_sha, refs["refs/heads/" + gen3_ref])'
+  end
+
+  # Review 5921692569: ordinary issue dispatches have no explicit recovery
+  # identity, so the issue step itself must reject a legacy-mirror generation
+  # that durable checkpoint refs already superseded. The state read is
+  # fail-closed and happens before the verification baseline.
+  def test_issue_resume_rejects_a_superseded_durable_generation
+    workflow = yaml(File.join(ROOT, '.github/workflows/continuum-opencode.yml'))
+    step = workflow.fetch('jobs').fetch('opencode').fetch('steps')
+                   .find { |entry| entry['name'] == 'Implement issue' }
+    refute_nil step, 'the issue implementation step is missing'
+    run = step.fetch('run')
+
+    assert_includes run, 'continuum_latest_durable_generation()'
+    assert_includes run,
+                    'git/matching-refs/heads/${namespace}${operation}?per_page=100'
+    assert_includes run, 'RESUME_GENERATION < RESUME_LATEST_GENERATION'
+    assert_includes run,
+                    '--resume-latest-generation "$RESUME_LATEST_GENERATION"'
+
+    supersession = run.index('RESUME_GENERATION < RESUME_LATEST_GENERATION')
+    baseline = run.index('verification_python baseline')
+    refute_nil supersession, 'the stale-generation check is missing'
+    refute_nil baseline, 'the verification baseline call is missing'
+    assert supersession < baseline,
+           'the stale-generation check must run before checkpoint work continues'
+  end
+
+  # Review 5921692569: a generation-2+ durable checkpoint ref is trusted only
+  # when the expected repository publishes that exact ref/SHA. This is the
+  # equivalent repository binding for historical metadata without a
+  # repository field; a local mirror or unrelated origin cannot supply it.
+  def test_generation_two_durable_refs_require_repository_provenance
+    source = File.read(File.join(ROOT, 'src/continuum/checkpoint_resume.py'))
+
+    assert_includes source, 'def _check_durable_repository_binding'
+    assert_includes source, 'def _origin_repository_matches'
+    assert_includes source,
+                    '"ls-remote", "--exit-code", "origin", "refs/heads/" + durable_ref'
+    assert_includes source, 'if request.generation > 1:'
+    assert_includes source, '_check_durable_repository_binding(repo, request, expected)'
+    assert_includes source,
+                    'the durable checkpoint ref does not publish the pinned commit'
+  end
+
   # ------------------------------------------------- CI-repair correlation
 
   # The correlation step is the only place that turns a queued ci-fix run into

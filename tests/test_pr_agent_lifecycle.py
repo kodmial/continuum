@@ -259,9 +259,13 @@ APPROVED_SCHEDULER_ORIGIN_OPENCODE_SHA256 = (
 # Review 5921692569 repair: a resumed generation is carried into the same-step
 # 429 evacuation, and admission compares a recovery identity against the
 # durable checkpoint refs so a superseded generation cannot replay work.
-# The digest is re-pinned after those guarded corrections; no other byte changed.
+# Review 5921692569 follow-up: ordinary issue resumes also read the highest
+# durable generation after the legacy identity is known and fail closed before
+# the baseline; generation-2+ durable refs must be published by the expected
+# repository at the pinned SHA. The digest is re-pinned after those guarded
+# corrections; no other byte changed.
 APPROVED_460_RESUME_OPENCODE_SHA256 = (
-    "a35faed4012916c0cd18cb20ca50f381f79ccbdff6459b016352e39b87bc513c"
+    "ce79a2ec022fede1ab4b1f3accf07f4cd1b55561ca2f27d1adc04bc055a10c3a"
 )
 APPROVED_446_CALLER_SHA256 = (
     "b7f3df118bc436526f48443b8f068372204073eb134c98e4a1543d025f314686"

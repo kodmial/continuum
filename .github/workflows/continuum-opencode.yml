@@ -3362,8 +3362,33 @@ jobs:
           RESUME_CHECKPOINT_SHA=""
           RESUME_OPERATION="opencode-issue-issue${ISSUE_NUMBER}"
           RESUME_GENERATION=1
+          RESUME_LATEST_GENERATION=0
           RESUME_FAILURE_RECORD="${RUNNER_TEMP:-/tmp}/continuum-checkpoint-resume-failure.json"
           rm -f "$RESUME_FAILURE_RECORD"
+
+          # kodmial/continuum#460: an ordinary issue dispatch discovers its
+          # generation from the legacy mirror after admission. Durable
+          # checkpoint refs are the authoritative state, so a stale mirror can
+          # never replay an older generation after a newer one completed.
+          continuum_latest_durable_generation() {
+            local operation="$1" namespace refs ref generation latest=0
+            for namespace in opencode/429-checkpoint- opencode/infra-checkpoint-; do
+              if ! refs="$(gh api --paginate \
+                "repos/$GITHUB_REPOSITORY/git/matching-refs/heads/${namespace}${operation}?per_page=100" \
+                --jq '.[].ref')"; then
+                return 1
+              fi
+              while IFS= read -r ref; do
+                [[ "$ref" == "refs/heads/${namespace}${operation}-gen-"* ]] || continue
+                generation="${ref##*-gen-}"
+                [[ "$generation" =~ ^[0-9]+$ ]] || continue
+                if (( generation > latest )); then
+                  latest="$generation"
+                fi
+              done <<< "$refs"
+            done
+            printf '%s\n' "$latest"
+          }
 
           # kodmial/continuum#290: a fresh-VM 429 resumption already restored
           # the exact checkpoint (see Restore 429 recovery checkpoint). Base
@@ -3417,6 +3442,27 @@ jobs:
           else
             git switch --detach "origin/$BASE_REF"
             git switch -c "$BRANCH"
+          fi
+
+          # kodmial/continuum#460: a resumed checkpoint is only current while
+          # no newer durable generation exists for the same operation. The
+          # identity may have come from a stale legacy mirror rather than the
+          # dispatch inputs, so this check runs after the metadata read and
+          # before the verification baseline. An unreadable durable state also
+          # fails closed instead of resuming an unproven generation.
+          if [[ "$RESUME_ACTIVE" == "true" ]]; then
+            if ! RESUME_LATEST_GENERATION="$(continuum_latest_durable_generation "$RESUME_OPERATION")"; then
+              echo "::error::Could not read durable recovery generation state for $RESUME_OPERATION; refusing to resume a checkpoint without supersession proof."
+              exit 1
+            fi
+            if [[ ! "$RESUME_LATEST_GENERATION" =~ ^[0-9]+$ ]]; then
+              echo "::error::Durable recovery generation state for $RESUME_OPERATION is malformed; refusing to resume."
+              exit 1
+            fi
+            if (( RESUME_GENERATION < RESUME_LATEST_GENERATION )); then
+              echo "::error::Checkpoint generation $RESUME_GENERATION for $RESUME_OPERATION is superseded by durable generation $RESUME_LATEST_GENERATION; refusing to replay older saved work."
+              exit 1
+            fi
           fi
 
           # kodmial/continuum#460: a resumed checkpoint carries its validated
@@ -3518,6 +3564,7 @@ jobs:
               --resume-base-sha "$BASE_START_SHA"
               --resume-snapshot-spec "$SNAPSHOT_SPEC"
               --resume-mode "issue"
+              --resume-latest-generation "$RESUME_LATEST_GENERATION"
               --resume-failure-record "$RESUME_FAILURE_RECORD"
             )
           fi
