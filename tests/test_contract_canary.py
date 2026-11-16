@@ -173,6 +173,7 @@ def repair_publication_receipt(
     head,
     pr_number=41,
     run_id=9001,
+    run_attempt="1",
     branch="opencode/issue100-9001",
     repo=canary.CANARY_OWNER_REPO,
     schema_version=1,
@@ -181,7 +182,7 @@ def repair_publication_receipt(
         "schema_version": schema_version,
         "repo": repo,
         "run_id": str(run_id),
-        "run_attempt": "1",
+        "run_attempt": run_attempt,
         "pr_number": pr_number,
         "branch": branch,
         "base_sha": base,
@@ -857,6 +858,51 @@ class CompletionEvidenceTest(unittest.TestCase):
         self.assertIsNone(
             canary.validate_completed_canary(
                 pr(), exact_head_runs(), 100, receipt, commits
+            )
+        )
+
+    def test_two_repair_commits_from_separate_attempts_of_one_run_pass(self):
+        """Each status keeps the receipt from its own repair attempt.
+
+        A rerun keeps the run id while publishing a second commit, so both
+        statuses name the same run. Continuity must pair each commit with the
+        receipt whose base and head match that commit, not the newest receipt.
+        """
+        published = "e" * 40
+        first = repair_publication_receipt(
+            published, OTHER_HEAD, run_attempt="1"
+        )
+        second = repair_publication_receipt(
+            OTHER_HEAD, HEAD, run_attempt="2"
+        )
+        commits = [
+            pr_commit(published, message="fix: implement issue #100"),
+            pr_commit(
+                OTHER_HEAD,
+                message="fix: address CodeRabbit findings",
+                statuses=[
+                    repair_status(
+                        published, OTHER_HEAD, publication_payload=first
+                    )
+                ],
+            ),
+            pr_commit(
+                HEAD,
+                message="fix: repair blocking workflow",
+                statuses=[
+                    repair_status(
+                        OTHER_HEAD, HEAD, publication_payload=second
+                    )
+                ],
+            ),
+        ]
+        self.assertIsNone(
+            canary.validate_completed_canary(
+                pr(),
+                exact_head_runs(),
+                100,
+                publication(head=published),
+                commits,
             )
         )
 
@@ -2553,6 +2599,10 @@ class WorkflowContractTest(unittest.TestCase):
         self.assertEqual(
             workflow.count("canary.select_repair_publication("), 2
         )
+        # Repair receipts are fetched by artifact id, not by name, so a rerun
+        # cannot resolve to another attempt's same-named artifact.
+        self.assertEqual(workflow.count("actions/artifacts/{}/zip"), 2)
+        self.assertEqual(workflow.count('"gh", "run", "download"'), 2)
         # Only the worker path may assume a single newest receipt; a repair
         # run can hold one receipt per attempt.
         self.assertEqual(workflow.count("_, name = max(candidates)"), 2)
@@ -2568,10 +2618,18 @@ class WorkflowContractTest(unittest.TestCase):
         branch = "opencode/issue100-9001"
         first_base = "e" * 40
         first = repair_publication_receipt(
-            first_base, OTHER_HEAD, run_id=WORKER_RUN_ID, branch=branch
+            first_base,
+            OTHER_HEAD,
+            run_id=WORKER_RUN_ID,
+            run_attempt="1",
+            branch=branch,
         )
         second = repair_publication_receipt(
-            OTHER_HEAD, HEAD, run_id=WORKER_RUN_ID, branch=branch
+            OTHER_HEAD,
+            HEAD,
+            run_id=WORKER_RUN_ID,
+            run_attempt="2",
+            branch=branch,
         )
         self.assertEqual(
             canary.select_repair_publication(
@@ -2584,6 +2642,18 @@ class WorkflowContractTest(unittest.TestCase):
                 branch,
             ),
             first,
+        )
+        self.assertEqual(
+            canary.select_repair_publication(
+                [second, first],
+                WORKER_RUN_ID,
+                OTHER_HEAD,
+                HEAD,
+                41,
+                canary.CANARY_OWNER_REPO,
+                branch,
+            ),
+            second,
         )
         self.assertIsNone(
             canary.select_repair_publication(

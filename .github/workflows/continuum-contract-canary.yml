@@ -138,10 +138,12 @@ jobs:
           PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=src OBSERVATION_DIR="$observation_dir" \
             CANARY_REPO="$GITHUB_REPOSITORY" \
             python3 - <<'PY'
+          import io
           import json
           import os
           import subprocess
           import tempfile
+          import zipfile
           from datetime import datetime, timezone
           from continuum import contract_canary as canary
 
@@ -363,31 +365,40 @@ jobs:
                   else ""
               )
               receipts = []
-              for _, name in sorted(candidates, reverse=True):
-                  target = tempfile.mkdtemp(
-                      prefix="continuum-repair-publication-",
-                      dir=os.environ.get("RUNNER_TEMP") or None,
-                  )
+              for artifact_id, name in sorted(candidates, reverse=True):
+                  # Fetch each receipt by artifact id. Downloading by name can
+                  # resolve to another attempt's same-named artifact, which
+                  # would lose the receipt for an earlier repair commit.
                   download = subprocess.run(
                       [
-                          "gh", "run", "download", str(run_id),
-                          "--repo", repo, "--name", name, "--dir", target,
+                          "gh", "api",
+                          "repos/{}/actions/artifacts/{}/zip".format(
+                              repo, artifact_id
+                          ),
                       ],
-                      check=False, capture_output=True, text=True,
+                      check=False, capture_output=True,
                   )
                   if download.returncode != 0:
                       raise SystemExit(
                           "could not download repair publication receipt {} from run {}: {}".format(
-                              name, run_id, (download.stderr or "").strip()[:500]
+                              name,
+                              run_id,
+                              (download.stderr or b"")
+                              .decode("utf-8", "replace")
+                              .strip()[:500],
                           )
                       )
                   try:
-                      with open(
-                          os.path.join(target, "publication.json"),
-                          encoding="utf-8",
-                      ) as handle:
-                          receipts.append(json.load(handle))
-                  except (OSError, ValueError):
+                      with zipfile.ZipFile(
+                          io.BytesIO(download.stdout or b"")
+                      ) as archive:
+                          with archive.open("publication.json") as handle:
+                              receipts.append(
+                                  json.loads(handle.read().decode("utf-8"))
+                              )
+                  except (
+                      OSError, KeyError, ValueError, zipfile.BadZipFile,
+                  ):
                       raise SystemExit(
                           "repair publication receipt {} from run {} cannot be read".format(
                               name, run_id
@@ -602,10 +613,12 @@ jobs:
             CANARY_ISSUE="$CANARY_ISSUE" CANARY_CREATED="$CANARY_CREATED" \
             SCHEDULER_WORKFLOW="$SCHEDULER_WORKFLOW" \
             python3 - <<'PY'
+          import io
           import json
           import os
           import subprocess
           import tempfile
+          import zipfile
           from continuum import contract_canary as canary
           from continuum import contract_observation as observation
           from continuum import contract_qualification as contract
@@ -828,31 +841,40 @@ jobs:
                   else ""
               )
               receipts = []
-              for _, name in sorted(candidates, reverse=True):
-                  target = tempfile.mkdtemp(
-                      prefix="continuum-repair-publication-",
-                      dir=os.environ.get("RUNNER_TEMP") or None,
-                  )
+              for artifact_id, name in sorted(candidates, reverse=True):
+                  # Fetch each receipt by artifact id. Downloading by name can
+                  # resolve to another attempt's same-named artifact, which
+                  # would lose the receipt for an earlier repair commit.
                   download = subprocess.run(
                       [
-                          "gh", "run", "download", str(run_id),
-                          "--repo", repo, "--name", name, "--dir", target,
+                          "gh", "api",
+                          "repos/{}/actions/artifacts/{}/zip".format(
+                              repo, artifact_id
+                          ),
                       ],
-                      check=False, capture_output=True, text=True,
+                      check=False, capture_output=True,
                   )
                   if download.returncode != 0:
                       raise SystemExit(
                           "could not download repair publication receipt {} from run {}: {}".format(
-                              name, run_id, (download.stderr or "").strip()[:500]
+                              name,
+                              run_id,
+                              (download.stderr or b"")
+                              .decode("utf-8", "replace")
+                              .strip()[:500],
                           )
                       )
                   try:
-                      with open(
-                          os.path.join(target, "publication.json"),
-                          encoding="utf-8",
-                      ) as handle:
-                          receipts.append(json.load(handle))
-                  except (OSError, ValueError):
+                      with zipfile.ZipFile(
+                          io.BytesIO(download.stdout or b"")
+                      ) as archive:
+                          with archive.open("publication.json") as handle:
+                              receipts.append(
+                                  json.loads(handle.read().decode("utf-8"))
+                              )
+                  except (
+                      OSError, KeyError, ValueError, zipfile.BadZipFile,
+                  ):
                       raise SystemExit(
                           "repair publication receipt {} from run {} cannot be read".format(
                               name, run_id
