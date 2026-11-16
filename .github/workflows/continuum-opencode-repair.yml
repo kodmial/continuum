@@ -1,12 +1,6 @@
 name: OpenCode repair controller
 
 on:
-  # GitHub can accept a CI-repair dispatch but never instantiate its jobs.
-  # Periodic liveness reconciliation uses the SAME run ID, not a second claim.
-  push:
-    branches: [main]
-  schedule:
-    - cron: "7,22,37,52 * * * *"
   workflow_call:
     inputs:
       continuum_ref:
@@ -783,29 +777,3 @@ jobs:
               echo "No approved workflow result is known for $RUN_HEAD_SHA; nothing to reconcile."
               ;;
           esac
-
-
-  ci-repair-liveness:
-    # Reuse the existing controller workflow rather than install a second
-    # unmanaged workflow/caller. This owner-only maintenance job does NOT
-    # claim a fresh exact-HEAD CI repair or run arbitrary PR code.
-    if: >-
-      github.repository == 'kodmial/continuum' &&
-      (github.event_name == 'schedule' || github.event_name == 'push')
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    permissions:
-      actions: write
-      contents: read
-      issues: write
-      pull-requests: read
-    steps:
-      - name: Checkout protected main for CI-repair liveness
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-        with:
-          persist-credentials: false
-      - name: Verify real jobs and recover bounded accepted-but-jobless CI repair
-        env:
-          GH_TOKEN: ${{ secrets.TAP_PAT || github.token }}
-          GITHUB_REPOSITORY: ${{ github.repository }}
-        run: python3 -B .github/scripts/ci_repair_liveness.py
