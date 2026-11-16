@@ -8,20 +8,24 @@ the standard test discovery path working without duplicating the scenario.
 from __future__ import annotations
 
 from scripts.test_opencode_429_evacuator import (  # noqa: F401
+    IssueResumeSupersessionTest,
     LatestDurableGenerationTest,
     ProductionEvacuatorTest,
     ProductionRestoreTest,
     extracted_evacuator,
+    extracted_issue_resume_supersession,
     extracted_latest_durable_generation,
     extracted_resume_generation_carry,
     run_git,
 )
 
 __all__ = [
+    "IssueResumeSupersessionTest",
     "LatestDurableGenerationTest",
     "ProductionEvacuatorTest",
     "ProductionRestoreTest",
     "extracted_evacuator",
+    "extracted_issue_resume_supersession",
     "extracted_latest_durable_generation",
     "extracted_resume_generation_carry",
     "run_git",

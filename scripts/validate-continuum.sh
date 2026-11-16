@@ -163,8 +163,8 @@ PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=src python3 -m unittest -v \
 # trusted only when the expected repository publishes the exact pinned SHA.
 printf '%s\n' \
   'Durable checkpoint supersession and repository-provenance regression evidence:' \
-  'setup: a legacy checkpoint generation is older than, equal to, or newer than the durable refs; a generation-2 durable checkpoint has matching or missing repository metadata, with matching, unpublished, mismatched, or wrong-origin refs, and a legacy alias with or without a published durable ref.' \
-  'assertions: a superseded generation fails closed before checkpoint work, the current generation resumes, historical metadata-less generation 2 resumes only through an expected-repository durable ref at the pinned SHA, and missing/unpublished/mismatched/wrong-origin provenance is rejected, including alias fallback without a published durable ref.'
+  'setup: a legacy checkpoint generation is older than, equal to, or newer than the durable refs; the workflow supersession gate sees a stale mirror, the current generation, and an unreadable durable-state read; a generation-2 durable checkpoint has matching or missing repository metadata, with matching, unpublished, mismatched, or wrong-origin refs, and a legacy alias with or without a published durable ref.' \
+  'assertions: a superseded generation fails closed before checkpoint work, the current generation resumes, an unreadable durable-state read fails closed, historical metadata-less generation 2 resumes only through an expected-repository durable ref at the pinned SHA, and missing/unpublished/mismatched/wrong-origin provenance is rejected, including alias fallback without a published durable ref.'
 PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=src python3 -m unittest -v \
   tests.test_checkpoint_resume.CheckpointResumeTest.test_superseded_generation_is_rejected_before_checkpoint_work \
   tests.test_checkpoint_resume.CheckpointResumeTest.test_current_durable_generation_is_accepted \
@@ -177,7 +177,10 @@ PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=src python3 -m unittest -v \
   tests.test_checkpoint_resume.CheckpointResumeTest.test_generation_2_alias_rejects_an_unpublished_durable_ref \
   tests.test_checkpoint_resume.CheckpointResumeTest.test_generation_2_alias_rejects_a_durable_ref_at_a_different_sha \
   scripts.test_opencode_429_evacuator.LatestDurableGenerationTest.test_reads_the_highest_durable_generation \
-  scripts.test_opencode_429_evacuator.LatestDurableGenerationTest.test_unreadable_durable_state_fails_closed
+  scripts.test_opencode_429_evacuator.LatestDurableGenerationTest.test_unreadable_durable_state_fails_closed \
+  scripts.test_opencode_429_evacuator.IssueResumeSupersessionTest.test_stale_mirror_generation_fails_before_resume \
+  scripts.test_opencode_429_evacuator.IssueResumeSupersessionTest.test_current_generation_resumes \
+  scripts.test_opencode_429_evacuator.IssueResumeSupersessionTest.test_unreadable_durable_state_fails_closed
 
 mkdir -p "$PWD/.opencode-tmp/bin"
 # Pin both the installer URL and its content: the tag can move and a

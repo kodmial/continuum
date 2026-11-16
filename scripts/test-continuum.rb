@@ -3877,34 +3877,40 @@ class ContinuumTest < Minitest::Test
     test = File.read(
       File.join(ROOT, 'scripts/test_opencode_429_evacuator.py')
     )
+    klass = test[/^class ProductionEvacuatorTest\b.*?(?=^class |\z)/m]
+    refute_nil klass, 'the production evacuation regression class is missing'
+    regression = test[
+      /^    def test_resumed_generation_evacuates_next_generation_without_overwriting\b.*?(?=^    def |\z)/m
+    ]
+    refute_nil regression, 'the named regression method is missing'
 
-    assert_includes test,
+    assert_includes regression,
                     'test_resumed_generation_evacuates_next_generation_without_overwriting'
-    assert_includes test,
+    assert_includes klass,
                     'self.script.write_text(extracted_evacuator(), encoding="utf-8")'
     assert_includes test,
                     'marker = "# kodmial/continuum#460: a resumed checkpoint carries"'
     assert_includes test, 'return textwrap.dedent(script[start:end])'
-    assert_includes test, 'prefix=extracted_resume_generation_carry() + "\n",'
-    assert_includes test, 'generation="",'
-    assert_includes test, 'resume_active="true",'
-    assert_includes test, 'resume_generation="2",'
-    assert_includes test,
+    assert_includes regression, 'prefix=extracted_resume_generation_carry() + "\n",'
+    assert_includes regression, 'generation="",'
+    assert_includes regression, 'resume_active="true",'
+    assert_includes regression, 'resume_generation="2",'
+    assert_includes regression,
                     'gen1_ref = "opencode/429-checkpoint-opencode-429-issue-issue350-gen-1"'
-    assert_includes test,
+    assert_includes regression,
                     'gen2_ref = "opencode/429-checkpoint-opencode-429-issue-issue350-gen-2"'
-    assert_includes test,
+    assert_includes regression,
                     'gen3_ref = "opencode/429-checkpoint-opencode-429-issue-issue350-gen-3"'
-    assert_includes test,
+    assert_includes regression,
                     'self.assertIn("CONTINUUM_429_CHECKPOINT_REF={}".format(gen3_ref), env)'
-    assert_includes test,
+    assert_includes regression,
                     'self.assertEqual(gen1_sha, refs["refs/heads/" + gen1_ref])'
-    assert_includes test,
+    assert_includes regression,
                     'self.assertEqual(gen2_sha, refs["refs/heads/" + gen2_ref])'
-    assert_includes test, 'self.assertIn("refs/heads/" + gen3_ref, refs)'
-    assert_includes test,
+    assert_includes regression, 'self.assertIn("refs/heads/" + gen3_ref, refs)'
+    assert_includes regression,
                     'self.assertNotEqual(gen1_sha, refs["refs/heads/" + gen3_ref])'
-    assert_includes test,
+    assert_includes regression,
                     'self.assertNotEqual(gen2_sha, refs["refs/heads/" + gen3_ref])'
   end
 
@@ -3932,6 +3938,17 @@ class ContinuumTest < Minitest::Test
     refute_nil baseline, 'the verification baseline call is missing'
     assert supersession < baseline,
            'the stale-generation check must run before checkpoint work continues'
+
+    regression = File.read(
+      File.join(ROOT, 'scripts/test_opencode_429_evacuator.py')
+    )
+    gate = regression[
+      /^class IssueResumeSupersessionTest\b.*?(?=^class |\z)/m
+    ]
+    refute_nil gate, 'the reviewable supersession regression is missing'
+    assert_includes gate, 'def test_stale_mirror_generation_fails_before_resume'
+    assert_includes gate, 'def test_current_generation_resumes'
+    assert_includes gate, 'def test_unreadable_durable_state_fails_closed'
   end
 
   # Review 5921692569: a generation-2+ durable checkpoint ref is trusted only

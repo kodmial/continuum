@@ -71,6 +71,26 @@ def extracted_latest_durable_generation() -> str:
     raise AssertionError("Implement issue step not found")
 
 
+def extracted_issue_resume_supersession() -> str:
+    """The exact fail-closed generation gate used by the issue step."""
+
+    import yaml
+
+    data = yaml.safe_load(WORKFLOW.read_text(encoding="utf-8"))
+    for step in data["jobs"]["opencode"]["steps"]:
+        if step.get("name") != "Implement issue":
+            continue
+        script = step["run"]
+        start_marker = (
+            "# kodmial/continuum#460: a resumed checkpoint is only current"
+        )
+        end_marker = "# kodmial/continuum#460: a resumed checkpoint carries"
+        start = script.index(start_marker)
+        end = script.index(end_marker, start)
+        return textwrap.dedent(script[start:end])
+    raise AssertionError("Implement issue step not found")
+
+
 def run_git(repo: Path, *args: str) -> str:
     env = dict(os.environ)
     env.update(GIT_ENV)
@@ -535,6 +555,90 @@ class LatestDurableGenerationTest(unittest.TestCase):
     def test_unreadable_durable_state_fails_closed(self):
         completed = self.invoke(FAKE_GH_FAIL="true")
         self.assertNotEqual(completed.returncode, 0)
+
+
+class IssueResumeSupersessionTest(unittest.TestCase):
+    """Run the workflow's ordinary-issue supersession gate."""
+
+    def setUp(self):
+        TMP_PARENT.mkdir(parents=True, exist_ok=True)
+        self.workdir = Path(
+            tempfile.mkdtemp(prefix="supersession-", dir=str(TMP_PARENT))
+        )
+        self.bin = self.workdir / "bin"
+        self.bin.mkdir()
+        gh = self.bin / "gh"
+        gh.write_text(
+            "#!/usr/bin/env bash\n"
+            "if [[ \"${FAKE_GH_FAIL:-}\" == \"true\" ]]; then exit 1; fi\n"
+            "case \"$*\" in\n"
+            "  *infra-checkpoint*) printf '%s\\n' \"${FAKE_INFRA_REFS:-}\" ;;\n"
+            "  *) printf '%s\\n' \"${FAKE_429_REFS:-}\" ;;\n"
+            "esac\n",
+            encoding="utf-8",
+        )
+        gh.chmod(0o755)
+        self.script = self.workdir / "resume-supersession.sh"
+        self.script.write_text(
+            extracted_latest_durable_generation()
+            + "\n"
+            + extracted_issue_resume_supersession(),
+            encoding="utf-8",
+        )
+
+    def tearDown(self):
+        shutil.rmtree(self.workdir, ignore_errors=True)
+
+    def invoke(self, generation, **environment):
+        env = dict(os.environ)
+        env.update(
+            {
+                "PATH": str(self.bin) + os.pathsep + env.get("PATH", ""),
+                "GITHUB_REPOSITORY": "owner/repo",
+                "RESUME_ACTIVE": "true",
+                "RESUME_OPERATION": "opencode-429-issue-issue350",
+                "RESUME_GENERATION": str(generation),
+            }
+        )
+        env.update(environment)
+        return subprocess.run(
+            ["bash", str(self.script)],
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=120,
+        )
+
+    def test_stale_mirror_generation_fails_before_resume(self):
+        completed = self.invoke(
+            2,
+            FAKE_429_REFS=(
+                "refs/heads/opencode/429-checkpoint-"
+                "opencode-429-issue-issue350-gen-3"
+            ),
+        )
+        output = completed.stdout + completed.stderr
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertIn("superseded by durable generation 3", output)
+
+    def test_current_generation_resumes(self):
+        completed = self.invoke(
+            3,
+            FAKE_429_REFS=(
+                "refs/heads/opencode/429-checkpoint-"
+                "opencode-429-issue-issue350-gen-3"
+            ),
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+
+    def test_unreadable_durable_state_fails_closed(self):
+        completed = self.invoke(2, FAKE_GH_FAIL="true")
+        output = completed.stdout + completed.stderr
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertIn(
+            "Could not read durable recovery generation state",
+            output,
+        )
 
 
 if __name__ == "__main__":
