@@ -1,15 +1,23 @@
 # Provider lifecycle duplication matrix (kodmial/continuum#304)
 
-Baseline SHA: `131c76c2966999778ebd80806e34a5d4df6ac8e3`
-(`fix: P0: Eliminate every direct-to-default-branch code mutation path`, #302 closed 2026-10-09.)
+## Historical snapshot disclaimer
 
-This matrix is the mandatory first step of #304. It compares the exact
-`main` CodeRabbit path against the exact `main` PR-Agent path, maps each
-responsibility to its implementation, names the executable tests that pin
-it, judges semantic equivalence, and assigns the canonical owner after
-extraction. Behavior is extracted only where semantics are truly
-equivalent and already proven; provider-specific retry/review policy
-never leaks into the common layer.
+This page is an **immutable historical snapshot** anchored to baseline
+`131c76c2966999778ebd80806e34a5d4df6ac8e3`
+(`fix: P0: Eliminate every direct-to-default-branch code mutation path`, #302
+closed 2026-10-09). All line numbers and workflow excerpts below refer to
+that baseline only. They are not maintained against current `main` and must
+not be read as current source locations. On current `main`, locate behavior
+by file and symbol (for example, a named function in
+`continuum-pr-agent-auto-merge.yml`), not by the line numbers recorded here.
+
+This matrix was the mandatory first step of #304. It compared the exact
+`main` CodeRabbit path against the exact `main` PR-Agent path, mapped each
+responsibility to its implementation, named the executable tests that pinned
+it, judged semantic equivalence, and assigned the canonical owner after
+extraction. Behavior was extracted only where semantics were truly
+equivalent and already proven; provider-specific retry/review policy never
+leaks into the common layer.
 
 Conventions:
 

@@ -57,8 +57,20 @@ validation engine.
 
 ## 2. Inspect and pin Continuum
 
-Choose a reviewed revision. A full commit SHA is best for a reproducible test;
-a tag or `main` is acceptable only when you understand that it moves.
+Choose one ref policy for the first run:
+
+- **Reproducible (recommended):** use the same full commit SHA for the
+  installer, the installed callers, and the project-owned `ci.yml`. The
+  caller `uses:` ref and `continuum_ref:` must match.
+- **Deliberately moving:** keep both the caller `uses:` ref and
+  `continuum_ref:` on `main`, and install from `main` as well. This is valid
+  only when you choose it for both references and accept that the workflow
+  and its engine move together. Never mix a pinned caller with an unpinned
+  `continuum_ref:` or the reverse.
+
+The steps below implement the reproducible path. The example `ci.yml` ships
+with the moving `main` references; the rewrite below changes both to the
+selected SHA.
 
 ```sh
 export CONTINUUM_REF="$(git -C "$CONTINUUM_DIR" rev-parse HEAD)"
@@ -106,6 +118,10 @@ PY
 
 The script fails instead of silently skipping a replacement when the example
 `ci.yml` drifts, so CI cannot be left unpinned by an unmatched constant.
+
+For the deliberate moving alternative, set `CONTINUUM_REF=main`, skip the
+`ci.yml` rewrite, and install with that same ref; the checked-in sample
+already contains `uses: ...@main` and `continuum_ref: main`.
 
 You can also create the installer locally from the checkout and pass the ref
 explicitly:

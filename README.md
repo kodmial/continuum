@@ -369,7 +369,7 @@ This section deliberately separates deterministic coverage from live evidence.
 | Route | Honest status |
 | --- | --- |
 | Continuum's own contract suite, `CI`, Contract Gate, and Contract qualification | Live on this repository's pull requests. They check the exact PR HEAD. |
-| Hosted Linux OpenCode/PR-Agent toolchain | Cold/warm restore and a small anonymous-model inference were live-verified. This is not a complete real-consumer coding or review cycle; see [docs/agent-toolchain-cache.md](docs/agent-toolchain-cache.md). |
+| Hosted Linux OpenCode/PR-Agent toolchain | Cold/warm restore and a small anonymous-model inference were live-verified for the historical OpenCode `1.19.3` pin. The current `2.2.6` manifest does not inherit that evidence, and this is not a complete real-consumer coding or review cycle; see [docs/agent-toolchain-cache.md](docs/agent-toolchain-cache.md). |
 | OpenCode issue implementation through an installed `core` set | Implemented and contract-tested. The Quick Start end-to-end walkthrough is **not live-verified for an external consumer in this repository generation**. |
 | CodeRabbit review route | Integrated and tested. No general claim that every review succeeds or approves. |
 | PR-Agent review route | Optional and disabled by default. The canary harness and offline checks exist; a live canary rerun is maintainer opt-in and is not asserted here. See [docs/pr-agent-canary.md](docs/pr-agent-canary.md). |
