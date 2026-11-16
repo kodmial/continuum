@@ -14,6 +14,7 @@ import os
 import shutil
 import signal
 import subprocess
+import sys
 import tempfile
 import time
 import unittest
@@ -1123,12 +1124,55 @@ class WrapperSignalTests(unittest.TestCase):
             "set -u\n"
             'if [[ -n "${FAKE_STDOUT:-}" ]]; then cat "$FAKE_STDOUT"; fi\n'
             'if [[ -n "${FAKE_STDERR:-}" ]]; then cat "$FAKE_STDERR" >&2; fi\n'
+            'if [[ -n "${FAKE_PID:-}" ]]; then printf "%s\\n" "$$" >"$FAKE_PID"; fi\n'
             ': >"$FAKE_READY"\n'
             'if [[ "${FAKE_HOLD:-0}" == "1" ]]; then exec sleep 300; fi\n'
             'exit "${FAKE_EXIT:-0}"\n',
             encoding="utf-8",
         )
         path.chmod(0o755)
+
+    def install_gated_readers(self):
+        """Hold the pipe readers until the producer exits.
+
+        The interruption path is only proven if the events are still buffered
+        in the pipe when the signal is delivered; an ungated reader may already
+        have consumed them, which would let the test pass without draining
+        anything. Gating on the producer's pid makes that deterministic: the
+        readers cannot consume a byte until the handler's stop phase has ended,
+        so the assertions cover the drain that runs before telemetry records
+        the interruption.
+        """
+        producer_pid = self.workdir / "producer.pid"
+        tee = shutil.which("tee")
+        self.assertIsNotNone(tee, "tee is required to run the wrapper")
+        gate = (
+            'while [[ ! -s "${FAKE_PID:-/nonexistent}" ]]; do sleep 0.02; done\n'
+            'producer_pid="$(cat "$FAKE_PID")"\n'
+            'while kill -0 "$producer_pid" 2>/dev/null; do sleep 0.02; done\n'
+            # Settle just past the handler's stop phase. The real drain waits up
+            # to two seconds for the readers, so buffered events still reach the
+            # log; a wrapper that only kills readers loses them here instead of
+            # racing a reader that happened to start early.
+            "sleep 0.2\n"
+        )
+        python_stub = self.bin_dir / "python3"
+        python_stub.write_text(
+            "#!/usr/bin/env bash\n"
+            # Only the event renderer reads a pipe; classify and telemetry run
+            # after the drain and must not be delayed.
+            'if [[ "${2:-}" == "render" ]]; then\n' + gate + "fi\n"
+            'exec "%s" "$@"\n' % sys.executable,
+            encoding="utf-8",
+        )
+        python_stub.chmod(0o755)
+        tee_stub = self.bin_dir / "tee"
+        tee_stub.write_text(
+            "#!/usr/bin/env bash\n" + gate + 'exec "%s" "$@"\n' % tee,
+            encoding="utf-8",
+        )
+        tee_stub.chmod(0o755)
+        return producer_pid
 
     def wrapper_env(self, **extra):
         env = {
@@ -1165,6 +1209,14 @@ class WrapperSignalTests(unittest.TestCase):
             time.sleep(0.05)
         self.fail("fake opencode never reached its held state")
 
+    def wait_for_watcher(self, watcher_pid, timeout=30):
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if watcher_pid.exists() and watcher_pid.read_text(encoding="utf-8"):
+                return
+            time.sleep(0.05)
+        self.fail("fake watcher never started")
+
     def telemetry_records(self):
         if not self.telemetry_dir.exists():
             return []
@@ -1174,8 +1226,12 @@ class WrapperSignalTests(unittest.TestCase):
         ]
 
     def test_run_interruption_drains_buffered_events_before_record(self):
+        producer_pid = self.install_gated_readers()
         proc = self.start_wrapper(
-            "run", FAKE_STDOUT=str(self.events), FAKE_HOLD="1"
+            "run",
+            FAKE_STDOUT=str(self.events),
+            FAKE_HOLD="1",
+            FAKE_PID=str(producer_pid),
         )
         self.wait_for_ready(proc)
         proc.send_signal(signal.SIGTERM)
@@ -1215,6 +1271,7 @@ class WrapperSignalTests(unittest.TestCase):
             FAKE_STDOUT=str(self.events),
             FAKE_STDERR=str(diagnostics),
             FAKE_HOLD="1",
+            FAKE_PID=str(self.install_gated_readers()),
         )
         self.wait_for_ready(proc)
         proc.send_signal(signal.SIGINT)
@@ -1265,7 +1322,19 @@ class WrapperSignalTests(unittest.TestCase):
     def test_watcher_cannot_delay_interruption_record(self):
         watcher = self.script_dir / "src" / "continuum" / "opencode_live_status.py"
         watcher.parent.mkdir(parents=True)
-        watcher.write_text("import time\n\ntime.sleep(600)\n", encoding="utf-8")
+        watcher_pid = self.workdir / "watcher.pid"
+        # A watcher parked in an HTTP call ignores TERM, so bounded cleanup must
+        # escalate to KILL instead of assuming a cooperative exit.
+        watcher.write_text(
+            "import os\n"
+            "import signal\n"
+            "import time\n"
+            "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+            "with open(%r, 'w', encoding='utf-8') as handle:\n"
+            "    handle.write(str(os.getpid()))\n"
+            "time.sleep(600)\n" % str(watcher_pid),
+            encoding="utf-8",
+        )
         proc = self.start_wrapper(
             "run",
             FAKE_STDOUT=str(self.events),
@@ -1274,6 +1343,7 @@ class WrapperSignalTests(unittest.TestCase):
             ISSUE_NUMBER="1",
         )
         self.wait_for_ready(proc)
+        self.wait_for_watcher(watcher_pid)
         started = time.monotonic()
         proc.send_signal(signal.SIGTERM)
         # A second cancellation signal must not pre-empt the record.
@@ -1284,6 +1354,11 @@ class WrapperSignalTests(unittest.TestCase):
 
         self.assertEqual(proc.returncode, 143, stderr)
         self.assertLess(elapsed, 30, "watcher delayed the interruption record")
+        # The watcher had to be escalated, not merely asked to stop.
+        self.assertGreaterEqual(elapsed, 2, "TERM-ignoring watcher was not escalated")
+        pid = int(watcher_pid.read_text(encoding="utf-8"))
+        with self.assertRaises(ProcessLookupError):
+            os.kill(pid, 0)
         records = self.telemetry_records()
         self.assertEqual(len(records), 1, stderr)
         self.assertEqual(
