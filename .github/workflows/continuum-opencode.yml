@@ -2298,7 +2298,11 @@ jobs:
           CONTINUUM_ENGINE_ROOT: ${{ github.workspace }}/.continuum-admission-engine
           RECOVERY_OPERATION_ID: ${{ inputs.recovery_operation_id }}
           RECOVERY_CHECKPOINT_REF: ${{ inputs.recovery_checkpoint_ref }}
-          RECOVERY_CHECKPOINT_SHA: ${{ inputs.recovery_checkpoint_sha }}
+          # The restore step verifies the checkpoint ref tip and records the
+          # exact commit it restored. Forward that verified SHA, not the raw
+          # dispatch input: an omitted input would otherwise fail the explicit
+          # recovery identity and skip implementation after a good restore.
+          RECOVERY_CHECKPOINT_SHA: ${{ steps.recovery_restore.outputs.checkpoint_sha }}
           RECOVERY_GENERATION: ${{ inputs.recovery_generation }}
         with:
           github-token: ${{ github.token }}

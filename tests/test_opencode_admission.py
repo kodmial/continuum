@@ -358,6 +358,46 @@ class DuplicateRunTests(unittest.TestCase):
         self.assertFalse(result["skip"])
         self.assertIn("explicit 429 recovery", result["reason"])
 
+    def test_recovery_identity_needs_the_verified_sha_not_the_dispatch_default(self):
+        # A recovery dispatch may omit recovery_checkpoint_sha; the restore
+        # step then pins the ref tip and records it. Until that verified SHA
+        # reaches admission the identity is incomplete and must fail closed,
+        # so duplicate_guard has to pass the restored output.
+        previous = run(20, "OpenCode issue #234",
+                       created="2026-01-01T10:00:00Z",
+                       updated="2026-01-01T10:05:00Z")
+        current = run(21, "OpenCode issue #234", status="in_progress",
+                      created="2026-01-01T10:02:00Z",
+                      updated="2026-01-01T10:06:00Z")
+        identity = {
+            "operation_id": "opencode-429-issue-issue234",
+            "checkpoint_ref": (
+                "opencode/429-checkpoint-opencode-429-issue-issue234-gen-2"
+            ),
+            "checkpoint_sha": "",
+            "generation": 2,
+        }
+        omitted = admission.duplicate_run_decision(
+            current=current,
+            runs=[previous, current],
+            issue_number=234,
+            workflow_name="OpenCode agent",
+            recovery_identity=identity,
+        )
+        self.assertTrue(omitted["skip"])
+        self.assertIn("malformed", omitted["reason"])
+
+        restored = dict(identity, checkpoint_sha="b" * 40)
+        admitted = admission.duplicate_run_decision(
+            current=current,
+            runs=[previous, current],
+            issue_number=234,
+            workflow_name="OpenCode agent",
+            recovery_identity=restored,
+        )
+        self.assertFalse(admitted["skip"])
+        self.assertIn("explicit 429 recovery", admitted["reason"])
+
     def test_malformed_explicit_recovery_identity_fails_closed(self):
         current = run(21, "OpenCode issue #234", status="in_progress",
                       created="2026-01-01T10:06:00Z")

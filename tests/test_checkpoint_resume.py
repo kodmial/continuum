@@ -757,6 +757,49 @@ class CheckpointResumeTest(unittest.TestCase):
         )
         self.assertIn("recovery_identity: recoveryIdentity,", workflow)
 
+    def test_duplicate_guard_uses_the_verified_restored_checkpoint_sha(self):
+        """An omitted dispatch SHA must still admit the restored recovery.
+
+        The restore step resolves the checkpoint ref tip when the dispatch
+        omits ``recovery_checkpoint_sha`` and records that verified commit as
+        its ``checkpoint_sha`` output. The duplicate guard must forward that
+        output: forwarding the raw, empty dispatch input makes the explicit
+        recovery identity fail closed, so implementation is skipped after a
+        successful restore.
+        """
+        workflow = (
+            ROOT / ".github" / "workflows" / "continuum-opencode.yml"
+        ).read_text(encoding="utf-8")
+        guard_start = workflow.index(
+            "- name: Skip duplicate issue implementation"
+        )
+        guard_end = workflow.index("# workflow_dispatch repair modes", guard_start)
+        guard = workflow[guard_start:guard_end]
+        self.assertIn(
+            "RECOVERY_CHECKPOINT_SHA: "
+            "${{ steps.recovery_restore.outputs.checkpoint_sha }}",
+            guard,
+        )
+        self.assertNotIn(
+            "RECOVERY_CHECKPOINT_SHA: ${{ inputs.recovery_checkpoint_sha }}",
+            guard,
+        )
+        # The documented empty-SHA fallback stays intact: the restore step
+        # still accepts the omitted input and pins the fetched ref tip.
+        restore_start = workflow.index(
+            "- name: Restore 429 recovery checkpoint"
+        )
+        restore_end = workflow.index(
+            "- name: Bind CI repair to the admitted exact HEAD", restore_start
+        )
+        restore = workflow[restore_start:restore_end]
+        self.assertIn(
+            "RECOVERY_CHECKPOINT_SHA: ${{ inputs.recovery_checkpoint_sha }}",
+            restore,
+        )
+        self.assertIn('CHECKPOINT_SHA="$(git rev-parse FETCH_HEAD)"', restore)
+        self.assertIn('echo "checkpoint_sha=$CHECKPOINT_SHA"', restore)
+
 
 if __name__ == "__main__":
     unittest.main()
