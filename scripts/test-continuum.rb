@@ -3799,6 +3799,32 @@ class ContinuumTest < Minitest::Test
                     'observed state must not expire on a fixed 48h horizon'
   end
 
+  # Review 5920627423: `recovery_checkpoint_sha` is optional. When a dispatch
+  # omits it, the restore step pins the fetched ref tip and records that
+  # verified commit. The pre-model duplicate guard must forward the recorded
+  # output; forwarding the raw empty input would fail the explicit recovery
+  # identity and skip implementation after a successful restore.
+  def test_duplicate_guard_forwards_the_restored_checkpoint_sha
+    workflow = yaml(File.join(ROOT, '.github/workflows/continuum-opencode.yml'))
+    steps = workflow.fetch('jobs').fetch('opencode').fetch('steps')
+
+    restore = steps.find { |step| step['id'] == 'recovery_restore' }
+    refute_nil restore, 'the 429 recovery restore step is missing'
+    assert_equal '${{ inputs.recovery_checkpoint_sha }}',
+                 restore.fetch('env').fetch('RECOVERY_CHECKPOINT_SHA'),
+                 'restore must keep accepting the optional dispatch input'
+    assert_includes restore.fetch('run'), 'CHECKPOINT_SHA="$(git rev-parse FETCH_HEAD)"'
+    assert_includes restore.fetch('run'), 'echo "checkpoint_sha=$CHECKPOINT_SHA"'
+
+    guard = steps.find { |step| step['id'] == 'duplicate_guard' }
+    refute_nil guard, 'the duplicate guard step is missing'
+    assert_equal '${{ steps.recovery_restore.outputs.checkpoint_sha }}',
+                 guard.fetch('env').fetch('RECOVERY_CHECKPOINT_SHA'),
+                 'the duplicate guard must forward the verified restored SHA'
+    assert_includes guard.fetch('with').fetch('script'),
+                    'checkpoint_sha: String(process.env.RECOVERY_CHECKPOINT_SHA'
+  end
+
   # ------------------------------------------------- CI-repair correlation
 
   # The correlation step is the only place that turns a queued ci-fix run into

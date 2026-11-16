@@ -257,15 +257,17 @@ class ProductionRestoreTest(unittest.TestCase):
             json.dumps(data, indent=2, sort_keys=True) + "\n", encoding="utf-8"
         )
 
-    def invoke(self):
-        output = self.workdir / "github-output"
+    def invoke(self, checkpoint_sha=None, output_name="github-output"):
+        output = self.workdir / output_name
         env = dict(os.environ)
         env.update(GIT_ENV)
         env.update(
             {
                 "RECOVERY_OPERATION_ID": "opencode-429-issue-issue350",
                 "RECOVERY_CHECKPOINT_REF": self.ref,
-                "RECOVERY_CHECKPOINT_SHA": self.checkpoint_sha,
+                "RECOVERY_CHECKPOINT_SHA": (
+                    self.checkpoint_sha if checkpoint_sha is None else checkpoint_sha
+                ),
                 "RECOVERY_STAGE": "implementation-incomplete",
                 "RECOVERY_GENERATION": "1",
                 "RECOVERY_MODE": "issue",
@@ -290,6 +292,74 @@ class ProductionRestoreTest(unittest.TestCase):
         data = (self.workdir / "github-output").read_text(encoding="utf-8")
         self.assertIn("resumed=true", data)
         self.assertIn(f"checkpoint_sha={self.checkpoint_sha}", data)
+
+    def test_omitted_checkpoint_sha_records_the_tip_for_recovery_admission(self):
+        """An omitted dispatch SHA must still admit the restored checkpoint.
+
+        ``recovery_checkpoint_sha`` is optional: when the dispatch leaves it
+        empty the restore step verifies the ref tip and records that exact
+        commit as its ``checkpoint_sha`` output. The duplicate guard forwards
+        that output, so admission sees a complete identity instead of failing
+        closed on the empty dispatch input.
+        """
+        completed = self.invoke(checkpoint_sha="", output_name="omitted-output")
+        output = completed.stdout + completed.stderr
+        self.assertEqual(completed.returncode, 0, output)
+        data = (self.workdir / "omitted-output").read_text(encoding="utf-8")
+        self.assertIn("resumed=true", data)
+        recorded = ""
+        for line in data.splitlines():
+            if line.startswith("checkpoint_sha="):
+                recorded = line.split("=", 1)[1]
+        self.assertEqual(recorded, self.checkpoint_sha)
+
+        from continuum import opencode_admission as admission
+
+        previous = {
+            "id": 20,
+            "display_title": "OpenCode issue #350",
+            "status": "completed",
+            "conclusion": "success",
+            "created_at": "2026-01-01T10:00:00Z",
+            "updated_at": "2026-01-01T10:05:00Z",
+            "name": "OpenCode agent",
+            "path": ".github/workflows/continuum-opencode.yml",
+        }
+        current = {
+            "id": 21,
+            "display_title": "OpenCode issue #350",
+            "status": "in_progress",
+            "conclusion": None,
+            "created_at": "2026-01-01T10:02:00Z",
+            "updated_at": "2026-01-01T10:06:00Z",
+            "name": "OpenCode agent",
+            "path": ".github/workflows/continuum-opencode.yml",
+        }
+        identity = {
+            "operation_id": "opencode-429-issue-issue350",
+            "checkpoint_ref": self.ref,
+            "checkpoint_sha": recorded,
+            "generation": 1,
+        }
+        admitted = admission.duplicate_run_decision(
+            current=current,
+            runs=[previous, current],
+            issue_number=350,
+            workflow_name="OpenCode agent",
+            recovery_identity=identity,
+        )
+        self.assertFalse(admitted["skip"], admitted["reason"])
+        self.assertIn("explicit 429 recovery", admitted["reason"])
+
+        omitted = admission.duplicate_run_decision(
+            current=current,
+            runs=[previous, current],
+            issue_number=350,
+            workflow_name="OpenCode agent",
+            recovery_identity=dict(identity, checkpoint_sha=""),
+        )
+        self.assertTrue(omitted["skip"])
+        self.assertIn("malformed", omitted["reason"])
 
     def test_production_restore_rejects_tampered_metadata(self):
         run_git(self.repo, "checkout", self.code_sha)
