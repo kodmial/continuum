@@ -1254,6 +1254,34 @@ class WrapperSignalTests(unittest.TestCase):
             list(self.runner_temp.glob("continuum-opencode-run.*")), []
         )
 
+    def test_run_hangup_drains_buffered_events_before_record(self):
+        producer_pid = self.install_gated_readers()
+        proc = self.start_wrapper(
+            "run",
+            FAKE_STDOUT=str(self.events),
+            FAKE_HOLD="1",
+            FAKE_PID=str(producer_pid),
+        )
+        self.wait_for_ready(proc)
+        proc.send_signal(signal.SIGHUP)
+        _stdout, stderr = proc.communicate(timeout=60)
+
+        self.assertEqual(proc.returncode, 129, stderr)
+        records = self.telemetry_records()
+        self.assertEqual(len(records), 1, stderr)
+        attempt = records[0]["attempt"]
+        self.assertEqual(attempt["mode"], "run")
+        self.assertEqual(attempt["exit_code"], 129)
+        self.assertEqual(attempt["classification"], "inconclusive")
+        # HUP shares the drain-first interruption path with TERM and INT.
+        self.assertEqual(records[0]["events"]["step_start"], 1)
+        self.assertEqual(records[0]["events"]["step_finish"], 1)
+        self.assertEqual(records[0]["usage"]["input_tokens"], 12)
+        self.assertIn("SIGHUP", stderr)
+        self.assertEqual(
+            list(self.runner_temp.glob("continuum-opencode-run.*")), []
+        )
+
     def test_github_interruption_drains_buffered_diagnostics_before_record(self):
         diagnostics = self.workdir / "github-err.log"
         diagnostics.write_text(
@@ -1323,16 +1351,22 @@ class WrapperSignalTests(unittest.TestCase):
         watcher = self.script_dir / "src" / "continuum" / "opencode_live_status.py"
         watcher.parent.mkdir(parents=True)
         watcher_pid = self.workdir / "watcher.pid"
-        # A watcher parked in an HTTP call ignores TERM, so bounded cleanup must
-        # escalate to KILL instead of assuming a cooperative exit.
+        watcher_term = self.workdir / "watcher.term"
+        # A watcher parked in an HTTP call records TERM but keeps running, so
+        # bounded cleanup must escalate to KILL instead of assuming a
+        # cooperative exit.
         watcher.write_text(
             "import os\n"
             "import signal\n"
             "import time\n"
-            "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+            "def record(signum, _frame):\n"
+            "    with open(%r, 'w', encoding='utf-8') as handle:\n"
+            "        handle.write(str(signum))\n"
+            "signal.signal(signal.SIGTERM, record)\n"
             "with open(%r, 'w', encoding='utf-8') as handle:\n"
             "    handle.write(str(os.getpid()))\n"
-            "time.sleep(600)\n" % str(watcher_pid),
+            "time.sleep(600)\n"
+            % (str(watcher_term), str(watcher_pid)),
             encoding="utf-8",
         )
         proc = self.start_wrapper(
@@ -1356,6 +1390,11 @@ class WrapperSignalTests(unittest.TestCase):
         self.assertLess(elapsed, 30, "watcher delayed the interruption record")
         # The watcher had to be escalated, not merely asked to stop.
         self.assertGreaterEqual(elapsed, 2, "TERM-ignoring watcher was not escalated")
+        self.assertEqual(
+            watcher_term.read_text(encoding="utf-8"),
+            str(signal.SIGTERM),
+            "watcher was killed before TERM was delivered",
+        )
         pid = int(watcher_pid.read_text(encoding="utf-8"))
         with self.assertRaises(ProcessLookupError):
             os.kill(pid, 0)
