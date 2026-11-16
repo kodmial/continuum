@@ -4720,12 +4720,14 @@ jobs:
               exit 76
             fi
           fi
-          if [[ -n "${UNRESOLVED_ITEMS_JSON:-}" ]]; then
-            if [[ "$(git rev-list --count "${REPAIR_BASE_SHA}"..HEAD)" -gt 0 ]]; then
-              echo "changed=true" >> "$GITHUB_OUTPUT"
-            else
-              echo "changed=false" >> "$GITHUB_OUTPUT"
-            fi
+          # https://github.com/kodmial/continuum/pull/459: the ordinary
+          # review-driven repair path (no unresolved batch payload) publishes
+          # exactly like the batch path. Always report whether this run pushed
+          # a commit so the authenticated publication status is never skipped.
+          if [[ "$(git rev-list --count "${REPAIR_BASE_SHA}"..HEAD)" -gt 0 ]]; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=false" >> "$GITHUB_OUTPUT"
           fi
           echo "base_sha=${REPAIR_BASE_SHA}" >> "$GITHUB_OUTPUT"
           echo "head_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
@@ -5504,6 +5506,35 @@ jobs:
             -f target_url="https://github.com/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
             >/dev/null
           echo "CREATED_REPAIR_STATUS=$head" >> "$GITHUB_OUTPUT"
+
+          # The status alone names a run URL, which a repository owner could
+          # copy onto a manual commit. Upload a receipt scoped to this very run
+          # so canary completion can prove the run, PR, branch, parent, and
+          # pushed commit all belong together.
+          REPAIR_RECEIPT_DIR="${RUNNER_TEMP:-/tmp}/continuum-repair-publication"
+          mkdir -p "$REPAIR_RECEIPT_DIR"
+          jq -n \
+            --arg repo "$GITHUB_REPOSITORY" \
+            --arg run "$GITHUB_RUN_ID" \
+            --arg attempt "$GITHUB_RUN_ATTEMPT" \
+            --arg pr "$PR_NUMBER" \
+            --arg branch "$HEAD_REF" \
+            --arg base "$base" \
+            --arg head "$head" \
+            '{schema_version:1, repo:$repo, run_id:$run, run_attempt:$attempt, pr_number:($pr | tonumber), branch:$branch, base_sha: $base, head_sha: $head}' \
+            > "$REPAIR_RECEIPT_DIR/publication.json"
+
+      - name: Upload authenticated repair publication receipt
+        if: >-
+          success() &&
+          (steps.coderabbit_repair.outputs.changed == 'true' ||
+           steps.resolve_conflict.outputs.changed == 'true' ||
+           steps.ci_fix.outputs.changed == 'true')
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: continuum-repair-publication-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/continuum-repair-publication/publication.json
+          if-no-files-found: error
 
       - name: Re-run the consumer blocking CI workflow for this head
         if: >-

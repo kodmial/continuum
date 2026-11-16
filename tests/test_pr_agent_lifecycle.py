@@ -254,11 +254,13 @@ APPROVED_SCHEDULER_ORIGIN_OPENCODE_SHA256 = (
 # publication receipt immediately after it creates or updates the task PR, and
 # the canary consumes that receipt as completion evidence. Later automation
 # repairs now publish an authenticated commit status binding their exact base,
-# head, and PR, so a manual commit cannot impersonate the bot identity. Keep
-# the scheduler origin digest above for audit and pin the full current
-# artifact; any further drift still fails closed.
+# head, and PR, plus a run-scoped receipt binding that status URL to the repair
+# run and pushed commit, so a manual commit cannot impersonate the bot identity.
+# Ordinary and batch review repairs both attest. Keep the scheduler origin
+# digest above for audit and pin the full current artifact; any further drift
+# still fails closed.
 APPROVED_458_PUBLICATION_OPENCODE_SHA256 = (
-    "f15cf425b825e51dad011b3454abfb3d48a98b826be8f7010a0ae150091ff325"
+    "b51b3d623e09d73d2c00323130bad7e2834faf9244e6d81f572a6b0af5e2d8d5"
 )
 APPROVED_446_CALLER_SHA256 = (
     "b7f3df118bc436526f48443b8f068372204073eb134c98e4a1543d025f314686"

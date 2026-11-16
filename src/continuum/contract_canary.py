@@ -56,8 +56,15 @@ CANARY_PUBLICATION_ARTIFACT_PREFIX = "continuum-task-publication"
 #: Commit-status context a workflow-owned repair sets through the authenticated
 #: API after it pushes a new commit. Git author/committer fields are forgeable;
 #: a status on the exact commit is not part of the commit object a manual
-#: author can spoof.
+#: author can spoof. The status is only accepted together with the run-scoped
+#: receipt the same repair run uploads, so its target URL must identify that
+#: run instead of merely pointing at any Actions run.
 CANARY_REPAIR_STATUS_CONTEXT = "continuum/repair-publication"
+
+#: Artifact name prefix of the run-scoped receipt a repair run uploads after it
+#: pushes a commit. Only the owning run can attach an artifact to itself, so a
+#: manually created status cannot borrow another run's URL as repair evidence.
+CANARY_REPAIR_PUBLICATION_ARTIFACT_PREFIX = "continuum-repair-publication"
 
 #: Exact marker prefix. A body containing this prefix is treated as canary
 #: metadata and must therefore be valid, owned, and single.
@@ -77,6 +84,11 @@ _MARKER_RE = re.compile(
 _SAFE_TOKEN_RE = re.compile(r"\A[A-Za-z0-9._-]{1,120}\Z")
 _IMPLEMENTATION_BRANCH_RE = re.compile(
     r"\Aopencode/issue(?P<issue>\d+)-(?P<run>\d+)\Z"
+)
+_REPAIR_STATUS_TARGET_RE = re.compile(
+    r"\Ahttps://github\.com/"
+    r"(?P<repo>[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)"
+    r"/actions/runs/(?P<run>[1-9][0-9]*)/?\Z"
 )
 #: GitHub auto-close keywords pointing at an issue in this repository. The
 #: lifecycle writes ``Closes #<issue>`` in its implementation PR, so this is the
@@ -1497,11 +1509,64 @@ def _is_authenticated_main_sync_commit(commit: object) -> bool:
     )
 
 
+def repair_status_run_id(
+    status: Mapping[str, Any], expected_repo: str
+) -> Optional[int]:
+    """Return the same-repository run id named by a repair status URL."""
+    target = str(status.get("target_url") or "").strip()
+    match = _REPAIR_STATUS_TARGET_RE.match(target)
+    if match is None:
+        return None
+    if match.group("repo").lower() != str(expected_repo or "").strip().lower():
+        return None
+    return int(match.group("run"))
+
+
+def _repair_publication_matches(
+    publication: object,
+    run_id: int,
+    base_sha: str,
+    head_sha: str,
+    pr_number: Optional[int],
+    expected_repo: str,
+    head_branch: str,
+) -> bool:
+    """Whether a repair receipt belongs to the run, PR, and commit it attests."""
+    if not isinstance(publication, Mapping):
+        return False
+    base = str(base_sha or "").strip().lower()
+    head = str(head_sha or "").strip().lower()
+    if not is_full_sha(base) or not is_full_sha(head):
+        return False
+    if _positive_int(publication.get("schema_version")) != 1:
+        return False
+    if (
+        str(publication.get("repo") or "").strip().lower()
+        != str(expected_repo or "").strip().lower()
+    ):
+        return False
+    if _positive_int(publication.get("run_id")) != run_id:
+        return False
+    expected_pr = _positive_int(pr_number)
+    if expected_pr is None:
+        return False
+    if _positive_int(publication.get("pr_number")) != expected_pr:
+        return False
+    if str(publication.get("base_sha") or "").strip().lower() != base:
+        return False
+    if str(publication.get("head_sha") or "").strip().lower() != head:
+        return False
+    if head_branch and str(publication.get("branch") or "").strip() != head_branch:
+        return False
+    return True
+
+
 def _commit_has_repair_status(
     commit: Mapping[str, Any],
     base_sha: str,
     pr_number: Optional[int],
     expected_repo: str,
+    head_branch: str = "",
 ) -> bool:
     """Whether an authenticated repair workflow attested this exact commit.
 
@@ -1510,7 +1575,10 @@ def _commit_has_repair_status(
     commit can copy the bot name and email but cannot create this status without
     first running the authenticated repair workflow that owns the push. The
     creator must be the repository owner's PAT identity (or the Actions bot),
-    so an unrelated collaborator cannot authorize a manual commit.
+    so an unrelated collaborator cannot authorize a manual commit. The target
+    URL must name this repository's run, and that run's own publication receipt
+    must bind the same run, PR, branch, parent, and pushed commit. A manually
+    created status cannot borrow an unrelated run URL as repair evidence.
     """
     statuses = commit.get("statuses")
     if not isinstance(statuses, Sequence):
@@ -1538,8 +1606,18 @@ def _commit_has_repair_status(
         )
         if login not in trusted_creators:
             continue
-        target = str(status.get("target_url") or "").strip()
-        if "/actions/runs/" not in target:
+        run_id = repair_status_run_id(status, expected_repo)
+        if run_id is None:
+            continue
+        if not _repair_publication_matches(
+            status.get("publication"),
+            run_id,
+            base_sha,
+            sha,
+            pr_number,
+            expected_repo,
+            head_branch,
+        ):
             continue
         return True
     return False
@@ -1551,6 +1629,7 @@ def _validate_publication_continuity(
     commits: Sequence[Mapping[str, Any]],
     pr_number: Optional[int] = None,
     expected_repo: str = CANARY_OWNER_REPO,
+    head_branch: str = "",
 ) -> Optional[str]:
     """Return a failure reason unless authenticated commits connect published to head.
 
@@ -1559,9 +1638,9 @@ def _validate_publication_continuity(
     before merge. Completion may only cross that gap through the PR's own
     commit history. A commit after the published one is trusted only when
     GitHub signed it as a two-parent ``web-flow`` merge, or when the repair
-    workflow published an authenticated status binding its direct parent, this
-    exact commit, and the PR. A plain commit that merely copies the Actions bot
-    identity is not evidence.
+    workflow published an authenticated status whose own run receipt binds its
+    direct parent, this exact commit, the PR, and the branch. A plain commit
+    that merely copies the Actions bot identity is not evidence.
     """
     entries = [
         commit for commit in commits or [] if isinstance(commit, Mapping)
@@ -1601,7 +1680,11 @@ def _validate_publication_continuity(
             previous = commit
             continue
         if _commit_has_repair_status(
-            commit, _commit_sha(previous), pr_number, expected_repo
+            commit,
+            _commit_sha(previous),
+            pr_number,
+            expected_repo,
+            head_branch,
         ):
             previous = commit
             continue
@@ -1633,8 +1716,9 @@ def validate_worker_publication(
     added repair or main-sync commits afterwards. In that case the PR's commit
     history must prove continuity from the published commit to the final head:
     a later commit is accepted only when GitHub signed it as a native main-sync
-    merge, or when the authenticated repair workflow status attests it and its
-    direct parent for this PR. Commit-name spoofing alone never qualifies. The
+    merge, or when the authenticated repair workflow status and that run's own
+    publication receipt attest it, its direct parent, and this PR. Commit-name
+    spoofing alone never qualifies. The
     exact-head CI and contract checks still target the final head. A published
     commit that cannot be connected that way never satisfies the receipt.
     """
@@ -1680,6 +1764,7 @@ def validate_worker_publication(
             pull_request_commits,
             _positive_int(pull_request.get("number")),
             expected_repo,
+            branch,
         )
         if continuity:
             return continuity

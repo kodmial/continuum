@@ -168,6 +168,27 @@ def publication(
     }
 
 
+def repair_publication_receipt(
+    base,
+    head,
+    pr_number=41,
+    run_id=9001,
+    branch="opencode/issue100-9001",
+    repo=canary.CANARY_OWNER_REPO,
+    schema_version=1,
+):
+    return {
+        "schema_version": schema_version,
+        "repo": repo,
+        "run_id": str(run_id),
+        "run_attempt": "1",
+        "pr_number": pr_number,
+        "branch": branch,
+        "base_sha": base,
+        "head_sha": head,
+    }
+
+
 def repair_status(
     base,
     head,
@@ -178,6 +199,7 @@ def repair_status(
     target="https://github.com/{}/actions/runs/9001".format(
         canary.CANARY_OWNER_REPO
     ),
+    publication_payload="default",
 ):
     return {
         "context": context,
@@ -187,6 +209,13 @@ def repair_status(
         ),
         "creator": {"login": creator},
         "target_url": target,
+        "publication": (
+            repair_publication_receipt(
+                base, head, pr_number=pr_number
+            )
+            if publication_payload == "default"
+            else publication_payload
+        ),
     }
 
 
@@ -859,6 +888,61 @@ class CompletionEvidenceTest(unittest.TestCase):
             repair_status(OTHER_HEAD, HEAD, context="some/other-check"),
             repair_status(OTHER_HEAD, HEAD, creator="unrelated-collaborator"),
             repair_status(OTHER_HEAD, HEAD, target=""),
+            repair_status(OTHER_HEAD, HEAD, publication_payload=None),
+            repair_status(
+                OTHER_HEAD,
+                HEAD,
+                publication_payload=repair_publication_receipt(
+                    OTHER_HEAD, HEAD, run_id=9002
+                ),
+            ),
+            repair_status(
+                OTHER_HEAD,
+                HEAD,
+                publication_payload=repair_publication_receipt(
+                    OTHER_HEAD, OTHER_HEAD
+                ),
+            ),
+            repair_status(
+                OTHER_HEAD,
+                HEAD,
+                publication_payload=repair_publication_receipt(
+                    OTHER_HEAD, HEAD, branch="opencode/issue100-7777"
+                ),
+            ),
+            repair_status(
+                OTHER_HEAD,
+                HEAD,
+                publication_payload=repair_publication_receipt(
+                    OTHER_HEAD, HEAD, repo="someone/else"
+                ),
+            ),
+            repair_status(
+                OTHER_HEAD,
+                HEAD,
+                publication_payload=repair_publication_receipt(
+                    OTHER_HEAD, HEAD, schema_version=2
+                ),
+            ),
+            repair_status(
+                OTHER_HEAD,
+                HEAD,
+                target="https://github.com/someone/else/actions/runs/9001",
+            ),
+            repair_status(
+                OTHER_HEAD,
+                HEAD,
+                target="https://example.com/{}/actions/runs/9001".format(
+                    canary.CANARY_OWNER_REPO
+                ),
+            ),
+            repair_status(
+                OTHER_HEAD,
+                HEAD,
+                target="https://github.com/{}/actions/runs/9001?foo".format(
+                    canary.CANARY_OWNER_REPO
+                ),
+            ),
         ]
         for repair in cases:
             with self.subTest(repair=repair):
@@ -2230,6 +2314,55 @@ class WorkflowContractTest(unittest.TestCase):
                 "steps.{}.outputs.head_sha".format(step_id), workflow
             )
         self.assertIn("pr=${PR_NUMBER} base=${base:0:12} head=${head:0:12}", workflow)
+        self.assertIn(
+            "name: Upload authenticated repair publication receipt", workflow
+        )
+        self.assertIn(
+            "continuum-repair-publication-${{ github.run_attempt }}", workflow
+        )
+        self.assertIn("base_sha: $base", workflow)
+        self.assertIn("head_sha: $head", workflow)
+
+    def test_ordinary_coderabbit_repair_always_reports_publication(self):
+        """A review-only repair must attest its pushed commit without a batch."""
+        workflow = yaml.safe_load(
+            (ROOT / ".github/workflows/continuum-opencode.yml").read_text(
+                encoding="utf-8"
+            )
+        )
+        steps = workflow["jobs"]["opencode"]["steps"]
+        script = next(
+            step["run"] for step in steps if step.get("id") == "coderabbit_repair"
+        )
+        self.assertIn(
+            'if [[ "$(git rev-list --count "${REPAIR_BASE_SHA}"..HEAD)" -gt 0 ]]; then',
+            script,
+        )
+        self.assertNotIn(
+            'if [[ -n "${UNRESOLVED_ITEMS_JSON:-}" ]]; then\n'
+            '            if [[ "$(git rev-list --count "${REPAIR_BASE_SHA}"..HEAD)"',
+            script,
+        )
+
+    def test_workflow_binds_repair_status_to_run_receipt(self):
+        """The canary reads the receipt named by each repair status run."""
+        workflow = (
+            ROOT / ".github/workflows/continuum-contract-canary.yml"
+        ).read_text(encoding="utf-8")
+        self.assertEqual(workflow.count("def repair_publication(run_id):"), 2)
+        self.assertEqual(
+            workflow.count("canary.repair_status_run_id(status, repo)"), 2
+        )
+        self.assertEqual(
+            workflow.count("status[\"publication\"] = repair_publication(run_id)"),
+            2,
+        )
+        self.assertEqual(
+            workflow.count(
+                "canary.CANARY_REPAIR_PUBLICATION_ARTIFACT_PREFIX"
+            ),
+            2,
+        )
 
     def test_workflow_fails_closed_on_unreadable_worker_evidence(self):
         """A failed direct read must never fall back to the bounded snapshot.
