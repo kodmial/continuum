@@ -158,14 +158,17 @@ PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=src python3 -m unittest -v \
 # Print the durable checkpoint supersession and repository-provenance
 # regressions by name in the exact-HEAD gate log. CodeRabbit excludes tests/**
 # from review, so the named results are the reviewable evidence that a stale
-# legacy-mirror generation is rejected before the baseline, the current
-# generation still resumes, and a generation-2 durable ref or legacy alias is
-# trusted only when the expected repository publishes the exact pinned SHA.
+# legacy-mirror generation is rejected before the baseline, an explicit
+# recovery dispatch cannot replay a superseded generation, the current
+# generation still resumes, generation-1 legacy continuation is unchanged, and
+# a generation-2 durable ref or legacy alias is trusted only when the expected
+# repository publishes the exact pinned SHA.
 printf '%s\n' \
   'Durable checkpoint supersession and repository-provenance regression evidence:' \
-  'setup: a legacy checkpoint generation is older than, equal to, or newer than the durable refs; the workflow supersession gate sees a stale mirror, the current generation, and an unreadable durable-state read; a generation-2 durable checkpoint has matching or missing repository metadata, with matching, unpublished, mismatched, or wrong-origin refs, and a legacy alias with or without a published durable ref.' \
-  'assertions: a superseded generation fails closed before checkpoint work, the current generation resumes, an unreadable durable-state read fails closed, historical metadata-less generation 2 resumes only through an expected-repository durable ref at the pinned SHA, and missing/unpublished/mismatched/wrong-origin provenance is rejected, including alias fallback without a published durable ref.'
+  'setup: a legacy checkpoint generation is older than, equal to, or newer than the durable refs; the workflow supersession gate sees a stale mirror, the current generation, and an unreadable durable-state read; an explicit recovery identity carries an older generation while durable refs publish a newer one, or durable state is unreadable; a generation-2 durable checkpoint has matching or missing repository metadata, with matching, unpublished, mismatched, or wrong-origin refs, and a legacy alias with or without a published durable ref; generation 1 still resumes its legacy 429 ref.' \
+  'assertions: a superseded generation fails closed before checkpoint work, a superseded explicit recovery identity and an unreadable durable-state read fail closed, the current generation resumes, generation-1 continuation is unchanged, historical metadata-less generation 2 resumes only through an expected-repository durable ref at the pinned SHA, and missing/unpublished/mismatched/wrong-origin provenance is rejected, including alias fallback without a published durable ref.'
 PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=src python3 -m unittest -v \
+  tests.test_checkpoint_resume.CheckpointResumeTest.test_fresh_checkpoint_429_ref_is_resumed \
   tests.test_checkpoint_resume.CheckpointResumeTest.test_superseded_generation_is_rejected_before_checkpoint_work \
   tests.test_checkpoint_resume.CheckpointResumeTest.test_current_durable_generation_is_accepted \
   tests.test_checkpoint_resume.CheckpointResumeTest.test_generation_2_durable_ref_resumes_historical_checkpoint_without_repository \
@@ -176,6 +179,8 @@ PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=src python3 -m unittest -v \
   tests.test_checkpoint_resume.CheckpointResumeTest.test_generation_2_alias_rejects_metadata_without_repository_binding \
   tests.test_checkpoint_resume.CheckpointResumeTest.test_generation_2_alias_rejects_an_unpublished_durable_ref \
   tests.test_checkpoint_resume.CheckpointResumeTest.test_generation_2_alias_rejects_a_durable_ref_at_a_different_sha \
+  tests.test_opencode_admission.DuplicateRunTests.test_superseded_recovery_identity_fails_closed \
+  tests.test_opencode_admission.DuplicateRunTests.test_recovery_identity_requires_durable_generation_state \
   scripts.test_opencode_429_evacuator.LatestDurableGenerationTest.test_reads_the_highest_durable_generation \
   scripts.test_opencode_429_evacuator.LatestDurableGenerationTest.test_unreadable_durable_state_fails_closed \
   scripts.test_opencode_429_evacuator.IssueResumeSupersessionTest.test_stale_mirror_generation_fails_before_resume \

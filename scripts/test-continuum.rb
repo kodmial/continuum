@@ -3965,7 +3965,20 @@ class ContinuumTest < Minitest::Test
     assert_includes source, 'if request.generation > 1:'
     assert_includes source, '_check_durable_repository_binding(repo, request, expected)'
     assert_includes source,
+                    '_check_durable_repository_binding(repo, request, metadata_checkpoint)'
+    assert_includes source, 'if request.generation == 1:'
+    assert_includes source,
+                    'Saved verification evidence is writable and untrusted'
+    assert_includes source,
                     'the durable checkpoint ref does not publish the pinned commit'
+
+    evidence = File.read(File.join(ROOT, 'scripts/validate-continuum.sh'))
+    assert_includes evidence,
+                    'test_generation_2_alias_rejects_an_unpublished_durable_ref'
+    assert_includes evidence,
+                    'test_generation_2_alias_rejects_a_durable_ref_at_a_different_sha'
+    assert_includes evidence,
+                    'test_fresh_checkpoint_429_ref_is_resumed'
   end
 
   # ------------------------------------------------- CI-repair correlation

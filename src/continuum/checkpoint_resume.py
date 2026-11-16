@@ -411,10 +411,12 @@ def _check_checkpoint_ref(
     A workflow-owned legacy mirror may also carry a fully validated
     generation-2+ checkpoint: the immutable commit metadata names the durable
     generation-specific ref for the same operation and issue, names this
-    repository explicitly, and carries saved verification evidence. The
-    expected repository must also publish that exact durable ref at the pinned
-    commit; metadata fields and a local mirror are claims, not provenance. The
-    local mirror must then resolve to that exact pinned commit. The destination
+    repository explicitly, and carries the saved verification evidence the
+    continuation contract requires. That evidence is untrusted input, so its
+    presence is only a requirement, never authentication. The expected
+    repository must also publish that exact durable ref at the pinned commit;
+    metadata fields and a local mirror are claims, not provenance. The local
+    mirror must then resolve to that exact pinned commit. The destination
     checkout's ``origin`` alone is never the repository binding for an alias: a
     copied mirror must not inherit trust from wherever it happens to be
     fetched. This is still an alias, never proof by itself: every other
@@ -497,9 +499,10 @@ def _check_checkpoint_ref(
             "wrong-repository",
             "the checkpoint recovery metadata belongs to a different repository",
         )
-    # Repository-bound recovery metadata is authenticated only from the saved
-    # verification evidence carried by the same immutable commit. A missing
-    # file cannot prove the alias is a real continuation.
+    # Saved verification evidence is writable and untrusted, so its presence
+    # is a required continuation signal, not authentication. Repository
+    # provenance comes from the published durable ref checked above; a missing
+    # file still blocks the alias because the continuation contract requires it.
     if _show_file(repo, request.checkpoint_sha, EVIDENCE_FILE_NAME) is None:
         raise ResumeError(
             "evidence-missing",
