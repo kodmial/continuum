@@ -70,9 +70,10 @@ Choose one ref policy for the first run:
 
 The steps below implement the reproducible path. The example `ci.yml` ships
 with the moving `main` references; the rewrite below changes both to the
-selected SHA. For the deliberately moving alternative, set
-`export CONTINUUM_REF=main` before downloading the installer so the downloaded
-script matches the selected ref.
+selected SHA. For the deliberately moving alternative, **replace** the `export CONTINUUM_REF=...`
+assignment in the next shell block with `export CONTINUUM_REF=main` **before**
+downloading the installer, so the downloaded script matches the selected ref.
+Do not run the pinned assignment and then try to override it from above.
 
 ```sh
 export CONTINUUM_REF="$(git -C "$CONTINUUM_DIR" rev-parse HEAD)"
