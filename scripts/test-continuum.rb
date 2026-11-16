@@ -3799,6 +3799,188 @@ class ContinuumTest < Minitest::Test
                     'observed state must not expire on a fixed 48h horizon'
   end
 
+  # Review 5920627423: `recovery_checkpoint_sha` is optional. When a dispatch
+  # omits it, the restore step pins the fetched ref tip and records that
+  # verified commit. The pre-model duplicate guard must forward the recorded
+  # output; forwarding the raw empty input would fail the explicit recovery
+  # identity and skip implementation after a successful restore.
+  def test_duplicate_guard_forwards_the_restored_checkpoint_sha
+    workflow = yaml(File.join(ROOT, '.github/workflows/continuum-opencode.yml'))
+    steps = workflow.fetch('jobs').fetch('opencode').fetch('steps')
+
+    restore = steps.find { |step| step['id'] == 'recovery_restore' }
+    refute_nil restore, 'the 429 recovery restore step is missing'
+    assert_equal '${{ inputs.recovery_checkpoint_sha }}',
+                 restore.fetch('env').fetch('RECOVERY_CHECKPOINT_SHA'),
+                 'restore must keep accepting the optional dispatch input'
+    assert_includes restore.fetch('run'), 'CHECKPOINT_SHA="$(git rev-parse FETCH_HEAD)"'
+    assert_includes restore.fetch('run'), 'echo "checkpoint_sha=$CHECKPOINT_SHA"'
+
+    guard = steps.find { |step| step['id'] == 'duplicate_guard' }
+    refute_nil guard, 'the duplicate guard step is missing'
+    assert_equal '${{ steps.recovery_restore.outputs.checkpoint_sha }}',
+                 guard.fetch('env').fetch('RECOVERY_CHECKPOINT_SHA'),
+                 'the duplicate guard must forward the verified restored SHA'
+    assert_includes guard.fetch('with').fetch('script'),
+                    'checkpoint_sha: String(process.env.RECOVERY_CHECKPOINT_SHA'
+  end
+
+  # Review 5921692569: recovery admission must compare the dispatch identity
+  # generation with the durable checkpoint refs already published for the
+  # operation, and reject a superseded generation instead of re-running work
+  # from an older checkpoint.
+  def test_duplicate_guard_passes_the_latest_durable_recovery_generation
+    workflow = yaml(File.join(ROOT, '.github/workflows/continuum-opencode.yml'))
+    steps = workflow.fetch('jobs').fetch('opencode').fetch('steps')
+
+    guard = steps.find { |step| step['id'] == 'duplicate_guard' }
+    refute_nil guard, 'the duplicate guard step is missing'
+    script = guard.fetch('with').fetch('script')
+    assert_includes script, 'latestDurableRecoveryGeneration'
+    assert_includes script, 'github.rest.git.listMatchingRefs'
+    assert_includes script, 'listMatchingRefsWithPat'
+    assert_includes script, "'opencode/429-checkpoint-'"
+    assert_includes script, "'opencode/infra-checkpoint-'"
+    assert_includes script, 'latest_recovery_generation: latestRecoveryGeneration'
+  end
+
+  # Review 5921692569: a generation-2 legacy resume on an ordinary issue
+  # dispatch starts with an empty RECOVERY_GENERATION_IN. The validated resume
+  # generation must reach the evacuator in the same step, where the environment
+  # is already fixed, instead of being written to GITHUB_ENV too late.
+  def test_resumed_generation_reaches_the_same_step_evacuator
+    workflow = yaml(File.join(ROOT, '.github/workflows/continuum-opencode.yml'))
+    step = workflow.fetch('jobs').fetch('opencode').fetch('steps')
+                   .find { |entry| entry['name'] == 'Implement issue' }
+    refute_nil step, 'the issue implementation step is missing'
+    run = step.fetch('run')
+    carry = "if [[ \"$RESUME_ACTIVE\" == \"true\" ]]; then\n" \
+            "  RECOVERY_GENERATION_IN=\"$RESUME_GENERATION\"\n" \
+            'fi'
+    assert_includes run, carry
+    evacuation = run.index(
+      'continuum_infra_evacuate "opencode-429-issue-issue${ISSUE_NUMBER}"'
+    )
+    refute_nil evacuation, 'the issue-mode evacuation call is missing'
+    assert run.index(carry) < evacuation,
+           'the resumed generation must be set before the evacuator runs'
+  end
+
+  # Review 5921692569: the generation-2 legacy resume followed by another 429
+  # is an executable regression in scripts/, which CodeRabbit reviews. Keep the
+  # scenario and exact expected outcomes asserted here as well: an ordinary
+  # issue dispatch starts with an empty generation, resumes a generation-2
+  # checkpoint through the workflow's own carry snippet, then hits another 429.
+  # The next checkpoint is generation 3 and the existing generation-1/generation-2
+  # refs are byte-for-byte unchanged.
+  def test_resumed_generation_evacuation_assertions_are_reviewable
+    test = File.read(
+      File.join(ROOT, 'scripts/test_opencode_429_evacuator.py')
+    )
+    klass = test[/^class ProductionEvacuatorTest\b.*?(?=^class |\z)/m]
+    refute_nil klass, 'the production evacuation regression class is missing'
+    regression = test[
+      /^    def test_resumed_generation_evacuates_next_generation_without_overwriting\b.*?(?=^    def |\z)/m
+    ]
+    refute_nil regression, 'the named regression method is missing'
+
+    assert_includes regression,
+                    'test_resumed_generation_evacuates_next_generation_without_overwriting'
+    assert_includes klass,
+                    'self.script.write_text(extracted_evacuator(), encoding="utf-8")'
+    assert_includes test,
+                    'marker = "# kodmial/continuum#460: a resumed checkpoint carries"'
+    assert_includes test, 'return textwrap.dedent(script[start:end])'
+    assert_includes regression, 'prefix=extracted_resume_generation_carry() + "\n",'
+    assert_includes regression, 'generation="",'
+    assert_includes regression, 'resume_active="true",'
+    assert_includes regression, 'resume_generation="2",'
+    assert_includes regression,
+                    'gen1_ref = "opencode/429-checkpoint-opencode-429-issue-issue350-gen-1"'
+    assert_includes regression,
+                    'gen2_ref = "opencode/429-checkpoint-opencode-429-issue-issue350-gen-2"'
+    assert_includes regression,
+                    'gen3_ref = "opencode/429-checkpoint-opencode-429-issue-issue350-gen-3"'
+    assert_includes regression,
+                    'self.assertIn("CONTINUUM_429_CHECKPOINT_REF={}".format(gen3_ref), env)'
+    assert_includes regression,
+                    'self.assertEqual(gen1_sha, refs["refs/heads/" + gen1_ref])'
+    assert_includes regression,
+                    'self.assertEqual(gen2_sha, refs["refs/heads/" + gen2_ref])'
+    assert_includes regression, 'self.assertIn("refs/heads/" + gen3_ref, refs)'
+    assert_includes regression,
+                    'self.assertNotEqual(gen1_sha, refs["refs/heads/" + gen3_ref])'
+    assert_includes regression,
+                    'self.assertNotEqual(gen2_sha, refs["refs/heads/" + gen3_ref])'
+  end
+
+  # Review 5921692569: ordinary issue dispatches have no explicit recovery
+  # identity, so the issue step itself must reject a legacy-mirror generation
+  # that durable checkpoint refs already superseded. The state read is
+  # fail-closed and happens before the verification baseline.
+  def test_issue_resume_rejects_a_superseded_durable_generation
+    workflow = yaml(File.join(ROOT, '.github/workflows/continuum-opencode.yml'))
+    step = workflow.fetch('jobs').fetch('opencode').fetch('steps')
+                   .find { |entry| entry['name'] == 'Implement issue' }
+    refute_nil step, 'the issue implementation step is missing'
+    run = step.fetch('run')
+
+    assert_includes run, 'continuum_latest_durable_generation()'
+    assert_includes run,
+                    'git/matching-refs/heads/${namespace}${operation}?per_page=100'
+    assert_includes run, 'RESUME_GENERATION < RESUME_LATEST_GENERATION'
+    assert_includes run,
+                    '--resume-latest-generation "$RESUME_LATEST_GENERATION"'
+
+    supersession = run.index('RESUME_GENERATION < RESUME_LATEST_GENERATION')
+    baseline = run.index('verification_python baseline')
+    refute_nil supersession, 'the stale-generation check is missing'
+    refute_nil baseline, 'the verification baseline call is missing'
+    assert supersession < baseline,
+           'the stale-generation check must run before checkpoint work continues'
+
+    regression = File.read(
+      File.join(ROOT, 'scripts/test_opencode_429_evacuator.py')
+    )
+    gate = regression[
+      /^class IssueResumeSupersessionTest\b.*?(?=^class |\z)/m
+    ]
+    refute_nil gate, 'the reviewable supersession regression is missing'
+    assert_includes gate, 'def test_stale_mirror_generation_fails_before_resume'
+    assert_includes gate, 'def test_current_generation_resumes'
+    assert_includes gate, 'def test_unreadable_durable_state_fails_closed'
+  end
+
+  # Review 5921692569: a generation-2+ durable checkpoint ref is trusted only
+  # when the expected repository publishes that exact ref/SHA. This is the
+  # equivalent repository binding for historical metadata without a
+  # repository field; a local mirror or unrelated origin cannot supply it.
+  def test_generation_two_durable_refs_require_repository_provenance
+    source = File.read(File.join(ROOT, 'src/continuum/checkpoint_resume.py'))
+
+    assert_includes source, 'def _check_durable_repository_binding'
+    assert_includes source, 'def _origin_repository_matches'
+    assert_includes source,
+                    '"ls-remote", "--exit-code", "origin", "refs/heads/" + durable_ref'
+    assert_includes source, 'if request.generation > 1:'
+    assert_includes source, '_check_durable_repository_binding(repo, request, expected)'
+    assert_includes source,
+                    '_check_durable_repository_binding(repo, request, metadata_checkpoint)'
+    assert_includes source, 'if request.generation == 1:'
+    assert_includes source,
+                    'Saved verification evidence is writable and untrusted'
+    assert_includes source,
+                    'the durable checkpoint ref does not publish the pinned commit'
+
+    evidence = File.read(File.join(ROOT, 'scripts/validate-continuum.sh'))
+    assert_includes evidence,
+                    'test_generation_2_alias_rejects_an_unpublished_durable_ref'
+    assert_includes evidence,
+                    'test_generation_2_alias_rejects_a_durable_ref_at_a_different_sha'
+    assert_includes evidence,
+                    'test_fresh_checkpoint_429_ref_is_resumed'
+  end
+
   # ------------------------------------------------- CI-repair correlation
 
   # The correlation step is the only place that turns a queued ci-fix run into

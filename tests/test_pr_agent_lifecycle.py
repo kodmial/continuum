@@ -256,10 +256,41 @@ APPROVED_SCHEDULER_ORIGIN_OPENCODE_SHA256 = (
 # telemetry artifact upload step (always(), continue-on-error,
 # upload-artifact v4, runner-temp telemetry directory) so per-attempt OpenCode
 # usage survives the runner without making observability failure a task
-# failure. The active pin covers the combined scheduler-origin bytes plus that
-# #454 step; unrelated drift still fails closed.
+# failure. Merging main's #460 generation-2 checkpoint-resume correction keeps
+# both reviewed behaviors in the same artifact, so this active pin covers the
+# combined scheduler-origin, #454 telemetry, and #460 resume bytes; unrelated
+# drift still fails closed.
 APPROVED_454_TELEMETRY_OPENCODE_SHA256 = (
-    "dcad5bdf774a416d40412b1dbd620b6a4a2f2466fd9f949aeb1ce6743c46c75a"
+    "c740682de530c242cc5904d0c53d8a2eed6cbb6900347ea453fbc03de4917249"
+)
+# 2026-11-16: intentional generation-2 checkpoint-resume correction
+# (kodmial/continuum#460). A validated generation-2+ legacy mirror may resume
+# only when its immutable metadata binds the same durable ref/operation/issue
+# and the local mirror resolves to the pinned commit; explicit 429 recovery is
+# also exempt from overlap duplicate fencing after its identity is validated.
+# Retain the scheduler-origin pin above for audit and reject any further drift.
+# Review 5920627423 repair: the pre-model duplicate guard now forwards the
+# restore step's verified checkpoint SHA, so an omitted recovery_checkpoint_sha
+# dispatch input still resumes instead of failing the explicit recovery identity.
+# Review 5921692569 repair: a resumed generation is carried into the same-step
+# 429 evacuation, and admission compares a recovery identity against the
+# durable checkpoint refs so a superseded generation cannot replay work.
+# Review 5921692569 follow-up: ordinary issue resumes also read the highest
+# durable generation after the legacy identity is known and fail closed before
+# the baseline; generation-2+ durable refs must be published by the expected
+# repository at the pinned SHA. The executable resumed-generation regression
+# lives in scripts/test_opencode_429_evacuator.py, which CodeRabbit reviews.
+# Merge with main cfd545c (#462): the optional CONTINUUM_429_LEGACY_REF mirror
+# is read with a default at the initial safety check so the CodeRabbit repair
+# evacuation path cannot crash under `set -u`; this pin covers the combined
+# #460 + #462 bytes, and the executable #462 legacies above run from the same
+# scripts module. The digest is re-pinned after the merge; no other byte changed.
+# Merging main into #455: the #454 telemetry upload step is additive to this
+# reviewed #460 + #462 artifact, so the merged bytes are pinned above by
+# APPROVED_454_TELEMETRY_OPENCODE_SHA256. This digest stays for audit and any
+# further byte drift still fails closed.
+APPROVED_460_RESUME_OPENCODE_SHA256 = (
+    "cf4593df8d89f638986426f3dc48fe62544617c40e3d3bcccfe14113fa07de4e"
 )
 APPROVED_446_CALLER_SHA256 = (
     "b7f3df118bc436526f48443b8f068372204073eb134c98e4a1543d025f314686"
@@ -2683,13 +2714,14 @@ class ProtectedBaselineTests(unittest.TestCase):
                     self.assertIn("steps.model_route.outputs.model", original)
                 if path == ".github/workflows/continuum-opencode.yml":
                     # #454 adds bounded telemetry on top of the deliberate
-                    # scheduler-origin recovery correction and #450's
-                    # chat-ownership change, with full-file digests and
-                    # executable regression tests.
+                    # scheduler-origin recovery correction, #450's
+                    # chat-ownership change, and main's #460 generation-2
+                    # resume repair, with full-file digests and executable
+                    # regression tests.
                     self.assertEqual(
                         protected_file_digest(path),
                         APPROVED_454_TELEMETRY_OPENCODE_SHA256,
-                        f"{path}: unexpected drift outside #454 telemetry on the scheduler-origin #450 serialized CodeRabbit chat owner",
+                        f"{path}: unexpected drift outside #454 telemetry on the scheduler-origin #450 serialized CodeRabbit chat owner and #460 resume repair",
                     )
                 else:
                     # The self-dogfood caller is the dispatchable surface

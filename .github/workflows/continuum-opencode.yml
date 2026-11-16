@@ -2296,6 +2296,14 @@ jobs:
           TAP_PAT: ${{ secrets.TAP_PAT }}
           GITHUB_API_URL: ${{ github.api_url }}
           CONTINUUM_ENGINE_ROOT: ${{ github.workspace }}/.continuum-admission-engine
+          RECOVERY_OPERATION_ID: ${{ inputs.recovery_operation_id }}
+          RECOVERY_CHECKPOINT_REF: ${{ inputs.recovery_checkpoint_ref }}
+          # The restore step verifies the checkpoint ref tip and records the
+          # exact commit it restored. Forward that verified SHA, not the raw
+          # dispatch input: an omitted input would otherwise fail the explicit
+          # recovery identity and skip implementation after a good restore.
+          RECOVERY_CHECKPOINT_SHA: ${{ steps.recovery_restore.outputs.checkpoint_sha }}
+          RECOVERY_GENERATION: ${{ inputs.recovery_generation }}
         with:
           github-token: ${{ github.token }}
           script: |
@@ -2305,6 +2313,13 @@ jobs:
             const repo = context.repo.repo;
             const issueNumber = Number(process.env.ISSUE_NUMBER || 0);
             const tapPat = String(process.env.TAP_PAT || '').trim();
+            const recoveryCheckpointRef = String(process.env.RECOVERY_CHECKPOINT_REF || '').trim();
+            const recoveryIdentity = recoveryCheckpointRef ? {
+              operation_id: String(process.env.RECOVERY_OPERATION_ID || '').trim(),
+              checkpoint_ref: recoveryCheckpointRef,
+              checkpoint_sha: String(process.env.RECOVERY_CHECKPOINT_SHA || '').trim().toLowerCase(),
+              generation: String(process.env.RECOVERY_GENERATION || '').trim(),
+            } : null;
             const apiBase = String(process.env.GITHUB_API_URL || 'https://api.github.com')
               .replace(/\/+$/, '');
             const RUN_HISTORY_LOOKBACK_MS = 24 * 60 * 60 * 1000;
@@ -2377,6 +2392,83 @@ jobs:
               return all;
             }
 
+            async function listMatchingRefsWithPat(ref) {
+              if (!tapPat) throw new Error('TAP_PAT is unavailable for recovery-generation fallback.');
+              const encodedRef = ref.split('/').map(encodeURIComponent).join('/');
+              const response = await fetch(
+                `${apiBase}/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}` +
+                `/git/matching-refs/${encodedRef}?per_page=100`,
+                {
+                  headers: {
+                    accept: 'application/vnd.github+json',
+                    authorization: `Bearer ${tapPat}`,
+                    'x-github-api-version': '2022-11-28',
+                  },
+                }
+              );
+              if (!response.ok) {
+                const details = (await response.text()).slice(0, 500);
+                throw new Error(
+                  `Recovery-generation PAT fallback failed with HTTP ${response.status}` +
+                  (details ? `: ${details}` : '')
+                );
+              }
+              const payload = await response.json();
+              if (!Array.isArray(payload)) {
+                throw new Error('Unexpected recovery-generation response.');
+              }
+              return payload;
+            }
+
+            function checkpointGeneration(refName, operation) {
+              const name = String(refName || '').replace(/^refs\/heads\//, '');
+              for (const namespace of [
+                'opencode/429-checkpoint-',
+                'opencode/infra-checkpoint-',
+              ]) {
+                const prefix = `${namespace}${operation}-gen-`;
+                if (!name.startsWith(prefix)) continue;
+                const generation = name.slice(prefix.length);
+                return /^[0-9]+$/.test(generation) ? Number(generation) : null;
+              }
+              return null;
+            }
+
+            async function latestDurableRecoveryGeneration(operation) {
+              if (!operation) return 0;
+              let latest = 0;
+              for (const namespace of [
+                'opencode/429-checkpoint-',
+                'opencode/infra-checkpoint-',
+              ]) {
+                const ref = `heads/${namespace}${operation}`;
+                let refs;
+                try {
+                  refs = (await github.rest.git.listMatchingRefs({
+                    owner,
+                    repo,
+                    ref,
+                  })).data;
+                } catch (err) {
+                  const status = err ? (err.status ?? err.response?.status) : undefined;
+                  if (![401, 403, 429].includes(status)) throw err;
+                  core.warning(
+                    `Repository-token recovery-generation read failed (${status}); ` +
+                    'retrying with TAP_PAT for supersession.'
+                  );
+                  refs = await listMatchingRefsWithPat(ref);
+                }
+                if (!Array.isArray(refs)) {
+                  throw new Error('Unexpected recovery-generation ref response.');
+                }
+                for (const item of refs) {
+                  const generation = checkpointGeneration(item.ref, operation);
+                  if (generation !== null) latest = Math.max(latest, generation);
+                }
+              }
+              return latest;
+            }
+
             let openPrs;
             try {
               openPrs = await github.paginate(
@@ -2442,6 +2534,16 @@ jobs:
               runs = await listRunsWithPat(createdSince);
             }
 
+            // The recovery identity must not replay a generation that durable
+            // checkpoint refs already superseded. This listing is the
+            // authoritative generation state; a token failure retries with
+            // TAP_PAT, and any unreadable state fails closed below.
+            const latestRecoveryGeneration = recoveryIdentity
+              ? await latestDurableRecoveryGeneration(
+                  String(recoveryIdentity.operation_id || '').trim()
+                )
+              : 0;
+
             const parser = path.join(
               process.env.CONTINUUM_ENGINE_ROOT || '',
               '.github/scripts/opencode_command.py'
@@ -2457,6 +2559,8 @@ jobs:
                     runs,
                     issue_number: issueNumber,
                     workflow_name: context.workflow,
+                    recovery_identity: recoveryIdentity,
+                    latest_recovery_generation: latestRecoveryGeneration,
                   }),
                   encoding: 'utf8',
                   maxBuffer: 16 * 1024 * 1024,
@@ -2753,6 +2857,7 @@ jobs:
           with open(path, "w", encoding="utf-8") as handle:
               json.dump({
                   "schema_version": 1,
+                  "repository": os.environ.get("GITHUB_REPOSITORY", ""),
                   "operation_id": operation,
                   "failure_kind": os.environ.get("CONTINUUM_INFRA_FAILURE_KIND", "quota_429"),
                   "generation": int(gen),
@@ -3265,8 +3370,33 @@ jobs:
           RESUME_CHECKPOINT_SHA=""
           RESUME_OPERATION="opencode-issue-issue${ISSUE_NUMBER}"
           RESUME_GENERATION=1
+          RESUME_LATEST_GENERATION=0
           RESUME_FAILURE_RECORD="${RUNNER_TEMP:-/tmp}/continuum-checkpoint-resume-failure.json"
           rm -f "$RESUME_FAILURE_RECORD"
+
+          # kodmial/continuum#460: an ordinary issue dispatch discovers its
+          # generation from the legacy mirror after admission. Durable
+          # checkpoint refs are the authoritative state, so a stale mirror can
+          # never replay an older generation after a newer one completed.
+          continuum_latest_durable_generation() {
+            local operation="$1" namespace refs ref generation latest=0
+            for namespace in opencode/429-checkpoint- opencode/infra-checkpoint-; do
+              if ! refs="$(gh api --paginate \
+                "repos/$GITHUB_REPOSITORY/git/matching-refs/heads/${namespace}${operation}?per_page=100" \
+                --jq '.[].ref')"; then
+                return 1
+              fi
+              while IFS= read -r ref; do
+                [[ "$ref" == "refs/heads/${namespace}${operation}-gen-"* ]] || continue
+                generation="${ref##*-gen-}"
+                [[ "$generation" =~ ^[0-9]+$ ]] || continue
+                if (( generation > latest )); then
+                  latest="$generation"
+                fi
+              done <<< "$refs"
+            done
+            printf '%s\n' "$latest"
+          }
 
           # kodmial/continuum#290: a fresh-VM 429 resumption already restored
           # the exact checkpoint (see Restore 429 recovery checkpoint). Base
@@ -3285,20 +3415,72 @@ jobs:
             # branch is workflow-owned and is deleted after a PR is published.
             RESUME_ACTIVE=true
             RESUME_CHECKPOINT_REF="$CHECKPOINT_BRANCH"
-            git fetch origin "$CHECKPOINT_BRANCH" --quiet
-            RESUME_CHECKPOINT_SHA="$(git rev-parse FETCH_HEAD)"
+            # Mirror the legacy branch into an exact local ref. A generation-2+
+            # checkpoint may only use this alias when the local mirror resolves
+            # to the same pinned commit as the durable ref in its metadata.
+            git fetch --no-tags origin "+${CHECKPOINT_BRANCH}:refs/heads/${CHECKPOINT_BRANCH}" --quiet
+            RESUME_CHECKPOINT_SHA="$(git rev-parse "refs/heads/${CHECKPOINT_BRANCH}")"
             RESUME_METADATA_JSON="$(git show "${RESUME_CHECKPOINT_SHA}:.continuum-429-recovery.json" 2>/dev/null || true)"
             if [[ -n "$RESUME_METADATA_JSON" ]]; then
               RESUME_METADATA_OPERATION="$(printf '%s' "$RESUME_METADATA_JSON" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("operation_id") or "")' 2>/dev/null || true)"
               RESUME_METADATA_GENERATION="$(printf '%s' "$RESUME_METADATA_JSON" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("generation") or "")' 2>/dev/null || true)"
+              RESUME_METADATA_REF="$(printf '%s' "$RESUME_METADATA_JSON" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("checkpoint_ref") or "")' 2>/dev/null || true)"
               [[ -n "$RESUME_METADATA_OPERATION" ]] && RESUME_OPERATION="$RESUME_METADATA_OPERATION"
               [[ "$RESUME_METADATA_GENERATION" =~ ^[1-9][0-9]*$ ]] && RESUME_GENERATION="$RESUME_METADATA_GENERATION"
+              # Prefer the durable checkpoint ref named by the immutable
+              # metadata over the workflow-owned legacy mirror. The ref must
+              # resolve to the exact pinned commit; otherwise the local mirror
+              # alias is used only after the engine verifies that the expected
+              # repository publishes the durable ref at the same pinned SHA.
+              case "$RESUME_METADATA_REF" in
+                opencode/429-checkpoint-*|opencode/infra-checkpoint-*)
+                  if git fetch --no-tags origin "$RESUME_METADATA_REF" --quiet 2>/dev/null; then
+                    DURABLE_CHECKPOINT_SHA="$(git rev-parse FETCH_HEAD)"
+                    if [[ "${DURABLE_CHECKPOINT_SHA,,}" == "${RESUME_CHECKPOINT_SHA,,}" ]]; then
+                      RESUME_CHECKPOINT_REF="$RESUME_METADATA_REF"
+                      echo "Routing resume through durable checkpoint $RESUME_CHECKPOINT_REF at pinned SHA $RESUME_CHECKPOINT_SHA."
+                    else
+                      echo "::warning::Durable checkpoint $RESUME_METADATA_REF resolves to $DURABLE_CHECKPOINT_SHA, not pinned $RESUME_CHECKPOINT_SHA; using the validated local mirror alias."
+                    fi
+                  fi
+                  ;;
+              esac
             fi
             git switch -c "$BRANCH" "$RESUME_CHECKPOINT_SHA"
             echo "Resuming issue #$ISSUE_NUMBER from interruption checkpoint $CHECKPOINT_BRANCH at $RESUME_CHECKPOINT_SHA."
           else
             git switch --detach "origin/$BASE_REF"
             git switch -c "$BRANCH"
+          fi
+
+          # kodmial/continuum#460: a resumed checkpoint is only current while
+          # no newer durable generation exists for the same operation. The
+          # identity may have come from a stale legacy mirror rather than the
+          # dispatch inputs, so this check runs after the metadata read and
+          # before the verification baseline. An unreadable durable state also
+          # fails closed instead of resuming an unproven generation.
+          if [[ "$RESUME_ACTIVE" == "true" ]]; then
+            if ! RESUME_LATEST_GENERATION="$(continuum_latest_durable_generation "$RESUME_OPERATION")"; then
+              echo "::error::Could not read durable recovery generation state for $RESUME_OPERATION; refusing to resume a checkpoint without supersession proof."
+              exit 1
+            fi
+            if [[ ! "$RESUME_LATEST_GENERATION" =~ ^[0-9]+$ ]]; then
+              echo "::error::Durable recovery generation state for $RESUME_OPERATION is malformed; refusing to resume."
+              exit 1
+            fi
+            if (( RESUME_GENERATION < RESUME_LATEST_GENERATION )); then
+              echo "::error::Checkpoint generation $RESUME_GENERATION for $RESUME_OPERATION is superseded by durable generation $RESUME_LATEST_GENERATION; refusing to replay older saved work."
+              exit 1
+            fi
+          fi
+
+          # kodmial/continuum#460: a resumed checkpoint carries its validated
+          # generation into a later 429 evacuation in this same step. The
+          # evacuator reads the shell variable, and this step's environment is
+          # fixed at start, so a GITHUB_ENV write would arrive too late. Fresh
+          # runs keep the dispatch input unchanged.
+          if [[ "$RESUME_ACTIVE" == "true" ]]; then
+            RECOVERY_GENERATION_IN="$RESUME_GENERATION"
           fi
 
           checkpoint_issue_progress() {
@@ -3391,6 +3573,7 @@ jobs:
               --resume-base-sha "$BASE_START_SHA"
               --resume-snapshot-spec "$SNAPSHOT_SPEC"
               --resume-mode "issue"
+              --resume-latest-generation "$RESUME_LATEST_GENERATION"
               --resume-failure-record "$RESUME_FAILURE_RECORD"
             )
           fi
