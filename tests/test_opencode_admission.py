@@ -333,6 +333,123 @@ class DuplicateRunTests(unittest.TestCase):
                       created="2026-01-01T10:06:00Z")
         self.assertFalse(self.decision(current, [previous, current])["skip"])
 
+    def test_explicit_recovery_identity_supersedes_overlap_fence(self):
+        previous = run(20, "OpenCode issue #234",
+                       created="2026-01-01T10:00:00Z",
+                       updated="2026-01-01T10:05:00Z")
+        current = run(21, "OpenCode issue #234", status="in_progress",
+                      created="2026-01-01T10:02:00Z",
+                      updated="2026-01-01T10:06:00Z")
+        identity = {
+            "operation_id": "opencode-429-issue-issue234",
+            "checkpoint_ref": (
+                "opencode/429-checkpoint-opencode-429-issue-issue234-gen-2"
+            ),
+            "checkpoint_sha": "a" * 40,
+            "generation": 2,
+        }
+        result = admission.duplicate_run_decision(
+            current=current,
+            runs=[previous, current],
+            issue_number=234,
+            workflow_name="OpenCode agent",
+            recovery_identity=identity,
+        )
+        self.assertFalse(result["skip"])
+        self.assertIn("explicit 429 recovery", result["reason"])
+
+    def test_malformed_explicit_recovery_identity_fails_closed(self):
+        current = run(21, "OpenCode issue #234", status="in_progress",
+                      created="2026-01-01T10:06:00Z")
+        for identity in (
+            {
+                "operation_id": "opencode-429-issue-issue234",
+                "checkpoint_ref": (
+                    "opencode/429-checkpoint-opencode-429-issue-issue234-gen-2"
+                ),
+                "checkpoint_sha": "not-a-sha",
+                "generation": 2,
+            },
+            {
+                "operation_id": "opencode-429-issue-issue999",
+                "checkpoint_ref": (
+                    "opencode/429-checkpoint-opencode-429-issue-issue234-gen-2"
+                ),
+                "checkpoint_sha": "a" * 40,
+                "generation": 2,
+            },
+            {
+                "operation_id": "opencode-429-issue-issue234",
+                "checkpoint_ref": (
+                    "opencode/429-checkpoint-opencode-429-issue-issue234-gen-2"
+                ),
+                "checkpoint_sha": "a" * 40,
+                "generation": 3,
+            },
+            {
+                # Internally consistent, but for a different issue: it must
+                # never relax this issue's duplicate fence.
+                "operation_id": "opencode-429-issue-issue999",
+                "checkpoint_ref": (
+                    "opencode/429-checkpoint-opencode-429-issue-issue999-gen-2"
+                ),
+                "checkpoint_sha": "a" * 40,
+                "generation": 2,
+            },
+        ):
+            with self.subTest(identity=identity):
+                result = admission.duplicate_run_decision(
+                    current=current,
+                    runs=[current],
+                    issue_number=234,
+                    workflow_name="OpenCode agent",
+                    recovery_identity=identity,
+                )
+                self.assertTrue(result["skip"])
+                self.assertIn("malformed", result["reason"])
+
+    def test_ordinary_dispatch_keeps_the_overlap_fence(self):
+        previous = run(20, "OpenCode issue #234",
+                       created="2026-01-01T10:00:00Z",
+                       updated="2026-01-01T10:05:00Z")
+        current = run(21, "OpenCode issue #234", status="in_progress",
+                      created="2026-01-01T10:02:00Z",
+                      updated="2026-01-01T10:06:00Z")
+        result = admission.duplicate_run_decision(
+            current=current,
+            runs=[previous, current],
+            issue_number=234,
+            workflow_name="OpenCode agent",
+            recovery_identity=None,
+        )
+        self.assertTrue(result["skip"])
+        self.assertEqual(result["duplicate_run_id"], 20)
+
+    def test_recovery_waits_for_an_earlier_run_that_is_still_active(self):
+        previous = run(20, "OpenCode issue #234", status="in_progress",
+                       created="2026-01-01T10:00:00Z",
+                       updated="2026-01-01T10:05:00Z")
+        current = run(21, "OpenCode issue #234", status="in_progress",
+                      created="2026-01-01T10:02:00Z",
+                      updated="2026-01-01T10:06:00Z")
+        identity = {
+            "operation_id": "opencode-429-issue-issue234",
+            "checkpoint_ref": (
+                "opencode/429-checkpoint-opencode-429-issue-issue234-gen-2"
+            ),
+            "checkpoint_sha": "a" * 40,
+            "generation": 2,
+        }
+        result = admission.duplicate_run_decision(
+            current=current,
+            runs=[previous, current],
+            issue_number=234,
+            workflow_name="OpenCode agent",
+            recovery_identity=identity,
+        )
+        self.assertTrue(result["skip"])
+        self.assertEqual(result["duplicate_run_id"], 20)
+
     def test_other_issue_or_workflow_is_ignored(self):
         current = run(21, "OpenCode issue #234", status="in_progress",
                       created="2026-01-01T10:06:00Z")

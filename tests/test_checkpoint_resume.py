@@ -95,26 +95,31 @@ class CheckpointResumeTest(unittest.TestCase):
     def make_checkpoint(
         self,
         *,
-        operation="opencode-429-issue-issue454",
+        issue=454,
+        operation=None,
         generation=1,
-        checkpoint_ref="opencode/429-checkpoint-opencode-429-issue-issue454-gen-1",
+        checkpoint_ref=None,
         metadata_overrides=None,
         evidence=None,
     ):
+        operation = operation or "opencode-429-issue-issue{}".format(issue)
+        checkpoint_ref = checkpoint_ref or (
+            "opencode/429-checkpoint-{}-gen-{}".format(operation, generation)
+        )
         (self.repo / "app.py").write_text("VALUE = 2\n", encoding="utf-8")
         (self.repo / "canary.py").write_text("CANARY = True\n", encoding="utf-8")
         metadata = {
             "schema_version": 1,
             "mode": "issue",
-            "issue_number": 454,
+            "issue_number": issue,
             "generation": generation,
             "operation_id": operation,
             "stage": "implementation-incomplete",
             "base_ref": "main",
             "base_sha": self.base,
             "head_sha": self.base,
-            "branch": "opencode/issue454-run",
-            "head_ref": "opencode/issue454-run",
+            "branch": "opencode/issue{}-run".format(issue),
+            "head_ref": "opencode/issue{}-run".format(issue),
             "checkpoint_ref": checkpoint_ref,
         }
         metadata.update(metadata_overrides or {})
@@ -142,7 +147,16 @@ class CheckpointResumeTest(unittest.TestCase):
             "mode": "issue",
         }
         values.update(overrides)
+        if "issue" in overrides and "operation" not in overrides:
+            values["operation"] = "opencode-429-issue-issue{}".format(
+                overrides["issue"]
+            )
+        if "issue" in overrides and "checkpoint_ref" not in overrides:
+            values["checkpoint_ref"] = "opencode/checkpoint-issue{}".format(
+                overrides["issue"]
+            )
         return values
+
 
     def assert_rejected(self, reason, request):
         with self.assertRaises(checkpoint_resume.ResumeError) as raised:
@@ -203,6 +217,243 @@ class CheckpointResumeTest(unittest.TestCase):
         self.assertEqual(
             checkpoint, data["resume_provenance"]["checkpoint_sha"]
         )
+
+    def test_generation_2_legacy_mirror_alias_resumes_validated_checkpoint(self):
+        # Exact kodmial/aa#534 regression: the saved generation-2 checkpoint
+        # is mirrored by the workflow-owned opencode/checkpoint-issue534 ref.
+        # Its immutable metadata binds the durable generation-2 ref, the same
+        # operation, issue and repository, and the mirror resolves to the
+        # pinned commit. The alias must resume the saved work instead of
+        # rejecting it as historical generation 1.
+        run_git(
+            self.repo,
+            "remote",
+            "add",
+            "origin",
+            "https://github.com/kodmial/aa.git",
+        )
+        operation = "opencode-429-issue-issue534"
+        durable = "opencode/429-checkpoint-{}-gen-2".format(operation)
+        snapshot = "456f396895a33ec247e65308865c1728aad67e44a473a6f3d2f00b81d2babbb2"
+        checkpoint = self.make_checkpoint(
+            issue=534,
+            operation=operation,
+            generation=2,
+            checkpoint_ref=durable,
+            metadata_overrides={
+                "stage": "implementation-complete",
+            },
+        )
+        run_git(
+            self.repo,
+            "update-ref",
+            "refs/heads/opencode/checkpoint-issue534",
+            checkpoint,
+        )
+        request = self.request(
+            checkpoint,
+            issue=534,
+            generation=2,
+            operation=operation,
+            checkpoint_ref="opencode/checkpoint-issue534",
+            snapshot_spec=snapshot,
+        )
+
+        data, reused = verification.ensure_baseline(
+            self.repo, self.evidence, self.base, self.env, resume=request
+        )
+
+        self.assertFalse(reused)
+        self.assertEqual(self.base, data["baseline"]["base_sha"])
+        self.assertEqual(
+            checkpoint, data["resume_provenance"]["checkpoint_sha"]
+        )
+        self.assertEqual(
+            "opencode/checkpoint-issue534",
+            data["resume_provenance"]["checkpoint_ref"],
+        )
+        self.assertEqual(operation, data["resume_provenance"]["operation"])
+        self.assertTrue(
+            data["resume_provenance"]["legacy_evidence_untrusted"]
+        )
+        self.assertEqual(checkpoint, run_git(self.repo, "rev-parse", "HEAD"))
+        self.assertEqual(
+            "VALUE = 2\n", (self.repo / "app.py").read_text(encoding="utf-8")
+        )
+        self.assertTrue((self.repo / "canary.py").exists())
+
+    def test_generation_2_alias_requires_the_local_mirror(self):
+        operation = "opencode-429-issue-issue534"
+        durable = "opencode/429-checkpoint-{}-gen-2".format(operation)
+        checkpoint = self.make_checkpoint(
+            issue=534,
+            operation=operation,
+            generation=2,
+            checkpoint_ref=durable,
+        )
+        self.assert_rejected(
+            "checkpoint-alias-missing",
+            self.request(
+                checkpoint,
+                issue=534,
+                generation=2,
+                operation=operation,
+                checkpoint_ref="opencode/checkpoint-issue534",
+            ),
+        )
+
+    def test_generation_2_alias_must_resolve_to_the_pinned_commit(self):
+        operation = "opencode-429-issue-issue534"
+        durable = "opencode/429-checkpoint-{}-gen-2".format(operation)
+        checkpoint = self.make_checkpoint(
+            issue=534,
+            operation=operation,
+            generation=2,
+            checkpoint_ref=durable,
+        )
+        run_git(
+            self.repo,
+            "update-ref",
+            "refs/heads/opencode/checkpoint-issue534",
+            self.base,
+        )
+        self.assert_rejected(
+            "checkpoint-alias-mismatch",
+            self.request(
+                checkpoint,
+                issue=534,
+                generation=2,
+                operation=operation,
+                checkpoint_ref="opencode/checkpoint-issue534",
+            ),
+        )
+
+    def test_generation_2_alias_requires_durable_metadata_ref(self):
+        # A generation-2 checkpoint whose metadata still records only the
+        # legacy ref is not proof of a durable generation-2 identity, even
+        # when the local mirror points at the pinned commit.
+        checkpoint = self.make_checkpoint(
+            issue=534,
+            generation=2,
+            checkpoint_ref="opencode/checkpoint-issue534",
+        )
+        run_git(
+            self.repo,
+            "update-ref",
+            "refs/heads/opencode/checkpoint-issue534",
+            checkpoint,
+        )
+        self.assert_rejected(
+            "wrong-ref",
+            self.request(
+                checkpoint,
+                issue=534,
+                generation=2,
+                checkpoint_ref="opencode/checkpoint-issue534",
+            ),
+        )
+
+    def test_generation_2_alias_rejects_a_different_operation(self):
+        operation = "opencode-429-issue-issue534"
+        checkpoint = self.make_checkpoint(
+            issue=534,
+            operation=operation,
+            generation=2,
+            checkpoint_ref="opencode/429-checkpoint-{}-gen-2".format(operation),
+        )
+        run_git(
+            self.repo,
+            "update-ref",
+            "refs/heads/opencode/checkpoint-issue534",
+            checkpoint,
+        )
+        self.assert_rejected(
+            "wrong-operation",
+            self.request(
+                checkpoint,
+                issue=534,
+                generation=2,
+                operation="opencode-429-issue-issue535",
+                checkpoint_ref="opencode/checkpoint-issue534",
+            ),
+        )
+
+    def test_generation_2_alias_rejects_a_different_generation(self):
+        operation = "opencode-429-issue-issue534"
+        checkpoint = self.make_checkpoint(
+            issue=534,
+            operation=operation,
+            generation=2,
+            checkpoint_ref="opencode/429-checkpoint-{}-gen-2".format(operation),
+        )
+        run_git(
+            self.repo,
+            "update-ref",
+            "refs/heads/opencode/checkpoint-issue534",
+            checkpoint,
+        )
+        self.assert_rejected(
+            "wrong-generation",
+            self.request(
+                checkpoint,
+                issue=534,
+                generation=3,
+                operation=operation,
+                checkpoint_ref="opencode/checkpoint-issue534",
+            ),
+        )
+
+    def test_generation_2_alias_rejects_a_different_issue(self):
+        operation = "opencode-429-issue-issue534"
+        checkpoint = self.make_checkpoint(
+            issue=534,
+            operation=operation,
+            generation=2,
+            checkpoint_ref="opencode/429-checkpoint-{}-gen-2".format(operation),
+        )
+        run_git(
+            self.repo,
+            "update-ref",
+            "refs/heads/opencode/checkpoint-issue534",
+            checkpoint,
+        )
+        self.assert_rejected(
+            "wrong-issue",
+            self.request(
+                checkpoint,
+                issue=999,
+                generation=2,
+                operation=operation,
+                checkpoint_ref="opencode/checkpoint-issue534",
+            ),
+        )
+
+    def test_generation_2_alias_rejects_a_different_repository(self):
+        operation = "opencode-429-issue-issue534"
+        checkpoint = self.make_checkpoint(
+            issue=534,
+            operation=operation,
+            generation=2,
+            checkpoint_ref="opencode/429-checkpoint-{}-gen-2".format(operation),
+            metadata_overrides={"repository": "evil/not-aa"},
+        )
+        run_git(
+            self.repo,
+            "update-ref",
+            "refs/heads/opencode/checkpoint-issue534",
+            checkpoint,
+        )
+        self.assert_rejected(
+            "wrong-repository",
+            self.request(
+                checkpoint,
+                issue=534,
+                generation=2,
+                operation=operation,
+                checkpoint_ref="opencode/checkpoint-issue534",
+            ),
+        )
+
 
     def test_checkpoint_at_the_expected_base_still_discards_old_evidence(self):
         # An interrupted run can save a checkpoint whose tip is already the
@@ -307,6 +558,43 @@ class CheckpointResumeTest(unittest.TestCase):
         self.assert_rejected(
             "evidence-base-mismatch", self.request(checkpoint)
         )
+
+    def test_drifted_snapshot_is_rejected(self):
+        checkpoint = self.make_checkpoint(
+            metadata_overrides={"snapshot_spec": "b" * 64}
+        )
+        self.assert_rejected("snapshot-drift", self.request(checkpoint))
+
+    def test_missing_recovery_metadata_is_rejected(self):
+        self.make_checkpoint()
+        run_git(
+            self.repo,
+            "rm",
+            "-q",
+            checkpoint_resume.METADATA_FILE_NAME,
+        )
+        run_git(self.repo, "commit", "-m", "drop recovery metadata")
+        checkpoint = run_git(self.repo, "rev-parse", "HEAD")
+        self.assert_rejected("metadata-missing", self.request(checkpoint))
+
+    def test_malformed_recovery_metadata_is_rejected(self):
+        self.make_checkpoint()
+        (self.repo / checkpoint_resume.METADATA_FILE_NAME).write_text(
+            "{not valid json\n", encoding="utf-8"
+        )
+        run_git(self.repo, "add", "-A")
+        run_git(self.repo, "commit", "-m", "corrupt recovery metadata")
+        checkpoint = run_git(self.repo, "rev-parse", "HEAD")
+        self.assert_rejected("metadata-malformed", self.request(checkpoint))
+
+    def test_invalid_metadata_checkpoint_ref_is_rejected(self):
+        checkpoint = self.make_checkpoint(
+            metadata_overrides={"checkpoint_ref": "opencode/not-a-checkpoint"}
+        )
+        self.assert_rejected(
+            "metadata-checkpoint-ref", self.request(checkpoint)
+        )
+
 
     def test_missing_baseline_ability_is_rejected(self):
         checkpoint = self.make_checkpoint()
@@ -438,6 +726,36 @@ class CheckpointResumeTest(unittest.TestCase):
         self.assertNotIn(
             '--body "$RESUME_MARKER" >/dev/null 2>&1 || true', workflow
         )
+
+    def test_resume_prefers_the_durable_ref_and_mirrors_the_legacy_alias(self):
+        workflow = (
+            ROOT / ".github" / "workflows" / "continuum-opencode.yml"
+        ).read_text(encoding="utf-8")
+        # The legacy branch is mirrored to an exact local ref so a
+        # generation-2+ alias can be proven against its pinned commit.
+        self.assertIn(
+            'git fetch --no-tags origin "+${CHECKPOINT_BRANCH}:refs/heads/${CHECKPOINT_BRANCH}" --quiet',
+            workflow,
+        )
+        self.assertIn(
+            'RESUME_CHECKPOINT_SHA="$(git rev-parse "refs/heads/${CHECKPOINT_BRANCH}")"',
+            workflow,
+        )
+        # Immutable metadata routing is preferred when the durable ref still
+        # resolves to the exact pinned checkpoint commit.
+        self.assertIn("RESUME_METADATA_REF=", workflow)
+        self.assertIn('RESUME_CHECKPOINT_REF="$RESUME_METADATA_REF"', workflow)
+        self.assertIn(
+            'echo "Routing resume through durable checkpoint $RESUME_CHECKPOINT_REF at pinned SHA $RESUME_CHECKPOINT_SHA."',
+            workflow,
+        )
+        # An explicit recovery identity reaches duplicate-run admission so a
+        # recovery created during the dying run is not silently skipped.
+        self.assertIn(
+            "RECOVERY_CHECKPOINT_REF: ${{ inputs.recovery_checkpoint_ref }}",
+            workflow,
+        )
+        self.assertIn("recovery_identity: recoveryIdentity,", workflow)
 
 
 if __name__ == "__main__":

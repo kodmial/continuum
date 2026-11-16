@@ -2296,6 +2296,10 @@ jobs:
           TAP_PAT: ${{ secrets.TAP_PAT }}
           GITHUB_API_URL: ${{ github.api_url }}
           CONTINUUM_ENGINE_ROOT: ${{ github.workspace }}/.continuum-admission-engine
+          RECOVERY_OPERATION_ID: ${{ inputs.recovery_operation_id }}
+          RECOVERY_CHECKPOINT_REF: ${{ inputs.recovery_checkpoint_ref }}
+          RECOVERY_CHECKPOINT_SHA: ${{ inputs.recovery_checkpoint_sha }}
+          RECOVERY_GENERATION: ${{ inputs.recovery_generation }}
         with:
           github-token: ${{ github.token }}
           script: |
@@ -2305,6 +2309,13 @@ jobs:
             const repo = context.repo.repo;
             const issueNumber = Number(process.env.ISSUE_NUMBER || 0);
             const tapPat = String(process.env.TAP_PAT || '').trim();
+            const recoveryCheckpointRef = String(process.env.RECOVERY_CHECKPOINT_REF || '').trim();
+            const recoveryIdentity = recoveryCheckpointRef ? {
+              operation_id: String(process.env.RECOVERY_OPERATION_ID || '').trim(),
+              checkpoint_ref: recoveryCheckpointRef,
+              checkpoint_sha: String(process.env.RECOVERY_CHECKPOINT_SHA || '').trim().toLowerCase(),
+              generation: String(process.env.RECOVERY_GENERATION || '').trim(),
+            } : null;
             const apiBase = String(process.env.GITHUB_API_URL || 'https://api.github.com')
               .replace(/\/+$/, '');
             const RUN_HISTORY_LOOKBACK_MS = 24 * 60 * 60 * 1000;
@@ -2457,6 +2468,7 @@ jobs:
                     runs,
                     issue_number: issueNumber,
                     workflow_name: context.workflow,
+                    recovery_identity: recoveryIdentity,
                   }),
                   encoding: 'utf8',
                   maxBuffer: 16 * 1024 * 1024,
@@ -3277,14 +3289,35 @@ jobs:
             # branch is workflow-owned and is deleted after a PR is published.
             RESUME_ACTIVE=true
             RESUME_CHECKPOINT_REF="$CHECKPOINT_BRANCH"
-            git fetch origin "$CHECKPOINT_BRANCH" --quiet
-            RESUME_CHECKPOINT_SHA="$(git rev-parse FETCH_HEAD)"
+            # Mirror the legacy branch into an exact local ref. A generation-2+
+            # checkpoint may only use this alias when the local mirror resolves
+            # to the same pinned commit as the durable ref in its metadata.
+            git fetch --no-tags origin "+${CHECKPOINT_BRANCH}:refs/heads/${CHECKPOINT_BRANCH}" --quiet
+            RESUME_CHECKPOINT_SHA="$(git rev-parse "refs/heads/${CHECKPOINT_BRANCH}")"
             RESUME_METADATA_JSON="$(git show "${RESUME_CHECKPOINT_SHA}:.continuum-429-recovery.json" 2>/dev/null || true)"
             if [[ -n "$RESUME_METADATA_JSON" ]]; then
               RESUME_METADATA_OPERATION="$(printf '%s' "$RESUME_METADATA_JSON" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("operation_id") or "")' 2>/dev/null || true)"
               RESUME_METADATA_GENERATION="$(printf '%s' "$RESUME_METADATA_JSON" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("generation") or "")' 2>/dev/null || true)"
+              RESUME_METADATA_REF="$(printf '%s' "$RESUME_METADATA_JSON" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("checkpoint_ref") or "")' 2>/dev/null || true)"
               [[ -n "$RESUME_METADATA_OPERATION" ]] && RESUME_OPERATION="$RESUME_METADATA_OPERATION"
               [[ "$RESUME_METADATA_GENERATION" =~ ^[1-9][0-9]*$ ]] && RESUME_GENERATION="$RESUME_METADATA_GENERATION"
+              # Prefer the durable checkpoint ref named by the immutable
+              # metadata over the workflow-owned legacy mirror. The ref must
+              # resolve to the exact pinned commit; otherwise the validated
+              # local mirror alias is used and the engine still proves it.
+              case "$RESUME_METADATA_REF" in
+                opencode/429-checkpoint-*|opencode/infra-checkpoint-*)
+                  if git fetch --no-tags origin "$RESUME_METADATA_REF" --quiet 2>/dev/null; then
+                    DURABLE_CHECKPOINT_SHA="$(git rev-parse FETCH_HEAD)"
+                    if [[ "${DURABLE_CHECKPOINT_SHA,,}" == "${RESUME_CHECKPOINT_SHA,,}" ]]; then
+                      RESUME_CHECKPOINT_REF="$RESUME_METADATA_REF"
+                      echo "Routing resume through durable checkpoint $RESUME_CHECKPOINT_REF at pinned SHA $RESUME_CHECKPOINT_SHA."
+                    else
+                      echo "::warning::Durable checkpoint $RESUME_METADATA_REF resolves to $DURABLE_CHECKPOINT_SHA, not pinned $RESUME_CHECKPOINT_SHA; using the validated local mirror alias."
+                    fi
+                  fi
+                  ;;
+              esac
             fi
             git switch -c "$BRANCH" "$RESUME_CHECKPOINT_SHA"
             echo "Resuming issue #$ISSUE_NUMBER from interruption checkpoint $CHECKPOINT_BRANCH at $RESUME_CHECKPOINT_SHA."

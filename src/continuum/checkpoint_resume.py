@@ -317,15 +317,50 @@ def _check_repository(
         )
 
 
+def _resolve_local_ref(repo: Path | str, ref: str) -> Optional[str]:
+    """Resolve a local mirror ref to its exact commit, or ``None`` when absent.
+
+    Workflow-owned mirrors may live as a local branch or as the fetched
+    remote-tracking branch. Every resolvable spelling must agree before the
+    alias can be trusted, so a stale local branch cannot hide a moved mirror.
+    """
+
+    resolved = set()
+    for candidate in (ref, "refs/heads/" + ref, "refs/remotes/origin/" + ref):
+        completed = _completed(
+            repo, "rev-parse", "--verify", "--quiet", candidate + "^{commit}"
+        )
+        if completed.returncode != 0:
+            continue
+        sha = (completed.stdout or "").strip().lower()
+        if sha:
+            resolved.add(sha)
+    if not resolved:
+        return None
+    if len(resolved) > 1:
+        return ""
+    return resolved.pop()
+
+
 def _check_checkpoint_ref(
-    request: ResumeRequest, metadata_checkpoint: str, operation: str
+    repo: Path | str,
+    request: ResumeRequest,
+    metadata_checkpoint: str,
+    operation: str,
 ) -> None:
     """Validate that the pinned ref names the same durable checkpoint.
 
     The durable 429 ref is the authoritative shape. Legacy interruption
     checkpoints may record the historical ``opencode/checkpoint-issueN`` ref
-    directly, so that shape is accepted for issue generation 1 as well. Any
-    other cross-ref combination is drift and fails closed.
+    directly, so that shape is accepted for issue generation 1 as well.
+
+    A workflow-owned legacy mirror may also carry a fully validated
+    generation-2+ checkpoint: the immutable commit metadata names the durable
+    generation-specific ref for the same operation, issue and repository, and
+    the local mirror must resolve to that exact pinned commit. This is an
+    alias, never proof by itself: every other generation/operation/ancestry
+    check still applies, and a moved or missing mirror fails closed. Any other
+    cross-ref combination is drift.
     """
 
     expected = request.checkpoint_ref
@@ -370,10 +405,26 @@ def _check_checkpoint_ref(
             "wrong-ref",
             "the resumed ref is neither the durable checkpoint nor the issue's legacy checkpoint",
         )
-    if request.generation != 1:
+    if request.generation == 1:
+        return
+    if parsed is None:
         raise ResumeError(
             "wrong-generation",
             "the legacy issue checkpoint only represents generation 1",
+        )
+    # The durable metadata ref above already proved this is the same
+    # generation and operation. The workflow mirror is only an alias for the
+    # pinned commit, so it must resolve locally to that exact immutable SHA.
+    mirror_sha = _resolve_local_ref(repo, expected)
+    if mirror_sha is None:
+        raise ResumeError(
+            "checkpoint-alias-missing",
+            "the legacy issue checkpoint mirror is not present at the pinned commit",
+        )
+    if mirror_sha != request.checkpoint_sha:
+        raise ResumeError(
+            "checkpoint-alias-mismatch",
+            "the legacy issue checkpoint mirror does not resolve to the pinned commit",
         )
 
 
@@ -509,7 +560,7 @@ def _validate_metadata(
         )
 
     metadata_checkpoint = str(metadata.get("checkpoint_ref") or "").strip()
-    _check_checkpoint_ref(request, metadata_checkpoint, operation)
+    _check_checkpoint_ref(repo, request, metadata_checkpoint, operation)
 
     # The original base must be an ancestor of the saved checkpoint.  A
     # current base that has advanced since the checkpoint is allowed, but the

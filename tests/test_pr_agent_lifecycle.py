@@ -247,6 +247,15 @@ APPROVED_450_SERIALIZED_OPENCODE_SHA256 = (
 APPROVED_SCHEDULER_ORIGIN_OPENCODE_SHA256 = (
     "b2bd86557d1050607e958698a75dae6ce234587f8934fac20a302587cb84ba4e"
 )
+# 2026-11-16: intentional generation-2 checkpoint-resume correction
+# (kodmial/continuum#460). A validated generation-2+ legacy mirror may resume
+# only when its immutable metadata binds the same durable ref/operation/issue
+# and the local mirror resolves to the pinned commit; explicit 429 recovery is
+# also exempt from overlap duplicate fencing after its identity is validated.
+# Retain the scheduler-origin pin above for audit and reject any further drift.
+APPROVED_460_RESUME_OPENCODE_SHA256 = (
+    "d2e3a21339a6384528342d136ae828b2aa701f60be62fa2f61591216ec3338ac"
+)
 APPROVED_446_CALLER_SHA256 = (
     "b7f3df118bc436526f48443b8f068372204073eb134c98e4a1543d025f314686"
 )
@@ -2672,8 +2681,8 @@ class ProtectedBaselineTests(unittest.TestCase):
                     # with a full-file digest and executable regression tests.
                     self.assertEqual(
                         protected_file_digest(path),
-                        APPROVED_SCHEDULER_ORIGIN_OPENCODE_SHA256,
-                        f"{path}: unexpected drift outside #450 serialized CodeRabbit chat owner",
+                        APPROVED_460_RESUME_OPENCODE_SHA256,
+                        f"{path}: unexpected drift outside #460 generation-2 resume repair",
                     )
                 else:
                     # The self-dogfood caller is the dispatchable surface
@@ -2758,7 +2767,7 @@ class ProtectedBaselineTests(unittest.TestCase):
         # therefore be dirty in this pre-commit worktree; any unapproved byte
         # change still fails the exact digest assertions above.
         approved = {
-            ".github/workflows/continuum-opencode.yml": APPROVED_450_SERIALIZED_OPENCODE_SHA256,
+            ".github/workflows/continuum-opencode.yml": APPROVED_460_RESUME_OPENCODE_SHA256,
             ".github/workflows/opencode.yml": APPROVED_350_SELF_CALLER_SHA256,
         }
         for path in PROTECTED_FILES:

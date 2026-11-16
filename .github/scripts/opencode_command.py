@@ -168,6 +168,7 @@ def _cmd_duplicate_run_decision(args) -> int:
             runs=payload.get("runs"),
             issue_number=payload.get("issue_number"),
             workflow_name=payload.get("workflow_name", ""),
+            recovery_identity=payload.get("recovery_identity"),
         )
     except ValueError as exc:
         raise RuntimeError(str(exc))

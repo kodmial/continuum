@@ -15,8 +15,10 @@ Standard library only.
 
 from __future__ import annotations
 
+import re
 from datetime import datetime, timezone
 
+from .opencode_429_recovery import parse_checkpoint_ref
 from .opencode_commands import (
     CANCEL,
     IGNORE,
@@ -215,6 +217,37 @@ def _skip(reason, duplicate=None):
     return result
 
 
+def _is_explicit_recovery_identity(identity, issue_number) -> bool:
+    """Whether ``identity`` is a complete, pinned 429 recovery identity.
+
+    The identity must also be scoped to the issue whose duplicate fence it
+    relaxes: a valid checkpoint for another issue is still not proof for this
+    one.
+    """
+
+    if not isinstance(identity, dict):
+        return False
+    operation = str(identity.get("operation_id") or "").strip()
+    checkpoint = str(identity.get("checkpoint_ref") or "").strip()
+    sha = str(identity.get("checkpoint_sha") or "").strip().lower()
+    try:
+        generation = int(identity.get("generation"))
+        issue_token = "issue{}".format(int(issue_number))
+    except (TypeError, ValueError):
+        return False
+    parsed = parse_checkpoint_ref(checkpoint)
+    return bool(
+        operation
+        and checkpoint
+        and generation >= 1
+        and issue_token in operation.split("-")
+        and re.fullmatch(r"[0-9a-f]{40}", sha)
+        and parsed is not None
+        and parsed["operation_id"] == operation
+        and parsed["generation"] == generation
+    )
+
+
 def duplicate_run_decision(
     *,
     current,
@@ -222,6 +255,7 @@ def duplicate_run_decision(
     issue_number,
     workflow_name="",
     legacy_title="",
+    recovery_identity=None,
 ):
     """Whether ``current`` is a queued duplicate of an earlier same-issue run.
 
@@ -229,6 +263,13 @@ def duplicate_run_decision(
     while an earlier same-issue run was still active is stale even if it
     starts after that earlier run completes. A run created after the earlier
     run completed is a legitimate recovery or a new owner command.
+
+    An explicit 429 recovery dispatch carries the durable operation,
+    generation, checkpoint ref and exact checkpoint SHA admitted by the
+    watchdog. That pinned continuation is not a duplicate of the run it
+    replaces, so overlap fencing yields only when the identity is complete and
+    internally consistent; a malformed recovery identity still fails closed.
+    An ordinary dispatch without that identity keeps the full duplicate fence.
 
     ``legacy_title`` is accepted for caller compatibility but ignored: an
     issue title is not an identity, so two different issues with the same
@@ -250,6 +291,13 @@ def duplicate_run_decision(
     current_created = _parse_timestamp(current.get("created_at"))
     if current_order is None or current_created is None:
         return _skip("current run identity is unavailable; refusing to start")
+
+    if recovery_identity is not None:
+        if not _is_explicit_recovery_identity(recovery_identity, issue_number):
+            return _skip("explicit recovery identity is malformed; refusing to start")
+        recovery_override = True
+    else:
+        recovery_override = False
 
     current_id = current_order[1]
     for run in runs:
@@ -285,9 +333,16 @@ def duplicate_run_decision(
                 duplicate=run,
             )
         if order < current_order and updated > current_created:
+            if recovery_override:
+                continue
             return _skip(
                 "run was queued while the previous same-issue run was active",
                 duplicate=run,
             )
 
+    if recovery_override:
+        return {
+            "skip": False,
+            "reason": "explicit 429 recovery identity supersedes overlap fencing",
+        }
     return {"skip": False, "reason": "no earlier active or overlapping same-issue run"}
