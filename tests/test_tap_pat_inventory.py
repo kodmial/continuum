@@ -109,8 +109,9 @@ class CoverageTests(unittest.TestCase):
         # creates the labelled task through the same fan-out actor the
         # scheduler observes.
         # Authenticated repair-publication statuses add one same-repo PAT
-        # binding beside the repair push it attests.
-        self.assertEqual(len(bindings), 129)
+        # binding beside the repair push it attests, plus one recovery binding
+        # that re-publishes the same attestation after a transient API failure.
+        self.assertEqual(len(bindings), 130)
         gaps = inventory.coverage_gaps(WORKFLOWS_DIR)
         self.assertEqual(gaps, [], f"uninventoried TAP_PAT bindings: {gaps}")
 

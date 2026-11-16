@@ -355,6 +355,14 @@ ENTRIES = (
     },
     {
         "workflow": "continuum-opencode.yml",
+        "step": "Recover authenticated repair publication status",
+        "capability": PUSH_FANOUT,
+        "same_repo": True,
+        "reason": "Recovery re-publishes the same authenticated status for the already pushed repair commit, so a transient status API failure cannot leave the canary continuity evidence permanently absent; the job grants no statuses:write, so the classic PAT supplies the same-repo status scope.",
+        "evidence": ("GH_TOKEN: ${{ secrets.TAP_PAT }}",),
+    },
+    {
+        "workflow": "continuum-opencode.yml",
         "step": "Re-run the consumer blocking CI workflow for this head",
         "capability": DISPATCH,
         "same_repo": True,

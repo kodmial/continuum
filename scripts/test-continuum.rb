@@ -7508,7 +7508,7 @@ class ContinuumTest < Minitest::Test
 
   def test_coderabbit_fix_survives_concurrent_pr_head_advance
     body = workflow_body('continuum-opencode.yml')
-    step = body[/^\s+- name: Fix CodeRabbit review findings\n(.*?)(?=^\s+- name: Ask CodeRabbit to verify every original finding)/m, 1]
+    step = body[/^\s+- name: Fix CodeRabbit review findings\n(.*?)(?=^\s+- name: Resolve merge conflict with main)/m, 1]
     refute_nil step, 'CodeRabbit fix step is missing'
 
     assert_includes step, 'REPAIR_BASE_SHA="$(git rev-parse HEAD)"'
@@ -7525,7 +7525,7 @@ class ContinuumTest < Minitest::Test
 
   def test_coderabbit_fix_verification_uses_published_branch_ref
     body = workflow_body('continuum-opencode.yml')
-    step = body[/^\s+- name: Ask CodeRabbit to verify every original finding\n(.*?)(?=^\s+- name: Resolve merge conflict with main)/m, 1]
+    step = body[/^\s+- name: Ask CodeRabbit to verify every original finding\n(.*?)(?=^\s+- name: Re-run the consumer blocking CI workflow for this head)/m, 1]
     refute_nil step, 'CodeRabbit verification step is missing'
 
     assert_includes step, 'github.rest.git.getRef({'

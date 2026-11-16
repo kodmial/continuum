@@ -2323,6 +2323,87 @@ class WorkflowContractTest(unittest.TestCase):
         self.assertIn("base_sha: $base", workflow)
         self.assertIn("head_sha: $head", workflow)
 
+    def test_repair_publication_survives_a_failed_verification_handoff(self):
+        """A pushed repair is attested before CodeRabbit verification runs.
+
+        The verification handoff can fail after the repair commit is already
+        pushed. Publication therefore runs first and must not depend on
+        ``success()``, while a status or receipt failure is retried by
+        dedicated recovery steps instead of leaving the pushed commit
+        unattested and blocking canary completion or replacement.
+        """
+        workflow = (
+            ROOT / ".github/workflows/continuum-opencode.yml"
+        ).read_text(encoding="utf-8")
+        prepare = workflow.index(
+            "      - name: Prepare authenticated repair publication receipt"
+        )
+        receipt = workflow.index(
+            "      - name: Upload authenticated repair publication receipt"
+        )
+        status = workflow.index(
+            "      - name: Record authenticated repair publication"
+        )
+        handoff = workflow.index(
+            "      - name: Ask CodeRabbit to verify every original finding"
+        )
+        self.assertLess(prepare, receipt)
+        self.assertLess(receipt, status)
+        self.assertLess(
+            status,
+            handoff,
+            "a failed handoff must never precede repair publication",
+        )
+        publication = workflow[prepare:handoff]
+        self.assertNotIn(
+            "success() &&",
+            publication,
+            "publication must still run when an earlier step failed",
+        )
+        self.assertEqual(publication.count("!cancelled() &&"), 5)
+        self.assertEqual(
+            publication.count("continue-on-error: true"),
+            2,
+            "a failed attestation must reach recovery instead of failing first",
+        )
+        self.assertEqual(
+            publication.count("== 'failure'"),
+            2,
+            "recovery must target exactly the failed attestation step",
+        )
+        self.assertIn(
+            "      - name: Recover authenticated repair publication status",
+            publication,
+        )
+        self.assertIn(
+            "      - name: Recover authenticated repair publication receipt",
+            publication,
+        )
+        self.assertIn("CONTINUUM_REPAIR_PUBLICATION_RETRY_REQUIRED", publication)
+        self.assertIn("for attempt in 1 2 3; do", publication)
+        recovered_name = (
+            "continuum-repair-publication-"
+            "${{ github.run_attempt }}-recovery"
+        )
+        self.assertIn("name: " + recovered_name, publication)
+        # The recovery artifact keeps the prefix the canary uses to find a
+        # repair run's own receipt, so recovered evidence is consumable.
+        self.assertTrue(
+            recovered_name.startswith(
+                canary.CANARY_REPAIR_PUBLICATION_ARTIFACT_PREFIX
+            )
+        )
+        handoff_step = workflow[
+            handoff:workflow.index(
+                "      - name: Re-run the consumer blocking CI workflow for this head"
+            )
+        ]
+        self.assertNotIn(
+            "always()",
+            handoff_step,
+            "verification must stay fail-closed when publication failed",
+        )
+
     def test_ordinary_coderabbit_repair_always_reports_publication(self):
         """A review-only repair must attest its pushed commit without a batch."""
         workflow = yaml.safe_load(
