@@ -148,7 +148,8 @@ jobs:
     # explicit `periodic_wake=true` signal (or the 17,47 cron slot) may spend
     # the cross-repository TAP_PAT on the global watchdog.
     if: >-
-      (github.event_name == 'schedule' && github.event.schedule == '17,47 * * * *') ||
+      github.event_name == 'push' ||
+      github.event_name == 'schedule' ||
       (github.event_name == 'workflow_dispatch' && inputs.periodic_wake == 'true')
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -164,6 +165,12 @@ jobs:
           persist-credentials: false
 
       - name: Wake repository-local reconcilers
+        # Keep the existing cross-repository wake cadence unchanged: only
+        # explicit periodic signals and its 17,47 cron may spend TAP_PAT on
+        # consumer discovery. Extra owner-main wakes below are local only.
+        if: >-
+          (github.event_name == 'schedule' && github.event.schedule == '17,47 * * * *') ||
+          (github.event_name == 'workflow_dispatch' && inputs.periodic_wake == 'true')
         uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
         env:
           TAP_PAT: ${{ secrets.TAP_PAT }}
@@ -260,3 +267,16 @@ jobs:
               // repository-identifying detail ever reaches this message.
               core.setFailed(error instanceof Error ? error.message : String(error));
             }
+
+      - name: Reconcile accepted-but-jobless CI repair on Continuum
+        # The existing quarter-hour scheduler wake is also the owner-only
+        # safety net for exact-run CI repair liveness. Never dispatch a new
+        # attempt, and never cancel a run with an actual job.
+        if: >-
+          github.repository == 'kodmial/continuum' &&
+          (github.event_name == 'push' || github.event_name == 'schedule' ||
+           (github.event_name == 'workflow_dispatch' && inputs.periodic_wake == 'true'))
+        env:
+          GH_TOKEN: ${{ secrets.TAP_PAT }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+        run: python3 -B .github/scripts/ci_repair_liveness.py
