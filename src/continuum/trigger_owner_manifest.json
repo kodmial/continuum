@@ -1260,16 +1260,27 @@
         },
         {
           "event": "pull_request"
+        },
+        {
+          "event": "schedule",
+          "crons": [
+            "8,23,38,53 * * * *"
+          ]
         }
       ],
       "jobs": [
         "validate",
-        "toolchain_cache_qualification"
+        "toolchain_cache_qualification",
+        "ci_repair_liveness"
       ],
       "owners": [
-        "validation"
+        "validation",
+        "ci-repair"
       ],
-      "event_payload_dependent": true
+      "event_payload_dependent": true,
+      "job_owners": {
+        "ci_repair_liveness": "ci-repair"
+      }
     },
     {
       "path": ".github/workflows/add-review-label.yml",
