@@ -33,8 +33,14 @@ class TestJoblessLiveness(unittest.TestCase):
     def test_real_stuck_case_requests_cancel_not_duplicate_dispatch(self):
         self.assertEqual(self.classify(run()), "cancel")
 
-    def test_queued_young_run_waits(self):
+    def test_queued_young_and_old_runs_preserve_scheduler_position(self):
         self.assertEqual(self.classify(run(status="queued", created_at=NOW.strftime("%Y-%m-%dT%H:%M:%SZ"))), "wait")
+        # A queued/pending job may legitimately be delayed by GitHub Actions.
+        # Elapsed time alone must never cancel it or lose its queue position.
+        self.assertEqual(self.classify(run(status="queued")), "wait")
+        self.assertEqual(self.classify(run(status="pending")), "wait")
+        self.assertEqual(self.classify(run(status="waiting")), "wait")
+        self.assertEqual(self.classify(run(status="requested")), "wait")
 
     def test_running_with_a_job_cannot_be_cancelled(self):
         self.assertEqual(self.classify(run(), {"total_count": 1, "jobs": [{"id": 23}]}), "work")
