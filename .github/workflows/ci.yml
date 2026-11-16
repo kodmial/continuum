@@ -4,6 +4,10 @@ on:
   push:
     branches: [main]
   pull_request:
+  # Existing repository-owned CI also owns bounded liveness maintenance.
+  # No new reusable workflow, caller, or workflow admission surface is added.
+  schedule:
+    - cron: "8,23,38,53 * * * *"
 
 permissions:
   # continuum-validation's validate job declares actions: write for its
@@ -18,6 +22,7 @@ permissions:
 
 jobs:
   validate:
+    if: github.event_name != 'schedule'
     uses: ./.github/workflows/continuum-validation.yml
     secrets: inherit
     with:
@@ -49,3 +54,28 @@ jobs:
           pr-agent --version
           echo "verified_cache_hit=${{ steps.toolchain.outputs.cache-hit }}"
           echo "opencode_version=${{ steps.toolchain.outputs.runtime-version }}"
+
+  ci_repair_liveness:
+    # Maintain only Continuum's own previously accepted CI-repair runs. Never
+    # dispatch a second correlation/attempt; retry the SAME run only after
+    # terminal cancellation with no actual jobs.
+    if: >-
+      github.repository == 'kodmial/continuum' &&
+      (github.event_name == 'push' || github.event_name == 'schedule')
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      actions: write
+      contents: read
+      issues: write
+      pull-requests: read
+    steps:
+      - name: Checkout current main without stored credentials
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Verify GitHub jobs before any jobless CI repair recovery
+        env:
+          GH_TOKEN: ${{ secrets.TAP_PAT || github.token }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+        run: python3 -B .github/scripts/ci_repair_liveness.py
