@@ -232,12 +232,12 @@ immutable digest; it never repairs a mutable runner.
 | Profile | Image kind | Compute | Qualification |
 | --- | --- | --- | --- |
 | Linux | golden image | fresh instance per job, zero idle | deterministic + live Linux job |
-| macOS | VM template/snapshot | fresh instance per job, zero idle | NanoDictate macOS fixture |
+| macOS | VM template/snapshot | fresh instance per job, zero idle | consumer-owned macOS/Swift fixture |
 | Windows | prepared image | fresh instance per job, zero idle | deterministic contract qualification |
 
 Unsupported platforms are never advertised (`canonical_manifest` fails
-closed). NanoDictate remains the mandatory macOS + Swift/OpenCode
-qualification fixture; no consumer name is hard-coded into generic logic.
+closed). A macOS + Swift/OpenCode qualification fixture remains mandatory for that
+profile; no consumer name is hard-coded into generic logic.
 
 ## Security
 
@@ -255,7 +255,7 @@ models and never requires, reads, or forwards a paid provider key.
 ## Live qualification
 
 `live_qualification_evidence` proves the architecture with real controller
-jobs for Linux and the NanoDictate macOS fixture: start at zero live
+jobs for Linux and a consumer-owned macOS/Swift fixture: start at zero live
 instances, queue a real job, record profile + image digest, prove a new
 provider instance was created after demand, prove OpenCode/PR-Agent was
 already present (validated image identity before task execution), prove no

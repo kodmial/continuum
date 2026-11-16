@@ -81,8 +81,8 @@ the same change. Keep workflow `name:` values stable: controllers and
 ## Verification
 
 There is no Swift package here. Do not run `swift build`, `swift test`, or
-`swift run` in this repository; those commands apply to a NanoDictate checkout,
-not to Continuum.
+`swift run` in this repository; use the Python, Ruby, Bash, and workflow
+checks below.
 
 Run the checks that match your change from the repository root:
 
@@ -105,13 +105,6 @@ Use `actionlint` 1.7.12 or newer. New or changed behavior requires focused
 automated tests; never weaken or delete an existing test or coverage check to make
 validation pass. If a required check cannot run here, report the exact limitation
 instead of substituting an unrelated check or claiming success.
-
-## Release machinery
-
-`release-please-config.json`, `.release-please-manifest.json`, and
-`scripts/release-policy.sh` describe the NanoDictate release contract that the
-release workflows enforce inside a consumer repository. Do not hand-edit versions
-or these files outside a task that explicitly concerns release automation.
 
 ## Git lifecycle
 
