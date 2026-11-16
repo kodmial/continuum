@@ -3,7 +3,10 @@
 This page documents the repeatable live canary for Continuum's
 OpenCode-backed PR-Agent. It exercises the real enabled GitHub path from a
 disposable PR without enabling PR-Agent globally and without changing
-CodeRabbit; it does not assert that a live run has already happened.
+CodeRabbit; it does not assert that a live run has already happened. Run it
+only in a disposable consumer repository: the provider setting is
+repository-wide, so `CONTINUUM_REVIEW_PROVIDER=pr-agent` selects PR-Agent for
+that entire repository, not only for the disposable PR.
 
 ## Guarantees
 
@@ -21,9 +24,14 @@ CodeRabbit; it does not assert that a live run has already happened.
 * Reviewer-only. The bridge pins the read-only `plan` agent; the harness
   fails the run when `git status --porcelain` is non-empty or `HEAD`
   moves under the reviewer.
-* No paid provider. The canary refuses paid-provider secrets
-  (`OPENCODE_API_KEY`, `ANTHROPIC_API_KEY`, `GROQ_API_KEY`) and named
-  paid-provider references. It does not hard-code a model: the deployed
+* No paid provider. The canary refuses the repository variables
+  `OPENCODE_API_KEY`, `ANTHROPIC_API_KEY`, and `GROQ_API_KEY`, and it refuses
+  named paid-provider references in the explicit `opencode_model` dispatch
+  input, the legacy `OPENCODE_MODEL` repository variable, and the request
+  model. It does not read GitHub secrets with those names, so a secret alone
+  does not trigger the refusal; audit secrets separately. Entries in the
+  trusted `OPENCODE_MODELS` pool are not screened for paid providers;
+  configure only free routes there. It does not hard-code a model: the deployed
   `model-route` step resolves the trusted `OPENCODE_MODELS` pool, the legacy
   `OPENCODE_MODEL` single-route fallback when no pool is configured, or an
   explicit `opencode_model` dispatch input that must be an allowed pool route.
@@ -62,8 +70,10 @@ Prerequisites in that consumer repository:
 * the core callers are installed and the installed canary caller is on the
   selected ref;
 * `TAP_PAT` is configured;
-* `CONTINUUM_REVIEW_PROVIDER=pr-agent`, so the installed PR-Agent router and
-  recovery callers handle the `/review` commands;
+* `CONTINUUM_REVIEW_PROVIDER=pr-agent`, a repository variable that selects
+  PR-Agent for the whole consumer repository, not only the disposable PR, so
+  the installed PR-Agent router and recovery callers handle the `/review`
+  commands;
 * a working project-owned `CI` workflow runs on the disposable PR, because
   the review path admits an exact CI-qualified HEAD;
 * `OPENCODE_MODELS` (preferred) or the legacy `OPENCODE_MODEL` contains a
@@ -87,9 +97,12 @@ manual dispatch with `canary_enabled=true` creates the disposable PR, posts
 the real `/review` and `/verify <finding-id>` commands as the owner, waits for
 the real event-driven `continuum-pr-agent.yml` runs, proves blocking finding
 -> correction -> `RESOLVED` -> clean-HEAD `APPROVED`, uploads the
-`pr-agent-canary-evidence.json` bundle, then closes the PR and deletes the
-branch in a `finally` block even when a gate fails. CodeRabbit is never
-referenced or changed.
+`pr-agent-canary-evidence.json` bundle, then attempts to close the PR and
+delete the branch in a `finally` block even when a gate fails. The evidence
+bundle's cleanup claim is written before those attempts, and cleanup errors
+are only warnings, so after every run verify that the disposable PR is closed
+and its branch is deleted, and manually remove either resource if it remains.
+CodeRabbit is never referenced or changed.
 
 ## Live rerun (maintainer, disposable only)
 
@@ -105,6 +118,8 @@ referenced or changed.
      evidence, including the `pr-agent-canary-<run-id>` artifact and the
      evidence comment. The workflow already posts the review and verification
      commands, closes the PR, and deletes the branch; do not repeat steps 3-8.
+     Cleanup failures are warnings, so verify that the PR and branch were
+     actually removed and remove either resource if it remains.
    * **Manual:** create a disposable branch/PR from the consumer `main` SHA
      recorded above, containing only a known blocking defect (for example
      `canary/blocking-fixture.py` with an unguarded `None` dereference and an

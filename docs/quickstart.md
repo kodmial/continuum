@@ -128,15 +128,19 @@ pinned checkout, re-download it after setting `CONTINUUM_REF=main` so the
 installer matches the selected ref; the checked-in sample already contains
 `uses: ...@main` and `continuum_ref: main`.
 
-You can also create the installer locally from the checkout and pass the ref
-explicitly:
+Alternatively, you can run the installer from the checkout only when that
+checkout is itself at the selected revision; the installer, not just the
+templates it fetches, must match the selected ref. Confirm they match and
+then run:
 
 ```sh
+test "$(git -C "$CONTINUUM_DIR" rev-parse HEAD)" = "$CONTINUUM_REF"
 bash "$CONTINUUM_DIR/install.sh" . "$CONTINUUM_REF" core
 ```
 
-Use the downloaded `../continuum-install.sh` instead if you are not working from
-a trusted local checkout.
+Setting `CONTINUUM_REF` alone does not update an existing installer. If the
+checkout is not at the selected revision, use the downloaded
+`../continuum-install.sh` workflow above instead.
 
 ## 3. Install the core callers
 
