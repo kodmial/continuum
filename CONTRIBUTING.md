@@ -57,8 +57,7 @@ Install only what your change needs:
 - `curl` and network access for `scripts/validate-continuum.sh`, which downloads
   actionlint 1.7.12 into `.opencode-tmp/` when it is not already available.
 
-You do not need macOS, Xcode, Swift, NanoDictate, or any other consumer
-repository.
+You do not need macOS, Xcode, Swift, or a consumer repository.
 
 ## Validate your change
 
