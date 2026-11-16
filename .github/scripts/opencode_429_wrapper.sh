@@ -76,22 +76,26 @@ write_telemetry() {
 telemetry_mode=""
 telemetry_log=""
 telemetry_diagnostics=""
-telemetry_child_pids=()
+# Each entry is "<role> <pid>". Roles drive the interruption order: producers
+# (the CLI) stop first so the event pipe reaches EOF, readers (the renderer or
+# the tee pair) then drain every buffered event into the logs telemetry reads,
+# and the live-status watcher is last because it can be parked in an HTTP call.
+telemetry_children=()
 telemetry_fifo_paths=()
 
 track_telemetry_child() {
-  telemetry_child_pids+=("$1")
+  telemetry_children+=("$1 $2")
 }
 
 untrack_telemetry_child() {
-  local target="$1" pid
+  local target="$1" entry
   local remaining=()
-  for pid in "${telemetry_child_pids[@]+"${telemetry_child_pids[@]}"}"; do
-    if [[ "$pid" != "$target" ]]; then
-      remaining+=("$pid")
+  for entry in "${telemetry_children[@]+"${telemetry_children[@]}"}"; do
+    if [[ "${entry#* }" != "$target" ]]; then
+      remaining+=("$entry")
     fi
   done
-  telemetry_child_pids=("${remaining[@]+"${remaining[@]}"}")
+  telemetry_children=("${remaining[@]+"${remaining[@]}"}")
 }
 
 wait_telemetry_child() {
@@ -102,21 +106,96 @@ wait_telemetry_child() {
   return "$child_status"
 }
 
+# A child that already exited but has not been reaped is a zombie, for which
+# ``kill -0`` still succeeds; a bounded reap must inspect the process state.
+telemetry_child_running() {
+  local pid="$1" state
+  if ! state="$(ps -o stat= -p "$pid" 2>/dev/null)"; then
+    # Without process-state information, assume a live child so the caller's
+    # bounded escalation still applies instead of an unbounded wait.
+    kill -0 "$pid" 2>/dev/null
+    return
+  fi
+  [[ -n "$state" && "$state" != *Z* ]]
+}
+
+# Reap one child without letting it postpone the interruption record forever.
+# Cooperative children exit on TERM; a child stuck in a request is escalated.
+reap_telemetry_child_bounded() {
+  local pid="$1" limit="${2:-2}" waited=0
+  while telemetry_child_running "$pid"; do
+    if ((waited >= limit)); then
+      kill -KILL "$pid" 2>/dev/null || true
+      break
+    fi
+    sleep 1
+    waited=$((waited + 1))
+  done
+  wait "$pid" 2>/dev/null || true
+  untrack_telemetry_child "$pid"
+}
+
+# Give a reader a bounded grace period to flush the pipe buffer after the
+# producer stopped. A CLI descendant that inherited the write end can keep the
+# reader waiting for an EOF that never arrives, so the reader is stopped after
+# the grace period instead of blocking the interruption record.
+drain_telemetry_reader() {
+  local pid="$1" limit="${2:-2}" waited=0
+  while telemetry_child_running "$pid"; do
+    if ((waited >= limit)); then
+      kill "$pid" 2>/dev/null || true
+      reap_telemetry_child_bounded "$pid" 1
+      return 0
+    fi
+    sleep 1
+    waited=$((waited + 1))
+  done
+  wait "$pid" 2>/dev/null || true
+  untrack_telemetry_child "$pid"
+}
+
 # Commands run in the background so a TERM/INT/HUP addressed only to this
-# wrapper interrupts ``wait`` immediately. The handler stops and reaps every
-# child before telemetry reads the log, so an interrupted attempt cannot be
-# lost behind a foreground CLI or leave a writer mutating the log behind it.
-# Invoked by the trap handler above, which shellcheck cannot follow.
+# wrapper interrupts ``wait`` immediately. Stopping the producer first lets the
+# readers drain events already buffered in the FIFO, so an interrupted attempt
+# keeps its evidence instead of truncating it; no writer is left mutating the
+# logs telemetry reads. Invoked by the trap handler below, which shellcheck
+# cannot follow.
 # shellcheck disable=SC2329
 stop_telemetry_children() {
-  local pid
-  for pid in "${telemetry_child_pids[@]+"${telemetry_child_pids[@]}"}"; do
-    kill "$pid" 2>/dev/null || true
+  local entry role pid
+  # 1. Stop the producer so every reader sees EOF.
+  for entry in "${telemetry_children[@]+"${telemetry_children[@]}"}"; do
+    role="${entry%% *}"
+    pid="${entry#* }"
+    if [[ "$role" == "producer" ]]; then
+      kill "$pid" 2>/dev/null || true
+    fi
   done
-  for pid in "${telemetry_child_pids[@]+"${telemetry_child_pids[@]}"}"; do
-    wait "$pid" 2>/dev/null || true
+  for entry in "${telemetry_children[@]+"${telemetry_children[@]}"}"; do
+    role="${entry%% *}"
+    pid="${entry#* }"
+    if [[ "$role" == "producer" ]]; then
+      reap_telemetry_child_bounded "$pid" 5
+    fi
   done
-  telemetry_child_pids=()
+  # 2. Let the readers flush buffered events into the logs telemetry reads.
+  for entry in "${telemetry_children[@]+"${telemetry_children[@]}"}"; do
+    role="${entry%% *}"
+    pid="${entry#* }"
+    if [[ "$role" == "reader" ]]; then
+      drain_telemetry_reader "$pid" 2
+    fi
+  done
+  # 3. The watcher may be inside an HTTP request; never wait on it indefinitely.
+  for entry in "${telemetry_children[@]+"${telemetry_children[@]}"}"; do
+    role="${entry%% *}"
+    pid="${entry#* }"
+    if [[ "$role" == "watcher" ]]; then
+      kill "$pid" 2>/dev/null || true
+      reap_telemetry_child_bounded "$pid" 2
+    fi
+  done
+  telemetry_children=()
 }
 
 new_telemetry_fifo() {
@@ -139,7 +218,9 @@ remove_telemetry_fifos() {
 # shellcheck disable=SC2329
 record_interruption() {
   local signal="$1" signal_status="$2"
-  trap - TERM INT HUP
+  # A second cancellation signal must not terminate the wrapper before the
+  # record exists, so ignore further TERM/INT/HUP while this handler runs.
+  trap '' TERM INT HUP
   stop_telemetry_children
   if [[ -n "$telemetry_mode" && -n "$telemetry_log" ]]; then
     echo "::warning::OpenCode attempt interrupted by SIG${signal}; recording an inconclusive telemetry record." >&2
@@ -229,17 +310,17 @@ if [[ "$command" == "run" ]]; then
   if [[ -f "$live_script" && -n "$live_token" && -n "$live_issue" ]]; then
     CONTINUUM_LIVE_LOG_TOKEN="$live_token" CONTINUUM_LIVE_LOG_ISSUE="$live_issue" python3 "$live_script" watch --log "$log" >/dev/null 2>&1 &
     live_pid=$!
-    track_telemetry_child "$live_pid"
+    track_telemetry_child watcher "$live_pid"
   fi
   set +e
   # A FIFO keeps both pipeline members as direct children, so the interrupt
   # handler can stop and reap the CLI and renderer before writing telemetry.
   python3 "$classifier" render --log "$log" <"$render_pipe" &
   render_pid=$!
-  track_telemetry_child "$render_pid"
+  track_telemetry_child reader "$render_pid"
   env -u CONTINUUM_LIVE_LOG_TOKEN -u CONTINUUM_LIVE_LOG_ISSUE opencode "${args[@]}" >"$render_pipe" 2>&1 &
   opencode_pid=$!
-  track_telemetry_child "$opencode_pid"
+  track_telemetry_child producer "$opencode_pid"
   wait_telemetry_child "$opencode_pid"
   status=$?
   wait_telemetry_child "$render_pid"
@@ -314,13 +395,13 @@ if [[ "$command" == "github" && "${2:-}" == "run" ]]; then
   # logs, and a wrapper-only signal cannot leave the CLI running unattended.
   tee "$stdout_log" <"$stdout_pipe" &
   stdout_tee_pid=$!
-  track_telemetry_child "$stdout_tee_pid"
+  track_telemetry_child reader "$stdout_tee_pid"
   tee "$stderr_log" >&2 <"$stderr_pipe" &
   stderr_tee_pid=$!
-  track_telemetry_child "$stderr_tee_pid"
+  track_telemetry_child reader "$stderr_tee_pid"
   opencode "$@" >"$stdout_pipe" 2>"$stderr_pipe" &
   opencode_pid=$!
-  track_telemetry_child "$opencode_pid"
+  track_telemetry_child producer "$opencode_pid"
   wait_telemetry_child "$opencode_pid"
   status=$?
   wait_telemetry_child "$stdout_tee_pid" || true

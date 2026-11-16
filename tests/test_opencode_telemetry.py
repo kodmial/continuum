@@ -12,8 +12,10 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import signal
 import subprocess
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -1062,6 +1064,231 @@ class TelemetryCliTests(unittest.TestCase):
         self.assertEqual(summary["attempt"]["source"], "cli-diagnostics")
         self.assertEqual(summary["attempt"]["classification"], "quota_429")
         self.assertTrue(summary["attempt"]["classification_match"])
+
+
+class WrapperSignalTests(unittest.TestCase):
+    """Exercise the wrapper's real TERM/INT/HUP record path.
+
+    #454 compares cancelled attempts too, so an interruption must persist one
+    inconclusive record after draining events already buffered in the pipe, and
+    a completed attempt must still write exactly one classified record.
+    """
+
+    def setUp(self):
+        TMP_PARENT.mkdir(parents=True, exist_ok=True)
+        self.workdir = Path(
+            tempfile.mkdtemp(prefix="telemetry-signal-", dir=str(TMP_PARENT))
+        )
+        # Mirror the runner layout: the wrapper and classifier sit in the same
+        # directory, and the classifier imports ``src/continuum`` from two
+        # levels up (the checkout root in production).
+        self.tool_root = self.workdir / "tool"
+        self.script_dir = self.tool_root / "scripts"
+        self.script_dir.mkdir(parents=True)
+        os.symlink(ROOT / "src", self.workdir / "src")
+        self.wrapper = self.script_dir / WRAPPER.name
+        shutil.copyfile(WRAPPER, self.wrapper)
+        shutil.copyfile(CLASSIFIER, self.script_dir / CLASSIFIER.name)
+        self.runner_temp = self.workdir / "runner"
+        self.runner_temp.mkdir()
+        self.telemetry_dir = self.workdir / "telemetry"
+        self.bin_dir = self.workdir / "bin"
+        self.bin_dir.mkdir()
+        self.ready = self.workdir / "ready"
+        self.events = self.workdir / "events.log"
+        self.events.write_text(
+            "".join(
+                [
+                    start(),
+                    finish(
+                        BASE_TS + 40,
+                        tokens={"input": 12, "output": 4},
+                        cost=0.0001,
+                    ),
+                ]
+            ),
+            encoding="utf-8",
+        )
+        self.diagnostics = self.workdir / "diagnostics.log"
+        self.diagnostics.write_text("", encoding="utf-8")
+        self.write_fake_opencode()
+
+    def tearDown(self):
+        shutil.rmtree(self.workdir, ignore_errors=True)
+
+    def write_fake_opencode(self):
+        path = self.bin_dir / "opencode"
+        path.write_text(
+            "#!/usr/bin/env bash\n"
+            "set -u\n"
+            'if [[ -n "${FAKE_STDOUT:-}" ]]; then cat "$FAKE_STDOUT"; fi\n'
+            'if [[ -n "${FAKE_STDERR:-}" ]]; then cat "$FAKE_STDERR" >&2; fi\n'
+            ': >"$FAKE_READY"\n'
+            'if [[ "${FAKE_HOLD:-0}" == "1" ]]; then exec sleep 300; fi\n'
+            'exit "${FAKE_EXIT:-0}"\n',
+            encoding="utf-8",
+        )
+        path.chmod(0o755)
+
+    def wrapper_env(self, **extra):
+        env = {
+            "PATH": "{}:{}".format(self.bin_dir, os.environ.get("PATH", "")),
+            "RUNNER_TEMP": str(self.runner_temp),
+            "CONTINUUM_OPENCODE_TELEMETRY_DIR": str(self.telemetry_dir),
+            "CONTINUUM_429_CLASSIFIER": str(
+                self.script_dir / CLASSIFIER.name
+            ),
+            "FAKE_READY": str(self.ready),
+            "PYTHONDONTWRITEBYTECODE": "1",
+        }
+        env.update(extra)
+        return env
+
+    def start_wrapper(self, *args, **env_extra):
+        return subprocess.Popen(
+            ["bash", str(self.wrapper)] + list(args),
+            cwd=str(self.workdir),
+            env=self.wrapper_env(**env_extra),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            start_new_session=True,
+        )
+
+    def wait_for_ready(self, proc, timeout=30):
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if self.ready.exists():
+                return
+            if proc.poll() is not None:
+                break
+            time.sleep(0.05)
+        self.fail("fake opencode never reached its held state")
+
+    def telemetry_records(self):
+        if not self.telemetry_dir.exists():
+            return []
+        return [
+            json.loads(path.read_text(encoding="utf-8"))
+            for path in sorted(self.telemetry_dir.glob("*.json"))
+        ]
+
+    def test_run_interruption_drains_buffered_events_before_record(self):
+        proc = self.start_wrapper(
+            "run", FAKE_STDOUT=str(self.events), FAKE_HOLD="1"
+        )
+        self.wait_for_ready(proc)
+        proc.send_signal(signal.SIGTERM)
+        _stdout, stderr = proc.communicate(timeout=60)
+
+        self.assertEqual(proc.returncode, 143, stderr)
+        records = self.telemetry_records()
+        self.assertEqual(len(records), 1, stderr)
+        attempt = records[0]["attempt"]
+        self.assertEqual(attempt["mode"], "run")
+        self.assertEqual(attempt["exit_code"], 143)
+        self.assertEqual(attempt["classification"], "inconclusive")
+        # Events written before the signal were buffered in the FIFO; the
+        # reader must drain them before telemetry reads the log.
+        self.assertEqual(records[0]["events"]["step_start"], 1)
+        self.assertEqual(records[0]["events"]["step_finish"], 1)
+        self.assertEqual(records[0]["usage"]["input_tokens"], 12)
+        self.assertIn("SIGTERM", stderr)
+        self.assertEqual(
+            list(self.runner_temp.glob("continuum-opencode-run.*")), []
+        )
+
+    def test_github_interruption_drains_buffered_diagnostics_before_record(self):
+        diagnostics = self.workdir / "github-err.log"
+        diagnostics.write_text(
+            "Agent error: {\n"
+            "  name: 'FreeUsageLimitError',\n"
+            "  data: {\n"
+            "    statusCode: 429\n"
+            "  }\n"
+            "}\n",
+            encoding="utf-8",
+        )
+        proc = self.start_wrapper(
+            "github",
+            "run",
+            FAKE_STDOUT=str(self.events),
+            FAKE_STDERR=str(diagnostics),
+            FAKE_HOLD="1",
+        )
+        self.wait_for_ready(proc)
+        proc.send_signal(signal.SIGINT)
+        _stdout, stderr = proc.communicate(timeout=60)
+
+        self.assertEqual(proc.returncode, 130, stderr)
+        records = self.telemetry_records()
+        self.assertEqual(len(records), 1, stderr)
+        attempt = records[0]["attempt"]
+        self.assertEqual(attempt["mode"], "github")
+        self.assertEqual(attempt["exit_code"], 130)
+        self.assertEqual(attempt["classification"], "inconclusive")
+        # The tee reader must drain the buffered provider block first, so the
+        # summary still derives the typed diagnostic classification.
+        self.assertEqual(attempt["computed_classification"], "quota_429")
+        self.assertIn("SIGINT", stderr)
+        self.assertEqual(
+            list(self.runner_temp.glob("continuum-opencode-github-*")), []
+        )
+
+    def test_completed_runs_write_exactly_one_classified_record(self):
+        for args, mode in ((("run",), "run"), (("github", "run"), "github")):
+            with self.subTest(mode=mode):
+                shutil.rmtree(self.telemetry_dir, ignore_errors=True)
+                completed = subprocess.run(
+                    ["bash", str(self.wrapper)] + list(args),
+                    cwd=str(self.workdir),
+                    env=self.wrapper_env(
+                        FAKE_STDOUT=str(self.events),
+                        FAKE_STDERR=str(self.diagnostics),
+                        FAKE_HOLD="0",
+                    ),
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                    timeout=120,
+                )
+
+                self.assertEqual(completed.returncode, 0, completed.stderr)
+                records = self.telemetry_records()
+                self.assertEqual(len(records), 1, completed.stderr)
+                attempt = records[0]["attempt"]
+                self.assertEqual(attempt["mode"], mode)
+                self.assertEqual(attempt["exit_code"], 0)
+                self.assertEqual(attempt["classification"], "ok")
+                self.assertNotIn("interrupted", completed.stderr)
+
+    def test_watcher_cannot_delay_interruption_record(self):
+        watcher = self.script_dir / "src" / "continuum" / "opencode_live_status.py"
+        watcher.parent.mkdir(parents=True)
+        watcher.write_text("import time\n\ntime.sleep(600)\n", encoding="utf-8")
+        proc = self.start_wrapper(
+            "run",
+            FAKE_STDOUT=str(self.events),
+            FAKE_HOLD="1",
+            GITHUB_TOKEN="test-token",
+            ISSUE_NUMBER="1",
+        )
+        self.wait_for_ready(proc)
+        started = time.monotonic()
+        proc.send_signal(signal.SIGTERM)
+        # A second cancellation signal must not pre-empt the record.
+        time.sleep(0.5)
+        proc.send_signal(signal.SIGTERM)
+        _stdout, stderr = proc.communicate(timeout=60)
+        elapsed = time.monotonic() - started
+
+        self.assertEqual(proc.returncode, 143, stderr)
+        self.assertLess(elapsed, 30, "watcher delayed the interruption record")
+        records = self.telemetry_records()
+        self.assertEqual(len(records), 1, stderr)
+        self.assertEqual(
+            records[0]["attempt"]["classification"], "inconclusive"
+        )
 
 
 class TelemetryWorkflowContractTests(unittest.TestCase):
