@@ -262,10 +262,11 @@ APPROVED_SCHEDULER_ORIGIN_OPENCODE_SHA256 = (
 # Review 5921692569 follow-up: ordinary issue resumes also read the highest
 # durable generation after the legacy identity is known and fail closed before
 # the baseline; generation-2+ durable refs must be published by the expected
-# repository at the pinned SHA. The digest is re-pinned after those guarded
-# corrections; no other byte changed.
+# repository at the pinned SHA. The executable resumed-generation regression
+# lives in scripts/test_opencode_429_evacuator.py, which CodeRabbit reviews.
+# The digest is re-pinned after those guarded corrections; no other byte changed.
 APPROVED_460_RESUME_OPENCODE_SHA256 = (
-    "ce79a2ec022fede1ab4b1f3accf07f4cd1b55561ca2f27d1adc04bc055a10c3a"
+    "1e563c370707458178c1ea79bcce4bcddcc1116bcc8b4c601d5a5e4aaab8820d"
 )
 APPROVED_446_CALLER_SHA256 = (
     "b7f3df118bc436526f48443b8f068372204073eb134c98e4a1543d025f314686"
