@@ -238,14 +238,18 @@ APPROVED_448_REPAIR_OPENCODE_SHA256 = (
 # falling back to 65 minutes. The workflow-local retry parsers carry the same
 # normalization.
 APPROVED_450_SERIALIZED_OPENCODE_SHA256 = (
-    "236978024396822de9ee242f532aef9b4e10c81b1d1a46f548f5b2ceb441f38a"
+    "bd629cdefde4e5a19156c925f52e91507dd056bb71c070f75ee07bd7ed5afb48"
 )
 # 2026-11-14: intentional scheduler-origin recovery correction in Continuum main.
 # Pin the full protected workflow after canonical receipt validation and
-# explicit quoted-owner-marker handling. Retain #450 historical digest above
-# and reject any further unauthorized byte drift.
+# explicit quoted-owner-marker handling. This constant tracks the current
+# reviewed artifact; any further unauthorized byte drift still fails closed.
+# 2026-11-16 (#462): the optional CONTINUUM_429_LEGACY_REF mirror is read with
+# a default at the initial safety check so the CodeRabbit repair evacuation
+# path cannot crash under `set -u`; both full-file pins advance to that exact
+# reviewed artifact and any further byte drift still fails closed.
 APPROVED_SCHEDULER_ORIGIN_OPENCODE_SHA256 = (
-    "b2bd86557d1050607e958698a75dae6ce234587f8934fac20a302587cb84ba4e"
+    "bd629cdefde4e5a19156c925f52e91507dd056bb71c070f75ee07bd7ed5afb48"
 )
 # 2026-11-16: intentional generation-2 checkpoint-resume correction
 # (kodmial/continuum#460). A validated generation-2+ legacy mirror may resume
@@ -264,9 +268,13 @@ APPROVED_SCHEDULER_ORIGIN_OPENCODE_SHA256 = (
 # the baseline; generation-2+ durable refs must be published by the expected
 # repository at the pinned SHA. The executable resumed-generation regression
 # lives in scripts/test_opencode_429_evacuator.py, which CodeRabbit reviews.
-# The digest is re-pinned after those guarded corrections; no other byte changed.
+# Merge with main cfd545c (#462): the optional CONTINUUM_429_LEGACY_REF mirror
+# is read with a default at the initial safety check so the CodeRabbit repair
+# evacuation path cannot crash under `set -u`; this pin covers the combined
+# #460 + #462 bytes, and the executable #462 legacies above run from the same
+# scripts module. The digest is re-pinned after the merge; no other byte changed.
 APPROVED_460_RESUME_OPENCODE_SHA256 = (
-    "1e563c370707458178c1ea79bcce4bcddcc1116bcc8b4c601d5a5e4aaab8820d"
+    "cf4593df8d89f638986426f3dc48fe62544617c40e3d3bcccfe14113fa07de4e"
 )
 APPROVED_446_CALLER_SHA256 = (
     "b7f3df118bc436526f48443b8f068372204073eb134c98e4a1543d025f314686"
