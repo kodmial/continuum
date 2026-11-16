@@ -8,6 +8,7 @@ the helper as the oracle.
 
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import subprocess
@@ -66,6 +67,7 @@ class ProductionEvacuatorTest(unittest.TestCase):
         self.runner.mkdir()
         shutil.copy(STAGING_LIBRARY, self.runner / "continuum-pr-staging.sh")
         self.github_env = self.workdir / "github-env"
+        self.gh_log = self.workdir / "gh.log"
         subprocess.run(
             ["git", "init", "--bare", str(self.origin)],
             check=True,
@@ -83,9 +85,15 @@ class ProductionEvacuatorTest(unittest.TestCase):
         run_git(self.repo, "commit", "-m", "initial")
         run_git(self.repo, "branch", "-M", "main")
         run_git(self.repo, "push", "-u", "origin", "main")
+        self.main_sha = run_git(self.repo, "rev-parse", "HEAD")
         run_git(self.repo, "checkout", "-b", "opencode/issue350-test")
         gh = self.bin / "gh"
-        gh.write_text("#!/usr/bin/env bash\necho main\n", encoding="utf-8")
+        gh.write_text(
+            "#!/usr/bin/env bash\n"
+            'printf \'%s\\n\' "$*" >> "${CONTINUUM_TEST_GH_LOG:-/dev/null}"\n'
+            "echo main\n",
+            encoding="utf-8",
+        )
         gh.chmod(0o755)
         self.script = self.workdir / "evacuate.sh"
         self.script.write_text(extracted_evacuator(), encoding="utf-8")
@@ -94,14 +102,25 @@ class ProductionEvacuatorTest(unittest.TestCase):
     def tearDown(self):
         shutil.rmtree(self.workdir, ignore_errors=True)
 
+    def remote_ref_tips(self):
+        tips = {}
+        for line in run_git(self.repo, "ls-remote", "origin").splitlines():
+            sha, _, ref = line.partition("\t")
+            if ref:
+                tips[ref] = sha
+        return tips
+
     def invoke(self, operation="opencode-429-issue-issue350", mode="issue",
-               issue="350", pr=""):
+               issue="350", pr="", stage="implementation-incomplete",
+               legacy_ref=None, generation="0", failure_kind="quota_429",
+               head_ref="opencode/issue350-test"):
         call = self.workdir / "run-evacuator.sh"
         call.write_text(
-            self.script.read_text(encoding="utf-8")
-            + "\ncontinuum_infra_evacuate \"{}\" \"implementation-incomplete\" "
-            "\"{}\" \"{}\" \"{}\" \"{}\" \"quota_429\"\n".format(
-                operation, mode, issue, pr, self.base_sha
+            "set -u\n"
+            + self.script.read_text(encoding="utf-8")
+            + "\ncontinuum_infra_evacuate \"{}\" \"{}\" "
+            "\"{}\" \"{}\" \"{}\" \"{}\" \"{}\"\n".format(
+                operation, stage, mode, issue, pr, self.base_sha, failure_kind
             ),
             encoding="utf-8",
         )
@@ -113,10 +132,13 @@ class ProductionEvacuatorTest(unittest.TestCase):
                 "GITHUB_REPOSITORY": "owner/repo",
                 "GITHUB_ENV": str(self.github_env),
                 "RUNNER_TEMP": str(self.runner),
-                "HEAD_REF": "opencode/issue350-test",
-                "RECOVERY_GENERATION_IN": "0",
+                "HEAD_REF": head_ref,
+                "RECOVERY_GENERATION_IN": generation,
+                "CONTINUUM_TEST_GH_LOG": str(self.gh_log),
             }
         )
+        if legacy_ref is not None:
+            env["CONTINUUM_429_LEGACY_REF"] = legacy_ref
         return subprocess.run(
             ["bash", str(call)],
             cwd=str(self.repo),
@@ -188,6 +210,217 @@ class ProductionEvacuatorTest(unittest.TestCase):
         self.assertFalse(
             any("refs/heads/opencode/429-checkpoint-" in line for line in refs),
             "a false recoverable checkpoint pointer was published",
+        )
+
+    def test_set_u_unset_legacy_ref_keeps_published_checkpoint(self):
+        # Exact live reproducer: the CodeRabbit repair path invokes the
+        # evacuator without CONTINUUM_429_LEGACY_REF while the shell runs
+        # under `set -u`. The omitted optional mirror must never turn a
+        # successfully published primary checkpoint into a fatal shell error.
+        run_git(self.repo, "checkout", "-b", "opencode/pr459-review-repair")
+        (self.repo / "app.py").write_text("VALUE = 459\n", encoding="utf-8")
+        operation = "opencode-429-coderabbit-fix-pr459-review5909047979"
+        completed = self.invoke(
+            operation=operation,
+            mode="coderabbit-fix",
+            issue="",
+            pr="459",
+            stage="review-repair",
+            head_ref="opencode/pr459-review-repair",
+        )
+        output = completed.stdout + completed.stderr
+        self.assertEqual(completed.returncode, 75, output)
+        self.assertNotIn("unbound variable", output)
+        self.assertNotIn("refusing legacy checkpoint mirror", output)
+        self.assertIn("Evacuated 429 checkpoint", output)
+        ref = "opencode/429-checkpoint-{}-gen-1".format(operation)
+        env = self.github_env.read_text(encoding="utf-8")
+        self.assertIn("CONTINUUM_429_CHECKPOINT_REF={}".format(ref), env)
+        tips = self.remote_ref_tips()
+        self.assertIn("refs/heads/{}".format(ref), tips)
+        checkpoints = [
+            name for name in tips
+            if name.startswith("refs/heads/opencode/429-checkpoint-")
+        ]
+        self.assertEqual(checkpoints, ["refs/heads/{}".format(ref)])
+
+    def test_valid_same_repo_legacy_ref_is_mirrored(self):
+        run_git(self.repo, "checkout", "-b", "opencode/pr459-legacy")
+        (self.repo / "app.py").write_text("VALUE = 460\n", encoding="utf-8")
+        operation = "opencode-429-coderabbit-fix-pr459-review5909047980"
+        legacy = "opencode/issue459-123456789"
+        completed = self.invoke(
+            operation=operation,
+            mode="coderabbit-fix",
+            issue="",
+            pr="459",
+            stage="review-repair",
+            legacy_ref=legacy,
+            head_ref="opencode/pr459-legacy",
+        )
+        output = completed.stdout + completed.stderr
+        self.assertEqual(completed.returncode, 75, output)
+        self.assertNotIn("unbound variable", output)
+        self.assertIn("Evacuated 429 checkpoint", output)
+        tips = self.remote_ref_tips()
+        checkpoint = "refs/heads/opencode/429-checkpoint-{}-gen-1".format(
+            operation
+        )
+        self.assertIn(checkpoint, tips)
+        self.assertIn("refs/heads/{}".format(legacy), tips)
+        self.assertEqual(tips["refs/heads/{}".format(legacy)], tips[checkpoint])
+
+    def test_default_branch_and_malicious_legacy_refs_are_rejected(self):
+        for index, legacy in enumerate(
+            ("main", "refs/heads/main", "HEAD", "../escape", "a..b")
+        ):
+            with self.subTest(legacy=legacy):
+                operation = "opencode-429-issue-issue46{}".format(index)
+                completed = self.invoke(
+                    operation=operation,
+                    issue="46{}".format(index),
+                    legacy_ref=legacy,
+                )
+                output = completed.stdout + completed.stderr
+                self.assertEqual(completed.returncode, 75, output)
+                self.assertNotIn("unbound variable", output)
+                self.assertIn("Evacuated 429 checkpoint", output)
+                self.assertIn(
+                    "refusing legacy checkpoint mirror", output
+                )
+                tips = self.remote_ref_tips()
+                self.assertIn(
+                    "refs/heads/opencode/429-checkpoint-{}-gen-1".format(
+                        operation
+                    ),
+                    tips,
+                )
+                # The default branch never advances to a checkpoint commit.
+                self.assertEqual(tips["refs/heads/main"], self.main_sha)
+                if legacy not in ("main", "refs/heads/main"):
+                    self.assertNotIn(
+                        "refs/heads/{}".format(legacy), tips
+                    )
+                self.assertNotIn(
+                    "refs/heads/opencode/429-checkpoint-{}-gen-2".format(
+                        operation
+                    ),
+                    tips,
+                )
+
+    def test_provider_429_fresh_runner_handoff_preserves_provenance(self):
+        from continuum.opencode_429_recovery import is_opencode_429
+
+        provider_429 = json.dumps(
+            {
+                "type": "error",
+                "error": {
+                    "name": "APIError",
+                    "data": {
+                        "message": "free usage limit reached",
+                        "statusCode": 429,
+                    },
+                },
+            }
+        )
+        self.assertTrue(is_opencode_429(provider_429, 1))
+        run_git(self.repo, "checkout", "-b", "opencode/pr459-provenance")
+        (self.repo / "app.py").write_text("VALUE = 461\n", encoding="utf-8")
+        operation = "opencode-429-coderabbit-fix-pr459-review5909047981"
+        completed = self.invoke(
+            operation=operation,
+            mode="coderabbit-fix",
+            issue="",
+            pr="459",
+            stage="review-repair",
+            head_ref="opencode/pr459-provenance",
+        )
+        output = completed.stdout + completed.stderr
+        self.assertEqual(completed.returncode, 75, output)
+        self.assertNotIn("unbound variable", output)
+        self.assertIn("Evacuated 429 checkpoint", output)
+        ref = "opencode/429-checkpoint-{}-gen-1".format(operation)
+        checkpoint_sha = self.remote_ref_tips()["refs/heads/{}".format(ref)]
+
+        # A real fresh runner clones the same repository and runs the exact
+        # production restore step with the evacuation provenance.
+        fresh = self.workdir / "fresh-runner"
+        subprocess.run(
+            ["git", "clone", str(self.origin), str(fresh)],
+            check=True,
+            capture_output=True,
+        )
+        restore = self.workdir / "restore.sh"
+        restore.write_text(extracted_restore_step(), encoding="utf-8")
+        restore_output = self.workdir / "restore-output"
+        restore_env = dict(os.environ)
+        restore_env.update(
+            {
+                "RECOVERY_OPERATION_ID": operation,
+                "RECOVERY_CHECKPOINT_REF": ref,
+                "RECOVERY_CHECKPOINT_SHA": checkpoint_sha,
+                "RECOVERY_STAGE": "review-repair",
+                "RECOVERY_GENERATION": "1",
+                "RECOVERY_MODE": "coderabbit-fix",
+                "GITHUB_OUTPUT": str(restore_output),
+                "RUNNER_TEMP": str(self.runner),
+            }
+        )
+        restored = subprocess.run(
+            ["bash", str(restore)],
+            cwd=str(fresh),
+            capture_output=True,
+            text=True,
+            env=restore_env,
+            timeout=120,
+        )
+        restore_log = restored.stdout + restored.stderr
+        self.assertEqual(restored.returncode, 0, restore_log)
+        self.assertIn(
+            "Validated 429 recovery metadata for {} generation 1 stage "
+            "review-repair".format(operation),
+            restore_log,
+        )
+        self.assertIn("Restored 429 checkpoint {}".format(ref), restore_log)
+        outputs = restore_output.read_text(encoding="utf-8")
+        for expected in (
+            "resumed=true",
+            "checkpoint_sha={}".format(checkpoint_sha),
+            "checkpoint_ref={}".format(ref),
+            "operation_id={}".format(operation),
+            "generation=1",
+            "stage=review-repair",
+            "skip_opencode=false",
+        ):
+            self.assertIn(expected, outputs)
+        self.assertEqual(
+            run_git(fresh, "rev-parse", "HEAD"), checkpoint_sha
+        )
+        metadata = json.loads(
+            (fresh / ".continuum-429-recovery.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        self.assertEqual(metadata["operation_id"], operation)
+        self.assertEqual(metadata["failure_kind"], "quota_429")
+        self.assertEqual(metadata["generation"], 1)
+        self.assertEqual(metadata["checkpoint_ref"], ref)
+        self.assertEqual(metadata["stage"], "review-repair")
+        self.assertEqual(metadata["mode"], "coderabbit-fix")
+        self.assertEqual(str(metadata["issue_number"]), "")
+        self.assertEqual(str(metadata["pr_number"]), "459")
+        self.assertEqual(metadata["head_ref"], "opencode/pr459-provenance")
+        self.assertEqual(metadata["base_sha"], self.base_sha)
+        self.assertEqual(metadata["branch"], "opencode/pr459-provenance")
+        self.assertRegex(metadata["head_sha"], r"^[0-9a-f]{40}$")
+
+        # Evacuation only queried the repository default branch; it never
+        # created a stray PR or duplicate issue as a recovery side effect.
+        gh_calls = self.gh_log.read_text(encoding="utf-8").splitlines()
+        self.assertTrue(gh_calls)
+        self.assertEqual(
+            set(gh_calls),
+            {"api repos/owner/repo --jq .default_branch"},
         )
 
 
