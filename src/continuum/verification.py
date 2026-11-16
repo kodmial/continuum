@@ -1838,6 +1838,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 "resume_base_sha",
                 "resume_snapshot_spec",
                 "resume_mode",
+                "resume_latest_generation",
             )
             if any(options.get(key) for key in resume_keys):
                 resume = {
@@ -1850,6 +1851,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     "base_sha": options.get("resume_base_sha", ""),
                     "snapshot_spec": options.get("resume_snapshot_spec", ""),
                     "mode": options.get("resume_mode", "issue"),
+                    "latest_generation": options.get(
+                        "resume_latest_generation", ""
+                    ),
                 }
             try:
                 data, reused = ensure_baseline(
