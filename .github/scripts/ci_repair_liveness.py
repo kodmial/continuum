@@ -81,7 +81,13 @@ def run_decision(run, jobs, now, expected_id, expected_title):
         if run.get("conclusion") == "cancelled":
             return "rerun", "first attempt terminal-cancelled with zero jobs"
         return "hold", "terminal jobless run is not a verified safe retry"
-    if status not in SAFE_STATES:
+    # A legitimately queued GitHub Actions run may wait for runner capacity or
+    # concurrency for a long time. Cancelling it merely resets its position in
+    # that queue. Only an anomalous in_progress run with *zero* instantiated
+    # jobs is eligible for bounded cancellation.
+    if status in ("queued", "pending", "requested", "waiting"):
+        return "wait", "GitHub scheduler has not started this run; preserve queue position"
+    if status != "in_progress":
         return "hold", "unrecognized run status"
     created = run.get("created_at")
     if not isinstance(created, str) or not TIME_RE.fullmatch(created):
