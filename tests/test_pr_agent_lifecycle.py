@@ -274,8 +274,14 @@ APPROVED_SCHEDULER_ORIGIN_OPENCODE_SHA256 = (
 # Ordinary and batch review repairs both attest. Keep the scheduler origin
 # digest above for audit and pin the full current artifact; any further drift
 # still fails closed.
+# 2026-11-16 (#462 merge): main's fix for the optional
+# CONTINUUM_429_LEGACY_REF mirror in the 429 evacuation helper is merged into
+# this branch. The resolved artifact is exactly the reviewed #458 content above
+# plus that single #462 hunk (the helper no longer dereferences the optional
+# variable under `set -u`), so the full-file pin advances to the combined
+# merged artifact. Any unrelated byte drift still fails closed.
 APPROVED_458_PUBLICATION_OPENCODE_SHA256 = (
-    "9384d20341b74b25b335b476ac61b4ce919ca30e2327a52744ada67bb049cde2"
+    "eff960722bef2db6578ddcbce9182e96981304078fe82483cfc5a3d5ad3e89c6"
 )
 APPROVED_446_CALLER_SHA256 = (
     "b7f3df118bc436526f48443b8f068372204073eb134c98e4a1543d025f314686"
