@@ -263,7 +263,7 @@ The delegation runtime was restored from Continuum commit
 worker implementation matches its separately pinned
 `954aa575ab385b6785f6923937fceb7ec108c966` version. This preserves the existing
 recovery and review behavior while making those entry points available beside
-the NanoDictate workflows again.
+consumer-owned workflows.
 
 Two resolver guards are tightened: an invalid parent declaration fails the
 plan, and explicit child variables cannot fall back to a conflicting legacy
@@ -272,7 +272,7 @@ file. Legacy files remain supported when relationship variables are absent.
 This migration deliberately keeps Runtime Lab's Render lifecycle, knowledge
 sync, artifact delivery, publication-conflict handling, CI status context, and
 local repair controllers in Runtime Lab. They have different contracts from
-NanoDictate's macOS build and release automation. The shared boundary for this
+consumer-specific macOS build and release automation. The shared boundary for this
 first integration is delegated execution; a later migration can extract those
 other controllers with their existing tests.
 
