@@ -653,6 +653,36 @@ class TelemetryClassificationTests(unittest.TestCase):
         self.assertEqual(provider["terminal_error_events"], UNKNOWN)
         self.assertIn("provider=quota_429", format_human_summary(summary))
 
+    def test_inconclusive_github_attempt_keeps_diagnostic_provider_classification(
+        self,
+    ):
+        diagnostics = (
+            "Agent error: {\n"
+            "  name: 'FreeUsageLimitError',\n"
+            "  data: {\n"
+            "    statusCode: 429\n"
+            "  }\n"
+            "}\n"
+        )
+
+        summary = summarize_opencode_log(
+            "",
+            mode="github",
+            exit_code=130,
+            classification="inconclusive",
+            diagnostics_text=diagnostics,
+        )
+
+        # The wrapper's interrupted-attempt classification stays authoritative.
+        self.assertEqual(summary["attempt"]["classification"], "inconclusive")
+        self.assertEqual(summary["attempt"]["computed_classification"], "quota_429")
+        # Diagnostics remain provider evidence, and unavailable event counts
+        # are unknown rather than zero.
+        provider = summary["provider_error"]
+        self.assertEqual(provider["classification"], "quota_429")
+        self.assertEqual(provider["typed_provider_error_events"], UNKNOWN)
+        self.assertIn("provider=quota_429", format_human_summary(summary))
+
     def test_wrapper_authoritative_classification_parity_is_explicit(self):
         summary = summarize(
             [typed_error("FreeUsageLimitError", status=429)],
@@ -1313,8 +1343,13 @@ class WrapperSignalTests(unittest.TestCase):
         self.assertEqual(attempt["exit_code"], 130)
         self.assertEqual(attempt["classification"], "inconclusive")
         # The tee reader must drain the buffered provider block first, so the
-        # summary still derives the typed diagnostic classification.
+        # summary still derives the typed diagnostic classification and keeps
+        # it in the provider summary without rewriting the attempt outcome.
         self.assertEqual(attempt["computed_classification"], "quota_429")
+        provider = records[0]["provider_error"]
+        self.assertEqual(provider["classification"], "quota_429")
+        self.assertEqual(provider["typed_provider_error_events"], UNKNOWN)
+        self.assertIn("provider=quota_429", stderr)
         self.assertIn("SIGINT", stderr)
         self.assertEqual(
             list(self.runner_temp.glob("continuum-opencode-github-*")), []

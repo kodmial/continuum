@@ -759,8 +759,17 @@ def summarize_event_stream(
     if provider_classification == "none" and not event_stream_observed:
         # The diagnostics classifier is the only provider evidence available
         # for ``github run``; do not report "none" for a classified failure.
-        if selected_classification in _PROVIDER_CLASSIFICATION_ORDER:
-            provider_classification = selected_classification
+        # Keep the authoritative classification when it is provider evidence,
+        # and fall back to the diagnostic-derived result otherwise: an
+        # interruption reports ``inconclusive`` even when the captured
+        # diagnostics still contain a typed provider 429.
+        provider_evidence = (
+            selected_classification
+            if selected_classification in _PROVIDER_CLASSIFICATION_ORDER
+            else computed_classification
+        )
+        if provider_evidence in _PROVIDER_CLASSIFICATION_ORDER:
+            provider_classification = provider_evidence
 
     provider_error = {
         "classification": provider_classification,
