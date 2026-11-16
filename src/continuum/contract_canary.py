@@ -1509,6 +1509,31 @@ def _is_authenticated_main_sync_commit(commit: object) -> bool:
     )
 
 
+def publication_artifacts(listing: object, prefix: str) -> list:
+    """Return ``(artifact_id, name)`` candidates from a run-artifact listing.
+
+    The run artifacts endpoint lists every attempt of a rerun, so one repair
+    run can hold more than one receipt. Keep every live prefix-matching
+    artifact so callers can fetch each receipt by its stable artifact id
+    instead of a name that another attempt can also use.
+    """
+    candidates = []
+    wanted = str(prefix or "")
+    if not wanted:
+        return candidates
+    for line in str(listing or "").splitlines():
+        fields = line.split("\t")
+        if len(fields) != 3 or not fields[0].isdigit():
+            continue
+        artifact_id, name, expired = fields
+        if str(expired).strip().lower() == "true":
+            continue
+        if not name.startswith(wanted):
+            continue
+        candidates.append((int(artifact_id), name))
+    return candidates
+
+
 def repair_status_run_id(
     status: Mapping[str, Any], expected_repo: str
 ) -> Optional[int]:

@@ -2599,6 +2599,10 @@ class WorkflowContractTest(unittest.TestCase):
         self.assertEqual(
             workflow.count("canary.select_repair_publication("), 2
         )
+        # Both repair paths keep every artifact id from every attempt.
+        self.assertEqual(
+            workflow.count("canary.publication_artifacts("), 2
+        )
         # Repair receipts are fetched by artifact id, not by name, so a rerun
         # cannot resolve to another attempt's same-named artifact.
         self.assertEqual(workflow.count("actions/artifacts/{}/zip"), 2)
@@ -2665,6 +2669,33 @@ class WorkflowContractTest(unittest.TestCase):
                 canary.CANARY_OWNER_REPO,
                 branch,
             )
+        )
+
+    def test_publication_artifacts_keep_both_rerun_attempts(self):
+        """Both repair receipts stay listed even when their names collide.
+
+        GitHub lists artifacts from every attempt of one run, and a rerun can
+        upload the same artifact name again. The workflow must retain each
+        live artifact id so it can fetch the receipt for the matching commit
+        instead of resolving a name to another attempt.
+        """
+        listing = "\n".join(
+            [
+                "900\tcontinuum-repair-publication-2\tfalse",
+                "800\tcontinuum-repair-publication-1\tfalse",
+                "700\tcontinuum-repair-publication-1\ttrue",
+                "600\tunrelated-artifact\tfalse",
+                "not-an-id\tcontinuum-repair-publication-3\tfalse",
+            ]
+        )
+        self.assertEqual(
+            canary.publication_artifacts(
+                listing, canary.CANARY_REPAIR_PUBLICATION_ARTIFACT_PREFIX
+            ),
+            [
+                (900, "continuum-repair-publication-2"),
+                (800, "continuum-repair-publication-1"),
+            ],
         )
 
     def test_workflow_fails_closed_on_unreadable_worker_evidence(self):

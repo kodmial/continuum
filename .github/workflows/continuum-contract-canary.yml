@@ -338,19 +338,10 @@ jobs:
                           run_id, (listing.stderr or "").strip()[:500]
                       )
                   )
-              candidates = []
-              for line in listing.stdout.splitlines():
-                  fields = line.split("\t")
-                  if len(fields) != 3 or not fields[0].isdigit():
-                      continue
-                  artifact_id, name, expired = fields
-                  if str(expired).strip().lower() == "true":
-                      continue
-                  if not name.startswith(
-                      canary.CANARY_REPAIR_PUBLICATION_ARTIFACT_PREFIX
-                  ):
-                      continue
-                  candidates.append((int(artifact_id), name))
+              candidates = canary.publication_artifacts(
+                  listing.stdout,
+                  canary.CANARY_REPAIR_PUBLICATION_ARTIFACT_PREFIX,
+              )
               if not candidates:
                   return None
               parents = commit.get("parents")
@@ -814,19 +805,10 @@ jobs:
                           run_id, (listing.stderr or "").strip()[:500]
                       )
                   )
-              candidates = []
-              for line in listing.stdout.splitlines():
-                  fields = line.split("\t")
-                  if len(fields) != 3 or not fields[0].isdigit():
-                      continue
-                  artifact_id, name, expired = fields
-                  if str(expired).strip().lower() == "true":
-                      continue
-                  if not name.startswith(
-                      canary.CANARY_REPAIR_PUBLICATION_ARTIFACT_PREFIX
-                  ):
-                      continue
-                  candidates.append((int(artifact_id), name))
+              candidates = canary.publication_artifacts(
+                  listing.stdout,
+                  canary.CANARY_REPAIR_PUBLICATION_ARTIFACT_PREFIX,
+              )
               if not candidates:
                   return None
               parents = commit.get("parents")

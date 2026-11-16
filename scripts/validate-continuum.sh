@@ -166,14 +166,15 @@ PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=src python3 -m unittest -v \
 printf '%s\n' \
   'Contract canary worker-evidence regression evidence:' \
   'setup: a closed owned canary issue has a merged implementation PR with successful exact-HEAD CI and Contract qualification runs.' \
-  'assertions: completion rejects the missing worker run with worker-evidence-absent, the selected worker run id is recorded in the completed outcome, two repair commits published by separate attempts of one repair run each keep the receipt matching their own base and head, and the workflow downloads repair receipts by artifact id instead of a same-named artifact from another attempt.'
+  'assertions: completion rejects the missing worker run with worker-evidence-absent, the selected worker run id is recorded in the completed outcome, both receipts from separate attempts of one repair run stay listed even when their names collide, two repair commits published by those attempts each keep the receipt matching their own base and head, and the workflow downloads repair receipts by artifact id instead of a same-named artifact from another attempt.'
 PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=src python3 -m unittest -v \
   tests.test_contract_canary.CompletionEvidenceTest.test_missing_worker_evidence_fails \
   tests.test_contract_canary.CompletionEvidenceTest.test_completion_worker_run_id_is_recorded \
   tests.test_contract_canary.CompletionEvidenceTest.test_two_repair_commits_from_separate_attempts_of_one_run_pass \
   tests.test_contract_canary.WorkflowContractTest.test_workflow_records_completion_worker_run_id \
   tests.test_contract_canary.WorkflowContractTest.test_workflow_binds_each_repair_status_to_its_own_commit_receipt \
-  tests.test_contract_canary.WorkflowContractTest.test_repair_receipt_selection_matches_each_commit_from_a_rerun
+  tests.test_contract_canary.WorkflowContractTest.test_repair_receipt_selection_matches_each_commit_from_a_rerun \
+  tests.test_contract_canary.WorkflowContractTest.test_publication_artifacts_keep_both_rerun_attempts
 
 mkdir -p "$PWD/.opencode-tmp/bin"
 # Pin both the installer URL and its content: the tag can move and a
