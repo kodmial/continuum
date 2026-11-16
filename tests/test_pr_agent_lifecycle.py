@@ -251,6 +251,18 @@ APPROVED_450_SERIALIZED_OPENCODE_SHA256 = (
 APPROVED_SCHEDULER_ORIGIN_OPENCODE_SHA256 = (
     "bd629cdefde4e5a19156c925f52e91507dd056bb71c070f75ee07bd7ed5afb48"
 )
+# kodmial/continuum#454: the reviewed #448, #450, and scheduler-origin pins
+# above stay for audit. This task deliberately adds one bounded, privacy-safe
+# telemetry artifact upload step (always(), continue-on-error,
+# upload-artifact v4, runner-temp telemetry directory) so per-attempt OpenCode
+# usage survives the runner without making observability failure a task
+# failure. Merging main's #460 generation-2 checkpoint-resume correction keeps
+# both reviewed behaviors in the same artifact, so this active pin covers the
+# combined scheduler-origin, #454 telemetry, and #460 resume bytes; unrelated
+# drift still fails closed.
+APPROVED_454_TELEMETRY_OPENCODE_SHA256 = (
+    "c740682de530c242cc5904d0c53d8a2eed6cbb6900347ea453fbc03de4917249"
+)
 # 2026-11-16: intentional generation-2 checkpoint-resume correction
 # (kodmial/continuum#460). A validated generation-2+ legacy mirror may resume
 # only when its immutable metadata binds the same durable ref/operation/issue
@@ -280,8 +292,24 @@ APPROVED_SCHEDULER_ORIGIN_OPENCODE_SHA256 = (
 # instead of suppressing a repair on a commit the model never saw. This advances
 # the full-file pin to the reviewed no-change-guard artifact; every existing
 # 429/task-admission/verification invariant above is retained unchanged.
-APPROVED_460_RESUME_OPENCODE_SHA256 = (
+# Merging main's #454 telemetry upload step into this reviewed #467 artifact
+# keeps both intentional behaviors in one file, so the active pin below covers
+# the combined scheduler-origin, #460 resume, #454 telemetry, and #467
+# no-change-guard bytes; unrelated drift still fails closed.
+APPROVED_467_NO_CHANGE_OPENCODE_SHA256 = (
+    "37523b5d6a8a18ae975dcc6cc5b45d8c957142f3005936baf0182219003dff47"
+)
+# Retained for audit: the reviewed #467 artifact before main's #454 telemetry
+# upload step was merged into this branch.
+APPROVED_467_PRE_MERGE_OPENCODE_SHA256 = (
     "fc6620d539658f7058fadf121b7bde98738fd1c02b9407d54b34dbcba364922e"
+)
+# Merging main into #455: the #454 telemetry upload step is additive to this
+# reviewed #460 + #462 artifact, so the #454 bytes are pinned above by
+# APPROVED_454_TELEMETRY_OPENCODE_SHA256. This digest stays for audit and any
+# further byte drift still fails closed.
+APPROVED_460_RESUME_OPENCODE_SHA256 = (
+    "cf4593df8d89f638986426f3dc48fe62544617c40e3d3bcccfe14113fa07de4e"
 )
 APPROVED_446_CALLER_SHA256 = (
     "b7f3df118bc436526f48443b8f068372204073eb134c98e4a1543d025f314686"
@@ -2704,12 +2732,15 @@ class ProtectedBaselineTests(unittest.TestCase):
                     self.assertIn("CONTINUUM_OPENCODE_PUBLISH_RACE_RETRY_REQUIRED", original)
                     self.assertIn("steps.model_route.outputs.model", original)
                 if path == ".github/workflows/continuum-opencode.yml":
-                    # #450 deliberately changes chat-ownership behavior,
-                    # with a full-file digest and executable regression tests.
+                    # #454 adds bounded telemetry on top of the deliberate
+                    # scheduler-origin recovery correction, #450's
+                    # chat-ownership change, main's #460 generation-2 resume
+                    # repair, and this branch's #467 no-change guard, with
+                    # full-file digests and executable regression tests.
                     self.assertEqual(
                         protected_file_digest(path),
-                        APPROVED_460_RESUME_OPENCODE_SHA256,
-                        f"{path}: unexpected drift outside #460/#467 reviewed artifact",
+                        APPROVED_467_NO_CHANGE_OPENCODE_SHA256,
+                        f"{path}: unexpected drift outside the reviewed #467 no-change guard combined with #454 telemetry on the scheduler-origin #450 serialized CodeRabbit chat owner and #460 resume repair",
                     )
                 else:
                     # The self-dogfood caller is the dispatchable surface
@@ -2794,7 +2825,7 @@ class ProtectedBaselineTests(unittest.TestCase):
         # therefore be dirty in this pre-commit worktree; any unapproved byte
         # change still fails the exact digest assertions above.
         approved = {
-            ".github/workflows/continuum-opencode.yml": APPROVED_460_RESUME_OPENCODE_SHA256,
+            ".github/workflows/continuum-opencode.yml": APPROVED_467_NO_CHANGE_OPENCODE_SHA256,
             ".github/workflows/opencode.yml": APPROVED_350_SELF_CALLER_SHA256,
         }
         for path in PROTECTED_FILES:

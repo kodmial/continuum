@@ -11,7 +11,10 @@ one tested classifier instead of inline transcript greps:
 * ``classify`` prints one classification from ``src/continuum``'s engine. For
   ``run`` it trusts only top-level ``type=error`` events. For ``github run``
   it trusts only the CLI runtime's stderr ``Agent error:`` block, because the
-  pinned 1.19.3 CLI has no JSON mode for that command.
+  legacy ``github run`` path has no JSON mode.
+* ``telemetry`` writes a bounded, privacy-safe per-attempt summary from the
+  same structured ``run`` events. It never persists prompts, tool payloads,
+  provider response bodies, error text, credentials, or model messages.
 
 Standard library only; the script is copied next to ``src/continuum`` by the
 workflow bootstrap so runner environments need no package installation.
@@ -170,6 +173,74 @@ def classify(mode: str, log_path: str, diagnostics_path: str, exit_code: int) ->
     return 0
 
 
+def telemetry(
+    mode: str,
+    log_path: str,
+    diagnostics_path: str,
+    exit_code: int,
+    classification: str,
+    output_path: str,
+    model: str,
+    print_summary: bool,
+) -> int:
+    """Persist one bounded, privacy-safe per-attempt summary."""
+
+    # Telemetry is optional observability on top of the provider classifier.
+    # Import it lazily so a missing/broken telemetry module can never break
+    # ``render`` or ``classify`` (and therefore 429 runner protection).
+    try:
+        from continuum.opencode_telemetry import (  # noqa: PLC0415
+            build_provenance,
+            format_human_summary,
+            summarize_opencode_log,
+            write_summary,
+        )
+    except Exception as exc:  # noqa: BLE001 - optional feature isolation
+        _print(
+            "::warning::OpenCode telemetry support is unavailable: {}".format(exc),
+            sys.stderr,
+        )
+        return 2
+
+    source_readable = True
+    try:
+        log_text = _read(log_path)
+    except OSError as exc:
+        source_readable = False
+        log_text = ""
+        _print(
+            "::warning::Cannot read OpenCode log for telemetry: {}".format(exc),
+            sys.stderr,
+        )
+    diagnostics_text = None
+    if mode == "github" and diagnostics_path:
+        try:
+            diagnostics_text = _read(diagnostics_path)
+        except OSError:
+            diagnostics_text = None
+    summary = summarize_opencode_log(
+        log_text,
+        mode=mode,
+        exit_code=exit_code,
+        classification=classification,
+        model=model,
+        provenance=build_provenance(mode=mode, model=model),
+        diagnostics_text=diagnostics_text,
+        source_readable=source_readable,
+    )
+    try:
+        write_summary(summary, output_path)
+    except OSError as exc:
+        _print(
+            "::warning::Cannot write OpenCode telemetry summary: {}".format(exc),
+            sys.stderr,
+        )
+        return 2
+    if print_summary:
+        _print(format_human_summary(summary))
+    return 0
+
+
 def main(argv: list | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
@@ -184,12 +255,35 @@ def main(argv: list | None = None) -> int:
     classify_parser.add_argument("--diagnostics", default="")
     classify_parser.add_argument("--exit", dest="exit_code", type=int, default=1)
 
+    telemetry_parser = sub.add_parser(
+        "telemetry", help="persist a bounded per-attempt telemetry summary"
+    )
+    telemetry_parser.add_argument("--mode", choices=("run", "github"), required=True)
+    telemetry_parser.add_argument("--log", required=True)
+    telemetry_parser.add_argument("--diagnostics", default="")
+    telemetry_parser.add_argument("--exit", dest="exit_code", type=int, default=1)
+    telemetry_parser.add_argument("--classification", default="")
+    telemetry_parser.add_argument("--model", default="")
+    telemetry_parser.add_argument("--output", required=True)
+    telemetry_parser.add_argument("--print-summary", action="store_true")
+
     args = parser.parse_args(argv)
     if args.command == "render":
         if args.stdin == "-":
             return render(args.log)
         with open(args.stdin, "r", encoding="utf-8", errors="replace") as stream:
             return render(args.log, stream)
+    if args.command == "telemetry":
+        return telemetry(
+            args.mode,
+            args.log,
+            args.diagnostics,
+            args.exit_code,
+            args.classification,
+            args.output,
+            args.model,
+            args.print_summary,
+        )
     return classify(args.mode, args.log, args.diagnostics, args.exit_code)
 
 
