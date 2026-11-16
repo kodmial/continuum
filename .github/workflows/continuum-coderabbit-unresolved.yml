@@ -69,14 +69,17 @@ jobs:
         env:
           INPUT_PR_NUMBER: ${{ inputs.pr_number }}
           COMMENT_PAT: ${{ secrets.TAP_PAT }}
+          CONTINUUM_OPENCODE_WORKFLOW: ${{ inputs.opencode_workflow || vars.CONTINUUM_OPENCODE_WORKFLOW || 'continuum-opencode.yml' }}
         with:
-          # kodmial/continuum#259: read-only collection uses GITHUB_TOKEN so
-          # the run is attributed to github-actions[bot] and never uses
-          # TAP_PAT for collection. TAP_PAT is read once only to authenticate
-          # the login that authors verification markers, so a forged marker
-          # from an arbitrary commenter can never suppress a finding.
+          # kodmial/continuum#259: collection reads with GITHUB_TOKEN so the
+          # run is attributed to github-actions[bot] and never uses TAP_PAT
+          # to read findings. TAP_PAT is read once only to authenticate the
+          # login that authors verification markers, so a forged marker from
+          # an arbitrary commenter can never suppress a finding; it also
+          # writes the trusted, deduplicated no-change reason comment.
           github-token: ${{ github.token }}
           script: |
+            const crypto = require('crypto');
             const owner = context.repo.owner;
             const repo = context.repo.repo;
             const pullNumber = Number(
@@ -625,7 +628,280 @@ jobs:
               return newest;
             };
 
+            // A completed no-change repair has no new commit, so the same
+            // original finding would otherwise be re-dispatched forever after
+            // each CodeRabbit reply. A handoff comment alone is not proof:
+            // corroborate the matching Actions run, its successful repair
+            // step, and the published no-change result before suppressing.
+            const opencodeWorkflow = String(
+              process.env.CONTINUUM_OPENCODE_WORKFLOW ||
+                'continuum-opencode.yml'
+            ).trim();
+            if (!/^[A-Za-z0-9_.-]+\.yml$/.test(opencodeWorkflow)) {
+              throw new Error(
+                `Invalid OpenCode caller workflow: ${opencodeWorkflow}.`
+              );
+            }
+            const repairOutcomePattern =
+              /<!--\s*opencode-coderabbit-repair-outcome\s+([^>]*?)\s*-->/;
+            const batchLeasePattern =
+              /<!--\s*continuum-coderabbit-batch\s+head=([0-9a-f]{40})\s+digest=([0-9a-f]{64})\s*-->/;
+            const parseRepairOutcome = body => {
+              const match = String(body || '').match(repairOutcomePattern);
+              if (!match) return null;
+              const attrs = {};
+              for (const part of match[1].matchAll(/([a-z_]+)=([^\s>]+)/gi)) {
+                attrs[part[1].toLowerCase()] = part[2];
+              }
+              return attrs;
+            };
+            const outcomeRunCache = new Map();
+            const outcomeBatchMarkers = repairHandoffs
+              .filter(comment => trustedMarkerAuthors.has(
+                comment.user?.login || comment.author?.login || ''
+              ))
+              .map(comment => ({
+                comment,
+                match: String(comment.body || '').match(batchLeasePattern),
+              }))
+              .filter(entry => Boolean(entry.match));
+            const newestOutcomeForFinding = findingId => {
+              let newest = null;
+              for (const comment of repairHandoffs) {
+                if (!trustedMarkerAuthors.has(
+                  comment.user?.login || comment.author?.login || ''
+                )) {
+                  continue;
+                }
+                const attrs = parseRepairOutcome(comment.body);
+                if (!attrs || attrs.head !== headSha) continue;
+                const findings = String(attrs.findings || '')
+                  .split(',').map(Number);
+                if (!findings.includes(findingId)) continue;
+                if (!newest || Number(comment.id) > Number(newest.comment.id)) {
+                  newest = { comment, attrs };
+                }
+              }
+              return newest;
+            };
+            const corroborateOutcomeRun = async (comment, attrs) => {
+              const defer = reason => ({ state: 'defer', reason });
+              const runIdText = String(attrs.run || '');
+              if (!/^[1-9][0-9]*$/.test(runIdText)) {
+                return defer('missing-run-id');
+              }
+              const runId = Number(runIdText);
+              const findings = String(attrs.findings || '')
+                .split(',').map(Number);
+              if (!findings.length ||
+                  findings.some(id => !Number.isInteger(id) || id <= 0) ||
+                  new Set(findings).size !== findings.length) {
+                return defer('invalid-finding-set');
+              }
+              const matchingBatch = outcomeBatchMarkers
+                .filter(entry =>
+                  entry.match[1] === attrs.head &&
+                  entry.match[2] === attrs.digest &&
+                  Number(entry.comment.id) < Number(comment.id))
+                .sort(
+                  (a, b) => Number(a.comment.id) - Number(b.comment.id)
+                )[0];
+              if (!matchingBatch) return defer('missing-batch-provenance');
+              let digest;
+              try {
+                const identity = [];
+                for (const findingId of findings.slice().sort((a, b) => a - b)) {
+                  const reviewId = await originalReviewIdForFinding(findingId);
+                  if (!Number.isInteger(reviewId) || reviewId <= 0) {
+                    return defer('missing-review-id');
+                  }
+                  identity.push([reviewId, findingId]);
+                }
+                digest = crypto.createHash('sha256')
+                  .update(headSha + '\n' + JSON.stringify(identity))
+                  .digest('hex');
+              } catch (err) {
+                return defer(
+                  `finding-read-failed:${err.message || err}`
+                );
+              }
+              if (digest !== attrs.digest) return defer('digest-mismatch');
+              let evidence = outcomeRunCache.get(runId);
+              if (!evidence) {
+                evidence = {};
+                try {
+                  evidence.run = (await github.rest.actions.getWorkflowRun({
+                    owner, repo, run_id: runId,
+                  })).data;
+                  evidence.jobs = (await github.rest.actions.listJobsForWorkflowRun({
+                    owner, repo, run_id: runId, filter: 'latest', per_page: 100,
+                  })).data;
+                } catch (err) {
+                  evidence.error = err;
+                }
+                outcomeRunCache.set(runId, evidence);
+              }
+              if (evidence.error || !evidence.run) {
+                return defer('run-unreadable');
+              }
+              const run = evidence.run;
+              const runPath = String(run.path || '')
+                .replace(/^\.github\/workflows\//, '');
+              const expectedRepairTitle = new RegExp(
+                `^OpenCode repair PR #${pullNumber}` +
+                '(?:\\s+\\[ci-attempt:[A-Za-z0-9][A-Za-z0-9._:\\-]{7,127}\\])?$'
+              );
+              if (Number(run.id) !== runId ||
+                  run.event !== 'workflow_dispatch' ||
+                  runPath !== opencodeWorkflow ||
+                  !expectedRepairTitle.test(
+                    String(run.display_title || '').trim()
+                  ) ||
+                  Number(run.run_attempt || 0) !== Number(attrs.attempt)) {
+                return defer('run-provenance-mismatch');
+              }
+              if (run.status !== 'completed') {
+                return { state: 'none', reason: 'run-not-completed' };
+              }
+              if (run.conclusion !== 'success') {
+                return { state: 'none', reason: 'run-not-successful' };
+              }
+              const batchAt = Date.parse(
+                matchingBatch.comment.created_at || ''
+              );
+              const runAt = Date.parse(run.created_at || '');
+              if (Number.isFinite(batchAt) && Number.isFinite(runAt) &&
+                  runAt < batchAt - 60_000) {
+                return defer('run-before-dispatch');
+              }
+              const jobs = Array.isArray(evidence.jobs?.jobs)
+                ? evidence.jobs.jobs : [];
+              if (!jobs.length) {
+                return { state: 'none', reason: 'run-jobless' };
+              }
+              const repairJob = jobs.find(job =>
+                Array.isArray(job.steps) &&
+                job.steps.some(step =>
+                  step.name === 'Fix CodeRabbit review findings')
+              );
+              if (!repairJob) return defer('repair-step-missing');
+              if (repairJob.status !== 'completed' ||
+                  repairJob.conclusion !== 'success') {
+                return { state: 'none', reason: 'repair-job-not-successful' };
+              }
+              const repairStep = repairJob.steps.find(
+                step => step.name === 'Fix CodeRabbit review findings'
+              );
+              if (!repairStep ||
+                  repairStep.status !== 'completed' ||
+                  repairStep.conclusion !== 'success') {
+                return { state: 'none', reason: 'repair-step-not-successful' };
+              }
+              const runStart = Date.parse(
+                run.run_started_at || run.created_at || ''
+              );
+              const runEnd = Date.parse(run.updated_at || '');
+              const commentAt = Date.parse(comment.created_at || '');
+              if (!Number.isFinite(runStart) || !Number.isFinite(runEnd) ||
+                  !Number.isFinite(commentAt) ||
+                  commentAt < runStart - 60_000 ||
+                  commentAt > runEnd + 300_000) {
+                return defer('handoff-not-from-run');
+              }
+              return {
+                state: 'suppress',
+                run_id: runId,
+                reason: 'no-change-awaiting-review-or-evidence',
+              };
+            };
+            const evaluateNoChange = async findingId => {
+              const newest = newestOutcomeForFinding(findingId);
+              if (!newest) return { state: 'none' };
+              const attrs = newest.attrs;
+              if (attrs.changed !== 'false') return { state: 'none' };
+              const expectedRepo = `${owner}/${repo}`.toLowerCase();
+              if (String(attrs.repo || '').toLowerCase() !== expectedRepo ||
+                  Number(attrs.pr) !== pullNumber ||
+                  attrs.head !== headSha ||
+                  !/^[0-9a-f]{64}$/.test(String(attrs.digest || ''))) {
+                return { state: 'defer', reason: 'outcome-identity-mismatch' };
+              }
+              return corroborateOutcomeRun(newest.comment, attrs);
+            };
+
+            const noChangeGuarded = [];
+            const noChangeDeferred = [];
+            const noChangeStates = new Map();
+            for (const item of active) {
+              let decision;
+              try {
+                decision = await evaluateNoChange(item.finding_id);
+              } catch (err) {
+                decision = {
+                  state: 'defer',
+                  reason: `outcome-check-failed:${err.message || err}`,
+                };
+              }
+              noChangeStates.set(item.finding_id, decision.state);
+              if (decision.state === 'suppress') {
+                noChangeGuarded.push({
+                  finding_id: item.finding_id,
+                  run_id: decision.run_id,
+                  reason: decision.reason,
+                });
+              } else if (decision.state === 'defer') {
+                noChangeDeferred.push({
+                  finding_id: item.finding_id,
+                  reason: decision.reason,
+                });
+              }
+            }
+            if (noChangeDeferred.length) {
+              core.setOutput('no_change_deferred_json', JSON.stringify(
+                noChangeDeferred
+              ));
+            }
+            if (noChangeGuarded.length) {
+              const marker =
+                `<!-- continuum-coderabbit-no-change-guard head=${headSha} ` +
+                `findings=${noChangeGuarded.map(entry => entry.finding_id).join(',')} ` +
+                `runs=${noChangeGuarded.map(entry => entry.run_id).join(',')} ` +
+                'reason=no-change-awaiting-review-or-evidence -->';
+              const alreadyReported = repairHandoffs.some(comment =>
+                trustedMarkerAuthors.has(
+                  comment.user?.login || comment.author?.login || ''
+                ) &&
+                String(comment.body || '').includes(marker)
+              );
+              if (!alreadyReported) {
+                await markerGithub.rest.issues.createComment({
+                  owner,
+                  repo,
+                  issue_number: pullNumber,
+                  body: [
+                    marker,
+                    '⚡ **Continuum · coderabbit-unresolved**',
+                    '<!-- continuum-origin role=continuum component=coderabbit-unresolved -->',
+                    `No re-dispatch for ${noChangeGuarded.length} CodeRabbit finding(s) on HEAD \`${headSha}\`: the matching canonical OpenCode repair run completed successfully with **no code change**. The original review stays open and blocking; this is not approval or successful qualification. Reason: \`no-change-awaiting-review-or-evidence\`.`,
+                  ].join('\n'),
+                });
+              }
+              core.setOutput('no_change_json', JSON.stringify(noChangeGuarded));
+              core.notice(
+                `PR #${pullNumber}: suppressing re-dispatch for ${noChangeGuarded.length} finding(s) after a verified no-change repair at HEAD ${headSha}; the review remains unresolved.`
+              );
+            }
+            if (noChangeDeferred.length) {
+              core.notice(
+                `PR #${pullNumber}: deferring ${noChangeDeferred.length} finding(s) because the no-change outcome provenance is unreadable or inconsistent.`
+              );
+            }
+
             const dispatchable = active.filter(item => {
+              if (noChangeStates.get(item.finding_id) === 'suppress' ||
+                  noChangeStates.get(item.finding_id) === 'defer') {
+                return false;
+              }
               const verification = latestVerification.get(item.finding_id);
               const handoff = newestRepairHandoff(item.finding_id);
               if (!verification || !handoff) return true;
@@ -644,7 +920,7 @@ jobs:
             });
             if (dispatchable.length !== active.length) {
               core.notice(
-                `PR #${pullNumber}: deferring ${active.length - dispatchable.length} CodeRabbit finding(s) with a pending repair handoff until fresh verification.`
+                `PR #${pullNumber}: deferring ${active.length - dispatchable.length} CodeRabbit finding(s) with a verified no-change outcome or a pending repair handoff.`
               );
             }
             if (dispatchable.length === 0) {
@@ -721,7 +997,7 @@ jobs:
                 'Invalid CodeRabbit repair handoff cutoff; refusing dispatch.'
               );
             }
-            const items = JSON.parse(process.env.UNRESOLVED_ITEMS_JSON || '[]');
+            let items = JSON.parse(process.env.UNRESOLVED_ITEMS_JSON || '[]');
             if (!Number.isInteger(pullNumber) || pullNumber <= 0 ||
                 !/^[0-9a-f]{40}$/.test(head) ||
                 !/^[A-Za-z0-9_./-]+$/.test(headRef) ||
@@ -739,10 +1015,6 @@ jobs:
               }
               seen.add(item.finding_id);
             }
-            const batch = JSON.stringify(items);
-            if (Buffer.byteLength(batch, 'utf8') > 30000) {
-              throw new Error('CodeRabbit batch exceeds workflow-dispatch safe payload.');
-            }
             const live = (await github.rest.pulls.get({
               owner, repo, pull_number: pullNumber,
             })).data;
@@ -750,6 +1022,306 @@ jobs:
                 live.head.sha !== head || live.head.ref !== headRef) {
               core.notice('PR HEAD or state advanced during CodeRabbit batching; deferring to next reconciliation.');
               return;
+            }
+            const trustedHandoffAuthors = new Set(['github-actions[bot]']);
+            trustedHandoffAuthors.add(
+              String(
+                (await github.rest.users.getAuthenticated()).data.login || ''
+              ).trim().toLowerCase()
+            );
+            const repairOutcomePattern =
+              /<!--\s*opencode-coderabbit-repair-outcome\s+([^>]*?)\s*-->/;
+            const batchLeasePattern =
+              /<!--\s*continuum-coderabbit-batch\s+head=([0-9a-f]{40})\s+digest=([0-9a-f]{64})\s*-->/;
+            const parseRepairOutcome = body => {
+              const match = String(body || '').match(repairOutcomePattern);
+              if (!match) return null;
+              const attrs = {};
+              for (const part of match[1].matchAll(/([a-z_]+)=([^\s>]+)/gi)) {
+                attrs[part[1].toLowerCase()] = part[2];
+              }
+              return attrs;
+            };
+            const isTrustedHandoff = comment => trustedHandoffAuthors.has(
+              String(
+                comment.user?.login || comment.author?.login || ''
+              ).trim().toLowerCase()
+            );
+            const reviewIds = new Map(
+              items.map(item => [item.finding_id, item.review_id])
+            );
+            const reviewIdForFinding = async findingId => {
+              if (reviewIds.has(findingId)) return reviewIds.get(findingId);
+              const root = (await github.rest.pulls.getReviewComment({
+                owner, repo, comment_id: findingId,
+              })).data;
+              const reviewId = Number(root?.pull_request_review_id);
+              if (!Number.isInteger(reviewId) || reviewId <= 0) {
+                throw new Error(
+                  `Cannot resolve the original review for finding #${findingId}.`
+                );
+              }
+              reviewIds.set(findingId, reviewId);
+              return reviewId;
+            };
+            const outcomeRunCache = new Map();
+            const corroborateOutcomeRun = async (
+              comments, comment, attrs
+            ) => {
+              const defer = reason => ({ state: 'defer', reason });
+              const runIdText = String(attrs.run || '');
+              if (!/^[1-9][0-9]*$/.test(runIdText)) {
+                return defer('missing-run-id');
+              }
+              const runId = Number(runIdText);
+              const findings = String(attrs.findings || '')
+                .split(',').map(Number);
+              if (!findings.length ||
+                  findings.some(id => !Number.isInteger(id) || id <= 0) ||
+                  new Set(findings).size !== findings.length) {
+                return defer('invalid-finding-set');
+              }
+              const matchingBatch = comments
+                .filter(isTrustedHandoff)
+                .map(entry => ({
+                  comment: entry,
+                  match: String(entry.body || '').match(batchLeasePattern),
+                }))
+                .filter(entry =>
+                  entry.match &&
+                  entry.match[1] === attrs.head &&
+                  entry.match[2] === attrs.digest &&
+                  Number(entry.comment.id) < Number(comment.id))
+                .sort(
+                  (a, b) => Number(a.comment.id) - Number(b.comment.id)
+                )[0];
+              if (!matchingBatch) return defer('missing-batch-provenance');
+              let digest;
+              try {
+                const identity = [];
+                for (const findingId of findings.slice().sort((a, b) => a - b)) {
+                  const reviewId = await reviewIdForFinding(findingId);
+                  identity.push([reviewId, findingId]);
+                }
+                digest = crypto.createHash('sha256')
+                  .update(head + '\n' + JSON.stringify(identity))
+                  .digest('hex');
+              } catch (err) {
+                return defer(
+                  `finding-read-failed:${err.message || err}`
+                );
+              }
+              if (digest !== attrs.digest) return defer('digest-mismatch');
+              let evidence = outcomeRunCache.get(runId);
+              if (!evidence) {
+                evidence = {};
+                try {
+                  evidence.run = (await github.rest.actions.getWorkflowRun({
+                    owner, repo, run_id: runId,
+                  })).data;
+                  evidence.jobs = (await github.rest.actions.listJobsForWorkflowRun({
+                    owner, repo, run_id: runId, filter: 'latest', per_page: 100,
+                  })).data;
+                } catch (err) {
+                  evidence.error = err;
+                }
+                outcomeRunCache.set(runId, evidence);
+              }
+              if (evidence.error || !evidence.run) {
+                return defer('run-unreadable');
+              }
+              const run = evidence.run;
+              const runPath = String(run.path || '')
+                .replace(/^\.github\/workflows\//, '');
+              const expectedRepairTitle = new RegExp(
+                `^OpenCode repair PR #${pullNumber}` +
+                '(?:\\s+\\[ci-attempt:[A-Za-z0-9][A-Za-z0-9._:\\-]{7,127}\\])?$'
+              );
+              if (Number(run.id) !== runId ||
+                  run.event !== 'workflow_dispatch' ||
+                  runPath !== opencodeWorkflow ||
+                  !expectedRepairTitle.test(
+                    String(run.display_title || '').trim()
+                  ) ||
+                  Number(run.run_attempt || 0) !== Number(attrs.attempt)) {
+                return defer('run-provenance-mismatch');
+              }
+              if (run.status !== 'completed') {
+                return { state: 'none', reason: 'run-not-completed' };
+              }
+              if (run.conclusion !== 'success') {
+                return { state: 'none', reason: 'run-not-successful' };
+              }
+              const batchAt = Date.parse(
+                matchingBatch.comment.created_at || ''
+              );
+              const runAt = Date.parse(run.created_at || '');
+              if (Number.isFinite(batchAt) && Number.isFinite(runAt) &&
+                  runAt < batchAt - 60_000) {
+                return defer('run-before-dispatch');
+              }
+              const jobs = Array.isArray(evidence.jobs?.jobs)
+                ? evidence.jobs.jobs : [];
+              if (!jobs.length) {
+                return { state: 'none', reason: 'run-jobless' };
+              }
+              const repairJob = jobs.find(job =>
+                Array.isArray(job.steps) &&
+                job.steps.some(step =>
+                  step.name === 'Fix CodeRabbit review findings')
+              );
+              if (!repairJob) return defer('repair-step-missing');
+              if (repairJob.status !== 'completed' ||
+                  repairJob.conclusion !== 'success') {
+                return { state: 'none', reason: 'repair-job-not-successful' };
+              }
+              const repairStep = repairJob.steps.find(
+                step => step.name === 'Fix CodeRabbit review findings'
+              );
+              if (!repairStep ||
+                  repairStep.status !== 'completed' ||
+                  repairStep.conclusion !== 'success') {
+                return { state: 'none', reason: 'repair-step-not-successful' };
+              }
+              const runStart = Date.parse(
+                run.run_started_at || run.created_at || ''
+              );
+              const runEnd = Date.parse(run.updated_at || '');
+              const commentAt = Date.parse(comment.created_at || '');
+              if (!Number.isFinite(runStart) || !Number.isFinite(runEnd) ||
+                  !Number.isFinite(commentAt) ||
+                  commentAt < runStart - 60_000 ||
+                  commentAt > runEnd + 300_000) {
+                return defer('handoff-not-from-run');
+              }
+              return {
+                state: 'suppress',
+                run_id: runId,
+                reason: 'no-change-awaiting-review-or-evidence',
+              };
+            };
+            const evaluateNoChange = async (
+              findingId, comments, currentHead
+            ) => {
+              let newest = null;
+              for (const comment of comments) {
+                if (!isTrustedHandoff(comment)) continue;
+                const attrs = parseRepairOutcome(comment.body);
+                if (!attrs || attrs.head !== currentHead) continue;
+                const findings = String(attrs.findings || '')
+                  .split(',').map(Number);
+                if (!findings.includes(findingId)) continue;
+                if (!newest || Number(comment.id) > Number(newest.comment.id)) {
+                  newest = { comment, attrs };
+                }
+              }
+              if (!newest) return { state: 'none' };
+              const attrs = newest.attrs;
+              if (attrs.changed !== 'false') return { state: 'none' };
+              const expectedRepo = `${owner}/${repo}`.toLowerCase();
+              if (String(attrs.repo || '').toLowerCase() !== expectedRepo ||
+                  Number(attrs.pr) !== pullNumber ||
+                  attrs.head !== currentHead ||
+                  !/^[0-9a-f]{64}$/.test(String(attrs.digest || ''))) {
+                return { state: 'defer', reason: 'outcome-identity-mismatch' };
+              }
+              return corroborateOutcomeRun(
+                comments, newest.comment, attrs
+              );
+            };
+            const filterNoChange = async (
+              candidateItems, comments, currentHead
+            ) => {
+              const kept = [];
+              const suppressed = [];
+              const deferred = [];
+              for (const item of candidateItems) {
+                let decision;
+                try {
+                  decision = await evaluateNoChange(
+                    item.finding_id, comments, currentHead
+                  );
+                } catch (err) {
+                  decision = {
+                    state: 'defer',
+                    reason: `outcome-check-failed:${err.message || err}`,
+                  };
+                }
+                if (decision.state === 'suppress') {
+                  suppressed.push({
+                    finding_id: item.finding_id,
+                    run_id: decision.run_id,
+                    reason: decision.reason,
+                  });
+                } else if (decision.state === 'defer') {
+                  deferred.push({
+                    finding_id: item.finding_id,
+                    reason: decision.reason,
+                  });
+                } else {
+                  kept.push(item);
+                }
+              }
+              return { items: kept, suppressed, deferred };
+            };
+            const reportNoChange = async (comments, guarded) => {
+              const marker =
+                `<!-- continuum-coderabbit-no-change-guard head=${head} ` +
+                `findings=${guarded.map(entry => entry.finding_id).join(',')} ` +
+                `runs=${guarded.map(entry => entry.run_id).join(',')} ` +
+                'reason=no-change-awaiting-review-or-evidence -->';
+              const alreadyReported = comments.some(comment =>
+                isTrustedHandoff(comment) &&
+                String(comment.body || '').includes(marker)
+              );
+              if (alreadyReported) return;
+              await github.rest.issues.createComment({
+                owner, repo, issue_number: pullNumber,
+                body: [
+                  marker,
+                  '⚡ **Continuum · coderabbit-unresolved**',
+                  '<!-- continuum-origin role=continuum component=coderabbit-unresolved -->',
+                  `No re-dispatch for ${guarded.length} CodeRabbit finding(s) on HEAD \`${head}\`: the matching canonical OpenCode repair run completed successfully with **no code change**. The original review stays open and blocking; this is not approval or successful qualification. Reason: \`no-change-awaiting-review-or-evidence\`.`,
+                ].join('\n'),
+              });
+            };
+            let priorComments = [];
+            try {
+              priorComments = await github.paginate(
+                github.rest.issues.listComments,
+                { owner, repo, issue_number: pullNumber, per_page: 100 }
+              );
+            } catch (err) {
+              core.notice(
+                `PR #${pullNumber}: could not read CodeRabbit no-change outcomes before dispatch; deferring until the next reconciliation: ${err.message || err}`
+              );
+              return;
+            }
+            const preliminary = await filterNoChange(
+              items, priorComments, head
+            );
+            if (preliminary.deferred.length) {
+              core.notice(
+                `PR #${pullNumber}: no-change outcome provenance is unreadable or inconsistent; deferring the dispatch for safe reconciliation.`
+              );
+              return;
+            }
+            if (preliminary.suppressed.length) {
+              await reportNoChange(priorComments, preliminary.suppressed);
+              core.notice(
+                `PR #${pullNumber}: suppressing re-dispatch for ${preliminary.suppressed.length} finding(s) after a verified no-change repair at HEAD ${head}; the review remains unresolved.`
+              );
+            }
+            items = preliminary.items;
+            if (!items.length) {
+              core.notice(
+                'No CodeRabbit finding remains dispatchable after verified no-change suppression.'
+              );
+              return;
+            }
+            let batch = JSON.stringify(items);
+            if (Buffer.byteLength(batch, 'utf8') > 30000) {
+              throw new Error('CodeRabbit batch exceeds workflow-dispatch safe payload.');
             }
             // Verification replies may change unresolved_id without changing
             // the finding. A lease belongs to the underlying finding set
@@ -759,9 +1331,6 @@ jobs:
               .update(head + '\n' + JSON.stringify(batchIdentity)).digest('hex');
             const marker =
               `<!-- continuum-coderabbit-batch head=${head} digest=${batchKey} -->`;
-            const priorComments = await github.paginate(github.rest.issues.listComments, {
-              owner, repo, issue_number: pullNumber, per_page: 100,
-            });
             // Dispatch is NOT completion. The executor can finish a green
             // workflow without invoking the model when it rejects the batch,
             // or a provider can fail before publishing anything. Never make
@@ -846,12 +1415,6 @@ jobs:
               );
               return;
             }
-            const trustedHandoffAuthors = new Set(['github-actions[bot]']);
-            trustedHandoffAuthors.add(
-              String(
-                (await github.rest.users.getAuthenticated()).data.login || ''
-              ).trim().toLowerCase()
-            );
             const repairHandoffPattern =
               /<!-- opencode-coderabbit-verification-pending head=([0-9a-f]{40}) findings=([0-9,]+)(?: answers=[0-9,]+)? -->/;
             const batchFindingIds = new Set(
@@ -895,6 +1458,80 @@ jobs:
             }
             const callerSource = Buffer.from(caller.content.replace(/\n/g, ''), 'base64').toString('utf8');
             const supportsBatch = /^\s+unresolved_items_json:\s*$/m.test(callerSource);
+            // Re-read the authoritative completion evidence and the current
+            // PR HEAD immediately before createWorkflowDispatch. A repair can
+            // publish its outcome after collection and finish during the
+            // checks above; dispatching then would duplicate completed work.
+            let finalComments = [];
+            try {
+              finalComments = await github.paginate(
+                github.rest.issues.listComments,
+                { owner, repo, issue_number: pullNumber, per_page: 100 }
+              );
+            } catch (err) {
+              core.notice(
+                `PR #${pullNumber}: could not re-read CodeRabbit no-change outcomes immediately before dispatch; deferring until the next reconciliation: ${err.message || err}`
+              );
+              return;
+            }
+            let finalPr;
+            try {
+              finalPr = (await github.rest.pulls.get({
+                owner, repo, pull_number: pullNumber,
+              })).data;
+            } catch (err) {
+              core.notice(
+                `PR #${pullNumber}: could not re-read the current PR HEAD immediately before dispatch; deferring until the next reconciliation: ${err.message || err}`
+              );
+              return;
+            }
+            if (finalPr.state !== 'open' ||
+                finalPr.head?.repo?.full_name !== `${owner}/${repo}` ||
+                finalPr.head.sha !== head ||
+                finalPr.head.ref !== headRef) {
+              core.notice(
+                'PR HEAD or state advanced immediately before dispatch; deferring to the next reconciliation.'
+              );
+              return;
+            }
+            const finalNoChange = await filterNoChange(
+              items, finalComments, head
+            );
+            if (finalNoChange.deferred.length) {
+              core.notice(
+                `PR #${pullNumber}: no-change outcome provenance is unreadable or inconsistent immediately before dispatch; deferring for safe reconciliation.`
+              );
+              return;
+            }
+            if (finalNoChange.suppressed.length) {
+              await reportNoChange(finalComments, finalNoChange.suppressed);
+              core.notice(
+                `PR #${pullNumber}: a verified no-change repair completed between collection and dispatch; suppressing this duplicate dispatch.`
+              );
+              return;
+            }
+            const finalBatchFindingIds = new Set(
+              items.map(item => item.finding_id)
+            );
+            const finalPendingHandoff = finalComments.some(comment => {
+              if (!isTrustedHandoff(comment)) return false;
+              if (Number(comment.id) <= handoffCutoff) return false;
+              const match = String(comment.body || '').match(
+                repairHandoffPattern
+              );
+              return Boolean(
+                match && match[1] === head &&
+                match[2].split(',').map(Number).some(
+                  findingId => finalBatchFindingIds.has(findingId)
+                )
+              );
+            });
+            if (finalPendingHandoff) {
+              core.notice(
+                `PR #${pullNumber}: a CodeRabbit repair handoff was published immediately before dispatch; deferring this batch until fresh verification.`
+              );
+              return;
+            }
             const distinctReviews = [...new Set(items.map(item => item.review_id))];
             for (const reviewId of (supportsBatch ? [items[0].review_id] : distinctReviews)) {
               const inputs = {

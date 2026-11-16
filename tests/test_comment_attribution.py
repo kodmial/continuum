@@ -74,7 +74,7 @@ MUTATION_RES = (
 MUTATION_COUNTS = {
     "continuum-auto-merge.yml": 8,  # includes one bounded post-CI CodeRabbit verification reply
     "continuum-coderabbit-retry.yml": 1,
-    "continuum-coderabbit-unresolved.yml": 1,
+    "continuum-coderabbit-unresolved.yml": 2,
     "continuum-consumer-child-dispatcher.yml": 1,
     "continuum-consumer-child-pr-review.yml": 7,
     "continuum-consumer-child-review.yml": 11,
@@ -144,6 +144,7 @@ FUNCTIONAL_ANCHORS = {
     "continuum-coderabbit-retry.yml": ("@coderabbitai full review",),
     "continuum-coderabbit-unresolved.yml": (
         "Queued one canonical OpenCode repair for",
+        "No re-dispatch for ",
     ),
     "continuum-consumer-child-dispatcher.yml": (
         "Closed automatically: delegated task #",
@@ -198,7 +199,8 @@ FUNCTIONAL_ANCHORS = {
     "continuum-opencode.yml": (
         "Continuum classified this CodeRabbit",
         "@coderabbitai full review",
-        "opencode-coderabbit-verification-pending",
+        "Canonical repair finished for ",
+        "no-change-awaiting-review-or-evidence",
         "Automation produced no code changes",
         "Qualification attempted product changes",
         "produced no trusted pass/fail evidence",

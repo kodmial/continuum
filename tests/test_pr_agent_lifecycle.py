@@ -273,8 +273,15 @@ APPROVED_SCHEDULER_ORIGIN_OPENCODE_SHA256 = (
 # evacuation path cannot crash under `set -u`; this pin covers the combined
 # #460 + #462 bytes, and the executable #462 legacies above run from the same
 # scripts module. The digest is re-pinned after the merge; no other byte changed.
+# 2026-11-16 (#467): the canonical coderabbit-fix completion handoff now emits
+# a trusted `changed` result plus a durable, run-bound no-change outcome marker
+# so the batcher can suppress same-HEAD duplicate redispatches. The marker binds
+# the inspected base SHA, so a concurrent branch advance makes the outcome stale
+# instead of suppressing a repair on a commit the model never saw. This advances
+# the full-file pin to the reviewed no-change-guard artifact; every existing
+# 429/task-admission/verification invariant above is retained unchanged.
 APPROVED_460_RESUME_OPENCODE_SHA256 = (
-    "cf4593df8d89f638986426f3dc48fe62544617c40e3d3bcccfe14113fa07de4e"
+    "fc6620d539658f7058fadf121b7bde98738fd1c02b9407d54b34dbcba364922e"
 )
 APPROVED_446_CALLER_SHA256 = (
     "b7f3df118bc436526f48443b8f068372204073eb134c98e4a1543d025f314686"
@@ -2702,7 +2709,7 @@ class ProtectedBaselineTests(unittest.TestCase):
                     self.assertEqual(
                         protected_file_digest(path),
                         APPROVED_460_RESUME_OPENCODE_SHA256,
-                        f"{path}: unexpected drift outside #460 generation-2 resume repair",
+                        f"{path}: unexpected drift outside #460/#467 reviewed artifact",
                     )
                 else:
                     # The self-dogfood caller is the dispatchable surface
