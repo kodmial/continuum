@@ -156,6 +156,51 @@ class ReservationObservationTest(unittest.TestCase):
                     contract.ERROR,
                 )
 
+
+    def test_429_recovery_title_is_attributed_to_the_correct_issue(self):
+        active = {
+            "databaseId": 44079707337,
+            "status": "in_progress",
+            "created_at": iso(30),
+            "displayTitle": "OpenCode 429 recovery opencode-429-issue-issue7 gen 3",
+            "headBranch": "main",
+        }
+        self.assertTrue(observation._run_matches_issue(active, 7))
+        self.assertFalse(observation._run_matches_issue(active, 8))
+        reservation = observation.observe_reservation(issue(), runs=[active], now=NOW)
+        self.assertEqual(reservation.live_run_id, 44079707337)
+        self.assertEqual(contract.evaluate_reservation_liveness(reservation).outcome, "progress")
+
+    def test_older_worker_ids_are_only_discovered_from_owner_issue_markers(self):
+        def marker(body, login="kodmial"):
+            return {"user": {"login": login}, "body": body}
+        comments = [
+            marker("<!-- continuum-429-recovery op=opencode-429-issue-issue7 gen=2 run=111 -->"),
+            marker("<!-- continuum-opencode-live repo=kodmial/continuum issue=7 run=222 -->"),
+            marker("<!-- continuum-429-recovery op=opencode-429-issue-issue8 gen=1 run=333 -->"),
+            marker("<!-- continuum-opencode-live repo=other/repo issue=7 run=444 -->"),
+            marker("<!-- continuum-opencode-live repo=kodmial/continuum issue=7 run=555 -->", "stranger"),
+            marker("<!-- continuum-429-recovery op=opencode-429-issue-issue7 gen=3 run=666 -->"),
+            marker("<!-- continuum-429-recovery op=opencode-429-issue-issue7 gen=3 run=666 -->"),
+        ]
+        self.assertEqual(
+            observation.recorded_worker_run_ids(
+                comments, 7, "kodmial/continuum", "kodmial"
+            ),
+            [666, 222, 111],
+        )
+
+    def test_qualification_fetches_exact_run_when_recent_inventory_is_truncated(self):
+        from pathlib import Path
+        workflow = (Path(__file__).resolve().parents[1] /
+                    ".github/workflows/continuum-contract-qualification.yml"
+                    ).read_text(encoding="utf-8")
+        self.assertIn("recorded_worker_run_ids(", workflow)
+        self.assertIn('actions/runs/{run_id}', workflow)
+        self.assertIn("run.get(\"path\")", workflow)
+        self.assertIn("raise SystemExit", workflow)
+        self.assertIn("gh run list --repo", workflow)
+
     def test_select_observations_keeps_only_reserved_issues(self):
         selected = observation.select_observations(
             [issue(), issue(number=8, labels=())]
