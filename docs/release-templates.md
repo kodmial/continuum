@@ -225,9 +225,12 @@ checked-out `.git/config`. The next steps run `bun install --frozen-lockfile`
 and then the consumer build script from that same tree, so source-controlled
 code at the release commit can read the token while it builds. Because that same
 job also publishes, moving the publish step to a later point in the job does not
-help. A future Bun release must disable checkout credential persistence or run
-the build under a separate trust boundary from publication, so the build never
-holds a credential it does not need.
+help. Disabling checkout credential persistence is not sufficient on its own:
+build code can write to `GITHUB_PATH` so a later step resolves a modified `gh`
+or another tool, and can leave other state the publish step inherits. A future
+Bun release must run publication in a separate trusted job on a clean runner
+that receives only verified artifacts, so the build never shares a runner or
+environment with a publishing credential.
 
 ## What current main is missing
 
@@ -314,9 +317,11 @@ working:
 9. Qualify the optional Bun example separately, including its credential
    exposure: workflow-level `contents: write` plus checkout's default credential
    persistence leaves `github.token` readable by the source-controlled code that
-   `bun install` and the consumer build script run. Set
-   `persist-credentials: false` on checkout or separate the build and publish
-   steps into distinct trust boundaries so no build step holds a publishing
+   `bun install` and the consumer build script run. Disabling credential
+   persistence on checkout is not enough, because build code can write to
+   `GITHUB_PATH` and make a later step run a modified tool. Publication must
+   happen in a separate trusted job on a clean runner that receives only
+   verified artifacts, so no build step shares a runner with a publishing
    credential, before calling that path qualified.
 
 Until then, the correct status is **INACTIVE / HISTORICAL / UNQUALIFIED**.
