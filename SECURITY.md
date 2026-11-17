@@ -8,7 +8,8 @@ fixes are made on `main`. There is no LTS branch, no guaranteed backport to an
 older commit or tag, and no support window for a pinned ref. Consumers that pin
 a tag or commit should update the pin and re-run `install.sh` for every set they
 use so installed `continuum-*.yml` callers reference the fixed ref. See
-[Install](README.md#install) and [Upgrading](README.md#upgrading-and-safe-pruning).
+[Install](docs/technical-overview.md#install) and
+[Upgrading](docs/technical-overview.md#upgrading-and-safe-pruning).
 
 ## Reporting a vulnerability
 
@@ -54,7 +55,7 @@ Continuum executes in a consumer repository with that repository's permissions.
 It is not a sandbox for untrusted code, and it cannot make an insecure consumer
 configuration safe. Relevant credentials and trust boundaries are documented in:
 
-- [Secrets and variables](README.md#secrets-and-variables);
+- [Secrets and variables](docs/technical-overview.md#secrets-and-variables);
 - [Consumer configuration variables](docs/consumer-variables.md);
 - [Parent/child delegated execution](docs/parent-child-delegation.md);
 - [Commit and review provenance](docs/commit-review-provenance.md).
