@@ -157,6 +157,18 @@ PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=src:tests python3 -m unittest -v \
   tests.test_coderabbit_no_change_guard.NoChangeGuardTests.test_outcome_without_a_dispatch_lease_still_requires_run_evidence \
   tests.test_coderabbit_no_change_guard.NoChangeGuardTests.test_matching_dispatch_lease_still_anchors_run_order
 
+# Print the newer-outcome guard-preservation regressions by name in the
+# exact-HEAD gate log. CodeRabbit excludes tests/** from review, so the named
+# results are the reviewable evidence that a newer unverifiable changed=false
+# outcome never erases an earlier verified no-change guard for the same HEAD.
+printf '%s\n' \
+  'CodeRabbit newer-outcome guard-preservation regression evidence:' \
+  'setup: an earlier verified no-change outcome for the current HEAD is followed by a newer changed=false outcome whose run failed, was jobless, or skipped its repair step.' \
+  'assertions: both the collection and pre-dispatch verifiers keep suppressing re-dispatch through the earlier verified run, while an unverified changed=true outcome still defers instead of releasing suppression.'
+PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=src:tests python3 -m unittest -v \
+  tests.test_coderabbit_no_change_guard.NoChangeGuardTests.test_newer_unverified_outcome_preserves_earlier_verified_no_change \
+  tests.test_coderabbit_no_change_guard.NoChangeGuardTests.test_newer_jobless_or_admission_only_outcome_preserves_earlier_verified_no_change
+
 # Print the contract-canary exact-HEAD snapshot regressions by name in the
 # exact-HEAD gate log. CodeRabbit excludes tests/** from review, so the named
 # results are the only reviewable evidence that a snapshot success cannot mask

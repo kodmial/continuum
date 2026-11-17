@@ -233,7 +233,8 @@ def provenance_artifacts(*comment_groups):
 
 def collect_step(items, issue_comments, review_comments=None, head=HEAD,
                  run=None, jobs=None, runs_error=False, issue_error=False,
-                 threads=None, artifacts=None, artifacts_error=False, runs=None):
+                 threads=None, artifacts=None, artifacts_error=False, runs=None,
+                 jobs_by_run=None):
     source = js_for_step(BATCHER, "Collect all unresolved findings")
     review_comments = (
         base_review_comments(head=head) if review_comments is None
@@ -317,9 +318,13 @@ const github = {{
         }}
         return {{data: {json.dumps(run or base_run())}}};
       }},
-      listJobsForWorkflowRun: async () => ({{
-        data: {json.dumps(jobs if jobs is not None else base_jobs())},
-      }}),
+      listJobsForWorkflowRun: async ({{run_id}}) => {{
+        const byRun = {json.dumps(jobs_by_run or {})};
+        if (Object.prototype.hasOwnProperty.call(byRun, String(run_id))) {{
+          return {{data: byRun[String(run_id)]}};
+        }}
+        return {{data: {json.dumps(jobs if jobs is not None else base_jobs())}}};
+      }},
       listWorkflowRunArtifacts: async () => {{
         if ({str(artifacts_error).lower()}) throw new Error('artifacts unavailable');
         return {{data: {{artifacts: {json.dumps(artifacts)}}}}};
@@ -341,7 +346,8 @@ const github = {{
 def dispatch_step(items, issue_comment_rounds, review_comments=None, head=HEAD,
                   cutoff=None, run=None, jobs=None, runs_error=False,
                   issue_error_rounds=(), caller="batch", run_rounds=None,
-                  artifacts=None, artifacts_error=False, runs=None):
+                  artifacts=None, artifacts_error=False, runs=None,
+                  jobs_by_run=None):
     source = js_for_step(BATCHER, "Dispatch one batched repair to canonical OpenCode")
     review_comments = (
         base_review_comments(head=head) if review_comments is None
@@ -416,9 +422,13 @@ const github = {{
         runRound += 1;
         return {{data: value}};
       }},
-      listJobsForWorkflowRun: async () => ({{
-        data: {json.dumps(jobs if jobs is not None else base_jobs())},
-      }}),
+      listJobsForWorkflowRun: async ({{run_id}}) => {{
+        const byRun = {json.dumps(jobs_by_run or {})};
+        if (Object.prototype.hasOwnProperty.call(byRun, String(run_id))) {{
+          return {{data: byRun[String(run_id)]}};
+        }}
+        return {{data: {json.dumps(jobs if jobs is not None else base_jobs())}}};
+      }},
       listWorkflowRunArtifacts: async () => {{
         if ({str(artifacts_error).lower()}) throw new Error('artifacts unavailable');
         return {{data: {{artifacts: {json.dumps(artifacts)}}}}};
@@ -963,6 +973,53 @@ class NoChangeGuardTests(unittest.TestCase):
         self.assertEqual(len(dispatched["posted"]), 1)
         self.assertIn("no-change-awaiting-review-or-evidence",
                       dispatched["posted"][0])
+
+    def test_newer_jobless_or_admission_only_outcome_preserves_earlier_verified_no_change(self):
+        # A newer changed=false marker whose run has no jobs, or whose repair
+        # step was skipped, proves nothing either. Like a newer failed run, it
+        # must not erase an earlier verified no-change outcome for the same
+        # HEAD in either the collection or the pre-dispatch verifier.
+        older, _ = handoff_fixture(
+            run_id=RUN_ID, comment_id=940,
+            created_at="2026-11-16T20:15:00Z",
+        )
+        newer, _ = handoff_fixture(
+            run_id=RUN_ID + 1, comment_id=950,
+            created_at="2026-11-16T20:20:00Z",
+        )
+        issue_comments = [older, newer]
+        runs = {
+            str(RUN_ID): base_run(),
+            str(RUN_ID + 1): base_run(run_id=RUN_ID + 1),
+        }
+        cases = {
+            "jobless": {"jobs": []},
+            "admission-only": base_jobs(repair_conclusion="skipped"),
+        }
+        for name, newer_jobs in cases.items():
+            with self.subTest(case=name):
+                jobs_by_run = {
+                    str(RUN_ID): base_jobs(),
+                    str(RUN_ID + 1): newer_jobs,
+                }
+                collected = collect_step(
+                    items_for(), issue_comments, runs=runs,
+                    jobs_by_run=jobs_by_run,
+                )
+                self.assertEqual(collected["out"]["should_run"], "false")
+                self.assertEqual(json.loads(collected["out"]["items_json"]), [])
+                guarded = json.loads(collected["out"]["no_change_json"])
+                self.assertEqual(guarded[0]["finding_id"], FINDING)
+                self.assertEqual(guarded[0]["run_id"], RUN_ID)
+                dispatched = dispatch_step(
+                    items_for(), [issue_comments], cutoff=100000, runs=runs,
+                    jobs_by_run=jobs_by_run,
+                )
+                self.assertEqual(len(dispatched["dispatches"]), 0,
+                                 dispatched["notices"])
+                self.assertEqual(len(dispatched["posted"]), 1)
+                self.assertIn("no-change-awaiting-review-or-evidence",
+                              dispatched["posted"][0])
 
     def test_final_check_refreshes_run_evidence_cached_before_completion(self):
         # The preliminary check caches an in-progress run. The run completes
