@@ -231,6 +231,11 @@ jobs:
               'CONTINUUM_OPENCODE_UPSTREAM_UNAVAILABLE_RESTART_REQUIRED';
             const publishRaceMarker =
               'CONTINUUM_OPENCODE_PUBLISH_RACE_RETRY_REQUIRED';
+            // Logs echo shell source; only executed Actions errors authorize a restart.
+            const hasEmittedWorkflowError = (logText, marker) =>
+              String(logText || '').split('\n').some(line =>
+                line.includes('##[error]') && line.includes(marker)
+              );
             const metadataFailedMarker =
               'CONTINUUM_OPENCODE_429_RECOVERY_METADATA_FAILED';
             // Legacy claim/backoff markers remain readable so an older
@@ -2203,7 +2208,7 @@ jobs:
                 const failed = parseMetadataFailure(logText);
                 if (failed) metadataFailure429 = failed;
               }
-              if (logText.includes(publishRaceMarker)) {
+              if (hasEmittedWorkflowError(logText, publishRaceMarker)) {
                 publishRaceRestartRequired = true;
               }
               if ((runnerRestartRequired && (evacuated429 || metadataFailure429)) ||
