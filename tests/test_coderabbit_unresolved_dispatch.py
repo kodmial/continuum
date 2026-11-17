@@ -51,6 +51,47 @@ class CodeRabbitBatchContractTests(unittest.TestCase):
         self.assertIn("UNRESOLVED_ITEMS_JSON", canonical)
         self.assertIn("unresolved_items_json:", STUB.read_text(encoding="utf-8"))
 
+    def test_no_change_guard_requires_run_scoped_provenance_evidence(self):
+        # Suppression must be provable from the run itself: a workflow_dispatch
+        # repair reports the dispatch ref as `head_sha` and the Actions API
+        # never exposes dispatch inputs, so the run publishes the inspected
+        # HEAD and finding digest as a per-run artifact name instead.
+        executor = OPENCODE.read_text(encoding="utf-8")
+        self.assertIn("id: coderabbit_verification", executor)
+        self.assertIn(
+            "steps.coderabbit_verification.outputs.provenance", executor
+        )
+        self.assertIn("continuum-repair-provenance-", executor)
+        self.assertIn("actions/upload-artifact@", executor)
+        code = js_for_step(
+            OPENCODE, "Ask CodeRabbit to verify every original finding"
+        )
+        self.assertIn("core.setOutput(", code)
+        self.assertIn("outcomeDigest", code)
+        batcher = BATCHER.read_text(encoding="utf-8")
+        self.assertIn("listWorkflowRunArtifacts", batcher)
+        self.assertIn("continuum-repair-provenance-${attrs.head}", batcher)
+        self.assertIn("run-provenance-unverified", batcher)
+        self.assertIn("run-provenance-unreadable", batcher)
+        self.assertEqual(
+            batcher.count("listWorkflowRunArtifacts"), 2,
+            "both the collection and pre-dispatch checks must require run evidence",
+        )
+
+    def test_no_change_guard_never_requires_a_dispatch_lease(self):
+        # An ordinary full-review repair and an executor-admitted subset both
+        # publish verified run-scoped outcomes without a matching batch lease,
+        # so a lease may corroborate a decision but never gate reconciliation.
+        # A changed=true replacement outcome must release suppression only after
+        # the same run and artifact validation.
+        batcher = BATCHER.read_text(encoding="utf-8")
+        self.assertNotIn("missing-batch-provenance", batcher)
+        self.assertEqual(
+            batcher.count("changed-outcome-verified"), 2,
+            "both verifiers must validate a changed outcome before releasing",
+        )
+        self.assertEqual(batcher.count("outcomeIdentityValid"), 4)
+
     def test_post_repair_chat_has_one_serialized_sender_after_ci(self):
         # OpenCode must not bypass the account-wide chat cooldown by posting
         # its own inline verification immediately after a repair. The
@@ -142,6 +183,7 @@ class CodeRabbitBatchContractTests(unittest.TestCase):
             "]);\n"
             "const core = {\n"
             "  setFailed: message => { throw new Error(message); },\n"
+            "  setOutput: () => {},\n"
             "  notice: message => notices.push(message),\n"
             "  warning: message => warnings.push(message),\n"
             "};\n"
