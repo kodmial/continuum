@@ -285,6 +285,14 @@ APPROVED_454_TELEMETRY_OPENCODE_SHA256 = (
 # evacuation path cannot crash under `set -u`; this pin covers the combined
 # #460 + #462 bytes, and the executable #462 legacies above run from the same
 # scripts module. The digest is re-pinned after the merge; no other byte changed.
+# Immutable reviewed main artifact: the CI-repair/main-sync publication fence
+# (339eb2f) that refuses to overwrite a PR head advanced during a CI fix.
+# #467 merges this fence into its own no-change-guard artifact, so the reviewed
+# main bytes stay pinned here for audit while the active pin below covers the
+# exact union.
+APPROVED_CI_REPAIR_SYNC_OPENCODE_SHA256 = (
+    "aec3ba6c112b329a92fb3319b71ab1ecce458e93f746a2addff1f704d9856a7f"
+)
 # 2026-11-16 (#467): the canonical coderabbit-fix completion handoff now emits
 # a trusted `changed` result plus a durable, run-bound no-change outcome marker
 # so the batcher can suppress same-HEAD duplicate redispatches. The marker binds
@@ -304,7 +312,17 @@ APPROVED_454_TELEMETRY_OPENCODE_SHA256 = (
 # artifact name, and the batcher suppresses only when that artifact matches.
 # The pin advances once for this additive provenance step; every previously
 # reviewed invariant above is retained unchanged.
+# 2026-11-17 (#469 validation repair): merging main's reviewed CI-repair/
+# main-sync fence (339eb2f) into this branch combines those exact bytes with
+# the unchanged #467 no-change-guard bytes, so the active pin advances to that
+# verified union. The delta against the previous pin is only main's fence; no
+# #467 byte changed.
 APPROVED_467_NO_CHANGE_OPENCODE_SHA256 = (
+    "79f64d53f6eafc2e03cf6100b3c6369bd6ff2e0de1e083e08ea8469c0db96d4f"
+)
+# Retained for audit: the reviewed #467 union before main's CI-repair/main-sync
+# fence was merged into this branch.
+APPROVED_467_PRE_CI_REPAIR_SYNC_OPENCODE_SHA256 = (
     "1e3510f29e59daa33a6ad0aa4aa020d562427ac54aee44155a8d4621476330b8"
 )
 # Retained for audit: the reviewed #467 artifact before the run-scoped
@@ -2748,13 +2766,14 @@ class ProtectedBaselineTests(unittest.TestCase):
                     # #454 adds bounded telemetry on top of the deliberate
                     # scheduler-origin recovery correction, #450's
                     # chat-ownership change, main's #460 generation-2 resume
-                    # repair, and this branch's #467 no-change guard, plus the
-                    # run-scoped provenance artifact the #469 review requires,
-                    # with full-file digests and executable regression tests.
+                    # repair and reviewed CI-repair/main-sync fence, and this
+                    # branch's #467 no-change guard, plus the run-scoped
+                    # provenance artifact the #469 review requires, with
+                    # full-file digests and executable regression tests.
                     self.assertEqual(
                         protected_file_digest(path),
                         APPROVED_467_NO_CHANGE_OPENCODE_SHA256,
-                        f"{path}: unexpected drift outside the reviewed #467 no-change guard combined with #454 telemetry on the scheduler-origin #450 serialized CodeRabbit chat owner and #460 resume repair",
+                        f"{path}: unexpected drift outside the reviewed #467 no-change guard combined with main's CI-repair/main-sync fence, #454 telemetry on the scheduler-origin #450 serialized CodeRabbit chat owner and #460 resume repair",
                     )
                 else:
                     # The self-dogfood caller is the dispatchable surface
