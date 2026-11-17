@@ -287,6 +287,8 @@ APPROVED_454_TELEMETRY_OPENCODE_SHA256 = (
 # scripts module. The digest is re-pinned after the merge; no other byte changed.
 # Immutable reviewed main artifact: the CI-repair/main-sync publication fence
 # (339eb2f) that refuses to overwrite a PR head advanced during a CI fix.
+# The prior #454 telemetry digest remains immutable above for historical audit;
+# this exact pin rejects any unrelated drift in the reviewed main bytes.
 # #467 merges this fence into its own no-change-guard artifact, so the reviewed
 # main bytes stay pinned here for audit while the active pin below covers the
 # exact union.
