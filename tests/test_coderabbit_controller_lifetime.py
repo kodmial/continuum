@@ -68,6 +68,40 @@ class CodeRabbitControllerLifetimeContract(unittest.TestCase):
                 # the short-circuit, and the shared quota serializer is intact.
                 self.assertNotIn("cancel-in-progress: true", text)
 
+
+    def test_real_coderabbit_review_events_only_enter_shared_queue(self):
+        """Both callers must reject non-provider reviews before queue admission."""
+        for path in (
+            ROOT / ".github/workflows/coderabbit-retry.yml",
+            ROOT / ".github/caller-stubs/continuum-coderabbit-retry.yml",
+        ):
+            with self.subTest(path=path.name):
+                body = path.read_text(encoding="utf-8")
+                guard = body.split("jobs:\\n  call:\\n", 1)[1].split("    uses:", 1)[0]
+                for fragment in (
+                    "github.event_name != 'pull_request_review'",
+                    "github.event.review.user.login == 'coderabbitai[bot]'",
+                    "github.event_name != 'pull_request_review_comment'",
+                    "startsWith(github.event.comment.user.login, 'coderabbitai')",
+                    "github.event.pull_request.state == 'open'",
+                ):
+                    self.assertIn(fragment, guard)
+
+    def test_auto_merge_code_rabbit_wake_is_single_owner(self):
+        body = (ROOT / ".github/workflows/continuum-auto-merge.yml").read_text(
+            encoding="utf-8"
+        )
+        self.assertEqual(
+            body.count(
+                "owner, repo, workflow_id: codeRabbitRetryWorkflow, ref: 'main'"
+            ), 1,
+        )
+        self.assertIn("async function wakeCodeRabbitRetryIfIdle(pr, reason)", body)
+        self.assertIn("client.rest.actions.listWorkflowRuns({", body)
+        self.assertIn("status, per_page: 1,", body)
+        self.assertIn("queue state unreadable; deferring", body)
+        self.assertEqual(body.count("await wakeCodeRabbitRetryIfIdle(pr,"), 2)
+
     def test_serialized_review_queue_unchanged(self):
         body = WORKFLOW.read_text(encoding="utf-8")
         self.assertIn("group: coderabbit-rate-limit-controller-", body)
