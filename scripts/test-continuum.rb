@@ -6858,7 +6858,7 @@ class ContinuumTest < Minitest::Test
   # condition has to be a skip.
   def test_scheduler_rechecks_state_just_before_dispatch
     scheduler = workflow_body('continuum-issue-scheduler.yml')
-    dispatch = scheduler[/for \(const candidate of selected\) \{\n(.*?)\n              await addLabel\(issue\.number, inProgressLabel\);/m, 1]
+    dispatch = scheduler[/for \(const candidate of selected\) \{\n(.*?)\n\s+await addLabel\(issue\.number, inProgressLabel\);/m, 1]
     refute_nil dispatch, 'the just-in-time re-check block is gone'
 
     [
@@ -6879,9 +6879,13 @@ class ContinuumTest < Minitest::Test
     refute_nil local_dispatch, 'the local just-in-time re-check block is gone'
     # #442 adds an eighth mandatory fail-closed guard: do not dispatch
     # against a checkpoint/base/snapshot already known to fail before coding.
+    # #477 adds a ninth: a released hold is spent durably before dispatch, so
+    # an already-consumed or superseded claim must skip rather than fall
+    # through.
     assert_includes local_dispatch, 'const freshResumeHold = await checkpointResumeHold('
     assert_includes local_dispatch, 'checkpointResumeHoldSkipReason(issue.number, freshResumeHold)'
-    assert_equal 9, local_dispatch.scan(/^\s+continue;\s*$/).size,
+    assert_includes local_dispatch, 'consumeCheckpointResumeRelease({'
+    assert_equal 10, local_dispatch.scan(/^\s+continue;\s*$/).size,
                  'every local just-in-time guard must be a skip, not a fall-through'
   end
 
@@ -7042,6 +7046,9 @@ class ContinuumTest < Minitest::Test
       assert_includes body, 'repos.compareCommits'
       assert_includes body, 'listFiles'
       assert_includes body, 'listReviews'
+      assert_includes body, 'continuum-checkpoint-resume-consumed'
+      assert_includes body, 'consumeCheckpointResumeRelease'
+      assert_includes body, 'release-consumed-or-superseded'
     end
     assert_includes scheduler, 'allowRelease: false'
     assert_includes scheduler, 'run-completed-success-without-implementation'

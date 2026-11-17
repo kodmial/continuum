@@ -82,7 +82,7 @@ MUTATION_COUNTS = {
     "continuum-docker-qualification.yml": 1,
     "continuum-issue-scheduler.yml": 11,
     "continuum-opencode-repair.yml": 2,
-    "continuum-opencode-watchdog.yml": 5,  # includes the one-time durable checkpoint-hold release marker (marker-only, no prose)
+    "continuum-opencode-watchdog.yml": 6,  # includes the one-time durable checkpoint-hold release and consumption receipts (marker-only, no prose)
     "continuum-opencode.yml": 15,  # #450 moved two inline CodeRabbit replies into serialized auto-merge; #451 adds the repair-completion handoff; #459 records the publication identity marker on both publish paths
     "continuum-pr-agent-auto-merge.yml": 1,
     "continuum-pr-agent-canary.yml": 4,
@@ -195,6 +195,7 @@ FUNCTIONAL_ANCHORS = {
         "Automatic recovery retry ",
         "continuum-429-recovery op=",
         "continuum-checkpoint-resume-release v=1 repo=",
+        "continuum-checkpoint-resume-consumed v=1 repo=",
         "⚡ **Continuum · opencode-watchdog**",
     ),
     "continuum-opencode.yml": (

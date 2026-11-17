@@ -783,7 +783,9 @@ module.exports = async function runIssueScheduler({ github, context, core }) {
   // source revision this controller verifies. That release is deliberately
   // narrow: only a reason-specific, machine-verifiable validator fix is
   // accepted, the exact repo/issue/snapshot/base/checkpoint/generation must
-  // still match, and one durable release claim is created before any dispatch.
+  // still match, one durable release claim is created before any dispatch, and
+  // the dispatching pass spends it with a durable consumption receipt. A
+  // consumed claim or a rejection newer than the claim never releases again.
   // Arbitrary default-branch commits, free-form comments, a moved checkpoint,
   // a changed snapshot, an owner STOP, or a live competing run never release.
   let checkpointResumeHoldRelease = null;
@@ -943,6 +945,15 @@ module.exports = async function runIssueScheduler({ github, context, core }) {
   // never a comment claim, so arbitrary main commits cannot release a hold.
   const checkpointResumeReleaseMarkerRe =
     /<!--\s*continuum-checkpoint-resume-release\s+v=1\s+repo=([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)\s+issue=(\d+)\s+generation=(\d+)\s+operation=(\S+)\s+checkpoint=(\S+)\s+checkpoint_sha=([0-9a-fA-F]{40})\s+base_ref=(\S+)\s+base_sha=([0-9a-fA-F]{40})\s+snapshot=([0-9a-fA-F]{64})\s+reason=(\S+)\s+fix=([A-Za-z0-9_.-]+)\s+fix_pr=(\d+)\s+fix_sha=([0-9a-fA-F]{40})\s+owner=([A-Za-z0-9_.-]+)\s*-->/;
+  // A release claim is single-use. The controller that actually dispatches a
+  // resumption persists this durable consumption receipt first; the receipt
+  // names the release comment it spends and the attempt that spent it. A
+  // later scheduler/watchdog pass therefore replays history without
+  // authorizing a second resumption. The receipt is written before dispatch
+  // and rolled back if the dispatch itself fails, so an infrastructure
+  // failure remains an unconsumed claim that may be retried.
+  const checkpointResumeConsumptionMarkerRe =
+    /<!--\s*continuum-checkpoint-resume-consumed\s+v=1\s+repo=([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)\s+issue=(\d+)\s+release=(\d+)\s+attempt=(\S+)\s+generation=(\d+)\s+operation=(\S+)\s+checkpoint=(\S+)\s+checkpoint_sha=([0-9a-fA-F]{40})\s+snapshot=([0-9a-fA-F]{64})\s+reason=(\S+)\s*-->/;
   const checkpointFixableHoldReasons = new Set([
     'wrong-generation',
     'resume-wrong-generation',
@@ -1232,6 +1243,156 @@ module.exports = async function runIssueScheduler({ github, context, core }) {
     };
   }
 
+  function checkpointConsumptionMarkerBody({
+    repoFull, issueNumber, hold, release, attempt,
+  }) {
+    const clean = (value, fallback) => {
+      const text = String(value || '').trim().replace(/\s+/g, '-');
+      return text || (fallback || '-');
+    };
+    return [
+      '<!-- continuum-checkpoint-resume-consumed v=1 repo=' + repoFull +
+        ' issue=' + Number(issueNumber) +
+        ' release=' + Number(release.marker.commentId) +
+        ' attempt=' + clean(attempt) +
+        ' generation=' + (Number(hold.generation) || 0) +
+        ' operation=' + clean(hold.operation, 'unknown') +
+        ' checkpoint=' + clean(hold.checkpointRef) +
+        ' checkpoint_sha=' + String(hold.checkpointSha || '').toLowerCase() +
+        ' snapshot=' + String(hold.snapshotSpec || '').toLowerCase() +
+        ' reason=' + clean(hold.reason) + ' -->',
+      '⚡ **Continuum · issue-scheduler**',
+      '<!-- continuum-origin role=continuum component=issue-scheduler -->',
+      '',
+      'Consumed the single checkpoint resume release for #' +
+        Number(issueNumber) + '. A later pass must not resume this same ' +
+        'checkpoint/base/snapshot identity again.',
+    ].join('\n');
+  }
+
+  function parseCheckpointConsumptionMarker(body, {
+    repoFull, issueNumber, hold,
+  }) {
+    const match = String(body || '').match(checkpointResumeConsumptionMarkerRe);
+    if (!match) return null;
+    if (
+      match[1].toLowerCase() !== repoFull.toLowerCase() ||
+      Number(match[2]) !== Number(issueNumber) ||
+      Number(match[5]) !== Number(hold.generation) ||
+      match[6] !== String(hold.operation) ||
+      match[7].replace(/^refs\/heads\//, '') !==
+        String(hold.checkpointRef).replace(/^refs\/heads\//, '') ||
+      match[8].toLowerCase() !== String(hold.checkpointSha).toLowerCase() ||
+      match[9].toLowerCase() !== String(hold.snapshotSpec).toLowerCase() ||
+      match[10] !== String(hold.reason)
+    ) {
+      return null;
+    }
+    return {
+      releaseId: Number(match[3]),
+      attempt: match[4],
+      generation: Number(match[5]),
+      reason: match[10],
+    };
+  }
+
+  // Persist the consuming attempt before a dispatch. The lowest receipt id
+  // wins a concurrent consumption race, mirroring the release-claim rule, so
+  // two controllers can never both spend the same release.
+  async function consumeCheckpointResumeRelease({
+    targetOwner, targetRepo, issueNumber, hold, release,
+    readClient, writeClient, controller,
+  }) {
+    if (!release || !release.released || !release.marker) {
+      return { consumed: false, reason: 'release-not-authorized' };
+    }
+    const repoFull = targetOwner + '/' + targetRepo;
+    const attempt = (
+      String(controller || 'issue-scheduler') + ':' +
+      String(process.env.GITHUB_RUN_ID || 'local') + ':' +
+      String(process.env.GITHUB_RUN_ATTEMPT || '1') + ':' +
+      String(Date.now())
+    ).replace(/[^A-Za-z0-9_.:-]/g, '-');
+    let created;
+    try {
+      created = await writeClient.rest.issues.createComment({
+        owner: targetOwner,
+        repo: targetRepo,
+        issue_number: issueNumber,
+        body: checkpointConsumptionMarkerBody({
+          repoFull,
+          issueNumber,
+          hold,
+          release,
+          attempt,
+        }),
+      });
+    } catch (err) {
+      return {
+        consumed: false,
+        reason: 'consumption-write-failed',
+        status: Number(err && err.status || 0),
+      };
+    }
+    const ownId = Number(created && created.data && created.data.id || 0);
+    let freshComments;
+    try {
+      freshComments = await readClient.paginate(
+        readClient.rest.issues.listComments,
+        {
+          owner: targetOwner,
+          repo: targetRepo,
+          issue_number: issueNumber,
+          per_page: 100,
+        }
+      );
+    } catch (err) {
+      await releaseCheckpointResumeConsumption({
+        targetOwner, targetRepo, commentId: ownId, writeClient,
+      });
+      return { consumed: false, reason: 'consumption-verification-unavailable' };
+    }
+    const winners = [];
+    for (const comment of freshComments || []) {
+      if (!isTrustedStopComment(comment, targetOwner)) continue;
+      const parsed = parseCheckpointConsumptionMarker(comment.body || '', {
+        repoFull, issueNumber, hold,
+      });
+      if (!parsed || parsed.releaseId !== release.marker.commentId) continue;
+      winners.push({ ...parsed, commentId: Number(comment.id || 0) });
+    }
+    winners.sort((a, b) => a.commentId - b.commentId);
+    if (!winners.length || winners[0].commentId !== ownId) {
+      await releaseCheckpointResumeConsumption({
+        targetOwner, targetRepo, commentId: ownId, writeClient,
+      });
+      return {
+        consumed: false,
+        reason: 'consumption-claimed-by-other',
+        commentId: ownId,
+      };
+    }
+    return { consumed: true, commentId: ownId, attempt };
+  }
+
+  async function releaseCheckpointResumeConsumption({
+    targetOwner, targetRepo, commentId, writeClient,
+  }) {
+    if (!Number(commentId)) return;
+    try {
+      await writeClient.rest.issues.deleteComment({
+        owner: targetOwner,
+        repo: targetRepo,
+        comment_id: Number(commentId),
+      });
+    } catch (err) {
+      core.warning(
+        'Checkpoint resume consumption cleanup failed for comment ' +
+        commentId + ': ' + (err.message || err)
+      );
+    }
+  }
+
   async function evaluateCheckpointResumeRelease({
     targetOwner, targetRepo, issueNumber, hold, comments, readClient,
     sourceClient, writeClient, controller, allowRelease,
@@ -1254,7 +1415,42 @@ module.exports = async function runIssueScheduler({ github, context, core }) {
     }
     markers.sort((a, b) => a.commentId - b.commentId);
     if (markers.length > 0) {
+      const holdOrder = stopOrderKey(hold);
+      const consumptions = [];
+      for (const comment of trusted) {
+        const parsed = parseCheckpointConsumptionMarker(comment.body || '', {
+          repoFull, issueNumber, hold,
+        });
+        if (!parsed) continue;
+        consumptions.push({
+          ...parsed,
+          commentId: Number(comment.id || 0),
+          createdAt: comment.created_at || '',
+        });
+      }
+      let superseded = false;
       for (const marker of markers) {
+        const markerOrder = stopOrderKey({
+          created_at: marker.createdAt,
+          id: marker.commentId,
+        });
+        // A newer rejection for this exact tuple proves the release did not
+        // clear the held premise; the older release can never be spent again.
+        if (markerOrder <= holdOrder) {
+          superseded = true;
+          continue;
+        }
+        const consumed = consumptions.some(consumption =>
+          consumption.releaseId === marker.commentId &&
+          stopOrderKey({
+            created_at: consumption.createdAt,
+            id: consumption.commentId,
+          }) > markerOrder
+        );
+        if (consumed) {
+          superseded = true;
+          continue;
+        }
         const verified = await verifyCheckpointValidatorFix(
           { ...hold, reason: marker.reason }, sourceClient
         );
@@ -1275,10 +1471,18 @@ module.exports = async function runIssueScheduler({ github, context, core }) {
           };
         }
       }
-      // A release marker exists for this exact identity but its fix
-      // provenance cannot be proven. Keep the fail-closed hold and never
-      // create a second marker for the same identity.
-      return { released: false, reason: 'unverified-release-marker', markers };
+      // Either the only release markers were already consumed (or superseded
+      // by a newer rejection), or their fix provenance cannot be proven. Keep
+      // the fail-closed hold and never create a second marker for the same
+      // identity.
+      return {
+        released: false,
+        reason: superseded
+          ? 'release-consumed-or-superseded'
+          : 'unverified-release-marker',
+        markers,
+        consumptions,
+      };
     }
     if (allowRelease === false) {
       return { released: false, reason: 'release-not-allowed' };
@@ -5104,12 +5308,39 @@ module.exports = async function runIssueScheduler({ github, context, core }) {
       }
     }
   
-    // A label acts as a short lease/reservation while OpenCode starts.
-    // It is rolled back immediately if posting /oc fails, expires
-    // automatically if no PR appears, and is reconciled from PR state.
-    await addLabel(issue.number, inProgressLabel);
-  
+    // A release claim is single-use. Spend it durably before the dispatch so
+    // a later scheduler pass (including one that reconciles the reservation
+    // away before checking the lease) can never authorize a second
+    // resumption of the identical checkpoint/base/snapshot. The receipt is
+    // rolled back if the dispatch below fails, leaving the claim retryable.
+    let checkpointConsumption = null;
     try {
+      if (freshRelease && freshRelease.released) {
+        checkpointConsumption = await consumeCheckpointResumeRelease({
+          targetOwner: owner,
+          targetRepo: repo,
+          issueNumber: issue.number,
+          hold: freshRelease.marker,
+          release: freshRelease,
+          readClient: readGithub,
+          writeClient: github,
+          controller: 'issue-scheduler',
+        });
+        if (!checkpointConsumption.consumed) {
+          core.info(
+            'Skipping #' + issue.number +
+            ': checkpoint release consumption failed (' +
+            checkpointConsumption.reason + ').'
+          );
+          continue;
+        }
+      }
+
+      // A label acts as a short lease/reservation while OpenCode starts.
+      // It is rolled back immediately if posting /oc fails, expires
+      // automatically if no PR appears, and is reconciled from PR state.
+      await addLabel(issue.number, inProgressLabel);
+
       if (resetMarkers) {
         // Opt-in: drop previously recorded dispatch markers so the
         // issue starts from a fresh attempt budget. Consumers that
@@ -5192,6 +5423,14 @@ module.exports = async function runIssueScheduler({ github, context, core }) {
         });
       }
     } catch (err) {
+      if (checkpointConsumption && checkpointConsumption.consumed) {
+        await releaseCheckpointResumeConsumption({
+          targetOwner: owner,
+          targetRepo: repo,
+          commentId: checkpointConsumption.commentId,
+          writeClient: github,
+        });
+      }
       await removeLabel(issue.number, inProgressLabel);
       throw err;
     }

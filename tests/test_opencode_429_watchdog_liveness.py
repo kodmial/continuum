@@ -1944,7 +1944,7 @@ class WatchdogHarness(unittest.TestCase):
         scenario = self.verified_fix(self.stale_hold_retry_scenario())
         scenario["comments"].append(
             thread_comment(
-                7001,
+                6902177810,
                 checkpoint_release_marker(),
                 datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
             )

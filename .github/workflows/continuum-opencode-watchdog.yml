@@ -1162,6 +1162,13 @@ jobs:
           // and arbitrary main commits never authorize a release.
           const checkpointResumeReleaseMarkerRe =
             /<!--\s*continuum-checkpoint-resume-release\s+v=1\s+repo=([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)\s+issue=(\d+)\s+generation=(\d+)\s+operation=(\S+)\s+checkpoint=(\S+)\s+checkpoint_sha=([0-9a-fA-F]{40})\s+base_ref=(\S+)\s+base_sha=([0-9a-fA-F]{40})\s+snapshot=([0-9a-fA-F]{64})\s+reason=(\S+)\s+fix=([A-Za-z0-9_.-]+)\s+fix_pr=(\d+)\s+fix_sha=([0-9a-fA-F]{40})\s+owner=([A-Za-z0-9_.-]+)\s*-->/;
+          // A release claim is single-use. Whichever controller dispatches the
+          // resumption persists this durable receipt first, naming the release
+          // comment it spends. A later pass replays the release without
+          // authorizing a second resumption; a dispatch failure rolls the
+          // receipt back so an unconsumed claim stays retryable.
+          const checkpointResumeConsumptionMarkerRe =
+            /<!--\s*continuum-checkpoint-resume-consumed\s+v=1\s+repo=([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)\s+issue=(\d+)\s+release=(\d+)\s+attempt=(\S+)\s+generation=(\d+)\s+operation=(\S+)\s+checkpoint=(\S+)\s+checkpoint_sha=([0-9a-fA-F]{40})\s+snapshot=([0-9a-fA-F]{64})\s+reason=(\S+)\s*-->/;
           const checkpointFixableHoldReasons = new Set([
             'wrong-generation',
             'resume-wrong-generation',
@@ -1416,6 +1423,171 @@ jobs:
             }
             return markers.sort((a, b) => a.commentId - b.commentId);
           }
+          function checkpointConsumptionMarkerBody({
+            repoFull, issueNumber, hold, release, attempt,
+          }) {
+            const clean = (value, fallback) =>
+              String(value || '').trim().replace(/\s+/g, '-') ||
+                (fallback || '-');
+            const generation = Number(
+              hold.recoveryGeneration !== undefined
+                ? hold.recoveryGeneration
+                : hold.generation
+            ) || 0;
+            return [
+              '<!-- continuum-checkpoint-resume-consumed v=1 repo=' +
+                repoFull + ' issue=' + Number(issueNumber) +
+                ' release=' + Number(release.marker.commentId) +
+                ' attempt=' + clean(attempt) +
+                ' generation=' + generation +
+                ' operation=' + clean(hold.operation, 'unknown') +
+                ' checkpoint=' + clean(hold.checkpointRef) +
+                ' checkpoint_sha=' +
+                  String(hold.checkpointSha || '').toLowerCase() +
+                ' snapshot=' +
+                  String(hold.snapshotSpec || '').toLowerCase() +
+                ' reason=' + clean(hold.reason) + ' -->',
+              '⚡ **Continuum · opencode-watchdog**',
+              '<!-- continuum-origin role=continuum component=opencode-watchdog -->',
+              '',
+              'Consumed the single checkpoint resume release for #' +
+                Number(issueNumber) + '. A later pass must not resume this ' +
+                'same checkpoint/base/snapshot identity again.',
+            ].join('\n');
+          }
+          function parseCheckpointConsumptionMarker(body, {
+            issueNumber, hold,
+          }) {
+            const match = String(body || '').match(
+              checkpointResumeConsumptionMarkerRe
+            );
+            if (!match) return null;
+            const generation = Number(
+              hold.recoveryGeneration !== undefined
+                ? hold.recoveryGeneration
+                : hold.generation
+            );
+            if (
+              match[1].toLowerCase() !== repoFullName.toLowerCase() ||
+              Number(match[2]) !== Number(issueNumber) ||
+              Number(match[5]) !== generation ||
+              match[6] !== String(hold.operation) ||
+              match[7].replace(/^refs\/heads\//, '') !==
+                String(hold.checkpointRef).replace(/^refs\/heads\//, '') ||
+              match[8].toLowerCase() !==
+                String(hold.checkpointSha).toLowerCase() ||
+              match[9].toLowerCase() !==
+                String(hold.snapshotSpec).toLowerCase() ||
+              match[10] !== String(hold.reason)
+            ) return null;
+            return {
+              releaseId: Number(match[3]),
+              attempt: match[4],
+              generation: Number(match[5]),
+              reason: match[10],
+            };
+          }
+          function checkpointConsumptionMarkers(
+            comments, issueNumber, hold
+          ) {
+            const markers = [];
+            for (const comment of comments || []) {
+              if (!trustedCheckpointComment(comment)) continue;
+              const parsed = parseCheckpointConsumptionMarker(
+                comment.body || '', { issueNumber, hold }
+              );
+              if (!parsed) continue;
+              markers.push({
+                ...parsed,
+                commentId: Number(comment.id || 0),
+                createdAt: comment.created_at || '',
+              });
+            }
+            return markers.sort((a, b) => a.commentId - b.commentId);
+          }
+          async function releaseCheckpointResumeConsumption(commentId) {
+            if (!Number(commentId)) return;
+            try {
+              await github.rest.issues.deleteComment({
+                owner,
+                repo,
+                comment_id: Number(commentId),
+              });
+            } catch (err) {
+              core.warning(
+                'Checkpoint resume consumption cleanup failed for comment ' +
+                commentId + ': ' + (err.message || err)
+              );
+            }
+          }
+          // Persist the consuming attempt before a dispatch. The lowest
+          // receipt id wins a concurrent consumption race, mirroring the
+          // release-claim rule.
+          async function consumeCheckpointResumeRelease({
+            issueNumber, hold, release, controller,
+          }) {
+            if (!release || !release.released || !release.marker) {
+              return { consumed: false, reason: 'release-not-authorized' };
+            }
+            const attempt = (
+              String(controller || 'opencode-watchdog') + ':' +
+              String(process.env.GITHUB_RUN_ID || 'local') + ':' +
+              String(process.env.GITHUB_RUN_ATTEMPT || '1') + ':' +
+              String(Date.now())
+            ).replace(/[^A-Za-z0-9_.:-]/g, '-');
+            let created;
+            try {
+              // The consumed receipt is a Continuum-owned comment.
+              // <!-- continuum-origin role=continuum component=opencode-watchdog -->
+              // <!-- continuum-checkpoint-resume-consumed v=1 repo= -->
+              created = await github.rest.issues.createComment({
+                owner,
+                repo,
+                issue_number: issueNumber,
+                body: checkpointConsumptionMarkerBody({
+                  repoFull: repoFullName,
+                  issueNumber,
+                  hold,
+                  release,
+                  attempt,
+                }),
+              });
+            } catch (err) {
+              return {
+                consumed: false,
+                reason: 'consumption-write-failed',
+                status: Number(err && err.status || 0),
+              };
+            }
+            const ownId = Number(
+              created && created.data && created.data.id || 0
+            );
+            let freshComments;
+            try {
+              freshComments = await readGithub.paginate(
+                readGithub.rest.issues.listComments,
+                { owner, repo, issue_number: issueNumber, per_page: 100 }
+              );
+            } catch (err) {
+              await releaseCheckpointResumeConsumption(ownId);
+              return {
+                consumed: false,
+                reason: 'consumption-verification-unavailable',
+              };
+            }
+            const winners = checkpointConsumptionMarkers(
+              freshComments, issueNumber, hold
+            ).filter(marker => marker.releaseId === release.marker.commentId);
+            if (!winners.length || winners[0].commentId !== ownId) {
+              await releaseCheckpointResumeConsumption(ownId);
+              return {
+                consumed: false,
+                reason: 'consumption-claimed-by-other',
+                commentId: ownId,
+              };
+            }
+            return { consumed: true, commentId: ownId, attempt };
+          }
           async function evaluateCheckpointResumeRelease({
             issueNumber, hold, comments, client, sourceClient, controller,
             allowRelease, liveOverlap,
@@ -1424,7 +1596,34 @@ jobs:
               comments, issueNumber, hold
             );
             if (markers.length > 0) {
+              const holdOrder = String(hold.order || '');
+              const consumptions = checkpointConsumptionMarkers(
+                comments, issueNumber, hold
+              );
+              let superseded = false;
               for (const marker of markers) {
+                const markerOrder = checkpointCommentOrder({
+                  created_at: marker.createdAt,
+                  id: marker.commentId,
+                });
+                // A newer rejection for this exact tuple proves the release
+                // did not clear the held premise; the older release can never
+                // be spent again.
+                if (holdOrder && markerOrder <= holdOrder) {
+                  superseded = true;
+                  continue;
+                }
+                const consumed = consumptions.some(consumption =>
+                  consumption.releaseId === marker.commentId &&
+                  checkpointCommentOrder({
+                    created_at: consumption.createdAt,
+                    id: consumption.commentId,
+                  }) > markerOrder
+                );
+                if (consumed) {
+                  superseded = true;
+                  continue;
+                }
                 const verified = await verifyCheckpointValidatorFix(
                   { ...hold, reason: marker.reason }, sourceClient
                 );
@@ -1471,8 +1670,11 @@ jobs:
               }
               return {
                 released: false,
-                reason: 'unverified-release-marker',
+                reason: superseded
+                  ? 'release-consumed-or-superseded'
+                  : 'unverified-release-marker',
                 markers,
+                consumptions,
               };
             }
             if (allowRelease === false) {
@@ -2119,6 +2321,7 @@ jobs:
             // hold. A held checkpoint/base/snapshot identity already failed
             // resume verification, so never create a recovery claim or
             // dispatch it again: stop the pass instead.
+            let checkpointRelease = null;
             if (mode === 'issue') {
               const hold = await checkpointResumeHold(
                 issueText, comments, checkpointRef,
@@ -2173,6 +2376,9 @@ jobs:
                   'resumption and the watchdog stands down.'
                 );
                 return;
+              }
+              if (hold.release && hold.release.released) {
+                checkpointRelease = hold.release;
               }
             }
             // The ref tip is authoritative for a fetchable checkpoint; a
@@ -2577,6 +2783,28 @@ jobs:
                 return;
               }
             }
+            // The release claim, when one authorized this pass, is spent
+            // durably before the dispatch so no later pass can resume the same
+            // checkpoint/base/snapshot again.
+            let checkpointConsumption = null;
+            if (checkpointRelease) {
+              checkpointConsumption = await consumeCheckpointResumeRelease({
+                issueNumber: threadNumber,
+                hold: checkpointRelease.marker,
+                release: checkpointRelease,
+                controller: 'opencode-watchdog',
+              });
+              if (!checkpointConsumption.consumed) {
+                await deleteRecoveryClaim(claim);
+                core.notice(
+                  'OpenCode infrastructure operation ' + operation +
+                  ' generation ' + generation +
+                  ' could not consume its checkpoint release (' +
+                  checkpointConsumption.reason + '); standing down.'
+                );
+                return;
+              }
+            }
             const dispatchStarted = Date.now();
             try {
               await github.rest.actions.createWorkflowDispatch({
@@ -2588,6 +2816,11 @@ jobs:
               });
             } catch (dispatchErr) {
               const status = Number(dispatchErr && dispatchErr.status || 0);
+              if (checkpointConsumption && checkpointConsumption.consumed) {
+                await releaseCheckpointResumeConsumption(
+                  checkpointConsumption.commentId
+                );
+              }
               await deleteRecoveryClaim(claim);
               await recordRecoveryState({
                 ...baseState,
@@ -3384,24 +3617,54 @@ jobs:
           }
           await removeLabel(pausedLabel);
           await addLabel(inProgressLabel);
+          // A release claim is spent durably before the retry: a later pass
+          // must not authorize another resumption of the same identity.
+          let retryConsumption = null;
+          if (checkpointHold.release && checkpointHold.release.released) {
+            retryConsumption = await consumeCheckpointResumeRelease({
+              issueNumber,
+              hold: checkpointHold.release.marker,
+              release: checkpointHold.release,
+              controller: 'opencode-watchdog',
+            });
+            if (!retryConsumption.consumed) {
+              await removeLabel(inProgressLabel);
+              core.notice(
+                'Issue #' + issueNumber +
+                ' could not consume its checkpoint release (' +
+                retryConsumption.reason + '); standing down.'
+              );
+              return;
+            }
+          }
           // The actual recovery: a fresh `/oc` comment, which the consumer's
           // OpenCode caller admits on an owner-authored issue comment.
-          await github.rest.issues.createComment({
-            owner,
-            repo,
-            issue_number: issueNumber,
-            body: [
-              '/oc',
-              '',
-              retryMarker,
-              '⚡ **Continuum · opencode-watchdog**',
-              '<!-- continuum-origin role=continuum component=opencode-watchdog -->',
-              'Automatic recovery retry ' + (previousRetries + 1) +
-                '/' + maxRetries + ' after OpenCode run ' + run.id +
-                ' ended with ' + run.conclusion +
-                (run.conclusion === 'success' ? ' but produced no PR.' : '.') ,
-            ].join('\n'),
-          });
+          try {
+            await github.rest.issues.createComment({
+              owner,
+              repo,
+              issue_number: issueNumber,
+              body: [
+                '/oc',
+                '',
+                retryMarker,
+                '⚡ **Continuum · opencode-watchdog**',
+                '<!-- continuum-origin role=continuum component=opencode-watchdog -->',
+                'Automatic recovery retry ' + (previousRetries + 1) +
+                  '/' + maxRetries + ' after OpenCode run ' + run.id +
+                  ' ended with ' + run.conclusion +
+                  (run.conclusion === 'success' ? ' but produced no PR.' : '.') ,
+              ].join('\n'),
+            });
+          } catch (err) {
+            if (retryConsumption) {
+              await releaseCheckpointResumeConsumption(
+                retryConsumption.commentId
+              );
+            }
+            await removeLabel(inProgressLabel);
+            throw err;
+          }
           core.notice(
             'Immediately retried issue #' + issueNumber +
             ' after failed OpenCode run ' + run.id + '.'

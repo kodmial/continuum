@@ -71,6 +71,22 @@ def release_marker(
     )
 
 
+def consumption_marker(
+    release_id, *, attempt="issue-scheduler:1:1",
+    snapshot=SNAPSHOT, issue=ISSUE, checkpoint_sha=CHECKPOINT_SHA,
+    reason="wrong-generation", repo="kodmial/continuum", generation=2,
+) -> str:
+    return (
+        "<!-- continuum-checkpoint-resume-consumed v=1 "
+        "repo=" + repo + " issue=" + str(issue) +
+        " release=" + str(release_id) + " attempt=" + attempt +
+        " generation=" + str(generation) +
+        " operation=" + OPERATION + " checkpoint=" + CHECKPOINT_REF +
+        " checkpoint_sha=" + checkpoint_sha + " snapshot=" + snapshot +
+        " reason=" + reason + " -->"
+    )
+
+
 def manifest() -> dict:
     return {
         "schema_version": 1,
@@ -103,6 +119,7 @@ function apiError(status, message) {
 const comments = (scenario.comments || []).map(comment => ({ ...comment }));
 let nextCommentId = scenario.nextCommentId || 1000;
 let raceInjected = false;
+let lastSchedulerApi = null;
 
 const listReviews = async () => ({ data: scenario.reviews || [] });
 const listFiles = async () => ({ data: scenario.files || [] });
@@ -242,9 +259,10 @@ async function runScheduler() {
     'const stopOrderKey = entry => String(entry.created_at || "") + "#" + ' +
       'String(entry.id || 0).padStart(12, "0");\n' +
     schedulerSource +
-    '\nreturn { hold: checkpointResumeHold, released: () => checkpointResumeHoldRelease };'
+    '\nreturn { hold: checkpointResumeHold, released: () => checkpointResumeHoldRelease, consume: consumeCheckpointResumeRelease };'
   );
   const api = await factory(writeGithub, core, scenario.owner || 'kodmial', readGithub);
+  lastSchedulerApi = api;
   const hold = await api.hold(
     scenario.owner || 'kodmial',
     scenario.repo || 'continuum',
@@ -292,10 +310,26 @@ async function runWatchdog() {
 }
 
 (async () => {
+  const scheduler = await runScheduler();
+  let consumption = null;
+  if (scenario.consumeSchedulerRelease && scheduler.release &&
+      scheduler.release.released && lastSchedulerApi) {
+    consumption = await lastSchedulerApi.consume({
+      targetOwner: scenario.owner || 'kodmial',
+      targetRepo: scenario.repo || 'continuum',
+      issueNumber: Number(scenario.issue || 534),
+      hold: scheduler.release.marker,
+      release: scheduler.release,
+      readClient: readGithub,
+      writeClient: writeGithub,
+      controller: 'issue-scheduler',
+    });
+  }
   const result = {
-    scheduler: await runScheduler(),
-    // A second scheduler pass over the same durable history proves the
-    // authorized release is reused instead of republished.
+    scheduler,
+    consumption,
+    // A second scheduler pass over the same durable history proves an
+    // unconsumed release is reusable and a consumed one is spent.
     schedulerAgain: await runScheduler(),
     watchdog: await runWatchdog(),
     comments: comments.map(comment => ({ ...comment })),
@@ -439,6 +473,83 @@ class CheckpointHoldReleaseTests(unittest.TestCase):
             len([c for c in result["comments"] if "resume-release" in c["body"]]),
             1,
         )
+
+    def test_consuming_the_release_is_durable_across_scheduler_passes(self):
+        scenario = self.base_scenario()
+        scenario["consumeSchedulerRelease"] = True
+        result = self.run_scenario(scenario)
+        self.assertTrue(result["consumption"]["consumed"])
+        self.assertFalse(result["scheduler"]["blocked"])
+        # The receipt records the consuming attempt before any dispatch, so
+        # the next pass replays it without authorizing a second resumption.
+        self.assertTrue(result["schedulerAgain"]["blocked"])
+        self.assertFalse(result["schedulerAgain"]["release"]["released"])
+        self.assertEqual(
+            result["schedulerAgain"]["release"]["reason"],
+            "release-consumed-or-superseded",
+        )
+        self.assertTrue(result["watchdog"]["blocked"])
+        self.assertFalse(result["watchdog"]["release"]["released"])
+        self.assertEqual(
+            len([c for c in result["comments"] if "resume-release" in c["body"]]),
+            1,
+        )
+
+    def test_a_consumed_release_never_authorizes_another_resumption(self):
+        scenario = self.base_scenario()
+        scenario["comments"].extend([
+            {
+                "id": 2,
+                "body": release_marker(),
+                "user": {"login": "github-actions[bot]"},
+                "author_association": "OWNER",
+                "created_at": "2026-11-17T12:00:00Z",
+            },
+            {
+                "id": 3,
+                "body": consumption_marker(2),
+                "user": {"login": "github-actions[bot]"},
+                "author_association": "OWNER",
+                "created_at": "2026-11-17T12:01:00Z",
+            },
+        ])
+        result = self.run_scenario(scenario)
+        for name in ("scheduler", "watchdog"):
+            self.assertTrue(result[name]["blocked"], name)
+            self.assertFalse(result[name]["release"]["released"], name)
+            self.assertEqual(
+                result[name]["release"]["reason"],
+                "release-consumed-or-superseded",
+                name,
+            )
+
+    def test_a_newer_rejection_supersedes_an_older_release(self):
+        scenario = self.base_scenario()
+        scenario["comments"].extend([
+            {
+                "id": 2,
+                "body": release_marker(),
+                "user": {"login": "github-actions[bot]"},
+                "author_association": "OWNER",
+                "created_at": "2026-11-17T12:00:00Z",
+            },
+            {
+                "id": 3,
+                "body": hold_marker(),
+                "user": {"login": "github-actions[bot]"},
+                "author_association": "OWNER",
+                "created_at": "2026-11-17T12:05:00Z",
+            },
+        ])
+        result = self.run_scenario(scenario)
+        for name in ("scheduler", "watchdog"):
+            self.assertTrue(result[name]["blocked"], name)
+            self.assertFalse(result[name]["release"]["released"], name)
+            self.assertEqual(
+                result[name]["release"]["reason"],
+                "release-consumed-or-superseded",
+                name,
+            )
 
     def test_non_fixable_hold_reason_stays_blocked_with_a_verified_fix(self):
         scenario = self.base_scenario()
