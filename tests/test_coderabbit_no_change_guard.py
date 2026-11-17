@@ -295,12 +295,13 @@ const github = {{
 
 def dispatch_step(items, issue_comment_rounds, review_comments=None, head=HEAD,
                   cutoff=None, run=None, jobs=None, runs_error=False,
-                  issue_error_rounds=(), caller="batch"):
+                  issue_error_rounds=(), caller="batch", run_rounds=None):
     source = js_for_step(BATCHER, "Dispatch one batched repair to canonical OpenCode")
     review_comments = (
         base_review_comments(head=head) if review_comments is None
         else review_comments
     )
+    run_rounds = run_rounds or [run or base_run()]
     caller_source = (
         "on:\n  workflow_dispatch:\n    inputs:\n      unresolved_items_json:\n"
         if caller == "batch"
@@ -311,6 +312,8 @@ const crypto = require('crypto');
 const head = {json.dumps(head)};
 const items = {json.dumps(items)};
 const rounds = {json.dumps(issue_comment_rounds)};
+const runRounds = {json.dumps(run_rounds)};
+let runRound = 0;
 let round = 0;
 const posted = [];
 const dispatches = [];
@@ -355,7 +358,9 @@ const github = {{
       createWorkflowDispatch: async args => dispatches.push(args),
       getWorkflowRun: async () => {{
         if ({str(runs_error).lower()}) throw new Error('run unavailable');
-        return {{data: {json.dumps(run or base_run())}}};
+        const value = runRounds[Math.min(runRound, runRounds.length - 1)];
+        runRound += 1;
+        return {{data: value}};
       }},
       listJobsForWorkflowRun: async () => ({{
         data: {json.dumps(jobs if jobs is not None else base_jobs())},
@@ -611,6 +616,53 @@ class NoChangeGuardTests(unittest.TestCase):
         self.assertEqual(len(result["dispatches"]), 0)
         self.assertEqual(len(result["posted"]), 1)
         self.assertIn("no-change-awaiting-review-or-evidence", result["posted"][0])
+
+    def test_ref_qualified_workflow_path_still_corroborates_no_change(self):
+        # The Actions API may report `run.path` with an `@<ref>` suffix; that
+        # must not be mistaken for a different workflow.
+        issue_comments, _, _ = self.ready_state()
+        qualified = base_run(
+            path=".github/workflows/opencode.yml@refs/heads/main"
+        )
+        collected = collect_step(
+            items_for(), issue_comments, run=qualified,
+        )
+        self.assertEqual(collected["out"]["should_run"], "false")
+        self.assertNotIn("no_change_deferred_json", collected["out"])
+        self.assertEqual(
+            [entry["finding_id"]
+             for entry in json.loads(collected["out"]["no_change_json"])],
+            [FINDING],
+        )
+        dispatched = dispatch_step(
+            items_for(), [issue_comments], cutoff=100000, run=qualified,
+        )
+        self.assertEqual(len(dispatched["dispatches"]), 0)
+        self.assertEqual(len(dispatched["posted"]), 1)
+        self.assertIn("no-change-awaiting-review-or-evidence",
+                      dispatched["posted"][0])
+
+    def test_final_check_refreshes_run_evidence_cached_before_completion(self):
+        # The preliminary check caches an in-progress run. The run completes
+        # before dispatch, so the final check must re-read it and suppress the
+        # duplicate instead of trusting the stale response.
+        issue_comments, _, _ = self.ready_state()
+        result = dispatch_step(
+            items_for(),
+            [issue_comments, issue_comments, issue_comments],
+            cutoff=100000,
+            run_rounds=[
+                base_run(status="in_progress", conclusion=None),
+                base_run(),
+            ],
+        )
+        self.assertEqual(len(result["dispatches"]), 0, result["notices"])
+        self.assertEqual(len(result["posted"]), 1)
+        self.assertIn("no-change-awaiting-review-or-evidence",
+                      result["posted"][0])
+        self.assertTrue(any("between collection and dispatch" in notice
+                            for notice in result["notices"]),
+                        result["notices"])
 
     def test_failed_cancelled_timed_out_and_queued_runs_do_not_guard(self):
         cases = [

@@ -746,6 +746,7 @@ jobs:
               }
               const run = evidence.run;
               const runPath = String(run.path || '')
+                .replace(/@.*$/, '')
                 .replace(/^\.github\/workflows\//, '');
               const expectedRepairTitle = new RegExp(
                 `^OpenCode repair PR #${pullNumber}` +
@@ -1064,9 +1065,8 @@ jobs:
               reviewIds.set(findingId, reviewId);
               return reviewId;
             };
-            const outcomeRunCache = new Map();
             const corroborateOutcomeRun = async (
-              comments, comment, attrs
+              comments, comment, attrs, runCache
             ) => {
               const defer = reason => ({ state: 'defer', reason });
               const runIdText = String(attrs.run || '');
@@ -1112,7 +1112,7 @@ jobs:
                 );
               }
               if (digest !== attrs.digest) return defer('digest-mismatch');
-              let evidence = outcomeRunCache.get(runId);
+              let evidence = runCache.get(runId);
               if (!evidence) {
                 evidence = {};
                 try {
@@ -1125,13 +1125,14 @@ jobs:
                 } catch (err) {
                   evidence.error = err;
                 }
-                outcomeRunCache.set(runId, evidence);
+                runCache.set(runId, evidence);
               }
               if (evidence.error || !evidence.run) {
                 return defer('run-unreadable');
               }
               const run = evidence.run;
               const runPath = String(run.path || '')
+                .replace(/@.*$/, '')
                 .replace(/^\.github\/workflows\//, '');
               const expectedRepairTitle = new RegExp(
                 `^OpenCode repair PR #${pullNumber}` +
@@ -1201,7 +1202,7 @@ jobs:
               };
             };
             const evaluateNoChange = async (
-              findingId, comments, currentHead
+              findingId, comments, currentHead, runCache
             ) => {
               let newest = null;
               for (const comment of comments) {
@@ -1226,7 +1227,7 @@ jobs:
                 return { state: 'defer', reason: 'outcome-identity-mismatch' };
               }
               return corroborateOutcomeRun(
-                comments, newest.comment, attrs
+                comments, newest.comment, attrs, runCache
               );
             };
             const filterNoChange = async (
@@ -1235,11 +1236,14 @@ jobs:
               const kept = [];
               const suppressed = [];
               const deferred = [];
+              // Each check re-reads run evidence so a run that completes
+              // between the preliminary and the final check cannot be missed.
+              const runCache = new Map();
               for (const item of candidateItems) {
                 let decision;
                 try {
                   decision = await evaluateNoChange(
-                    item.finding_id, comments, currentHead
+                    item.finding_id, comments, currentHead, runCache
                   );
                 } catch (err) {
                   decision = {
