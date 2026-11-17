@@ -66,6 +66,15 @@ on:
         required: false
         type: string
         default: ''
+      ready_label:
+        description: >-
+          Optional admission label for automatic implementation. Empty falls
+          back to AUTOMATION_READY_LABEL, then `automation:ready`. Must match
+          the scheduler's ready_label so a ready-only recovery issue stays
+          discoverable after its reservation was reconciled away.
+        required: false
+        type: string
+        default: ''
       pause_marker:
         description: >-
           Label that pauses automation. Empty falls back to
@@ -125,7 +134,7 @@ jobs:
       GITHUB_API_URL: ${{ github.api_url }}
       RETRY_MARKER: ${{ inputs.retry_marker || vars.AUTOMATION_WATCHDOG_RETRY_MARKER || '<!-- opencode-watchdog-retry -->' }}
       IN_PROGRESS_LABEL: ${{ inputs.in_progress_label || vars.AUTOMATION_IN_PROGRESS_LABEL || 'automation:in-progress' }}
-      READY_LABEL: ${{ vars.AUTOMATION_READY_LABEL || 'automation:ready' }}
+      READY_LABEL: ${{ inputs.ready_label || vars.AUTOMATION_READY_LABEL || 'automation:ready' }}
       PAUSE_LABEL: ${{ inputs.pause_marker || vars.AUTOMATION_PAUSE_LABEL || 'automation:paused' }}
       BLOCKED_LABEL: ${{ vars.AUTOMATION_BLOCKED_LABEL || 'automation:blocked' }}
       QUALIFYING_LABEL: ${{ vars.AUTOMATION_QUALIFYING_LABEL || 'automation:qualifying' }}

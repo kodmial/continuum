@@ -4585,6 +4585,7 @@ class ContinuumTest < Minitest::Test
       'max_recovery_retries' => "MAX_RECOVERY_RETRIES: ${{ inputs.max_recovery_retries || vars.AUTOMATION_WATCHDOG_MAX_RETRIES || '1' }}",
       'retry_marker'         => "RETRY_MARKER: ${{ inputs.retry_marker || vars.AUTOMATION_WATCHDOG_RETRY_MARKER || '<!-- opencode-watchdog-retry -->' }}",
       'in_progress_label'    => "IN_PROGRESS_LABEL: ${{ inputs.in_progress_label || vars.AUTOMATION_IN_PROGRESS_LABEL || 'automation:in-progress' }}",
+      'ready_label'          => "READY_LABEL: ${{ inputs.ready_label || vars.AUTOMATION_READY_LABEL || 'automation:ready' }}",
       'pause_marker'         => "PAUSE_LABEL: ${{ inputs.pause_marker || vars.AUTOMATION_PAUSE_LABEL || 'automation:paused' }}",
       'dispatch_marker'      => "DISPATCH_MARKER: ${{ inputs.dispatch_marker || vars.AUTOMATION_DISPATCH_MARKER || '<!-- issue-scheduler-dispatch -->' }}",
       'timeout_minutes'      => "fromJSON(inputs.timeout_minutes || vars.AUTOMATION_WATCHDOG_TIMEOUT_MINUTES || '5')"
@@ -7047,7 +7048,7 @@ class ContinuumTest < Minitest::Test
     assert_includes scheduler, 'run-completed-success-without-publication'
     assert_includes watchdog, 'completed-success-without-implementation'
     assert_includes watchdog, 'completed-success-without-publication'
-    assert_includes watchdog, "READY_LABEL: ${{ vars.AUTOMATION_READY_LABEL || 'automation:ready' }}"
+    assert_includes watchdog, "READY_LABEL: ${{ inputs.ready_label || vars.AUTOMATION_READY_LABEL || 'automation:ready' }}"
     assert_includes watchdog, "process.env.READY_LABEL || 'automation:ready'"
     assert_includes watchdog, 'discoveryLabels.push(readyLabel)'
     assert_includes watchdog, 'liveOverlap: async () => {'
