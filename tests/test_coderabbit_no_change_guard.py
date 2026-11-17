@@ -6,6 +6,7 @@ unchanged must suppress later re-dispatches of the same original finding, while
 failed, forged, stale, or unverifiable outcomes never suppress anything.
 """
 
+import hashlib
 import json
 from pathlib import Path
 import re
@@ -821,8 +822,16 @@ class NoChangeGuardTests(unittest.TestCase):
         # Executor admission can remove a superseded finding, so the outcome
         # digest covers the admitted subset while the lease covers the original
         # batch. The outcome must reconcile instead of deferring forever.
-        handoff, _ = handoff_fixture()
-        issue_comments = [batch_marker(digest="0" * 64), handoff]
+        handoff, handoff_body = handoff_fixture()
+        superseded_finding = FINDING + 3
+        original_batch = [[REVIEW, FINDING], [REVIEW, superseded_finding]]
+        original_batch_digest = hashlib.sha256(
+            (HEAD + "\n" + json.dumps(original_batch)).encode("utf-8")
+        ).hexdigest()
+        self.assertNotEqual(original_batch_digest, outcome_digest(handoff_body))
+        issue_comments = [
+            batch_marker(digest=original_batch_digest), handoff,
+        ]
         collected = collect_step(items_for(), issue_comments)
         self.assertEqual(collected["out"]["should_run"], "false")
         self.assertNotIn("no_change_deferred_json", collected["out"])
