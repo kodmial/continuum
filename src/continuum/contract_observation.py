@@ -45,6 +45,13 @@ CANARY_RECOVERY_MARKER = "<!-- continuum-canary-recovery"
 
 _ISSUE_REF_RE = re.compile(r"(?<![0-9A-Za-z_])#(\d+)(?![0-9])")
 _BRANCH_ISSUE_RE = re.compile(r"(?:^|/)issue(\d+)(?:-|$)")
+# Canonical fresh-VM recovery run titles use a different, issue-bound identity.
+_RECOVERY_ISSUE_RE = re.compile(r"(?<![A-Za-z0-9_])opencode-429-issue-issue(\d+)(?!\d)")
+_WORKER_MARKER_RE = re.compile(
+    r"<!--\s*(continuum-opencode-live|continuum-429-recovery)\s+([^>]*?)-->",
+    re.IGNORECASE,
+)
+_MARKER_ATTRIBUTE_RE = re.compile(r"([A-Za-z_][A-Za-z_0-9]*)=([^\s>]+)")
 _QUALIFIED_ISSUE_REF_RE = re.compile(
     r"(?<![\w.-])(?P<repo>[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)#(?P<issue>\d+)(?!\d)"
 )
@@ -139,7 +146,9 @@ def _references_issue(value: object, issue_number: int) -> bool:
     if any(int(match) == issue_number for match in _ISSUE_REF_RE.findall(text)):
         return True
     return any(
-        int(match) == issue_number for match in _BRANCH_ISSUE_RE.findall(text)
+        int(match) == issue_number
+        for pattern in (_BRANCH_ISSUE_RE, _RECOVERY_ISSUE_RE)
+        for match in pattern.findall(text)
     )
 
 
@@ -148,6 +157,49 @@ def _run_matches_issue(run: Mapping[str, Any], issue_number: int) -> bool:
         if _references_issue(run.get(key), issue_number):
             return True
     return False
+
+
+
+def recorded_worker_run_ids(
+    comments: Sequence[Mapping[str, Any]],
+    issue_number: int,
+    repository: str,
+    owner_login: str,
+) -> List[int]:
+    """Newest authenticated run IDs for an issue whose run left a short inventory.
+
+    Issue comments are discovery hints, not evidence of liveness. The caller
+    must independently fetch each exact Actions run and verify its repository,
+    workflow, issue identity and actual status before observing it.
+    """
+    found: List[int] = []
+    seen = set()
+    for comment in reversed(list(comments or [])):
+        if not isinstance(comment, Mapping):
+            continue
+        author = comment.get("user") or {}
+        login = author.get("login") if isinstance(author, Mapping) else None
+        if str(login or "").lower() != str(owner_login or "").lower():
+            continue
+        body = str(comment.get("body") or "")
+        for marker_type, raw in reversed(_WORKER_MARKER_RE.findall(body)):
+            attrs = dict(_MARKER_ATTRIBUTE_RE.findall(raw))
+            if marker_type.lower() == "continuum-opencode-live":
+                if (str(attrs.get("repo") or "").lower() != str(repository).lower()
+                        or str(attrs.get("issue") or "") != str(issue_number)):
+                    continue
+            elif attrs.get("op") != "opencode-429-issue-issue{}".format(issue_number):
+                continue
+            try:
+                run_id = int(attrs.get("run") or 0)
+            except (TypeError, ValueError):
+                continue
+            if run_id > 0 and run_id not in seen:
+                found.append(run_id)
+                seen.add(run_id)
+            if len(found) >= 10:
+                return found
+    return found
 
 
 def _pr_matches_issue(pr: Mapping[str, Any], issue_number: int) -> bool:
