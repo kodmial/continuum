@@ -688,6 +688,13 @@ jobs:
             };
             const corroborateOutcomeRun = async (comment, attrs) => {
               const defer = reason => ({ state: 'defer', reason });
+              const changed = attrs.changed === 'true';
+              // A changed=true outcome replaces an earlier verified no-change
+              // decision, so it may only release suppression once its own
+              // identity, run, and artifact evidence validate. Any missing or
+              // unavailable evidence defers instead of dispatching blindly.
+              const unverified = reason =>
+                changed ? defer(reason) : { state: 'none', reason };
               const runIdText = String(attrs.run || '');
               if (!/^[1-9][0-9]*$/.test(runIdText)) {
                 return defer('missing-run-id');
@@ -700,6 +707,12 @@ jobs:
                   new Set(findings).size !== findings.length) {
                 return defer('invalid-finding-set');
               }
+              // A dispatch lease is corroboration, never a precondition. An
+              // ordinary full-review repair, and an executor that admits only
+              // a subset of a dispatched batch, both publish their run-scoped
+              // outcome without a lease matching its digest. A lease with this
+              // exact digest additionally anchors dispatch order; otherwise
+              // the run-produced provenance below carries the proof.
               const matchingBatch = outcomeBatchMarkers
                 .filter(entry =>
                   entry.match[1] === attrs.head &&
@@ -707,8 +720,7 @@ jobs:
                   Number(entry.comment.id) < Number(comment.id))
                 .sort(
                   (a, b) => Number(a.comment.id) - Number(b.comment.id)
-                )[0];
-              if (!matchingBatch) return defer('missing-batch-provenance');
+                )[0] || null;
               let digest;
               try {
                 const identity = [];
@@ -777,23 +789,25 @@ jobs:
                 return defer('run-provenance-mismatch');
               }
               if (run.status !== 'completed') {
-                return { state: 'none', reason: 'run-not-completed' };
+                return unverified('run-not-completed');
               }
               if (run.conclusion !== 'success') {
-                return { state: 'none', reason: 'run-not-successful' };
+                return unverified('run-not-successful');
               }
-              const batchAt = Date.parse(
-                matchingBatch.comment.created_at || ''
-              );
-              const runAt = Date.parse(run.created_at || '');
-              if (Number.isFinite(batchAt) && Number.isFinite(runAt) &&
-                  runAt < batchAt - 60_000) {
-                return defer('run-before-dispatch');
+              if (matchingBatch) {
+                const batchAt = Date.parse(
+                  matchingBatch.comment.created_at || ''
+                );
+                const runAt = Date.parse(run.created_at || '');
+                if (Number.isFinite(batchAt) && Number.isFinite(runAt) &&
+                    runAt < batchAt - 60_000) {
+                  return defer('run-before-dispatch');
+                }
               }
               const jobs = Array.isArray(evidence.jobs?.jobs)
                 ? evidence.jobs.jobs : [];
               if (!jobs.length) {
-                return { state: 'none', reason: 'run-jobless' };
+                return unverified('run-jobless');
               }
               const repairJob = jobs.find(job =>
                 Array.isArray(job.steps) &&
@@ -803,7 +817,7 @@ jobs:
               if (!repairJob) return defer('repair-step-missing');
               if (repairJob.status !== 'completed' ||
                   repairJob.conclusion !== 'success') {
-                return { state: 'none', reason: 'repair-job-not-successful' };
+                return unverified('repair-job-not-successful');
               }
               const repairStep = repairJob.steps.find(
                 step => step.name === 'Fix CodeRabbit review findings'
@@ -811,7 +825,7 @@ jobs:
               if (!repairStep ||
                   repairStep.status !== 'completed' ||
                   repairStep.conclusion !== 'success') {
-                return { state: 'none', reason: 'repair-step-not-successful' };
+                return unverified('repair-step-not-successful');
               }
               if (evidence.artifactsError) {
                 return defer('run-provenance-unreadable');
@@ -848,22 +862,32 @@ jobs:
                   commentAt > runEnd + 300_000) {
                 return defer('handoff-not-from-run');
               }
-              return {
-                state: 'suppress',
-                run_id: runId,
-                reason: 'no-change-awaiting-review-or-evidence',
-              };
+              return changed
+                ? { state: 'release', reason: 'changed-outcome-verified' }
+                : {
+                    state: 'suppress',
+                    run_id: runId,
+                    reason: 'no-change-awaiting-review-or-evidence',
+                  };
+            };
+            const outcomeIdentityValid = (attrs, expectedHead) => {
+              const expectedRepo = `${owner}/${repo}`.toLowerCase();
+              return (
+                (attrs.changed === 'false' || attrs.changed === 'true') &&
+                String(attrs.repo || '').toLowerCase() === expectedRepo &&
+                Number(attrs.pr) === pullNumber &&
+                attrs.head === expectedHead &&
+                /^[0-9a-f]{64}$/.test(String(attrs.digest || ''))
+              );
             };
             const evaluateNoChange = async findingId => {
               const newest = newestOutcomeForFinding(findingId);
               if (!newest) return { state: 'none' };
               const attrs = newest.attrs;
-              if (attrs.changed !== 'false') return { state: 'none' };
-              const expectedRepo = `${owner}/${repo}`.toLowerCase();
-              if (String(attrs.repo || '').toLowerCase() !== expectedRepo ||
-                  Number(attrs.pr) !== pullNumber ||
-                  attrs.head !== headSha ||
-                  !/^[0-9a-f]{64}$/.test(String(attrs.digest || ''))) {
+              // A newer outcome supersedes an earlier verified no-change only
+              // after its own identity, run, and artifact evidence validate. A
+              // changed=true marker value alone never releases suppression.
+              if (!outcomeIdentityValid(attrs, headSha)) {
                 return { state: 'defer', reason: 'outcome-identity-mismatch' };
               }
               return corroborateOutcomeRun(newest.comment, attrs);
@@ -1111,6 +1135,13 @@ jobs:
               comments, comment, attrs, runCache
             ) => {
               const defer = reason => ({ state: 'defer', reason });
+              const changed = attrs.changed === 'true';
+              // A changed=true outcome replaces an earlier verified no-change
+              // decision, so it may only release suppression once its own
+              // identity, run, and artifact evidence validate. Any missing or
+              // unavailable evidence defers instead of dispatching blindly.
+              const unverified = reason =>
+                changed ? defer(reason) : { state: 'none', reason };
               const runIdText = String(attrs.run || '');
               if (!/^[1-9][0-9]*$/.test(runIdText)) {
                 return defer('missing-run-id');
@@ -1123,6 +1154,12 @@ jobs:
                   new Set(findings).size !== findings.length) {
                 return defer('invalid-finding-set');
               }
+              // A dispatch lease is corroboration, never a precondition. An
+              // ordinary full-review repair, and an executor that admits only
+              // a subset of a dispatched batch, both publish their run-scoped
+              // outcome without a lease matching its digest. A lease with this
+              // exact digest additionally anchors dispatch order; otherwise
+              // the run-produced provenance below carries the proof.
               const matchingBatch = comments
                 .filter(isTrustedHandoff)
                 .map(entry => ({
@@ -1136,8 +1173,7 @@ jobs:
                   Number(entry.comment.id) < Number(comment.id))
                 .sort(
                   (a, b) => Number(a.comment.id) - Number(b.comment.id)
-                )[0];
-              if (!matchingBatch) return defer('missing-batch-provenance');
+                )[0] || null;
               let digest;
               try {
                 const identity = [];
@@ -1203,23 +1239,25 @@ jobs:
                 return defer('run-provenance-mismatch');
               }
               if (run.status !== 'completed') {
-                return { state: 'none', reason: 'run-not-completed' };
+                return unverified('run-not-completed');
               }
               if (run.conclusion !== 'success') {
-                return { state: 'none', reason: 'run-not-successful' };
+                return unverified('run-not-successful');
               }
-              const batchAt = Date.parse(
-                matchingBatch.comment.created_at || ''
-              );
-              const runAt = Date.parse(run.created_at || '');
-              if (Number.isFinite(batchAt) && Number.isFinite(runAt) &&
-                  runAt < batchAt - 60_000) {
-                return defer('run-before-dispatch');
+              if (matchingBatch) {
+                const batchAt = Date.parse(
+                  matchingBatch.comment.created_at || ''
+                );
+                const runAt = Date.parse(run.created_at || '');
+                if (Number.isFinite(batchAt) && Number.isFinite(runAt) &&
+                    runAt < batchAt - 60_000) {
+                  return defer('run-before-dispatch');
+                }
               }
               const jobs = Array.isArray(evidence.jobs?.jobs)
                 ? evidence.jobs.jobs : [];
               if (!jobs.length) {
-                return { state: 'none', reason: 'run-jobless' };
+                return unverified('run-jobless');
               }
               const repairJob = jobs.find(job =>
                 Array.isArray(job.steps) &&
@@ -1229,7 +1267,7 @@ jobs:
               if (!repairJob) return defer('repair-step-missing');
               if (repairJob.status !== 'completed' ||
                   repairJob.conclusion !== 'success') {
-                return { state: 'none', reason: 'repair-job-not-successful' };
+                return unverified('repair-job-not-successful');
               }
               const repairStep = repairJob.steps.find(
                 step => step.name === 'Fix CodeRabbit review findings'
@@ -1237,7 +1275,7 @@ jobs:
               if (!repairStep ||
                   repairStep.status !== 'completed' ||
                   repairStep.conclusion !== 'success') {
-                return { state: 'none', reason: 'repair-step-not-successful' };
+                return unverified('repair-step-not-successful');
               }
               if (evidence.artifactsError) {
                 return defer('run-provenance-unreadable');
@@ -1274,11 +1312,23 @@ jobs:
                   commentAt > runEnd + 300_000) {
                 return defer('handoff-not-from-run');
               }
-              return {
-                state: 'suppress',
-                run_id: runId,
-                reason: 'no-change-awaiting-review-or-evidence',
-              };
+              return changed
+                ? { state: 'release', reason: 'changed-outcome-verified' }
+                : {
+                    state: 'suppress',
+                    run_id: runId,
+                    reason: 'no-change-awaiting-review-or-evidence',
+                  };
+            };
+            const outcomeIdentityValid = (attrs, expectedHead) => {
+              const expectedRepo = `${owner}/${repo}`.toLowerCase();
+              return (
+                (attrs.changed === 'false' || attrs.changed === 'true') &&
+                String(attrs.repo || '').toLowerCase() === expectedRepo &&
+                Number(attrs.pr) === pullNumber &&
+                attrs.head === expectedHead &&
+                /^[0-9a-f]{64}$/.test(String(attrs.digest || ''))
+              );
             };
             const evaluateNoChange = async (
               findingId, comments, currentHead, runCache
@@ -1297,12 +1347,10 @@ jobs:
               }
               if (!newest) return { state: 'none' };
               const attrs = newest.attrs;
-              if (attrs.changed !== 'false') return { state: 'none' };
-              const expectedRepo = `${owner}/${repo}`.toLowerCase();
-              if (String(attrs.repo || '').toLowerCase() !== expectedRepo ||
-                  Number(attrs.pr) !== pullNumber ||
-                  attrs.head !== currentHead ||
-                  !/^[0-9a-f]{64}$/.test(String(attrs.digest || ''))) {
+              // A newer outcome supersedes an earlier verified no-change only
+              // after its own identity, run, and artifact evidence validate. A
+              // changed=true marker value alone never releases suppression.
+              if (!outcomeIdentityValid(attrs, currentHead)) {
                 return { state: 'defer', reason: 'outcome-identity-mismatch' };
               }
               return corroborateOutcomeRun(

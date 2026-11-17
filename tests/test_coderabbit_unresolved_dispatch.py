@@ -78,6 +78,20 @@ class CodeRabbitBatchContractTests(unittest.TestCase):
             "both the collection and pre-dispatch checks must require run evidence",
         )
 
+    def test_no_change_guard_never_requires_a_dispatch_lease(self):
+        # An ordinary full-review repair and an executor-admitted subset both
+        # publish verified run-scoped outcomes without a matching batch lease,
+        # so a lease may corroborate a decision but never gate reconciliation.
+        # A changed=true replacement outcome must release suppression only after
+        # the same run and artifact validation.
+        batcher = BATCHER.read_text(encoding="utf-8")
+        self.assertNotIn("missing-batch-provenance", batcher)
+        self.assertEqual(
+            batcher.count("changed-outcome-verified"), 2,
+            "both verifiers must validate a changed outcome before releasing",
+        )
+        self.assertEqual(batcher.count("outcomeIdentityValid"), 4)
+
     def test_post_repair_chat_has_one_serialized_sender_after_ci(self):
         # OpenCode must not bypass the account-wide chat cooldown by posting
         # its own inline verification immediately after a repair. The

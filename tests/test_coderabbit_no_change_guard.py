@@ -798,6 +798,76 @@ class NoChangeGuardTests(unittest.TestCase):
         self.assertEqual(len(unreadable["dispatches"]), 0)
         self.assertEqual(unreadable["posted"], [])
 
+    def test_run_scoped_outcome_verifies_without_a_dispatch_lease(self):
+        # An ordinary full-review repair publishes its run-scoped outcome
+        # without a `continuum-coderabbit-batch` lease. The batch lease is
+        # corroboration, so the verified artifact must still suppress.
+        handoff, _ = handoff_fixture()
+        collected = collect_step(items_for(), [handoff])
+        self.assertEqual(collected["out"]["should_run"], "false")
+        self.assertNotIn("no_change_deferred_json", collected["out"])
+        self.assertEqual(
+            [entry["finding_id"]
+             for entry in json.loads(collected["out"]["no_change_json"])],
+            [FINDING],
+        )
+        dispatched = dispatch_step(items_for(), [[handoff]], cutoff=100000)
+        self.assertEqual(len(dispatched["dispatches"]), 0, dispatched["notices"])
+        self.assertEqual(len(dispatched["posted"]), 1)
+        self.assertIn("no-change-awaiting-review-or-evidence",
+                      dispatched["posted"][0])
+
+    def test_admitted_subset_outcome_reconciles_with_original_batch_lease(self):
+        # Executor admission can remove a superseded finding, so the outcome
+        # digest covers the admitted subset while the lease covers the original
+        # batch. The outcome must reconcile instead of deferring forever.
+        handoff, _ = handoff_fixture()
+        issue_comments = [batch_marker(digest="0" * 64), handoff]
+        collected = collect_step(items_for(), issue_comments)
+        self.assertEqual(collected["out"]["should_run"], "false")
+        self.assertNotIn("no_change_deferred_json", collected["out"])
+        self.assertEqual(
+            [entry["finding_id"]
+             for entry in json.loads(collected["out"]["no_change_json"])],
+            [FINDING],
+        )
+        dispatched = dispatch_step(items_for(), [issue_comments], cutoff=100000)
+        self.assertEqual(len(dispatched["dispatches"]), 0, dispatched["notices"])
+        self.assertEqual(len(dispatched["posted"]), 1)
+
+    def test_unverified_changed_outcome_defers_instead_of_releasing(self):
+        # A changed=true marker must not release the no-change suppression on
+        # its bare value: only validated run and artifact evidence may do so.
+        handoff, _ = handoff_fixture(changed=True)
+        issue_comments = [handoff]
+        cases = {
+            "missing-provenance": {"artifacts": []},
+            "failed-run": {"run": base_run(conclusion="failure")},
+            "unreadable-run": {"runs_error": True},
+        }
+        for name, overrides in cases.items():
+            with self.subTest(case=name):
+                collected = collect_step(
+                    items_for(), issue_comments, **overrides,
+                )
+                self.assertEqual(collected["out"]["should_run"], "false")
+                self.assertEqual(json.loads(collected["out"]["items_json"]), [])
+                deferred = json.loads(
+                    collected["out"]["no_change_deferred_json"]
+                )
+                self.assertEqual(deferred[0]["finding_id"], FINDING)
+                self.assertIn(
+                    deferred[0]["reason"],
+                    ("run-provenance-unverified", "run-not-successful",
+                     "run-unreadable"),
+                )
+                dispatched = dispatch_step(
+                    items_for(), [issue_comments], cutoff=100000, **overrides,
+                )
+                self.assertEqual(len(dispatched["dispatches"]), 0,
+                                 dispatched["notices"])
+                self.assertEqual(dispatched["posted"], [])
+
     def test_final_check_refreshes_run_evidence_cached_before_completion(self):
         # The preliminary check caches an in-progress run. The run completes
         # before dispatch, so the final check must re-read it and suppress the
