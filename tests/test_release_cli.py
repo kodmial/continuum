@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import tempfile
 import unittest
 
@@ -29,26 +30,43 @@ set -euo pipefail
 test -s dist/widget.tar.gz
 """
 
-HOOKS = {
-    "schema": "continuum.release-hooks/v1",
-    "targets": [
+LINUX_TARGET = {
+    "id": "linux-x64",
+    "platform": "linux",
+    "runner": "ubuntu-latest",
+    "build": {"command": ["bash", "build.sh"]},
+    "sign": {"command": ["bash", "sign.sh"], "identity": "acme-ci"},
+    "verify": {"command": ["bash", "verify.sh"], "identity": "acme-ci"},
+    "artifacts": [
         {
-            "id": "linux-x64",
-            "platform": "linux",
-            "runner": "ubuntu-latest",
-            "build": {"command": ["bash", "build.sh"]},
-            "sign": {"command": ["bash", "sign.sh"], "identity": "acme-ci"},
-            "verify": {"command": ["bash", "verify.sh"], "identity": "acme-ci"},
-            "artifacts": [
-                {
-                    "name": "widget-{version}-linux-x64.tar.gz",
-                    "path": "dist/widget.tar.gz",
-                    "type": "archive",
-                    "classifier": "linux-x64",
-                }
-            ],
+            "name": "widget-{version}-linux-x64.tar.gz",
+            "path": "dist/widget.tar.gz",
+            "type": "archive",
+            "classifier": "linux-x64",
         }
     ],
+}
+
+WINDOWS_TARGET = {
+    "id": "windows-x64",
+    "platform": "windows",
+    "runner": "windows-latest",
+    "build": {"command": ["bash", "build.sh"]},
+    "sign": {"command": ["bash", "sign.sh"], "identity": "acme-ci"},
+    "verify": {"command": ["bash", "verify.sh"], "identity": "acme-ci"},
+    "artifacts": [
+        {
+            "name": "widget-{version}-windows-x64.zip",
+            "path": "dist/widget.tar.gz",
+            "type": "archive",
+            "classifier": "windows-x64",
+        }
+    ],
+}
+
+HOOKS = {
+    "schema": "continuum.release-hooks/v1",
+    "targets": [LINUX_TARGET],
 }
 
 
@@ -60,14 +78,26 @@ class Fixture:
         self.write("build.sh", BUILD)
         self.write("sign.sh", SIGN)
         self.write("verify.sh", VERIFY)
-        with open(os.path.join(self.workdir, "hooks.json"), "w", encoding="utf-8") as handle:
-            json.dump(HOOKS, handle)
+        self.hooks_path = os.path.join(self.workdir, "hooks.json")
+        self.write_hooks(HOOKS)
         with open(os.path.join(self.workdir, "CHANGELOG.md"), "w", encoding="utf-8") as handle:
             handle.write("# Changelog\n\n## 1.2.3\n\n- first thing\n")
         self.config_path = os.path.join(self.workdir, ".continuum.yml")
         self.write_config("release:\n  hooks: hooks.json\n")
         self.receipts = os.path.join(root, "receipts")
         self.plan_json = os.path.join(root, "plan.json")
+        self.matrix_json = os.path.join(root, "matrix.json")
+        self.bundle = os.path.join(root, "bundle")
+
+    def write_hooks(self, document):
+        with open(self.hooks_path, "w", encoding="utf-8") as handle:
+            json.dump(document, handle)
+
+    def two_target_hooks(self):
+        return {
+            "schema": "continuum.release-hooks/v1",
+            "targets": [LINUX_TARGET, WINDOWS_TARGET],
+        }
 
     def write(self, name, body, mode=0o755):
         path = os.path.join(self.workdir, name)
@@ -99,7 +129,11 @@ class Fixture:
         for key, value in values.items():
             if value is None:
                 continue
-            argv.extend([key, str(value)])
+            if isinstance(value, (list, tuple)):
+                for item in value:
+                    argv.extend([key, str(item)])
+            else:
+                argv.extend([key, str(value)])
         return argv
 
 
@@ -174,7 +208,7 @@ class PlanTests(CliTestCase):
         self.assertEqual(self.main(self.fixture.args("plan")), cli.EXIT_OK)
 
     def test_a_plan_from_a_disabled_repository_does_not_read_a_token(self):
-        self.fixture.write_config("release: {}\n")
+        self.fixture.write_config("release:\n")
         os.environ.pop("GITHUB_TOKEN")
         self.assertEqual(self.main(self.fixture.args("plan")), cli.EXIT_OK)
         self.assertEqual(self.payload()["status"], "no-op")
@@ -200,6 +234,231 @@ class BuildPhaseTests(CliTestCase):
         payload = self.payload()
         self.assertEqual(payload["status"], "failed")
         self.assertEqual(payload["code"], "build-not-recorded")
+
+
+class PrepareTests(CliTestCase):
+    def test_prepare_records_the_release_up_to_the_source_pin_without_building(self):
+        code = self.main(self.fixture.args("prepare"))
+        self.assertEqual(code, cli.EXIT_OK, self.payload())
+        payload = self.payload()
+        self.assertEqual(payload["status"], "prepared")
+        self.assertEqual(payload["version"], VERSION)
+        self.assertEqual(payload["source_sha"], SHA)
+        self.assertEqual(payload["manifests"], [])
+        self.assertFalse(payload["published"])
+        self.assertEqual(self.fake.calls, [])
+        self.assertFalse(os.path.exists(os.path.join(self.fixture.workdir, "dist")))
+        receipts = os.listdir(self.fixture.receipts)
+        self.assertEqual(len(receipts), 1, receipts)
+
+    def test_a_prepared_receipt_lets_a_build_job_skip_the_preparation_stages(self):
+        self.assertEqual(self.main(self.fixture.args("prepare")), cli.EXIT_OK)
+        prepared_dir = self.fixture.receipts
+        build_receipts = os.path.join(self.fixture.root, "build-receipts")
+        build_bundle = os.path.join(self.fixture.root, "build-bundle")
+        receipt = os.path.join(prepared_dir, os.listdir(prepared_dir)[0])
+        code = self.main(
+            self.fixture.args(
+                "build",
+                **{
+                    "--receipt-dir": build_receipts,
+                    "--receipt-import": receipt,
+                    "--bundle-out": build_bundle,
+                },
+            )
+        )
+        self.assertEqual(code, cli.EXIT_OK, self.payload())
+        self.assertEqual(self.payload()["status"], "no-op")
+        self.assertTrue(os.path.isfile(os.path.join(build_bundle, "receipt.json")))
+        self.assertTrue(
+            os.path.isfile(
+                os.path.join(build_bundle, f"widget-{VERSION}-linux-x64.tar.gz")
+            )
+        )
+
+    def test_prepare_does_not_publish_or_need_a_release_token(self):
+        os.environ.pop("GITHUB_TOKEN")
+        self.assertEqual(self.main(self.fixture.args("prepare")), cli.EXIT_OK)
+        self.assertEqual(self.payload()["status"], "prepared")
+        self.assertEqual(self.fake.calls, [])
+
+
+class MatrixTests(CliTestCase):
+    def test_the_matrix_names_every_hook_target_and_its_runner(self):
+        self.fixture.write_hooks(self.fixture.two_target_hooks())
+        code = self.main(
+            self.fixture.args("plan", **{"--matrix": self.fixture.matrix_json})
+        )
+        self.assertEqual(code, cli.EXIT_OK, self.payload())
+        with open(self.fixture.matrix_json, encoding="utf-8") as handle:
+            matrix = json.load(handle)
+        self.assertTrue(matrix["enabled"])
+        self.assertEqual(matrix["mode"], "hooks")
+        self.assertEqual(
+            matrix["targets"],
+            [
+                {"id": "linux-x64", "runner": "ubuntu-latest", "platform": "linux"},
+                {"id": "windows-x64", "runner": "windows-latest", "platform": "windows"},
+            ],
+        )
+
+    def test_a_disabled_repository_has_a_matrix_with_no_targets_and_no_mode(self):
+        self.fixture.write_config("review:\n  provider: none\n")
+        code = self.main(
+            self.fixture.args("plan", **{"--matrix": self.fixture.matrix_json})
+        )
+        self.assertEqual(code, cli.EXIT_OK, self.payload())
+        with open(self.fixture.matrix_json, encoding="utf-8") as handle:
+            matrix = json.load(handle)
+        self.assertFalse(matrix["enabled"])
+        self.assertEqual(matrix["mode"], "disabled")
+        self.assertEqual(matrix["targets"], [])
+
+    def test_a_config_only_repository_is_named_as_such(self):
+        self.fixture.write_config(
+            "release:\n"
+            "  targets:\n"
+            "    - id: macos\n"
+            "      adapter: apple\n"
+            "      architectures:\n"
+            "        - arm64\n"
+            "      artifacts:\n"
+            "        - zip\n"
+            "      binaries:\n"
+            "        - name: widget\n"
+            "          identifier: com.example.widget\n"
+            "      signing:\n"
+            "        mode: adhoc\n"
+        )
+        code = self.main(
+            self.fixture.args(
+                "plan", **{"--hooks": None, "--matrix": self.fixture.matrix_json}
+            )
+        )
+        self.assertEqual(code, cli.EXIT_OK, self.payload())
+        with open(self.fixture.matrix_json, encoding="utf-8") as handle:
+            matrix = json.load(handle)
+        self.assertTrue(matrix["enabled"])
+        self.assertEqual(matrix["mode"], "config-only")
+        self.assertEqual(matrix["targets"], [])
+
+    def test_target_selection_restricts_a_build_to_one_matrix_leg(self):
+        self.fixture.write_hooks(self.fixture.two_target_hooks())
+        code = self.main(
+            self.fixture.args(
+                "build",
+                **{"--target": "windows-x64", "--receipt-dir": os.path.join(self.fixture.root, "only")},
+            )
+        )
+        self.assertEqual(code, cli.EXIT_OK, self.payload())
+        manifests = self.payload()["manifests"]
+        self.assertEqual([item["target"] for item in manifests], ["windows-x64"])
+
+    def test_an_unknown_target_is_refused_before_anything_is_built(self):
+        code = self.main(
+            self.fixture.args("build", **{"--target": "not-a-target"})
+        )
+        self.assertEqual(code, cli.EXIT_USAGE)
+        self.assertEqual(self.payload()["code"], "target-not-declared")
+        self.assertEqual(self.fake.calls, [])
+        self.assertFalse(os.path.exists(os.path.join(self.fixture.workdir, "dist")))
+
+
+class BundleTests(CliTestCase):
+    def _build(self, target, bundle, receipts, sha=SHA):
+        return self.main(
+            self.fixture.args(
+                "build",
+                **{
+                    "--target": target,
+                    "--bundle-out": bundle,
+                    "--receipt-dir": receipts,
+                    "--sha": sha,
+                },
+            )
+        )
+
+    def test_a_publish_job_resumes_from_both_build_bundles(self):
+        self.fixture.write_hooks(self.fixture.two_target_hooks())
+        linux = os.path.join(self.fixture.root, "linux")
+        windows = os.path.join(self.fixture.root, "windows")
+        self.assertEqual(
+            self._build("linux-x64", linux, os.path.join(self.fixture.root, "rl")),
+            cli.EXIT_OK,
+            self.payload(),
+        )
+        self.assertEqual(
+            self._build("windows-x64", windows, os.path.join(self.fixture.root, "rw")),
+            cli.EXIT_OK,
+            self.payload(),
+        )
+        flat = os.path.join(self.fixture.root, "artifacts")
+        os.makedirs(flat)
+        for bundle in (linux, windows):
+            for name in os.listdir(bundle):
+                if name.startswith("receipt-") and name != "receipt.json":
+                    continue
+                shutil.copyfile(os.path.join(bundle, name), os.path.join(flat, name))
+        code = self.main(
+            self.fixture.args(
+                "publish",
+                **{
+                    "--target": ["linux-x64", "windows-x64"],
+                    "--receipt-dir": os.path.join(self.fixture.root, "publish"),
+                    "--receipt-import": [
+                        os.path.join(linux, "receipt.json"),
+                        os.path.join(windows, "receipt.json"),
+                    ],
+                    "--artifact-dir": flat,
+                },
+            )
+        )
+        self.assertEqual(code, cli.EXIT_OK, self.payload())
+        payload = self.payload()
+        self.assertEqual(payload["status"], "released")
+        self.assertEqual(
+            sorted(item["target"] for item in payload["manifests"]),
+            ["linux-x64", "windows-x64"],
+        )
+        record = self.fake._find(f"v{VERSION}")
+        self.assertIn(f"widget-{VERSION}-linux-x64.tar.gz", record["assets"])
+        self.assertIn(f"widget-{VERSION}-windows-x64.zip", record["assets"])
+
+    def test_receipts_that_disagree_about_the_same_target_are_refused(self):
+        self.fixture.write_hooks(self.fixture.two_target_hooks())
+        first = os.path.join(self.fixture.root, "first")
+        second = os.path.join(self.fixture.root, "second")
+        self.assertEqual(
+            self._build("linux-x64", first, os.path.join(self.fixture.root, "r1")),
+            cli.EXIT_OK,
+            self.payload(),
+        )
+        self.assertEqual(
+            self._build(
+                "linux-x64",
+                second,
+                os.path.join(self.fixture.root, "r2"),
+                sha=OTHER_SHA,
+            ),
+            cli.EXIT_OK,
+            self.payload(),
+        )
+        receipt_path = os.path.join(second, "receipt.json")
+        code = self.main(
+            self.fixture.args(
+                "publish",
+                **{
+                    "--receipt-dir": os.path.join(self.fixture.root, "publish"),
+                    "--receipt-import": [
+                        os.path.join(first, "receipt.json"),
+                        receipt_path,
+                    ],
+                },
+            )
+        )
+        self.assertEqual(code, cli.EXIT_FAILED)
+        self.assertEqual(self.payload()["code"], "receipt-conflict")
+        self.assertEqual(self.fake.calls, [])
 
 
 class ExecuteTests(CliTestCase):
@@ -295,8 +554,15 @@ class ConfigurationTests(CliTestCase):
             "  targets:\n"
             "    - id: macos\n"
             "      adapter: apple\n"
-            "      architectures: [arm64]\n"
-            "      artifacts: [zip]\n"
+            "      architectures:\n"
+            "        - arm64\n"
+            "      artifacts:\n"
+            "        - zip\n"
+            "      binaries:\n"
+            "        - name: widget\n"
+            "          identifier: com.example.widget\n"
+            "      signing:\n"
+            "        mode: adhoc\n"
         )
         code = self.main(self.fixture.args("plan", **{"--hooks": None}))
         self.assertEqual(code, cli.EXIT_OK, self.payload())

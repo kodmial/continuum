@@ -41,10 +41,12 @@ These are public interfaces and must not change silently:
   `TAP_PAT` and the two are never interchangeable: a GitHub token is not
   accepted by the Render API, and the render executor fails explicitly when the
   key is unset instead of falling back to any GitHub token;
-- the installer sets (`core`, `tech`, `parent`): `core` installs every stub
-  under `.github/caller-stubs/`, `tech` installs only
+- the installer sets (`core`, `tech`, `release`, `parent`): `core` installs
+  every stub under `.github/caller-stubs/`, `tech` installs only
   `.github/caller-stubs/tech/` (the `continuum-tech-` prefix marks an opt-in
-  library), `parent` installs only `.github/caller-stubs/parent/`;
+  library), `release` installs only `.github/caller-stubs/release/` (the
+  application-release caller is opt-in and is never part of `core`), `parent`
+  installs only `.github/caller-stubs/parent/`;
 - the `install.sh` argument shape `[path] [ref] [set]`, plus the optional `--yes`
   flag (accepted in any position, and equivalent to
   `CONTINUUM_INSTALL_ASSUME_YES=1`) and the optional `--dry-run` flag (accepted
@@ -89,7 +91,7 @@ Run the checks that match your change from the repository root:
 ```sh
 ruby -E UTF-8 scripts/test-continuum.rb   # caller/workflow/install contracts
 bash -n install.sh                        # installer syntax
-actionlint -shellcheck= -pyflakes= .github/workflows/*.yml .github/caller-stubs/*.yml .github/caller-stubs/tech/*.yml .github/caller-stubs/parent/*.yml
+actionlint -shellcheck= -pyflakes= .github/workflows/*.yml .github/caller-stubs/*.yml .github/caller-stubs/tech/*.yml .github/caller-stubs/release/*.yml .github/caller-stubs/parent/*.yml
 ```
 
 The Python engine and delegation suites (keep fixtures inside the worktree):

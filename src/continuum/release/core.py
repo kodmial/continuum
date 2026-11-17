@@ -96,9 +96,10 @@ CORE_NAME = "release-core"
 # nothing to do and that was correct — a disabled release, an ineligible event, a
 # duplicate. It is deliberately not `failed`, and not `released`.
 PLANNED = "planned"
+PREPARED = "prepared"
 RELEASED = "released"
 NO_OP = "no-op"
-GREEN_STATUSES: Tuple[str, ...] = (PLANNED, RELEASED, NO_OP)
+GREEN_STATUSES: Tuple[str, ...] = (PLANNED, PREPARED, RELEASED, NO_OP)
 
 #: The stages that write somewhere outside the job. A release that reaches them
 #: and writes to none of them has not published, and has to say why.
@@ -636,6 +637,7 @@ class ReleaseCore:
         *,
         journal: Journal = EMPTY_JOURNAL,
         manifests: Tuple[ArtifactManifest, ...] = (),
+        stop_after: str = "",
     ) -> ReleaseOutcome:
         """Walk the chain once.
 
@@ -643,7 +645,22 @@ class ReleaseCore:
         previous run built, needed when a run resumes past a stage it may not
         repeat. A run that needs a manifest it was not given fails rather than
         publishing from a description.
+
+        `stop_after` is the build-matrix seam: one job may only be allowed to
+        prepare a release. Stopping is a real, recorded pass — unlike a plan,
+        the journal it returns can be handed to the jobs that build — so the
+        release pull request is created once rather than once per build target.
+        It is deliberately limited to the stages before `build`; a caller that
+        asks to stop after a destination would be asking for a half-publish.
         """
+
+        if stop_after:
+            allowed = stage_names()[: stage_names().index("build")]
+            if stop_after not in allowed:
+                raise ContractError(
+                    f"stop_after={stop_after!r} is not a preparation stage; it must be "
+                    f"one of {', '.join(allowed)}"
+                )
 
         run = _Run(request, self._components, journal, manifests)
         handlers: Dict[str, Callable[[_Run], StageOutcome]] = {
@@ -669,6 +686,8 @@ class ReleaseCore:
                 return self._finish(run, status=FAILED, failure=outcome)
             if outcome.outcome == NOOP and stage(name).terminal:
                 return self._finish(run, status=NO_OP, no_op_reason=outcome.summary)
+            if stop_after and name == stop_after:
+                return self._finish(run, status=PREPARED)
             previous = name
         if run.dry_run:
             return self._finish(run, status=PLANNED)

@@ -23,6 +23,7 @@ from continuum.release.core import (
     DUPLICATE_EVENT_CODE,
     NO_OP,
     PLANNED,
+    PREPARED,
     RELEASED,
     SOURCE_CONFLICT_CODE,
     UNRESUMABLE_CODE,
@@ -177,6 +178,25 @@ class ChainTests(ReleaseTestCase):
         outcome = self.core.execute(self.request())
         self.assertTrue(outcome.released)
         self.assertStages(outcome, *stage_names())
+
+    def test_a_preparation_pass_records_the_source_pin_without_building(self):
+        outcome = self.core.execute(self.request(), stop_after="source")
+        self.assertEqual(outcome.status, PREPARED)
+        self.assertTrue(outcome.ok)
+        self.assertFalse(outcome.published)
+        self.assertEqual(outcome.manifests, ())
+        self.assertEqual(outcome.source_sha, SHA)
+        self.assertEqual(
+            [item.stage for item in outcome.outcomes],
+            list(stage_names())[: stage_names().index("build")],
+        )
+        self.assertEqual(self.adapter.built, [])
+        self.assertEqual(self.destination_calls(), [])
+
+    def test_a_preparation_pass_may_not_stop_after_a_destination(self):
+        with self.assertRaises(contract.ContractError):
+            self.core.execute(self.request(), stop_after="publish")
+        self.assertEqual(self.adapter.built, [])
 
     def test_a_release_ends_with_one_tag_at_one_commit(self):
         outcome = self.core.execute(self.request())

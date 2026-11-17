@@ -1,0 +1,747 @@
+name: Application release
+
+# One opt-in release state machine, reused by a consumer's thin caller.
+#
+# The shape is dictated by one property: a release is built from an exact
+# commit by several jobs on several runners, and all of them must describe the
+# same release. So the workflow runs the preparation stages once, builds one
+# target per matrix leg, and publishes once from the union of their receipts.
+# The core refuses to repeat a completed stage, so a duplicated event or a
+# re-run cannot produce a second tag, a second release, or a second publisher
+# call.
+#
+# This workflow is never triggered by Continuum itself. A consumer opts in by
+# installing the `release` caller set and configuring `release.hooks` (or
+# `release.targets` for a plan). With no release configuration the plan job is
+# a green no-op, no build or publish job starts, and no token is read.
+
+on:
+  workflow_call:
+    inputs:
+      source_sha:
+        description: Exact 40-character consumer commit to release
+        required: true
+        type: string
+      event:
+        description: >-
+          Release event being handled (push, tag-push, workflow-dispatch,
+          release-pr-merged, scheduled).
+        required: false
+        default: push
+        type: string
+      version:
+        description: >-
+          Explicit version for a manual release. Empty lets the configured
+          version source (file or tag) decide.
+        required: false
+        default: ''
+        type: string
+      version_file:
+        description: Repository-relative file carrying the version
+        required: false
+        default: ''
+        type: string
+      version_pattern:
+        description: Pattern the version file must match
+        required: false
+        default: '\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?'
+        type: string
+      tag:
+        description: Tag being released, for a tag-triggered release
+        required: false
+        default: ''
+        type: string
+      tag_prefix:
+        description: Prefix of the immutable release tag
+        required: false
+        default: v
+        type: string
+      channel:
+        description: Release channel recorded in the receipt and concurrency key
+        required: false
+        default: default
+        type: string
+      hooks:
+        description: Repository-relative release hooks document (overrides release.hooks)
+        required: false
+        default: ''
+        type: string
+      notes_file:
+        description: Repository-relative changelog used for release notes
+        required: false
+        default: CHANGELOG.md
+        type: string
+      release_pr:
+        description: Release pull request number, when the event carries one
+        required: false
+        default: ''
+        type: string
+      default_branch:
+        description: Branch a release may be cut from. Empty uses the repository default.
+        required: false
+        default: ''
+        type: string
+      no_github_release:
+        description: Do not publish to GitHub Releases (a downstream hook must still exist)
+        required: false
+        default: false
+        type: boolean
+      hook_secret_env:
+        description: >-
+          Space- or comma-separated environment variable names forwarded from
+          inherited repository secrets to hook commands. Every named secret is
+          required; an absent one fails the job before any build.
+        required: false
+        default: ''
+        type: string
+      continuum_ref:
+        description: >-
+          Audited Continuum revision supplying the release engine. Pin this to
+          the same exact commit as the caller's `uses:` line during adoption.
+        required: false
+        default: main
+        type: string
+      runner:
+        description: Runner for plan and preparation jobs
+        required: false
+        default: ubuntu-latest
+        type: string
+      publish_runner:
+        description: Runner for the publishing job
+        required: false
+        default: ubuntu-latest
+        type: string
+      python_version:
+        description: Python version used to run the Continuum release engine
+        required: false
+        default: '3.12'
+        type: string
+      timeout_minutes:
+        description: Per-job timeout in minutes
+        required: false
+        default: 90
+        type: number
+    secrets:
+      TAP_PAT:
+        description: >-
+          Classic PAT with repo and workflow scopes. Used to create the tag and
+          GitHub Release, to let release-PR pushes trigger normal workflows, and
+          to let publisher hooks reach their own repositories.
+        required: false
+    outputs:
+      status:
+        description: Final release status (released, no-op, prepared, failed)
+        value: ${{ jobs.publish.outputs.status || jobs.prepare.outputs.status || jobs.plan.outputs.status }}
+      version:
+        description: Agreed release version
+        value: ${{ jobs.plan.outputs.version }}
+      tag:
+        description: Agreed release tag
+        value: ${{ jobs.plan.outputs.tag }}
+      release_url:
+        description: Published GitHub Release URL, when one exists
+        value: ${{ jobs.publish.outputs.release_url }}
+
+permissions:
+  contents: read
+
+# One release per repository at a time. A duplicate event waits rather than
+# cancelling the run that is already publishing, because cancelling halfway
+# through an asset upload is exactly how a partial release happens.
+concurrency:
+  group: continuum-release-${{ github.repository }}
+  cancel-in-progress: false
+
+env:
+  CONTINUUM_ENGINE: ${{ github.workspace }}/continuum
+  CONTINUUM_CONSUMER: ${{ github.workspace }}/consumer
+
+jobs:
+  plan:
+    name: Plan release
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: ${{ inputs.timeout_minutes }}
+    permissions:
+      contents: read
+    outputs:
+      status: ${{ steps.outputs.outputs.status }}
+      should_release: ${{ steps.outputs.outputs.should_release }}
+      mode: ${{ steps.outputs.outputs.mode }}
+      targets: ${{ steps.outputs.outputs.targets }}
+      version: ${{ steps.outputs.outputs.version }}
+      tag: ${{ steps.outputs.outputs.tag }}
+    steps:
+      - name: Validate the exact source commit
+        env:
+          SOURCE_SHA: ${{ inputs.source_sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]] || {
+            echo "::error::source_sha must be a full 40-character lowercase commit SHA, got: $SOURCE_SHA"
+            exit 1
+          }
+
+      - name: Checkout consumer at the exact source commit
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ inputs.source_sha }}
+          path: consumer
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Checkout the Continuum release engine
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: kodmial/continuum
+          ref: ${{ inputs.continuum_ref }}
+          path: continuum
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Record the commits this run is about
+        shell: bash
+        run: |
+          set -euo pipefail
+          printf '%s\n' "${{ inputs.source_sha }}" > "$RUNNER_TEMP/source-sha.txt"
+          git -C "$CONTINUUM_CONSUMER" rev-parse HEAD > "$RUNNER_TEMP/consumer-head.txt"
+          git -C "$CONTINUUM_ENGINE" rev-parse HEAD > "$RUNNER_TEMP/engine-head.txt"
+          test "$(cat "$RUNNER_TEMP/consumer-head.txt")" = "${{ inputs.source_sha }}" || {
+            echo "::error::the consumer checkout is not the requested source commit"
+            exit 1
+          }
+
+      - name: Plan the release and its target matrix
+        id: plan
+        shell: bash
+        env:
+          RELEASE_EVENT: ${{ inputs.event }}
+          RELEASE_SHA: ${{ inputs.source_sha }}
+          RELEASE_TAG: ${{ inputs.tag }}
+          RELEASE_VERSION: ${{ inputs.version }}
+          RELEASE_VERSION_FILE: ${{ inputs.version_file }}
+          RELEASE_VERSION_PATTERN: ${{ inputs.version_pattern }}
+          RELEASE_TAG_PREFIX: ${{ inputs.tag_prefix }}
+          RELEASE_CHANNEL: ${{ inputs.channel }}
+          RELEASE_HOOKS: ${{ inputs.hooks }}
+          RELEASE_NOTES_FILE: ${{ inputs.notes_file }}
+          RELEASE_PR: ${{ inputs.release_pr }}
+          RELEASE_DEFAULT_BRANCH: ${{ inputs.default_branch || github.event.repository.default_branch || 'main' }}
+          RELEASE_NO_GITHUB: ${{ inputs.no_github_release }}
+        run: |
+          set -euo pipefail
+          export PYTHONPATH="$CONTINUUM_ENGINE/src:$CONTINUUM_ENGINE"
+          mkdir -p "$RUNNER_TEMP/release"
+
+          changed="$RUNNER_TEMP/release/changed-files.txt"
+          if git -C "$CONTINUUM_CONSUMER" rev-parse "$RELEASE_SHA^" >/dev/null 2>&1; then
+            git -C "$CONTINUUM_CONSUMER" diff --name-only "$RELEASE_SHA^" "$RELEASE_SHA" > "$changed"
+          else
+            git -C "$CONTINUUM_CONSUMER" ls-tree -r --name-only "$RELEASE_SHA" > "$changed"
+          fi
+          commit_message="$(git -C "$CONTINUUM_CONSUMER" log -1 --format=%B "$RELEASE_SHA")"
+
+          args=(
+            plan
+            --config "$CONTINUUM_CONSUMER/.continuum.yml"
+            --workdir "$CONTINUUM_CONSUMER"
+            --event "$RELEASE_EVENT"
+            --repository "$GITHUB_REPOSITORY"
+            --sha "$RELEASE_SHA"
+            --branch "$RELEASE_DEFAULT_BRANCH"
+            --default-branch "$RELEASE_DEFAULT_BRANCH"
+            --changed-files-file "$changed"
+            --commit-message "$commit_message"
+            --tag-prefix "$RELEASE_TAG_PREFIX"
+            --channel "$RELEASE_CHANNEL"
+            --notes-file "$RELEASE_NOTES_FILE"
+            --matrix "$RUNNER_TEMP/release/matrix.json"
+            --json "$RUNNER_TEMP/release/plan.json"
+            --github-output "$GITHUB_OUTPUT"
+            --summary "$GITHUB_STEP_SUMMARY"
+          )
+          [[ -n "$RELEASE_VERSION" ]] && args+=(--version "$RELEASE_VERSION")
+          [[ -n "$RELEASE_VERSION_FILE" ]] && args+=(--version-file "$RELEASE_VERSION_FILE")
+          [[ -n "$RELEASE_VERSION_PATTERN" ]] && args+=(--version-pattern "$RELEASE_VERSION_PATTERN")
+          [[ -n "$RELEASE_TAG" ]] && args+=(--tag "$RELEASE_TAG")
+          [[ -n "$RELEASE_HOOKS" ]] && args+=(--hooks "$RELEASE_HOOKS")
+          [[ -n "$RELEASE_PR" ]] && args+=(--release-pr "$RELEASE_PR")
+          [[ "$RELEASE_NO_GITHUB" == "true" ]] && args+=(--no-github-release)
+
+          python3 -m continuum.release "${args[@]}"
+
+      - name: Publish the plan as job outputs
+        id: outputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, os
+
+          with open(os.path.join(os.environ["RUNNER_TEMP"], "release", "plan.json"), encoding="utf-8") as handle:
+              plan = json.load(handle)
+          with open(os.path.join(os.environ["RUNNER_TEMP"], "release", "matrix.json"), encoding="utf-8") as handle:
+              matrix = json.load(handle)
+
+          status = str(plan.get("status") or "")
+          targets = json.dumps(matrix.get("targets") or [], separators=(",", ":"))
+          values = {
+              "status": status,
+              "should_release": "true" if status == "planned" else "false",
+              "mode": str(matrix.get("mode") or ""),
+              "targets": targets,
+              "version": str(plan.get("version") or ""),
+              "tag": str(plan.get("tag") or ""),
+          }
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as out:
+              for name, value in values.items():
+                  out.write(f"{name}={value}\n")
+          PY
+
+      - name: Require executable release hooks
+        if: steps.outputs.outputs.status == 'planned' && steps.outputs.outputs.mode == 'config-only'
+        shell: bash
+        run: |
+          echo "::error::release.targets declares a release, but release.hooks is not configured. A configured target can be planned; only hooks declare the build, sign, and verify commands this workflow runs. Add a release.hooks document before publishing."
+          exit 1
+
+      - name: Upload the release plan
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: continuum-release-plan
+          path: |
+            ${{ runner.temp }}/release/plan.json
+            ${{ runner.temp }}/release/matrix.json
+            ${{ runner.temp }}/release/changed-files.txt
+            ${{ runner.temp }}/source-sha.txt
+            ${{ runner.temp }}/consumer-head.txt
+            ${{ runner.temp }}/engine-head.txt
+          if-no-files-found: error
+          retention-days: 14
+
+  prepare:
+    name: Prepare release
+    needs: plan
+    if: needs.plan.outputs.should_release == 'true' && needs.plan.outputs.mode == 'hooks'
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: ${{ inputs.timeout_minutes }}
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - name: Checkout consumer at the exact source commit
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ inputs.source_sha }}
+          path: consumer
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Checkout the Continuum release engine
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: kodmial/continuum
+          ref: ${{ inputs.continuum_ref }}
+          path: continuum
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Expose only the named hook secrets
+        env:
+          ALL_SECRETS: ${{ toJSON(secrets) }}
+          HOOK_SECRET_ENV: ${{ inputs.hook_secret_env }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, os, re
+
+          secrets = json.loads(os.environ.get("ALL_SECRETS") or "{}")
+          requested = [name for name in re.split(r"[\s,]+", os.environ.get("HOOK_SECRET_ENV", "")) if name]
+          missing = [name for name in requested if not secrets.get(name)]
+          if missing:
+              raise SystemExit(
+                  "::error::hook_secret_env names secrets this job did not receive: "
+                  + ", ".join(missing)
+                  + ". Add them to the caller's `secrets: inherit` or configure the secret."
+              )
+          with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as out:
+              for name in requested:
+                  value = str(secrets[name])
+                  print(f"::add-mask::{value}")
+                  out.write(f"{name}<<CONTINUUM_HOOK_SECRET_EOF\n{value}\nCONTINUUM_HOOK_SECRET_EOF\n")
+          PY
+
+      - name: Record the preparation pass
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ secrets.TAP_PAT || github.token }}
+          RELEASE_EVENT: ${{ inputs.event }}
+          RELEASE_SHA: ${{ inputs.source_sha }}
+          RELEASE_TAG: ${{ inputs.tag }}
+          RELEASE_VERSION: ${{ needs.plan.outputs.version }}
+          RELEASE_VERSION_FILE: ${{ inputs.version_file }}
+          RELEASE_VERSION_PATTERN: ${{ inputs.version_pattern }}
+          RELEASE_TAG_PREFIX: ${{ inputs.tag_prefix }}
+          RELEASE_CHANNEL: ${{ inputs.channel }}
+          RELEASE_HOOKS: ${{ inputs.hooks }}
+          RELEASE_NOTES_FILE: ${{ inputs.notes_file }}
+          RELEASE_PR: ${{ inputs.release_pr }}
+          RELEASE_DEFAULT_BRANCH: ${{ inputs.default_branch || github.event.repository.default_branch || 'main' }}
+          HOOK_SECRET_ENV: ${{ inputs.hook_secret_env }}
+        run: |
+          set -euo pipefail
+          export PYTHONPATH="$CONTINUUM_ENGINE/src:$CONTINUUM_ENGINE"
+          mkdir -p prepared evidence
+
+          changed="$RUNNER_TEMP/changed-files.txt"
+          if git -C "$CONTINUUM_CONSUMER" rev-parse "$RELEASE_SHA^" >/dev/null 2>&1; then
+            git -C "$CONTINUUM_CONSUMER" diff --name-only "$RELEASE_SHA^" "$RELEASE_SHA" > "$changed"
+          else
+            git -C "$CONTINUUM_CONSUMER" ls-tree -r --name-only "$RELEASE_SHA" > "$changed"
+          fi
+          commit_message="$(git -C "$CONTINUUM_CONSUMER" log -1 --format=%B "$RELEASE_SHA")"
+
+          args=(
+            prepare
+            --config "$CONTINUUM_CONSUMER/.continuum.yml"
+            --workdir "$CONTINUUM_CONSUMER"
+            --event "$RELEASE_EVENT"
+            --repository "$GITHUB_REPOSITORY"
+            --sha "$RELEASE_SHA"
+            --branch "$RELEASE_DEFAULT_BRANCH"
+            --default-branch "$RELEASE_DEFAULT_BRANCH"
+            --changed-files-file "$changed"
+            --commit-message "$commit_message"
+            --tag-prefix "$RELEASE_TAG_PREFIX"
+            --channel "$RELEASE_CHANNEL"
+            --notes-file "$RELEASE_NOTES_FILE"
+            --receipt-dir prepared
+            --json evidence/prepare.json
+            --github-output "$GITHUB_OUTPUT"
+            --summary "$GITHUB_STEP_SUMMARY"
+            --quiet
+          )
+          [[ -n "$RELEASE_VERSION" ]] && args+=(--version "$RELEASE_VERSION")
+          [[ -n "$RELEASE_VERSION_FILE" ]] && args+=(--version-file "$RELEASE_VERSION_FILE")
+          [[ -n "$RELEASE_VERSION_PATTERN" ]] && args+=(--version-pattern "$RELEASE_VERSION_PATTERN")
+          [[ -n "$RELEASE_TAG" ]] && args+=(--tag "$RELEASE_TAG")
+          [[ -n "$RELEASE_HOOKS" ]] && args+=(--hooks "$RELEASE_HOOKS")
+          [[ -n "$RELEASE_PR" ]] && args+=(--release-pr "$RELEASE_PR")
+          for name in ${HOOK_SECRET_ENV//,/ }; do
+            args+=(--secret-env "$name")
+          done
+
+          python3 -m continuum.release "${args[@]}"
+
+      - name: Upload the prepared release
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: continuum-release-prepared
+          path: |
+            prepared/
+            evidence/
+          if-no-files-found: error
+          retention-days: 14
+
+  build:
+    name: Build ${{ matrix.id }}
+    needs: [plan, prepare]
+    if: needs.plan.outputs.should_release == 'true' && needs.plan.outputs.mode == 'hooks'
+    strategy:
+      fail-fast: true
+      matrix:
+        include: ${{ fromJSON(needs.plan.outputs.targets) }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: ${{ inputs.timeout_minutes }}
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout consumer at the exact source commit
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ inputs.source_sha }}
+          path: consumer
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Checkout the Continuum release engine
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: kodmial/continuum
+          ref: ${{ inputs.continuum_ref }}
+          path: continuum
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Download the prepared release
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: continuum-release-prepared
+          path: prepared
+
+      - name: Expose only the named hook secrets
+        env:
+          ALL_SECRETS: ${{ toJSON(secrets) }}
+          HOOK_SECRET_ENV: ${{ inputs.hook_secret_env }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, os, re
+
+          secrets = json.loads(os.environ.get("ALL_SECRETS") or "{}")
+          requested = [name for name in re.split(r"[\s,]+", os.environ.get("HOOK_SECRET_ENV", "")) if name]
+          missing = [name for name in requested if not secrets.get(name)]
+          if missing:
+              raise SystemExit(
+                  "::error::hook_secret_env names secrets this job did not receive: "
+                  + ", ".join(missing)
+                  + ". Add them to the caller's `secrets: inherit` or configure the secret."
+              )
+          with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as out:
+              for name in requested:
+                  value = str(secrets[name])
+                  print(f"::add-mask::{value}")
+                  out.write(f"{name}<<CONTINUUM_HOOK_SECRET_EOF\n{value}\nCONTINUUM_HOOK_SECRET_EOF\n")
+          PY
+
+      - name: Build sign and verify one target
+        shell: bash
+        env:
+          RELEASE_EVENT: ${{ inputs.event }}
+          RELEASE_SHA: ${{ inputs.source_sha }}
+          RELEASE_VERSION: ${{ needs.plan.outputs.version }}
+          RELEASE_TAG: ${{ needs.plan.outputs.tag }}
+          RELEASE_VERSION_FILE: ${{ inputs.version_file }}
+          RELEASE_VERSION_PATTERN: ${{ inputs.version_pattern }}
+          RELEASE_TAG_PREFIX: ${{ inputs.tag_prefix }}
+          RELEASE_CHANNEL: ${{ inputs.channel }}
+          RELEASE_HOOKS: ${{ inputs.hooks }}
+          RELEASE_NOTES_FILE: ${{ inputs.notes_file }}
+          RELEASE_PR: ${{ inputs.release_pr }}
+          RELEASE_DEFAULT_BRANCH: ${{ inputs.default_branch || github.event.repository.default_branch || 'main' }}
+          TARGET_ID: ${{ matrix.id }}
+          HOOK_SECRET_ENV: ${{ inputs.hook_secret_env }}
+        run: |
+          set -euo pipefail
+          export PYTHONPATH="$CONTINUUM_ENGINE/src:$CONTINUUM_ENGINE"
+          mkdir -p evidence
+
+          changed="$RUNNER_TEMP/changed-files.txt"
+          if git -C "$CONTINUUM_CONSUMER" rev-parse "$RELEASE_SHA^" >/dev/null 2>&1; then
+            git -C "$CONTINUUM_CONSUMER" diff --name-only "$RELEASE_SHA^" "$RELEASE_SHA" > "$changed"
+          else
+            git -C "$CONTINUUM_CONSUMER" ls-tree -r --name-only "$RELEASE_SHA" > "$changed"
+          fi
+          commit_message="$(git -C "$CONTINUUM_CONSUMER" log -1 --format=%B "$RELEASE_SHA")"
+
+          args=(
+            build
+            --config "$CONTINUUM_CONSUMER/.continuum.yml"
+            --workdir "$CONTINUUM_CONSUMER"
+            --event "$RELEASE_EVENT"
+            --repository "$GITHUB_REPOSITORY"
+            --sha "$RELEASE_SHA"
+            --branch "$RELEASE_DEFAULT_BRANCH"
+            --default-branch "$RELEASE_DEFAULT_BRANCH"
+            --changed-files-file "$changed"
+            --commit-message "$commit_message"
+            --tag-prefix "$RELEASE_TAG_PREFIX"
+            --channel "$RELEASE_CHANNEL"
+            --notes-file "$RELEASE_NOTES_FILE"
+            --target "$TARGET_ID"
+            --receipt-dir "$RUNNER_TEMP/build-receipts"
+            --bundle-out bundle
+            --json evidence/build.json
+            --summary "$GITHUB_STEP_SUMMARY"
+            --quiet
+          )
+          [[ -n "$RELEASE_VERSION" ]] && args+=(--version "$RELEASE_VERSION")
+          [[ -n "$RELEASE_TAG" ]] && args+=(--tag "$RELEASE_TAG")
+          [[ -n "$RELEASE_VERSION_FILE" ]] && args+=(--version-file "$RELEASE_VERSION_FILE")
+          [[ -n "$RELEASE_VERSION_PATTERN" ]] && args+=(--version-pattern "$RELEASE_VERSION_PATTERN")
+          [[ -n "$RELEASE_HOOKS" ]] && args+=(--hooks "$RELEASE_HOOKS")
+          [[ -n "$RELEASE_PR" ]] && args+=(--release-pr "$RELEASE_PR")
+          for receipt in prepared/receipt-*.json; do
+            [[ -f "$receipt" ]] && args+=(--receipt-import "$receipt")
+          done
+          for name in ${HOOK_SECRET_ENV//,/ }; do
+            args+=(--secret-env "$name")
+          done
+
+          python3 -m continuum.release "${args[@]}"
+
+      - name: Upload this target's build
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: continuum-release-build-${{ matrix.id }}
+          path: |
+            bundle/
+            evidence/
+          if-no-files-found: error
+          retention-days: 14
+
+  publish:
+    name: Publish release
+    needs: [plan, prepare, build]
+    if: needs.plan.outputs.should_release == 'true' && needs.plan.outputs.mode == 'hooks'
+    runs-on: ${{ inputs.publish_runner }}
+    timeout-minutes: ${{ inputs.timeout_minutes }}
+    permissions:
+      contents: write
+      pull-requests: write
+    outputs:
+      status: ${{ steps.publish.outputs.status }}
+      release_url: ${{ steps.publish.outputs.release_url }}
+    steps:
+      - name: Checkout consumer at the exact source commit
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ inputs.source_sha }}
+          path: consumer
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Checkout the Continuum release engine
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: kodmial/continuum
+          ref: ${{ inputs.continuum_ref }}
+          path: continuum
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Download the prepared release
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: continuum-release-prepared
+          path: prepared
+
+      - name: Download every target's build
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: continuum-release-build-*
+          path: artifacts
+          merge-multiple: true
+
+      - name: Expose only the named hook secrets
+        env:
+          ALL_SECRETS: ${{ toJSON(secrets) }}
+          HOOK_SECRET_ENV: ${{ inputs.hook_secret_env }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, os, re
+
+          secrets = json.loads(os.environ.get("ALL_SECRETS") or "{}")
+          requested = [name for name in re.split(r"[\s,]+", os.environ.get("HOOK_SECRET_ENV", "")) if name]
+          missing = [name for name in requested if not secrets.get(name)]
+          if missing:
+              raise SystemExit(
+                  "::error::hook_secret_env names secrets this job did not receive: "
+                  + ", ".join(missing)
+                  + ". Add them to the caller's `secrets: inherit` or configure the secret."
+              )
+          with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as out:
+              for name in requested:
+                  value = str(secrets[name])
+                  print(f"::add-mask::{value}")
+                  out.write(f"{name}<<CONTINUUM_HOOK_SECRET_EOF\n{value}\nCONTINUUM_HOOK_SECRET_EOF\n")
+          PY
+
+      - name: Refuse an incomplete build set
+        shell: bash
+        run: |
+          set -euo pipefail
+          count=0
+          for receipt in artifacts/receipt-*.json; do
+            [[ -f "$receipt" ]] && count=$((count + 1))
+          done
+          test "$count" -gt 0 || {
+            echo "::error::no target receipt was downloaded; refusing to publish a release with no recorded build"
+            exit 1
+          }
+          echo "downloaded $count target receipt(s)"
+
+      - name: Publish the complete asset set
+        id: publish
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ secrets.TAP_PAT || github.token }}
+          RELEASE_EVENT: ${{ inputs.event }}
+          RELEASE_SHA: ${{ inputs.source_sha }}
+          RELEASE_VERSION: ${{ needs.plan.outputs.version }}
+          RELEASE_TAG: ${{ needs.plan.outputs.tag }}
+          RELEASE_VERSION_FILE: ${{ inputs.version_file }}
+          RELEASE_VERSION_PATTERN: ${{ inputs.version_pattern }}
+          RELEASE_TAG_PREFIX: ${{ inputs.tag_prefix }}
+          RELEASE_CHANNEL: ${{ inputs.channel }}
+          RELEASE_HOOKS: ${{ inputs.hooks }}
+          RELEASE_NOTES_FILE: ${{ inputs.notes_file }}
+          RELEASE_PR: ${{ inputs.release_pr }}
+          RELEASE_DEFAULT_BRANCH: ${{ inputs.default_branch || github.event.repository.default_branch || 'main' }}
+          RELEASE_NO_GITHUB: ${{ inputs.no_github_release }}
+          HOOK_SECRET_ENV: ${{ inputs.hook_secret_env }}
+        run: |
+          set -euo pipefail
+          export PYTHONPATH="$CONTINUUM_ENGINE/src:$CONTINUUM_ENGINE"
+          mkdir -p evidence publish-receipts
+
+          changed="$RUNNER_TEMP/changed-files.txt"
+          if git -C "$CONTINUUM_CONSUMER" rev-parse "$RELEASE_SHA^" >/dev/null 2>&1; then
+            git -C "$CONTINUUM_CONSUMER" diff --name-only "$RELEASE_SHA^" "$RELEASE_SHA" > "$changed"
+          else
+            git -C "$CONTINUUM_CONSUMER" ls-tree -r --name-only "$RELEASE_SHA" > "$changed"
+          fi
+          commit_message="$(git -C "$CONTINUUM_CONSUMER" log -1 --format=%B "$RELEASE_SHA")"
+
+          args=(
+            publish
+            --config "$CONTINUUM_CONSUMER/.continuum.yml"
+            --workdir "$CONTINUUM_CONSUMER"
+            --event "$RELEASE_EVENT"
+            --repository "$GITHUB_REPOSITORY"
+            --sha "$RELEASE_SHA"
+            --branch "$RELEASE_DEFAULT_BRANCH"
+            --default-branch "$RELEASE_DEFAULT_BRANCH"
+            --changed-files-file "$changed"
+            --commit-message "$commit_message"
+            --tag-prefix "$RELEASE_TAG_PREFIX"
+            --channel "$RELEASE_CHANNEL"
+            --notes-file "$RELEASE_NOTES_FILE"
+            --receipt-dir publish-receipts
+            --artifact-dir artifacts
+            --asset-receipt
+            --json evidence/publish.json
+            --github-output "$GITHUB_OUTPUT"
+            --summary "$GITHUB_STEP_SUMMARY"
+          )
+          [[ -n "$RELEASE_VERSION" ]] && args+=(--version "$RELEASE_VERSION")
+          [[ -n "$RELEASE_TAG" ]] && args+=(--tag "$RELEASE_TAG")
+          [[ -n "$RELEASE_VERSION_FILE" ]] && args+=(--version-file "$RELEASE_VERSION_FILE")
+          [[ -n "$RELEASE_VERSION_PATTERN" ]] && args+=(--version-pattern "$RELEASE_VERSION_PATTERN")
+          [[ -n "$RELEASE_HOOKS" ]] && args+=(--hooks "$RELEASE_HOOKS")
+          [[ -n "$RELEASE_PR" ]] && args+=(--release-pr "$RELEASE_PR")
+          [[ "$RELEASE_NO_GITHUB" == "true" ]] && args+=(--no-github-release)
+          for receipt in prepared/receipt-*.json; do
+            [[ -f "$receipt" ]] && args+=(--receipt-import "$receipt")
+          done
+          for receipt in artifacts/receipt-*.json; do
+            [[ -f "$receipt" ]] && args+=(--receipt-import "$receipt")
+          done
+          for name in ${HOOK_SECRET_ENV//,/ }; do
+            args+=(--secret-env "$name")
+          done
+
+          python3 -m continuum.release "${args[@]}"
+
+      - name: Upload release evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: continuum-release-evidence
+          path: evidence/
+          if-no-files-found: warn
+          retention-days: 14

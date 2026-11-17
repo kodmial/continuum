@@ -11,6 +11,7 @@ class ContinuumTest < Minitest::Test
   ROOT = File.expand_path('..', __dir__)
   CORE_STUBS = Dir[File.join(ROOT, '.github/caller-stubs/*.yml')].sort
   TECH_STUBS = Dir[File.join(ROOT, '.github/caller-stubs/tech/*.yml')].sort
+  RELEASE_STUBS = Dir[File.join(ROOT, '.github/caller-stubs/release/*.yml')].sort
   PARENT_STUBS = Dir[File.join(ROOT, '.github/caller-stubs/parent/*.yml')].sort
   WORKFLOWS = Dir[File.join(ROOT, '.github/workflows/*.yml')].sort
   # Project-owned entry workflows used only by the Continuum repository itself.
@@ -19,8 +20,8 @@ class ContinuumTest < Minitest::Test
   PROJECT_ENTRY_WORKFLOWS = %w[add-review-label.yml automation.yml ci.yml coderabbit-retry.yml coderabbit-unresolved.yml contract-gate.yml contract-qualification.yml contract-qualification-canary.yml opencode.yml pr-agent.yml pr-agent-recovery.yml pr-agent-router.yml remove-review-label.yml].freeze
   # Every caller stub in every layer, for the checks that must not care which
   # layer a file belongs to.
-  ALL_STUBS = (CORE_STUBS + TECH_STUBS + PARENT_STUBS).sort
-  STUBS = (CORE_STUBS + TECH_STUBS).sort
+  ALL_STUBS = (CORE_STUBS + TECH_STUBS + RELEASE_STUBS + PARENT_STUBS).sort
+  STUBS = (CORE_STUBS + TECH_STUBS + RELEASE_STUBS).sort
   # Transitional workflow_run aliases kept by the scheduler so already
   # installed parent callers using the pre-SubTask names still wake it.
   LEGACY_WORKFLOW_RUN_NAMES = ['Child task', 'Child review', 'Child PR review'].freeze
@@ -653,6 +654,7 @@ class ContinuumTest < Minitest::Test
       'project entry workflows' => project_entries,
       'core stubs' => CORE_STUBS,
       'tech stubs' => TECH_STUBS,
+      'release stubs' => RELEASE_STUBS,
       'parent stubs' => PARENT_STUBS
     }.each do |layer, paths|
       names = paths.map { |path| yaml(path).fetch('name') }
@@ -683,7 +685,7 @@ class ContinuumTest < Minitest::Test
   # unique, so a self-reference can only be an explicit copy of the file's own
   # name into its filter — the exact shape of the watchdog self-trigger.
   def test_no_workflow_run_trigger_watches_itself
-    watched_sources = WORKFLOWS + CORE_STUBS + TECH_STUBS + PARENT_STUBS
+    watched_sources = WORKFLOWS + CORE_STUBS + TECH_STUBS + RELEASE_STUBS + PARENT_STUBS
     watched_sources.each do |path|
       caller = yaml(path)
       watched = events(caller).fetch('workflow_run', {}).fetch('workflows', [])
@@ -1122,7 +1124,7 @@ class ContinuumTest < Minitest::Test
       if [ -f "$CURL_OVERRIDES/$name" ]; then
         cat "$CURL_OVERRIDES/$name"
       else
-        for dir in "$CURL_STUB_DIR" "$CURL_STUB_DIR/tech" "$CURL_STUB_DIR/parent"; do
+        for dir in "$CURL_STUB_DIR" "$CURL_STUB_DIR/tech" "$CURL_STUB_DIR/release" "$CURL_STUB_DIR/parent"; do
           if [ -f "$dir/$name" ]; then cat "$dir/$name"; exit 0; fi
         done
         exit 22
@@ -1461,17 +1463,17 @@ class ContinuumTest < Minitest::Test
   end
 
   # Installing one layer must never remove another layer's callers. Today the
-  # three sets are independent files in one directory, so a one-line edit to the
+  # sets are independent files in one directory, so a one-line edit to the
   # prune candidate list — or a future edit to `"${STUBS[@]}"` — could delete a
-  # consumer's whole tech or parent layer with no warning. The growth
-  # 18 -> 19 -> 23 is the observable form of that guarantee.
+  # consumer's whole tech, release, or parent layer with no warning. The growth
+  # 18 -> 19 -> 20 -> 24 is the observable form of that guarantee.
   def test_installing_one_set_does_not_delete_another_sets_callers
     fixture do |dir|
       target = File.join(dir, 'consumer')
       env = fake_curl(dir).merge('CONTINUUM_INSTALL_ASSUME_YES' => '1')
       workflows = File.join(target, '.github/workflows')
       counts = {}
-      %w[core tech parent].each do |set|
+      %w[core tech release parent].each do |set|
         output, status = Open3.capture2e(env, 'bash', File.join(ROOT, 'install.sh'), target, 'main', set)
         assert status.success?, output
         installed = Dir[File.join(workflows, '*.yml')].map { |f| File.basename(f) }
@@ -1482,19 +1484,24 @@ class ContinuumTest < Minitest::Test
           next unless set == 'core' || installed.include?(base)
           assert_includes installed, base, "#{set} install removed the core caller #{base}"
         end
-        if set == 'tech'
+        if %w[tech release parent].include?(set)
           TECH_STUBS.each { |stub| assert_includes installed, File.basename(stub) }
+        end
+        if %w[release parent].include?(set)
+          RELEASE_STUBS.each { |stub| assert_includes installed, File.basename(stub) }
         end
         if set == 'parent'
           PARENT_STUBS.each { |stub| assert_includes installed, File.basename(stub) }
         end
       end
-      # Each set adds exactly its own files: 18 core, +1 tech, +4 parent.
+      # Each set adds exactly its own files: 18 core, +1 tech, +1 release,
+      # +4 parent.
       assert_equal CORE_STUBS.size, counts['core']
       assert_equal CORE_STUBS.size + TECH_STUBS.size, counts['tech']
+      assert_equal CORE_STUBS.size + TECH_STUBS.size + RELEASE_STUBS.size, counts['release']
       assert_equal ALL_STUBS.size, counts['parent']
-      assert_equal 23, ALL_STUBS.size,
-                   'every install-managed caller Continuum ships, across all three layers'
+      assert_equal 24, ALL_STUBS.size,
+                   'every install-managed caller Continuum ships, across all four layers'
     end
   end
 
@@ -1519,7 +1526,7 @@ class ContinuumTest < Minitest::Test
       FileUtils.mkdir_p(workflows)
       FileUtils.cp(File.join(ROOT, 'install.sh'), File.join(checkout, 'install.sh'))
       env = fake_curl(dir).merge('CONTINUUM_INSTALL_ASSUME_YES' => '1')
-      %w[core tech parent].each do |set|
+      %w[core tech release parent].each do |set|
         # One real core workflow body, plus a file that satisfies BOTH prune
         # conditions (the prefix and a repository `uses:` call) under a name
         # Continuum no longer ships. Against any other directory both the write
@@ -2023,7 +2030,7 @@ class ContinuumTest < Minitest::Test
   end
 
   def test_every_core_workflow_has_a_caller_or_is_repo_ci
-    stubs = CORE_STUBS + TECH_STUBS + PARENT_STUBS
+    stubs = CORE_STUBS + TECH_STUBS + RELEASE_STUBS + PARENT_STUBS
     called = stubs.map { |path| stub_callee_name(path) }.compact
     workflows = WORKFLOWS.map { |path| File.basename(path) }
     uncalled = workflows.reject do |base|
@@ -5888,6 +5895,8 @@ class ContinuumTest < Minitest::Test
                  consumer_defined.call(CORE_STUBS)
     assert_equal %w[CHILD_RUNTIME_REPOSITORIES CHILD_RUNTIME_TOKEN TAP_PAT],
                  consumer_defined.call(PARENT_STUBS)
+    assert_equal %w[TAP_PAT], consumer_defined.call(RELEASE_STUBS),
+                 'the release set reads only the release token'
     assert_empty consumer_defined.call(TECH_STUBS),
                  'the consumer-neutral Swift profile must require no product secret'
   end
@@ -5906,7 +5915,7 @@ class ContinuumTest < Minitest::Test
              "docs/consumer-variables.md documents #{name}, which no workflow reads"
     end
 
-    { 'core' => CORE_STUBS, 'parent' => PARENT_STUBS, 'tech' => TECH_STUBS }.each do |set, stubs|
+    { 'core' => CORE_STUBS, 'parent' => PARENT_STUBS, 'release' => RELEASE_STUBS, 'tech' => TECH_STUBS }.each do |set, stubs|
       secrets_read_by(stubs).reject { |name| name == 'GITHUB_TOKEN' }.each do |name|
         assert_includes table, "`#{name}`",
                         "the #{set} set reads #{name}, so the Secrets table must document it"
@@ -5945,7 +5954,7 @@ class ContinuumTest < Minitest::Test
 
     readable = ->(name) { WORKFLOWS.any? { |path| File.read(path).include?("secrets.#{name}") } }
 
-    (CORE_STUBS + PARENT_STUBS + TECH_STUBS).each do |stub|
+    (CORE_STUBS + PARENT_STUBS + RELEASE_STUBS + TECH_STUBS).each do |stub|
       secrets_read_by([stub]).reject { |name| name == 'GITHUB_TOKEN' }.each do |name|
         assert_includes table, "`#{name}`",
                         "#{File.basename(stub)} reads #{name}, so the README secrets table must list it"
@@ -11727,6 +11736,202 @@ class ContinuumTest < Minitest::Test
                      'the watchdog must not retry an operator-cancelled generation'
     assert File.exist?(File.join(ROOT, 'tests/test_opencode_cancel.py')),
                  'physical cancellation needs hermetic stop/provenance tests'
+  end
+
+  # ------------------------------------------ application release (opt-in)
+  #
+  # The application release is the one Continuum workflow a consumer must
+  # install deliberately. These contracts pin the properties that make the
+  # opt-in safe: it is never self-triggered, it serializes publication, every
+  # target is built as its own matrix leg from one exact commit, an
+  # unconfigured consumer is a green no-op that reads no token, and the caller
+  # stays a thin forwarder with no product build command in it.
+
+  def release_workflow_path
+    File.join(ROOT, '.github/workflows/continuum-release.yml')
+  end
+
+  def release_caller_path
+    File.join(ROOT, '.github/caller-stubs/release/continuum-release.yml')
+  end
+
+  # One top-level job block, so an assertion cannot accidentally match the same
+  # word in a sibling job or in an embedded script.
+  def release_job_body(name)
+    lines = File.read(release_workflow_path).lines
+    start = lines.index { |line| line == "  #{name}:\n" }
+    raise "release job #{name} is missing" if start.nil?
+
+    rest = lines[(start + 1)..]
+    stop = rest.index { |line| line.match?(/^  [a-z0-9-]+:\s*$/) }
+    (stop ? lines[start...(start + 1 + stop)] : lines[start..]).join
+  end
+
+  def test_application_release_is_a_separate_opt_in_layer
+    document = yaml(release_workflow_path)
+    caller = yaml(release_caller_path)
+
+    assert_equal ['workflow_call'], events(document).keys.sort,
+                 'the reusable release workflow must not trigger itself'
+    assert_equal 'Application release', document.fetch('name')
+    assert_equal 'Application release', caller.fetch('name'),
+                 'controllers and dispatchers match on the stable workflow name'
+
+    assert_equal ['continuum-release.yml'], RELEASE_STUBS.map { |path| File.basename(path) },
+                 'the release layer must install exactly the release caller'
+    assert_equal ['continuum-release.yml'], RELEASE_STUBS.map { |path| stub_callee_name(path) }
+    core = CORE_STUBS.map { |path| stub_callee_name(path) }.compact
+    refute_includes core, 'continuum-release.yml',
+                    'core must never install the release caller'
+
+    trigger = events(caller)
+    assert_equal %w[push workflow_dispatch], trigger.keys.sort
+    refute_includes trigger.keys, 'pull_request',
+                    'a pull request must never start a release'
+    assert_equal ['main'], trigger.fetch('push').fetch('branches')
+    assert_equal ['v*'], trigger.fetch('push').fetch('tags')
+  end
+
+  def test_application_release_serializes_one_publication_per_repository
+    document = yaml(release_workflow_path)
+    concurrency = document.fetch('concurrency')
+    assert_equal false, concurrency.fetch('cancel-in-progress'),
+                 'a duplicate event must wait, never cancel, a release mid-upload'
+    assert_includes concurrency.fetch('group'), 'github.repository'
+
+    jobs = document.fetch('jobs')
+    assert_equal %w[plan prepare build publish], jobs.keys,
+                 'one preparation job and one publication job are the whole safety argument'
+    assert_equal '${{ fromJSON(needs.plan.outputs.targets) }}',
+                 jobs.fetch('build').fetch('strategy').fetch('matrix').fetch('include'),
+                 'the build matrix must come from the single plan'
+  end
+
+  def test_application_release_builds_each_target_from_the_same_exact_commit
+    jobs = yaml(release_workflow_path).fetch('jobs')
+    plan = release_job_body('plan')
+    assert_includes plan, '^[0-9a-f]{40}$',
+                    'the plan must reject anything but an exact lowercase commit'
+    assert_includes plan, 'the consumer checkout is not the requested source commit'
+
+    jobs.each do |name, job|
+      checkouts = job.fetch('steps').select { |step| step['uses'].to_s.start_with?('actions/checkout@') }
+      consumer = checkouts.find { |step| step.fetch('with', {})['path'] == 'consumer' }
+      engine = checkouts.find { |step| step.fetch('with', {})['path'] == 'continuum' }
+      refute_nil consumer, "#{name} must check out the consumer"
+      refute_nil engine, "#{name} must check out the Continuum engine"
+      assert_equal '${{ inputs.source_sha }}', consumer.fetch('with').fetch('ref'),
+                   "#{name} must check out the exact requested commit, not a branch head"
+      assert_equal 'kodmial/continuum', engine.fetch('with').fetch('repository')
+      assert_equal '${{ inputs.continuum_ref }}', engine.fetch('with').fetch('ref')
+    end
+
+    upload = jobs.fetch('build').fetch('steps').find { |step| step['uses'].to_s.include?('upload-artifact@') }
+    refute_nil upload, 'each build leg must publish its bundle and receipt'
+    assert_equal 'continuum-release-build-${{ matrix.id }}', upload.fetch('with').fetch('name')
+    build_body = release_job_body('build')
+    assert_includes build_body, '--target "$TARGET_ID"'
+    assert_includes build_body, '--bundle-out bundle'
+    assert_includes build_body, '--receipt-import "$receipt"'
+
+    downloads = jobs.fetch('publish').fetch('steps')
+                     .select { |step| step['uses'].to_s.include?('download-artifact@') }
+    builds = downloads.find { |step| step.fetch('with', {})['pattern'] == 'continuum-release-build-*' }
+    refute_nil builds, 'publish must import every build leg, not one of them'
+    publish_body = release_job_body('publish')
+    assert_includes publish_body, '--artifact-dir artifacts'
+    assert_includes publish_body, '--asset-receipt'
+    assert_includes publish_body, '--receipt-import "$receipt"'
+  end
+
+  def test_application_release_without_configuration_is_a_green_no_op
+    jobs = yaml(release_workflow_path).fetch('jobs')
+    assert_equal 'read', jobs.fetch('plan').fetch('permissions').fetch('contents'),
+                 'planning must not hold a write permission'
+    refute_includes release_job_body('plan'), 'secrets.',
+                    'planning must not read the release credential'
+
+    plan_step = jobs.fetch('plan').fetch('steps').find { |step| step['id'] == 'plan' }
+    refute_nil plan_step
+    assert_includes plan_step.fetch('run'), '--matrix "$RUNNER_TEMP/release/matrix.json"'
+    assert_includes plan_step.fetch('run'), '--json "$RUNNER_TEMP/release/plan.json"'
+
+    %w[prepare build publish].each do |name|
+      condition = jobs.fetch(name).fetch('if')
+      assert_includes condition, "needs.plan.outputs.should_release == 'true'"
+      assert_includes condition, "needs.plan.outputs.mode == 'hooks'",
+                      "#{name} must not start for a consumer with no release hooks"
+    end
+  end
+
+  def test_application_release_reads_its_token_only_where_it_writes
+    call = events(yaml(release_workflow_path)).fetch('workflow_call')
+    assert_equal ['TAP_PAT'], call.fetch('secrets').keys,
+                 'the release set defines exactly the release token'
+    assert_equal false, call.fetch('secrets').fetch('TAP_PAT').fetch('required'),
+                 'a dry plan must not require the release token'
+
+    %w[plan build].each do |name|
+      refute_includes release_job_body(name), 'secrets.TAP_PAT',
+                      "#{name} must not read the release credential"
+    end
+    %w[prepare publish].each do |name|
+      body = release_job_body(name)
+      assert_includes body, 'GITHUB_TOKEN: ${{ secrets.TAP_PAT || github.token }}'
+      refute_match(/echo[^\n]*secrets\.TAP_PAT/, body,
+                   "#{name} must never print the credential")
+    end
+  end
+
+  def test_application_release_exposes_only_the_named_hook_secrets
+    document = File.read(release_workflow_path)
+    assert_equal 3, document.scan('ALL_SECRETS: ${{ toJSON(secrets) }}').size,
+                 'the inherited secret bag may be read only to filter it'
+    assert_includes document, 'requested = [name for name in re.split(r"[\s,]+", os.environ.get("HOOK_SECRET_ENV", "")) if name]'
+    assert_includes document, 'missing = [name for name in requested if not secrets.get(name)]'
+    assert_includes document, '::add-mask::'
+    assert_includes document, '--secret-env'
+    refute_includes document, '--secret-json',
+                    'hook commands must never receive every inherited secret'
+    refute_includes document, 'env: ${{ toJSON(secrets) }}'
+  end
+
+  def test_application_release_publish_refuses_an_incomplete_artifact_set
+    publish = release_job_body('publish')
+    assert_includes publish, 'test "$count" -gt 0'
+    assert_includes publish, 'refusing to publish a release with no recorded build'
+    assert_includes publish, 'if: always()', 'publication evidence must survive a failed publish'
+  end
+
+  def test_application_release_caller_is_a_thin_forwarder
+    caller = yaml(release_caller_path)
+    job = caller.fetch('jobs').fetch('call')
+    assert_equal 'kodmial/continuum/.github/workflows/continuum-release.yml@main',
+                 job.fetch('uses'),
+                 'install.sh rewrites this literal `uses:` ref to the requested ref'
+    assert_equal 'inherit', job.fetch('secrets')
+    assert_equal 'main', job.fetch('with').fetch('continuum_ref'),
+                 'the installer rewrites literal refs; a runtime expression would be forwarded verbatim'
+    refute job.key?('steps'), 'the caller must not run build or publish commands itself'
+    refute_includes File.read(release_caller_path), 'run:'
+    refute_includes File.read(release_caller_path), 'shell:'
+
+    job.fetch('with').each do |key, value|
+      next if key == 'continuum_ref'
+
+      assert_match(/\A\$\{\{ inputs\./, value.to_s,
+                   "#{key} must forward the caller's own input, not pin a consumer knob")
+    end
+  end
+
+  def test_application_release_delegates_every_phase_to_the_tested_engine
+    { 'plan' => 'plan', 'prepare' => 'prepare', 'build' => 'build', 'publish' => 'publish' }.each do |job, phase|
+      body = release_job_body(job)
+      assert_includes body, "\n            #{phase}\n",
+                      "#{job} must run the #{phase} engine phase"
+      assert_includes body, 'python3 -m continuum.release "${args[@]}"',
+                      "#{job} must delegate to the tested release engine"
+    end
   end
 
   def test_terminal_generation_stop_gates_every_scheduler_path

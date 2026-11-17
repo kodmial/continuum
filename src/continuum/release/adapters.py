@@ -47,7 +47,7 @@ def bind_material(
 ) -> Dict[str, str]:
     """Join the job's secrets to the names the adapter's own steps read.
 
-    Configuration names a secret (`NANODICTATE_SIGNING_P12`); the adapter's
+    Configuration names a secret (`ACME_SIGNING_P12`); the adapter's
     steps read a name of their own (`CONTINUUM_APPLE_P12`). The join is the
     adapter's business, so it happens here rather than in a caller that would
     have to know both names.

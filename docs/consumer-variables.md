@@ -338,6 +338,28 @@ explicitly; core never guesses a consumer repository layout. Docker qualificatio
 consumers configure their artifact repository, binary name, image, memory/trial
 limits and result paths.
 
+## Optional application release
+
+The release layer is installed separately with the `release` set and is not part
+of `core`. It is configured by `.continuum.yml`:
+
+```yaml
+version: 1
+release:
+  hooks: .github/release-hooks.json
+```
+
+`release.targets` can describe the target matrix for planning, but a real build
+needs `release.hooks`, because the product build and signing commands are the
+consumer's. With neither key the release workflow is a verified green no-op.
+
+The reusable workflow accepts one declared secret, `TAP_PAT`, and an optional
+`hook_secret_env` input naming additional inherited secrets for hook commands.
+Build jobs only receive the secrets named there; publisher jobs receive
+`TAP_PAT` only when the hooks document or a publisher command names it. See
+[Release consumer guide](release-consumer-guide.md) for the hooks schema, matrix,
+retry/exit-code semantics, and the read-only NanoDictate parity report.
+
 ## Secrets
 
 | Secret | Required when | Purpose |

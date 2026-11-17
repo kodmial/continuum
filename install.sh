@@ -2,8 +2,8 @@
 set -euo pipefail
 # Install Continuum reusable workflows into a consumer repo (one command).
 # Usage: curl -fsSL https://raw.githubusercontent.com/kodmial/continuum/main/install.sh | bash
-#    or: curl -fsSL https://raw.githubusercontent.com/kodmial/continuum/main/install.sh | bash -s -- [path] [ref] [core|parent|tech]
-#    or: bash continuum/install.sh [path-to-consumer-repo] [ref] [core|parent|tech]
+#    or: curl -fsSL https://raw.githubusercontent.com/kodmial/continuum/main/install.sh | bash -s -- [path] [ref] [core|tech|release|parent]
+#    or: bash continuum/install.sh [path-to-consumer-repo] [ref] [core|tech|release|parent]
 # An optional `--yes` (or CONTINUUM_INSTALL_ASSUME_YES=1) removes superseded
 # Continuum callers without the interactive confirmation. The variable is
 # honoured only for an exact `1`, `true` or `yes`; any other value, including
@@ -14,6 +14,8 @@ set -euo pipefail
 # Installing into Continuum's own checkout is refused outright.
 # ref defaults to main. `core` is the task-domain layer every project needs;
 # `tech` is the opt-in consumer-neutral technology library (`continuum-tech-<tech>-`);
+# `release` adds only the opt-in application-release caller; it is never part
+# of `core`, so an existing consumer keeps its working release pipeline.
 # `parent` adds only child-execution callers.
 # Continuum never triggers its own technology library: consumers opt into it.
 #
@@ -49,7 +51,7 @@ DEST="${1:-.}"
 REF="${2:-main}"
 SET="${3:-core}"
 case "$SET" in
-  core|parent|tech) ;;
+  core|parent|tech|release) ;;
   *) echo "invalid set: $SET (the old 'swift' set is now 'tech')" >&2; exit 1 ;;
 esac
 [[ "$REF" =~ ^[A-Za-z0-9._/-]+$ ]] || { echo "invalid ref: $REF" >&2; exit 1; }
@@ -67,7 +69,7 @@ if [[ -e "$DEST/.github/workflows" && ! -d "$DEST/.github/workflows" ]]; then
   echo "invalid target: $DEST/.github/workflows is not a directory" >&2
   exit 1
 fi
-# The three layers, each stored under the exact name it installs as. There is
+# The layers, each stored under the exact name it installs as. There is
 # one naming rule in Continuum and no exception list: a caller is stored as
 # `continuum-<name>.yml` and installed verbatim, so the repository file name and
 # the consumer file name are always the same string.
@@ -96,6 +98,11 @@ CORE_STUBS=(
 TECH_STUBS=(
   continuum-tech-swift-ci.yml
 )
+# The opt-in application-release caller. It is a fourth layer rather than part
+# of `core` so installing core cannot add publishing to an existing consumer.
+RELEASE_STUBS=(
+  continuum-release.yml
+)
 PARENT_STUBS=(
   continuum-child-pr-review.yml
   continuum-child-review.yml
@@ -112,6 +119,10 @@ case "$SET" in
     # library/opt-in); Continuum itself never triggers these.
     STUB_PATH=".github/caller-stubs/tech"
     STUBS=("${TECH_STUBS[@]}")
+    ;;
+  release)
+    STUB_PATH=".github/caller-stubs/release"
+    STUBS=("${RELEASE_STUBS[@]}")
     ;;
   parent)
     STUB_PATH=".github/caller-stubs/parent"
@@ -172,7 +183,7 @@ workflow bodies this repository exists to provide.
 Continuum's own workflows are already in place. To install callers, point the
 installer at a consumer repository instead:
 
-  bash install.sh /path/to/consumer-repo [ref] [core|parent|tech]
+  bash install.sh /path/to/consumer-repo [ref] [core|tech|release|parent]
 EOF
   exit 1
 fi
@@ -348,9 +359,9 @@ done
 # 3. Self-install. Installing into Continuum's own checkout is refused before
 #    this point, so its own workflows are never candidates.
 #
-# The other layers' callers are never candidates: ALL_STUBS spans all three
-# layers, so installing one set cannot delete another set's files.
-ALL_STUBS=("${CORE_STUBS[@]}" "${TECH_STUBS[@]}" "${PARENT_STUBS[@]}")
+# The other layers' callers are never candidates: ALL_STUBS spans every layer,
+# so installing one set cannot delete another set's files.
+ALL_STUBS=("${CORE_STUBS[@]}" "${TECH_STUBS[@]}" "${RELEASE_STUBS[@]}" "${PARENT_STUBS[@]}")
 SUPERSEDED=()
 if [[ -d "$TARGET_WORKFLOWS" ]]; then
   for installed in "$TARGET_WORKFLOWS"/continuum-*.yml; do

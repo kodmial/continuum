@@ -1,0 +1,86 @@
+name: Application release
+
+# Opt-in caller for the Continuum release state machine.
+#
+# Installing this file is the opt-in. It is deliberately not part of the `core`
+# set: a repository that installs core gets no release job. With no
+# `release.targets` and no `release.hooks` in `.continuum.yml`, every run of this
+# caller is a green no-op that reads no token and builds nothing.
+#
+# Pin the `uses:` line to the same audited Continuum commit as `continuum_ref`
+# before adopting it. Keep this file thin: product build, sign, and verify
+# commands belong to the consumer's hooks document, and publisher commands
+# belong in `release.publishers`/`release.syncs` there.
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_sha:
+        description: Exact commit to release. Empty uses the dispatched ref's commit.
+        required: false
+        type: string
+      version:
+        description: Explicit version. Empty uses the configured version source.
+        required: false
+        type: string
+      version_file:
+        description: Repository-relative file carrying the version
+        required: false
+        type: string
+      tag:
+        description: Tag being released, when this dispatch is about a tag
+        required: false
+        type: string
+      event:
+        description: Release event to model (push, tag-push, workflow-dispatch, scheduled)
+        required: false
+        default: workflow-dispatch
+        type: choice
+        options:
+          - workflow-dispatch
+          - push
+          - tag-push
+          - release-pr-merged
+          - scheduled
+      hooks:
+        description: Repository-relative release hooks document
+        required: false
+        type: string
+      channel:
+        description: Release channel
+        required: false
+        default: default
+        type: string
+      hook_secret_env:
+        description: Secret environment names forwarded to hook commands
+        required: false
+        type: string
+      default_branch:
+        description: Branch a release may be cut from. Empty uses the repository default.
+        required: false
+        type: string
+  push:
+    branches:
+      - main
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  call:
+    uses: kodmial/continuum/.github/workflows/continuum-release.yml@main
+    secrets: inherit
+    with:
+      source_sha: "${{ inputs.source_sha || github.sha }}"
+      event: "${{ inputs.event || (github.ref_type == 'tag' && 'tag-push' || (github.event_name == 'push' && 'push' || 'workflow-dispatch')) }}"
+      version: "${{ inputs.version }}"
+      version_file: "${{ inputs.version_file }}"
+      tag: "${{ inputs.tag || (github.ref_type == 'tag' && github.ref_name || '') }}"
+      hooks: "${{ inputs.hooks }}"
+      channel: "${{ inputs.channel || 'default' }}"
+      hook_secret_env: "${{ inputs.hook_secret_env }}"
+      default_branch: "${{ inputs.default_branch }}"
+      continuum_ref: "main"

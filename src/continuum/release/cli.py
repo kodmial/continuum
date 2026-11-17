@@ -30,7 +30,9 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shutil
 import sys
+from dataclasses import replace
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from .. import config as config_module
@@ -53,8 +55,8 @@ from .receipt import (
     ReceiptError,
     TagReceiptStore,
 )
-from .state import EMPTY_JOURNAL, Journal
-from .targets import config_adapters, recorded_adapters
+from .state import COMPLETED, EMPTY_JOURNAL, NOOP, Journal
+from .targets import RECORDED_ADAPTER, config_adapters, recorded_adapters
 from .version import (
     ExplicitVersion,
     ProjectFileVersion,
@@ -80,6 +82,24 @@ EXIT_USAGE = 2
 EXIT_RETRYABLE = 75
 EXIT_BLOCKED = 78
 
+#: Failure codes that mean "a human has to resolve a contradiction". They are
+#: not retryable, and they are not a generic failure either: a release that is
+#: blocked must be visibly different from one that happened to error, because
+#: re-running a blocked release cannot help.
+BLOCKED_CODES = (
+    "stale-head",
+    "changes-requested",
+    "review-stale",
+    "source-conflict",
+    "asset-set-conflict",
+    "asset-conflict",
+    "asset-digest-mismatch",
+    "checksums-mismatch",
+    "tag-source-conflict",
+    "draft-source-conflict",
+    "release-source-conflict",
+)
+
 
 class CliError(ValueError):
     """A refusal this module can explain, with the exit code it implies."""
@@ -102,9 +122,11 @@ def _parser() -> argparse.ArgumentParser:
         "phase",
         nargs="?",
         default="execute",
-        choices=("plan", "build", "publish", "execute"),
-        help="plan: dry run; build: run and record without publishing; publish: "
-        "resume a recorded build; execute: the whole chain",
+        choices=("plan", "prepare", "build", "publish", "execute"),
+        help="plan: dry run; prepare: record everything up to the source pin, so "
+        "a build matrix shares one version and one release pull request; build: "
+        "run and record without publishing; publish: resume a recorded build; "
+        "execute: the whole chain",
     )
     parser.add_argument("--config", default=DEFAULT_CONFIG)
     parser.add_argument("--workdir", default="")
@@ -154,6 +176,28 @@ def _parser() -> argparse.ArgumentParser:
         help="forward the named environment variable to hook commands; "
         "nothing else is inherited",
     )
+    hooks.add_argument(
+        "--target",
+        action="append",
+        default=[],
+        metavar="ID",
+        help="restrict this job to one declared target (repeatable). A build matrix "
+        "uses one job per target; the release as a whole is still the union.",
+    )
+    hooks.add_argument(
+        "--matrix",
+        default="",
+        metavar="PATH",
+        help="write the declared target matrix (id, runner, platform) as JSON, for a "
+        "workflow that builds each target on its own runner",
+    )
+    hooks.add_argument(
+        "--bundle-out",
+        default="",
+        metavar="DIR",
+        help="copy built artifacts and this target's receipt into DIR so a later "
+        "publish job can resume from them",
+    )
 
     destination = parser.add_argument_group("destination")
     destination.add_argument(
@@ -173,6 +217,21 @@ def _parser() -> argparse.ArgumentParser:
 
     receipts = parser.add_argument_group("receipts")
     receipts.add_argument("--receipt-dir", default=DEFAULT_RECEIPT_DIR)
+    receipts.add_argument(
+        "--receipt-import",
+        action="append",
+        default=[],
+        metavar="PATH",
+        help="merge a receipt another job recorded (repeatable). A publish job "
+        "resumes from the build jobs' receipts rather than rebuilding",
+    )
+    receipts.add_argument(
+        "--artifact-dir",
+        default="",
+        metavar="DIR",
+        help="rebase imported artifacts into DIR by file name, so a publish job on "
+        "another runner uploads the bytes it downloaded rather than the build paths",
+    )
     receipts.add_argument(
         "--asset-receipt",
         action="store_true",
@@ -435,6 +494,147 @@ def _load_receipt(
     return CompositeReceiptStore(stores).load(repository, version)
 
 
+def _merge_receipts(
+    base: Optional[Receipt], extra: Optional[Receipt], *, context: str
+) -> Optional[Receipt]:
+    """Merge two records, turning a contradiction into an explained refusal."""
+
+    if base is None:
+        return extra
+    if extra is None:
+        return base
+    try:
+        return base.merge(extra)
+    except ReceiptError as exc:
+        raise CliError(
+            f"{context}: {exc}",
+            code=exc.code or "receipt-conflict",
+            exit_code=EXIT_FAILED,
+        ) from exc
+
+
+def _import_receipts(paths: Sequence[str]) -> Optional[Receipt]:
+    """Merge the receipts another job recorded into one durable record.
+
+    A build matrix is several jobs and one release: each job records what it
+    built, and the publish job has to hold all of them at once or it would
+    publish from a description of the targets it happened to see. The merge is
+    `Receipt.merge`, so two jobs that disagree about the commit, the tag, or the
+    bytes of one artifact are refused here rather than uploaded.
+    """
+
+    combined: Optional[Receipt] = None
+    for path in paths:
+        try:
+            with open(path, encoding="utf-8") as handle:
+                found = Receipt.from_json(handle.read())
+        except OSError as exc:
+            raise CliError(
+                f"the imported receipt at {path} could not be read: {exc}",
+                code="receipt-import-unreadable",
+                exit_code=EXIT_FAILED,
+            ) from exc
+        except ReceiptError as exc:
+            raise CliError(
+                f"the imported receipt at {path} cannot be trusted: {exc}",
+                code="receipt-import-invalid",
+                exit_code=EXIT_FAILED,
+            ) from exc
+        combined = _merge_receipts(
+            combined,
+            found,
+            context=f"two imported receipts disagree at {path}",
+        )
+    return combined
+
+
+def _rebase_artifacts(
+    manifests: Tuple[Any, ...], directory: str
+) -> Tuple[Any, ...]:
+    """Point an imported manifest's artifacts at the bytes this job downloaded.
+
+    A receipt records the path an artifact had on the runner that built it.
+    Publishing from another runner has the same bytes under a workflow artifact
+    directory, and uploading the recorded path would fail as "artifact missing"
+    even though everything was downloaded. Only the path changes; the digest,
+    size, signature, and verification are the recorded values and are what the
+    destination still checks.
+    """
+
+    if not directory:
+        return manifests
+    rebased: List[Any] = []
+    for manifest in manifests:
+        artifacts: List[Any] = []
+        for artifact in manifest.artifacts:
+            candidate = os.path.join(directory, artifact.name)
+            if not os.path.isfile(candidate):
+                fallback = os.path.join(directory, os.path.basename(artifact.path or ""))
+                candidate = fallback
+            artifacts.append(replace(artifact, path=candidate))
+        rebased.append(replace(manifest, artifacts=tuple(artifacts)))
+    return tuple(rebased)
+
+
+def _write_bundle(receipt: Receipt, directory: str) -> None:
+    """Stage a build job's artifacts and receipt for a later publish job.
+
+    The bundle is what crosses the runner boundary: the bytes under the name the
+    manifest says they are, plus one receipt per target. It is deliberately not
+    a cache — the publish job still verifies every digest against the destination
+    — and it is not trusted because it exists: a missing bundle file fails the
+    upload instead of shrinking the asset set.
+    """
+
+    try:
+        os.makedirs(directory, exist_ok=True)
+        for manifest in receipt.manifests:
+            for artifact in manifest.artifacts:
+                if not os.path.isfile(artifact.path):
+                    raise CliError(
+                        f"{artifact.name} was recorded at {artifact.path!r}, which is "
+                        "not readable, so the publish job would receive an incomplete "
+                        "bundle",
+                        code="bundle-artifact-missing",
+                        exit_code=EXIT_FAILED,
+                    )
+                shutil.copyfile(artifact.path, os.path.join(directory, artifact.name))
+            name = f"receipt-{manifest.target}.json"
+            with open(os.path.join(directory, name), "w", encoding="utf-8") as handle:
+                handle.write(receipt.to_json())
+        with open(os.path.join(directory, "receipt.json"), "w", encoding="utf-8") as handle:
+            handle.write(receipt.to_json())
+    except OSError as exc:
+        raise CliError(
+            f"the release bundle at {directory} could not be written: {exc}",
+            code="bundle-write-failed",
+            exit_code=EXIT_FAILED,
+        ) from exc
+
+
+def _durable_journal(journal: Journal) -> Journal:
+    """The part of a run's record that is safe to persist.
+
+    A receipt records what a release *did*, not what a run tried. Persisting a
+    failure under the same key as an earlier success would make the two records
+    disagree, and refusing to save is then the only honest answer — but it would
+    also drop the completed work that preceded the failure. So the durable view
+    keeps one green outcome per key (the last one, in order) and drops failed or
+    blocked attempts: a later run must be allowed to retry those, and a completed
+    stage that a re-run merely re-confirmed is the same fact rather than a new
+    one.
+    """
+
+    latest: Dict[str, Any] = {}
+    for entry in journal.entries:
+        if entry.outcome not in (COMPLETED, NOOP):
+            continue
+        if Journal.was_just_a_plan(entry):
+            continue
+        latest[entry.key] = entry
+    return Journal(entries=tuple(latest.values()))
+
+
 def _receipt_for(outcome: ReleaseOutcome, repository: str, event: ReleaseEvent) -> Receipt:
     release_id = ""
     url = ""
@@ -449,12 +649,62 @@ def _receipt_for(outcome: ReleaseOutcome, repository: str, event: ReleaseEvent) 
         tag=outcome.tag or tag_for(outcome.version),
         source_sha=outcome.source_sha or event.sha,
         channel=outcome.channel,
-        journal=outcome.journal,
+        journal=_durable_journal(outcome.journal),
         manifests=outcome.manifests,
         release_id=release_id,
         url=url,
         published=outcome.published,
     )
+
+
+def _declared_hook_targets(plan: Any) -> Tuple[Any, ...]:
+    """The hook targets, when a hooks document is what declares them."""
+
+    return tuple(getattr(plan, "targets", ()) or ())
+
+
+def _select_targets(args: argparse.Namespace, targets: Tuple[TargetSpec, ...]) -> Tuple[TargetSpec, ...]:
+    """Apply the per-job target selection a build matrix asks for."""
+
+    requested = tuple(args.target or ())
+    if not requested:
+        return targets
+    declared = {target.id for target in targets}
+    unknown = sorted(set(requested) - declared)
+    if unknown:
+        raise CliError(
+            f"--target names {', '.join(unknown)}, which this release does not declare. "
+            f"Declared targets: {', '.join(sorted(declared)) or 'none'}.",
+            code="target-not-declared",
+        )
+    if len(set(requested)) != len(requested):
+        raise CliError(
+            "--target names the same target twice; one job builds one target",
+            code="target-selected-twice",
+        )
+    return tuple(target for target in targets if target.id in requested)
+
+
+def _matrix(hooks_plan: Any) -> List[Dict[str, str]]:
+    """The build matrix a workflow needs, in declaration order.
+
+    Only hook targets are buildable. A configured Apple target is a plan and a
+    signing contract, but its build command is repository-owned; it appears in
+    the plan and not in the matrix, so the workflow does not invent a build for
+    it. The runner defaults to `ubuntu-latest` so a hooks document that omits
+    `runner` still gets a deterministic job rather than an empty `runs-on`.
+    """
+
+    rows: List[Dict[str, str]] = []
+    for target in _declared_hook_targets(hooks_plan):
+        rows.append(
+            {
+                "id": target.id,
+                "runner": target.runner or "ubuntu-latest",
+                "platform": target.platform or "any",
+            }
+        )
+    return rows
 
 
 def _repository_components(
@@ -464,19 +714,22 @@ def _repository_components(
     *,
     dry_run: bool,
     phase: str,
-) -> Tuple[ReleaseComponents, Any, str]:
+) -> Tuple[ReleaseComponents, Any, str, List[Dict[str, str]]]:
     enabled = config.release.enabled
     hooks_plan = _configured_hooks(args, config) if enabled else None
     targets = _targets(config, hooks_plan) if enabled else ()
+    matrix = _matrix(hooks_plan)
+    targets = _select_targets(args, targets) if enabled else ()
     primary, checks, policy = _version_parts(args, event, enabled=enabled)
     notes = ChangelogNotes(path=args.notes_file, fallback_notes=args.notes)
 
     token = os.environ.get(args.token_env, "") if enabled else ""
     evidence = _evidence(args, event.repository, token) if enabled else None
 
-    publish = enabled and phase != "build"
+    publishing_phase = phase not in ("prepare", "build")
+    publish = enabled and publishing_phase
     syncs: Tuple[Any, ...] = ()
-    if enabled and hooks_plan is not None and phase != "build":
+    if enabled and hooks_plan is not None and publishing_phase:
         # GitHub Releases is the *publisher*: it owns the immutable asset set.
         # A tap or a port tree is downstream, so every hook destination is a
         # sync. Mapping them this way keeps the retry semantics per destination
@@ -494,6 +747,15 @@ def _repository_components(
     if enabled:
         if phase == "publish":
             adapters = recorded_adapters(target.id for target in targets)
+            # A publish phase may not build. The core looks adapters up by name,
+            # so the request's targets have to name the recorded adapter rather
+            # than the build adapter this commit would otherwise declare. Without
+            # this the lookup fails with "adapter-unavailable", which hides the
+            # real refusal ("there is no recorded build") behind a configuration
+            # error.
+            targets = tuple(
+                TargetSpec(id=target.id, adapter=RECORDED_ADAPTER) for target in targets
+            )
         elif hooks_plan is not None:
             environment, secrets = _secrets(args)
             adapters = build_adapters(
@@ -532,7 +794,7 @@ def _repository_components(
         dry_run=dry_run,
         channel=args.channel,
     )
-    return components, request, token
+    return components, request, token, matrix
 
 
 # -- output -----------------------------------------------------------------
@@ -658,13 +920,7 @@ def emit(outcome: ReleaseOutcome, args: argparse.Namespace, receipt: Optional[Re
         with open(args.summary, "a", encoding="utf-8") as handle:
             handle.write(_summary_markdown(payload))
     if outcome.failed:
-        if outcome.failure is not None and outcome.failure.code in (
-            "stale-head",
-            "changes-requested",
-            "review-stale",
-            "source-conflict",
-            "asset-set-conflict",
-        ):
+        if outcome.failure is not None and outcome.failure.code in BLOCKED_CODES:
             return EXIT_BLOCKED
         return EXIT_RETRYABLE if outcome.resumable else EXIT_FAILED
     return EXIT_OK
@@ -678,6 +934,51 @@ def _write_json(payload: Dict[str, Any], path: str) -> None:
         handle.write(json.dumps(payload, indent=2, sort_keys=True) + "\n")
 
 
+def _emit_component_failure(args: argparse.Namespace, exc: "CliError") -> None:
+    """Write the machine-readable outcome of a refusal before it is raised.
+
+    A release job can fail before the core runs at all: a missing token, a
+    missing signing secret, a hooks document the job was not given. The workflow
+    still needs the same JSON document it gets from a failed run, because its
+    retry/block classification reads `code` and `resumable` rather than the exit
+    status alone. Writing it here keeps one outcome schema for every path.
+    """
+
+    retryable = bool(getattr(exc, "retryable", False))
+    payload: Dict[str, Any] = {
+        "schema": OUTCOME_SCHEMA,
+        "status": "failed",
+        "ok": False,
+        "resumable": retryable,
+        "published": False,
+        "stage": "",
+        "version": "",
+        "tag": "",
+        "source_sha": getattr(args, "sha", ""),
+        "channel": "",
+        "reason": "",
+        "manifests": [],
+        "publications": [],
+        "receipt": None,
+        "code": exc.code,
+        "failure": {
+            "stage": "",
+            "outcome": "failed",
+            "summary": str(exc),
+            "code": exc.code,
+            "retryable": retryable,
+        },
+    }
+    if args.json:
+        _write_json(payload, args.json)
+    _github_output(payload, args.github_output)
+    if args.summary:
+        with open(args.summary, "a", encoding="utf-8") as handle:
+            handle.write(_summary_markdown(payload))
+    if not args.quiet:
+        _print_human(payload)
+
+
 # -- the run ----------------------------------------------------------------
 
 
@@ -689,9 +990,32 @@ def run(args: argparse.Namespace) -> int:
     event = _event(args)
     dry_run = args.dry_run or args.phase == "plan"
 
-    components, request, token = _repository_components(
-        args, config, event, dry_run=dry_run, phase=args.phase
-    )
+    components, request, token, matrix = None, None, "", []
+    try:
+        components, request, token, matrix = _repository_components(
+            args, config, event, dry_run=dry_run, phase=args.phase
+        )
+    except CliError as exc:
+        _emit_component_failure(args, exc)
+        raise
+
+    if args.matrix:
+        if not config.release.enabled:
+            mode = "disabled"
+        elif args.hooks or config.release.hooks:
+            mode = "hooks"
+        else:
+            mode = "config-only"
+        _write_json(
+            {
+                "schema": "continuum.release-matrix/v1",
+                "enabled": config.release.enabled,
+                "mode": mode,
+                "channel": request.channel,
+                "targets": matrix,
+            },
+            args.matrix,
+        )
 
     receipt = None
     stores: List[Any] = []
@@ -718,13 +1042,36 @@ def run(args: argparse.Namespace) -> int:
             tag=tag_for(version, args.tag_prefix) if version else "",
             dry_run=dry_run,
         )
-        receipt = _load_receipt(stores, event.repository, version)
+        try:
+            receipt = _load_receipt(stores, event.repository, version)
+            imported = _import_receipts(args.receipt_import)
+            receipt = _merge_receipts(
+                receipt,
+                imported,
+                context="the stored receipt and an imported receipt disagree",
+            )
+        except CliError as exc:
+            _emit_component_failure(args, exc)
+            raise
+        except ReceiptError as exc:
+            failure = CliError(
+                f"the release receipt cannot be trusted: {exc}",
+                code=exc.code or "receipt-invalid",
+                exit_code=EXIT_FAILED,
+            )
+            _emit_component_failure(args, failure)
+            raise failure from exc
+
+    manifests = _rebase_artifacts(
+        receipt.manifests if receipt is not None else (), args.artifact_dir
+    )
 
     core = ReleaseCore(components)
     outcome = core.execute(
         request,
         journal=receipt.journal if receipt is not None else EMPTY_JOURNAL,
-        manifests=receipt.manifests if receipt is not None else (),
+        manifests=manifests,
+        stop_after="source" if args.phase == "prepare" else "",
     )
 
     saved = receipt
@@ -735,13 +1082,22 @@ def run(args: argparse.Namespace) -> int:
             try:
                 saved = CompositeReceiptStore(stores).save(candidate)
             except Exception as exc:  # noqa: BLE001 - any store, any failure
-                raise CliError(
-                    f"the release ran, but its receipt could not be written: {exc}. A "
-                    "release without a durable receipt cannot be resumed or checked, so "
-                    "this job fails rather than reporting a success nobody can audit.",
-                    code="receipt-save-failed",
-                    exit_code=EXIT_FAILED,
-                ) from exc
+                if outcome.failed and getattr(exc, "code", "") == "receipt-target-absent":
+                    # A release-attached receipt has nothing to attach to until
+                    # the draft exists. A run that failed before creating it is
+                    # still a retryable failure, not a fatal one; the local
+                    # receipt store (when configured) already has the record.
+                    saved = candidate
+                else:
+                    raise CliError(
+                        f"the release ran, but its receipt could not be written: {exc}. A "
+                        "release without a durable receipt cannot be resumed or checked, so "
+                        "this job fails rather than reporting a success nobody can audit.",
+                        code="receipt-save-failed",
+                        exit_code=EXIT_FAILED,
+                    ) from exc
+        if args.bundle_out:
+            _write_bundle(saved, args.bundle_out)
     return emit(outcome, args, saved if not dry_run else None)
 
 

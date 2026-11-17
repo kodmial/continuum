@@ -198,6 +198,9 @@ bash install.sh /path/to/consumer "$CONTINUUM_REF" core
 # Opt into the consumer-neutral technology library
 bash install.sh /path/to/consumer "$CONTINUUM_REF" tech
 
+# Opt into application releases (never installed by core)
+bash install.sh /path/to/consumer "$CONTINUUM_REF" release
+
 # Add parent/child delegated execution
 bash install.sh /path/to/consumer "$CONTINUUM_REF" parent
 
@@ -214,6 +217,7 @@ Installing into Continuum's own checkout is refused.
 | --- | --- |
 | `core` (default) | The task-domain callers installed by the `CORE_STUBS` array in `install.sh`: scheduling, implementation/repair, optional review controllers, validation hand-off, and merge. The retired `continuum-opencode-unresolved.yml` caller is not shipped; `continuum-coderabbit-unresolved.yml` is the canonical CodeRabbit UNRESOLVED caller. |
 | `tech` | The caller under `.github/caller-stubs/tech/`. This is an opt-in technology library that Continuum never triggers itself; it currently contains a consumer-neutral Swift validation profile. |
+| `release` | The application-release caller under `.github/caller-stubs/release/`. It is opt-in and never part of `core`; install it only when the repository is ready to adopt the release state machine. See [Release consumer guide](docs/release-consumer-guide.md). |
 | `parent` | The callers under `.github/caller-stubs/parent/`. These are the delegated child worker/review/pr-review/cleanup wrappers. |
 
 The set arrays in `install.sh` are the authoritative inventory. This README does
@@ -387,6 +391,7 @@ No consumer repository was created or changed to produce this documentation.
 | `.github/workflows/{ci,opencode,automation}.yml` and other project-owned entries | Workflows used only to dogfood Continuum on this repository. They intentionally carry no `continuum-` prefix. |
 | `.github/caller-stubs/*.yml` | Thin caller templates for the default `core` set; the `CORE_STUBS` array in `install.sh` is authoritative. |
 | `.github/caller-stubs/tech/*.yml` | Thin callers for the opt-in technology library. |
+| `.github/caller-stubs/release/*.yml` | Thin caller for the opt-in application-release workflow. |
 | `.github/caller-stubs/parent/*.yml` | Thin callers installed by the `parent` set. |
 | `install.sh` | Installs one set into a consumer repository. |
 | `src/continuum/` | Dependency-free Python engine. |
@@ -402,7 +407,7 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for the full list. Quick version:
 ```sh
 ruby -E UTF-8 scripts/test-continuum.rb
 bash -n install.sh
-actionlint -shellcheck= -pyflakes= .github/workflows/*.yml .github/caller-stubs/*.yml .github/caller-stubs/tech/*.yml .github/caller-stubs/parent/*.yml examples/minimal-consumer/.github/workflows/*.yml
+actionlint -shellcheck= -pyflakes= .github/workflows/*.yml .github/caller-stubs/*.yml .github/caller-stubs/tech/*.yml .github/caller-stubs/release/*.yml .github/caller-stubs/parent/*.yml examples/minimal-consumer/.github/workflows/*.yml
 
 mkdir -p .opencode-tmp
 export TMPDIR="$PWD/.opencode-tmp"
