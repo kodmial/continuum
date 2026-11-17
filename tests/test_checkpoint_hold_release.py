@@ -19,6 +19,8 @@ import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+from continuum import checkpoint_resume
+
 ROOT = Path(__file__).resolve().parents[1]
 TMP_PARENT = ROOT / ".opencode-tmp"
 SCHEDULER = ROOT / ".github" / "scripts" / "issue_scheduler.js"
@@ -572,6 +574,117 @@ class CheckpointHoldReleaseTests(unittest.TestCase):
         self.assertEqual(
             result["scheduler"]["release"]["owner"], "opencode-watchdog"
         )
+
+    def production_hold_marker(self):
+        """Run the production validator and return its real rejection marker.
+
+        The release is bound to the validator's own deterministic reason and
+        to the exact checkpoint/base/snapshot identity it recorded. Building
+        the fixture here keeps the regression tied to
+        ``src/continuum/checkpoint_resume.py`` instead of a synthetic string.
+        """
+        workdir = Path(
+            tempfile.mkdtemp(prefix="validator-", dir=str(TMP_PARENT))
+        )
+        self.addCleanup(shutil.rmtree, workdir, True)
+        repo = workdir / "repo"
+        repo.mkdir()
+
+        def git(*args):
+            completed = subprocess.run(
+                ["git", "-C", str(repo), *args],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            return (completed.stdout or "").strip()
+
+        git("init", "-q")
+        git("config", "user.name", "Test")
+        git("config", "user.email", "test@example.invalid")
+        (repo / "value.txt").write_text("saved work\n", encoding="utf-8")
+        git("add", "-A")
+        git("commit", "-m", "base")
+        base = git("rev-parse", "HEAD")
+        metadata = {
+            "schema_version": 1,
+            "mode": "issue",
+            "issue_number": str(ISSUE),
+            "generation": 1,
+            "operation_id": OPERATION,
+            "stage": "implementation-incomplete",
+            "base_ref": "main",
+            "base_sha": base,
+            "head_sha": base,
+            "branch": "opencode/issue534-run",
+            "head_ref": "opencode/issue534-run",
+            "checkpoint_ref": CHECKPOINT_REF,
+        }
+        (repo / checkpoint_resume.METADATA_FILE_NAME).write_text(
+            json.dumps(metadata, indent=2) + "\n", encoding="utf-8"
+        )
+        git("add", "-A")
+        git("commit", "-m", "checkpoint saved work")
+        checkpoint = git("rev-parse", "HEAD")
+        request = checkpoint_resume.ResumeRequest(
+            repository=OWNER + "/" + REPO,
+            issue=ISSUE,
+            generation=2,
+            operation=OPERATION,
+            checkpoint_ref=CHECKPOINT_REF,
+            checkpoint_sha=checkpoint,
+            base_sha=base,
+            snapshot_spec=SNAPSHOT,
+            mode="issue",
+        )
+        with self.assertRaises(checkpoint_resume.ResumeError) as raised:
+            checkpoint_resume.validate_checkpoint(repo, request)
+        self.assertEqual("wrong-generation", raised.exception.reason)
+        self.assertTrue(checkpoint_resume.should_hold(raised.exception))
+        return (
+            checkpoint_resume.failure_marker(raised.exception.record),
+            checkpoint,
+            base,
+        )
+
+    def test_production_validator_reason_is_the_release_identity(self):
+        marker, checkpoint, base = self.production_hold_marker()
+        self.assertIn("reason=wrong-generation", marker)
+        self.assertIn("checkpoint_sha=" + checkpoint, marker)
+        self.assertIn("snapshot=" + SNAPSHOT, marker)
+
+        scenario = self.base_scenario()
+        scenario["holdSha"] = checkpoint
+        scenario["comments"] = [
+            {
+                "id": 11,
+                "body": marker,
+                "user": {"login": "github-actions[bot]"},
+                "author_association": "OWNER",
+                "created_at": "2026-11-17T09:00:00Z",
+            }
+        ]
+        held = self.run_scenario(dict(scenario, manifest=None))
+        self.assertTrue(held["scheduler"]["blocked"])
+        self.assertTrue(held["watchdog"]["blocked"])
+        self.assertEqual(
+            [c for c in held["comments"] if "resume-release" in c["body"]],
+            [],
+        )
+
+        released = self.run_scenario(scenario)
+        self.assertFalse(released["scheduler"]["blocked"])
+        self.assertTrue(released["scheduler"]["release"]["released"])
+        self.assertFalse(released["watchdog"]["blocked"])
+        bodies = [
+            c["body"] for c in released["comments"]
+            if "resume-release" in c["body"]
+        ]
+        self.assertEqual(len(bodies), 1)
+        self.assertIn("checkpoint_sha=" + checkpoint, bodies[0])
+        self.assertIn("base_sha=" + base, bodies[0])
+        self.assertIn("snapshot=" + SNAPSHOT, bodies[0])
+        self.assertIn("reason=wrong-generation", bodies[0])
 
     def test_controller_stops_precede_hold_release(self):
         scheduler = SCHEDULER.read_text(encoding="utf-8")

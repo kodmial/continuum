@@ -7050,6 +7050,9 @@ class ContinuumTest < Minitest::Test
     assert_includes watchdog, "READY_LABEL: ${{ vars.AUTOMATION_READY_LABEL || 'automation:ready' }}"
     assert_includes watchdog, "process.env.READY_LABEL || 'automation:ready'"
     assert_includes watchdog, 'discoveryLabels.push(readyLabel)'
+    assert_includes watchdog, 'liveOverlap: async () => {'
+    assert_includes watchdog, "reason: 'release-blocked-by-live-overlap'"
+    assert_includes watchdog, "reason: 'release-overlap-unverified'"
   end
 
   # kodmial/continuum#266: the optional `automation:ready` admission gate.

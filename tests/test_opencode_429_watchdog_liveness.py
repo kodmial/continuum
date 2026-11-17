@@ -38,6 +38,23 @@ NEW_RUN_ID = "39933043642"
 BRANCH = "opencode/issue382-429-recovery"
 BASE_SHA = "0123456789abcdef0123456789abcdef01234567"
 
+# kodmial/aa#534 shape (continuum#477): a ready-only issue whose stale
+# generation-2 `wrong-generation` hold outlived the merged validator fix in
+# PR #461. The identity below matches the live hold; the repository stays the
+# harness repository so the production watchdog reads it as its own thread.
+AA_ISSUE = 534
+AA_OPERATION = "opencode-429-issue-issue534"
+AA_DURABLE_REF = "opencode/429-checkpoint-opencode-429-issue-issue534-gen-2"
+AA_LEGACY_REF = "opencode/checkpoint-issue534"
+AA_CHECKPOINT_SHA = "4a6e1eb11b2ab6e4ce233a610b177d4e7bc59ecb"
+AA_BASE_SHA = "705d8e53fdd83a3c17ead5723afb707d8f3fcd80"
+AA_SNAPSHOT = "456f396895a33ec247e65308865c1728aad67e44a473a6f3d2f00b81d2babbb2"
+AA_HEAD_REF = "opencode/issue534-429-recovery"
+AA_FIX_ID = "generation-2-checkpoint-validator"
+AA_FIX_PR = 461
+AA_FIX_SHA = "d063e72900790a647a9709771f477085b8141d83"
+
+
 NODE_HARNESS = r"""
 'use strict';
 const fs = require('fs');
@@ -511,6 +528,96 @@ def metadata(sha=NEW_SHA):
         "head_sha": sha,
         "branch": BRANCH,
         "checkpoint_ref": CHECKPOINT_REF,
+    }
+
+
+def stale_hold_marker(ref=AA_LEGACY_REF):
+    """The live AA #534 deterministic hold comment (reason wrong-generation)."""
+    return (
+        "<!-- continuum-checkpoint-resume-blocked "
+        "repo={owner}/{repo} issue={issue} generation=2 "
+        "operation={op} checkpoint={ref} checkpoint_sha={sha} "
+        "base_ref=main base_sha={base} snapshot={spec} "
+        "reason=wrong-generation episode=43763622351-1 -->"
+    ).format(
+        owner=OWNER,
+        repo=REPO,
+        issue=AA_ISSUE,
+        op=AA_OPERATION,
+        ref=ref,
+        sha=AA_CHECKPOINT_SHA,
+        base=AA_BASE_SHA,
+        spec=AA_SNAPSHOT,
+    )
+
+
+def validator_fix_manifest():
+    return {
+        "schema_version": 1,
+        "fixes": [
+            {
+                "id": AA_FIX_ID,
+                "pull_request": AA_FIX_PR,
+                "merge_sha": AA_FIX_SHA,
+                "reasons": ["wrong-generation", "resume-wrong-generation"],
+                "paths": ["src/continuum/checkpoint_resume.py"],
+            }
+        ],
+    }
+
+
+def validator_fix_pull():
+    return {
+        "number": AA_FIX_PR,
+        "state": "closed",
+        "merged_at": "2026-11-17T10:00:00Z",
+        "merged": True,
+        "merge_commit_sha": AA_FIX_SHA,
+        "user": {"login": "kodmial"},
+        "head": {
+            "ref": "fix/checkpoint-generation-2",
+            "repo": {"full_name": OWNER + "/" + REPO},
+        },
+    }
+
+
+def checkpoint_release_marker(owner="opencode-watchdog", ref=AA_LEGACY_REF):
+    return (
+        "<!-- continuum-checkpoint-resume-release v=1 "
+        "repo={repo_full} issue={issue} generation=2 operation={op} "
+        "checkpoint={ref} checkpoint_sha={sha} base_ref=main base_sha={base} "
+        "snapshot={spec} reason=wrong-generation fix={fix} fix_pr={pr} "
+        "fix_sha={fix_sha} owner={controller} -->"
+    ).format(
+        repo_full=OWNER + "/" + REPO,
+        issue=AA_ISSUE,
+        op=AA_OPERATION,
+        ref=ref,
+        sha=AA_CHECKPOINT_SHA,
+        base=AA_BASE_SHA,
+        spec=AA_SNAPSHOT,
+        fix=AA_FIX_ID,
+        pr=AA_FIX_PR,
+        fix_sha=AA_FIX_SHA,
+        controller=owner,
+    )
+
+
+def aa_recovery_metadata():
+    return {
+        "schema_version": 1,
+        "operation_id": AA_OPERATION,
+        "failure_kind": "quota_429",
+        "generation": 2,
+        "stage": "implementation-incomplete",
+        "mode": "issue",
+        "issue_number": str(AA_ISSUE),
+        "pr_number": "",
+        "head_ref": AA_HEAD_REF,
+        "base_sha": AA_BASE_SHA,
+        "head_sha": AA_CHECKPOINT_SHA,
+        "branch": AA_HEAD_REF,
+        "checkpoint_ref": AA_DURABLE_REF,
     }
 
 
@@ -1710,6 +1817,210 @@ class WatchdogHarness(unittest.TestCase):
         self.assertEqual(
             len(self.retried_bodies(result)) - seeded, 0, result["comments"]
         )
+
+    def stale_hold_retry_scenario(self):
+        """AA #534 shape: ready-only issue, no reservation, stale hold.
+
+        The run completed with failure (the stale queued-overlap guard), so the
+        normal watchdog retry path is the route that owns re-admission. The
+        deterministic hold must not strand it after the validator fix merges.
+        """
+        scenario = base_scenario()
+        timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        scenario["triggerRun"] = {
+            "id": 43767507862,
+            "status": "completed",
+            "conclusion": "failure",
+            "event": "workflow_dispatch",
+            "path": ".github/workflows/opencode.yml",
+            "display_title": "OpenCode issue #" + str(AA_ISSUE),
+            "created_at": timestamp,
+            "run_started_at": timestamp,
+        }
+        scenario["runs"] = []
+        scenario["workflowRuns"] = []
+        scenario["jobs"] = []
+        scenario["jobLog"] = ""
+        scenario["issues"] = [
+            {
+                "number": AA_ISSUE,
+                "state": "open",
+                "title": "Repair qualification failure for #514",
+                "labels": [{"name": "automation:ready"}],
+            }
+        ]
+        # The preserved live checkpoint: the ref tip still equals the pinned
+        # hold SHA, so the hold is not released by a premise change.
+        scenario["checkpoint"] = {
+            "refSha": AA_CHECKPOINT_SHA,
+            "metadata": aa_recovery_metadata(),
+        }
+        scenario["comments"] = [
+            thread_comment(6902177809, stale_hold_marker(), timestamp)
+        ]
+        scenario["pulls"] = []
+        return scenario
+
+    def verified_fix(self, scenario):
+        scenario["validatorFixManifest"] = validator_fix_manifest()
+        scenario["pulls"] = [validator_fix_pull()]
+        scenario["pullReviews"] = [
+            {"user": {"login": "coderabbitai[bot]"}, "state": "APPROVED"}
+        ]
+        scenario["pullFiles"] = [
+            {"filename": "src/continuum/checkpoint_resume.py"}
+        ]
+        return scenario
+
+    def release_comments(self, result):
+        return [
+            comment["body"] for comment in result["comments"]
+            if "continuum-checkpoint-resume-release" in comment["body"]
+        ]
+
+    def test_ready_only_stale_hold_is_held_before_the_fix_is_verified(self):
+        result = self.run_scenario(
+            self.stale_hold_retry_scenario(),
+            env={"MAX_RECOVERY_RETRIES": "1"},
+        )
+        self.assert_no_dispatch(result)
+        self.assertEqual(self.release_comments(result), [])
+        self.assertEqual(self.retried_bodies(result), [])
+        self.assertTrue(
+            any(
+                "deterministic checkpoint resume hold (wrong-generation" in
+                " ".join(line)
+                for line in result["notices"]
+            ),
+            result["notices"],
+        )
+
+    def test_ready_only_stale_hold_is_admitted_once_after_the_verified_fix(self):
+        scenario = self.verified_fix(self.stale_hold_retry_scenario())
+        result = self.run_scenario(
+            scenario, env={"MAX_RECOVERY_RETRIES": "1"}
+        )
+        releases = self.release_comments(result)
+        self.assertEqual(len(releases), 1, releases)
+        for fragment in (
+            "issue=" + str(AA_ISSUE),
+            "generation=2",
+            "checkpoint=" + AA_LEGACY_REF,
+            "checkpoint_sha=" + AA_CHECKPOINT_SHA,
+            "base_sha=" + AA_BASE_SHA,
+            "snapshot=" + AA_SNAPSHOT,
+            "reason=wrong-generation",
+            "fix=" + AA_FIX_ID,
+            "fix_pr=" + str(AA_FIX_PR),
+            "fix_sha=" + AA_FIX_SHA,
+            "owner=opencode-watchdog",
+        ):
+            self.assertIn(fragment, releases[0])
+        retries = self.retried_bodies(result)
+        self.assertEqual(len(retries), 1, retries)
+        self.assertIn("Automatic recovery retry 1/1", retries[0])
+        self.assertFalse(
+            any(
+                "was released by" in " ".join(line)
+                for line in result["notices"]
+            ),
+            "the watchdog owns the claim it created; it must not stand down",
+        )
+
+    def test_the_durable_release_claim_is_consumed_not_repeated(self):
+        scenario = self.verified_fix(self.stale_hold_retry_scenario())
+        scenario["comments"].append(
+            thread_comment(
+                7001,
+                checkpoint_release_marker(),
+                datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            )
+        )
+        result = self.run_scenario(
+            scenario, env={"MAX_RECOVERY_RETRIES": "1"}
+        )
+        self.assertEqual(
+            len(self.release_comments(result)), 1,
+            "the one authorized claim must be reused, never republished",
+        )
+        self.assertEqual(
+            len(self.retried_bodies(result)), 1,
+            "the released hold must allow exactly one fresh retry",
+        )
+
+    def restart_recovery_scenario(self, hold_ref=AA_DURABLE_REF):
+        """Runner-restart route: `recoverFrom429OnFreshVm` owns re-admission."""
+        scenario = base_scenario()
+        timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        scenario["triggerRun"] = {
+            "id": 43767507862,
+            "status": "completed",
+            "conclusion": "failure",
+            "event": "workflow_dispatch",
+            "path": ".github/workflows/opencode.yml",
+            "display_title": "OpenCode issue #" + str(AA_ISSUE),
+            "created_at": timestamp,
+            "run_started_at": timestamp,
+        }
+        scenario["runs"] = []
+        scenario["workflowRuns"] = []
+        scenario["jobs"] = [{"id": 132975886955}]
+        scenario["jobLog"] = (
+            "Evacuated 429 checkpoint {ref} at exact SHA {sha} "
+            "(operation {op}, stage implementation-incomplete, generation 2, "
+            "mode issue, issue {issue}, pr -, branch {branch})\n"
+            "##[error]CONTINUUM_OPENCODE_429_RESTART_REQUIRED\n"
+        ).format(
+            ref=AA_DURABLE_REF,
+            sha=AA_CHECKPOINT_SHA,
+            op=AA_OPERATION,
+            issue=AA_ISSUE,
+            branch=AA_HEAD_REF,
+        )
+        scenario["checkpoint"] = {
+            "refSha": AA_CHECKPOINT_SHA,
+            "metadata": aa_recovery_metadata(),
+        }
+        scenario["comments"] = [
+            thread_comment(6902177809, stale_hold_marker(hold_ref), timestamp)
+        ]
+        return self.verified_fix(scenario)
+
+    def test_a_genuine_live_competing_run_blocks_the_release_and_dispatch(self):
+        scenario = self.restart_recovery_scenario()
+        scenario["workflowRuns"] = [
+            {
+                "id": 43763622351,
+                "status": "in_progress",
+                "conclusion": None,
+                "event": "issue_comment",
+                "path": ".github/workflows/opencode.yml",
+                "display_title": "OpenCode issue #" + str(AA_ISSUE),
+                "created_at": datetime.now(timezone.utc).strftime(
+                    "%Y-%m-%dT%H:%M:%SZ"
+                ),
+            }
+        ]
+        result = self.run_scenario(scenario)
+        self.assert_no_dispatch(result)
+        self.assertEqual(
+            self.release_comments(result), [],
+            "a live overlap must never authorize a checkpoint-hold release",
+        )
+        self.assertTrue(
+            any(
+                "deterministic checkpoint resume rejection" in " ".join(line)
+                for line in result["notices"]
+            ),
+            result["notices"],
+        )
+
+    def test_unverifiable_active_inventory_never_releases_the_hold(self):
+        scenario = self.restart_recovery_scenario()
+        scenario["activeRunsError"] = 403
+        result = self.run_scenario(scenario)
+        self.assert_no_dispatch(result)
+        self.assertEqual(self.release_comments(result), [])
 
     def test_production_source_verifies_authoritative_run_evidence(self):
         self.assertIn("getWorkflowRun", self.source)

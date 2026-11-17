@@ -4739,6 +4739,10 @@ module.exports = async function runIssueScheduler({ github, context, core }) {
       continue;
     }
     const candidateRelease = checkpointResumeHoldRelease;
+    // A release is only ever created here for an issue that passed the
+    // active-run/WIP inventory above, so a genuine live competing run never
+    // reaches this claim. The watchdog applies the same rule inside its own
+    // release path.
     if (
       candidateRelease &&
       candidateRelease.released &&

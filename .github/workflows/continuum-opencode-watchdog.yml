@@ -1440,6 +1440,7 @@ jobs:
           }
           async function evaluateCheckpointResumeRelease({
             issueNumber, hold, comments, client, controller, allowRelease,
+            liveOverlap,
           }) {
             const markers = checkpointReleaseMarkers(
               comments, issueNumber, hold
@@ -1475,6 +1476,28 @@ jobs:
             }
             if (allowRelease === false) {
               return { released: false, reason: 'release-not-allowed' };
+            }
+            // A genuine live competing run already owns this exact work.
+            // Releasing the hold and dispatching beside it would resume the
+            // same checkpoint twice, so a new claim is refused. An
+            // unverifiable active inventory fails closed instead of
+            // assuming the issue is idle.
+            if (typeof liveOverlap === 'function') {
+              let competing;
+              try {
+                competing = await liveOverlap();
+              } catch (err) {
+                return {
+                  released: false,
+                  reason: 'release-overlap-unverified',
+                };
+              }
+              if (competing) {
+                return {
+                  released: false,
+                  reason: 'release-blocked-by-live-overlap',
+                };
+              }
             }
             const verified = await verifyCheckpointValidatorFix(hold, client);
             if (!verified.ok) {
@@ -1709,6 +1732,7 @@ jobs:
                 client: readGithub,
                 controller: options.controller || 'opencode-watchdog',
                 allowRelease: options.allowRelease !== false,
+                liveOverlap: options.liveOverlap,
               });
               if (release.released) {
                 return { blocked: false, marker, release };
@@ -2046,7 +2070,31 @@ jobs:
             if (mode === 'issue') {
               const hold = await checkpointResumeHold(
                 issueText, comments, checkpointRef,
-                { controller: 'opencode-watchdog' }
+                {
+                  controller: 'opencode-watchdog',
+                  // A verified validator fix may release the stale hold, but
+                  // only while no other OpenCode run owns this exact work.
+                  // The current (finished) run is excluded; any queued or
+                  // in-progress run for this issue or recovery identity keeps
+                  // the fail-closed hold. An unreadable inventory throws and
+                  // the release stays blocked.
+                  liveOverlap: async () => {
+                    const activeRuns = await listActiveOpenCodeRuns();
+                    return activeRuns.some(candidate => {
+                      if (
+                        String(candidate.id) ===
+                        String(run && run.id || '')
+                      ) return false;
+                      if (!isOpenCodeWorkflowCandidate(candidate)) {
+                        return false;
+                      }
+                      return candidate.display_title ===
+                          'OpenCode issue #' + issueText ||
+                        candidate.display_title ===
+                          recoveryRunName(operation, generation);
+                    });
+                  },
+                }
               );
               if (hold.blocked) {
                 core.notice(
@@ -2310,13 +2358,20 @@ jobs:
                   return;
                 }
                 core.notice(
-                  'OpenCode infrastructure operation ' + operation + ' generation ' +
-                  generation + ' observed run ' + previous.runId +
-                  ' ended ' + observed.conclusion + ' at checkpoint ' +
-                  observed.previousSha + ', but the metadata-verified checkpoint ' +
-                  'advanced to ' + observed.currentSha + ' (' +
-                  observed.reason + '); that old run never saw the newer saved ' +
-                  'work, so a bounded fresh-VM resumption is allowed.'
+                  'OpenCode infrastructure operation ' + operation +
+                  ' generation ' + generation + ' observed run ' +
+                  previous.runId + ' ended ' + observed.conclusion + ' at ' +
+                  'checkpoint ' + observed.previousSha + ' (' +
+                  observed.reason + '); ' +
+                  (
+                    observed.previousSha === observed.currentSha
+                      ? 'the exact checkpoint is unchanged but that run left ' +
+                        'no implementation/publication evidence'
+                      : 'the metadata-verified checkpoint advanced to ' +
+                        observed.currentSha + ', so that old run never saw ' +
+                        'the newer saved work'
+                  ) +
+                  '; a bounded fresh-VM resumption is allowed.'
                 );
               }
               if (previous.state === 'accepted' && previous.nextDue > now) {
