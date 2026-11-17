@@ -7634,7 +7634,7 @@ class ContinuumTest < Minitest::Test
     assert_includes body, "core.setOutput('ready', 'false');"
     assert_includes body, 'Continuum will not create a partial PR for a blocked/umbrella task.'
 
-    assert_match(/- name: Implement issue\n\s+if: >-\n\s+steps\.issue_readiness\.outputs\.ready != 'false'/, body)
+    assert_match(/- name: Implement issue\n\s+id: implement_issue\n\s+if: >-\n\s+steps\.issue_readiness\.outputs\.ready != 'false'/, body)
     assert_match(/- name: Restore verified cached OpenCode for coder and repair\n\s+id: cached_opencode\n\s+if: steps\.issue_readiness\.outputs\.ready != 'false'/, body)
     assert_includes body, 'Do not turn a tracking/umbrella issue or a task with unmet prerequisites into a partial PR.'
   end

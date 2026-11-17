@@ -22,6 +22,7 @@ OTHER_HEAD = "c" * 40
 WORKER_HEAD = "d" * 40
 WORKER_RUN_ID = 9001
 ROOT = Path(__file__).resolve().parents[1]
+EVIDENCE_MODULE = ROOT / "src/continuum/contract_canary_evidence.py"
 
 
 def iso(seconds_ago):
@@ -226,6 +227,7 @@ def pr_commit(
     committer="github-actions[bot]",
     message="fix: canary implementation",
     parents=1,
+    parent=None,
     verified=False,
     statuses=(),
 ):
@@ -247,6 +249,14 @@ def pr_commit(
     commit_committer = (
         person(committer) if committer else {"name": "", "email": ""}
     )
+    if parent is None:
+        parent_shas = [
+            "{:040x}".format(index + 1) for index in range(parents)
+        ]
+    elif isinstance(parent, str):
+        parent_shas = [parent]
+    else:
+        parent_shas = list(parent)
     return {
         "sha": sha,
         "author": person(author) if author else None,
@@ -261,8 +271,7 @@ def pr_commit(
             },
         },
         "parents": [
-            {"sha": "{:040x}".format(index + 1)}
-            for index in range(parents)
+            {"sha": parent_sha} for parent_sha in parent_shas
         ],
         "statuses": list(statuses),
     }
@@ -840,12 +849,14 @@ class CompletionEvidenceTest(unittest.TestCase):
                 OTHER_HEAD,
                 message="fix: address CodeRabbit findings",
                 statuses=[repair_status(published, OTHER_HEAD)],
+                parent=published,
             ),
             pr_commit(
                 WORKER_HEAD,
                 author="kodmial",
                 committer="web-flow",
                 parents=2,
+                parent=[OTHER_HEAD, MERGE],
                 verified=True,
                 message="Merge branch 'main' into opencode/issue100-9001",
             ),
@@ -853,6 +864,7 @@ class CompletionEvidenceTest(unittest.TestCase):
                 HEAD,
                 message="fix: repair blocking workflow",
                 statuses=[repair_status(WORKER_HEAD, HEAD)],
+                parent=WORKER_HEAD,
             ),
         ]
         self.assertIsNone(
@@ -885,6 +897,7 @@ class CompletionEvidenceTest(unittest.TestCase):
                         published, OTHER_HEAD, publication_payload=first
                     )
                 ],
+                parent=published,
             ),
             pr_commit(
                 HEAD,
@@ -894,6 +907,7 @@ class CompletionEvidenceTest(unittest.TestCase):
                         OTHER_HEAD, HEAD, publication_payload=second
                     )
                 ],
+                parent=OTHER_HEAD,
             ),
         ]
         self.assertIsNone(
@@ -906,6 +920,73 @@ class CompletionEvidenceTest(unittest.TestCase):
             )
         )
 
+    def test_commit_list_order_cannot_hide_an_unauthenticated_commit(self):
+        """The gap is computed from parents, never from list position.
+
+        GitHub returns PR commits to a consumer in an order that is not an
+        ancestry proof. A manual commit listed before the published commit is
+        still reachable from the final head, so it must be authenticated.
+        """
+        published = "e" * 40
+        commits = [
+            pr_commit(
+                HEAD,
+                author="kodmial",
+                committer="kodmial",
+                parent=published,
+            ),
+            pr_commit(published, message="fix: implement issue #100"),
+        ]
+        problem = canary.validate_completed_canary(
+            pr(),
+            exact_head_runs(),
+            100,
+            publication(head=published),
+            commits,
+        )
+        self.assertIn("unauthenticated commit", problem)
+
+    def test_signed_main_sync_cannot_smuggle_a_manual_second_parent(self):
+        """A trusted merge only vouches for itself, not for its other parent."""
+        published = "e" * 40
+        commits = [
+            pr_commit(published, message="fix: implement issue #100"),
+            pr_commit(
+                OTHER_HEAD,
+                author="kodmial",
+                committer="kodmial",
+                parent=published,
+            ),
+            pr_commit(
+                HEAD,
+                author="kodmial",
+                committer="web-flow",
+                parents=2,
+                parent=[OTHER_HEAD, MERGE],
+                verified=True,
+                message="Merge branch 'main' into opencode/issue100-9001",
+            ),
+        ]
+        problem = canary.validate_completed_canary(
+            pr(),
+            exact_head_runs(),
+            100,
+            publication(head=published),
+            commits,
+        )
+        self.assertIn("unauthenticated commit", problem)
+
+    def test_completed_canary_honours_the_expected_repository(self):
+        """A consumer's authentic receipt must match its own repository."""
+        problem = canary.validate_completed_canary(
+            pr(),
+            exact_head_runs(),
+            100,
+            publication(),
+            expected_repo="consumer/repository",
+        )
+        self.assertIn("names another repository", problem)
+
     def test_bot_identity_without_repair_status_fails(self):
         published = "e" * 40
         receipt = publication(head=published)
@@ -916,8 +997,9 @@ class CompletionEvidenceTest(unittest.TestCase):
                 author="github-actions[bot]",
                 committer="github-actions[bot]",
                 message="fix: manually spoofed as automation",
+                parent=published,
             ),
-            pr_commit(HEAD),
+            pr_commit(HEAD, parent=OTHER_HEAD),
         ]
         problem = canary.validate_completed_canary(
             pr(), exact_head_runs(), 100, receipt, commits
@@ -998,11 +1080,13 @@ class CompletionEvidenceTest(unittest.TestCase):
                         OTHER_HEAD,
                         message="fix: address CodeRabbit findings",
                         statuses=[repair_status(published, OTHER_HEAD)],
+                        parent=published,
                     ),
                     pr_commit(
                         HEAD,
                         message="fix: repair blocking workflow",
                         statuses=[repair],
+                        parent=OTHER_HEAD,
                     ),
                 ]
                 problem = canary.validate_completed_canary(
@@ -1020,10 +1104,11 @@ class CompletionEvidenceTest(unittest.TestCase):
                 author="kodmial",
                 committer="web-flow",
                 parents=1,
+                parent=published,
                 verified=True,
                 message="edit from the GitHub web editor",
             ),
-            pr_commit(HEAD),
+            pr_commit(HEAD, parent=OTHER_HEAD),
         ]
         problem = canary.validate_completed_canary(
             pr(), exact_head_runs(), 100, receipt, commits
@@ -1035,8 +1120,13 @@ class CompletionEvidenceTest(unittest.TestCase):
         receipt = publication(head=published)
         commits = [
             pr_commit(published, message="fix: implement issue #100"),
-            pr_commit(OTHER_HEAD, committer="kodmial", author="kodmial"),
-            pr_commit(HEAD),
+            pr_commit(
+                OTHER_HEAD,
+                committer="kodmial",
+                author="kodmial",
+                parent=published,
+            ),
+            pr_commit(HEAD, parent=OTHER_HEAD),
         ]
         problem = canary.validate_completed_canary(
             pr(), exact_head_runs(), 100, receipt, commits
@@ -1075,7 +1165,9 @@ class CompletionEvidenceTest(unittest.TestCase):
             pull_request_commits=[
                 pr_commit(published),
                 pr_commit(
-                    HEAD, statuses=[repair_status(published, HEAD)]
+                    HEAD,
+                    statuses=[repair_status(published, HEAD)],
+                    parent=published,
                 ),
             ],
         )
@@ -2307,36 +2399,58 @@ class WorkflowContractTest(unittest.TestCase):
         self.assertEqual(workflow.count("canary.completion_worker_run_id("), 2)
         self.assertEqual(workflow.count("canary.merge_bound_worker_run("), 2)
         self.assertIn('"run", "view"', workflow)
-        self.assertEqual(workflow.count("worker_publication(bound)"), 2)
+        self.assertEqual(workflow.count("worker_publication(repo, bound)"), 2)
         self.assertEqual(workflow.count("worker_publication=publication"), 1)
         self.assertEqual(
             workflow.count("latest, runs, issue_number, publication"), 1
         )
+        evidence = EVIDENCE_MODULE.read_text(encoding="utf-8")
         self.assertEqual(
-            workflow.count("CANARY_PUBLICATION_ARTIFACT_PREFIX"), 2
+            evidence.count("CANARY_PUBLICATION_ARTIFACT_PREFIX"), 2
         )
+        self.assertIn("def worker_publication(", evidence)
 
     def test_workflow_reads_pr_commits_for_trusted_continuity(self):
         """A worker-published commit may be followed by trusted repairs."""
         workflow = (
             ROOT / ".github/workflows/continuum-contract-canary.yml"
         ).read_text(encoding="utf-8")
-        self.assertEqual(workflow.count("def implementation_commits("), 2)
-        self.assertEqual(workflow.count("implementation_commits("), 4)
-        self.assertEqual(workflow.count("pulls/{}/commits?per_page=100"), 2)
-        self.assertEqual(workflow.count("--slurp"), 4)
-        self.assertEqual(workflow.count("could not read commits"), 2)
+        # Both inline scripts import one shared implementation instead of
+        # carrying their own copy of the evidence reader.
+        self.assertEqual(
+            workflow.count(
+                "from continuum.contract_canary_evidence import ("
+            ),
+            2,
+        )
+        self.assertEqual(workflow.count("implementation_commits("), 2)
         self.assertEqual(workflow.count("pull_request_commits=commits"), 2)
+        evidence = EVIDENCE_MODULE.read_text(encoding="utf-8")
+        self.assertEqual(evidence.count("def implementation_commits("), 1)
+        self.assertEqual(
+            evidence.count("pulls/{}/commits?per_page=100"), 1
+        )
+        self.assertEqual(evidence.count("--slurp"), 2)
+        self.assertIn("read commits for implementation PR", evidence)
 
     def test_workflow_reads_authenticated_repair_statuses(self):
         """Repair commits need API-written statuses, not forgeable git fields."""
         workflow = (
             ROOT / ".github/workflows/continuum-contract-canary.yml"
         ).read_text(encoding="utf-8")
-        self.assertEqual(workflow.count("commits/{}/statuses?per_page=100"), 2)
-        self.assertEqual(workflow.count("could not read commit statuses"), 2)
         self.assertEqual(
-            workflow.count('commit["statuses"] = parsed_statuses'), 2
+            workflow.count(
+                "from continuum.contract_canary_evidence import ("
+            ),
+            2,
+        )
+        evidence = EVIDENCE_MODULE.read_text(encoding="utf-8")
+        self.assertEqual(
+            evidence.count("commits/{}/statuses?per_page=100"), 1
+        )
+        self.assertIn("read commit statuses for", evidence)
+        self.assertEqual(
+            evidence.count('commit["statuses"] = parsed_statuses'), 1
         )
 
     def test_repair_paths_publish_authenticated_status(self):
@@ -2581,40 +2695,25 @@ class WorkflowContractTest(unittest.TestCase):
         ).read_text(encoding="utf-8")
         self.assertEqual(
             workflow.count(
-                "def repair_publication(run_id, commit, pr_number, branch):"
+                "from continuum.contract_canary_evidence import ("
             ),
             2,
         )
-        self.assertEqual(
-            workflow.count("canary.repair_status_run_id(status, repo)"), 2
-        )
-        self.assertEqual(
-            workflow.count(
-                'status["publication"] = repair_publication(\n'
-                "                          run_id, commit, number, branch\n"
-                "                      )"
-            ),
-            2,
-        )
-        self.assertEqual(
-            workflow.count("canary.select_repair_publication("), 2
-        )
-        # Both repair paths keep every artifact id from every attempt.
-        self.assertEqual(
-            workflow.count("canary.publication_artifacts("), 2
-        )
+        evidence = EVIDENCE_MODULE.read_text(encoding="utf-8")
+        self.assertEqual(evidence.count("def repair_publication("), 1)
+        self.assertIn("repair_status_run_id(status, repo)", evidence)
+        self.assertIn("select_repair_publication(", evidence)
+        # One helper keeps every artifact id from every attempt.
+        self.assertIn("publication_artifacts(", evidence)
         # Repair receipts are fetched by artifact id, not by name, so a rerun
         # cannot resolve to another attempt's same-named artifact.
-        self.assertEqual(workflow.count("actions/artifacts/{}/zip"), 2)
-        self.assertEqual(workflow.count('"gh", "run", "download"'), 2)
+        self.assertIn("actions/artifacts/{}/zip", evidence)
+        self.assertIn('"gh", "run", "download"', evidence)
         # Only the worker path may assume a single newest receipt; a repair
         # run can hold one receipt per attempt.
-        self.assertEqual(workflow.count("_, name = max(candidates)"), 2)
-        self.assertEqual(
-            workflow.count(
-                "canary.CANARY_REPAIR_PUBLICATION_ARTIFACT_PREFIX"
-            ),
-            2,
+        self.assertIn("_, name = max(candidates)", evidence)
+        self.assertIn(
+            "CANARY_REPAIR_PUBLICATION_ARTIFACT_PREFIX", evidence
         )
 
     def test_repair_receipt_selection_matches_each_commit_from_a_rerun(self):
@@ -2711,15 +2810,11 @@ class WorkflowContractTest(unittest.TestCase):
         ).read_text(encoding="utf-8")
         self.assertEqual(workflow.count("could not read bound worker run"), 2)
         self.assertEqual(workflow.count("if proc.returncode == 0"), 0)
-        self.assertEqual(
-            workflow.count("could not read publication artifacts"), 2
-        )
-        self.assertEqual(
-            workflow.count("could not download publication receipt"), 2
-        )
-        self.assertEqual(
-            workflow.count("is unreadable"), 2
-        )
+        evidence = EVIDENCE_MODULE.read_text(encoding="utf-8")
+        self.assertEqual(evidence.count("if proc.returncode == 0"), 0)
+        self.assertIn("read publication artifacts for run", evidence)
+        self.assertIn("download publication receipt", evidence)
+        self.assertEqual(evidence.count("is unreadable"), 1)
         self.assertIn("worker publication receipt is absent", (
             ROOT / "src/continuum/contract_canary.py"
         ).read_text(encoding="utf-8"))
@@ -2736,10 +2831,144 @@ class WorkflowContractTest(unittest.TestCase):
         self.assertIn("branch: $branch", workflow)
         self.assertIn("pr_number: ($pr | tonumber)", workflow)
         self.assertIn("head_sha: $head", workflow)
-        # Both publish paths (normal and branch-recovery) must attest.
-        self.assertEqual(workflow.count("PUBLICATION_DIR="), 2)
-        self.assertEqual(workflow.count("schema_version: 1, repo: $repo"), 2)
-        self.assertGreaterEqual(workflow.count("publication.json"), 3)
+        # Both publish paths (normal and branch-recovery) must attest, and a
+        # rerun that skips them through the duplicate guard may re-attest the
+        # identity this run recorded at creation.
+        self.assertEqual(workflow.count("PUBLICATION_DIR="), 3)
+        self.assertEqual(workflow.count("schema_version: 1, repo: $repo"), 4)
+        self.assertGreaterEqual(workflow.count("publication.json"), 6)
+        self.assertIn(
+            "name: Recover publication receipt for an existing PR", workflow
+        )
+        self.assertIn(
+            "name: Upload recovered OpenCode publication receipt", workflow
+        )
+
+    def test_failed_issue_publication_receipt_is_recoverable(self):
+        """A failed receipt upload must not orphan the run's publication.
+
+        The identity recorded at creation is exported as job outputs from both
+        publish paths and re-attested by a receipt-only job. That job must never
+        create a PR and must verify the recorded PR, branch, and commit first.
+        """
+        workflow = yaml.safe_load(
+            (ROOT / ".github/workflows/continuum-opencode.yml").read_text(
+                encoding="utf-8"
+            )
+        )
+        jobs = workflow["jobs"]
+        producer = jobs["opencode"]
+        expected = {
+            "publication_issue": "publication_issue",
+            "publication_attempt": "publication_attempt",
+            "publication_branch": "publication_branch",
+            "publication_pr_number": "publication_pr_number",
+            "publication_head_sha": "publication_head_sha",
+        }
+        for output, value in expected.items():
+            self.assertEqual(
+                producer["outputs"][output],
+                "${{ steps.implement_issue.outputs.%s || "
+                "steps.recover_issue_branch.outputs.%s }}" % (value, value),
+            )
+        for step_id in ("implement_issue", "recover_issue_branch"):
+            step = next(
+                item
+                for item in producer["steps"]
+                if item.get("id") == step_id
+            )
+            for output in expected:
+                self.assertIn(
+                    'echo "%s=$' % output, step["run"]
+                )
+            self.assertIn('>> "$GITHUB_OUTPUT"', step["run"])
+
+        recovery = jobs["recover-issue-publication"]
+        self.assertEqual(recovery["needs"], "opencode")
+        self.assertIn("!cancelled()", recovery["if"])
+        self.assertIn("needs.opencode.result == 'failure'", recovery["if"])
+        self.assertEqual(recovery["permissions"], {})
+
+        step = next(
+            item
+            for item in recovery["steps"]
+            if item.get("name")
+            == "Republish the OpenCode publication receipt from the recorded identity"
+        )
+        env_names = {
+            "publication_issue": "ISSUE_NUMBER",
+            "publication_attempt": "PUBLICATION_ATTEMPT",
+            "publication_branch": "BRANCH",
+            "publication_pr_number": "PR_NUMBER",
+            "publication_head_sha": "HEAD_SHA",
+        }
+        for output, env_name in env_names.items():
+            self.assertEqual(
+                step["env"][env_name],
+                "${{ needs.opencode.outputs.%s }}" % output,
+            )
+        self.assertEqual(step["env"]["GH_TOKEN"], "${{ secrets.TAP_PAT }}")
+        script = step["run"]
+        self.assertNotIn("gh pr create", script)
+        self.assertIn("No issue publication was recorded", script)
+        self.assertIn('"repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER"', script)
+        self.assertIn('"opencode/issue${ISSUE_NUMBER}-"*', script)
+        self.assertIn("compare/${HEAD_SHA}...${PR_HEAD}", script)
+        self.assertIn("{schema_version: 1, repo: $repo", script)
+        self.assertIn("head_sha: $head", script)
+
+        upload = next(
+            item
+            for item in recovery["steps"]
+            if item.get("name")
+            == "Upload recovered OpenCode publication receipt"
+        )
+        self.assertTrue(
+            upload["with"]["name"].startswith(
+                canary.CANARY_PUBLICATION_ARTIFACT_PREFIX
+            )
+        )
+        self.assertEqual(upload["with"]["if-no-files-found"], "error")
+
+    def test_repair_task_context_requires_the_canonical_marker(self):
+        """A mutable PR reference must not become a wrong-issue guard alone."""
+        workflow = yaml.safe_load(
+            (ROOT / ".github/workflows/continuum-opencode.yml").read_text(
+                encoding="utf-8"
+            )
+        )
+        steps = workflow["jobs"]["opencode"]["steps"]
+        context_step = next(
+            step for step in steps if step.get("id") == "task_context"
+        )
+        condition = context_step["if"]
+        for mode in (
+            "issue",
+            "ci-fix",
+            "resolve-conflict",
+            "coderabbit-fix",
+        ):
+            self.assertIn("inputs.mode == '%s'" % mode, condition)
+        script = context_step["with"]["script"]
+        self.assertIn(
+            "mode === 'ci-fix' || mode === 'resolve-conflict' || "
+            "mode === 'coderabbit-fix'",
+            script,
+        )
+        # Legacy PR-body references stay a ci-fix compatibility path.
+        self.assertEqual(script.count("if (!taskNumber && mode === 'ci-fix')"), 3)
+        for step_id in ("coderabbit_repair", "resolve_conflict"):
+            step = next(
+                item for item in steps if item.get("id") == step_id
+            )
+            self.assertEqual(
+                step["env"]["TASK_CONTEXT_SOURCE"],
+                "${{ steps.task_context.outputs.source }}",
+            )
+            self.assertIn(
+                "TASK_CONTEXT_SOURCE:-}\" != \"canonical-marker",
+                step["run"],
+            )
 
     def test_workflow_preserves_review_decision_for_the_merge_stage(self):
         """The REST pulls inventory must still carry the review decision.

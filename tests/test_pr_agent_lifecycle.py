@@ -328,6 +328,13 @@ APPROVED_458_460_MERGED_OPENCODE_SHA256 = (
 APPROVED_458_460_455_MERGED_OPENCODE_SHA256 = (
     "43fe7886c93cfff2d0ebf646ed3744a32c083d433acaf5db6da20a40d2a7f196"
 )
+# PR #459 review 5935178627 repair: receipt-only issue-publication recovery for
+# a skipped rerun and a failed upload, canonical-marker task resolution for
+# repair modes, and the shared canary evidence import used by both canary
+# scripts. Pin the exact combined bytes; unrelated byte drift still fails closed.
+APPROVED_459_REVIEW_OPENCODE_SHA256 = (
+    "f5d95154fe85153e3d919dacce3298e73e925a4f6207268cb609219e33c3d394"
+)
 # The prior #460 resume pin stays for audit; any further byte drift still
 # fails closed.
 APPROVED_460_RESUME_OPENCODE_SHA256 = (
@@ -2759,8 +2766,8 @@ class ProtectedBaselineTests(unittest.TestCase):
                     # with full-file digests and executable regression tests.
                     self.assertEqual(
                         protected_file_digest(path),
-                        APPROVED_458_460_455_MERGED_OPENCODE_SHA256,
-                        f"{path}: unexpected drift outside #458 publication attestation, #460 resume repair, and #454 telemetry merged protected workflow",
+                        APPROVED_459_REVIEW_OPENCODE_SHA256,
+                        f"{path}: unexpected drift outside the PR #459 review repair of the merged protected workflow",
                     )
                 else:
                     # The self-dogfood caller is the dispatchable surface
@@ -2845,7 +2852,7 @@ class ProtectedBaselineTests(unittest.TestCase):
         # therefore be dirty in this pre-commit worktree; any unapproved byte
         # change still fails the exact digest assertions above.
         approved = {
-            ".github/workflows/continuum-opencode.yml": APPROVED_458_460_455_MERGED_OPENCODE_SHA256,
+            ".github/workflows/continuum-opencode.yml": APPROVED_459_REVIEW_OPENCODE_SHA256,
             ".github/workflows/opencode.yml": APPROVED_350_SELF_CALLER_SHA256,
         }
         for path in PROTECTED_FILES:

@@ -1490,6 +1490,22 @@ def _commit_parent_count(commit: Mapping[str, Any]) -> int:
     return len(parents) if isinstance(parents, Sequence) else 0
 
 
+def _commit_parent_shas(commit: Mapping[str, Any]) -> list:
+    """Return the normalized parent SHAs one PR commit declares."""
+    parents = commit.get("parents")
+    if not isinstance(parents, Sequence) or isinstance(parents, (str, bytes)):
+        return []
+    shas = []
+    for parent in parents:
+        if isinstance(parent, Mapping):
+            sha = str(parent.get("sha") or parent.get("oid") or "").strip().lower()
+        else:
+            sha = str(parent or "").strip().lower()
+        if sha:
+            shas.append(sha)
+    return shas
+
+
 def _is_authenticated_main_sync_commit(commit: object) -> bool:
     """Whether GitHub itself signed this commit as a native main-sync merge.
 
@@ -1692,11 +1708,16 @@ def _validate_publication_continuity(
     The worker receipt names the commit the worker actually published. A later
     CodeRabbit/CI repair or a native main-sync may advance the same PR branch
     before merge. Completion may only cross that gap through the PR's own
-    commit history. A commit after the published one is trusted only when
-    GitHub signed it as a two-parent ``web-flow`` merge, or when the repair
-    workflow published an authenticated status whose own run receipt binds its
-    direct parent, this exact commit, the PR, and the branch. A plain commit
-    that merely copies the Actions bot identity is not evidence.
+    commit history. GitHub's PR commit list is not an ancestry proof, so the gap
+    is computed from the ``parents`` links: every commit reachable from the
+    final head but not reachable from the published commit must be trusted.
+    A manual commit therefore cannot hide by appearing before the published
+    commit in list order, and a signed merge cannot smuggle a manual second
+    parent through the gap. A commit in the gap is trusted only when GitHub
+    signed it as a two-parent ``web-flow`` merge, or when the repair workflow
+    published an authenticated status whose own run receipt binds its direct
+    parent, this exact commit, the PR, and the branch. A plain commit that
+    merely copies the Actions bot identity is not evidence.
     """
     entries = [
         commit for commit in commits or [] if isinstance(commit, Mapping)
@@ -1706,43 +1727,60 @@ def _validate_publication_continuity(
             "worker publication receipt published another commit without a "
             "PR commit history to prove trusted continuity"
         )
-    indices = {}
-    for index, commit in enumerate(entries):
+    by_sha = {}
+    order = []
+    for commit in entries:
         sha = _commit_sha(commit)
-        if sha:
-            indices.setdefault(sha, index)
-    if head not in indices:
+        if sha and sha not in by_sha:
+            by_sha[sha] = commit
+            order.append(sha)
+    if head not in by_sha:
         return (
             "worker publication receipt PR history does not contain the final "
             "head"
         )
-    if published not in indices:
+    if published not in by_sha:
         return (
             "worker publication receipt published a commit outside the final "
             "PR history"
         )
-    start = indices[published]
-    end = indices[head]
-    if start >= end:
+
+    def reachable(start: str) -> set:
+        seen = set()
+        pending = [start]
+        while pending:
+            sha = pending.pop()
+            if sha in seen:
+                continue
+            seen.add(sha)
+            commit = by_sha.get(sha)
+            if commit is not None:
+                pending.extend(_commit_parent_shas(commit))
+        return seen
+
+    reachable_from_head = reachable(head)
+    if published not in reachable_from_head:
         return (
             "worker publication receipt published a commit that is not behind "
             "the final head"
         )
-    previous = entries[start]
-    for index in range(start + 1, end + 1):
-        commit = entries[index]
-        sha = _commit_sha(commit)
-        if _is_authenticated_main_sync_commit(commit):
-            previous = commit
+    reachable_from_published = reachable(published)
+    for sha in order:
+        if sha not in reachable_from_head or sha in reachable_from_published:
             continue
-        if _commit_has_repair_status(
-            commit,
-            _commit_sha(previous),
-            pr_number,
-            expected_repo,
-            head_branch,
+        commit = by_sha[sha]
+        if _is_authenticated_main_sync_commit(commit):
+            continue
+        if any(
+            _commit_has_repair_status(
+                commit,
+                parent,
+                pr_number,
+                expected_repo,
+                head_branch,
+            )
+            for parent in _commit_parent_shas(commit)
         ):
-            previous = commit
             continue
         return (
             "worker publication receipt has unauthenticated commit {} after "
@@ -1771,10 +1809,11 @@ def validate_worker_publication(
     evidence. The published commit may sit behind the final head when automation
     added repair or main-sync commits afterwards. In that case the PR's commit
     history must prove continuity from the published commit to the final head:
-    a later commit is accepted only when GitHub signed it as a native main-sync
-    merge, or when the authenticated repair workflow status and that run's own
-    publication receipt attest it, its direct parent, and this PR. Commit-name
-    spoofing alone never qualifies. The
+    every commit reachable from the head but not from the published commit is
+    accepted only when GitHub signed it as a native main-sync merge, or when the
+    authenticated repair workflow status and that run's own publication receipt
+    attest it, its direct parent, and this PR. Commit-name spoofing alone never
+    qualifies. The
     exact-head CI and contract checks still target the final head. A published
     commit that cannot be connected that way never satisfies the receipt.
     """
@@ -1997,6 +2036,7 @@ def validate_completed_canary(
     issue_number: int,
     worker_publication: object = None,
     pull_request_commits: Sequence[Mapping[str, Any]] = (),
+    expected_repo: str = CANARY_OWNER_REPO,
 ) -> Optional[str]:
     """Return a failure reason unless a completed canary PR has exact-HEAD evidence.
 
@@ -2011,10 +2051,16 @@ def validate_completed_canary(
     receipt that the worker uploads only when it publishes this exact PR. So
     neither a manual PR with only a closing keyword, a PR reusing an unrelated
     issue's run id, nor a PR borrowing the id of a successful no-op run ever
-    satisfies it. A worker-published commit may sit behind the final head when
+    satisfies it. ``expected_repo`` is the repository that actually holds the
+    evidence: a consumer with ``CONTINUUM_CANARY_ISSUE`` supplies its own
+    repository, so its authentic receipt is not rejected by the bootstrap
+    repository default. The bootstrap restriction stays in
+    :func:`resolve_canary` and never leaks into receipt validation. A
+    worker-published commit may sit behind the final head when
     automation later repairs the branch; ``pull_request_commits`` must then
-    prove that every intervening commit is either a GitHub-signed main-sync
-    merge or carries the authenticated repair-publication status. A plain
+    prove that every commit reachable from the head but not from the published
+    commit is either a GitHub-signed main-sync merge or carries the
+    authenticated repair-publication status. A plain
     commit that copies the bot identity is not automation evidence. Evidence
     for any other SHA is stale and never satisfies the check; a manually
     implemented PR with no worker run is not live lifecycle proof.
@@ -2065,6 +2111,7 @@ def validate_completed_canary(
         completion_worker_run(issue_number, runs, pull_request),
         worker_publication,
         issue_number,
+        expected_repo=expected_repo,
         pull_request_commits=pull_request_commits,
     )
     if publication_problem:
@@ -2179,6 +2226,7 @@ def resolve_canary(
         issue.number,
         worker_publication,
         pull_request_commits,
+        expected_repo=expected_repo,
     )
     if problem:
         raise CanaryBootstrapError(

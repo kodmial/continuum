@@ -371,6 +371,22 @@ ENTRIES = (
     },
     {
         "workflow": "continuum-opencode.yml",
+        "step": "Recover publication receipt for an existing PR",
+        "capability": EXACTLY_ONCE_CLAIM,
+        "same_repo": True,
+        "reason": "A skipped duplicate rerun re-attests only the publication identity this same run recorded; the PR/commit read and artifact listing must use the same actor that created the branch, so the run's own exactly-once recovery evidence cannot be suppressed by a repository-scoped token.",
+        "evidence": ("GH_TOKEN: ${{ secrets.TAP_PAT }}",),
+    },
+    {
+        "workflow": "continuum-opencode.yml",
+        "step": "Republish the OpenCode publication receipt from the recorded identity",
+        "capability": EXACTLY_ONCE_CLAIM,
+        "same_repo": True,
+        "reason": "A fresh-runner post-failure job re-attests the exact issue, PR, branch, and task commit from the failed job's outputs after the receipt upload failed; only the PAT identity that owns the publication can read and attest that durable exactly-once identity.",
+        "evidence": ("GH_TOKEN: ${{ secrets.TAP_PAT }}",),
+    },
+    {
+        "workflow": "continuum-opencode.yml",
         "step": "Re-run the consumer blocking CI workflow for this head",
         "capability": DISPATCH,
         "same_repo": True,
