@@ -68,9 +68,17 @@ Choose one ref policy for the first run:
   and its engine move together. Never mix a pinned caller with an unpinned
   `continuum_ref:` or the reverse.
 
+Unlike the installed callers, `continuum-validation.yml` takes its revision
+only from the caller's `uses:` ref; the `continuum_ref:` value in the
+project-owned `ci.yml` has no effect on the engine revision. The installed
+callers (for example `continuum-opencode.yml`) do read `continuum_ref:` to
+select their engine checkout, so the matching policy above applies to them.
+The rewrite below still updates both lines so the sample stays consistent.
+
 The steps below implement the reproducible path. The example `ci.yml` ships
-with the moving `main` references; the rewrite below changes both to the
-selected SHA. For the deliberately moving alternative, **replace** the `export CONTINUUM_REF=...`
+with the moving `main` references; the rewrite below changes the `uses:` ref
+(and the inert `continuum_ref:`) to the selected SHA. For the deliberately
+moving alternative, **replace** the `export CONTINUUM_REF=...`
 assignment in the next shell block with `export CONTINUUM_REF=main` **before**
 downloading the installer, so the downloaded script matches the selected ref.
 Do not run the pinned assignment and then try to override it from above.

@@ -88,6 +88,13 @@ fall back to the trusted repository configuration and documented defaults.
 `max_tokens` is retained but is not passed to the `/review` run, so it does
 not control review budgeting.
 
+`opencode_model` qualifies the route for the canary run only. The `/review`
+command the canary posts passes no model, and the installed review caller
+declares no `opencode_model` input, so the review run resolves its own route
+from the trusted `OPENCODE_MODELS` pool (or the legacy `OPENCODE_MODEL`) with
+`sticky-failover`. A passing canary therefore does not prove that the route
+the review run actually used was qualified; verify that route separately.
+
 ```sh
 export CONSUMER_REPO="YOUR_OWNER/YOUR_DISPOSABLE_REPO"
 gh workflow run continuum-pr-agent-canary.yml \
