@@ -272,10 +272,19 @@ working:
    disposable consumer repository as the target, a protected release
    environment, and a disposable test signing certificate. Do not migrate a
    production consumer in the same step.
-5. Qualify secret isolation: resolve and target jobs hold no publishing token;
-   only the transaction does; Apple material reaches only the Apple row. Run
-   the transaction from a separately trusted engine, not from the release
-   source tree, because the source CLI executes with `RELEASE_TOKEN` in scope.
+5. Qualify secret isolation and establish a signing trust boundary: resolve and
+   target jobs hold no publishing token; only the transaction does. The Apple
+   target job does run the source-tree CLI with `CONTINUUM_APPLE_P12` and
+   `CONTINUUM_APPLE_P12_PASSWORD` in its environment, so modified source can
+   read the signing key and passphrase. Restricting those secrets to the Apple
+   row does not isolate them from the code being built, and a trusted
+   transaction engine does not protect the target job. Run the transaction from
+   a separately trusted engine, not from the release source tree, because the
+   source CLI executes with `RELEASE_TOKEN` in scope. Do not expose signing
+   material to a job that executes untrusted source either; require an
+   established signing trust boundary, such as a separately trusted engine or
+   an isolated signing step that receives only verified artifacts, before
+   qualification.
 6. Qualify failure and recovery semantics: incomplete fragment sets are refused,
    mid-publish interruption resumes or reports safely, and a duplicate event
    cannot publish twice.
