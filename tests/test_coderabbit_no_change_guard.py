@@ -844,6 +844,53 @@ class NoChangeGuardTests(unittest.TestCase):
         self.assertEqual(len(dispatched["dispatches"]), 0, dispatched["notices"])
         self.assertEqual(len(dispatched["posted"]), 1)
 
+    def test_outcome_without_a_dispatch_lease_still_requires_run_evidence(self):
+        # Making the lease optional must not bypass the run-scoped checks: a
+        # full-review outcome with no lease still defers when the provenance
+        # artifact is missing, in both the collection and dispatch guards.
+        handoff, _ = handoff_fixture()
+        collected = collect_step(items_for(), [handoff], artifacts=[])
+        self.assertEqual(collected["out"]["should_run"], "false")
+        self.assertEqual(json.loads(collected["out"]["items_json"]), [])
+        deferred = json.loads(collected["out"]["no_change_deferred_json"])
+        self.assertEqual(deferred[0]["finding_id"], FINDING)
+        self.assertEqual(deferred[0]["reason"], "run-provenance-unverified")
+        dispatched = dispatch_step(
+            items_for(), [[handoff]], cutoff=100000, artifacts=[],
+        )
+        self.assertEqual(len(dispatched["dispatches"]), 0, dispatched["notices"])
+        self.assertEqual(dispatched["posted"], [])
+        self.assertTrue(any(
+            "run-provenance-unverified" in notice
+            for notice in dispatched["notices"]
+        ), dispatched["notices"])
+
+    def test_matching_dispatch_lease_still_anchors_run_order(self):
+        # A lease whose digest matches the outcome remains corroboration: when
+        # the named run started before that dispatch, the outcome cannot be its
+        # result, so neither guard may suppress on it.
+        handoff, body = handoff_fixture()
+        issue_comments = [
+            batch_marker(
+                digest=outcome_digest(body),
+                created_at="2026-11-16T20:10:00Z",
+            ),
+            handoff,
+        ]
+        collected = collect_step(items_for(), issue_comments)
+        self.assertEqual(collected["out"]["should_run"], "false")
+        self.assertEqual(json.loads(collected["out"]["items_json"]), [])
+        deferred = json.loads(collected["out"]["no_change_deferred_json"])
+        self.assertEqual(deferred[0]["finding_id"], FINDING)
+        self.assertEqual(deferred[0]["reason"], "run-before-dispatch")
+        dispatched = dispatch_step(items_for(), [issue_comments], cutoff=100000)
+        self.assertEqual(len(dispatched["dispatches"]), 0, dispatched["notices"])
+        self.assertEqual(dispatched["posted"], [])
+        self.assertTrue(any(
+            "run-before-dispatch" in notice
+            for notice in dispatched["notices"]
+        ), dispatched["notices"])
+
     def test_unverified_changed_outcome_defers_instead_of_releasing(self):
         # A changed=true marker must not release the no-change suppression on
         # its bare value: only validated run and artifact evidence may do so.
