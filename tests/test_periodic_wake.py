@@ -360,6 +360,51 @@ class WorkflowGateTests(unittest.TestCase):
         self.assertNotIn("CRON_JOB_ORG_API_KEY", doc)
         self.assertNotIn("api.cron-job.org", doc)
 
+    def test_self_dogfood_auto_merge_backstop_is_documented_exactly(self):
+        doc = (ROOT / "docs" / "cron-job-org.md").read_text(encoding="utf-8")
+
+        # The #375 consumer instructions stay intact.
+        self.assertIn(
+            "https://api.github.com/repos/OWNER/REPO/actions/workflows/"
+            "continuum-issue-scheduler.yml/dispatches",
+            doc,
+        )
+        self.assertIn(
+            '{"ref":"main","inputs":{"periodic_wake":"true"}}',
+            doc,
+        )
+
+        heading = "## Self-dogfood auto-merge-only backstop"
+        self.assertIn(heading, doc)
+        section = doc.split(heading, 1)[1]
+        self.assertIn(
+            "https://api.github.com/repos/kodmial/continuum/actions/workflows/"
+            "automation.yml/dispatches",
+            section,
+        )
+        self.assertIn("**Method**: `POST`", section)
+        self.assertIn(
+            '{"ref":"main","inputs":{"periodic_wake":"true",'
+            '"auto_merge_only":"true"}}',
+            section,
+        )
+        self.assertIn("periodic_wake=true", section)
+        self.assertIn("auto_merge_only=true", section)
+        self.assertIn("Never send only `periodic_wake=true`", section)
+        self.assertIn("Actions: write", section)
+        self.assertIn("fine-grained", section.lower())
+        self.assertIn("Never put a token", section)
+        self.assertIn("`17,47 * * * *`", section)
+        self.assertIn("`:19`", section)
+        self.assertIn("`:49`", section)
+        self.assertIn("HTTP `204`", section)
+        self.assertIn("not** that reconciliation succeeded", section)
+        self.assertIn("manual operator step", section)
+        self.assertIn("Nothing here provisions or reads cron-job.org", section)
+        for status in ("`401`", "`403`", "`404`", "`422`", "Token expiry"):
+            with self.subTest(status=status):
+                self.assertIn(status, section)
+
 
 class ExtractedGateScriptTests(unittest.TestCase):
     """Execute the real workflow step with a fake gh, not a copy."""

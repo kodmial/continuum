@@ -1,10 +1,14 @@
-"""Regression tests for #394: machine-origin comments must not wake the scheduler.
+"""Regression tests for #394 and #470.
 
 Both scheduler entrypoints are evaluated from their real checked-in YAML: the
 consumer caller stub's ``jobs.call.if`` and the self-dogfood ``automation.yml``
 ``jobs.scheduler.if``. The small expression evaluator below understands only
 the GitHub Actions expression subset those conditions actually use, so the
 tests never mirror a hand-written approximation of the decision.
+
+The ``AutomationAutoMergeOnlyRoutingTests`` class applies the same evaluator to
+every ``automation.yml`` job so the narrow external auto-merge wake is proven
+from the real conditions rather than a detached model.
 """
 
 from __future__ import annotations
@@ -272,6 +276,7 @@ def event_context(
     action=None,
     schedule=None,
     workflow_run=None,
+    inputs=None,
 ):
     return {
         "github": {
@@ -287,6 +292,7 @@ def event_context(
             },
         },
         "vars": {"CONTINUUM_ROLE": role},
+        "inputs": inputs or {},
     }
 
 
@@ -677,6 +683,292 @@ class ActualSchedulerConditionTests(unittest.TestCase):
         self.assertFalse(
             "issue-scheduler-dispatch" in OLD_AUTOMATION_IF
             or "opencode-watchdog" in OLD_AUTOMATION_IF
+        )
+
+
+class AutomationAutoMergeOnlyRoutingTests(unittest.TestCase):
+    """#470: the external wake must admit only the existing auto-merge job.
+
+    Every decision below is evaluated from the checked-in ``automation.yml``
+    job conditions, not from a hand-written model of the workflow.
+    """
+
+    AUTO_MERGE_JOBS = (
+        "scheduler",
+        "watchdog",
+        "repair",
+        "auto-merge",
+        "global-pr-watchdog",
+    )
+
+    def setUp(self):
+        self.workflow = yaml.safe_load(SELF_SCHEDULER.read_text(encoding="utf-8"))
+        self.conditions = {
+            name: self.workflow["jobs"][name]["if"] for name in self.AUTO_MERGE_JOBS
+        }
+
+    def events(self):
+        return self.workflow.get("on") or self.workflow.get(True) or {}
+
+    def routing(self, event_name, **context):
+        return {
+            name: admitted(condition, event_context(event_name, **context))
+            for name, condition in self.conditions.items()
+        }
+
+    def test_auto_merge_only_is_an_optional_typed_dispatch_selector(self):
+        dispatch = self.events()["workflow_dispatch"]["inputs"]["auto_merge_only"]
+        self.assertEqual("boolean", dispatch["type"])
+        self.assertIs(False, dispatch["default"])
+        self.assertIs(False, dispatch["required"])
+
+        run_name = self.workflow["run-name"]
+        self.assertIn("[continuum-periodic]", run_name)
+        self.assertIn("[continuum-wake:", run_name)
+        self.assertNotIn(
+            "auto_merge_only",
+            run_name,
+            "the narrow selector must reuse the #375 markers, not add a competing one",
+        )
+
+    def test_external_two_input_wake_admits_only_auto_merge(self):
+        expected = {
+            "scheduler": False,
+            "watchdog": False,
+            "repair": False,
+            "auto-merge": True,
+            "global-pr-watchdog": False,
+        }
+        # REST dispatch sends input values as strings; the boolean declaration
+        # may surface the same value as a JSON boolean in the inputs context.
+        for selector in (True, "true"):
+            with self.subTest(selector=selector):
+                result = self.routing(
+                    "workflow_dispatch",
+                    inputs={
+                        "periodic_wake": "true",
+                        "auto_merge_only": selector,
+                    },
+                )
+                self.assertEqual(expected, result)
+
+    def test_auto_merge_only_alone_remains_narrow_for_manual_testing(self):
+        expected = {
+            "scheduler": False,
+            "watchdog": False,
+            "repair": False,
+            "auto-merge": True,
+            "global-pr-watchdog": False,
+        }
+        for selector in (True, "true"):
+            with self.subTest(selector=selector):
+                result = self.routing(
+                    "workflow_dispatch", inputs={"auto_merge_only": selector}
+                )
+                self.assertEqual(expected, result)
+
+    def test_false_or_absent_selector_preserves_ordinary_manual_dispatch(self):
+        ordinary = {
+            "scheduler": True,
+            "watchdog": True,
+            "repair": False,
+            "auto-merge": True,
+            "global-pr-watchdog": False,
+        }
+        for label, inputs in (
+            ("absent", {}),
+            ("explicit false", {"auto_merge_only": False}),
+            ("REST string false", {"auto_merge_only": "false"}),
+        ):
+            with self.subTest(label=label):
+                self.assertEqual(
+                    ordinary, self.routing("workflow_dispatch", inputs=inputs)
+                )
+
+    def test_prior_periodic_wake_behavior_is_unchanged(self):
+        periodic = {
+            "scheduler": True,
+            "watchdog": True,
+            "repair": False,
+            "auto-merge": True,
+            "global-pr-watchdog": True,
+        }
+        for label, inputs in (
+            ("legacy periodic", {"periodic_wake": "true"}),
+            (
+                "periodic with selector false",
+                {"periodic_wake": "true", "auto_merge_only": False},
+            ),
+            (
+                "periodic with REST selector false",
+                {"periodic_wake": "true", "auto_merge_only": "false"},
+            ),
+        ):
+            with self.subTest(label=label):
+                self.assertEqual(
+                    periodic, self.routing("workflow_dispatch", inputs=inputs)
+                )
+
+    def test_native_cron_routing_is_unchanged(self):
+        primary = {
+            "scheduler": True,
+            "watchdog": True,
+            "repair": False,
+            "auto-merge": False,
+            "global-pr-watchdog": False,
+        }
+        safety_net = {
+            "scheduler": False,
+            "watchdog": False,
+            "repair": False,
+            "auto-merge": True,
+            "global-pr-watchdog": True,
+        }
+        self.assertEqual(
+            primary, self.routing("schedule", schedule="*/15 * * * *")
+        )
+        self.assertEqual(
+            safety_net, self.routing("schedule", schedule="17,47 * * * *")
+        )
+
+    def test_non_dispatch_event_routing_is_unchanged(self):
+        cases = {
+            "push": {
+                "scheduler": False,
+                "watchdog": False,
+                "repair": False,
+                "auto-merge": True,
+                "global-pr-watchdog": False,
+            },
+            "status": {
+                "scheduler": False,
+                "watchdog": False,
+                "repair": False,
+                "auto-merge": True,
+                "global-pr-watchdog": False,
+            },
+            "pull_request_review": {
+                "scheduler": False,
+                "watchdog": False,
+                "repair": False,
+                "auto-merge": True,
+                "global-pr-watchdog": False,
+            },
+            "pull_request_review_comment": {
+                "scheduler": False,
+                "watchdog": False,
+                "repair": False,
+                "auto-merge": True,
+                "global-pr-watchdog": False,
+            },
+            "issues": {
+                "scheduler": True,
+                "watchdog": False,
+                "repair": False,
+                "auto-merge": False,
+                "global-pr-watchdog": False,
+            },
+        }
+        for event_name, expected in cases.items():
+            with self.subTest(event=event_name):
+                self.assertEqual(expected, self.routing(event_name))
+
+        self.assertEqual(
+            {
+                "scheduler": False,
+                "watchdog": False,
+                "repair": True,
+                "auto-merge": False,
+                "global-pr-watchdog": False,
+            },
+            self.routing("pull_request_target", action="opened"),
+        )
+        self.assertEqual(
+            {
+                "scheduler": True,
+                "watchdog": False,
+                "repair": False,
+                "auto-merge": False,
+                "global-pr-watchdog": False,
+            },
+            self.routing("pull_request_target", action="closed"),
+        )
+        self.assertEqual(
+            {
+                "scheduler": True,
+                "watchdog": True,
+                "repair": False,
+                "auto-merge": False,
+                "global-pr-watchdog": False,
+            },
+            self.routing(
+                "workflow_run",
+                workflow_run={"path": ".github/workflows/opencode.yml"},
+            ),
+        )
+        self.assertEqual(
+            {
+                "scheduler": False,
+                "watchdog": False,
+                "repair": True,
+                "auto-merge": True,
+                "global-pr-watchdog": False,
+            },
+            self.routing(
+                "workflow_run",
+                workflow_run={"path": ".github/workflows/ci.yml"},
+            ),
+        )
+
+    def test_auto_merge_reuses_one_caller_engine_and_serialization(self):
+        jobs = self.workflow["jobs"]
+        auto_merge = jobs["auto-merge"]
+        self.assertEqual(
+            "./.github/workflows/continuum-auto-merge.yml", auto_merge["uses"]
+        )
+        self.assertEqual(
+            {
+                "continuum_ref": "main",
+                "opencode_workflow": "opencode.yml",
+                "coderabbit_retry_workflow": "coderabbit-retry.yml",
+                "coderabbit_unresolved_workflow": "coderabbit-unresolved.yml",
+            },
+            auto_merge["with"],
+        )
+        callers = [
+            name
+            for name, job in jobs.items()
+            if str(job.get("uses", "")).endswith("/continuum-auto-merge.yml")
+        ]
+        self.assertEqual(["auto-merge"], callers)
+
+        engine = yaml.safe_load(
+            (ROOT / ".github" / "workflows" / "continuum-auto-merge.yml").read_text(
+                encoding="utf-8"
+            )
+        )
+        concurrency = engine["concurrency"]
+        self.assertEqual("${{ github.workflow }}-auto-merge", concurrency["group"])
+        self.assertIs(False, concurrency["cancel-in-progress"])
+
+        condition = auto_merge["if"]
+        for event in (
+            "pull_request_review",
+            "pull_request_review_comment",
+            "status",
+            "push",
+            "workflow_dispatch",
+        ):
+            self.assertIn(f"github.event_name == '{event}'", condition)
+        self.assertIn(
+            "(github.event_name == 'schedule' && "
+            "github.event.schedule == '17,47 * * * *')",
+            condition,
+        )
+        self.assertIn(
+            "(github.event_name == 'workflow_run' && "
+            "github.event.workflow_run.path == '.github/workflows/ci.yml')",
+            condition,
         )
 
 

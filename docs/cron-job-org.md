@@ -29,18 +29,21 @@ All of these are **not supported external target** choices:
   (GitHub REST cannot dispatch it);
 - `continuum-pr-agent-recovery.yml` (it has per-child recovery identity and is
   intentionally left on its native schedule);
-- Continuum's own self-dogfood `automation.yml`, even though it now accepts the
-  same input:
+- Continuum's own self-dogfood `automation.yml` **as an Issue Scheduler
+  target**, even though it now accepts the same input:
 
   ```text
   https://api.github.com/repos/OWNER/REPO/actions/workflows/automation.yml/dispatches
   ```
 
-  A `workflow_dispatch` to `automation.yml` starts `scheduler` **and** the
-  unrelated `watchdog`, `auto-merge`, and `global-pr-watchdog` jobs. The
+  A default `workflow_dispatch` (without the narrow `auto_merge_only` selector)
+  to `automation.yml` starts `scheduler` **and** the unrelated `watchdog`,
+  `auto-merge`, and, for `periodic_wake=true`, `global-pr-watchdog`. The
   `periodic_wake` input gates only the scheduler job's work, so an external
-  periodic wake there is not cheap and is not supported. Use the installed
-  `continuum-issue-scheduler.yml` caller instead.
+  periodic wake there is not cheap and is not supported as an Issue Scheduler
+  target. Use the installed `continuum-issue-scheduler.yml` caller instead. The
+  separate, supported auto-merge-only self-dogfood backstop is documented in
+  [Self-dogfood auto-merge-only backstop](#self-dogfood-auto-merge-only-backstop).
 
 The caller must be installed at the repository's default branch and Actions
 must be enabled. Do not configure this job in a verified child repository:
@@ -167,3 +170,95 @@ prevent duplicate domain side effects.
 | `422` | Invalid `ref` or an input the caller does not declare | Use the default branch and `periodic_wake: "true"`. |
 | No run appears | The request never reached GitHub or was rejected | Check the cron-job.org response status and request headers. |
 | Run is a NOOP | Another periodic pass already completed the window | Inspect the gate step reason; this is expected duplicate protection. |
+
+## Self-dogfood auto-merge-only backstop
+
+The Issue Scheduler setup above is the consumer-facing backstop. Continuum's own
+repository has a second, narrower self-dogfood target: the existing
+`automation.yml` caller can wake **only** its existing auto-merge job. Native
+`schedule` stays enabled, and both native events and an external dispatch enter
+the same `continuum-auto-merge.yml` reusable engine with the same inputs and the
+same repository-global serialization (`group: <workflow>-auto-merge`,
+`cancel-in-progress: false`). This is an optional operator-created backup for a
+lost or delayed GitHub `schedule` when there are no new events; it is not a
+second reconciler or merge writer.
+
+Nothing here provisions or reads cron-job.org account settings. Creating,
+testing, and maintaining the job is an explicit manual operator step.
+
+### Dispatch target and payload
+
+- **URL**:
+  `https://api.github.com/repos/kodmial/continuum/actions/workflows/automation.yml/dispatches`
+- **Method**: `POST`
+- **Headers**:
+
+  ```text
+  Authorization: Bearer <FINE_GRAINED_PAT>
+  Accept: application/vnd.github+json
+  Content-Type: application/json
+  ```
+
+- **Body**:
+
+  ```json
+  {"ref":"main","inputs":{"periodic_wake":"true","auto_merge_only":"true"}}
+  ```
+
+Use the repository's actual default branch in `ref` if it is not `main`. Both
+inputs are required for this backstop. `periodic_wake=true` is the existing
+external periodic marker from the Issue Scheduler setup, so the run name keeps
+the established `[continuum-periodic]` / `[continuum-wake:true]` markers.
+`auto_merge_only=true` is a narrow job selector: it skips `scheduler`,
+`watchdog`, and `global-pr-watchdog` (including when `periodic_wake=true`), while
+`repair` already skips every dispatch. The existing `auto-merge` caller, its
+`uses` target, `with` inputs, permissions, and engine stay unchanged. Both
+inputs are mode selectors, not authorization overrides.
+
+Never send only `periodic_wake=true` to `automation.yml` as an external
+auto-merge-only backstop. That keeps its original broad dispatch behavior:
+`scheduler`, `watchdog`, `auto-merge`, and `global-pr-watchdog` all start. The
+Issue Scheduler section above explains why that target is unsupported
+for the scheduler. `auto_merge_only=true` may be sent alone for a narrow manual
+test, but the cron-job.org payload uses both inputs.
+
+### Token and schedule
+
+Reuse the same narrow **fine-grained personal access token** guidance as the
+Issue Scheduler setup: repository access to `kodmial/continuum`, repository
+permission **Actions: write** (Metadata read is added automatically), and a
+short deliberate expiry with a rotation reminder. Store it only in cron-job.org's
+`Authorization` header. Never put a token in the repository, a URL, a query
+string, an issue, a log, or a screenshot. Do not paste a broad `TAP_PAT` or the
+run-scoped `GITHUB_TOKEN` into cron-job.org.
+
+The native auto-merge safety-net cron is `17,47 * * * *`. A useful external
+backup is UTC minute `:19` and `:49`, letting the native slot run first while
+still covering a skipped or delayed delivery. HTTP `204` means GitHub accepted
+the dispatch event, **not** that reconciliation succeeded or that any eligible
+PR merged.
+
+### Verification and troubleshooting
+
+1. Use cron-job.org's test button and confirm the dispatch is accepted (`204`).
+2. Open the `kodmial/continuum` Actions run list for **Continuum automation**.
+   The external run should show the established periodic markers and only the
+   `auto-merge` job should execute; `scheduler`, `watchdog`, `repair`, and
+   `global-pr-watchdog` should be skipped.
+3. Open the `auto-merge` job and read the canonical engine outcome. A truthful
+   child-role skip is also valid. The reconciler may legitimately wake its own
+   existing recovery/review workflows when ordinary reconciliation requires
+   them; that is not a second merge writer.
+4. Redundant native, event, and external runs are permitted. Serialization plus
+   latest-state reconciliation and exact-HEAD idempotence prevent a duplicate
+   merge or duplicate effects for unchanged state; they do not make a redundant
+   run free.
+
+| Status | Likely cause | Check |
+| --- | --- | --- |
+| `401` | Token missing, expired, or revoked | Recreate/rotate the fine-grained token and update the header. |
+| `403` | Token lacks **Actions: write**, is not allowed to the repository, or an organization SSO policy blocks it | Check repository access and authorize SSO if required. |
+| `404` | Wrong owner/repo, `automation.yml` missing on the default branch, or Actions disabled | Verify the exact URL and workflow state. |
+| `422` | Invalid `ref` or an input the caller does not declare | Use the default branch and both `periodic_wake` and `auto_merge_only`. |
+| No run appears | The request never reached GitHub or was rejected | Check the cron-job.org response status and request headers. |
+| Token expiry | The fine-grained PAT reached its expiry date | Issue a new PAT, update the header, verify one dispatch, then revoke the old one. |
