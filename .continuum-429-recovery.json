@@ -1,0 +1,23 @@
+{
+  "base_ref": "",
+  "base_sha": "a9558d33234aeafe4f8866698093027810d25800",
+  "branch": "opencode/issue458-43567860780",
+  "capability_number": "",
+  "checkpoint_ref": "opencode/429-checkpoint-opencode-429-coderabbit-fix-pr459-review5935178627-gen-1",
+  "failure_kind": "quota_429",
+  "generation": 1,
+  "head_ref": "opencode/issue458-43567860780",
+  "head_sha": "2bb7226834d465acaf2377d452e97f59e23d47e6",
+  "issue_number": "",
+  "mode": "coderabbit-fix",
+  "operation_id": "opencode-429-coderabbit-fix-pr459-review5935178627",
+  "pr_number": "459",
+  "qualification_number": "",
+  "repository": "kodmial/continuum",
+  "required_sha": "",
+  "review_id": "5935178627",
+  "run_id": "",
+  "schema_version": 1,
+  "stage": "review-repair",
+  "unresolved_items_json": ""
+}
