@@ -243,6 +243,49 @@ jobs:
           issues = observation.select_observations(load("issues.json"))
           runs = load("runs.json")
           pulls = load("pulls.json")
+          # The last 200 Actions runs are a fast path, not exhaustive evidence:
+          # high workflow fan-out can evict a still-running recovery worker.
+          # Use owner-authored issue markers only to discover an exact run ID;
+          # independently verify the fetched Actions identity before trusting it.
+          import subprocess
+
+          repo = os.environ["GITHUB_REPOSITORY"]
+          owner = repo.split("/", 1)[0]
+
+          def github_api(*args):
+              response = subprocess.run(
+                  ["gh", "api", *args],
+                  text=True, capture_output=True, check=False, timeout=120,
+              )
+              if response.returncode:
+                  raise SystemExit(
+                      "worker liveness evidence unreadable (cannot trust "
+                      "truncated recent-run inventory): " +
+                      (response.stderr or "")[:350]
+                  )
+              return json.loads(response.stdout)
+
+          for issue in issues:
+              number = int(issue["number"])
+              if any(observation._run_matches_issue(run, number) for run in runs):
+                  continue
+              pages = github_api(
+                  "--paginate", "--slurp",
+                  f"repos/{repo}/issues/{number}/comments?per_page=100",
+              )
+              comments = [comment for page in pages for comment in page]
+              for run_id in observation.recorded_worker_run_ids(
+                  comments, number, repo, owner
+              ):
+                  run = github_api(f"repos/{repo}/actions/runs/{run_id}")
+                  if (int(run.get("id") or 0) != run_id
+                          or run.get("path") != ".github/workflows/opencode.yml"
+                          or str((run.get("repository") or {}).get("full_name") or "").lower() != repo.lower()
+                          or not observation._run_matches_issue(run, number)):
+                      continue
+                  runs.insert(0, run)
+                  print(f"observed exact issue #{number} worker run {run_id} outside recent window")
+                  break
           reservations = [
               observation.observe_reservation(issue, runs, pulls)
               for issue in issues
