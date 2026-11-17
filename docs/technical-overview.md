@@ -251,10 +251,29 @@ jobs:
     uses: kodmial/continuum/.github/workflows/continuum-validation.yml@main
     with:
       continuum_ref: main
+      # Replace with your project's real hook. With no hook and no detected
+      # stack, validation has nothing to execute and the job still succeeds.
+      test_command: make test
+      # Fork and Dependabot pull requests receive a read-only GITHUB_TOKEN, so
+      # they cannot publish the continuum/validation commit status or dispatch
+      # repair. Require the Validate job check for those PRs instead.
+      publish_status: ${{ github.event_name == 'pull_request' && (github.event.pull_request.head.repo.fork || github.actor == 'dependabot[bot]') && 'false' || 'true' }}
+      dispatch_repair: ${{ github.event_name == 'pull_request' && (github.event.pull_request.head.repo.fork || github.actor == 'dependabot[bot]') && 'false' || 'true' }}
 ```
 
 A complete runnable example is in
 [`examples/minimal-consumer/.github/workflows/ci.yml`](../examples/minimal-consumer/.github/workflows/ci.yml).
+
+Set at least one project-specific hook such as `test_command` before treating
+this job as a merge gate. A check built only from this example is not a test of
+your project: when no hook runs and no stack is detected, the engine logs
+`validation has nothing to execute` and still exits successfully. Require the
+reusable workflow's `Validate` check run (no check run is literally named `CI`)
+and copy the exact check name from the first pull-request run. For fork and
+Dependabot pull requests, require that job check rather than the optional
+`continuum/validation` commit-status context, because their read-only token
+cannot publish the status; the conditionals above disable `publish_status` and
+`dispatch_repair` for those PRs.
 
 ### Upgrading and safe pruning
 

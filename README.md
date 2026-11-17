@@ -20,11 +20,14 @@ admitted issue -> OpenCode implementation -> pull request
   -> exact-HEAD merge gate -> merge only when every gate passes
 ```
 
-Admission is explicit: you decide which issues are ready. Automation writes
-through branches and pull requests, never directly to `main`. Merge is gated on
-evidence for the exact current HEAD and happens only when every configured gate
-passes. A missing, stale, or failing gate stops at the gate; a green run is
-never guaranteed.
+Admission is opt-in configuration: `AUTOMATION_READY_LABEL` defaults to empty,
+and while it is empty the scheduler may dispatch any eligible open issue without
+a label. Set it before enabling automation, for example to `automation:ready`,
+and from then on you decide which issues are ready. Automation writes through
+branches and pull requests, never directly to `main`. Merge is gated on evidence
+for the exact current HEAD and happens only when every configured gate passes. A
+missing, stale, or failing gate stops at the gate; a green run is never
+guaranteed.
 
 ## What you get
 
@@ -101,7 +104,8 @@ rest.
 ## License
 
 Continuum is **source-available**, not OSI-approved open source, under the
-[Business Source License 1.1](LICENSE) (SPDX: `BUSL-1.1`). Production use is
-permitted only for noncommercial purposes, and you may not use it to provide a
-competing product or service. Each version converts to the Apache License 2.0 on
-its Change Date; the [license text](LICENSE) is authoritative.
+[Business Source License 1.1](LICENSE) (SPDX: `BUSL-1.1`). Non-production use is
+allowed; the additional production-use grant is limited to noncommercial
+purposes and must not provide a competing product or service. Each version
+converts to the Apache License 2.0 on its Change Date; the [license
+text](LICENSE) is authoritative.
