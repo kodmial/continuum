@@ -7146,9 +7146,14 @@ class ContinuumTest < Minitest::Test
 
     # An active OpenCode run is authoritative too, or the lease would release
     # an issue GitHub is still implementing.
-    assert_includes scheduler, 'for (let page = 1; page <= 3; page += 1) {'
+    assert_includes scheduler, "const activeRunStatuses = ['queued', 'in_progress', 'waiting', 'pending', 'requested'];"
+    assert_includes scheduler, 'for (const status of activeRunStatuses) {'
+    assert_includes scheduler, 'for (let page = 1; page <= maxActivePagesPerStatus; page += 1) {'
     assert_includes scheduler, 'readGithub.rest.actions.listWorkflowRunsForRepo({'
-    assert_includes scheduler, 'if (data.workflow_runs.length < 100) break;'
+    assert_includes scheduler, 'status,'
+    assert_includes scheduler, 'if (batch.length < 100) {'
+    assert_includes scheduler, 'if (!complete) {'
+    assert_includes scheduler, 'Issue scheduler active Actions inventory truncated ('
     refute_includes scheduler, "readGithub.paginate(\n              readGithub.rest.actions.listWorkflowRunsForRepo"
     refute_includes scheduler, 'gh api --paginate "repos/$GITHUB_REPOSITORY/actions/runs?per_page=100"'
     refute_includes scheduler, 'gh api --paginate "repos/$child_repo/actions/runs?per_page=100"'
