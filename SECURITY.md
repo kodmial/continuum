@@ -60,8 +60,9 @@ configuration safe. Relevant credentials and trust boundaries are documented in:
 - [Commit and review provenance](docs/commit-review-provenance.md).
 
 Third-party Actions, tools, and models invoked by a workflow remain under their
-own licenses and security policies; report their issues to their respective
-maintainers. Derived workflow material is attributed in [NOTICE](NOTICE).
+own licenses and security policies. Review the referenced upstream project and
+report its issues to its maintainers; consult that project's license and
+security policy for its terms.
 
 Out of scope: vulnerabilities that require the attacker to already control the
 consumer repository or its administrator-configured secrets, spam or
