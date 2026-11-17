@@ -330,10 +330,12 @@ APPROVED_458_460_455_MERGED_OPENCODE_SHA256 = (
 )
 # PR #459 review 5935178627 repair: recover the issue publication receipt
 # after an upload failure or a duplicate-guard-skipped rerun, preserving the
-# identity recorded at creation and never creating another PR. Pin the exact
-# workflow bytes; unrelated drift still fails closed.
+# identity recorded at creation and never creating another PR. The upload
+# failure is continued so the recovered run still satisfies the canary's
+# completed-success worker requirement. Pin the exact workflow bytes;
+# unrelated drift still fails closed.
 APPROVED_459_REVIEW_OPENCODE_SHA256 = (
-    "48eefcfc3afd9783f21b2e53d5e0f99d14bc28fb5bce0440e086f29edda31157"
+    "98d11bb92fbb11007c25588fde700c703b58a1eb5cf1ee4be48a3533b8b16b8d"
 )
 # The prior #460 resume pin stays for audit; any further byte drift still
 # fails closed.

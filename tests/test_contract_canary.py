@@ -2748,6 +2748,10 @@ class WorkflowContractTest(unittest.TestCase):
         self.assertIn(
             "name: Upload recovered OpenCode publication receipt", workflow
         )
+        self.assertGreaterEqual(
+            workflow.count("continue-on-error: true"), 2,
+            "a failed receipt upload must not fail the completed worker run",
+        )
 
     def test_failed_issue_publication_receipt_is_recoverable(self):
         """A failed receipt upload must not orphan the run's publication.
@@ -2776,6 +2780,23 @@ class WorkflowContractTest(unittest.TestCase):
                 "${{ steps.implement_issue.outputs.%s || "
                 "steps.recover_issue_branch.outputs.%s }}" % (value, value),
             )
+        # The upload failure is tracked separately from the job result so the
+        # completed worker run stays successful while the receipt is recovered.
+        self.assertEqual(
+            producer["outputs"]["publication_upload_outcome"],
+            "${{ steps.upload_publication.outcome }}",
+        )
+        self.assertEqual(
+            producer["outputs"]["publication_recovery_upload_outcome"],
+            "${{ steps.upload_publication_recovery.outcome }}",
+        )
+        for step_id in ("upload_publication", "upload_publication_recovery"):
+            step = next(
+                item
+                for item in producer["steps"]
+                if item.get("id") == step_id
+            )
+            self.assertIs(step["continue-on-error"], True)
         for step_id in ("implement_issue", "recover_issue_branch"):
             step = next(
                 item
@@ -2792,6 +2813,16 @@ class WorkflowContractTest(unittest.TestCase):
         self.assertEqual(recovery["needs"], "opencode")
         self.assertIn("!cancelled()", recovery["if"])
         self.assertIn("needs.opencode.result == 'failure'", recovery["if"])
+        self.assertIn(
+            "needs.opencode.outputs.publication_upload_outcome == 'failure'",
+            recovery["if"],
+            "a continued upload failure must still trigger receipt recovery",
+        )
+        self.assertIn(
+            "needs.opencode.outputs.publication_recovery_upload_outcome "
+            "== 'failure'",
+            recovery["if"],
+        )
         self.assertEqual(recovery["permissions"], {})
 
         step = next(
@@ -2800,6 +2831,7 @@ class WorkflowContractTest(unittest.TestCase):
             if item.get("name")
             == "Republish the OpenCode publication receipt from the recorded identity"
         )
+        self.assertEqual(step["id"], "republish_issue_publication")
         env_names = {
             "publication_issue": "ISSUE_NUMBER",
             "publication_attempt": "PUBLICATION_ATTEMPT",
@@ -2821,12 +2853,19 @@ class WorkflowContractTest(unittest.TestCase):
         self.assertIn("compare/${HEAD_SHA}...${PR_HEAD}", script)
         self.assertIn("{schema_version: 1, repo: $repo", script)
         self.assertIn("head_sha: $head", script)
+        self.assertIn("Publication receipt already exists", script)
+        self.assertIn('echo "present=true" >> "$GITHUB_OUTPUT"', script)
 
         upload = next(
             item
             for item in recovery["steps"]
             if item.get("name")
             == "Upload recovered OpenCode publication receipt"
+        )
+        self.assertEqual(
+            upload["if"],
+            "!cancelled() && "
+            "steps.republish_issue_publication.outputs.present == 'true'",
         )
         self.assertTrue(
             upload["with"]["name"].startswith(
@@ -2846,6 +2885,39 @@ class WorkflowContractTest(unittest.TestCase):
                 recovered,
                 100,
             )
+        )
+        # The recovered run must also still count as the completed successful
+        # worker the completion gate requires; continuing the upload failure
+        # keeps that conclusion truthful while the receipt is re-attested.
+        self.assertEqual(
+            contract.evaluate_regression_gate(
+                HEAD,
+                [
+                    contract.GateEvidence(
+                        contract.REGRESSION_WORKFLOW_NAME,
+                        HEAD,
+                        "completed",
+                        "success",
+                    ),
+                    contract.GateEvidence(
+                        contract.CONTRACT_WORKFLOW_NAME,
+                        HEAD,
+                        "completed",
+                        "success",
+                    ),
+                    contract.GateEvidence(
+                        "OpenCode agent",
+                        WORKER_HEAD,
+                        "completed",
+                        "success",
+                        run_id=WORKER_RUN_ID,
+                        display_title="OpenCode issue #100",
+                    ),
+                ],
+                worker_issue_number=100,
+                worker_run_id=WORKER_RUN_ID,
+            ).outcome,
+            contract.GATE_PASS,
         )
 
     def test_workflow_preserves_review_decision_for_the_merge_stage(self):

@@ -932,6 +932,12 @@ jobs:
       publication_branch: ${{ steps.implement_issue.outputs.publication_branch || steps.recover_issue_branch.outputs.publication_branch }}
       publication_pr_number: ${{ steps.implement_issue.outputs.publication_pr_number || steps.recover_issue_branch.outputs.publication_pr_number }}
       publication_head_sha: ${{ steps.implement_issue.outputs.publication_head_sha || steps.recover_issue_branch.outputs.publication_head_sha }}
+      # A receipt upload failure must not fail an otherwise successful worker
+      # run, or the recovered receipt could never satisfy the canary's
+      # completed-success worker requirement. Keep the pre-continue-on-error
+      # outcome so the recovery job still re-attests the receipt.
+      publication_upload_outcome: ${{ steps.upload_publication.outcome }}
+      publication_recovery_upload_outcome: ${{ steps.upload_publication_recovery.outcome }}
 
     steps:
       - name: Checkout repository
@@ -2699,7 +2705,9 @@ jobs:
           echo "present=true" >> "$GITHUB_OUTPUT"
 
       - name: Upload recovered OpenCode publication receipt
+        id: upload_publication_recovery
         if: steps.publication_recovery.outputs.present == 'true'
+        continue-on-error: true
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: continuum-task-publication-${{ github.run_attempt }}-recovery
@@ -4161,6 +4169,12 @@ jobs:
           } >> "$GITHUB_OUTPUT"
 
       - name: Upload OpenCode publication receipt
+        id: upload_publication
+        # The PR is already published at this point. A transient artifact
+        # service failure must be recovered by the receipt-only job without
+        # turning the completed publication into a failed worker run, which
+        # would be permanently ineligible as canary completion evidence.
+        continue-on-error: true
         if: >-
           success() &&
           steps.duplicate_guard.outputs.skip != 'true' &&
@@ -6135,7 +6149,9 @@ jobs:
     # or changing any PR.
     if: >-
       !cancelled() &&
-      needs.opencode.result == 'failure'
+      (needs.opencode.result == 'failure' ||
+       needs.opencode.outputs.publication_upload_outcome == 'failure' ||
+       needs.opencode.outputs.publication_recovery_upload_outcome == 'failure')
     runs-on: ubuntu-latest
     timeout-minutes: ${{ fromJSON(vars.AUTOMATION_ATTEMPTS_TIMEOUT_MINUTES || '10') }}
 
@@ -6143,6 +6159,7 @@ jobs:
 
     steps:
       - name: Republish the OpenCode publication receipt from the recorded identity
+        id: republish_issue_publication
         env:
           GH_TOKEN: ${{ secrets.TAP_PAT }}
           ISSUE_NUMBER: ${{ needs.opencode.outputs.publication_issue }}
@@ -6184,6 +6201,15 @@ jobs:
               exit 1
               ;;
           esac
+          # A failed action can still have uploaded its artifact, and a worker
+          # failure after a successful upload needs no extra receipt. Recovery
+          # is idempotent, so a rerun of this job never piles up duplicates.
+          PRESENT="$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/artifacts?per_page=100" \
+            --jq '[.artifacts[] | select((.expired | tostring) != "true") | select(.name | startswith("continuum-task-publication"))] | length')"
+          if [[ "$PRESENT" != "0" ]]; then
+            echo "Publication receipt already exists for run $GITHUB_RUN_ID; nothing to recover."
+            exit 0
+          fi
           RECOVERY_DIR="${RUNNER_TEMP:-/tmp}/continuum-task-publication-recovery"
           mkdir -p "$RECOVERY_DIR"
           jq -n \
@@ -6196,11 +6222,12 @@ jobs:
             --arg head "$HEAD_SHA" \
             '{schema_version: 1, repo: $repo, issue: ($issue | tonumber), run_id: $run, run_attempt: $attempt, branch: $branch, pr_number: ($pr | tonumber), head_sha: $head}' \
             > "$RECOVERY_DIR/publication.json"
+          echo "present=true" >> "$GITHUB_OUTPUT"
 
       - name: Upload recovered OpenCode publication receipt
         if: >-
           !cancelled() &&
-          needs.opencode.outputs.publication_pr_number != ''
+          steps.republish_issue_publication.outputs.present == 'true'
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: continuum-task-publication-${{ needs.opencode.outputs.publication_attempt || github.run_attempt }}-job-recovery
