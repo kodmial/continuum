@@ -3237,6 +3237,52 @@ jobs:
             'CodeRabbit unresolved'
           );
 
+
+          // Coalesce global CodeRabbit wakeups across separate auto-merge runs.
+          async function wakeCodeRabbitRetryIfIdle(pr, reason) {
+            const support = await reconciliationDispatchSupport(
+              codeRabbitRetryWorkflow, 'main', ['pr_number']
+            );
+            if (!support.ok) {
+              core.notice(`PR #${pr.number}: CodeRabbit wake deferred: ${support.reason}.`);
+              return;
+            }
+            // The controller may sleep for an hour. Do not rely on the newest
+            // unfiltered runs, which can be crowded out by cancelled wakes.
+            for (const status of ['in_progress', 'pending', 'queued', 'waiting', 'requested']) {
+              let observed;
+              try {
+                observed = await withReadFallback(client =>
+                  client.rest.actions.listWorkflowRuns({
+                    owner, repo, workflow_id: codeRabbitRetryWorkflow,
+                    status, per_page: 1,
+                  })
+                );
+              } catch (err) {
+                core.warning(
+                  `PR #${pr.number}: CodeRabbit queue state unreadable; deferring ${reason} wake to the next event/cron: ${err.message || err}`
+                );
+                return;
+              }
+              const runs = observed?.data?.workflow_runs;
+              if (!Array.isArray(runs)) {
+                core.warning(`PR #${pr.number}: CodeRabbit queue state incomplete; deferring ${reason} wake.`);
+                return;
+              }
+              if (runs.length > 0) {
+                core.info(
+                  `PR #${pr.number}: CodeRabbit controller #${runs[0].id} already ${status}; skipping duplicate ${reason} wake.`
+                );
+                return;
+              }
+            }
+            await github.rest.actions.createWorkflowDispatch({
+              owner, repo, workflow_id: codeRabbitRetryWorkflow, ref: 'main',
+              inputs: { pr_number: String(pr.number) },
+            });
+            core.notice(`PR #${pr.number}: ${reason}; woke the global CodeRabbit review controller.`);
+          }
+
           // Mirrors src/continuum/conflict_repair.py:is_conflicted. Keep the
           // two in sync: mergeable may be a REST boolean (or null) or a
           // GraphQL-style string such as CONFLICTING; mergeable_state is
@@ -4398,30 +4444,8 @@ jobs:
             // wake, and a repository without `continuum-coderabbit-retry.yml`
             // would answer the dispatch with a 404.
             if (requireCodeRabbit && !reviewBasis && !codeRabbitRetryControllerDispatched) {
-              const retryDispatchSupport =
-                await reconciliationDispatchSupport(
-                  codeRabbitRetryWorkflow,
-                  'main',
-                  ['pr_number']
-                );
-              if (!retryDispatchSupport.ok) {
-                codeRabbitRetryControllerDispatched = true;
-                core.notice(
-                  `PR #${pr.number}: skipped CodeRabbit review-queue dispatch: ${retryDispatchSupport.reason}.`
-                );
-              } else {
-                await github.rest.actions.createWorkflowDispatch({
-                  owner,
-                  repo,
-                  workflow_id: codeRabbitRetryWorkflow,
-                  ref: 'main',
-                  inputs: { pr_number: String(pr.number) },
-                });
-                codeRabbitRetryControllerDispatched = true;
-                core.notice(
-                  `PR #${pr.number}: missing a valid CodeRabbit approval; dispatched the global review controller.`
-                );
-              }
+              codeRabbitRetryControllerDispatched = true;
+              await wakeCodeRabbitRetryIfIdle(pr, 'missing valid CodeRabbit approval');
             }
 
             // Never lose an old CodeRabbit finding just because its diff is
@@ -4471,29 +4495,8 @@ jobs:
               // source issues P0 -> P1 -> P2 and emits at most one review
               // command for the next legal quota slot.
               if (!codeRabbitRetryControllerDispatched) {
-                const retryDispatchSupport =
-                  await reconciliationDispatchSupport(
-                    codeRabbitRetryWorkflow,
-                    'main',
-                    ['pr_number']
-                  );
-                if (!retryDispatchSupport.ok) {
-                  core.notice(
-                    `PR #${pr.number}: skipped rate-limited CodeRabbit review-queue dispatch: ${retryDispatchSupport.reason}.`
-                  );
-                } else {
-                  await github.rest.actions.createWorkflowDispatch({
-                    owner,
-                    repo,
-                    workflow_id: codeRabbitRetryWorkflow,
-                    ref: 'main',
-                    inputs: { pr_number: String(pr.number) },
-                  });
-                  codeRabbitRetryControllerDispatched = true;
-                  core.notice(
-                    'Delegated rate-limited CodeRabbit reviews to the global priority controller.'
-                  );
-                }
+                codeRabbitRetryControllerDispatched = true;
+                await wakeCodeRabbitRetryIfIdle(pr, 'rate-limited CodeRabbit review');
               }
               continue;
             }
