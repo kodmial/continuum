@@ -667,8 +667,8 @@ jobs:
                 match: String(comment.body || '').match(batchLeasePattern),
               }))
               .filter(entry => Boolean(entry.match));
-            const newestOutcomeForFinding = findingId => {
-              let newest = null;
+            const outcomesForFinding = findingId => {
+              const outcomes = [];
               for (const comment of repairHandoffs) {
                 if (!trustedMarkerAuthors.has(
                   comment.user?.login || comment.author?.login || ''
@@ -680,11 +680,11 @@ jobs:
                 const findings = String(attrs.findings || '')
                   .split(',').map(Number);
                 if (!findings.includes(findingId)) continue;
-                if (!newest || Number(comment.id) > Number(newest.comment.id)) {
-                  newest = { comment, attrs };
-                }
+                outcomes.push({ comment, attrs });
               }
-              return newest;
+              return outcomes.sort(
+                (a, b) => Number(b.comment.id) - Number(a.comment.id)
+              );
             };
             const corroborateOutcomeRun = async (comment, attrs) => {
               const defer = reason => ({ state: 'defer', reason });
@@ -881,16 +881,36 @@ jobs:
               );
             };
             const evaluateNoChange = async findingId => {
-              const newest = newestOutcomeForFinding(findingId);
-              if (!newest) return { state: 'none' };
-              const attrs = newest.attrs;
-              // A newer outcome supersedes an earlier verified no-change only
-              // after its own identity, run, and artifact evidence validate. A
-              // changed=true marker value alone never releases suppression.
-              if (!outcomeIdentityValid(attrs, headSha)) {
-                return { state: 'defer', reason: 'outcome-identity-mismatch' };
+              const outcomes = outcomesForFinding(findingId);
+              if (!outcomes.length) return { state: 'none' };
+              // Walk from newest to oldest. A newer changed=false outcome
+              // that cannot be verified must not erase an earlier verified
+              // no-change result; only a verified outcome may replace it.
+              let noGuard = null;
+              for (const outcome of outcomes) {
+                const attrs = outcome.attrs;
+                // A newer outcome supersedes an earlier verified no-change
+                // only after its own identity, run, and artifact evidence
+                // validate. A changed=true marker value alone never releases
+                // suppression.
+                if (!outcomeIdentityValid(attrs, headSha)) {
+                  return {
+                    state: 'defer',
+                    reason: 'outcome-identity-mismatch',
+                  };
+                }
+                const decision = await corroborateOutcomeRun(
+                  outcome.comment, attrs
+                );
+                if (decision.state === 'none') {
+                  // This outcome proves nothing either way. Preserve any
+                  // earlier verified guard; if none exists, dispatch normally.
+                  noGuard = decision;
+                  continue;
+                }
+                return decision;
               }
-              return corroborateOutcomeRun(newest.comment, attrs);
+              return noGuard || { state: 'none' };
             };
 
             const noChangeGuarded = [];
@@ -1333,7 +1353,7 @@ jobs:
             const evaluateNoChange = async (
               findingId, comments, currentHead, runCache
             ) => {
-              let newest = null;
+              const outcomes = [];
               for (const comment of comments) {
                 if (!isTrustedHandoff(comment)) continue;
                 const attrs = parseRepairOutcome(comment.body);
@@ -1341,21 +1361,40 @@ jobs:
                 const findings = String(attrs.findings || '')
                   .split(',').map(Number);
                 if (!findings.includes(findingId)) continue;
-                if (!newest || Number(comment.id) > Number(newest.comment.id)) {
-                  newest = { comment, attrs };
-                }
+                outcomes.push({ comment, attrs });
               }
-              if (!newest) return { state: 'none' };
-              const attrs = newest.attrs;
-              // A newer outcome supersedes an earlier verified no-change only
-              // after its own identity, run, and artifact evidence validate. A
-              // changed=true marker value alone never releases suppression.
-              if (!outcomeIdentityValid(attrs, currentHead)) {
-                return { state: 'defer', reason: 'outcome-identity-mismatch' };
-              }
-              return corroborateOutcomeRun(
-                comments, newest.comment, attrs, runCache
+              outcomes.sort(
+                (a, b) => Number(b.comment.id) - Number(a.comment.id)
               );
+              if (!outcomes.length) return { state: 'none' };
+              // Walk from newest to oldest. A newer changed=false outcome
+              // that cannot be verified must not erase an earlier verified
+              // no-change result; only a verified outcome may replace it.
+              let noGuard = null;
+              for (const outcome of outcomes) {
+                const attrs = outcome.attrs;
+                // A newer outcome supersedes an earlier verified no-change
+                // only after its own identity, run, and artifact evidence
+                // validate. A changed=true marker value alone never releases
+                // suppression.
+                if (!outcomeIdentityValid(attrs, currentHead)) {
+                  return {
+                    state: 'defer',
+                    reason: 'outcome-identity-mismatch',
+                  };
+                }
+                const decision = await corroborateOutcomeRun(
+                  comments, outcome.comment, attrs, runCache
+                );
+                if (decision.state === 'none') {
+                  // This outcome proves nothing either way. Preserve any
+                  // earlier verified guard; if none exists, dispatch normally.
+                  noGuard = decision;
+                  continue;
+                }
+                return decision;
+              }
+              return noGuard || { state: 'none' };
             };
             const filterNoChange = async (
               candidateItems, comments, currentHead
