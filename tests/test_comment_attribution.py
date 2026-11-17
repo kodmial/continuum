@@ -83,7 +83,7 @@ MUTATION_COUNTS = {
     "continuum-issue-scheduler.yml": 11,
     "continuum-opencode-repair.yml": 2,
     "continuum-opencode-watchdog.yml": 4,
-    "continuum-opencode.yml": 13,  # #450 moved two inline CodeRabbit replies into serialized auto-merge; #451 adds the repair-completion handoff
+    "continuum-opencode.yml": 15,  # #450 moved two inline CodeRabbit replies into serialized auto-merge; #451 adds the repair-completion handoff; #459 records the publication identity marker on both publish paths
     "continuum-pr-agent-auto-merge.yml": 1,
     "continuum-pr-agent-canary.yml": 4,
     "continuum-pr-agent-recovery.yml": 4,
@@ -346,6 +346,11 @@ BUILDER_REFS = {
 MARKER_ONLY_REFS = (
     "body: marker +",
     '"$FAILURE_MARKER" "<!-- continuum-origin',
+    # The publication identity comment is machine evidence, not prose: it
+    # carries the hidden origin marker next to the recorded identity so the
+    # same comment stays a pure receipt and never adds a second visible
+    # status comment.
+    'PUBLICATION_IDENTITY="<!-- continuum-task-publication',
 )
 
 #: Files whose bodies are assembled at runtime by the shared policy bundle

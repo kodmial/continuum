@@ -23,9 +23,21 @@ SHA_A = "a" * 40
 SHA_B = "b" * 40
 
 
-def gate_evidence(workflow, sha, status="completed", conclusion="success"):
+def gate_evidence(
+    workflow,
+    sha,
+    status="completed",
+    conclusion="success",
+    run_id=None,
+    display_title="",
+):
     return contract.GateEvidence(
-        workflow_name=workflow, head_sha=sha, status=status, conclusion=conclusion
+        workflow_name=workflow,
+        head_sha=sha,
+        status=status,
+        conclusion=conclusion,
+        run_id=run_id,
+        display_title=display_title,
     )
 
 
@@ -86,6 +98,124 @@ class RegressionGateTest(unittest.TestCase):
     def test_invalid_head_blocks(self):
         verdict = contract.evaluate_regression_gate("short", [])
         self.assertEqual(verdict.outcome, contract.GATE_BLOCK)
+
+
+class WorkerEvidenceTest(unittest.TestCase):
+    def green(self):
+        return [
+            gate_evidence("CI", SHA_A),
+            gate_evidence("Contract qualification", SHA_A),
+        ]
+
+    def test_worker_requirement_is_opt_in_for_ordinary_merge_paths(self):
+        verdict = contract.evaluate_regression_gate(SHA_A, self.green())
+        self.assertEqual(verdict.outcome, contract.GATE_PASS)
+
+    def test_required_worker_evidence_absent_blocks(self):
+        verdict = contract.evaluate_regression_gate(
+            SHA_A, self.green(), worker_issue_number=100, worker_run_id=9001
+        )
+        self.assertEqual(verdict.outcome, contract.GATE_BLOCK)
+        self.assertIn("worker-evidence-absent", verdict.reason)
+
+    def test_worker_title_alone_does_not_bind_a_run(self):
+        evidence = self.green() + [
+            gate_evidence(
+                "OpenCode agent",
+                SHA_B,
+                run_id=9001,
+                display_title="OpenCode issue #100",
+            )
+        ]
+        verdict = contract.evaluate_regression_gate(
+            SHA_A, evidence, worker_issue_number=100
+        )
+        self.assertEqual(verdict.outcome, contract.GATE_BLOCK)
+        self.assertIn("worker-evidence-unbound", verdict.reason)
+
+    def test_required_worker_evidence_success_passes(self):
+        evidence = self.green() + [
+            gate_evidence(
+                "OpenCode agent",
+                SHA_B,
+                run_id=9001,
+                display_title="OpenCode issue #100",
+            )
+        ]
+        verdict = contract.evaluate_regression_gate(
+            SHA_A, evidence, worker_issue_number=100, worker_run_id=9001
+        )
+        self.assertEqual(verdict.outcome, contract.GATE_PASS)
+
+    def test_worker_evidence_from_another_issue_does_not_pass(self):
+        evidence = self.green() + [
+            gate_evidence(
+                "OpenCode agent",
+                SHA_B,
+                run_id=9999,
+                display_title="OpenCode issue #999",
+            )
+        ]
+        verdict = contract.evaluate_regression_gate(
+            SHA_A, evidence, worker_issue_number=100, worker_run_id=9001
+        )
+        self.assertEqual(verdict.outcome, contract.GATE_BLOCK)
+        self.assertIn("worker-evidence-absent", verdict.reason)
+
+    def test_delegated_worker_run_does_not_bind_a_local_canary_issue(self):
+        evidence = self.green() + [
+            gate_evidence(
+                "Worker task [child] #100",
+                SHA_B,
+                run_id=9001,
+                display_title="Worker task [child] #100",
+            )
+        ]
+        verdict = contract.evaluate_regression_gate(
+            SHA_A,
+            evidence,
+            worker_issue_number=100,
+            worker_run_id=9001,
+        )
+        self.assertEqual(verdict.outcome, contract.GATE_BLOCK)
+        self.assertIn("worker-evidence-absent", verdict.reason)
+
+    def test_recovery_worker_run_matches_the_implementation_run_id(self):
+        evidence = self.green() + [
+            gate_evidence(
+                "OpenCode 429 recovery opencode-429-issue-issue100 gen 1",
+                SHA_B,
+                run_id=9001,
+                display_title=(
+                    "OpenCode 429 recovery opencode-429-issue-issue100 gen 1"
+                ),
+            )
+        ]
+        verdict = contract.evaluate_regression_gate(
+            SHA_A,
+            evidence,
+            worker_issue_number=100,
+            worker_run_id=9001,
+        )
+        self.assertEqual(verdict.outcome, contract.GATE_PASS)
+
+    def test_worker_run_id_must_match_the_implementation_branch(self):
+        evidence = self.green() + [
+            gate_evidence(
+                "OpenCode agent",
+                SHA_B,
+                run_id=9001,
+                display_title="OpenCode issue #100",
+            )
+        ]
+        verdict = contract.evaluate_regression_gate(
+            SHA_A,
+            evidence,
+            worker_issue_number=100,
+            worker_run_id=7777,
+        )
+        self.assertEqual(verdict.outcome, contract.GATE_BLOCK)
+        self.assertIn("worker-evidence-absent", verdict.reason)
 
 
 class MergePathParityTest(unittest.TestCase):

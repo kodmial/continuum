@@ -142,6 +142,40 @@ PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=src python3 -m unittest -v \
   tests.test_coderabbit_unresolved_dispatch.CodeRabbitBatchContractTests.test_repair_completion_handoff_is_durable_serialized_and_unforgeable \
   tests.test_coderabbit_unresolved_dispatch.CodeRabbitBatchContractTests.test_pending_repair_handoff_blocks_redispatch_until_reverified
 
+# Print the contract-canary exact-HEAD snapshot regressions by name in the
+# exact-HEAD gate log. CodeRabbit excludes tests/** from review, so the named
+# results are the only reviewable evidence that a snapshot success cannot mask
+# a newer failed or pending exact-HEAD run, and that both workflow fetches
+# replace the snapshot records for that head.
+printf '%s\n' \
+  'Contract canary exact-HEAD snapshot regression evidence:' \
+  'setup: the bounded run snapshot holds successful CI and Contract qualification runs for the canary implementation PR head.' \
+  'assertions: merging a failed exact-HEAD CI run blocks completion with regression-evidence-completed-failure, merging a pending exact-HEAD CI run blocks completion with regression-evidence-in_progress-pending, records for other heads are preserved, and both the resolver and observation paths call merge_exact_head_runs instead of appending.'
+PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=src python3 -m unittest -v \
+  tests.test_contract_canary.ExactHeadRunsTest.test_replaces_only_the_target_head_snapshot_records \
+  tests.test_contract_canary.ExactHeadRunsTest.test_fresh_exact_head_failure_masks_the_snapshot_success \
+  tests.test_contract_canary.ExactHeadRunsTest.test_fresh_exact_head_pending_masks_the_snapshot_success \
+  tests.test_contract_canary.WorkflowContractTest.test_both_exact_head_fetches_replace_stale_snapshot_evidence
+
+# Print the contract-canary worker-evidence and repair-attempt regressions by
+# name in the exact-HEAD gate log. CodeRabbit excludes tests/** from review, so
+# the named results are the only reviewable evidence that completion records an
+# issue-bound worker run, rejects a closed owned issue with a merged PR and both
+# exact-HEAD checks but no worker evidence, and pairs each repair commit with
+# the receipt from its own attempt of the same run.
+printf '%s\n' \
+  'Contract canary worker-evidence regression evidence:' \
+  'setup: a closed owned canary issue has a merged implementation PR with successful exact-HEAD CI and Contract qualification runs.' \
+  'assertions: completion rejects the missing worker run with worker-evidence-absent, the selected worker run id is recorded in the completed outcome, both receipts from separate attempts of one repair run stay listed even when their names collide, two repair commits published by those attempts each keep the receipt matching their own base and head, and the workflow downloads repair receipts by artifact id instead of a same-named artifact from another attempt.'
+PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=src python3 -m unittest -v \
+  tests.test_contract_canary.CompletionEvidenceTest.test_missing_worker_evidence_fails \
+  tests.test_contract_canary.CompletionEvidenceTest.test_completion_worker_run_id_is_recorded \
+  tests.test_contract_canary.CompletionEvidenceTest.test_two_repair_commits_from_separate_attempts_of_one_run_pass \
+  tests.test_contract_canary.WorkflowContractTest.test_workflow_records_completion_worker_run_id \
+  tests.test_contract_canary.WorkflowContractTest.test_workflow_binds_each_repair_status_to_its_own_commit_receipt \
+  tests.test_contract_canary.WorkflowContractTest.test_repair_receipt_selection_matches_each_commit_from_a_rerun \
+  tests.test_contract_canary.WorkflowContractTest.test_publication_artifacts_keep_both_rerun_attempts
+
 # Print the resumed-generation 429 evacuation regression by name in the
 # exact-HEAD gate log. The executable regression and its setup live in
 # scripts/test_opencode_429_evacuator.py, which CodeRabbit reviews; the named
