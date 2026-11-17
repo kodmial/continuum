@@ -87,20 +87,71 @@ class CodeRabbitControllerLifetimeContract(unittest.TestCase):
                 ):
                     self.assertIn(fragment, guard)
 
-    def test_auto_merge_code_rabbit_wake_is_single_owner(self):
+    def test_auto_merge_reuses_existing_global_coderabbit_run(self):
+        """Each retry dispatch is feature-gated and probes the shared queue."""
         body = (ROOT / ".github/workflows/continuum-auto-merge.yml").read_text(
             encoding="utf-8"
         )
-        self.assertEqual(
-            body.count(
-                "owner, repo, workflow_id: codeRabbitRetryWorkflow, ref: 'main'"
-            ), 1,
-        )
-        self.assertIn("async function wakeCodeRabbitRetryIfIdle(pr, reason)", body)
+        self.assertIn("async function codeRabbitRetryWakeBlocked(pr)", body)
         self.assertIn("client.rest.actions.listWorkflowRuns({", body)
         self.assertIn("status, per_page: 1,", body)
-        self.assertIn("queue state unreadable; deferring", body)
-        self.assertEqual(body.count("await wakeCodeRabbitRetryIfIdle(pr,"), 2)
+        self.assertIn("CodeRabbit queue state unreadable; deferring", body)
+        self.assertEqual(body.count("retryDispatchSupport.ok"), 2)
+        self.assertEqual(body.count("else if (await codeRabbitRetryWakeBlocked(pr))"), 2)
+        self.assertEqual(body.count("workflow_id: codeRabbitRetryWorkflow,"), 2)
+
+    def test_runtime_coderabbit_queue_probe_suppresses_live_and_uncertain_wakes(self):
+        """Run the actual JS helper against Active/Idle/API-error fixtures."""
+        import json
+        import subprocess
+
+        text = (ROOT / ".github/workflows/continuum-auto-merge.yml").read_text(
+            encoding="utf-8"
+        )
+        fn = "async function codeRabbitRetryWakeBlocked(pr) {" + text.split(
+            "async function codeRabbitRetryWakeBlocked(pr) {", 1
+        )[1].split("          // Mirrors src/continuum/conflict_repair.py", 1)[0]
+        js = r"""
+            const assert = require('node:assert/strict');
+            const fn = PRODUCTION_FUNCTION;
+            async function check(state) {
+              const scanned = [], warnings = [];
+              const core = {info(){},warning: x => warnings.push(x)};
+              const withReadFallback = async f => f({rest:{actions:{
+                listWorkflowRuns: async p => {
+                  scanned.push(p.status);
+                  if (state === 'error') throw Error('API 429');
+                  if (state === 'incomplete') return {data: {}};
+                  return {data:{workflow_runs: p.status === state ? [{id:1}] : []}};
+                }
+              }}});
+              const probe = new Function(
+                'owner','repo','codeRabbitRetryWorkflow','withReadFallback','core',
+                fn + ';return codeRabbitRetryWakeBlocked;'
+              )('kodmial','continuum','coderabbit-retry.yml',withReadFallback,core);
+              const blocked = await probe({number:459});
+              return {blocked,scanned,warnings};
+            }
+            (async()=> {
+              for (const state of ['in_progress','pending','queued','waiting','requested']) {
+                const result = await check(state);
+                assert.equal(result.blocked,true,state);
+                assert(result.scanned.includes(state),state);
+              }
+              const idle=await check('');
+              assert.equal(idle.blocked,false);
+              assert.equal(idle.scanned.length,5);
+              for (const error of ['error','incomplete']) {
+                const result=await check(error);
+                assert.equal(result.blocked,true,error);
+                assert(result.warnings.length,error);
+              }
+            })().catch(e=>{console.error(e);process.exitCode=1});
+        """.replace("PRODUCTION_FUNCTION", json.dumps(fn))
+        completed = subprocess.run(
+            ["node", "-e", js], capture_output=True, text=True, check=False
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
 
     def test_serialized_review_queue_unchanged(self):
         body = WORKFLOW.read_text(encoding="utf-8")
