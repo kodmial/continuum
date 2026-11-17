@@ -3050,30 +3050,47 @@ module.exports = async function runIssueScheduler({ github, context, core }) {
   // consume a coding WIP slot or be restarted from main.
   const recoveryPendingIssueNumbers = new Set();
   
-  // Active/pending OpenCode Actions are authoritative in-flight work.
-  // Without this, lease expiry releases an issue while GitHub is still
-  // running or queueing its implementation.
-  // The scheduler only needs recent active work. Never paginate the
-  // complete Actions history: large repositories can exhaust the
-  // GitHub API quota during a single reconciliation pass.
+  // Active/pending OpenCode Actions own WIP until their actual run completes.
+  // A recent unfiltered 300-run window can exclude a long-running OpenCode
+  // worker under high Actions fan-out, causing false 45-minute lease expiry
+  // and an extra implementation dispatch. Query the actual active states
+  // instead; a truncated or unreadable active inventory fails closed.
   const workflowRuns = [];
-  for (let page = 1; page <= 3; page += 1) {
-    const { data } =
-      await readGithub.rest.actions.listWorkflowRunsForRepo({
+  const activeRunStatuses = ['queued', 'in_progress', 'waiting', 'pending', 'requested'];
+  const maxActivePagesPerStatus = 3;
+  for (const status of activeRunStatuses) {
+    let complete = false;
+    for (let page = 1; page <= maxActivePagesPerStatus; page += 1) {
+      const { data } = await readGithub.rest.actions.listWorkflowRunsForRepo({
         owner,
         repo,
+        status,
         per_page: 100,
         page,
       });
-    workflowRuns.push(...data.workflow_runs);
-    if (data.workflow_runs.length < 100) break;
+      const batch = data?.workflow_runs;
+      if (!Array.isArray(batch)) {
+        throw new Error('Issue scheduler active Actions inventory unreadable (' + status + ').');
+      }
+      workflowRuns.push(...batch);
+      if (batch.length < 100) {
+        complete = true;
+        break;
+      }
+    }
+    if (!complete) {
+      throw new Error(
+        'Issue scheduler active Actions inventory truncated (' + status +
+        '); preserving WIP reservations and refusing a duplicate dispatch.'
+      );
+    }
   }
-  
+
   const activeRunIssues = new Set();
   for (const run of workflowRuns) {
     const isOpenCodeWorkflow =
       run.path === opencodeWorkflowPath ||
-      run.name === opencodeWorkflowName;
+      (!run.path && run.name === opencodeWorkflowName);
     // kodmial/continuum#350: a fresh-VM 429 resumption is a
     // workflow_dispatch run. It must count as authoritative
     // in-flight work exactly like an issue_comment run, or lease
@@ -3090,6 +3107,8 @@ module.exports = async function runIssueScheduler({ github, context, core }) {
   
     const numbered = (run.display_title || '').match(
       /^OpenCode issue #(\d+)$/
+    ) || (run.display_title || '').match(
+      /^OpenCode 429 recovery opencode-429-issue-issue(\d+)(?:\s|$)/
     );
     if (numbered) {
       activeRunIssues.add(Number(numbered[1]));
@@ -3462,6 +3481,19 @@ module.exports = async function runIssueScheduler({ github, context, core }) {
           keepReservation: true,
           recoveryPending: true,
           reason: 'checkpoint-awaiting-recovery',
+          checkpointSha: checkpoint.refSha,
+        };
+      }
+      if (state === 'backoff') {
+        // next_due is the watchdog's earliest retry time, NOT expiration.
+        // An authenticated, unchanged 429 checkpoint still belongs to the
+        // recovery controller after that instant. Releasing it would let the
+        // ordinary scheduler burn the issue dispatch budget and pause work.
+        return {
+          ...base,
+          keepReservation: true,
+          recoveryPending: true,
+          reason: 'backoff-awaiting-watchdog',
           checkpointSha: checkpoint.refSha,
         };
       }
