@@ -48,9 +48,17 @@ jobs:
   call:
     # Private child repositories do not run local PR lifecycle controllers.
     # Non-CodeRabbit consumers do not run this controller either.
+    # Only the provider's real quota response is actionable on issue_comment.
+    # Filter before the reusable engine's shared concurrency admission:
+    # OpenCode live-event edits must not evict pending CodeRabbit wakes.
     if: >-
       vars.CONTINUUM_ROLE != 'child' &&
-      (vars.CONTINUUM_REVIEW_PROVIDER || 'none') == 'coderabbit'
+      (vars.CONTINUUM_REVIEW_PROVIDER || 'none') == 'coderabbit' &&
+      (github.event_name != 'issue_comment' ||
+       (github.event.issue.pull_request != null &&
+        github.event.comment.user.login == 'coderabbitai[bot]' &&
+        (contains(github.event.comment.body, 'Review rate limited') ||
+         contains(github.event.comment.body, 'Review limit reached'))))
     uses: ./.github/workflows/continuum-coderabbit-retry.yml
     secrets: inherit
     with:
