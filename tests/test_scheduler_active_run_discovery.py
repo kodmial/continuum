@@ -44,7 +44,11 @@ const fake = {
       }
       const runs = [];
       if (status === 'in_progress') {
-        if (scenario.oldActive) runs.push(worker(473));
+        if (scenario.oldActive) {
+          const active = worker(473);
+          if (scenario.missingPath) delete active.path;
+          runs.push(active);
+        }
         if (scenario.recovery) {
           runs.push({...worker(472, 'in_progress', 'workflow_dispatch'),
             display_title: 'OpenCode 429 recovery opencode-429-issue-issue472 gen 3'});
@@ -97,6 +101,13 @@ class ActiveRunDiscoveryTest(unittest.TestCase):
         result = probe({"recovery": True, "wrongWorkflow": True})
         self.assertFalse(result["failed"], result)
         self.assertEqual([472], result["issues"])
+
+    def test_legacy_worker_missing_path_still_matches_by_configured_name(self):
+        # Explicitly wrong paths cannot impersonate the configured workflow;
+        # older Actions inventories without a path remain backwards compatible.
+        result = probe({"oldActive": True, "missingPath": True})
+        self.assertFalse(result["failed"], result)
+        self.assertEqual([473], result["issues"])
 
     def test_unreadable_active_inventory_fails_closed(self):
         result = probe({"error": True})
