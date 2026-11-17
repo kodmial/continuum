@@ -114,6 +114,22 @@ class WatchdogScriptStagingTests(unittest.TestCase):
         self.assertNotIn("recoverFrom429OnFreshVm", loader)
         self.assertLess(len(loader.encode("utf-8")), 1024)
 
+    def test_loader_step_reads_the_staged_file_it_wrote(self):
+        body = WATCHDOG.read_text(encoding="utf-8")
+        start = body.index("      - name: Recover failed OpenCode issue run\n")
+        step = body[start:body.index("          script: |\n", start)]
+        self.assertIn(
+            "CONTINUUM_WATCHDOG_SCRIPT: ${{ runner.temp }}/continuum/"
+            "opencode-watchdog.js",
+            step,
+            "the loader must read the exact staged path, never an unset env",
+        )
+        self.assertIn(
+            'cat > "$RUNNER_TEMP/continuum/opencode-watchdog.js"',
+            body,
+            "the staged path and the loader path must name the same file",
+        )
+
     @unittest.skipUnless(shutil.which("node"), "Node.js unavailable")
     def test_real_loader_executes_the_staged_watchdog_body(self):
         body = WATCHDOG.read_text(encoding="utf-8")

@@ -133,6 +133,12 @@ jobs:
       DISPATCH_MARKER: ${{ inputs.dispatch_marker || vars.AUTOMATION_DISPATCH_MARKER || '<!-- issue-scheduler-dispatch -->' }}
       PAUSE_ON_FAILURE: ${{ inputs.pause_on_failure || vars.AUTOMATION_PAUSE_ON_FAILURE || 'false' }}
       READ_GITHUB_TOKEN: ${{ github.token }}
+      # Continuum source that must contain a merged, independently reviewed
+      # validator fix before a stale deterministic hold may be released. The
+      # holder-release reader is PAT-authenticated: this job's own token is
+      # scoped to the consumer repository and cannot read Continuum.
+      CONTINUUM_SOURCE_REPOSITORY: kodmial/continuum
+      CONTINUUM_SOURCE_REF: ${{ inputs.continuum_ref || 'main' }}
 
     steps:
       - name: Checkout Continuum watchdog helpers
@@ -1401,46 +1407,9 @@ jobs:
             }
             return markers.sort((a, b) => a.commentId - b.commentId);
           }
-          function checkpointReleaseMarkerBody({
-            repoFull, issueNumber, hold, fix, controller,
-          }) {
-            const clean = (value, fallback) =>
-              String(value || '').trim().replace(/\s+/g, '-') ||
-                (fallback || '-');
-            const sha = String(hold.checkpointSha || '').toLowerCase();
-            const baseSha = String(hold.baseSha || '').toLowerCase();
-            const spec = String(hold.snapshotSpec || '').toLowerCase();
-            const generation = Number(hold.recoveryGeneration) || 0;
-            const ref = clean(hold.checkpointRef);
-            const baseRef = clean(hold.baseRef, 'main');
-            return [
-              '<!-- continuum-checkpoint-resume-release v=1 repo=' +
-                repoFull + ' issue=' + Number(issueNumber) +
-                ' generation=' + generation +
-                ' operation=' + clean(hold.operation, 'unknown') +
-                ' checkpoint=' + ref + ' checkpoint_sha=' + sha +
-                ' base_ref=' + baseRef + ' base_sha=' + baseSha +
-                ' snapshot=' + spec + ' reason=' + clean(hold.reason) +
-                ' fix=' + fix.id + ' fix_pr=' + fix.pullRequest +
-                ' fix_sha=' + fix.mergeSha + ' owner=' + controller + ' -->',
-              '⚡ **Continuum · opencode-watchdog**',
-              '<!-- continuum-origin role=continuum component=opencode-watchdog -->',
-              '',
-              'Released the deterministic checkpoint resume hold for #' +
-                Number(issueNumber) + ' once: validator fix `' + fix.id +
-                '` (PR #' + fix.pullRequest + ', merge `' + fix.mergeSha +
-                '`) is independently reviewed, merged, and contained in ' +
-                'the verified source revision.',
-              '',
-              'Checkpoint `' + ref + '` at `' + sha + '`, snapshot `' +
-                spec + '`, base `' + baseRef + '` at `' + baseSha +
-                '` and recovery generation ' + generation + ' are ' +
-                'unchanged. Only one fresh runner may resume.',
-            ].join('\n');
-          }
           async function evaluateCheckpointResumeRelease({
-            issueNumber, hold, comments, client, controller, allowRelease,
-            liveOverlap,
+            issueNumber, hold, comments, client, sourceClient, controller,
+            allowRelease, liveOverlap,
           }) {
             const markers = checkpointReleaseMarkers(
               comments, issueNumber, hold
@@ -1448,7 +1417,7 @@ jobs:
             if (markers.length > 0) {
               for (const marker of markers) {
                 const verified = await verifyCheckpointValidatorFix(
-                  { ...hold, reason: marker.reason }, client
+                  { ...hold, reason: marker.reason }, sourceClient
                 );
                 if (
                   verified.ok &&
@@ -1456,6 +1425,29 @@ jobs:
                   verified.fix.pullRequest === marker.fixPullRequest &&
                   verified.fix.mergeSha === marker.fixSha
                 ) {
+                  // A durable claim authorizes re-admission; it never
+                  // authorizes a second runner beside an already live one.
+                  // Replay the same live-overlap fence as the first claim so
+                  // a later pass cannot dispatch beside an active run.
+                  if (typeof liveOverlap === 'function') {
+                    let competing;
+                    try {
+                      competing = await liveOverlap();
+                    } catch (err) {
+                      return {
+                        released: false,
+                        reason: 'release-overlap-unverified',
+                        markers,
+                      };
+                    }
+                    if (competing) {
+                      return {
+                        released: false,
+                        reason: 'release-blocked-by-live-overlap',
+                        markers,
+                      };
+                    }
+                  }
                   const releasedAt = new Date(marker.createdAt || 0).getTime();
                   return {
                     released: true,
@@ -1499,9 +1491,48 @@ jobs:
                 };
               }
             }
-            const verified = await verifyCheckpointValidatorFix(hold, client);
+            const verified = await verifyCheckpointValidatorFix(
+              hold, sourceClient
+            );
             if (!verified.ok) {
               return { released: false, reason: verified.reason };
+            }
+            function checkpointReleaseMarkerBody({
+              repoFull, issueNumber, hold, fix, controller,
+            }) {
+              const clean = (value, fallback) =>
+                String(value || '').trim().replace(/\s+/g, '-') ||
+                  (fallback || '-');
+              const sha = String(hold.checkpointSha || '').toLowerCase();
+              const baseSha = String(hold.baseSha || '').toLowerCase();
+              const spec = String(hold.snapshotSpec || '').toLowerCase();
+              const generation = Number(hold.recoveryGeneration) || 0;
+              const ref = clean(hold.checkpointRef);
+              const baseRef = clean(hold.baseRef, 'main');
+              return [
+                '<!-- continuum-checkpoint-resume-release v=1 repo=' +
+                  repoFull + ' issue=' + Number(issueNumber) +
+                  ' generation=' + generation +
+                  ' operation=' + clean(hold.operation, 'unknown') +
+                  ' checkpoint=' + ref + ' checkpoint_sha=' + sha +
+                  ' base_ref=' + baseRef + ' base_sha=' + baseSha +
+                  ' snapshot=' + spec + ' reason=' + clean(hold.reason) +
+                  ' fix=' + fix.id + ' fix_pr=' + fix.pullRequest +
+                  ' fix_sha=' + fix.mergeSha + ' owner=' + controller + ' -->',
+                '⚡ **Continuum · opencode-watchdog**',
+                '<!-- continuum-origin role=continuum component=opencode-watchdog -->',
+                '',
+                'Released the deterministic checkpoint resume hold for #' +
+                  Number(issueNumber) + ' once: validator fix `' + fix.id +
+                  '` (PR #' + fix.pullRequest + ', merge `' + fix.mergeSha +
+                  '`) is independently reviewed, merged, and contained in ' +
+                  'the verified source revision.',
+                '',
+                'Checkpoint `' + ref + '` at `' + sha + '`, snapshot `' +
+                  spec + '`, base `' + baseRef + '` at `' + baseSha +
+                  '` and recovery generation ' + generation + ' are ' +
+                  'unchanged. Only one fresh runner may resume.',
+              ].join('\n');
             }
             let created;
             try {
@@ -1706,7 +1737,14 @@ jobs:
                 const tip = String(
                   response.data?.object?.sha || ''
                 ).toLowerCase();
-                if (tip && tip !== marker.checkpointSha) {
+                if (!/^[0-9a-f]{40}$/.test(tip)) {
+                  core.warning(
+                    'Checkpoint-resume hold ref for #' + wantedIssue +
+                    ' returned no verifiable SHA; keeping the deterministic hold.'
+                  );
+                  return { blocked: true, marker, release: null };
+                }
+                if (tip !== marker.checkpointSha) {
                   return { blocked: false, marker };
                 }
               } catch (err) {
@@ -1719,6 +1757,7 @@ jobs:
                   '; keeping the deterministic hold until it can be ' +
                   'proven changed.'
                 );
+                return { blocked: true, marker, release: null };
               }
             }
             if (
@@ -1730,6 +1769,10 @@ jobs:
                 hold: marker,
                 comments,
                 client: readGithub,
+                // The verified source repository is Continuum itself, not
+                // this consumer checkout: the repository-scoped read token
+                // cannot read it, so fix verification uses the PAT client.
+                sourceClient: github,
                 controller: options.controller || 'opencode-watchdog',
                 allowRelease: options.allowRelease !== false,
                 liveOverlap: options.liveOverlap,
@@ -3359,6 +3402,9 @@ jobs:
         uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
         env:
           CONTINUUM_DISPATCH_HELPER: ${{ github.workspace }}/.continuum-watchdog-engine/.github/scripts/opencode_429_dispatch.js
+          # The staged body is read from disk: actions/github-script passes
+          # `script:` through argv and Linux caps one argv entry at 128 KiB.
+          CONTINUUM_WATCHDOG_SCRIPT: ${{ runner.temp }}/continuum/opencode-watchdog.js
         with:
           # TAP_PAT is intentional: the recovery writes labels and comments,
           # and only a PAT (not GITHUB_TOKEN) reliably fans those writes out

@@ -561,6 +561,12 @@ jobs:
       COUNT_OPEN_PRS_AS_WIP: ${{ inputs.count_open_prs_as_wip || vars.AUTOMATION_COUNT_OPEN_PRS_AS_WIP || 'true' }}
       PAUSE_ON_FAILURE: ${{ inputs.pause_on_failure || vars.AUTOMATION_PAUSE_ON_FAILURE || 'false' }}
       READ_GITHUB_TOKEN: ${{ github.token }}
+      # Continuum source that must contain a merged, independently reviewed
+      # validator fix before a stale deterministic hold may be released. The
+      # fix verification reader is PAT-authenticated: this job's own token is
+      # scoped to the consumer repository and cannot read Continuum.
+      CONTINUUM_SOURCE_REPOSITORY: kodmial/continuum
+      CONTINUUM_SOURCE_REF: ${{ inputs.continuum_ref || 'main' }}
 
     steps:
       # Cheap cross-source guard (kodmial/continuum#375). Native schedule is

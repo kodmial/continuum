@@ -7053,6 +7053,22 @@ class ContinuumTest < Minitest::Test
     assert_includes watchdog, 'liveOverlap: async () => {'
     assert_includes watchdog, "reason: 'release-blocked-by-live-overlap'"
     assert_includes watchdog, "reason: 'release-overlap-unverified'"
+
+    # The verified fix lives in Continuum, not in the consumer checkout. The
+    # repository-scoped read token cannot read it, so release verification
+    # must run on the PAT-authenticated source client.
+    assert_includes scheduler, 'sourceClient: options.sourceClient || github'
+    assert_includes scheduler, 'verifyCheckpointValidatorFix(hold, sourceClient)'
+    assert_includes watchdog, 'sourceClient: github'
+    assert_match(
+      /verifyCheckpointValidatorFix\(\s*hold, sourceClient\s*\)/, watchdog
+    )
+    assert_includes watchdog, "CONTINUUM_SOURCE_REPOSITORY: kodmial/continuum"
+    assert_includes watchdog, "CONTINUUM_SOURCE_REF: ${{ inputs.continuum_ref || 'main' }}"
+    assert_includes(
+      File.read(File.join(ROOT, '.github/workflows/continuum-issue-scheduler.yml')),
+      "CONTINUUM_SOURCE_REF: ${{ inputs.continuum_ref || 'main' }}"
+    )
   end
 
   # kodmial/continuum#266: the optional `automation:ready` admission gate.

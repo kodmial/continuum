@@ -58,13 +58,14 @@ def hold_marker(reason: str = "wrong-generation") -> str:
 def release_marker(
     *, owner="issue-scheduler", snapshot=SNAPSHOT, issue=ISSUE,
     checkpoint_sha=CHECKPOINT_SHA, fix_sha=FIX_SHA,
+    base_sha=BASE_SHA, repo="kodmial/continuum",
 ) -> str:
     return (
         "<!-- continuum-checkpoint-resume-release v=1 "
-        "repo=kodmial/continuum issue=" + str(issue) + " generation=2 " +
+        "repo=" + repo + " issue=" + str(issue) + " generation=2 " +
         "operation=" + OPERATION + " checkpoint=" + CHECKPOINT_REF +
         " checkpoint_sha=" + checkpoint_sha + " base_ref=main base_sha=" +
-        BASE_SHA + " snapshot=" + snapshot + " reason=wrong-generation " +
+        base_sha + " snapshot=" + snapshot + " reason=wrong-generation " +
         "fix=" + FIX_ID + " fix_pr=461 fix_sha=" + fix_sha +
         " owner=" + owner + " -->"
     )
@@ -107,6 +108,9 @@ const listReviews = async () => ({ data: scenario.reviews || [] });
 const listFiles = async () => ({ data: scenario.files || [] });
 const listComments = async () => ({ data: comments.map(c => ({ ...c })) });
 
+// The repository-scoped token can read this consumer issue thread only. The
+// verified fix lives in kodmial/continuum, which this token cannot read, so
+// any source read through it must fail exactly like the production 404.
 const readGithub = {
   rest: {
     git: {
@@ -117,6 +121,25 @@ const readGithub = {
         };
       },
     },
+    repos: {
+      getContent: async () => {
+        throw apiError(
+          404, 'repository-scoped token cannot read the Continuum source'
+        );
+      },
+    },
+    issues: { listComments },
+  },
+};
+readGithub.paginate = async (method) => {
+  if (method === listComments) return (await listComments()).data;
+  throw new Error('unexpected paginate call');
+};
+
+// The PAT-authenticated client is the only one that can read the Continuum
+// source repository, and it is also the writer for label/comment side effects.
+const writeGithub = {
+  rest: {
     repos: {
       getContent: async ({ path }) => {
         if (
@@ -156,18 +179,6 @@ const readGithub = {
       listReviews,
       listFiles,
     },
-    issues: { listComments },
-  },
-};
-readGithub.paginate = async (method) => {
-  if (method === listReviews) return (await listReviews()).data;
-  if (method === listFiles) return (await listFiles()).data;
-  if (method === listComments) return (await listComments()).data;
-  throw new Error('unexpected paginate call');
-};
-
-const writeGithub = {
-  rest: {
     issues: {
       createComment: async ({ body }) => {
         const comment = {
@@ -199,6 +210,11 @@ const writeGithub = {
       },
     },
   },
+};
+writeGithub.paginate = async (method) => {
+  if (method === listReviews) return (await listReviews()).data;
+  if (method === listFiles) return (await listFiles()).data;
+  throw new Error('unexpected paginate call');
 };
 
 const core = {
@@ -258,7 +274,15 @@ async function runWatchdog() {
     Number(scenario.issue || 534),
     snapshotComments(),
     null,
-    { controller: 'opencode-watchdog' }
+    {
+      controller: 'opencode-watchdog',
+      liveOverlap: async () => {
+        if (scenario.liveOverlapError) {
+          throw apiError(scenario.liveOverlapError, 'inventory failed');
+        }
+        return Boolean(scenario.liveOverlap);
+      },
+    }
   );
   return {
     blocked: Boolean(result && result.blocked),
@@ -270,6 +294,9 @@ async function runWatchdog() {
 (async () => {
   const result = {
     scheduler: await runScheduler(),
+    // A second scheduler pass over the same durable history proves the
+    // authorized release is reused instead of republished.
+    schedulerAgain: await runScheduler(),
     watchdog: await runWatchdog(),
     comments: comments.map(comment => ({ ...comment })),
     notices,
@@ -385,6 +412,22 @@ class CheckpointHoldReleaseTests(unittest.TestCase):
         self.assertEqual(len(released), 1)
         self.assertIn("owner=issue-scheduler", released[0]["body"])
 
+        # The next scheduler pass sees its own durable claim and stands on it:
+        # no second release comment and no second identity change.
+        self.assertFalse(result["schedulerAgain"]["blocked"])
+        self.assertTrue(result["schedulerAgain"]["release"]["released"])
+        self.assertEqual(
+            result["schedulerAgain"]["release"]["owner"], "issue-scheduler"
+        )
+        self.assertEqual(
+            result["schedulerAgain"]["release"]["marker"]["commentId"],
+            result["scheduler"]["release"]["marker"]["commentId"],
+        )
+        self.assertEqual(
+            len([c for c in result["comments"] if "resume-release" in c["body"]]),
+            1,
+        )
+
         # The watchdog sees the same exact claim and stands down rather than
         # publishing a second release comment.
         self.assertFalse(result["watchdog"]["blocked"])
@@ -395,6 +438,20 @@ class CheckpointHoldReleaseTests(unittest.TestCase):
         self.assertEqual(
             len([c for c in result["comments"] if "resume-release" in c["body"]]),
             1,
+        )
+
+    def test_non_fixable_hold_reason_stays_blocked_with_a_verified_fix(self):
+        scenario = self.base_scenario()
+        scenario["comments"][0]["body"] = hold_marker("checkpoint-missing")
+        result = self.run_scenario(scenario)
+        self.assertTrue(result["scheduler"]["blocked"])
+        self.assertTrue(result["watchdog"]["blocked"])
+        self.assertIsNone(result["scheduler"]["release"])
+        self.assertIsNone(result["watchdog"]["release"])
+        self.assertEqual(
+            [c for c in result["comments"] if "resume-release" in c["body"]],
+            [],
+            "only the reason-specific generation validator hold may release",
         )
 
     def test_release_claim_loser_stands_down_without_a_second_resumption(self):
@@ -490,6 +547,27 @@ class CheckpointHoldReleaseTests(unittest.TestCase):
                     name,
                 )
 
+    def test_unverifiable_checkpoint_ref_never_releases_a_verified_fix(self):
+        """A failed checkpoint-ref read must keep the hold, not authorize it.
+
+        The release is bound to the checkpoint SHA recorded in the hold. If the
+        current ref tip cannot be read, the controller cannot prove that the
+        checkpoint is unchanged, so the merged-fix evidence alone must not
+        release it.
+        """
+
+        scenario = self.base_scenario()
+        scenario["refError"] = 403
+        result = self.run_scenario(scenario)
+        self.assertTrue(result["scheduler"]["blocked"])
+        self.assertTrue(result["watchdog"]["blocked"])
+        self.assertIsNone(result["scheduler"]["release"])
+        self.assertIsNone(result["watchdog"]["release"])
+        self.assertEqual(
+            [c for c in result["comments"] if "resume-release" in c["body"]],
+            [],
+        )
+
     def test_comment_claim_or_arbitrary_commit_is_not_fix_provenance(self):
         scenario = self.base_scenario()
         scenario["manifest"] = None
@@ -527,7 +605,9 @@ class CheckpointHoldReleaseTests(unittest.TestCase):
         for name, update in (
             ("checkpoint", {"checkpoint_sha": "b" * 40}),
             ("snapshot", {"snapshot": "c" * 64}),
+            ("base", {"base_sha": "e" * 40}),
             ("issue", {"issue": 999}),
+            ("repo", {"repo": "kodmial/other"}),
             ("fix-sha", {"fix_sha": "d" * 40}),
         ):
             with self.subTest(name=name):
@@ -551,6 +631,45 @@ class CheckpointHoldReleaseTests(unittest.TestCase):
                         if "resume-release" in c["body"]
                     ],
                     [scenario["comments"][-1]],
+                    name,
+                )
+
+    def test_a_replayed_release_still_refuses_a_live_competing_run(self):
+        for name, update, reason in (
+            ("live", {"liveOverlap": True}, "release-blocked-by-live-overlap"),
+            ("unverifiable", {"liveOverlapError": 403},
+             "release-overlap-unverified"),
+        ):
+            with self.subTest(name=name):
+                scenario = self.base_scenario()
+                scenario["comments"].append(
+                    {
+                        "id": 2,
+                        "body": release_marker(owner="opencode-watchdog"),
+                        "user": {"login": "github-actions[bot]"},
+                        "author_association": "OWNER",
+                        "created_at": "2026-11-17T12:00:00Z",
+                    }
+                )
+                scenario.update(update)
+                result = self.run_scenario(scenario)
+                # The scheduler has no live-overlap callback in this harness,
+                # so only the watchdog is expected to keep the hold.
+                self.assertTrue(result["watchdog"]["blocked"], name)
+                self.assertFalse(
+                    result["watchdog"]["release"]["released"], name
+                )
+                self.assertEqual(
+                    result["watchdog"]["release"]["reason"], reason, name
+                )
+                self.assertEqual(
+                    len(
+                        [
+                            c for c in result["comments"]
+                            if "resume-release" in c["body"]
+                        ]
+                    ),
+                    1,
                     name,
                 )
 
@@ -721,6 +840,54 @@ class CheckpointHoldReleaseTests(unittest.TestCase):
             watchdog.index("const checkpointHold = await checkpointResumeHold(")
         ]
         self.assertIn("effective operator cancellation stop", normal)
+
+    def test_ready_only_candidate_defers_to_the_recovery_watchdog(self):
+        """A ready-only AA #534-style candidate must not restart from main.
+
+        The scheduler reconciler removes the reservation of an issue whose
+        checkpoint it can no longer prove is live, so a ready-only candidate
+        with a trusted durable 429 recovery marker is exactly the moment the
+        old deadlock re-appeared: the scheduler dispatched a fresh generation
+        from the default branch beside the watchdog's checkpoint resumption.
+        Admission therefore has to defer to the watchdog for every candidate
+        whose verified recovery owns the checkpoint -- before the hold
+        decision and before selection can authorize any dispatch.
+        """
+
+        scheduler = SCHEDULER.read_text(encoding="utf-8")
+        start = scheduler.index(
+            "const candidateComments = await readGithub.paginate("
+        )
+        selection = "selected.push(candidate);"
+        end = scheduler.rindex(selection) + len(selection)
+        loop = scheduler[start:end]
+
+        self.assertIn("latestSchedulerRecoveryState(candidateComments)", loop)
+        self.assertIn("evaluateScheduler429Recovery({", loop)
+        self.assertIn("keepReservation", loop)
+        self.assertIn("checkpoint-unchanged", loop)
+        self.assertIn("owned by the recovery watchdog", loop)
+        self.assertLess(
+            loop.index("latestSchedulerRecoveryState(candidateComments)"),
+            loop.index("const candidateResumeHold = await checkpointResumeHold("),
+            "a verified durable 429 checkpoint must defer admission before "
+            "the resume-hold decision can authorize a dispatch",
+        )
+        self.assertLess(
+            loop.index("owned by the recovery watchdog"),
+            loop.index(selection),
+            "the watchdog deferral must happen before the candidate is "
+            "selected for dispatch",
+        )
+        # The deferral is a skip, not a selection: no fallthrough path may
+        # reach selection while the watchdog owns the checkpoint.
+        deferral = loop[
+            loop.index("const candidateRecovery = latestSchedulerRecoveryState("):
+            loop.index(
+                "const candidateResumeHold = await checkpointResumeHold("
+            )
+        ]
+        self.assertIn("continue;", deferral)
 
 
 if __name__ == "__main__":

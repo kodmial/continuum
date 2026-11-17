@@ -603,6 +603,19 @@ def checkpoint_release_marker(owner="opencode-watchdog", ref=AA_LEGACY_REF):
     )
 
 
+def aa_recovery_marker():
+    """The live AA #534 durable gen-2 recovery marker (run 43767507862)."""
+    return (
+        "<!-- continuum-429-recovery op={op} gen=2 state=observed "
+        "attempt=1 next_due=0 checkpoint={ref} sha={sha} "
+        "run=43767507862 detail=run-started -->"
+    ).format(
+        op=AA_OPERATION,
+        ref=AA_DURABLE_REF,
+        sha=AA_CHECKPOINT_SHA,
+    )
+
+
 def aa_recovery_metadata():
     return {
         "schema_version": 1,
@@ -2021,6 +2034,107 @@ class WatchdogHarness(unittest.TestCase):
         result = self.run_scenario(scenario)
         self.assert_no_dispatch(result)
         self.assertEqual(self.release_comments(result), [])
+
+    def aa_durable_green_run_scenario(self):
+        """AA #534 operational shape on the scheduled durable-recovery route.
+
+        The gen-2 checkpoint's last run is a green wrapper whose code steps
+        were skipped by the duplicate guard, the deterministic hold still
+        pins the exact checkpoint SHA, and the scheduler already reconciled
+        the reservation away so only ``automation:ready`` remains.
+        """
+        scenario = self.verified_fix(self.restart_recovery_scenario())
+        scenario["triggerRun"] = None
+        scenario["jobLog"] = ""
+        scenario["issues"] = [
+            {
+                "number": AA_ISSUE,
+                "state": "open",
+                "title": "Repair qualification failure for #514",
+                "labels": [{"name": "automation:ready"}],
+            }
+        ]
+        timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        green = {
+            "id": 43767507862,
+            "status": "completed",
+            "conclusion": "success",
+            "event": "workflow_dispatch",
+            "path": ".github/workflows/opencode.yml",
+            "name": "OpenCode agent",
+            "display_title": "OpenCode issue #" + str(AA_ISSUE),
+            "created_at": timestamp,
+            "run_started_at": timestamp,
+            "updated_at": timestamp,
+        }
+        scenario["runs"] = [green]
+        scenario["workflowRuns"] = [dict(green)]
+        scenario["jobs"] = [
+            {
+                "id": 132975886955,
+                "steps": [
+                    {"name": "Run OpenCode", "conclusion": "skipped"},
+                    {"name": "Implement issue", "conclusion": "skipped"},
+                ],
+            }
+        ]
+        scenario["comments"] = [
+            thread_comment(6902148316, aa_recovery_marker(), timestamp),
+            thread_comment(
+                6902177809, stale_hold_marker(ref=AA_DURABLE_REF), timestamp
+            ),
+        ]
+        return scenario
+
+    def test_ready_only_green_wrapper_run_resumes_the_exact_checkpoint_once(self):
+        scenario = self.aa_durable_green_run_scenario()
+        scenario["passes"] = 2
+        result = self.run_scenario(scenario)
+        # One code runner from the preserved checkpoint, not a fresh
+        # implementation and not a second resumption on the next pass.
+        self.assertEqual(len(result["dispatches"]), 1, result["dispatches"])
+        identity = json.loads(
+            result["dispatches"][0]["inputs"]["recovery_identity"]
+        )
+        self.assertEqual(identity["recovery_operation_id"], AA_OPERATION)
+        self.assertEqual(identity["recovery_checkpoint_ref"], AA_DURABLE_REF)
+        self.assertEqual(identity["recovery_checkpoint_sha"], AA_CHECKPOINT_SHA)
+        self.assertEqual(identity["recovery_generation"], "2")
+        # The release re-admits implementation on the preserved branch; it
+        # never publishes or merges on its own. The consumer's PR plus
+        # exact-HEAD review/CI gate therefore stays the only merge authority.
+        inputs = result["dispatches"][0]["inputs"]
+        self.assertEqual(inputs["mode"], "issue")
+        self.assertEqual(inputs["issue_number"], str(AA_ISSUE))
+        self.assertEqual(inputs["head_ref"], AA_HEAD_REF)
+        self.assertEqual(inputs["pr_number"], "")
+        self.assertEqual(
+            identity["recovery_stage"], "implementation-incomplete"
+        )
+        self.assertEqual(len(self.release_comments(result)), 1)
+        self.assertIn("owner=opencode-watchdog", self.release_comments(result)[0])
+        self.assertTrue(
+            any(
+                "completed-success-without-implementation" in " ".join(line)
+                for line in result["notices"]
+            ),
+            result["notices"],
+        )
+        self.assertTrue(
+            any(
+                "state=observed" in comment["body"] and
+                "run=5001" in comment["body"]
+                for comment in result["comments"]
+            ),
+            result["comments"],
+        )
+        self.assertFalse(
+            any(
+                "was released by" in " ".join(line)
+                for line in result["notices"]
+            ),
+            "the watchdog owns the claim it created; it must dispatch it",
+        )
 
     def test_production_source_verifies_authoritative_run_evidence(self):
         self.assertIn("getWorkflowRun", self.source)

@@ -880,13 +880,21 @@ module.exports = async function runIssueScheduler({ github, context, core }) {
         ref: 'heads/' + refName,
       });
       const tip = String(response.data?.object?.sha || '').toLowerCase();
-      if (tip && tip !== marker.checkpointSha) return null;
+      if (!/^[0-9a-f]{40}$/.test(tip)) {
+        core.warning(
+          'Checkpoint-resume hold ref for #' + issueNumber +
+          ' returned no verifiable SHA; keeping the deterministic hold.'
+        );
+        return marker;
+      }
+      if (tip !== marker.checkpointSha) return null;
     } catch (err) {
       if (err.status === 404) return null;
       core.warning(
         'Checkpoint-resume hold lookup failed for #' + issueNumber +
         '; keeping the deterministic hold until it can be proven changed.'
       );
+      return marker;
     }
     if (
       checkpointFixableHoldReasons.has(marker.reason) &&
@@ -899,6 +907,12 @@ module.exports = async function runIssueScheduler({ github, context, core }) {
         hold: marker,
         comments,
         readClient: client,
+        // The verified source repository is Continuum itself, which is a
+        // different repository from this consumer checkout. `readClient`
+        // carries the repository-scoped GitHub token, so only the
+        // PAT-authenticated client can read the fix manifest, the fix pull
+        // request, and the main comparison.
+        sourceClient: options.sourceClient || github,
         writeClient: options.writeClient || github,
         controller: options.controller || 'issue-scheduler',
         allowRelease: options.allowRelease !== false,
@@ -1220,7 +1234,7 @@ module.exports = async function runIssueScheduler({ github, context, core }) {
 
   async function evaluateCheckpointResumeRelease({
     targetOwner, targetRepo, issueNumber, hold, comments, readClient,
-    writeClient, controller, allowRelease,
+    sourceClient, writeClient, controller, allowRelease,
   }) {
     const repoFull = targetOwner + '/' + targetRepo;
     const trusted = (comments || []).filter(comment =>
@@ -1242,7 +1256,7 @@ module.exports = async function runIssueScheduler({ github, context, core }) {
     if (markers.length > 0) {
       for (const marker of markers) {
         const verified = await verifyCheckpointValidatorFix(
-          { ...hold, reason: marker.reason }, readClient
+          { ...hold, reason: marker.reason }, sourceClient
         );
         if (
           verified.ok &&
@@ -1269,7 +1283,7 @@ module.exports = async function runIssueScheduler({ github, context, core }) {
     if (allowRelease === false) {
       return { released: false, reason: 'release-not-allowed' };
     }
-    const verified = await verifyCheckpointValidatorFix(hold, readClient);
+    const verified = await verifyCheckpointValidatorFix(hold, sourceClient);
     if (!verified.ok) {
       return { released: false, reason: verified.reason };
     }
@@ -4727,6 +4741,33 @@ module.exports = async function runIssueScheduler({ github, context, core }) {
         per_page: 100,
       }
     );
+    // A trusted durable 429 recovery marker means the recovery watchdog owns
+    // this exact checkpoint: it resumes the saved work from the pinned SHA.
+    // A scheduler dispatch here would restart the issue from the default
+    // branch beside that resumption, so the scheduler defers for every
+    // candidate, including a ready-only issue whose reservation the
+    // reconciler already removed. The watchdog discovers ready-only recovery
+    // issues too, so this handoff never assumes an unreachable owner.
+    const candidateRecovery = latestSchedulerRecoveryState(candidateComments);
+    if (candidateRecovery) {
+      const candidateRecoveryEvaluation = await evaluateScheduler429Recovery({
+        recovery: candidateRecovery,
+        issueNumber: issue.number,
+      });
+      const watchdogOwned = candidateRecoveryEvaluation.keepReservation ||
+        candidateRecoveryEvaluation.reason === 'checkpoint-unchanged';
+      if (watchdogOwned) {
+        core.info(
+          'Skipping #' + issue.number + ': verified durable 429 recovery ' +
+          'checkpoint is owned by the recovery watchdog (' +
+          candidateRecoveryEvaluation.reason + '; op=' +
+          (candidateRecoveryEvaluation.operation || '-') + ' gen=' +
+          (candidateRecoveryEvaluation.generation || 0) + ' checkpoint=' +
+          (candidateRecoveryEvaluation.checkpointRef || '-') + ').'
+        );
+        continue;
+      }
+    }
     const candidateResumeHold = await checkpointResumeHold(
       owner, repo, issue.number, candidateComments, readGithub, 1,
       { controller: 'issue-scheduler' }
