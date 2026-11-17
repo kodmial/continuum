@@ -330,10 +330,11 @@ class ReleaseTarget:
 @dataclass(frozen=True)
 class ReleaseSettings:
     targets: tuple = ()
+    hooks: str = ""
 
     @property
     def enabled(self) -> bool:
-        return bool(self.targets)
+        return bool(self.targets) or bool(self.hooks)
 
     def target(self, target_id: str) -> Optional[ReleaseTarget]:
         for target in self.targets:
@@ -345,6 +346,7 @@ class ReleaseSettings:
         return {
             "enabled": self.enabled,
             "targets": [target.describe() for target in self.targets],
+            "hooks": self.hooks,
             "required_secrets": sorted(
                 {
                     name
@@ -440,7 +442,7 @@ _ALLOWED_PR_AGENT_KEYS = (
     "bot_login",
 )
 _ALLOWED_CODERABBIT_KEYS = ("bot_login", "status_context")
-_ALLOWED_RELEASE_KEYS = ("targets",)
+_ALLOWED_RELEASE_KEYS = ("targets", "hooks")
 _ALLOWED_TARGET_KEYS = (
     "id",
     "adapter",
@@ -1029,9 +1031,12 @@ def _parse_target(value: Any, where: str) -> ReleaseTarget:
 def _parse_release(value: Any) -> ReleaseSettings:
     mapping = _require_mapping(value, "release")
     _reject_unknown(mapping, _ALLOWED_RELEASE_KEYS, "release")
+    hooks = ""
+    if mapping.get("hooks") is not None:
+        hooks = _require_relative_path(mapping["hooks"], "release.hooks")
     targets_value = mapping.get("targets")
     if targets_value is None:
-        return ReleaseSettings()
+        return ReleaseSettings(hooks=hooks)
     if not isinstance(targets_value, list) or not targets_value:
         raise ConfigError("release.targets must be a non-empty list, or omitted entirely")
     targets = tuple(
@@ -1043,7 +1048,7 @@ def _parse_release(value: Any) -> ReleaseSettings:
         if target.id in seen:
             raise ConfigError(f"release.targets[{index}].id duplicates {target.id!r}")
         seen.append(target.id)
-    return ReleaseSettings(targets=targets)
+    return ReleaseSettings(targets=targets, hooks=hooks)
 
 
 

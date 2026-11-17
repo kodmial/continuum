@@ -1,0 +1,49 @@
+{
+  "baseline": {
+    "base_sha": "a052d50f2e4a0fe0fc54dd15a8098a8c749e7dbf",
+    "commands": [
+      {
+        "command": "bash scripts/validate-continuum.sh",
+        "duration_ms": 247501,
+        "exit_code": 0,
+        "name": "validation",
+        "output_sha256": "d15d2c1ecb3088bda6224c37cff728ad8537cc327d51661e6ed9a680623e2fb8",
+        "output_tail": "kpoint (tests.test_checkpoint_resume.CheckpointResumeTest.test_generation_2_legacy_mirror_alias_resumes_repository_bound_checkpoint) ... ok\ntest_generation_2_alias_rejects_metadata_without_repository_binding (tests.test_checkpoint_resume.CheckpointResumeTest.test_generation_2_alias_rejects_metadata_without_repository_binding) ... ok\ntest_generation_2_alias_rejects_an_unpublished_durable_ref (tests.test_checkpoint_resume.CheckpointResumeTest.test_generation_2_alias_rejects_an_unpublished_durable_ref) ... ok\ntest_generation_2_alias_rejects_a_durable_ref_at_a_different_sha (tests.test_checkpoint_resume.CheckpointResumeTest.test_generation_2_alias_rejects_a_durable_ref_at_a_different_sha) ... ok\ntest_superseded_recovery_identity_fails_closed (tests.test_opencode_admission.DuplicateRunTests.test_superseded_recovery_identity_fails_closed) ... ok\ntest_recovery_identity_requires_durable_generation_state (tests.test_opencode_admission.DuplicateRunTests.test_recovery_identity_requires_durable_generation_state) ... ok\ntest_reads_the_highest_durable_generation (scripts.test_opencode_429_evacuator.LatestDurableGenerationTest.test_reads_the_highest_durable_generation) ... ok\ntest_unreadable_durable_state_fails_closed (scripts.test_opencode_429_evacuator.LatestDurableGenerationTest.test_unreadable_durable_state_fails_closed) ... ok\ntest_stale_mirror_generation_fails_before_resume (scripts.test_opencode_429_evacuator.IssueResumeSupersessionTest.test_stale_mirror_generation_fails_before_resume) ... ok\ntest_current_generation_resumes (scripts.test_opencode_429_evacuator.IssueResumeSupersessionTest.test_current_generation_resumes) ... ok\ntest_unreadable_durable_state_fails_closed (scripts.test_opencode_429_evacuator.IssueResumeSupersessionTest.test_unreadable_durable_state_fails_closed) ... ok\n\n----------------------------------------------------------------------\nRan 18 tests in 1.047s\n\nOK\nRe-established a fresh verification baseline at the checkpoint's original base 2450557973e24af4bc6f536adea50970dba69489 in an isolated worktree; the checkpoint's unattested evidence was discarded, not reused.\nRe-established a fresh verification baseline at the checkpoint's original base 2450557973e24af4bc6f536adea50970dba69489 in an isolated worktree; the checkpoint's unattested evidence was discarded, not reused.\nRe-established a fresh verification baseline at the checkpoint's original base 2450557973e24af4bc6f536adea50970dba69489 in an isolated worktree; the checkpoint's unattested evidence was discarded, not reused.\nRe-established a fresh verification baseline at the checkpoint's original base 2450557973e24af4bc6f536adea50970dba69489 in an isolated worktree; the checkpoint's unattested evidence was discarded, not reused.\n/home/runner/work/continuum/continuum/.opencode-tmp/download-actionlint.bash: OK\nStart downloading actionlint v1.7.12 to /home/runner/work/continuum/continuum/.opencode-tmp/bin\nDetected OS=linux ext=tar.gz arch=amd64\nDownloading https://github.com/rhysd/actionlint/releases/download/v1.7.12/actionlint_1.7.12_linux_amd64.tar.gz with curl\n  % Total    % Received % Xferd  Average Speed  Time    Time    Time   Current\n                                 Dload  Upload  Total   Spent   Left   Speed\n\n  0      0   0      0   0      0      0      0                              0\n  0      0   0      0   0      0      0      0                              0\n  0      0   0      0   0      0      0      0                              0\n\n  0      0   0      0   0      0      0      0                              0actionlint\n\n100  2.24M 100  2.24M   0      0 17.69M      0                              0\n100  2.24M 100  2.24M   0      0 17.69M      0                              0\n100  2.24M 100  2.24M   0      0 17.68M      0                              0\nDownloaded and unarchived executable: /home/runner/work/continuum/continuum/.opencode-tmp/bin/actionlint\nDone: 1.7.12\ninstalled by downloading from release page\nbuilt with go1.26.1 compiler for linux/amd64\n",
+        "source": ".github/workflows/ci.yml:validation_command"
+      }
+    ],
+    "contract": {
+      "commands": [
+        {
+          "command": "bash scripts/validate-continuum.sh",
+          "name": "validation",
+          "source": ".github/workflows/ci.yml:validation_command"
+        }
+      ],
+      "errors": [],
+      "fingerprint": "f64c5cdb89b0ef8331e7cf22362d5aaf4328ec461a31e7d0f4cd9fda98292dfb",
+      "source": "ci-caller",
+      "state": "configured"
+    },
+    "environment_fingerprint": "6561ada003d9fd0afd485687b1c577dbb70fd17be4a76c943777ca3e074a2562",
+    "failed_commands": [],
+    "head_sha": "a052d50f2e4a0fe0fc54dd15a8098a8c749e7dbf",
+    "phase": "baseline",
+    "recorded_at": "2026-11-17T10:19:24Z",
+    "state": "passed"
+  },
+  "contract": {
+    "commands": [
+      {
+        "command": "bash scripts/validate-continuum.sh",
+        "name": "validation",
+        "source": ".github/workflows/ci.yml:validation_command"
+      }
+    ],
+    "errors": [],
+    "fingerprint": "f64c5cdb89b0ef8331e7cf22362d5aaf4328ec461a31e7d0f4cd9fda98292dfb",
+    "source": "ci-caller",
+    "state": "configured"
+  },
+  "schema_version": 1
+}
