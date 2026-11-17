@@ -24,10 +24,15 @@ kodmial/continuum@0bbf57dbb8834d0aaef2cfb83f08ead7da623985
 ```
 
 Three workflow examples are copies of their historical source bodies with an
-ARCHIVED header prepended. The macOS caller, target configuration, `Info.plist`,
-and entitlements file are new, product-neutral examples built against the
-historical `workflow_call` surface and configuration schema. No live workflow,
-engine module, installer rule, or consumer repository was changed.
+ARCHIVED header prepended. The generic workflow keeps the historical job logic
+unchanged, but two comment blocks in its body were edited: the privilege-split
+description now names the remaining transaction trust gap, and a paragraph
+describing that gap was added. The consumer hand-off and Bun example bodies are
+unmodified copies of their historical source. The macOS caller, target
+configuration, `Info.plist`, and entitlements file are new, product-neutral
+examples built against the historical `workflow_call` surface and configuration
+schema. No live workflow, engine module, installer rule, or consumer repository
+was changed.
 
 ## Architecture
 
@@ -117,9 +122,9 @@ publisher is not a signing adapter. A target policy is not an Actions workflow.
 
 | File | Recovered from | Role | Required surface | Current-main gap |
 | --- | --- | --- | --- | --- |
-| [`generic-release-workflow.yml`](../examples/release-templates/generic-release-workflow.yml) | `.github/workflows/release.yml` at `0bbf57dbb8834d0aaef2cfb83f08ead7da623985` | Generic `workflow_call` release orchestration with a per-target matrix | Inputs `version`, `source_sha`; secret `RELEASE_TOKEN`; optional channel, tag, environment, signing and attestation inputs | No `src/continuum/release/` engine, no release CLI, no active `release.yml` |
+| [`generic-release-workflow.yml`](../examples/release-templates/generic-release-workflow.yml) | `.github/workflows/release.yml` at `0bbf57dbb8834d0aaef2cfb83f08ead7da623985` | Generic `workflow_call` release orchestration with a per-target matrix; historical job logic unchanged, body comments edited to state the transaction trust gap | Inputs `version`, `source_sha`; secret `RELEASE_TOKEN`; optional channel, tag, environment, signing and attestation inputs | No `src/continuum/release/` engine, no release CLI, no active `release.yml` |
 | [`consumer-release-handoff.yml`](../examples/release-templates/consumer-release-handoff.yml) | `fixtures/consumer-repo/.github/workflows/continuum-release.yml` at `0bbf57dbb8834d0aaef2cfb83f08ead7da623985` | Thin consumer entrypoint that records a hand-off; it intentionally implements no release | Input `source_sha`; no secrets | Not installed by any installer set; not a release implementation |
-| [`bun-binary-release-workflow.yml`](../examples/release-templates/bun-binary-release-workflow.yml) | `.github/workflows/release-bun-binary.yml` at `0bbf57dbb8834d0aaef2cfb83f08ead7da623985` | Separate optional Bun standalone-binary example, not the default architecture | Inputs `source_sha`, `package_dir`, `binary_path`, `asset_name`; optional `RELEASE_TOKEN` | No active workflow; Bun toolchain is technology-specific and not part of the generic release path |
+| [`bun-binary-release-workflow.yml`](../examples/release-templates/bun-binary-release-workflow.yml) | `.github/workflows/release-bun-binary.yml` at `0bbf57dbb8834d0aaef2cfb83f08ead7da623985` | Separate optional Bun standalone-binary example, not the default architecture | Inputs `source_sha`, `package_dir`, `binary_path`, `asset_name`; optional `RELEASE_TOKEN` | No active workflow; Bun toolchain is technology-specific and not part of the generic release path; workflow-level `contents: write` plus checkout's persisted credential expose `github.token` to build code |
 | [`macos-release-caller.yml`](../examples/release-templates/macos-release-caller.yml) | New example against the historical `workflow_call` surface | Manual macOS release selection that hands `version` and `source_sha` to the generic workflow | Inputs `version`, `source_sha`; secrets `RELEASE_TOKEN`, `CONTINUUM_APPLE_P12`, `CONTINUUM_APPLE_P12_PASSWORD` | Called workflow, engine, and CLI are all absent on current main |
 | [`macos-target.continuum.yml`](../examples/release-templates/macos-target.continuum.yml) | New example against `.continuum.yml` and `config.py` at `0bbf57dbb8834d0aaef2cfb83f08ead7da623985` | Policy/configuration, **not** a workflow: SwiftPM macOS `.app` for `arm64` and `x86_64` | Names the two Apple signing secret names; no secret values | The schema parses, but no runtime consumes release targets on current main |
 | [`macos/Info.plist`](../examples/release-templates/macos/Info.plist), [`macos/ExampleApp.entitlements`](../examples/release-templates/macos/ExampleApp.entitlements) | New illustrative inputs | Neutral files referenced by the target policy | None | Placeholders only; replace them with your project's real files |
@@ -212,6 +217,18 @@ files are archived rather than presented as a working feature.
 The Bun example is separate and optional. It must not become the default
 architecture for a future release implementation.
 
+Its own credential exposure is part of why it is unqualified. The archived Bun
+workflow declares `contents: write` at workflow level, and its
+`actions/checkout` step does not set `persist-credentials: false`. Checkout
+therefore leaves `github.token`, a write-scoped repository token, in the
+checked-out `.git/config`. The next steps run `bun install --frozen-lockfile`
+and then the consumer build script from that same tree, so source-controlled
+code at the release commit can read the token while it builds. Because that same
+job also publishes, moving the publish step to a later point in the job does not
+help. A future Bun release must disable checkout credential persistence or run
+the build under a separate trust boundary from publication, so the build never
+holds a credential it does not need.
+
 ## What current main is missing
 
 A real release is not one YAML file away. These dependencies are absent or
@@ -294,6 +311,13 @@ working:
 8. Treat Developer ID, notarization, App Store, installers, and downstream
    publishers as separate qualification work. Do not infer them from a passing
    self-signed macOS build.
+9. Qualify the optional Bun example separately, including its credential
+   exposure: workflow-level `contents: write` plus checkout's default credential
+   persistence leaves `github.token` readable by the source-controlled code that
+   `bun install` and the consumer build script run. Set
+   `persist-credentials: false` on checkout or separate the build and publish
+   steps into distinct trust boundaries so no build step holds a publishing
+   credential, before calling that path qualified.
 
 Until then, the correct status is **INACTIVE / HISTORICAL / UNQUALIFIED**.
 

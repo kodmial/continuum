@@ -11,9 +11,11 @@
 # described in docs/release-templates.md exist and a disposable consumer has
 # qualified the complete path.
 #
-# The body below is the historical source verbatim. Its `workflow_call` surface
-# is the provenance of the generic orchestration design, not a supported
-# interface on current main.
+# The body below retains the historical job logic unchanged; only two comment
+# blocks were edited, namely the privilege-split description and an added
+# paragraph about the transaction trust gap. Its `workflow_call` surface is the
+# provenance of the generic orchestration design, not a supported interface on
+# current main.
 
 name: Continuum release
 
