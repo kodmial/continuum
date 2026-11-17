@@ -101,6 +101,14 @@ on:
         required: false
         default: main
         type: string
+      continuum_engine_repository:
+        description: >-
+          Repository holding the audited Continuum engine. Leave the default
+          unless an audited fork or an isolated qualification run must supply
+          the engine; `continuum_ref` is still an exact commit in it.
+        required: false
+        default: kodmial/continuum
+        type: string
       runner:
         description: Runner for plan and preparation jobs
         required: false
@@ -193,7 +201,7 @@ jobs:
       - name: Checkout the Continuum release engine
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          repository: kodmial/continuum
+          repository: ${{ inputs.continuum_engine_repository }}
           ref: ${{ inputs.continuum_ref }}
           path: continuum
           fetch-depth: 1
@@ -230,7 +238,9 @@ jobs:
           RELEASE_NO_GITHUB: ${{ inputs.no_github_release }}
         run: |
           set -euo pipefail
-          export PYTHONPATH="$CONTINUUM_ENGINE/src:$CONTINUUM_ENGINE"
+          # os.pathsep, so the same step works on a Windows runner where the
+          # module path separator is a semicolon rather than a colon.
+          export PYTHONPATH="$CONTINUUM_ENGINE/src$(python3 -c 'import os; print(os.pathsep)')$CONTINUUM_ENGINE"
           mkdir -p "$RUNNER_TEMP/release"
 
           changed="$RUNNER_TEMP/release/changed-files.txt"
@@ -340,7 +350,7 @@ jobs:
       - name: Checkout the Continuum release engine
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          repository: kodmial/continuum
+          repository: ${{ inputs.continuum_engine_repository }}
           ref: ${{ inputs.continuum_ref }}
           path: continuum
           fetch-depth: 1
@@ -356,9 +366,9 @@ jobs:
           python3 - <<'PY'
           import json, os, re
 
-          secrets = json.loads(os.environ.get("ALL_SECRETS") or "{}")
+          inherited = json.loads(os.environ.get("ALL_SECRETS") or "{}")
           requested = [name for name in re.split(r"[\s,]+", os.environ.get("HOOK_SECRET_ENV", "")) if name]
-          missing = [name for name in requested if not secrets.get(name)]
+          missing = [name for name in requested if not inherited.get(name)]
           if missing:
               raise SystemExit(
                   "::error::hook_secret_env names secrets this job did not receive: "
@@ -367,7 +377,7 @@ jobs:
               )
           with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as out:
               for name in requested:
-                  value = str(secrets[name])
+                  value = str(inherited[name])
                   print(f"::add-mask::{value}")
                   out.write(f"{name}<<CONTINUUM_HOOK_SECRET_EOF\n{value}\nCONTINUUM_HOOK_SECRET_EOF\n")
           PY
@@ -391,7 +401,9 @@ jobs:
           HOOK_SECRET_ENV: ${{ inputs.hook_secret_env }}
         run: |
           set -euo pipefail
-          export PYTHONPATH="$CONTINUUM_ENGINE/src:$CONTINUUM_ENGINE"
+          # os.pathsep, so the same step works on a Windows runner where the
+          # module path separator is a semicolon rather than a colon.
+          export PYTHONPATH="$CONTINUUM_ENGINE/src$(python3 -c 'import os; print(os.pathsep)')$CONTINUUM_ENGINE"
           mkdir -p prepared evidence
 
           changed="$RUNNER_TEMP/changed-files.txt"
@@ -435,6 +447,7 @@ jobs:
           python3 -m continuum.release "${args[@]}"
 
       - name: Upload the prepared release
+        if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: continuum-release-prepared
@@ -468,7 +481,7 @@ jobs:
       - name: Checkout the Continuum release engine
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          repository: kodmial/continuum
+          repository: ${{ inputs.continuum_engine_repository }}
           ref: ${{ inputs.continuum_ref }}
           path: continuum
           fetch-depth: 1
@@ -490,9 +503,9 @@ jobs:
           python3 - <<'PY'
           import json, os, re
 
-          secrets = json.loads(os.environ.get("ALL_SECRETS") or "{}")
+          inherited = json.loads(os.environ.get("ALL_SECRETS") or "{}")
           requested = [name for name in re.split(r"[\s,]+", os.environ.get("HOOK_SECRET_ENV", "")) if name]
-          missing = [name for name in requested if not secrets.get(name)]
+          missing = [name for name in requested if not inherited.get(name)]
           if missing:
               raise SystemExit(
                   "::error::hook_secret_env names secrets this job did not receive: "
@@ -501,7 +514,7 @@ jobs:
               )
           with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as out:
               for name in requested:
-                  value = str(secrets[name])
+                  value = str(inherited[name])
                   print(f"::add-mask::{value}")
                   out.write(f"{name}<<CONTINUUM_HOOK_SECRET_EOF\n{value}\nCONTINUUM_HOOK_SECRET_EOF\n")
           PY
@@ -525,7 +538,9 @@ jobs:
           HOOK_SECRET_ENV: ${{ inputs.hook_secret_env }}
         run: |
           set -euo pipefail
-          export PYTHONPATH="$CONTINUUM_ENGINE/src:$CONTINUUM_ENGINE"
+          # os.pathsep, so the same step works on a Windows runner where the
+          # module path separator is a semicolon rather than a colon.
+          export PYTHONPATH="$CONTINUUM_ENGINE/src$(python3 -c 'import os; print(os.pathsep)')$CONTINUUM_ENGINE"
           mkdir -p evidence
 
           changed="$RUNNER_TEMP/changed-files.txt"
@@ -573,6 +588,7 @@ jobs:
           python3 -m continuum.release "${args[@]}"
 
       - name: Upload this target's build
+        if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: continuum-release-build-${{ matrix.id }}
@@ -606,7 +622,7 @@ jobs:
       - name: Checkout the Continuum release engine
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          repository: kodmial/continuum
+          repository: ${{ inputs.continuum_engine_repository }}
           ref: ${{ inputs.continuum_ref }}
           path: continuum
           fetch-depth: 1
@@ -635,9 +651,9 @@ jobs:
           python3 - <<'PY'
           import json, os, re
 
-          secrets = json.loads(os.environ.get("ALL_SECRETS") or "{}")
+          inherited = json.loads(os.environ.get("ALL_SECRETS") or "{}")
           requested = [name for name in re.split(r"[\s,]+", os.environ.get("HOOK_SECRET_ENV", "")) if name]
-          missing = [name for name in requested if not secrets.get(name)]
+          missing = [name for name in requested if not inherited.get(name)]
           if missing:
               raise SystemExit(
                   "::error::hook_secret_env names secrets this job did not receive: "
@@ -646,7 +662,7 @@ jobs:
               )
           with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as out:
               for name in requested:
-                  value = str(secrets[name])
+                  value = str(inherited[name])
                   print(f"::add-mask::{value}")
                   out.write(f"{name}<<CONTINUUM_HOOK_SECRET_EOF\n{value}\nCONTINUUM_HOOK_SECRET_EOF\n")
           PY
@@ -686,7 +702,9 @@ jobs:
           HOOK_SECRET_ENV: ${{ inputs.hook_secret_env }}
         run: |
           set -euo pipefail
-          export PYTHONPATH="$CONTINUUM_ENGINE/src:$CONTINUUM_ENGINE"
+          # os.pathsep, so the same step works on a Windows runner where the
+          # module path separator is a semicolon rather than a colon.
+          export PYTHONPATH="$CONTINUUM_ENGINE/src$(python3 -c 'import os; print(os.pathsep)')$CONTINUUM_ENGINE"
           mkdir -p evidence publish-receipts
 
           changed="$RUNNER_TEMP/changed-files.txt"

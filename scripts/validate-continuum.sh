@@ -208,4 +208,5 @@ bash "$actionlint_installer" 1.7.12 "$PWD/.opencode-tmp/bin"
   .github/workflows/*.yml \
   .github/caller-stubs/*.yml \
   .github/caller-stubs/tech/*.yml \
+  .github/caller-stubs/release/*.yml \
   .github/caller-stubs/parent/*.yml

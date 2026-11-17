@@ -913,7 +913,10 @@ def emit(outcome: ReleaseOutcome, args: argparse.Namespace, receipt: Optional[Re
         payload["release_url"] = receipt.url
     if args.json:
         _write_json(payload, args.json)
-    if not args.quiet:
+    # A failure must explain itself in the job log even when the workflow asked
+    # for quiet output: the machine-readable evidence is uploaded separately,
+    # but the person reading the run needs the reason in front of them.
+    if not args.quiet or outcome.failed:
         _print_human(payload)
     _github_output(payload, args.github_output)
     if args.summary:
@@ -975,8 +978,8 @@ def _emit_component_failure(args: argparse.Namespace, exc: "CliError") -> None:
     if args.summary:
         with open(args.summary, "a", encoding="utf-8") as handle:
             handle.write(_summary_markdown(payload))
-    if not args.quiet:
-        _print_human(payload)
+    # This path only runs before a refusal is raised, so it always speaks.
+    _print_human(payload)
 
 
 # -- the run ----------------------------------------------------------------

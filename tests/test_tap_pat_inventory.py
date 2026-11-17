@@ -105,7 +105,10 @@ class CoverageTests(unittest.TestCase):
         # kodmial/continuum#446 adds the dispatched-receipt correlation step,
         # which binds TAP_PAT twice (env token + github-script token) under one
         # exactly-once claim identity.
-        self.assertEqual(len(bindings), 127)
+        # kodmial/continuum#472 adds the opt-in application release: prepare
+        # (release-PR push fan-out) and publish (tag/release and publisher
+        # hooks) bind the same TAP_PAT contract twice.
+        self.assertEqual(len(bindings), 129)
         gaps = inventory.coverage_gaps(WORKFLOWS_DIR)
         self.assertEqual(gaps, [], f"uninventoried TAP_PAT bindings: {gaps}")
 

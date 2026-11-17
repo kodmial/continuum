@@ -497,6 +497,28 @@
       "phase_a_adapter": null
     },
     {
+      "id": "application-release",
+      "summary": "Opt-in application-release state machine; Continuum never triggers it itself.",
+      "canonical_policy": [
+        "continuum.release.eligibility",
+        "continuum.release.core.ReleaseCore",
+        "continuum.release.cli.main"
+      ],
+      "state_inputs": [
+        "consumer push/tag/manual dispatch state",
+        "release receipts and published GitHub Release assets",
+        "release configuration and hooks document"
+      ],
+      "event_payload_dependencies": [
+        "push.ref",
+        "push.after",
+        "workflow_dispatch.inputs"
+      ],
+      "fallback_owner": "consumer-owned push/tag/manual dispatch only; a disabled release is a green no-op",
+      "mutates": true,
+      "phase_a_adapter": null
+    },
+    {
       "id": "project-e2e",
       "summary": "Project-owned live model-routing end-to-end verification.",
       "canonical_policy": [
@@ -1040,6 +1062,30 @@
         "render-executor"
       ],
       "event_payload_dependent": false
+    },
+    {
+      "path": ".github/caller-stubs/release/continuum-release.yml",
+      "name": "Application release",
+      "layer": "release-caller",
+      "installer_set": "release",
+      "triggers": [
+        {
+          "event": "workflow_dispatch"
+        },
+        {
+          "event": "push",
+          "branches": [
+            "main"
+          ]
+        }
+      ],
+      "jobs": [
+        "call"
+      ],
+      "owners": [
+        "application-release"
+      ],
+      "event_payload_dependent": true
     },
     {
       "path": ".github/caller-stubs/parent/continuum-child-pr-review.yml",
@@ -1896,6 +1942,27 @@
       ],
       "owners": [
         "render-executor"
+      ],
+      "event_payload_dependent": false
+    },
+    {
+      "path": ".github/workflows/continuum-release.yml",
+      "name": "Application release",
+      "layer": "reusable-engine",
+      "installer_set": "not-installed",
+      "triggers": [
+        {
+          "event": "workflow_call"
+        }
+      ],
+      "jobs": [
+        "plan",
+        "prepare",
+        "build",
+        "publish"
+      ],
+      "owners": [
+        "application-release"
       ],
       "event_payload_dependent": false
     },

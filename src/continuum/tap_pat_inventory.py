@@ -525,6 +525,22 @@ ENTRIES = (
         "evidence": ("GH_TOKEN: ${{ secrets.TAP_PAT || github.token }}",),
     },
     {
+        "workflow": "continuum-release.yml",
+        "step": "Record the preparation pass",
+        "capability": PUSH_FANOUT,
+        "same_repo": True,
+        "reason": "The optional release-PR hook pushes a proposal branch so normal pull_request CI and review workflows trigger; a GITHUB_TOKEN push is suppressed, so the classic PAT is the contract. The same bound token serves the release destination and bounded cross-repository publisher hooks.",
+        "evidence": ("GITHUB_TOKEN: ${{ secrets.TAP_PAT || github.token }}",),
+    },
+    {
+        "workflow": "continuum-release.yml",
+        "step": "Publish the complete asset set",
+        "capability": PUSH_FANOUT,
+        "same_repo": True,
+        "reason": "Creating the immutable tag and GitHub Release with the classic PAT lets downstream push/tag workflows observe the published release; a GITHUB_TOKEN write is suppressed. Publisher hooks that reach a tap or port repository are cross-repository by nature.",
+        "evidence": ("GITHUB_TOKEN: ${{ secrets.TAP_PAT || github.token }}",),
+    },
+    {
         "workflow": "continuum-docker-qualification.yml",
         "step": "Run exact artifact under the fixed no-swap ceiling",
         "capability": BOUNDED_FALLBACK,

@@ -27,6 +27,7 @@ WORKFLOW_GLOB = ".github/workflows/*.yml"
 STUB_GLOBS = (
     ".github/caller-stubs/*.yml",
     ".github/caller-stubs/tech/*.yml",
+    ".github/caller-stubs/release/*.yml",
     ".github/caller-stubs/parent/*.yml",
 )
 
@@ -295,6 +296,8 @@ def expected_installer_set(path: str) -> str:
 
     if path.startswith(".github/caller-stubs/tech/"):
         return "tech"
+    if path.startswith(".github/caller-stubs/release/"):
+        return "release"
     if path.startswith(".github/caller-stubs/parent/"):
         return "parent"
     if path.startswith(".github/caller-stubs/"):

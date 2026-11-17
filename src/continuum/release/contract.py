@@ -599,8 +599,12 @@ class ArtifactManifest:
         parent = os.path.dirname(path)
         if parent:
             os.makedirs(parent, exist_ok=True)
-        with open(path, "w", encoding="utf-8") as handle:
-            handle.write(self.checksums_listing())
+        # Bytes, not text: a text-mode write lets the host translate "\n" to
+        # "\r\n", and then the file a consumer verifies is not the file whose
+        # digest the manifest recorded. The listing's byte form is the contract,
+        # so the platform never gets to choose it.
+        with open(path, "wb") as handle:
+            handle.write(self.checksums_listing().encode("utf-8"))
         return path
 
     def digest(self) -> str:

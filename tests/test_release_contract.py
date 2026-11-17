@@ -9,10 +9,12 @@ is assembled from, so those types are tested on their own.
 
 from __future__ import annotations
 
+import builtins
 import hashlib
 import os
 import tempfile
 import unittest
+from unittest import mock
 
 from continuum.release import contract
 from continuum.release.contract import (
@@ -191,6 +193,35 @@ class ManifestTests(unittest.TestCase):
             size, digest = digest_file(path)
         self.assertEqual(digest, manifest(artifact()).checksums_digest())
         self.assertEqual(size, len(listing.encode("utf-8")))
+
+    def test_a_checksum_listing_is_written_without_host_line_endings(self):
+        """A Windows checkout translates text-mode "\n" into "\r\n".
+
+        The listing's digest is computed from its canonical bytes, so a host
+        that rewrites the separators produces a checksums file that cannot
+        describe the artifacts recorded beside it. Writing bytes removes the
+        platform from the decision.
+        """
+
+        original = manifest(artifact())
+        calls = []
+
+        def recording_open(file, mode="r", *args, **kwargs):
+            calls.append(mode)
+            return builtins.open(file, mode, *args, **kwargs)
+
+        with tempfile.TemporaryDirectory() as directory:
+            with mock.patch.object(contract, "open", recording_open, create=True):
+                path = original.write_checksums(directory)
+            written = builtins.open(path, "rb").read()
+
+        self.assertEqual(written, original.checksums_listing().encode("utf-8"))
+        self.assertNotIn(b"\r\n", written)
+        self.assertTrue(calls)
+        self.assertTrue(
+            all("b" in mode for mode in calls),
+            "the checksums file must be written as bytes, not through the host's text mode",
+        )
 
 
 class ManifestBuilderTests(unittest.TestCase):

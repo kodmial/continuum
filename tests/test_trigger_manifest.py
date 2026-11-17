@@ -91,6 +91,17 @@ class TriggerManifestTests(unittest.TestCase):
             )
         )
 
+    def test_release_surfaces_are_opt_in_and_owned(self):
+        surfaces = {surface["path"]: surface for surface in self.payload["surfaces"]}
+        stub = surfaces[".github/caller-stubs/release/continuum-release.yml"]
+        self.assertEqual(stub["installer_set"], "release")
+        self.assertEqual(stub["owners"], ["application-release"])
+        self.assertTrue(stub["event_payload_dependent"])
+        engine = surfaces[".github/workflows/continuum-release.yml"]
+        self.assertEqual(engine["installer_set"], "not-installed")
+        self.assertEqual(engine["jobs"], ["plan", "prepare", "build", "publish"])
+        self.assertFalse(engine["event_payload_dependent"])
+
     def test_self_dogfood_jobs_have_explicit_owners(self):
         automation = next(
             surface

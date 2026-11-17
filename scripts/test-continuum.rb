@@ -11844,6 +11844,18 @@ class ContinuumTest < Minitest::Test
     assert_includes publish_body, '--receipt-import "$receipt"'
   end
 
+  def test_application_release_runs_its_engine_on_a_windows_runner
+    document = File.read(release_workflow_path)
+    assert_equal 4, document.scan('print(os.pathsep)').size,
+                 'every engine step must build PYTHONPATH with the host separator'
+    %w[plan prepare build publish].each do |job|
+      body = release_job_body(job)
+      assert_includes body, "print(os.pathsep)",
+                      "#{job} must not hardcode a colon-separated engine path on Windows"
+      refute_includes body, 'export PYTHONPATH="$CONTINUUM_ENGINE/src:$CONTINUUM_ENGINE"'
+    end
+  end
+
   def test_application_release_without_configuration_is_a_green_no_op
     jobs = yaml(release_workflow_path).fetch('jobs')
     assert_equal 'read', jobs.fetch('plan').fetch('permissions').fetch('contents'),
@@ -11888,7 +11900,9 @@ class ContinuumTest < Minitest::Test
     assert_equal 3, document.scan('ALL_SECRETS: ${{ toJSON(secrets) }}').size,
                  'the inherited secret bag may be read only to filter it'
     assert_includes document, 'requested = [name for name in re.split(r"[\s,]+", os.environ.get("HOOK_SECRET_ENV", "")) if name]'
-    assert_includes document, 'missing = [name for name in requested if not secrets.get(name)]'
+    assert_includes document, 'missing = [name for name in requested if not inherited.get(name)]'
+    refute_includes document, 'secrets.get(',
+                    'the credential inventory must never read a python variable as a secret'
     assert_includes document, '::add-mask::'
     assert_includes document, '--secret-env'
     refute_includes document, '--secret-json',
