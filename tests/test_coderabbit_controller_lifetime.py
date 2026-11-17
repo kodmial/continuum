@@ -39,6 +39,35 @@ class CodeRabbitControllerLifetimeContract(unittest.TestCase):
         self.assertGreater(lifetime, defer_cap + 5)
         self.assertGreater(job_timeout, lifetime + 5)
 
+    def test_caller_rejects_unrelated_comments_before_queue(self):
+        """The caller must reject telemetry before reusable-workflow concurrency."""
+        same_as_engine = [
+            "github.event.issue.pull_request != null",
+            "github.event.comment.user.login == 'coderabbitai[bot]'",
+            "contains(github.event.comment.body, 'Review rate limited')",
+            "contains(github.event.comment.body, 'Review limit reached')",
+        ]
+        engine = WORKFLOW.read_text(encoding="utf-8")
+        for entry in (
+            ROOT / ".github/workflows/coderabbit-retry.yml",
+            ROOT / ".github/caller-stubs/continuum-coderabbit-retry.yml",
+        ):
+            with self.subTest(entry=entry.name):
+                text = entry.read_text(encoding="utf-8")
+                # Not a post-admission filter in reusable jobs.controller.
+                caller_if = text.split("jobs:\\n  call:\\n", 1)[1].split(
+                    "    uses:", 1
+                )[0]
+                self.assertIn("github.event_name != 'issue_comment'", caller_if)
+                for predicate in same_as_engine:
+                    self.assertIn(predicate, caller_if)
+                    self.assertIn(predicate, engine)
+                self.assertIn("github.event_name == 'schedule'", engine)
+                self.assertIn("github.event_name == 'workflow_dispatch'", engine)
+                # The ordinary manual and scheduled events remain enabled by
+                # the short-circuit, and the shared quota serializer is intact.
+                self.assertNotIn("cancel-in-progress: true", text)
+
     def test_serialized_review_queue_unchanged(self):
         body = WORKFLOW.read_text(encoding="utf-8")
         self.assertIn("group: coderabbit-rate-limit-controller-", body)
