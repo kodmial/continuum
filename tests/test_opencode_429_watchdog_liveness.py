@@ -245,7 +245,24 @@ function makeRest() {
       },
     },
     git: {
-      getRef: async () => {
+      getRef: async ({ ref } = {}) => {
+        const refName = String(ref || '').replace(/^heads\//, '');
+        const metadata = scenario.checkpoint && scenario.checkpoint.metadata;
+        const baseRef = String(scenario.baseRef || 'main');
+        if (refName === baseRef) {
+          if (scenario.baseError) {
+            throw apiError(scenario.baseError, 'base ref failed');
+          }
+          return {
+            data: {
+              object: {
+                sha: scenario.baseSha ||
+                  (scenario.checkpoint && scenario.checkpoint.baseSha) ||
+                  (metadata && metadata.base_sha) || BASE_SHA,
+              },
+            },
+          };
+        }
         if (scenario.checkpoint && scenario.checkpoint.missingRef) {
           throw apiError(404, 'ref not found');
         }
@@ -808,6 +825,12 @@ class WatchdogHarness(unittest.TestCase):
     def test_successful_observed_run_with_publication_owns_the_work(self):
         scenario = base_scenario()
         scenario["runs"][0]["conclusion"] = "success"
+        scenario["jobs"] = [
+            {
+                "id": 120345823697,
+                "steps": [{"name": "Run OpenCode", "conclusion": "success"}],
+            }
+        ]
         scenario["pulls"] = [
             {
                 "number": 500,
@@ -815,6 +838,7 @@ class WatchdogHarness(unittest.TestCase):
                 "merged_at": "2026-10-23T09:40:00Z",
                 "head": {
                     "ref": BRANCH,
+                    "sha": NEW_SHA,
                     "repo": {"full_name": OWNER + "/" + REPO},
                 },
             }
@@ -852,6 +876,39 @@ class WatchdogHarness(unittest.TestCase):
                     result["notices"],
                 )
 
+    def test_matching_publication_does_not_bypass_implementation_evidence(self):
+        scenario = base_scenario()
+        scenario["runs"][0]["conclusion"] = "success"
+        scenario["jobs"] = [
+            {
+                "id": 132975886955,
+                "steps": [
+                    {"name": "Run OpenCode", "conclusion": "skipped"},
+                    {"name": "Implement issue", "conclusion": "skipped"},
+                ],
+            }
+        ]
+        scenario["pulls"] = [
+            {
+                "number": 500,
+                "state": "open",
+                "head": {
+                    "ref": BRANCH,
+                    "sha": NEW_SHA,
+                    "repo": {"full_name": OWNER + "/" + REPO},
+                },
+            }
+        ]
+        result = self.run_scenario(scenario)
+        self.assert_one_current_dispatch(result, NEW_SHA)
+        self.assertTrue(
+            any(
+                "completed-success-without-implementation" in " ".join(line)
+                for line in result["notices"]
+            ),
+            result["notices"],
+        )
+
     def test_success_run_evidence_unavailable_fails_closed(self):
         scenario = base_scenario()
         scenario["runs"][0]["conclusion"] = "success"
@@ -875,6 +932,7 @@ class WatchdogHarness(unittest.TestCase):
                 "state": "open",
                 "head": {
                     "ref": BRANCH,
+                    "sha": NEW_SHA,
                     "repo": {"full_name": OWNER + "/" + REPO},
                 },
             }
@@ -1225,12 +1283,31 @@ class WatchdogHarness(unittest.TestCase):
                 "state": "open",
                 "head": {
                     "ref": BRANCH,
+                    "sha": NEW_SHA,
                     "repo": {"full_name": OWNER + "/" + REPO},
                 },
             }
         ]
         result = self.run_scenario(scenario)
         self.assert_no_dispatch(result)
+
+    def test_scheduled_historical_issue_pr_does_not_prove_this_recovery(self):
+        scenario = self.durable_scenario()
+        scenario["pulls"] = [
+            {
+                "number": 500,
+                "state": "closed",
+                "merged_at": "2026-10-23T09:40:00Z",
+                "merged": True,
+                "head": {
+                    "ref": "opencode/issue382-earlier-attempt",
+                    "sha": OLD_SHA,
+                    "repo": {"full_name": OWNER + "/" + REPO},
+                },
+            }
+        ]
+        result = self.run_scenario(scenario)
+        self.assert_one_current_dispatch(result, NEW_SHA)
 
     def test_scheduled_closed_unmerged_pr_does_not_fence_newer_checkpoint(self):
         scenario = self.durable_scenario()
@@ -1373,6 +1450,16 @@ class WatchdogHarness(unittest.TestCase):
         # trusted durable checkpoint instead of assuming the scheduler owns it.
         scenario = self.durable_scenario()
         scenario["issues"][0]["labels"] = [{"name": "automation:ready"}]
+        result = self.run_scenario(scenario)
+        self.assert_one_current_dispatch(result, NEW_SHA)
+
+    def test_scheduled_checkpoint_without_either_label_is_scanned(self):
+        # When no ready label is configured, the scheduler may release the
+        # in-progress reservation from a checkpointed issue, leaving neither
+        # automation:in-progress nor automation:ready. Durable discovery must
+        # still find the trusted checkpoint.
+        scenario = self.durable_scenario()
+        scenario["issues"][0]["labels"] = []
         result = self.run_scenario(scenario)
         self.assert_one_current_dispatch(result, NEW_SHA)
 

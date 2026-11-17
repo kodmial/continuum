@@ -1393,6 +1393,41 @@ module.exports = async function runIssueScheduler({ github, context, core }) {
     }
   }
 
+  // The release is bound to the consumer base the held run rejected against.
+  // A moved base changes the premise, and an unreadable base cannot prove it
+  // unchanged, so neither may authorize a new resumption.
+  async function verifyCheckpointConsumerBase({
+    targetOwner, targetRepo, hold, client,
+  }) {
+    const baseRef = String(hold && hold.baseRef || '')
+      .trim().replace(/^refs\/heads\//, '');
+    const wantedSha = String(hold && hold.baseSha || '').toLowerCase();
+    if (!baseRef || baseRef === '-' || !/^[0-9a-f]{40}$/.test(wantedSha)) {
+      return { ok: false, reason: 'base-unverifiable' };
+    }
+    let response;
+    try {
+      response = await client.rest.git.getRef({
+        owner: targetOwner,
+        repo: targetRepo,
+        ref: 'heads/' + baseRef,
+      });
+    } catch (err) {
+      return {
+        ok: false,
+        reason: 'base-unavailable',
+        status: Number(err && err.status || 0),
+      };
+    }
+    const tip = String(response && response.data?.object?.sha || '')
+      .toLowerCase();
+    if (!/^[0-9a-f]{40}$/.test(tip)) {
+      return { ok: false, reason: 'base-unverifiable' };
+    }
+    if (tip !== wantedSha) return { ok: false, reason: 'base-changed' };
+    return { ok: true, sha: tip };
+  }
+
   async function evaluateCheckpointResumeRelease({
     targetOwner, targetRepo, issueNumber, hold, comments, readClient,
     sourceClient, writeClient, controller, allowRelease,
@@ -1415,6 +1450,14 @@ module.exports = async function runIssueScheduler({ github, context, core }) {
     }
     markers.sort((a, b) => a.commentId - b.commentId);
     if (markers.length > 0) {
+      const base = await verifyCheckpointConsumerBase({
+        targetOwner, targetRepo, hold, client: readClient,
+      });
+      if (!base.ok) {
+        return {
+          released: false, reason: base.reason, markers, base,
+        };
+      }
       const holdOrder = stopOrderKey(hold);
       const consumptions = [];
       for (const comment of trusted) {
@@ -1486,6 +1529,12 @@ module.exports = async function runIssueScheduler({ github, context, core }) {
     }
     if (allowRelease === false) {
       return { released: false, reason: 'release-not-allowed' };
+    }
+    const base = await verifyCheckpointConsumerBase({
+      targetOwner, targetRepo, hold, client: readClient,
+    });
+    if (!base.ok) {
+      return { released: false, reason: base.reason, base };
     }
     const verified = await verifyCheckpointValidatorFix(hold, sourceClient);
     if (!verified.ok) {
@@ -4188,7 +4237,15 @@ module.exports = async function runIssueScheduler({ github, context, core }) {
         observedSteps,
       };
     }
-    async function schedulerPublishedIssuePullRequest() {
+    async function schedulerPublishedIssuePullRequest(identity) {
+      const branch = String(
+        identity && (identity.branch || identity.head_ref) || ''
+      ).trim().replace(/^refs\/heads\//, '');
+      const savedSha = String(identity && identity.head_sha || '')
+        .toLowerCase();
+      if (!branch || !/^[0-9a-f]{40}$/.test(savedSha)) {
+        return { kind: 'invalid', reason: 'recovery-identity-incomplete' };
+      }
       let pulls;
       try {
         pulls = await readGithub.paginate(
@@ -4201,17 +4258,47 @@ module.exports = async function runIssueScheduler({ github, context, core }) {
           status: Number(err && err.status || 0),
         };
       }
-      const prefix = 'opencode/issue' + issueNumber + '-';
-      const published = (pulls || []).some(pull => {
+      let verificationUnavailable = false;
+      for (const pull of pulls || []) {
         const headRepo = String(pull.head?.repo?.full_name || '');
-        const headRef = String(pull.head?.ref || '');
-        if (headRepo !== repoFullName) return false;
-        if (!headRef.startsWith(prefix)) return false;
-        return pull.state === 'open' ||
+        const headRef = String(pull.head?.ref || '')
+          .replace(/^refs\/heads\//, '');
+        // A historical PR on another issue-branch attempt, or on a different
+        // branch, is not evidence for this exact recovery.
+        if (headRepo !== repoFullName || headRef !== branch) continue;
+        const published = pull.state === 'open' ||
           Boolean(pull.merged_at) ||
           pull.merged === true;
-      });
-      return { kind: 'ok', published };
+        if (!published) continue;
+        const headSha = String(pull.head?.sha || '').toLowerCase();
+        if (headSha === savedSha) return { kind: 'ok', published: true };
+        if (!/^[0-9a-f]{40}$/.test(headSha)) {
+          verificationUnavailable = true;
+          continue;
+        }
+        // The PR may have advanced after the checkpoint, but it must still
+        // contain the saved work this recovery preserves.
+        let comparison;
+        try {
+          comparison = (await readGithub.rest.repos.compareCommits({
+            owner,
+            repo,
+            base: savedSha,
+            head: headSha,
+          })).data;
+        } catch (err) {
+          verificationUnavailable = true;
+          continue;
+        }
+        const status = String(comparison && comparison.status || '');
+        if (status === 'ahead' || status === 'identical') {
+          return { kind: 'ok', published: true };
+        }
+      }
+      if (verificationUnavailable) {
+        return { kind: 'unavailable', status: 0 };
+      }
+      return { kind: 'ok', published: false };
     }
     if (checkpoint.kind === 'valid') {
       if (
@@ -4220,12 +4307,11 @@ module.exports = async function runIssueScheduler({ github, context, core }) {
         run.run.status === 'completed' &&
         run.run.conclusion === 'success'
       ) {
-        const publication = await schedulerPublishedIssuePullRequest();
+        const publication = await schedulerPublishedIssuePullRequest(
+          checkpoint.identity
+        );
         if (publication.kind !== 'ok') {
           return keepRecoveryReservation('publication-unavailable');
-        }
-        if (publication.published) {
-          return { ...base, reason: 'run-completed-success' };
         }
         const evidence = await schedulerRunImplementationEvidence(run.run.id);
         if (evidence.kind !== 'ok') {
@@ -4239,9 +4325,12 @@ module.exports = async function runIssueScheduler({ github, context, core }) {
             'run-completed-success-without-implementation'
           );
         }
-        return keepRecoveryReservation(
-          'run-completed-success-without-publication'
-        );
+        if (!publication.published) {
+          return keepRecoveryReservation(
+            'run-completed-success-without-publication'
+          );
+        }
+        return { ...base, reason: 'run-completed-success' };
       }
       const markerSha = String(
         recovery.checkpointSha || ''

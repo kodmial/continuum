@@ -789,28 +789,60 @@ jobs:
           }) {
             if (mode === 'issue' && /^[0-9]+$/.test(String(issueNumber || ''))) {
               const branch = String(
-                identity.head_ref || identity.branch || ''
-              ).trim();
-              const prefix = 'opencode/issue' + issueNumber + '-';
+                identity.branch || identity.head_ref || ''
+              ).trim().replace(/^refs\/heads\//, '');
+              const savedSha = String(identity.head_sha || '')
+                .toLowerCase();
+              // A publication claim is only meaningful for this exact
+              // implementation branch and saved checkpoint work.
+              if (!branch || !/^[0-9a-f]{40}$/.test(savedSha)) {
+                throw apiError(0, 'recovery identity is incomplete');
+              }
               const pulls = await readGithub.paginate(
                 readGithub.rest.pulls.list,
                 { owner, repo, state: 'all', per_page: 100 }
               );
-              return pulls.some(pull => {
+              let verificationUnavailable = false;
+              for (const pull of pulls || []) {
                 const headRepo = String(pull.head?.repo?.full_name || '');
-                const headRef = String(pull.head?.ref || '');
-                if (headRepo !== owner + '/' + repo) return false;
+                const headRef = String(pull.head?.ref || '')
+                  .replace(/^refs\/heads\//, '');
+                if (headRepo !== owner + '/' + repo) continue;
+                // An older PR from another attempt or branch is not evidence
+                // that this recovery published the saved work.
+                if (headRef !== branch) continue;
                 const published =
                   pull.state === 'open' ||
                   Boolean(pull.merged_at) ||
                   pull.merged === true;
-                if (!published) return false;
-                // Any published PR on this issue's OpenCode branch family
-                // proves the work already published, even when the current
-                // branch name advanced.
-                return headRef.startsWith(prefix) ||
-                  (Boolean(branch) && headRef === branch);
-              });
+                if (!published) continue;
+                const headSha = String(pull.head?.sha || '').toLowerCase();
+                if (headSha === savedSha) return true;
+                if (!/^[0-9a-f]{40}$/.test(headSha)) {
+                  verificationUnavailable = true;
+                  continue;
+                }
+                // The branch may have advanced, but the published PR must
+                // still contain the checkpoint's saved work.
+                let comparison;
+                try {
+                  comparison = (await readGithub.rest.repos.compareCommits({
+                    owner,
+                    repo,
+                    base: savedSha,
+                    head: headSha,
+                  })).data;
+                } catch (err) {
+                  verificationUnavailable = true;
+                  continue;
+                }
+                const status = String(comparison && comparison.status || '');
+                if (status === 'ahead' || status === 'identical') return true;
+              }
+              if (verificationUnavailable) {
+                throw apiError(0, 'publication work comparison unavailable');
+              }
+              return false;
             }
             if (/^[0-9]+$/.test(String(prNumber || ''))) {
               try {
@@ -926,13 +958,6 @@ jobs:
                     (apiStatus || 'unavailable'),
                 };
               }
-              if (published) {
-                return {
-                  ...evidence,
-                  action: 'stand-down',
-                  reason: 'completed-success',
-                };
-              }
               const implementation =
                 await inspectRunImplementationEvidence(runId);
               if (implementation.kind !== 'ok') {
@@ -956,6 +981,13 @@ jobs:
                   reason: 'completed-success-without-implementation',
                   previousSha,
                   currentSha,
+                };
+              }
+              if (published) {
+                return {
+                  ...evidence,
+                  action: 'stand-down',
+                  reason: 'completed-success',
                 };
               }
               return {
@@ -1588,6 +1620,45 @@ jobs:
             }
             return { consumed: true, commentId: ownId, attempt };
           }
+          // The release is bound to the consumer base the held run rejected
+          // against. A moved base changes the premise, and an unreadable base
+          // cannot prove it unchanged, so neither may authorize a resumption.
+          async function verifyCheckpointConsumerBase({ hold, client }) {
+            const baseRef = String(hold && hold.baseRef || '')
+              .trim().replace(/^refs\/heads\//, '');
+            const wantedSha = String(hold && hold.baseSha || '')
+              .toLowerCase();
+            if (
+              !baseRef ||
+              baseRef === '-' ||
+              !/^[0-9a-f]{40}$/.test(wantedSha)
+            ) {
+              return { ok: false, reason: 'base-unverifiable' };
+            }
+            let response;
+            try {
+              response = await client.rest.git.getRef({
+                owner,
+                repo,
+                ref: 'heads/' + baseRef,
+              });
+            } catch (err) {
+              return {
+                ok: false,
+                reason: 'base-unavailable',
+                status: Number(err && err.status || 0),
+              };
+            }
+            const tip = String(response && response.data?.object?.sha || '')
+              .toLowerCase();
+            if (!/^[0-9a-f]{40}$/.test(tip)) {
+              return { ok: false, reason: 'base-unverifiable' };
+            }
+            if (tip !== wantedSha) {
+              return { ok: false, reason: 'base-changed' };
+            }
+            return { ok: true, sha: tip };
+          }
           async function evaluateCheckpointResumeRelease({
             issueNumber, hold, comments, client, sourceClient, controller,
             allowRelease, liveOverlap,
@@ -1596,6 +1667,14 @@ jobs:
               comments, issueNumber, hold
             );
             if (markers.length > 0) {
+              const base = await verifyCheckpointConsumerBase({
+                hold, client,
+              });
+              if (!base.ok) {
+                return {
+                  released: false, reason: base.reason, markers, base,
+                };
+              }
               const holdOrder = String(hold.order || '');
               const consumptions = checkpointConsumptionMarkers(
                 comments, issueNumber, hold
@@ -1679,6 +1758,12 @@ jobs:
             }
             if (allowRelease === false) {
               return { released: false, reason: 'release-not-allowed' };
+            }
+            const base = await verifyCheckpointConsumerBase({
+              hold, client,
+            });
+            if (!base.ok) {
+              return { released: false, reason: base.reason, base };
             }
             // A genuine live competing run already owns this exact work.
             // Releasing the hold and dispatching beside it would resume the
@@ -2033,6 +2118,50 @@ jobs:
                 seen.add(Number(issue.number));
                 reserved.push(issue);
               }
+            }
+            // A checkpointed issue may carry neither the reservation nor the
+            // ready label: the scheduler releases the reservation on the
+            // qualification/blocker paths even when no ready label is
+            // configured. Inspect one bounded recent page of all open issues
+            // and add only those outside the two label queries, so the
+            // recovery cannot become undiscoverable just because both labels
+            // are absent.
+            let openIssuesResponse = null;
+            try {
+              openIssuesResponse = await readGithub.rest.issues.listForRepo({
+                owner,
+                repo,
+                state: 'open',
+                sort: 'updated',
+                direction: 'desc',
+                per_page: 100,
+                page: 1,
+              });
+            } catch (err) {
+              core.warning(
+                'OpenCode durable 429 recovery could not list open issues for ' +
+                'label-free checkpoint discovery: ' + (err.message || err)
+              );
+            }
+            const openIssues = Array.isArray(openIssuesResponse)
+              ? openIssuesResponse
+              : (
+                openIssuesResponse &&
+                Array.isArray(openIssuesResponse.data)
+                  ? openIssuesResponse.data
+                  : []
+              );
+            for (const issue of openIssues) {
+              if (reserved.length >= 100) break;
+              if (!issue || issue.pull_request) continue;
+              if (seen.has(Number(issue.number))) continue;
+              const names = issueLabelNames(issue);
+              if (
+                names.has(inProgressLabel) ||
+                (readyLabel && names.has(readyLabel))
+              ) continue;
+              seen.add(Number(issue.number));
+              reserved.push(issue);
             }
             const issues = reserved
               .filter(issue => !issue.pull_request)

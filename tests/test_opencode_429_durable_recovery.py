@@ -146,6 +146,15 @@ const readGithub = {
       },
     },
     repos: {
+      compareCommits: async ({ base, head }) => {
+        if (scenario.compareError) {
+          throw apiError(scenario.compareError, 'compare failed');
+        }
+        const key = String(base) + ':' + String(head);
+        const status = (scenario.comparisons || {})[key] ||
+          scenario.compareStatus || 'ahead';
+        return { data: { status } };
+      },
       getContent: async () => {
         if (scenario.metadataError) {
           throw apiError(scenario.metadataError, 'metadata failed');
@@ -409,12 +418,19 @@ class SchedulerDurableRecoveryTests(unittest.TestCase):
     def test_completed_success_with_publication_is_not_live_recovery_ownership(self):
         scenario = self.base_scenario()
         scenario["exactRuns"][0]["conclusion"] = "success"
+        scenario["jobs"] = [
+            {
+                "id": 132975886955,
+                "steps": [{"name": "Run OpenCode", "conclusion": "success"}],
+            }
+        ]
         scenario["pulls"] = [
             {
                 "number": 500,
                 "state": "open",
                 "head": {
                     "ref": "opencode/issue382-39933043642",
+                    "sha": NEW_SHA,
                     "repo": {"full_name": "kodmial/continuum"},
                 },
             }
@@ -422,6 +438,123 @@ class SchedulerDurableRecoveryTests(unittest.TestCase):
         evaluation = self.run_scenario(scenario)["evaluation"]
         self.assertFalse(evaluation["keepReservation"])
         self.assertEqual(evaluation["reason"], "run-completed-success")
+
+    def test_publication_must_match_the_current_recovery_branch(self):
+        scenario = self.base_scenario()
+        scenario["exactRuns"][0]["conclusion"] = "success"
+        scenario["jobs"] = [
+            {
+                "id": 132975886955,
+                "steps": [{"name": "Run OpenCode", "conclusion": "success"}],
+            }
+        ]
+        scenario["pulls"] = [
+            {
+                "number": 500,
+                "state": "merged",
+                "merged_at": "2026-10-23T09:40:00Z",
+                "head": {
+                    "ref": "opencode/issue382-older-attempt",
+                    "sha": OLD_SHA,
+                    "repo": {"full_name": "kodmial/continuum"},
+                },
+            }
+        ]
+        evaluation = self.run_scenario(scenario)["evaluation"]
+        self.assertTrue(evaluation["keepReservation"])
+        self.assertTrue(evaluation["recoveryPending"])
+        self.assertEqual(
+            evaluation["reason"],
+            "run-completed-success-without-publication",
+        )
+
+    def test_publication_must_contain_the_saved_checkpoint_work(self):
+        scenario = self.base_scenario()
+        scenario["exactRuns"][0]["conclusion"] = "success"
+        scenario["jobs"] = [
+            {
+                "id": 132975886955,
+                "steps": [{"name": "Run OpenCode", "conclusion": "success"}],
+            }
+        ]
+        scenario["pulls"] = [
+            {
+                "number": 500,
+                "state": "open",
+                "head": {
+                    "ref": "opencode/issue382-39933043642",
+                    "sha": OLD_SHA,
+                    "repo": {"full_name": "kodmial/continuum"},
+                },
+            }
+        ]
+        scenario["comparisons"] = {
+            NEW_SHA + ":" + OLD_SHA: "behind",
+        }
+        evaluation = self.run_scenario(scenario)["evaluation"]
+        self.assertTrue(evaluation["keepReservation"])
+        self.assertTrue(evaluation["recoveryPending"])
+        self.assertEqual(
+            evaluation["reason"],
+            "run-completed-success-without-publication",
+        )
+
+    def test_publication_may_advance_beyond_the_saved_checkpoint_work(self):
+        descendant = "a" * 40
+        scenario = self.base_scenario()
+        scenario["exactRuns"][0]["conclusion"] = "success"
+        scenario["jobs"] = [
+            {
+                "id": 132975886955,
+                "steps": [{"name": "Run OpenCode", "conclusion": "success"}],
+            }
+        ]
+        scenario["pulls"] = [
+            {
+                "number": 500,
+                "state": "open",
+                "head": {
+                    "ref": "opencode/issue382-39933043642",
+                    "sha": descendant,
+                    "repo": {"full_name": "kodmial/continuum"},
+                },
+            }
+        ]
+        scenario["comparisons"] = {NEW_SHA + ":" + descendant: "ahead"}
+        evaluation = self.run_scenario(scenario)["evaluation"]
+        self.assertFalse(evaluation["keepReservation"])
+        self.assertEqual(evaluation["reason"], "run-completed-success")
+
+    def test_matching_publication_does_not_bypass_implementation_evidence(self):
+        scenario = self.base_scenario()
+        scenario["exactRuns"][0]["conclusion"] = "success"
+        scenario["jobs"] = [
+            {
+                "id": 132975886955,
+                "steps": [
+                    {"name": "Run OpenCode", "conclusion": "skipped"},
+                    {"name": "Implement issue", "conclusion": "skipped"},
+                ],
+            }
+        ]
+        scenario["pulls"] = [
+            {
+                "number": 500,
+                "state": "open",
+                "head": {
+                    "ref": "opencode/issue382-39933043642",
+                    "sha": NEW_SHA,
+                    "repo": {"full_name": "kodmial/continuum"},
+                },
+            }
+        ]
+        evaluation = self.run_scenario(scenario)["evaluation"]
+        self.assertTrue(evaluation["keepReservation"])
+        self.assertTrue(evaluation["recoveryPending"])
+        self.assertEqual(
+            evaluation["reason"],
+            "run-completed-success-without-implementation",
+        )
 
     def test_success_evidence_unavailable_fails_closed(self):
         for name, update in (

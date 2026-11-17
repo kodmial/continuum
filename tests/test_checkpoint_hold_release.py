@@ -131,7 +131,19 @@ const listComments = async () => ({ data: comments.map(c => ({ ...c })) });
 const readGithub = {
   rest: {
     git: {
-      getRef: async () => {
+      getRef: async ({ ref } = {}) => {
+        const refName = String(ref || '').replace(/^heads\//, '');
+        if (refName === String(scenario.baseRef || 'main')) {
+          if (scenario.baseError) {
+            throw apiError(scenario.baseError, 'base ref failed');
+          }
+          return {
+            data: {
+              object: { sha: scenario.baseSha ||
+                '0123456789abcdef0123456789abcdef01234567' },
+            },
+          };
+        }
         if (scenario.refError) throw apiError(scenario.refError, 'ref failed');
         return {
           data: { object: { sha: scenario.refSha || scenario.holdSha } },
@@ -679,6 +691,42 @@ class CheckpointHoldReleaseTests(unittest.TestCase):
             [],
         )
 
+    def test_changed_consumer_base_never_releases_the_hold(self):
+        scenario = self.base_scenario()
+        scenario["baseSha"] = "f" * 40
+        result = self.run_scenario(scenario)
+        for name in ("scheduler", "watchdog"):
+            self.assertTrue(result[name]["blocked"], name)
+            self.assertFalse(result[name]["release"]["released"], name)
+            self.assertEqual(result[name]["release"]["reason"], "base-changed")
+        self.assertEqual(
+            [c for c in result["comments"] if "resume-release" in c["body"]],
+            [],
+        )
+
+    def test_unavailable_consumer_base_never_releases_the_hold(self):
+        for status in (403, 404, 500):
+            with self.subTest(status=status):
+                scenario = self.base_scenario()
+                scenario["baseError"] = status
+                result = self.run_scenario(scenario)
+                for name in ("scheduler", "watchdog"):
+                    self.assertTrue(result[name]["blocked"], name)
+                    self.assertFalse(
+                        result[name]["release"]["released"], name
+                    )
+                    self.assertEqual(
+                        result[name]["release"]["reason"],
+                        "base-unavailable",
+                    )
+                self.assertEqual(
+                    [
+                        c for c in result["comments"]
+                        if "resume-release" in c["body"]
+                    ],
+                    [],
+                )
+
     def test_comment_claim_or_arbitrary_commit_is_not_fix_provenance(self):
         scenario = self.base_scenario()
         scenario["manifest"] = None
@@ -885,6 +933,7 @@ class CheckpointHoldReleaseTests(unittest.TestCase):
 
         scenario = self.base_scenario()
         scenario["holdSha"] = checkpoint
+        scenario["baseSha"] = base
         scenario["comments"] = [
             {
                 "id": 11,
