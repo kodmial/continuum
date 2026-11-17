@@ -261,6 +261,11 @@ jobs:
       dispatch_repair: ${{ github.event_name == 'pull_request' && (github.event.pull_request.head.repo.full_name != github.repository || github.actor == 'dependabot[bot]') && 'false' || 'true' }}
 ```
 
+Both the `uses:` ref and the `continuum_ref:` input must be replaced with the
+same full commit SHA used for installation. The installer does not edit
+`ci.yml`; follow the pinning step in
+[Inspect and pin Continuum](quickstart.md#2-inspect-and-pin-continuum).
+
 A complete runnable example is in
 [`examples/minimal-consumer/.github/workflows/ci.yml`](../examples/minimal-consumer/.github/workflows/ci.yml).
 
@@ -314,9 +319,14 @@ The preview lists every superseded caller that would be pruned and changes
 nothing. A real non-interactive install also deletes nothing; confirm the exact
 list at a terminal, or use `--yes`/`CONTINUUM_INSTALL_ASSUME_YES=1` only for an
 owner-approved unattended prune. Keep the canonical caller installed before
-removing the old one. To roll back, restore the previous caller file from the
-consumer's Git history (or reinstall from the previous Continuum ref) and re-run
-the installer for the sets you use.
+removing the old one. To roll back, remove the installed canonical
+`continuum-coderabbit-unresolved.yml` caller, restore the compatible legacy
+`continuum-opencode-unresolved.yml` caller from the consumer's Git history, and
+use the matching previous Continuum installer and ref that shipped it. Then
+re-run the installer for the sets you use from that previous ref. Restoring the
+caller alone is not enough: the legacy caller disables itself while the
+canonical caller is present, and the current installer does not ship the legacy
+caller and can prune it.
 
 The `tech` and `parent` sets remain optional. CodeRabbit, PR-Agent, Render, and
 delegation are enabled only when you install and configure them.
