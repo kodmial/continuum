@@ -5525,10 +5525,32 @@ jobs:
           continuum_stage_publishable || exit 1
           if ! git diff --cached --quiet; then
             git commit -m "fix: repair blocking workflow for PR #${PR_NUMBER}" -m "Continuum-Component: opencode"
-            # kodmial/continuum#302: CI repair publishes only to the proven
-            # non-default PR head asserted on entry.
+            # kodmial/continuum#302: publish only to the proven PR ref.
+            # The PR may advance during CI-fix; never overwrite its history.
+            # The newer HEAD is evaluated by its own exact-HEAD CI-repair gate.
             continuum_assert_safe_push "${HEAD_REF}" || exit 1
-            git push origin "HEAD:${HEAD_REF}"
+            if ! git fetch --no-tags origin "refs/heads/${HEAD_REF}"; then
+              echo "::error::Cannot verify remote CI-repair PR head."
+              exit 1
+            fi
+            REMOTE_HEAD="$(git rev-parse FETCH_HEAD)"
+            if [[ "$REMOTE_HEAD" != "$BEFORE_SHA" ]]; then
+              echo "::notice::CI-repair PR #${PR_NUMBER}: superseded by remote HEAD $REMOTE_HEAD (base $BEFORE_SHA); stale fix discarded."
+              exit 0
+            fi
+            if ! git push origin "HEAD:${HEAD_REF}"; then
+              # Recheck the actual ref: reject a transport/auth failure, but
+              # treat a proved concurrent head advance as a stale no-op.
+              if git fetch --no-tags origin "refs/heads/${HEAD_REF}"; then
+                REMOTE_HEAD="$(git rev-parse FETCH_HEAD)"
+                if [[ "$REMOTE_HEAD" != "$BEFORE_SHA" ]]; then
+                  echo "::notice::CI-repair PR #${PR_NUMBER}: superseded during push by $REMOTE_HEAD; new-head CI owns recovery."
+                  exit 0
+                fi
+              fi
+              echo "::error::CI-repair push failed without confirmed HEAD advance."
+              exit 1
+            fi
           fi
           AFTER_SHA=$(git rev-parse HEAD)
           if [[ "$AFTER_SHA" != "$BEFORE_SHA" ]]; then

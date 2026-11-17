@@ -292,6 +292,14 @@ APPROVED_SCHEDULER_ORIGIN_OPENCODE_SHA256 = (
 APPROVED_454_TELEMETRY_OPENCODE_SHA256 = (
     "c740682de530c242cc5904d0c53d8a2eed6cbb6900347ea453fbc03de4917249"
 )
+
+# 2026-11-17: explicitly reviewed CI-repair/main-sync race fix. The exact
+# protected workflow digest advances only for the verified non-destructive
+# CI-fix publication fence; the prior #454 telemetry digest remains immutable
+# above for historical audit. The new exact pin rejects any unrelated drift.
+APPROVED_CI_REPAIR_SYNC_OPENCODE_SHA256 = (
+    "aec3ba6c112b329a92fb3319b71ab1ecce458e93f746a2addff1f704d9856a7f"
+)
 # 2026-11-16: intentional generation-2 checkpoint-resume correction
 # (kodmial/continuum#460). A validated generation-2+ legacy mirror may resume
 # only when its immutable metadata binds the same durable ref/operation/issue
@@ -336,6 +344,15 @@ APPROVED_458_460_455_MERGED_OPENCODE_SHA256 = (
 # unrelated drift still fails closed.
 APPROVED_459_REVIEW_OPENCODE_SHA256 = (
     "98d11bb92fbb11007c25588fde700c703b58a1eb5cf1ee4be48a3533b8b16b8d"
+)
+# 2026-11-17 merge of main into #459: the protected workflow now carries both
+# the reviewed PR #459 publication-attestation repair above and main's
+# #339eb2f CI-repair/main-sync publication fence, which discards a stale
+# CI-fix push only after proving the remote head advanced. The earlier #454,
+# CI-repair-sync, and #459 review pins stay for audit; this active pin covers
+# the combined bytes and any unrelated drift still fails closed.
+APPROVED_459_CI_REPAIR_SYNC_MERGED_OPENCODE_SHA256 = (
+    "a8d028a7f02cd74678f843ecc658956d40a9d9c24736db9038b17be43558c824"
 )
 # The prior #460 resume pin stays for audit; any further byte drift still
 # fails closed.
@@ -2764,12 +2781,13 @@ class ProtectedBaselineTests(unittest.TestCase):
                     self.assertIn("steps.model_route.outputs.model", original)
                 if path == ".github/workflows/continuum-opencode.yml":
                     # #458 publication attestation, main's #460 resume repair,
-                    # and main's #454 telemetry upload all share this artifact,
-                    # with full-file digests and executable regression tests.
+                    # main's #454 telemetry upload, and main's reviewed
+                    # CI-repair/main-sync fence all share this artifact, with
+                    # full-file digests and executable regression tests.
                     self.assertEqual(
                         protected_file_digest(path),
-                        APPROVED_459_REVIEW_OPENCODE_SHA256,
-                        f"{path}: unexpected drift outside the PR #459 review repair of the merged protected workflow",
+                        APPROVED_459_CI_REPAIR_SYNC_MERGED_OPENCODE_SHA256,
+                        f"{path}: unexpected drift outside the PR #459 review repair merged with main's CI-repair/main-sync fence",
                     )
                 else:
                     # The self-dogfood caller is the dispatchable surface
@@ -2854,7 +2872,7 @@ class ProtectedBaselineTests(unittest.TestCase):
         # therefore be dirty in this pre-commit worktree; any unapproved byte
         # change still fails the exact digest assertions above.
         approved = {
-            ".github/workflows/continuum-opencode.yml": APPROVED_459_REVIEW_OPENCODE_SHA256,
+            ".github/workflows/continuum-opencode.yml": APPROVED_459_CI_REPAIR_SYNC_MERGED_OPENCODE_SHA256,
             ".github/workflows/opencode.yml": APPROVED_350_SELF_CALLER_SHA256,
         }
         for path in PROTECTED_FILES:
