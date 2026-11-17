@@ -840,6 +840,50 @@ jobs:
               )[0] || null;
           }
 
+          // PR-Agent statuses do not cover the same PR's OpenCode CI/review
+          // repair workflow. A live OpenCode run owns the mutable PR head:
+          // never merge main underneath it. Recheck just before update-branch.
+          async function activeOpenCodeRepairOperation(pr) {
+            const workflowId =
+              process.env.OPENCODE_WORKFLOW || 'continuum-opencode.yml';
+            const target = `OpenCode repair PR #${pr.number}`;
+            for (const status of ACTIVE_REPAIR_STATUSES) {
+              let runs;
+              try {
+                const { data } = await withReadFallback(client =>
+                  client.rest.actions.listWorkflowRuns({
+                    owner, repo, workflow_id: workflowId,
+                    event: 'workflow_dispatch', status, per_page: 100,
+                  })
+                );
+                if (!Array.isArray(data?.workflow_runs) ||
+                    Number(data.total_count || 0) > data.workflow_runs.length) {
+                  throw new Error('incomplete OpenCode repair inventory');
+                }
+                runs = data.workflow_runs;
+              } catch (err) {
+                core.warning(
+                  `PR #${pr.number}: could not verify live OpenCode repair; ` +
+                  `holding main sync: ${err.message || err}`
+                );
+                return { active: true, reason: 'OpenCode repair inventory unavailable' };
+              }
+              const run = runs.find(item => {
+                const name = String(item.display_title || item.name || '');
+                return (name === target || name.startsWith(`${target} [`)) &&
+                  item.event === 'workflow_dispatch' &&
+                  ACTIVE_REPAIR_STATUSES.has(String(item.status || '').toLowerCase());
+              });
+              if (run) {
+                return {
+                  active: true,
+                  reason: `OpenCode repair run ${run.id} is ${run.status}`,
+                };
+              }
+            }
+            return { active: false, reason: '' };
+          }
+
           // A running PR-Agent review/repair is a live Work Lock on this
           // exact source HEAD. An automatic main-sync during the agent run
           // discards minutes of valid repair work; do not mutate that branch
@@ -848,6 +892,8 @@ jobs:
           // run's live status so a crashed/completed old run cannot strand
           // the queue. Only invoked when a merge-critical sync is required.
           async function activePrAgentHeadOperation(pr) {
+            const opencode = await activeOpenCodeRepairOperation(pr);
+            if (opencode.active) return opencode;
             const { data } = await withReadFallback(client =>
               client.rest.repos.getCombinedStatusForRef({
                 owner, repo, ref: pr.head.sha,
