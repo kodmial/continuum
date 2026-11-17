@@ -1,0 +1,19 @@
+{
+  "schema_version": 1,
+  "description": "Machine-verifiable validator fixes that may release a reason-specific deterministic checkpoint resume hold once. A release requires the pull request to be merged, independently reviewed, to touch one of the listed paths, and to have its merge commit contained in the verified Continuum source ref.",
+  "fixes": [
+    {
+      "id": "generation-2-checkpoint-validator",
+      "pull_request": 461,
+      "merge_sha": "d063e72900790a647a9709771f477085b8141d83",
+      "reasons": [
+        "wrong-generation",
+        "resume-wrong-generation"
+      ],
+      "paths": [
+        "src/continuum/checkpoint_resume.py",
+        "tests/test_checkpoint_resume.py"
+      ]
+    }
+  ]
+}

@@ -6880,7 +6880,7 @@ class ContinuumTest < Minitest::Test
     # against a checkpoint/base/snapshot already known to fail before coding.
     assert_includes local_dispatch, 'const freshResumeHold = await checkpointResumeHold('
     assert_includes local_dispatch, 'checkpointResumeHoldSkipReason(issue.number, freshResumeHold)'
-    assert_equal 8, local_dispatch.scan(/^\s+continue;\s*$/).size,
+    assert_equal 9, local_dispatch.scan(/^\s+continue;\s*$/).size,
                  'every local just-in-time guard must be a skip, not a fall-through'
   end
 
@@ -6899,9 +6899,9 @@ class ContinuumTest < Minitest::Test
     scheduler_hold = scheduler[scheduler_start...scheduler_finish]
 
     watchdog = watchdog_body
-    watchdog_start = watchdog.index('            const TASK_SNAPSHOT_GENERATION = 1;')
+    watchdog_start = watchdog.index('          const TASK_SNAPSHOT_GENERATION = 1;')
     watchdog_finish = watchdog.index(
-      '            async function discoverDurableRecoveryCandidates()',
+      '          async function discoverDurableRecoveryCandidates()',
       watchdog_start
     )
     refute_nil watchdog_start, 'the watchdog checkpoint hold is missing'
@@ -7009,6 +7009,47 @@ class ContinuumTest < Minitest::Test
     stdout, stderr, status = Open3.capture3('node', '-e', harness, chdir: ROOT)
     assert status.success?, stderr
     assert_includes stdout, 'checkpoint-resume-hold-selector: PASS'
+  end
+
+  # #477: a deterministic checkpoint hold may be released only by a
+  # machine-verifiable validator-fix manifest entry that is merged into the
+  # verified Continuum source revision. Comment prose and arbitrary main
+  # commits never authorize a release, and a green wrapper without
+  # implementation/publication evidence stays incomplete.
+  def test_checkpoint_resume_hold_release_is_manifest_verified
+    manifest_path = File.join(ROOT, '.github/continuum-checkpoint-validator-fixes.json')
+    assert File.file?(manifest_path), 'the checkpoint validator fix manifest is missing'
+    manifest = JSON.parse(File.read(manifest_path))
+    assert_equal 1, manifest.fetch('schema_version')
+    fixes = manifest.fetch('fixes')
+    refute_empty fixes
+    fixes.each do |fix|
+      assert_match(/\A[A-Za-z0-9_.-]+\z/, fix.fetch('id'))
+      assert_kind_of Integer, fix.fetch('pull_request')
+      assert_match(/\A[0-9a-f]{40}\z/, fix.fetch('merge_sha'))
+      assert_includes fix.fetch('reasons'), 'wrong-generation'
+      refute_empty fix.fetch('paths')
+    end
+
+    scheduler = File.read(File.join(ROOT, '.github/scripts/issue_scheduler.js'))
+    watchdog = watchdog_body
+    [scheduler, watchdog].each do |body|
+      assert_includes body, '.github/continuum-checkpoint-validator-fixes.json'
+      assert_includes body, 'continuum-checkpoint-resume-release'
+      assert_includes body, '15 * 60 * 1000'
+      assert_includes body, "options.allowRelease !== false"
+      assert_includes body, 'repos.compareCommits'
+      assert_includes body, 'listFiles'
+      assert_includes body, 'listReviews'
+    end
+    assert_includes scheduler, 'allowRelease: false'
+    assert_includes scheduler, 'run-completed-success-without-implementation'
+    assert_includes scheduler, 'run-completed-success-without-publication'
+    assert_includes watchdog, 'completed-success-without-implementation'
+    assert_includes watchdog, 'completed-success-without-publication'
+    assert_includes watchdog, "READY_LABEL: ${{ vars.AUTOMATION_READY_LABEL || 'automation:ready' }}"
+    assert_includes watchdog, "process.env.READY_LABEL || 'automation:ready'"
+    assert_includes watchdog, 'discoveryLabels.push(readyLabel)'
   end
 
   # kodmial/continuum#266: the optional `automation:ready` admission gate.

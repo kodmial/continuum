@@ -239,7 +239,7 @@ class WatchdogContractTest(unittest.TestCase):
             "generation matching must never be an unanchored prefix substring",
         )
         self.assertIn(
-            "parseRecoveryStates(\n                  comment.body || '', operation, generation\n                ).length > 0",
+            "parseRecoveryStates(\n                comment.body || '', operation, generation\n              ).length > 0",
             self.body,
             "state updates must locate the exact operation+generation marker",
         )

@@ -15,11 +15,10 @@ import re
 import shutil
 import subprocess
 import tempfile
+import textwrap
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-
-import yaml
 
 ROOT = Path(__file__).resolve().parents[1]
 TMP_PARENT = ROOT / ".opencode-tmp"
@@ -147,6 +146,10 @@ function makeRest() {
         if (!pull) throw apiError(404, 'pull not found');
         return { data: { ...pull } };
       },
+      listFiles: async () =>
+        (scenario.pullFiles || []).map(file => ({ ...file })),
+      listReviews: async () =>
+        (scenario.pullReviews || []).map(review => ({ ...review })),
     },
     actions: {
       listWorkflowRuns: async () => state.workflowRuns.map(run => ({ ...run })),
@@ -178,8 +181,18 @@ function makeRest() {
           },
         };
       },
-      listJobsForWorkflowRun: async () =>
-        (scenario.jobs || []).map(job => ({ ...job })),
+      listJobsForWorkflowRun: async (params = {}) => {
+        if (
+          scenario.jobsError &&
+          (
+            !scenario.jobsErrorRun ||
+            String(params.run_id) === String(scenario.jobsErrorRun)
+          )
+        ) {
+          throw apiError(scenario.jobsError, 'job listing failed');
+        }
+        return (scenario.jobs || []).map(job => ({ ...job }));
+      },
       getWorkflowRun: async ({ run_id }) => {
         const key = String(run_id);
         state.runLookups.push(key);
@@ -230,7 +243,25 @@ function makeRest() {
     },
     repos: {
       get: async () => ({ data: { default_branch: 'main' } }),
+      compareCommits: async () => ({
+        data: { status: scenario.compareStatus || 'ahead' },
+      }),
       getContent: async ({ path }) => {
+        if (path === '.github/continuum-checkpoint-validator-fixes.json') {
+          if (!scenario.validatorFixManifest) {
+            throw apiError(404, 'manifest not found');
+          }
+          const manifest = scenario.validatorFixManifest;
+          const text = typeof manifest === 'string'
+            ? manifest
+            : JSON.stringify(manifest);
+          return {
+            data: {
+              type: 'file',
+              content: Buffer.from(text, 'utf8').toString('base64'),
+            },
+          };
+        }
         if (path === '.continuum-429-recovery.json') {
           if (!scenario.checkpoint || scenario.checkpoint.missingMetadata) {
             throw apiError(404, 'metadata not found');
@@ -287,6 +318,7 @@ class MockGithub {
         }
         return items;
       }
+      if (first && Array.isArray(first.data)) return first.data;
       return first;
     };
   }
@@ -366,12 +398,21 @@ async function runOnce() {
 
 
 def watchdog_script() -> str:
-    data = yaml.safe_load(WATCHDOG.read_text(encoding="utf-8"))
-    for step in data["jobs"]["recover"]["steps"]:
-        script = (step.get("with") or {}).get("script")
-        if script and "recoverFrom429OnFreshVm" in script:
-            return script
-    raise AssertionError("production watchdog script not found")
+    """Return the production watchdog body staged from its quoted heredoc.
+
+    ``actions/github-script`` passes its ``script:`` input through argv, so the
+    implementation is staged in ``$RUNNER_TEMP`` and only a small loader stays
+    inline. The tests execute the staged body, not the loader.
+    """
+    body = WATCHDOG.read_text(encoding="utf-8")
+    marker = (
+        'cat > "$RUNNER_TEMP/continuum/opencode-watchdog.js" '
+        "<<'CONTINUUM_WATCHDOG_JS'\n"
+    )
+    start = body.index(marker) + len(marker)
+    return textwrap.dedent(
+        body[start:body.index("\n          CONTINUUM_WATCHDOG_JS\n", start)]
+    )
 
 
 def recovery_marker(state, sha, run_id, attempt=1, next_due=0):
@@ -660,6 +701,51 @@ class WatchdogHarness(unittest.TestCase):
         ]
         result = self.run_scenario(scenario)
         self.assert_no_dispatch(result)
+
+    def test_green_run_without_implementation_or_publication_is_resumed(self):
+        for name, steps, reason in (
+            (
+                "skipped",
+                [
+                    {"name": "Run OpenCode", "conclusion": "skipped"},
+                    {"name": "Implement issue", "conclusion": "skipped"},
+                ],
+                "completed-success-without-implementation",
+            ),
+            (
+                "implemented-no-pr",
+                [{"name": "Run OpenCode", "conclusion": "success"}],
+                "completed-success-without-publication",
+            ),
+        ):
+            with self.subTest(name=name):
+                scenario = base_scenario()
+                scenario["runs"][0]["conclusion"] = "success"
+                scenario["jobs"] = [{"id": 132975886955, "steps": steps}]
+                result = self.run_scenario(scenario)
+                self.assert_one_current_dispatch(result, NEW_SHA)
+                self.assertTrue(
+                    any(
+                        reason in " ".join(line)
+                        for line in result["notices"]
+                    ),
+                    result["notices"],
+                )
+
+    def test_success_run_evidence_unavailable_fails_closed(self):
+        scenario = base_scenario()
+        scenario["runs"][0]["conclusion"] = "success"
+        scenario["jobsError"] = 500
+        scenario["jobsErrorRun"] = OLD_RUN_ID
+        result = self.run_scenario(scenario)
+        self.assert_no_dispatch(result)
+        self.assertTrue(
+            any(
+                "run-evidence-500" in " ".join(line)
+                for line in result["notices"]
+            ),
+            result["notices"],
+        )
 
     def test_failed_run_that_published_a_pr_is_not_redispatched(self):
         scenario = base_scenario()
@@ -1160,11 +1246,15 @@ class WatchdogHarness(unittest.TestCase):
         result = self.run_scenario(scenario)
         self.assert_no_dispatch(result)
 
-    def test_scheduled_unreserved_issue_is_not_scanned(self):
+    def test_scheduled_ready_only_issue_is_scanned(self):
+        # AA #534 shape: the scheduler reconciliation removed the in-progress
+        # reservation while the deterministic hold was stale, so only
+        # automation:ready remains. The watchdog must still discover the
+        # trusted durable checkpoint instead of assuming the scheduler owns it.
         scenario = self.durable_scenario()
         scenario["issues"][0]["labels"] = [{"name": "automation:ready"}]
         result = self.run_scenario(scenario)
-        self.assert_no_dispatch(result)
+        self.assert_one_current_dispatch(result, NEW_SHA)
 
     def normal_retry_scenario(self):
         # A failed OpenCode issue run without a 429 marker reaches the normal

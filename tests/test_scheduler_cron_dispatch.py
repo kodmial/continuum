@@ -660,12 +660,14 @@ function stopOrderKey(c) {
         self.assertIn("async function checkpointResumeHold(", watchdog)
         self.assertIn("recoveryCheckpointRef = null", watchdog)
         self.assertIn("normalizeCheckpointRef(match[5])", watchdog)
-        self.assertIn("return { blocked: true, marker };", watchdog)
+        self.assertIn(
+            "return { blocked: true, marker, release: null };", watchdog
+        )
         self.assertIn(
             "const hold = await checkpointResumeHold(", watchdog
         )
         self.assertIn(
-            "issueText, comments, checkpointRef", watchdog
+            "issueText, comments, checkpointRef,", watchdog
         )
         self.assertLess(
             watchdog.index("const checkpointResumeBlockedRe ="),

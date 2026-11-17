@@ -777,9 +777,21 @@ module.exports = async function runIssueScheduler({ github, context, core }) {
   //   * a `continuum-task-snapshot` marker's `generation` is the *task*
   //     generation, which the workflow pins to 1 (`continuum-opencode.yml`).
   //     Only that generation can release the hold with a different spec.
+  //
+  // A deterministic hold can also become obsolete when the code that produced
+  // it was independently reviewed, merged, and is present in the Continuum
+  // source revision this controller verifies. That release is deliberately
+  // narrow: only a reason-specific, machine-verifiable validator fix is
+  // accepted, the exact repo/issue/snapshot/base/checkpoint/generation must
+  // still match, and one durable release claim is created before any dispatch.
+  // Arbitrary default-branch commits, free-form comments, a moved checkpoint,
+  // a changed snapshot, an owner STOP, or a live competing run never release.
+  let checkpointResumeHoldRelease = null;
   async function checkpointResumeHold(
-    targetOwner, targetRepo, issueNumber, comments, client, taskGeneration = 1
+    targetOwner, targetRepo, issueNumber, comments, client, taskGeneration = 1,
+    options = {}
   ) {
+    checkpointResumeHoldRelease = null;
     const wantedRepo = (targetOwner + '/' + targetRepo).toLowerCase();
     const wantedTaskGeneration = Number(taskGeneration) || 1;
     const trusted = (comments || []).filter(comment =>
@@ -799,6 +811,7 @@ module.exports = async function runIssueScheduler({ github, context, core }) {
       const candidate = {
         created_at: comment.created_at || '',
         id: comment.id || 0,
+        generation: Number(match[3]),
         operation: match[4],
         checkpointRef: match[5],
         checkpointSha: match[6].toLowerCase(),
@@ -875,6 +888,28 @@ module.exports = async function runIssueScheduler({ github, context, core }) {
         '; keeping the deterministic hold until it can be proven changed.'
       );
     }
+    if (
+      checkpointFixableHoldReasons.has(marker.reason) &&
+      options.allowRelease !== false
+    ) {
+      const release = await evaluateCheckpointResumeRelease({
+        targetOwner,
+        targetRepo,
+        issueNumber,
+        hold: marker,
+        comments,
+        readClient: client,
+        writeClient: options.writeClient || github,
+        controller: options.controller || 'issue-scheduler',
+        allowRelease: options.allowRelease !== false,
+      });
+      checkpointResumeHoldRelease = release;
+      if (release.released) return null;
+      // A concurrent release claim won the race. The loser deleted its own
+      // marker, so this pass must stand down instead of dispatching a second
+      // resumption beside the winner.
+      if (release.deferred) return marker;
+    }
     return marker;
   }
 
@@ -885,6 +920,442 @@ module.exports = async function runIssueScheduler({ github, context, core }) {
       '); the saved checkpoint is preserved and this exact ' +
       'checkpoint/base/snapshot is not redispatched until a material ' +
       'premise changes.';
+  }
+
+  // A hold may outlive the reviewed validator fix that caused it. The release
+  // is authorized only by a machine-verifiable manifest entry whose pull
+  // request is merged, independently reviewed, and contained in the verified
+  // Continuum source revision. The manifest is code in the source repository,
+  // never a comment claim, so arbitrary main commits cannot release a hold.
+  const checkpointResumeReleaseMarkerRe =
+    /<!--\s*continuum-checkpoint-resume-release\s+v=1\s+repo=([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)\s+issue=(\d+)\s+generation=(\d+)\s+operation=(\S+)\s+checkpoint=(\S+)\s+checkpoint_sha=([0-9a-fA-F]{40})\s+base_ref=(\S+)\s+base_sha=([0-9a-fA-F]{40})\s+snapshot=([0-9a-fA-F]{64})\s+reason=(\S+)\s+fix=([A-Za-z0-9_.-]+)\s+fix_pr=(\d+)\s+fix_sha=([0-9a-fA-F]{40})\s+owner=([A-Za-z0-9_.-]+)\s*-->/;
+  const checkpointFixableHoldReasons = new Set([
+    'wrong-generation',
+    'resume-wrong-generation',
+  ]);
+  const checkpointValidatorFixManifestPath =
+    '.github/continuum-checkpoint-validator-fixes.json';
+  const continuumSourceRepository = (
+    process.env.CONTINUUM_SOURCE_REPOSITORY || 'kodmial/continuum'
+  ).trim();
+  const continuumSourceRef = (
+    process.env.CONTINUUM_SOURCE_REF || 'main'
+  ).trim();
+  const checkpointReleaseOwnershipWindowMs = 15 * 60 * 1000;
+  let checkpointValidatorFixManifestCache = null;
+
+  function checkpointSourceSlug() {
+    const parts = String(continuumSourceRepository || '').split('/');
+    if (
+      parts.length !== 2 ||
+      !/^[A-Za-z0-9_.-]+$/.test(parts[0]) ||
+      !/^[A-Za-z0-9_.-]+$/.test(parts[1])
+    ) {
+      return null;
+    }
+    return { owner: parts[0], repo: parts[1] };
+  }
+
+  async function readCheckpointValidatorFixManifest(client) {
+    if (checkpointValidatorFixManifestCache) {
+      return checkpointValidatorFixManifestCache;
+    }
+    const source = checkpointSourceSlug();
+    if (!source) {
+      checkpointValidatorFixManifestCache = {
+        kind: 'invalid', reason: 'source-slug',
+      };
+      return checkpointValidatorFixManifestCache;
+    }
+    let response;
+    try {
+      response = await client.rest.repos.getContent({
+        owner: source.owner,
+        repo: source.repo,
+        path: checkpointValidatorFixManifestPath,
+        ref: continuumSourceRef,
+      });
+    } catch (err) {
+      const status = Number(err && err.status || 0);
+      checkpointValidatorFixManifestCache = {
+        kind: status === 404 ? 'missing' : 'unavailable',
+        status,
+      };
+      return checkpointValidatorFixManifestCache;
+    }
+    const content = response && response.data;
+    if (!content || Array.isArray(content) || content.type !== 'file') {
+      checkpointValidatorFixManifestCache = {
+        kind: 'invalid', reason: 'manifest-not-file',
+      };
+      return checkpointValidatorFixManifestCache;
+    }
+    let manifest;
+    try {
+      manifest = JSON.parse(
+        Buffer.from(content.content || '', 'base64').toString('utf8')
+      );
+    } catch (err) {
+      checkpointValidatorFixManifestCache = {
+        kind: 'invalid', reason: 'manifest-not-json',
+      };
+      return checkpointValidatorFixManifestCache;
+    }
+    if (
+      !manifest ||
+      typeof manifest !== 'object' ||
+      Array.isArray(manifest) ||
+      Number(manifest.schema_version) !== 1 ||
+      !Array.isArray(manifest.fixes)
+    ) {
+      checkpointValidatorFixManifestCache = {
+        kind: 'invalid', reason: 'manifest-schema',
+      };
+      return checkpointValidatorFixManifestCache;
+    }
+    checkpointValidatorFixManifestCache = {
+      kind: 'ok',
+      fixes: manifest.fixes.slice(0, 20),
+    };
+    return checkpointValidatorFixManifestCache;
+  }
+
+  async function verifyCheckpointValidatorFix(hold, client) {
+    if (!hold || !checkpointFixableHoldReasons.has(String(hold.reason || ''))) {
+      return { ok: false, reason: 'reason-not-fixable' };
+    }
+    const manifest = await readCheckpointValidatorFixManifest(client);
+    if (manifest.kind !== 'ok') {
+      return { ok: false, reason: 'manifest-' + manifest.kind };
+    }
+    const source = checkpointSourceSlug();
+    if (!source) return { ok: false, reason: 'source-slug' };
+    const candidates = manifest.fixes.filter(entry =>
+      entry &&
+      Array.isArray(entry.reasons) &&
+      entry.reasons.map(reason => String(reason)).includes(hold.reason)
+    );
+    for (const entry of candidates) {
+      const id = String(entry.id || '').trim();
+      const pullRequest = Number(entry.pull_request);
+      const mergeSha = String(entry.merge_sha || '').toLowerCase();
+      if (
+        !/^[A-Za-z0-9_.-]{1,80}$/.test(id) ||
+        !Number.isInteger(pullRequest) ||
+        pullRequest < 1 ||
+        !/^[0-9a-f]{40}$/.test(mergeSha)
+      ) continue;
+      let pull;
+      try {
+        pull = (await client.rest.pulls.get({
+          owner: source.owner,
+          repo: source.repo,
+          pull_number: pullRequest,
+        })).data;
+      } catch (err) {
+        continue;
+      }
+      if (
+        !pull ||
+        pull.merged !== true ||
+        String(pull.merge_commit_sha || '').toLowerCase() !== mergeSha
+      ) continue;
+      const author = String(
+        pull.user && pull.user.login || ''
+      ).toLowerCase();
+      let reviews;
+      try {
+        reviews = await client.paginate(
+          client.rest.pulls.listReviews,
+          {
+            owner: source.owner,
+            repo: source.repo,
+            pull_number: pullRequest,
+            per_page: 100,
+          }
+        );
+      } catch (err) {
+        continue;
+      }
+      const independentlyReviewed = (reviews || []).some(review => {
+        const login = String(
+          review && review.user && review.user.login || ''
+        ).toLowerCase();
+        const state = String(review && review.state || '').toUpperCase();
+        return Boolean(login) &&
+          login !== author &&
+          ['APPROVED', 'CHANGES_REQUESTED', 'COMMENTED'].includes(state);
+      });
+      if (!independentlyReviewed) continue;
+      let files;
+      try {
+        files = await client.paginate(
+          client.rest.pulls.listFiles,
+          {
+            owner: source.owner,
+            repo: source.repo,
+            pull_number: pullRequest,
+            per_page: 100,
+          }
+        );
+      } catch (err) {
+        continue;
+      }
+      const requiredPaths = Array.isArray(entry.paths)
+        ? entry.paths.map(path => String(path))
+        : [];
+      if (
+        requiredPaths.length > 0 &&
+        !requiredPaths.some(required =>
+          (files || []).some(file =>
+            String(file && file.filename || '') === required
+          )
+        )
+      ) continue;
+      let comparison;
+      try {
+        comparison = (await client.rest.repos.compareCommits({
+          owner: source.owner,
+          repo: source.repo,
+          base: mergeSha,
+          head: continuumSourceRef,
+        })).data;
+      } catch (err) {
+        continue;
+      }
+      const status = String(comparison && comparison.status || '');
+      if (!['ahead', 'identical'].includes(status)) continue;
+      return {
+        ok: true,
+        fix: {
+          id,
+          pullRequest,
+          mergeSha,
+          reason: hold.reason,
+        },
+      };
+    }
+    return { ok: false, reason: 'no-verified-fix' };
+  }
+
+  function checkpointReleaseMarkerBody({
+    repoFull, issueNumber, hold, fix, controller,
+  }) {
+    const clean = (value, fallback) => {
+      const text = String(value || '').trim().replace(/\s+/g, '-');
+      return text || (fallback || '-');
+    };
+    const marker =
+      '<!-- continuum-checkpoint-resume-release v=1 repo=' + repoFull +
+      ' issue=' + Number(issueNumber) +
+      ' generation=' + (Number(hold.generation) || 0) +
+      ' operation=' + clean(hold.operation, 'unknown') +
+      ' checkpoint=' + clean(hold.checkpointRef) +
+      ' checkpoint_sha=' + String(hold.checkpointSha || '').toLowerCase() +
+      ' base_ref=' + clean(hold.baseRef, 'main') +
+      ' base_sha=' + String(hold.baseSha || '').toLowerCase() +
+      ' snapshot=' + String(hold.snapshotSpec || '').toLowerCase() +
+      ' reason=' + clean(hold.reason) +
+      ' fix=' + fix.id +
+      ' fix_pr=' + fix.pullRequest +
+      ' fix_sha=' + fix.mergeSha +
+      ' owner=' + controller + ' -->';
+    return [
+      marker,
+      '⚡ **Continuum · issue-scheduler**',
+      '<!-- continuum-origin role=continuum component=issue-scheduler -->',
+      '',
+      'Released the deterministic checkpoint resume hold for #' +
+        Number(issueNumber) + ' once, because the exact validator fix `' +
+        fix.id + '` (PR #' + fix.pullRequest + ', merge `' + fix.mergeSha +
+        '`) is independently reviewed, merged, and contained in the verified ' +
+        'Continuum source revision.',
+      '',
+      'Checkpoint `' + clean(hold.checkpointRef) + '` at `' +
+        String(hold.checkpointSha || '').toLowerCase() +
+        '`, snapshot `' + String(hold.snapshotSpec || '').toLowerCase() +
+        '`, base `' + clean(hold.baseRef, 'main') + '` at `' +
+        String(hold.baseSha || '').toLowerCase() +
+        '` and recovery generation ' + (Number(hold.generation) || 0) +
+        ' are unchanged. Only one fresh runner may resume; no checkpoint, ' +
+        'task generation, or task budget was reset.',
+    ].join('\n');
+  }
+
+  function parseCheckpointReleaseMarker(body, {
+    repoFull, issueNumber, hold,
+  }) {
+    const match = String(body || '').match(checkpointResumeReleaseMarkerRe);
+    if (!match) return null;
+    if (
+      match[1].toLowerCase() !== repoFull.toLowerCase() ||
+      Number(match[2]) !== Number(issueNumber) ||
+      Number(match[3]) !== Number(hold.generation) ||
+      match[4] !== String(hold.operation) ||
+      match[5].replace(/^refs\/heads\//, '') !==
+        String(hold.checkpointRef).replace(/^refs\/heads\//, '') ||
+      match[6].toLowerCase() !== String(hold.checkpointSha).toLowerCase() ||
+      match[7] !== String(hold.baseRef) ||
+      match[8].toLowerCase() !== String(hold.baseSha).toLowerCase() ||
+      match[9].toLowerCase() !== String(hold.snapshotSpec).toLowerCase() ||
+      match[10] !== String(hold.reason)
+    ) {
+      return null;
+    }
+    return {
+      generation: Number(match[3]),
+      operation: match[4],
+      checkpointRef: match[5],
+      checkpointSha: match[6].toLowerCase(),
+      baseRef: match[7],
+      baseSha: match[8].toLowerCase(),
+      snapshotSpec: match[9].toLowerCase(),
+      reason: match[10],
+      fix: match[11],
+      fixPullRequest: Number(match[12]),
+      fixSha: match[13].toLowerCase(),
+      owner: match[14],
+    };
+  }
+
+  async function evaluateCheckpointResumeRelease({
+    targetOwner, targetRepo, issueNumber, hold, comments, readClient,
+    writeClient, controller, allowRelease,
+  }) {
+    const repoFull = targetOwner + '/' + targetRepo;
+    const trusted = (comments || []).filter(comment =>
+      isTrustedStopComment(comment, targetOwner)
+    );
+    const markers = [];
+    for (const comment of trusted) {
+      const parsed = parseCheckpointReleaseMarker(comment.body || '', {
+        repoFull, issueNumber, hold,
+      });
+      if (!parsed) continue;
+      markers.push({
+        ...parsed,
+        commentId: Number(comment.id || 0),
+        createdAt: comment.created_at || '',
+      });
+    }
+    markers.sort((a, b) => a.commentId - b.commentId);
+    if (markers.length > 0) {
+      for (const marker of markers) {
+        const verified = await verifyCheckpointValidatorFix(
+          { ...hold, reason: marker.reason }, readClient
+        );
+        if (
+          verified.ok &&
+          verified.fix.id === marker.fix &&
+          verified.fix.pullRequest === marker.fixPullRequest &&
+          verified.fix.mergeSha === marker.fixSha
+        ) {
+          const releasedAt = new Date(marker.createdAt || 0).getTime();
+          return {
+            released: true,
+            marker,
+            fix: verified.fix,
+            owner: marker.owner,
+            fresh: Boolean(releasedAt) &&
+              Date.now() - releasedAt < checkpointReleaseOwnershipWindowMs,
+          };
+        }
+      }
+      // A release marker exists for this exact identity but its fix
+      // provenance cannot be proven. Keep the fail-closed hold and never
+      // create a second marker for the same identity.
+      return { released: false, reason: 'unverified-release-marker', markers };
+    }
+    if (allowRelease === false) {
+      return { released: false, reason: 'release-not-allowed' };
+    }
+    const verified = await verifyCheckpointValidatorFix(hold, readClient);
+    if (!verified.ok) {
+      return { released: false, reason: verified.reason };
+    }
+    let created;
+    try {
+      created = await writeClient.rest.issues.createComment({
+        owner: targetOwner,
+        repo: targetRepo,
+        issue_number: issueNumber,
+        body: checkpointReleaseMarkerBody({
+          repoFull,
+          issueNumber,
+          hold,
+          fix: verified.fix,
+          controller,
+        }),
+      });
+    } catch (err) {
+      return {
+        released: false,
+        reason: 'release-write-failed',
+        status: Number(err && err.status || 0),
+      };
+    }
+    // Race-safe bounded claim: after publishing, only the lowest matching
+    // release comment may proceed. A concurrent loser deletes its own marker
+    // and holds this pass; the winner's durable marker is reused later.
+    let freshComments;
+    try {
+      freshComments = await readClient.paginate(
+        readClient.rest.issues.listComments,
+        {
+          owner: targetOwner,
+          repo: targetRepo,
+          issue_number: issueNumber,
+          per_page: 100,
+        }
+      );
+    } catch (err) {
+      return { released: false, reason: 'release-verification-unavailable' };
+    }
+    const winners = [];
+    for (const comment of freshComments || []) {
+      if (!isTrustedStopComment(comment, targetOwner)) continue;
+      const parsed = parseCheckpointReleaseMarker(comment.body || '', {
+        repoFull, issueNumber, hold,
+      });
+      if (!parsed) continue;
+      winners.push({
+        ...parsed,
+        commentId: Number(comment.id || 0),
+        createdAt: comment.created_at || '',
+      });
+    }
+    winners.sort((a, b) => a.commentId - b.commentId);
+    const ownId = Number(created && created.data && created.data.id || 0);
+    if (!winners.length || winners[0].commentId !== ownId) {
+      try {
+        if (ownId > 0) {
+          await writeClient.rest.issues.deleteComment({
+            owner: targetOwner,
+            repo: targetRepo,
+            comment_id: ownId,
+          });
+        }
+      } catch (err) {
+        core.warning(
+          'Checkpoint release claim cleanup failed for #' + issueNumber + ': ' +
+          (err.message || err)
+        );
+      }
+      return {
+        released: false,
+        deferred: true,
+        reason: 'release-claimed-by-other',
+        marker: winners[0] || null,
+        owner: winners[0] && winners[0].owner || '',
+      };
+    }
+    return {
+      released: true,
+      marker: winners[0],
+      fix: verified.fix,
+      owner: controller,
+      fresh: true,
+    };
   }
 
   const ownerResumeMarkerRe =
@@ -3448,6 +3919,82 @@ module.exports = async function runIssueScheduler({ github, context, core }) {
         reason: 'checkpoint-unavailable',
       };
     }
+    const keepRecoveryReservation = reason => ({
+      ...base,
+      keepReservation: true,
+      recoveryPending: true,
+      reason,
+    });
+    // A completed Actions run is not by itself a completed recovery. The
+    // duplicate guard can skip `Run OpenCode`/`Implement issue` while the
+    // wrapper still reports success. Only authoritative step evidence plus a
+    // published PR on the issue branch proves the saved work was implemented.
+    async function schedulerRunImplementationEvidence(runId) {
+      let jobs;
+      try {
+        jobs = await readGithub.paginate(
+          readGithub.rest.actions.listJobsForWorkflowRun,
+          {
+            owner,
+            repo,
+            run_id: Number(runId),
+            filter: 'latest',
+            per_page: 100,
+          }
+        );
+      } catch (err) {
+        return {
+          kind: 'unavailable',
+          status: Number(err && err.status || 0),
+        };
+      }
+      const implementationSteps = new Set([
+        'Run OpenCode',
+        'Implement issue',
+      ]);
+      let implementationSucceeded = false;
+      let observedSteps = 0;
+      for (const job of jobs || []) {
+        for (const step of job.steps || []) {
+          const name = String(step.name || '');
+          if (!implementationSteps.has(name)) continue;
+          observedSteps += 1;
+          if (String(step.conclusion || '') === 'success') {
+            implementationSucceeded = true;
+          }
+        }
+      }
+      return {
+        kind: 'ok',
+        implementationSucceeded,
+        observedSteps,
+      };
+    }
+    async function schedulerPublishedIssuePullRequest() {
+      let pulls;
+      try {
+        pulls = await readGithub.paginate(
+          readGithub.rest.pulls.list,
+          { owner, repo, state: 'all', per_page: 100 }
+        );
+      } catch (err) {
+        return {
+          kind: 'unavailable',
+          status: Number(err && err.status || 0),
+        };
+      }
+      const prefix = 'opencode/issue' + issueNumber + '-';
+      const published = (pulls || []).some(pull => {
+        const headRepo = String(pull.head?.repo?.full_name || '');
+        const headRef = String(pull.head?.ref || '');
+        if (headRepo !== repoFullName) return false;
+        if (!headRef.startsWith(prefix)) return false;
+        return pull.state === 'open' ||
+          Boolean(pull.merged_at) ||
+          pull.merged === true;
+      });
+      return { kind: 'ok', published };
+    }
     if (checkpoint.kind === 'valid') {
       if (
         run.kind === 'found' &&
@@ -3455,7 +4002,28 @@ module.exports = async function runIssueScheduler({ github, context, core }) {
         run.run.status === 'completed' &&
         run.run.conclusion === 'success'
       ) {
-        return { ...base, reason: 'run-completed-success' };
+        const publication = await schedulerPublishedIssuePullRequest();
+        if (publication.kind !== 'ok') {
+          return keepRecoveryReservation('publication-unavailable');
+        }
+        if (publication.published) {
+          return { ...base, reason: 'run-completed-success' };
+        }
+        const evidence = await schedulerRunImplementationEvidence(run.run.id);
+        if (evidence.kind !== 'ok') {
+          return keepRecoveryReservation('run-evidence-unavailable');
+        }
+        if (!evidence.implementationSucceeded) {
+          // A green wrapper that skipped the code steps is not implementation
+          // evidence. Preserve the reservation so the watchdog can resume the
+          // exact checkpoint instead of treating this as a completed recovery.
+          return keepRecoveryReservation(
+            'run-completed-success-without-implementation'
+          );
+        }
+        return keepRecoveryReservation(
+          'run-completed-success-without-publication'
+        );
       }
       const markerSha = String(
         recovery.checkpointSha || ''
@@ -3645,7 +4213,8 @@ module.exports = async function runIssueScheduler({ github, context, core }) {
       }
     );
     const resumeHold = await checkpointResumeHold(
-      owner, repo, issueNumber, comments, readGithub
+      owner, repo, issueNumber, comments, readGithub, 1,
+      { allowRelease: false, controller: 'issue-scheduler' }
     );
     if (resumeHold) {
       // Deterministic pre-model rejection: release the coding slot but do
@@ -4159,12 +4728,28 @@ module.exports = async function runIssueScheduler({ github, context, core }) {
       }
     );
     const candidateResumeHold = await checkpointResumeHold(
-      owner, repo, issue.number, candidateComments, readGithub
+      owner, repo, issue.number, candidateComments, readGithub, 1,
+      { controller: 'issue-scheduler' }
     );
     if (candidateResumeHold) {
       core.info(
         'Skipping #' + issue.number + ': ' +
         checkpointResumeHoldSkipReason(issue.number, candidateResumeHold)
+      );
+      continue;
+    }
+    const candidateRelease = checkpointResumeHoldRelease;
+    if (
+      candidateRelease &&
+      candidateRelease.released &&
+      candidateRelease.fresh &&
+      candidateRelease.owner &&
+      candidateRelease.owner !== 'issue-scheduler'
+    ) {
+      core.info(
+        'Skipping #' + issue.number +
+        ': checkpoint hold release is owned by ' + candidateRelease.owner +
+        '; that controller owns the fresh resumption.'
       );
       continue;
     }
@@ -4378,12 +4963,28 @@ module.exports = async function runIssueScheduler({ github, context, core }) {
       }
     );
     const freshResumeHold = await checkpointResumeHold(
-      owner, repo, issue.number, freshComments, readGithub
+      owner, repo, issue.number, freshComments, readGithub, 1,
+      { controller: 'issue-scheduler' }
     );
     if (freshResumeHold) {
       core.info(
         'Skipping #' + issue.number + ': ' +
         checkpointResumeHoldSkipReason(issue.number, freshResumeHold)
+      );
+      continue;
+    }
+    const freshRelease = checkpointResumeHoldRelease;
+    if (
+      freshRelease &&
+      freshRelease.released &&
+      freshRelease.fresh &&
+      freshRelease.owner &&
+      freshRelease.owner !== 'issue-scheduler'
+    ) {
+      core.info(
+        'Skipping #' + issue.number +
+        ': checkpoint hold release is owned by ' + freshRelease.owner +
+        '; that controller owns the fresh resumption.'
       );
       continue;
     }

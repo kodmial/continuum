@@ -101,9 +101,30 @@ function apiError(status, message) {
 }
 
 const runLookups = [];
+const listPulls = async () => {
+  if (scenario.publicationError) {
+    throw apiError(scenario.publicationError, 'pull listing failed');
+  }
+  return { data: scenario.pulls || [] };
+};
+const listJobs = async () => {
+  if (scenario.jobsError) {
+    throw apiError(scenario.jobsError, 'job listing failed');
+  }
+  return { data: { jobs: scenario.jobs || [] } };
+};
 const readGithub = {
+  paginate: async (method) => {
+    if (method === listPulls) return (await listPulls()).data;
+    if (method === listJobs) return (await listJobs()).data.jobs;
+    throw new Error('unexpected paginate call');
+  },
   rest: {
+    pulls: {
+      list: listPulls,
+    },
     actions: {
+      listJobsForWorkflowRun: listJobs,
       getWorkflowRun: async ({ run_id }) => {
         const key = String(run_id);
         runLookups.push(key);
@@ -147,15 +168,18 @@ const readGithub = {
 
 const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor;
 const factory = new AsyncFunction(
-  'owner', 'repo', 'workflowRuns', 'readGithub',
+  'owner', 'repo', 'workflowRuns', 'readGithub', 'repoFullName',
   source + '\nreturn evaluateScheduler429Recovery;'
 );
 (async () => {
+  const owner = scenario.owner || 'kodmial';
+  const repo = scenario.repo || 'continuum';
   const evaluate = await factory(
-    scenario.owner || 'kodmial',
-    scenario.repo || 'continuum',
+    owner,
+    repo,
     scenario.workflowRuns || [],
-    readGithub
+    readGithub,
+    owner + '/' + repo
   );
   const evaluation = await evaluate({
     recovery: scenario.recovery,
@@ -345,12 +369,78 @@ class SchedulerDurableRecoveryTests(unittest.TestCase):
                 self.assertFalse(evaluation["keepReservation"])
                 self.assertIn("checkpoint-invalid", evaluation["reason"])
 
-    def test_completed_success_is_not_live_recovery_ownership(self):
+    def test_green_wrapper_without_implementation_is_not_a_completed_recovery(self):
         scenario = self.base_scenario()
         scenario["exactRuns"][0]["conclusion"] = "success"
+        scenario["jobs"] = [
+            {
+                "id": 132975886955,
+                "steps": [
+                    {"name": "Run OpenCode", "conclusion": "skipped"},
+                    {"name": "Implement issue", "conclusion": "skipped"},
+                ],
+            }
+        ]
+        evaluation = self.run_scenario(scenario)["evaluation"]
+        self.assertTrue(evaluation["keepReservation"])
+        self.assertTrue(evaluation["recoveryPending"])
+        self.assertEqual(
+            evaluation["reason"],
+            "run-completed-success-without-implementation",
+        )
+
+    def test_green_wrapper_without_publication_is_not_a_completed_recovery(self):
+        scenario = self.base_scenario()
+        scenario["exactRuns"][0]["conclusion"] = "success"
+        scenario["jobs"] = [
+            {
+                "id": 132975886955,
+                "steps": [{"name": "Run OpenCode", "conclusion": "success"}],
+            }
+        ]
+        evaluation = self.run_scenario(scenario)["evaluation"]
+        self.assertTrue(evaluation["keepReservation"])
+        self.assertTrue(evaluation["recoveryPending"])
+        self.assertEqual(
+            evaluation["reason"],
+            "run-completed-success-without-publication",
+        )
+
+    def test_completed_success_with_publication_is_not_live_recovery_ownership(self):
+        scenario = self.base_scenario()
+        scenario["exactRuns"][0]["conclusion"] = "success"
+        scenario["pulls"] = [
+            {
+                "number": 500,
+                "state": "open",
+                "head": {
+                    "ref": "opencode/issue382-39933043642",
+                    "repo": {"full_name": "kodmial/continuum"},
+                },
+            }
+        ]
         evaluation = self.run_scenario(scenario)["evaluation"]
         self.assertFalse(evaluation["keepReservation"])
         self.assertEqual(evaluation["reason"], "run-completed-success")
+
+    def test_success_evidence_unavailable_fails_closed(self):
+        for name, update in (
+            ("publication", {"publicationError": 403}),
+            ("steps", {"jobsError": 500}),
+        ):
+            with self.subTest(name=name):
+                scenario = self.base_scenario()
+                scenario["exactRuns"][0]["conclusion"] = "success"
+                scenario.update(update)
+                evaluation = self.run_scenario(scenario)["evaluation"]
+                self.assertTrue(evaluation["keepReservation"])
+                self.assertTrue(evaluation["recoveryPending"])
+                self.assertEqual(
+                    evaluation["reason"],
+                    "publication-unavailable"
+                    if name == "publication"
+                    else "run-evidence-unavailable",
+                )
 
     def test_watchdog_lease_is_bounded_and_does_not_poll_runs(self):
         scenario = self.base_scenario()
