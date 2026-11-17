@@ -25,13 +25,15 @@ that entire repository, not only for the disposable PR.
   fails the run when `git status --porcelain` is non-empty or `HEAD`
   moves under the reviewer.
 * No paid provider. The canary refuses the repository variables
-  `OPENCODE_API_KEY`, `ANTHROPIC_API_KEY`, and `GROQ_API_KEY`, and it refuses
-  named paid-provider references in the selected model value: the explicit
-  `opencode_model` dispatch input, or the legacy `OPENCODE_MODEL` repository
-  variable when that input is empty, plus the request model. It does not read
+  `OPENCODE_API_KEY`, `ANTHROPIC_API_KEY`, and `GROQ_API_KEY`; it does not read
   GitHub secrets with those names, so a secret alone does not trigger the
-  refusal; audit secrets separately. Entries in the trusted `OPENCODE_MODELS`
-  pool are not screened for paid providers; configure only free routes there.
+  refusal; audit secrets separately. It also refuses the strings `groq`,
+  `anthropic`, and `openai_api_key` (case-insensitive) in the selected model
+  value: the explicit `opencode_model` dispatch input, or the legacy
+  `OPENCODE_MODEL` repository variable when that input is empty, plus the
+  request model. Other paid-provider routes, such as `openai/` routes, are not
+  screened. Entries in the trusted `OPENCODE_MODELS` pool are not screened for
+  paid providers; configure only free routes there.
   It does not hard-code a model: the deployed `model-route` step resolves the
   trusted `OPENCODE_MODELS` pool, the legacy `OPENCODE_MODEL` single-route
   fallback when no pool is configured, or an explicit `opencode_model`
@@ -71,7 +73,9 @@ Prerequisites in that consumer repository:
 
 * the core callers are installed and the installed canary caller is on the
   selected ref;
-* `TAP_PAT` is configured;
+* `TAP_PAT` is configured with a PAT owned by the consumer repository's owner,
+  and the consumer repository must be user-owned; the `/review` router admits
+  only a comment author whose login equals the repository owner;
 * `CONTINUUM_REVIEW_PROVIDER=pr-agent`, a repository variable that selects
   PR-Agent for the whole consumer repository, not only the disposable PR, so
   the installed PR-Agent router and recovery callers handle the `/review`
@@ -86,7 +90,9 @@ The installed caller accepts these `workflow_dispatch` inputs:
 `api_base`, `bridge_port`, `server_port`, and `pr_agent_version`. Empty inputs
 fall back to the trusted repository configuration and documented defaults.
 `max_tokens` is retained but is not passed to the `/review` run, so it does
-not control review budgeting.
+not control review budgeting. `api_base`, `bridge_port`, `server_port`, and
+`pr_agent_version` are canary-only dispatch inputs; the `/review` run does not
+receive them.
 
 `opencode_model` qualifies the route for the canary run only. The `/review`
 command the canary posts passes no model, and the installed review caller
