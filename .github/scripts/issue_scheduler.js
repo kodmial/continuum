@@ -1358,7 +1358,9 @@ module.exports = async function runIssueScheduler({ github, context, core }) {
       const parsed = parseCheckpointConsumptionMarker(comment.body || '', {
         repoFull, issueNumber, hold,
       });
-      if (!parsed || parsed.releaseId !== release.marker.commentId) continue;
+      // Receipts arbitrate the hold identity, not one release comment: a
+      // duplicate claim for the same hold must lose to the first consumer.
+      if (!parsed) continue;
       winners.push({ ...parsed, commentId: Number(comment.id || 0) });
     }
     winners.sort((a, b) => a.commentId - b.commentId);
@@ -1449,6 +1451,30 @@ module.exports = async function runIssueScheduler({ github, context, core }) {
       });
     }
     markers.sort((a, b) => a.commentId - b.commentId);
+    // Consumption is bound to the checkpoint/base/snapshot identity, not to
+    // one release comment. Concurrent claims for the same hold can leave more
+    // than one release marker behind, and spending any one of them must spend
+    // the whole identity so a surviving duplicate can never resume it again.
+    const consumptions = [];
+    for (const comment of trusted) {
+      const parsed = parseCheckpointConsumptionMarker(comment.body || '', {
+        repoFull, issueNumber, hold,
+      });
+      if (!parsed) continue;
+      consumptions.push({
+        ...parsed,
+        commentId: Number(comment.id || 0),
+        createdAt: comment.created_at || '',
+      });
+    }
+    const holdOrder = stopOrderKey(hold);
+    const consumptionOrder = consumption => stopOrderKey({
+      created_at: consumption.createdAt,
+      id: consumption.commentId,
+    });
+    const holdConsumed = consumptions.some(
+      consumption => consumptionOrder(consumption) > holdOrder
+    );
     if (markers.length > 0) {
       const base = await verifyCheckpointConsumerBase({
         targetOwner, targetRepo, hold, client: readClient,
@@ -1457,19 +1483,6 @@ module.exports = async function runIssueScheduler({ github, context, core }) {
         return {
           released: false, reason: base.reason, markers, base,
         };
-      }
-      const holdOrder = stopOrderKey(hold);
-      const consumptions = [];
-      for (const comment of trusted) {
-        const parsed = parseCheckpointConsumptionMarker(comment.body || '', {
-          repoFull, issueNumber, hold,
-        });
-        if (!parsed) continue;
-        consumptions.push({
-          ...parsed,
-          commentId: Number(comment.id || 0),
-          createdAt: comment.created_at || '',
-        });
       }
       let superseded = false;
       for (const marker of markers) {
@@ -1483,12 +1496,8 @@ module.exports = async function runIssueScheduler({ github, context, core }) {
           superseded = true;
           continue;
         }
-        const consumed = consumptions.some(consumption =>
-          consumption.releaseId === marker.commentId &&
-          stopOrderKey({
-            created_at: consumption.createdAt,
-            id: consumption.commentId,
-          }) > markerOrder
+        const consumed = holdConsumed || consumptions.some(
+          consumption => consumptionOrder(consumption) > markerOrder
         );
         if (consumed) {
           superseded = true;
@@ -1529,6 +1538,15 @@ module.exports = async function runIssueScheduler({ github, context, core }) {
     }
     if (allowRelease === false) {
       return { released: false, reason: 'release-not-allowed' };
+    }
+    if (holdConsumed) {
+      // A consumed identity is spent even if its release marker was cleaned
+      // up. Never mint a replacement claim for the same hold.
+      return {
+        released: false,
+        reason: 'release-consumed-or-superseded',
+        consumptions,
+      };
     }
     const base = await verifyCheckpointConsumerBase({
       targetOwner, targetRepo, hold, client: readClient,

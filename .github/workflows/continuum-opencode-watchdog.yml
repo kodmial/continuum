@@ -1612,9 +1612,12 @@ jobs:
                 reason: 'consumption-verification-unavailable',
               };
             }
+            // Receipts arbitrate the hold identity, not one release comment:
+            // a duplicate claim for the same hold must lose to the first
+            // consumer.
             const winners = checkpointConsumptionMarkers(
               freshComments, issueNumber, hold
-            ).filter(marker => marker.releaseId === release.marker.commentId);
+            );
             if (!winners.length || winners[0].commentId !== ownId) {
               await releaseCheckpointResumeConsumption(ownId);
               return {
@@ -1671,6 +1674,22 @@ jobs:
             const markers = checkpointReleaseMarkers(
               comments, issueNumber, hold
             );
+            // Consumption is bound to the checkpoint/base/snapshot identity,
+            // not to one release comment. Concurrent claims for the same hold
+            // can leave more than one release marker behind, and spending any
+            // one of them must spend the whole identity so a surviving
+            // duplicate can never resume it again.
+            const consumptions = checkpointConsumptionMarkers(
+              comments, issueNumber, hold
+            );
+            const holdOrder = String(hold.order || '');
+            const consumptionOrder = consumption => checkpointCommentOrder({
+              created_at: consumption.createdAt,
+              id: consumption.commentId,
+            });
+            const holdConsumed = Boolean(holdOrder) && consumptions.some(
+              consumption => consumptionOrder(consumption) > holdOrder
+            );
             if (markers.length > 0) {
               const base = await verifyCheckpointConsumerBase({
                 hold, client,
@@ -1680,10 +1699,6 @@ jobs:
                   released: false, reason: base.reason, markers, base,
                 };
               }
-              const holdOrder = String(hold.order || '');
-              const consumptions = checkpointConsumptionMarkers(
-                comments, issueNumber, hold
-              );
               let superseded = false;
               for (const marker of markers) {
                 const markerOrder = checkpointCommentOrder({
@@ -1697,12 +1712,8 @@ jobs:
                   superseded = true;
                   continue;
                 }
-                const consumed = consumptions.some(consumption =>
-                  consumption.releaseId === marker.commentId &&
-                  checkpointCommentOrder({
-                    created_at: consumption.createdAt,
-                    id: consumption.commentId,
-                  }) > markerOrder
+                const consumed = holdConsumed || consumptions.some(
+                  consumption => consumptionOrder(consumption) > markerOrder
                 );
                 if (consumed) {
                   superseded = true;
@@ -1763,6 +1774,15 @@ jobs:
             }
             if (allowRelease === false) {
               return { released: false, reason: 'release-not-allowed' };
+            }
+            if (holdConsumed) {
+              // A consumed identity is spent even if its release marker was
+              // cleaned up. Never mint a replacement claim for the same hold.
+              return {
+                released: false,
+                reason: 'release-consumed-or-superseded',
+                consumptions,
+              };
             }
             const base = await verifyCheckpointConsumerBase({
               hold, client,

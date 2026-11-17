@@ -231,6 +231,9 @@ const writeGithub = {
         return { data: { ...comment } };
       },
       deleteComment: async ({ comment_id }) => {
+        if (scenario.deleteCommentError) {
+          throw apiError(scenario.deleteCommentError, 'delete comment failed');
+        }
         const index = comments.findIndex(
           item => Number(item.id) === Number(comment_id)
         );
@@ -324,6 +327,7 @@ async function runWatchdog() {
 (async () => {
   const scheduler = await runScheduler();
   let consumption = null;
+  let duplicateConsumption = null;
   if (scenario.consumeSchedulerRelease && scheduler.release &&
       scheduler.release.released && lastSchedulerApi) {
     consumption = await lastSchedulerApi.consume({
@@ -336,10 +340,29 @@ async function runWatchdog() {
       writeClient: writeGithub,
       controller: 'issue-scheduler',
     });
+    if (scenario.consumeDuplicateRelease) {
+      duplicateConsumption = await lastSchedulerApi.consume({
+        targetOwner: scenario.owner || 'kodmial',
+        targetRepo: scenario.repo || 'continuum',
+        issueNumber: Number(scenario.issue || 534),
+        hold: scheduler.release.marker,
+        release: {
+          ...scheduler.release,
+          marker: {
+            ...scheduler.release.marker,
+            commentId: Number(scenario.consumeDuplicateRelease.commentId),
+          },
+        },
+        readClient: readGithub,
+        writeClient: writeGithub,
+        controller: 'issue-scheduler',
+      });
+    }
   }
   const result = {
     scheduler,
     consumption,
+    duplicateConsumption,
     // A second scheduler pass over the same durable history proves an
     // unconsumed release is reusable and a consumed one is spent.
     schedulerAgain: await runScheduler(),
@@ -534,6 +557,106 @@ class CheckpointHoldReleaseTests(unittest.TestCase):
                 "release-consumed-or-superseded",
                 name,
             )
+
+    def test_a_consumption_receipt_spends_surviving_duplicate_claims(self):
+        # Concurrent release claims can both survive when the losing claim's
+        # cleanup fails. A receipt for either claim consumes the whole hold
+        # identity, so the surviving duplicate never authorizes a second
+        # resumption in either controller.
+        scenario = self.base_scenario()
+        scenario["comments"].extend([
+            {
+                "id": 2,
+                "body": release_marker(owner="opencode-watchdog"),
+                "user": {"login": "github-actions[bot]"},
+                "author_association": "OWNER",
+                "created_at": "2026-11-17T12:00:00Z",
+            },
+            {
+                "id": 3,
+                "body": release_marker(),
+                "user": {"login": "github-actions[bot]"},
+                "author_association": "OWNER",
+                "created_at": "2026-11-17T12:01:00Z",
+            },
+            {
+                "id": 4,
+                "body": consumption_marker(2),
+                "user": {"login": "github-actions[bot]"},
+                "author_association": "OWNER",
+                "created_at": "2026-11-17T12:02:00Z",
+            },
+        ])
+        result = self.run_scenario(scenario)
+        for name in ("scheduler", "watchdog"):
+            self.assertTrue(result[name]["blocked"], name)
+            self.assertFalse(result[name]["release"]["released"], name)
+            self.assertEqual(
+                result[name]["release"]["reason"],
+                "release-consumed-or-superseded",
+                name,
+            )
+        self.assertEqual(
+            len([c for c in result["comments"] if "resume-release" in c["body"]]),
+            2,
+        )
+
+    def test_consuming_one_duplicate_claim_blocks_the_surviving_claim(self):
+        scenario = self.base_scenario()
+        scenario["comments"].extend([
+            {
+                "id": 2,
+                "body": release_marker(),
+                "user": {"login": "github-actions[bot]"},
+                "author_association": "OWNER",
+                "created_at": "2026-11-17T12:00:00Z",
+            },
+            {
+                "id": 3,
+                "body": release_marker(owner="opencode-watchdog"),
+                "user": {"login": "github-actions[bot]"},
+                "author_association": "OWNER",
+                "created_at": "2026-11-17T12:01:00Z",
+            },
+        ])
+        scenario["consumeSchedulerRelease"] = True
+        # A second consumer of the surviving claim must lose on the first
+        # receipt. Its cleanup also fails, so both receipts remain durable.
+        scenario["consumeDuplicateRelease"] = {"commentId": 3}
+        scenario["deleteCommentError"] = 500
+        result = self.run_scenario(scenario)
+        self.assertTrue(result["consumption"]["consumed"])
+        self.assertFalse(result["duplicateConsumption"]["consumed"])
+        self.assertEqual(
+            result["duplicateConsumption"]["reason"],
+            "consumption-claimed-by-other",
+        )
+        self.assertTrue(
+            any(
+                "consumption cleanup failed" in " ".join(line)
+                for line in result["notices"]
+            ),
+            result["notices"],
+        )
+        for name in ("schedulerAgain", "watchdog"):
+            self.assertTrue(result[name]["blocked"], name)
+            self.assertFalse(result[name]["release"]["released"], name)
+            self.assertEqual(
+                result[name]["release"]["reason"],
+                "release-consumed-or-superseded",
+                name,
+            )
+        self.assertEqual(
+            len([c for c in result["comments"] if "resume-release" in c["body"]]),
+            2,
+        )
+        self.assertEqual(
+            len([
+                c for c in result["comments"]
+                if "resume-consumed" in c["body"]
+            ]),
+            2,
+        )
 
     def test_a_newer_rejection_supersedes_an_older_release(self):
         scenario = self.base_scenario()
