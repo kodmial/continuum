@@ -3484,6 +3484,19 @@ module.exports = async function runIssueScheduler({ github, context, core }) {
           checkpointSha: checkpoint.refSha,
         };
       }
+      if (state === 'backoff') {
+        // next_due is the watchdog's earliest retry time, NOT expiration.
+        // An authenticated, unchanged 429 checkpoint still belongs to the
+        // recovery controller after that instant. Releasing it would let the
+        // ordinary scheduler burn the issue dispatch budget and pause work.
+        return {
+          ...base,
+          keepReservation: true,
+          recoveryPending: true,
+          reason: 'backoff-awaiting-watchdog',
+          checkpointSha: checkpoint.refSha,
+        };
+      }
       return {
         ...base,
         reason: 'checkpoint-unchanged',
