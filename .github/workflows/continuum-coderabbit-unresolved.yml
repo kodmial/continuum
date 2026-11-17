@@ -832,10 +832,10 @@ jobs:
                 artifact?.name === expectedProvenanceName &&
                 artifact.expired !== true)) {
                 // The run published no recoverable proof of the HEAD and
-                // finding set it inspected, so the outcome is not verified.
-                // Never suppress on a comment alone; leave the finding on the
-                // normal dispatch path so fresh evidence can be produced.
-                return { state: 'none', reason: 'run-provenance-unverified' };
+                // finding set it inspected, so the outcome cannot be verified.
+                // Never suppress or re-dispatch on a comment alone: defer
+                // until run-scoped provenance is available again.
+                return defer('run-provenance-unverified');
               }
               const runStart = Date.parse(
                 run.run_started_at || run.created_at || ''
@@ -933,7 +933,10 @@ jobs:
             }
             if (noChangeDeferred.length) {
               core.notice(
-                `PR #${pullNumber}: deferring ${noChangeDeferred.length} finding(s) because the no-change outcome provenance is unreadable or inconsistent.`
+                `PR #${pullNumber}: deferring ${noChangeDeferred.length} finding(s) because the no-change outcome provenance is unreadable or inconsistent: ` +
+                noChangeDeferred
+                  .map(entry => `#${entry.finding_id} (${entry.reason})`)
+                  .join(', ') + '.'
               );
             }
 
@@ -1255,10 +1258,10 @@ jobs:
                 artifact?.name === expectedProvenanceName &&
                 artifact.expired !== true)) {
                 // The run published no recoverable proof of the HEAD and
-                // finding set it inspected, so the outcome is not verified.
-                // Never suppress on a comment alone; leave the finding on the
-                // normal dispatch path so fresh evidence can be produced.
-                return { state: 'none', reason: 'run-provenance-unverified' };
+                // finding set it inspected, so the outcome cannot be verified.
+                // Never suppress or re-dispatch on a comment alone: defer
+                // until run-scoped provenance is available again.
+                return defer('run-provenance-unverified');
               }
               const runStart = Date.parse(
                 run.run_started_at || run.created_at || ''
@@ -1382,7 +1385,10 @@ jobs:
             );
             if (preliminary.deferred.length) {
               core.notice(
-                `PR #${pullNumber}: no-change outcome provenance is unreadable or inconsistent; deferring the dispatch for safe reconciliation.`
+                `PR #${pullNumber}: no-change outcome provenance is unreadable or inconsistent; deferring the dispatch for safe reconciliation: ` +
+                preliminary.deferred
+                  .map(entry => `#${entry.finding_id} (${entry.reason})`)
+                  .join(', ') + '.'
               );
               return;
             }
@@ -1579,7 +1585,10 @@ jobs:
             );
             if (finalNoChange.deferred.length) {
               core.notice(
-                `PR #${pullNumber}: no-change outcome provenance is unreadable or inconsistent immediately before dispatch; deferring for safe reconciliation.`
+                `PR #${pullNumber}: no-change outcome provenance is unreadable or inconsistent immediately before dispatch; deferring for safe reconciliation: ` +
+                finalNoChange.deferred
+                  .map(entry => `#${entry.finding_id} (${entry.reason})`)
+                  .join(', ') + '.'
               );
               return;
             }

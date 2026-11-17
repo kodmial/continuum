@@ -708,7 +708,7 @@ class NoChangeGuardTests(unittest.TestCase):
             f"{HEAD}-{changed_digest}-1-true",
         )
 
-    def test_missing_expired_or_mismatched_provenance_artifact_never_suppresses(self):
+    def test_missing_expired_or_mismatched_provenance_artifact_defers(self):
         issue_comments, _, digest = self.ready_state()
         expected = provenance_artifacts(issue_comments)[0]["name"]
         # Timestamp the verification request after the handoff so the
@@ -754,16 +754,41 @@ class NoChangeGuardTests(unittest.TestCase):
                     items_for(), issue_comments, review_comments=comments,
                     artifacts=artifacts,
                 )
-                self.assertEqual(collected["out"]["should_run"], "true")
+                self.assertEqual(collected["out"]["should_run"], "false")
+                self.assertEqual(
+                    json.loads(collected["out"]["items_json"]), []
+                )
+                deferred = json.loads(
+                    collected["out"]["no_change_deferred_json"]
+                )
+                self.assertEqual(deferred[0]["finding_id"], FINDING)
+                self.assertEqual(
+                    deferred[0]["reason"], "run-provenance-unverified"
+                )
+                self.assertTrue(any(
+                    "outcome provenance is unreadable or inconsistent"
+                    in notice
+                    for notice in collected["notices"]
+                ), collected["notices"])
+                self.assertTrue(any(
+                    "run-provenance-unverified" in notice
+                    for notice in collected["notices"]
+                ), collected["notices"])
                 dispatched = dispatch_step(
                     items_for(), [issue_comments], review_comments=comments,
                     cutoff=100000, artifacts=artifacts,
                 )
-                self.assertEqual(len(dispatched["dispatches"]), 1)
-                self.assertFalse(any(
-                    "continuum-coderabbit-no-change-guard" in body
-                    for body in dispatched["posted"]
-                ))
+                self.assertEqual(len(dispatched["dispatches"]), 0)
+                self.assertEqual(dispatched["posted"], [])
+                self.assertTrue(any(
+                    "outcome provenance is unreadable or inconsistent"
+                    in notice
+                    for notice in dispatched["notices"]
+                ), dispatched["notices"])
+                self.assertTrue(any(
+                    "run-provenance-unverified" in notice
+                    for notice in dispatched["notices"]
+                ), dispatched["notices"])
         # A temporarily unreadable artifact list defers instead of suppressing
         # or dispatching a duplicate repair.
         unreadable = dispatch_step(
