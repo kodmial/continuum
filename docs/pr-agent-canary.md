@@ -26,17 +26,19 @@ that entire repository, not only for the disposable PR.
   moves under the reviewer.
 * No paid provider. The canary refuses the repository variables
   `OPENCODE_API_KEY`, `ANTHROPIC_API_KEY`, and `GROQ_API_KEY`, and it refuses
-  named paid-provider references in the explicit `opencode_model` dispatch
-  input, the legacy `OPENCODE_MODEL` repository variable, and the request
-  model. It does not read GitHub secrets with those names, so a secret alone
-  does not trigger the refusal; audit secrets separately. Entries in the
-  trusted `OPENCODE_MODELS` pool are not screened for paid providers;
-  configure only free routes there. It does not hard-code a model: the deployed
-  `model-route` step resolves the trusted `OPENCODE_MODELS` pool, the legacy
-  `OPENCODE_MODEL` single-route fallback when no pool is configured, or an
-  explicit `opencode_model` dispatch input that must be an allowed pool route.
-  A free route can still be rate-limited or unavailable; the canary fails
-  closed instead of promising that inference succeeds.
+  named paid-provider references in the selected model value: the explicit
+  `opencode_model` dispatch input, or the legacy `OPENCODE_MODEL` repository
+  variable when that input is empty, plus the request model. It does not read
+  GitHub secrets with those names, so a secret alone does not trigger the
+  refusal; audit secrets separately. Entries in the trusted `OPENCODE_MODELS`
+  pool are not screened for paid providers; configure only free routes there.
+  It does not hard-code a model: the deployed `model-route` step resolves the
+  trusted `OPENCODE_MODELS` pool, the legacy `OPENCODE_MODEL` single-route
+  fallback when no pool is configured, or an explicit `opencode_model`
+  dispatch input. When `OPENCODE_MODELS` is set, that input must be one of its
+  routes; when it is empty, a well-formed input is accepted as the sole pinned
+  route. A free route can still be rate-limited or unavailable; the canary
+  fails closed instead of promising that inference succeeds.
 * Fail closed. Stale HEAD, partial chunk coverage, bridge/OpenCode
   failure, reviewer mutation, a missing blocking finding, an unresolved
   verification, or incomplete evidence all fail instead of reporting
