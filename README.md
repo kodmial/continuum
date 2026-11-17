@@ -165,6 +165,8 @@ its configuration. The detailed lifecycle routes are documented in
 - [PR-Agent review](docs/pr-agent-opencode.md) — the optional review stack.
 - [Contract qualification](docs/contract-qualification.md) — the exact-HEAD gate
   model.
+- [Release workflow reference templates](docs/release-templates.md) — historical,
+  inactive examples; not a supported release feature.
 
 ## Single-repository setup (basic)
 

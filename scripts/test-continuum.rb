@@ -541,7 +541,15 @@ class ContinuumTest < Minitest::Test
   # permissions are the job's own block when present, otherwise the workflow
   # default; a callee job inherits its workflow's default the same way.
   def test_every_reusable_workflow_caller_grants_callee_job_permissions
-    callers = (WORKFLOWS + ALL_STUBS + Dir[File.join(ROOT, 'examples/**/*.yml')].sort).uniq
+    # examples/release-templates/ is archived reference material, not a live
+    # caller tree. Its macOS example intentionally names a historical
+    # workflow that current main does not ship; the static release-template
+    # test checks that surface instead of requiring it to be installed.
+    archived_release = File.join(ROOT, 'examples/release-templates')
+    examples = Dir[File.join(ROOT, 'examples/**/*.yml')].reject do |path|
+      path.start_with?("#{archived_release}/")
+    end
+    callers = (WORKFLOWS + ALL_STUBS + examples.sort).uniq
     callers.each do |caller_path|
       caller = yaml(caller_path)
       next unless caller.is_a?(Hash) && caller['jobs'].is_a?(Hash)

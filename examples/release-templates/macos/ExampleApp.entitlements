@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  ILLUSTRATIVE ENTITLEMENTS - INACTIVE, NOT QUALIFIED, NOT A PRODUCTION VALUE.
+
+  This neutral example deliberately grants no special capability. Add only the
+  entitlements your application actually needs, and treat each one as a
+  security decision. The historical Apple adapter passes this path to
+  `codesign --entitlements` for both the binary and the app bundle so the
+  product keeps one identity.
+-->
+<plist version="1.0">
+<dict/>
+</plist>
