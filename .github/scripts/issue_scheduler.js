@@ -3090,7 +3090,7 @@ module.exports = async function runIssueScheduler({ github, context, core }) {
   for (const run of workflowRuns) {
     const isOpenCodeWorkflow =
       run.path === opencodeWorkflowPath ||
-      run.name === opencodeWorkflowName;
+      (!run.path && run.name === opencodeWorkflowName);
     // kodmial/continuum#350: a fresh-VM 429 resumption is a
     // workflow_dispatch run. It must count as authoritative
     // in-flight work exactly like an issue_comment run, or lease
