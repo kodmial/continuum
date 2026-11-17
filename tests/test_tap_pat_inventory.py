@@ -113,7 +113,10 @@ class CoverageTests(unittest.TestCase):
         # that re-publishes the same attestation after a transient API failure,
         # plus one fresh-runner post-failure binding that recovers the exact
         # original commit after both retry budgets are exhausted.
-        self.assertEqual(len(bindings), 131)
+        # PR #459 review adds receipt-only publication recovery for a skipped
+        # duplicate rerun and a fresh-runner post-failure job, two same-repo PAT
+        # bindings beside the publication evidence they re-attest.
+        self.assertEqual(len(bindings), 133)
         gaps = inventory.coverage_gaps(WORKFLOWS_DIR)
         self.assertEqual(gaps, [], f"uninventoried TAP_PAT bindings: {gaps}")
 

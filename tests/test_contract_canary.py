@@ -2736,10 +2736,117 @@ class WorkflowContractTest(unittest.TestCase):
         self.assertIn("branch: $branch", workflow)
         self.assertIn("pr_number: ($pr | tonumber)", workflow)
         self.assertIn("head_sha: $head", workflow)
-        # Both publish paths (normal and branch-recovery) must attest.
-        self.assertEqual(workflow.count("PUBLICATION_DIR="), 2)
-        self.assertEqual(workflow.count("schema_version: 1, repo: $repo"), 2)
-        self.assertGreaterEqual(workflow.count("publication.json"), 3)
+        # Both publish paths (normal and branch-recovery) must attest, and a
+        # rerun that skips them through the duplicate guard may re-attest the
+        # identity this run recorded at creation.
+        self.assertEqual(workflow.count("PUBLICATION_DIR="), 3)
+        self.assertEqual(workflow.count("schema_version: 1, repo: $repo"), 4)
+        self.assertGreaterEqual(workflow.count("publication.json"), 6)
+        self.assertIn(
+            "name: Recover publication receipt for an existing PR", workflow
+        )
+        self.assertIn(
+            "name: Upload recovered OpenCode publication receipt", workflow
+        )
+
+    def test_failed_issue_publication_receipt_is_recoverable(self):
+        """A failed receipt upload must not orphan the run's publication.
+
+        The identity recorded at creation is exported as job outputs from both
+        publish paths and re-attested by a receipt-only job. That job must never
+        create a PR and must verify the recorded PR, branch, and commit first.
+        """
+        workflow = yaml.safe_load(
+            (ROOT / ".github/workflows/continuum-opencode.yml").read_text(
+                encoding="utf-8"
+            )
+        )
+        jobs = workflow["jobs"]
+        producer = jobs["opencode"]
+        expected = {
+            "publication_issue": "publication_issue",
+            "publication_attempt": "publication_attempt",
+            "publication_branch": "publication_branch",
+            "publication_pr_number": "publication_pr_number",
+            "publication_head_sha": "publication_head_sha",
+        }
+        for output, value in expected.items():
+            self.assertEqual(
+                producer["outputs"][output],
+                "${{ steps.implement_issue.outputs.%s || "
+                "steps.recover_issue_branch.outputs.%s }}" % (value, value),
+            )
+        for step_id in ("implement_issue", "recover_issue_branch"):
+            step = next(
+                item
+                for item in producer["steps"]
+                if item.get("id") == step_id
+            )
+            for output in expected:
+                self.assertIn(
+                    'echo "%s=$' % output, step["run"]
+                )
+            self.assertIn('>> "$GITHUB_OUTPUT"', step["run"])
+
+        recovery = jobs["recover-issue-publication"]
+        self.assertEqual(recovery["needs"], "opencode")
+        self.assertIn("!cancelled()", recovery["if"])
+        self.assertIn("needs.opencode.result == 'failure'", recovery["if"])
+        self.assertEqual(recovery["permissions"], {})
+
+        step = next(
+            item
+            for item in recovery["steps"]
+            if item.get("name")
+            == "Republish the OpenCode publication receipt from the recorded identity"
+        )
+        env_names = {
+            "publication_issue": "ISSUE_NUMBER",
+            "publication_attempt": "PUBLICATION_ATTEMPT",
+            "publication_branch": "BRANCH",
+            "publication_pr_number": "PR_NUMBER",
+            "publication_head_sha": "HEAD_SHA",
+        }
+        for output, env_name in env_names.items():
+            self.assertEqual(
+                step["env"][env_name],
+                "${{ needs.opencode.outputs.%s }}" % output,
+            )
+        self.assertEqual(step["env"]["GH_TOKEN"], "${{ secrets.TAP_PAT }}")
+        script = step["run"]
+        self.assertNotIn("gh pr create", script)
+        self.assertIn("No issue publication was recorded", script)
+        self.assertIn('"repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER"', script)
+        self.assertIn('"opencode/issue${ISSUE_NUMBER}-"*', script)
+        self.assertIn("compare/${HEAD_SHA}...${PR_HEAD}", script)
+        self.assertIn("{schema_version: 1, repo: $repo", script)
+        self.assertIn("head_sha: $head", script)
+
+        upload = next(
+            item
+            for item in recovery["steps"]
+            if item.get("name")
+            == "Upload recovered OpenCode publication receipt"
+        )
+        self.assertTrue(
+            upload["with"]["name"].startswith(
+                canary.CANARY_PUBLICATION_ARTIFACT_PREFIX
+            )
+        )
+        self.assertEqual(upload["with"]["if-no-files-found"], "error")
+        # The re-attested receipt uses the same schema and identity the canary
+        # consumes, so the recovered run satisfies the publication requirement.
+        recovered = publication(
+            issue=100, run_id=WORKER_RUN_ID, pr_number=41, head=HEAD
+        )
+        self.assertIsNone(
+            canary.validate_worker_publication(
+                pr(number=41, head=HEAD),
+                worker_run(issue=100, run_id=WORKER_RUN_ID),
+                recovered,
+                100,
+            )
+        )
 
     def test_workflow_preserves_review_decision_for_the_merge_stage(self):
         """The REST pulls inventory must still carry the review decision.

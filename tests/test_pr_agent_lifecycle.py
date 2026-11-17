@@ -328,6 +328,13 @@ APPROVED_458_460_MERGED_OPENCODE_SHA256 = (
 APPROVED_458_460_455_MERGED_OPENCODE_SHA256 = (
     "43fe7886c93cfff2d0ebf646ed3744a32c083d433acaf5db6da20a40d2a7f196"
 )
+# PR #459 review 5935178627 repair: recover the issue publication receipt
+# after an upload failure or a duplicate-guard-skipped rerun, preserving the
+# identity recorded at creation and never creating another PR. Pin the exact
+# workflow bytes; unrelated drift still fails closed.
+APPROVED_459_REVIEW_OPENCODE_SHA256 = (
+    "48eefcfc3afd9783f21b2e53d5e0f99d14bc28fb5bce0440e086f29edda31157"
+)
 # The prior #460 resume pin stays for audit; any further byte drift still
 # fails closed.
 APPROVED_460_RESUME_OPENCODE_SHA256 = (
@@ -2759,8 +2766,8 @@ class ProtectedBaselineTests(unittest.TestCase):
                     # with full-file digests and executable regression tests.
                     self.assertEqual(
                         protected_file_digest(path),
-                        APPROVED_458_460_455_MERGED_OPENCODE_SHA256,
-                        f"{path}: unexpected drift outside #458 publication attestation, #460 resume repair, and #454 telemetry merged protected workflow",
+                        APPROVED_459_REVIEW_OPENCODE_SHA256,
+                        f"{path}: unexpected drift outside the PR #459 review repair of the merged protected workflow",
                     )
                 else:
                     # The self-dogfood caller is the dispatchable surface
@@ -2845,7 +2852,7 @@ class ProtectedBaselineTests(unittest.TestCase):
         # therefore be dirty in this pre-commit worktree; any unapproved byte
         # change still fails the exact digest assertions above.
         approved = {
-            ".github/workflows/continuum-opencode.yml": APPROVED_458_460_455_MERGED_OPENCODE_SHA256,
+            ".github/workflows/continuum-opencode.yml": APPROVED_459_REVIEW_OPENCODE_SHA256,
             ".github/workflows/opencode.yml": APPROVED_350_SELF_CALLER_SHA256,
         }
         for path in PROTECTED_FILES:

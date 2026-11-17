@@ -921,6 +921,17 @@ jobs:
       repair_head_sha: ${{ steps.repair_publication.outputs.head_sha }}
       repair_pr_number: ${{ steps.repair_publication.outputs.pr_number }}
       repair_branch: ${{ steps.repair_publication.outputs.branch }}
+      # kodmial/continuum#458, PR #459 review: the initial issue publication
+      # receipt is uploaded by a separate step. If that upload fails after the
+      # PR exists, a rerun skips implementation through the duplicate guard, so
+      # the identity recorded at creation is the only remaining evidence. Both
+      # publish paths record it here so the recovery job never has to infer a
+      # PR or commit, and never creates one.
+      publication_issue: ${{ steps.implement_issue.outputs.publication_issue || steps.recover_issue_branch.outputs.publication_issue }}
+      publication_attempt: ${{ steps.implement_issue.outputs.publication_attempt || steps.recover_issue_branch.outputs.publication_attempt }}
+      publication_branch: ${{ steps.implement_issue.outputs.publication_branch || steps.recover_issue_branch.outputs.publication_branch }}
+      publication_pr_number: ${{ steps.implement_issue.outputs.publication_pr_number || steps.recover_issue_branch.outputs.publication_pr_number }}
+      publication_head_sha: ${{ steps.implement_issue.outputs.publication_head_sha || steps.recover_issue_branch.outputs.publication_head_sha }}
 
     steps:
       - name: Checkout repository
@@ -2503,6 +2514,12 @@ jobs:
                 'skipping duplicate OpenCode run.'
               );
               core.setOutput('skip', 'true');
+              // The receipt-only recovery path needs the existing PR identity.
+              // Its head ref proves whether this PR was published by this very
+              // workflow run (a rerun keeps the run id) or by an earlier run
+              // whose artifacts this run cannot restore.
+              core.setOutput('pr_number', String(existing.number));
+              core.setOutput('head_ref', String(existing.head?.ref || ''));
               return;
             }
 
@@ -2597,6 +2614,98 @@ jobs:
               );
               core.setOutput('skip', 'false');
             }
+      # kodmial/continuum#458, PR #459 review: an artifact upload failure after
+      # `gh pr create` would otherwise leave this run's publication unattested
+      # forever. A rerun keeps the run id but finds the existing
+      # `opencode/issue<N>-<run>` PR, so the duplicate guard skipped both the
+      # implementation and the receipt upload. Re-attest the identity this run
+      # recorded at creation, without creating or changing any PR. Only a PR
+      # whose head ref embeds this run id is recoverable here: an artifact can
+      # only be attached to its own workflow run.
+      - name: Recover publication receipt for an existing PR
+        id: publication_recovery
+        if: >-
+          steps.duplicate_guard.outputs.skip == 'true' &&
+          steps.duplicate_guard.outputs.pr_number != ''
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.TAP_PAT }}
+          ISSUE_NUMBER: ${{ inputs.issue_number || github.event.issue.number }}
+          EXISTING_PR: ${{ steps.duplicate_guard.outputs.pr_number }}
+          EXISTING_BRANCH: ${{ steps.duplicate_guard.outputs.head_ref }}
+        run: |
+          set -euo pipefail
+          EXPECTED_BRANCH="opencode/issue${ISSUE_NUMBER}-${GITHUB_RUN_ID}"
+          if [[ "$EXISTING_BRANCH" != "$EXPECTED_BRANCH" ]]; then
+            echo "::notice::PR #$EXISTING_PR belongs to '$EXISTING_BRANCH', not this run's '$EXPECTED_BRANCH'; refusing to attest another run's publication."
+            exit 0
+          fi
+          [[ "$ISSUE_NUMBER" =~ ^[1-9][0-9]*$ && "$EXISTING_PR" =~ ^[1-9][0-9]*$ ]] \
+            || { echo "::error::Publication recovery has no issue or PR identity; refusing to attest."; exit 1; }
+          # An existing non-expired receipt already attests this run, so recovery
+          # is idempotent and never piles up duplicate artifacts on every rerun.
+          PRESENT="$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/artifacts?per_page=100" \
+            --jq '[.artifacts[] | select((.expired | tostring) != "true") | select(.name | startswith("continuum-task-publication"))] | length')"
+          if [[ "$PRESENT" != "0" ]]; then
+            echo "Publication receipt already exists for run $GITHUB_RUN_ID; nothing to recover."
+            exit 0
+          fi
+          # The identity recorded at creation: this run id (embedded in the
+          # branch), this issue, this PR, this attempt, and the task commit. The
+          # oldest PR commit is the commit this run pushed; later repair commits
+          # still have to prove continuity separately, so recovery never widens
+          # what completion may accept.
+          PR_JSON="$(gh api "repos/$GITHUB_REPOSITORY/pulls/$EXISTING_PR")"
+          PR_HEAD="$(jq -r '.head.sha // ""' <<<"$PR_JSON")"
+          PR_CREATED_AT="$(jq -r '.created_at // ""' <<<"$PR_JSON")"
+          [[ "$PR_HEAD" =~ ^[0-9a-f]{40}$ ]] \
+            || { echo "::error::Could not read PR #$EXISTING_PR head; refusing to attest."; exit 1; }
+          TASK_COMMIT="$(gh api "repos/$GITHUB_REPOSITORY/pulls/$EXISTING_PR/commits?per_page=1" --jq '.[0].sha // empty')"
+          [[ "$TASK_COMMIT" =~ ^[0-9a-f]{40}$ ]] \
+            || { echo "::error::Could not recover the published task commit for PR #$EXISTING_PR; refusing to attest."; exit 1; }
+          ANCESTRY="$(gh api "repos/$GITHUB_REPOSITORY/compare/${TASK_COMMIT}...${PR_HEAD}" --jq .status)"
+          case "$ANCESTRY" in
+            ahead|identical) ;;
+            *)
+              echo "::error::Recovered task commit $TASK_COMMIT is not behind PR #$EXISTING_PR head $PR_HEAD; refusing to attest."
+              exit 1
+              ;;
+          esac
+          # The creation attempt is the last attempt that had started when the PR
+          # was created. A read failure falls back to this attempt, which is the
+          # same truthful value when no rerun happened.
+          PUBLISHED_ATTEMPT="$GITHUB_RUN_ATTEMPT"
+          if [[ -n "$PR_CREATED_AT" ]]; then
+            for attempt in $(seq 1 "$GITHUB_RUN_ATTEMPT"); do
+              ATTEMPT_STARTED_AT="$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/attempts/$attempt" --jq '.run_started_at // ""' 2>/dev/null || true)"
+              [[ -n "$ATTEMPT_STARTED_AT" ]] || continue
+              if [[ ! "$PR_CREATED_AT" < "$ATTEMPT_STARTED_AT" ]]; then
+                PUBLISHED_ATTEMPT="$attempt"
+              fi
+            done
+          fi
+          PUBLICATION_DIR="${RUNNER_TEMP:-/tmp}/continuum-task-publication"
+          mkdir -p "$PUBLICATION_DIR"
+          jq -n \
+            --arg repo "$GITHUB_REPOSITORY" \
+            --arg issue "$ISSUE_NUMBER" \
+            --arg run "$GITHUB_RUN_ID" \
+            --arg attempt "$PUBLISHED_ATTEMPT" \
+            --arg branch "$EXPECTED_BRANCH" \
+            --arg pr "$EXISTING_PR" \
+            --arg head "$TASK_COMMIT" \
+            '{schema_version: 1, repo: $repo, issue: ($issue | tonumber), run_id: $run, run_attempt: $attempt, branch: $branch, pr_number: ($pr | tonumber), head_sha: $head}' \
+            > "$PUBLICATION_DIR/publication.json"
+          echo "present=true" >> "$GITHUB_OUTPUT"
+
+      - name: Upload recovered OpenCode publication receipt
+        if: steps.publication_recovery.outputs.present == 'true'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: continuum-task-publication-${{ github.run_attempt }}-recovery
+          path: ${{ runner.temp }}/continuum-task-publication/publication.json
+          if-no-files-found: error
+
       - name: Remove duplicate-run decision engine
         if: always()
         shell: bash
@@ -3057,6 +3166,7 @@ jobs:
       # this recovery path makes the workflow lossless if a future OpenCode
       # version, shell indirection, or tool bypass still changes branches.
       - name: Recover agent-managed issue branch
+        id: recover_issue_branch
         if: >-
           steps.issue_readiness.outputs.ready != 'false' &&
           needs.admit.outputs.route == 'issue'
@@ -3190,8 +3300,18 @@ jobs:
             --arg head "$(git rev-parse HEAD)" \
             '{schema_version: 1, repo: $repo, issue: ($issue | tonumber), run_id: $run, run_attempt: $attempt, branch: $branch, pr_number: ($pr | tonumber), head_sha: $head}' \
             > "$PUBLICATION_DIR/publication.json"
+          # Record the same identity as job outputs so a failed receipt upload
+          # can still be recovered on a fresh runner from this run's evidence.
+          {
+            echo "publication_issue=$ISSUE_NUMBER"
+            echo "publication_attempt=$GITHUB_RUN_ATTEMPT"
+            echo "publication_branch=$CURRENT_BRANCH"
+            echo "publication_pr_number=$RECOVER_PR_NUMBER"
+            echo "publication_head_sha=$(git rev-parse HEAD)"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Implement issue
+        id: implement_issue
         if: >-
           steps.issue_readiness.outputs.ready != 'false' &&
           ((github.event_name == 'workflow_dispatch' && inputs.mode == 'issue') ||
@@ -4030,6 +4150,15 @@ jobs:
             --arg head "$TASK_COMMIT" \
             '{schema_version: 1, repo: $repo, issue: ($issue | tonumber), run_id: $run, run_attempt: $attempt, branch: $branch, pr_number: ($pr | tonumber), head_sha: $head}' \
             > "$PUBLICATION_DIR/publication.json"
+          # Record the same identity as job outputs so a failed receipt upload
+          # can still be recovered on a fresh runner from this run's evidence.
+          {
+            echo "publication_issue=$ISSUE_NUMBER"
+            echo "publication_attempt=$GITHUB_RUN_ATTEMPT"
+            echo "publication_branch=$BRANCH"
+            echo "publication_pr_number=$PR_NUMBER"
+            echo "publication_head_sha=$TASK_COMMIT"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Upload OpenCode publication receipt
         if: >-
@@ -5993,6 +6122,89 @@ jobs:
         with:
           name: continuum-repair-publication-${{ github.run_attempt }}-job-recovery
           path: ${{ runner.temp }}/continuum-repair-publication-recovery/publication.json
+          if-no-files-found: error
+
+  recover-issue-publication:
+    name: Recover authenticated issue publication receipt
+    needs: opencode
+    # A failed `Upload OpenCode publication receipt` step leaves the PR in place
+    # without the run-scoped receipt the canary requires. A rerun cannot repair
+    # it: the duplicate guard sees the existing `opencode/issue<N>-` PR and
+    # skips both implementation and the upload. Re-attest the identity the
+    # publish step recorded as job outputs, on a fresh runner, without creating
+    # or changing any PR.
+    if: >-
+      !cancelled() &&
+      needs.opencode.result == 'failure'
+    runs-on: ubuntu-latest
+    timeout-minutes: ${{ fromJSON(vars.AUTOMATION_ATTEMPTS_TIMEOUT_MINUTES || '10') }}
+
+    permissions: {}
+
+    steps:
+      - name: Republish the OpenCode publication receipt from the recorded identity
+        env:
+          GH_TOKEN: ${{ secrets.TAP_PAT }}
+          ISSUE_NUMBER: ${{ needs.opencode.outputs.publication_issue }}
+          BRANCH: ${{ needs.opencode.outputs.publication_branch }}
+          PR_NUMBER: ${{ needs.opencode.outputs.publication_pr_number }}
+          HEAD_SHA: ${{ needs.opencode.outputs.publication_head_sha }}
+          PUBLICATION_ATTEMPT: ${{ needs.opencode.outputs.publication_attempt }}
+        run: |
+          set -euo pipefail
+          if [[ -z "$ISSUE_NUMBER$BRANCH$PR_NUMBER$HEAD_SHA" ]]; then
+            echo "No issue publication was recorded for this run; nothing to recover."
+            exit 0
+          fi
+          [[ "$ISSUE_NUMBER" =~ ^[1-9][0-9]*$ && "$PR_NUMBER" =~ ^[1-9][0-9]*$ ]] \
+            || { echo "::error::Recovered publication has no issue or pull-request identity; refusing to attest."; exit 1; }
+          [[ "$HEAD_SHA" =~ ^[0-9a-f]{40}$ ]] \
+            || { echo "::error::Recovered publication has no full task commit; refusing to attest."; exit 1; }
+          [[ "$BRANCH" == "opencode/issue${ISSUE_NUMBER}-"* ]] \
+            || { echo "::error::Recovered publication branch '$BRANCH' is not this issue's task branch; refusing to attest."; exit 1; }
+          [[ "${PUBLICATION_ATTEMPT:-}" =~ ^[1-9][0-9]*$ ]] \
+            || { echo "::error::Recovered publication has no valid run attempt; refusing to attest."; exit 1; }
+          # The identity is only trustworthy when the PR it names still exists
+          # with this branch and contains this commit. Verify both before
+          # attesting; a deleted or retargeted PR must never inherit a receipt.
+          PR_JSON="$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER" 2>/dev/null)" \
+            || { echo "::error::Could not read PR #$PR_NUMBER for publication recovery; refusing to attest."; exit 1; }
+          PR_BRANCH="$(jq -r '.head.ref // ""' <<<"$PR_JSON")"
+          PR_HEAD="$(jq -r '.head.sha // ""' <<<"$PR_JSON")"
+          [[ "$PR_BRANCH" == "$BRANCH" ]] \
+            || { echo "::error::PR #$PR_NUMBER head is '$PR_BRANCH', not the recorded '$BRANCH'; refusing to attest."; exit 1; }
+          [[ "$PR_HEAD" =~ ^[0-9a-f]{40}$ ]] \
+            || { echo "::error::Could not read PR #$PR_NUMBER head; refusing to attest."; exit 1; }
+          ANCESTRY="$(gh api "repos/$GITHUB_REPOSITORY/compare/${HEAD_SHA}...${PR_HEAD}" --jq .status 2>/dev/null)" \
+            || { echo "::error::Could not compare recovered task commit with PR #$PR_NUMBER; refusing to attest."; exit 1; }
+          case "$ANCESTRY" in
+            ahead|identical) ;;
+            *)
+              echo "::error::Recovered task commit $HEAD_SHA is not behind PR #$PR_NUMBER head $PR_HEAD; refusing to attest."
+              exit 1
+              ;;
+          esac
+          RECOVERY_DIR="${RUNNER_TEMP:-/tmp}/continuum-task-publication-recovery"
+          mkdir -p "$RECOVERY_DIR"
+          jq -n \
+            --arg repo "$GITHUB_REPOSITORY" \
+            --arg issue "$ISSUE_NUMBER" \
+            --arg run "$GITHUB_RUN_ID" \
+            --arg attempt "$PUBLICATION_ATTEMPT" \
+            --arg branch "$BRANCH" \
+            --arg pr "$PR_NUMBER" \
+            --arg head "$HEAD_SHA" \
+            '{schema_version: 1, repo: $repo, issue: ($issue | tonumber), run_id: $run, run_attempt: $attempt, branch: $branch, pr_number: ($pr | tonumber), head_sha: $head}' \
+            > "$RECOVERY_DIR/publication.json"
+
+      - name: Upload recovered OpenCode publication receipt
+        if: >-
+          !cancelled() &&
+          needs.opencode.outputs.publication_pr_number != ''
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: continuum-task-publication-${{ needs.opencode.outputs.publication_attempt || github.run_attempt }}-job-recovery
+          path: ${{ runner.temp }}/continuum-task-publication-recovery/publication.json
           if-no-files-found: error
 
   cleanup-workflow-repair-lock:
