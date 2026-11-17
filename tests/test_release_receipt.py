@@ -22,7 +22,7 @@ from continuum.release.receipt import (
     TagReceiptStore,
     receipt_name,
 )
-from continuum.release.state import COMPLETED, StageOutcome
+from continuum.release.state import COMPLETED, SKIPPED, Journal, StageOutcome
 
 SHA = "a" * 40
 OTHER_SHA = "b" * 40
@@ -122,6 +122,134 @@ class ReceiptValueTests(unittest.TestCase):
         merged = first.merge(second)
         self.assertTrue(merged.published)
         self.assertEqual(len(merged.manifests), 1)
+
+    def test_a_later_noop_does_not_undo_an_earlier_completion(self):
+        # A duplicate event re-runs the destination stage, finds the release
+        # already published, and records a no-op. The stored receipt says the
+        # draft completed. Both are true: the work was already done.
+        stored = self.make(
+            published=True,
+            journal=Journal(
+                entries=(StageOutcome.completed("draft", "draft-key", "drafted"),)
+            ),
+        )
+        rebuilt = self.make(
+            journal=Journal(
+                entries=(
+                    StageOutcome.noop(
+                        "draft",
+                        "draft-key",
+                        "already published",
+                        code="already-published",
+                    ),
+                )
+            )
+        )
+        merged = stored.merge(rebuilt)
+        entries = [item for item in merged.journal.entries if item.stage == "draft"]
+        self.assertEqual(len(entries), 1)
+        self.assertEqual(entries[0].outcome, COMPLETED)
+
+    def test_a_later_completion_replaces_an_earlier_noop(self):
+        noop_first = self.make(
+            journal=Journal(
+                entries=(
+                    StageOutcome.noop("draft", "draft-key", "nothing yet"),
+                )
+            )
+        )
+        completed = self.make(
+            journal=Journal(
+                entries=(StageOutcome.completed("draft", "draft-key", "drafted"),)
+            )
+        )
+        merged = noop_first.merge(completed)
+        entries = [item for item in merged.journal.entries if item.stage == "draft"]
+        self.assertEqual(len(entries), 1)
+        self.assertEqual(entries[0].outcome, COMPLETED)
+
+    def test_a_later_duplicate_skip_does_not_undo_an_earlier_completion(self):
+        stored = self.make(
+            published=True,
+            journal=Journal(
+                entries=(StageOutcome.completed("publish", "publish-key", "published"),)
+            ),
+        )
+        rebuilt = self.make(
+            journal=Journal(
+                entries=(
+                    StageOutcome.skipped(
+                        "publish",
+                        "publish-key",
+                        "every destination already had it",
+                        duplicate=True,
+                        code="duplicate-event",
+                    ),
+                )
+            )
+        )
+        merged = stored.merge(rebuilt)
+        entries = [item for item in merged.journal.entries if item.stage == "publish"]
+        self.assertEqual(len(entries), 1)
+        self.assertEqual(entries[0].outcome, COMPLETED)
+
+    def test_a_later_failure_still_conflicts_with_a_completion(self):
+        stored = self.make(
+            journal=Journal(
+                entries=(StageOutcome.completed("draft", "draft-key", "drafted"),)
+            )
+        )
+        failed = self.make(
+            journal=Journal(
+                entries=(
+                    StageOutcome.failed(
+                        "draft", "draft-key", "could not draft", code="draft-not-created"
+                    ),
+                )
+            )
+        )
+        with self.assertRaises(ReceiptError) as caught:
+            stored.merge(failed)
+        self.assertEqual(caught.exception.code, "receipt-conflict")
+
+    def test_merge_reconciles_a_stored_receipt_with_a_rebuild_elsewhere(self):
+        # A published receipt names the release asset; a duplicate run rebuilds
+        # the same bytes into a different workspace path. They are one release.
+        second_directory = tempfile.TemporaryDirectory()
+        self.addCleanup(second_directory.cleanup)
+        stored = self.make(published=True)
+        rebuilt = Receipt(
+            repository="example/widgets",
+            version=VERSION,
+            tag="v1.2.3",
+            source_sha=SHA,
+            manifests=(manifest(second_directory.name),),
+        )
+        merged = stored.merge(rebuilt)
+        self.assertEqual(len(merged.manifests), 1)
+        self.assertTrue(merged.published)
+
+    def test_merge_still_refuses_different_bytes_built_elsewhere(self):
+        second_directory = tempfile.TemporaryDirectory()
+        self.addCleanup(second_directory.cleanup)
+        changed = os.path.join(second_directory.name, "linux.tar.gz")
+        with open(changed, "wb") as handle:
+            handle.write(b"different payload")
+        builder = ManifestBuilder(
+            target="linux", adapter="fixture", source_sha=SHA, version=VERSION
+        )
+        builder.record("widget.tar.gz", changed, TYPE_ARCHIVE)
+        with self.assertRaises(ReceiptError) as caught:
+            self.make(published=True).merge(
+                Receipt(
+                    repository="example/widgets",
+                    version=VERSION,
+                    tag="v1.2.3",
+                    source_sha=SHA,
+                    manifests=(builder.build(),),
+                )
+            )
+        self.assertEqual(caught.exception.code, "asset-set-conflict")
 
     def test_a_receipt_name_is_derived_from_repository_and_version(self):
         self.assertEqual(receipt_name("example/widgets", "1.2.3"), "receipt-example-widgets-1.2.3.json")

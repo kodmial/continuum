@@ -633,11 +633,18 @@ class MultiTargetTests(ReleaseTestCase):
 class PublisherResultTests(ReleaseTestCase):
     def test_a_publication_names_its_destination_and_its_identity(self):
         outcome = self.core.execute(self.request())
-        publication = outcome.publications[0]
+        publication = outcome.publications[1]
         self.assertTrue(publication.published)
         self.assertEqual(publication.destination, support.GITHUB_DESTINATION)
         self.assertEqual(publication.identity, f"v1.4.0@{SHA}")
         self.assertEqual(publication.external_version, "v1.4.0")
+
+    def test_a_draft_is_not_reported_as_a_completed_publication(self):
+        outcome = self.core.execute(self.request())
+        draft = outcome.publications[0]
+        self.assertTrue(draft.drafted)
+        self.assertFalse(draft.published)
+        self.assertTrue(outcome.published)
 
     def test_a_draft_and_a_publication_are_two_distinct_writes(self):
         outcome = self.core.execute(self.request())

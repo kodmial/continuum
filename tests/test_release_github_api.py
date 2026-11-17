@@ -95,9 +95,22 @@ class FakeGitHub:
         if method == "GET" and "/releases/tags/" in path:
             tag = path.rsplit("/", 1)[-1]
             record = self._find(tag)
-            if record is None:
+            # GitHub's by-tag endpoint does not return drafts; a draft is only
+            # visible through the release listing. The qualification run found
+            # this the expensive way, so the fake enforces it too.
+            if record is None or record["draft"]:
                 return HttpResponse(404, {}, b"{}")
             return HttpResponse(200, {}, json.dumps(self._payload(record)).encode())
+
+        if method == "GET" and path.endswith("/releases") and "/releases/" not in path:
+            page = int(query.get("page", ["1"])[0])
+            per_page = int(query.get("per_page", ["30"])[0])
+            records = sorted(self.releases.values(), key=lambda item: item["id"])
+            start = (page - 1) * per_page
+            window = records[start : start + per_page]
+            return HttpResponse(
+                200, {}, json.dumps([self._payload(record) for record in window]).encode()
+            )
 
         if method == "POST" and path.endswith("/releases"):
             payload = json.loads(body.decode())
@@ -246,6 +259,19 @@ class TagIdentityTests(unittest.TestCase):
             repository.create_draft(tag="v1.0.0", name="v1.0.0", target_sha=SHA, notes="n")
         self.assertEqual(caught.exception.code, "tag-source-conflict")
         self.assertFalse(caught.exception.retryable)
+
+    def test_a_draft_is_found_by_tag_even_though_the_tag_endpoint_hides_it(self):
+        fake = FakeGitHub()
+        repository = GitHubReleaseRepository(client(fake))
+        created = repository.create_draft(
+            tag="v1.0.0", name="v1.0.0", target_sha=SHA, notes="notes"
+        )
+        # The fake answers 404 from /releases/tags for a draft, like GitHub.
+        self.assertEqual(client(fake).find_release("v1.0.0")["id"], int(created.id))
+        found = repository.find_by_tag("v1.0.0")
+        self.assertIsNotNone(found)
+        self.assertTrue(found.draft)
+        self.assertEqual(found.target_sha, SHA)
 
 
 class AssetTests(unittest.TestCase):

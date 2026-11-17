@@ -138,9 +138,10 @@ SUPPORTED_PROVENANCE_STATES: Tuple[str, ...] = (
 # is what makes "this repository already released this version" a normal,
 # expected result of a duplicate event rather than a red job.
 PUBLISHED = "published"
+DRAFTED = "drafted"
 SKIPPED = "skipped"
 FAILED = "failed"
-SUPPORTED_PUBLISH_OUTCOMES: Tuple[str, ...] = (PUBLISHED, SKIPPED, FAILED)
+SUPPORTED_PUBLISH_OUTCOMES: Tuple[str, ...] = (PUBLISHED, DRAFTED, SKIPPED, FAILED)
 
 # -- event vocabulary --------------------------------------------------------
 
@@ -620,6 +621,39 @@ class ArtifactManifest:
         )
         return hashlib.sha256(joined.encode("utf-8")).hexdigest()
 
+    def same_release(self, other: "ArtifactManifest") -> bool:
+        """Whether two manifests describe the same release content.
+
+        ``Artifact.path`` is deliberately excluded. It records where the bytes
+        sat in the run that produced them: a workspace ``dist`` directory for a
+        build, or the publish job's download directory once the receipt has been
+        stored beside the release asset. A duplicate event rebuilds into a
+        different workspace, and that must not read as "different bytes"; the
+        release identity is the target, source, version, adapter, and every
+        artifact's name, digest, size and claims.
+        """
+
+        if (
+            self.target != other.target
+            or self.source_sha != other.source_sha
+            or self.version != other.version
+            or self.adapter != other.adapter
+            or self.contract_version != other.contract_version
+        ):
+            return False
+
+        def claims(manifest: "ArtifactManifest") -> Dict[str, Dict[str, Any]]:
+            return {
+                item.name: {
+                    key: value
+                    for key, value in item.describe().items()
+                    if key != "path"
+                }
+                for item in manifest.artifacts
+            }
+
+        return claims(self) == claims(other)
+
     def assert_release_source(self, source_sha: str) -> None:
         """Refuse a manifest built from any commit but the approved one."""
 
@@ -914,7 +948,7 @@ class PublisherResult:
                 "a publication result must name its destination; 'it went somewhere' "
                 "is not a record"
             )
-        if self.outcome == PUBLISHED and not self.identity:
+        if self.outcome in (PUBLISHED, DRAFTED) and not self.identity:
             raise ContractError(
                 f"publication to {self.destination!r} reported success without an "
                 "immutable identity. Something that cannot be named cannot be "
@@ -939,6 +973,18 @@ class PublisherResult:
     @property
     def published(self) -> bool:
         return self.outcome == PUBLISHED
+
+    @property
+    def drafted(self) -> bool:
+        """Whether the destination now holds an unpublished draft.
+
+        A draft is real work, but it is not a release. Keeping it a distinct
+        outcome is what stops a failed publish stage from reporting
+        `published: true` just because the draft it was supposed to promote was
+        created successfully.
+        """
+
+        return self.outcome == DRAFTED
 
     @property
     def ok(self) -> bool:
@@ -996,6 +1042,33 @@ def published(
 ) -> PublisherResult:
     return PublisherResult(
         outcome=PUBLISHED,
+        destination=destination,
+        identity=identity,
+        external_id=external_id,
+        external_version=external_version,
+        code=code,
+        details=_detail_tuple(details),
+    )
+
+
+def drafted(
+    destination: str,
+    identity: str,
+    *,
+    external_id: str = "",
+    external_version: str = "",
+    code: str = "",
+    details: Optional[Mapping[str, str]] = None,
+) -> PublisherResult:
+    """A destination that now holds a complete, unpublished draft.
+
+    Distinct from `published` on purpose: the draft stage and the publish stage
+    are separate claims, and an outcome that called both "published" would make
+    a partial release indistinguishable from a complete one.
+    """
+
+    return PublisherResult(
+        outcome=DRAFTED,
         destination=destination,
         identity=identity,
         external_id=external_id,
@@ -1641,6 +1714,7 @@ def register(registry: Dict[str, Any], name: str, component: Any, role: str) -> 
 
 __all__ = [
     "CONTRACT_VERSION",
+    "DRAFTED",
     "EVIDENCE_ARTIFACT_TYPES",
     "EVENT_DISPATCH",
     "EVENT_PUSH",
@@ -1700,6 +1774,7 @@ __all__ = [
     "conform",
     "checksums_document",
     "digest_file",
+    "drafted",
     "failed",
     "ineligible",
     "is_source_sha",

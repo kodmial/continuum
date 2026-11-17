@@ -55,6 +55,7 @@ from .contract import (
     ContractError,
     PublishRequest,
     PublisherResult,
+    drafted,
     failed,
     published,
     require_conform,
@@ -462,7 +463,7 @@ class GitHubReleasePublisher:
         if isinstance(attested, PublisherResult):
             return attested
 
-        return published(
+        return drafted(
             self._destination,
             self._identity(record),
             external_id=record.id,

@@ -3,8 +3,9 @@
 These are the assertions that would be most expensive to get wrong later,
 because everything above them assumes them: a manifest is one target from one
 commit of one version, a digest is a fact rather than a claim, and a publisher
-result is one of three words. A release is only as trustworthy as the types it
-is assembled from, so those types are tested on their own.
+result distinguishes a draft from a publication. A release is only as
+trustworthy as the types it is assembled from, so those types are tested on
+their own.
 """
 
 from __future__ import annotations
@@ -28,6 +29,7 @@ from continuum.release.contract import (
     TargetSpec,
     VerificationReport,
     digest_file,
+    drafted,
     failed,
     published,
     skipped,
@@ -307,11 +309,17 @@ class PublishRequestTests(unittest.TestCase):
 
 
 class PublisherResultTests(unittest.TestCase):
-    def test_there_are_three_outcomes_and_no_others(self):
+    def test_there_are_four_outcomes_and_no_others(self):
         self.assertEqual(
             contract.SUPPORTED_PUBLISH_OUTCOMES,
-            ("published", "skipped", "failed"),
+            ("published", "drafted", "skipped", "failed"),
         )
+
+    def test_a_draft_is_successful_work_but_not_a_publication(self):
+        result = drafted("github release", "v1.4.0@" + SHA, external_id="R_1")
+        self.assertTrue(result.ok)
+        self.assertTrue(result.drafted)
+        self.assertFalse(result.published)
 
     def test_a_skipped_publication_is_a_success_that_explained_itself(self):
         result = skipped("github release", "already published", identity="v1.4.0@abc")

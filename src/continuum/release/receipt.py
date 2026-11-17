@@ -31,7 +31,15 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from .contract import ArtifactManifest, ContractError, require_source_sha
-from .state import EMPTY_JOURNAL, Journal, ReleaseStateError, StageOutcome
+from .state import (
+    COMPLETED,
+    EMPTY_JOURNAL,
+    Journal,
+    NOOP,
+    ReleaseStateError,
+    SKIPPED,
+    StageOutcome,
+)
 
 RECEIPT_SCHEMA = "continuum.release-receipt/v1"
 
@@ -193,7 +201,11 @@ class Receipt:
         for candidate in other.manifests:
             for index, existing in enumerate(manifests):
                 if existing.target == candidate.target:
-                    if existing != candidate:
+                    # Compare release content, not the run-local path: the
+                    # stored receipt names the published asset while a rebuilt
+                    # receipt names the workspace file, and a duplicate event
+                    # must reconcile those two as the same release.
+                    if not existing.same_release(candidate):
                         raise ReceiptError(
                             f"two runs built different bytes for target "
                             f"{candidate.target!r} at {self.version}",
@@ -301,6 +313,21 @@ def _entry_identity(entry: StageOutcome) -> Tuple[str, ...]:
     )
 
 
+def _weaker_outcome(outcome: str) -> bool:
+    """Outcomes that mean a later attempt found nothing left to do.
+
+    Completion is monotonic for one idempotency key: once a stage has completed
+    for a (repository, version, tag, source) release, a later run of that same
+    release recording a no-op or a duplicate is agreeing that no work was left,
+    not contradicting the earlier run. The no-op at a terminal destination stage
+    means exactly this — "the release already holds it" — so a duplicate event
+    must reconcile with the receipt the first run stored instead of being
+    refused as a disagreement.
+    """
+
+    return outcome in (NOOP, SKIPPED)
+
+
 def _merge_journals(first: Journal, second: Journal) -> Journal:
     """Both records, in order, with a disagreement refused.
 
@@ -308,13 +335,19 @@ def _merge_journals(first: Journal, second: Journal) -> Journal:
     same transition recorded twice is the same fact, but two different outcomes
     under one key are two runs that disagree, and a resumed run that silently
     kept the last one would forget that it had ever been told otherwise.
+
+    The one tolerated difference is completion against a later no-op (or a
+    duplicate skip). The completed record is the stronger fact and survives;
+    the weaker record is not appended, so the merged journal still says the work
+    was done. The reverse — a no-op that a later run contradicts by completing —
+    replaces the no-op with the completion, because a stage cannot be
+    un-completed by an attempt that then does the work.
     """
 
     merged: List[StageOutcome] = list(first.entries)
-    seen = {_entry_identity(entry) for entry in merged}
     for entry in second.entries:
         identity = _entry_identity(entry)
-        if identity in seen:
+        if any(_entry_identity(candidate) == identity for candidate in merged):
             continue
         previous = next(
             (
@@ -327,13 +360,17 @@ def _merge_journals(first: Journal, second: Journal) -> Journal:
             None,
         )
         if previous is not None and previous.outcome != entry.outcome:
+            if previous.outcome == COMPLETED and _weaker_outcome(entry.outcome):
+                continue
+            if entry.outcome == COMPLETED and _weaker_outcome(previous.outcome):
+                merged[merged.index(previous)] = entry
+                continue
             raise ReceiptError(
                 f"two records disagree about {entry.stage} for key {entry.key}: "
                 f"{previous.outcome} versus {entry.outcome}",
                 code="receipt-conflict",
             )
         merged.append(entry)
-        seen.add(identity)
     return Journal(entries=tuple(merged))
 
 

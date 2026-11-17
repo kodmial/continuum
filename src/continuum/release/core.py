@@ -158,6 +158,15 @@ def _destination_outcome(
             destination=destination,
             **run.note(),
         )
+    if result.drafted:
+        return StageOutcome.completed(
+            stage_name,
+            key,
+            f"{destination} holds a complete draft; it is not published yet",
+            code=result.code or "drafted",
+            destination=destination,
+            **run.note(),
+        )
     return StageOutcome.completed(
         stage_name,
         key,

@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import json
+import io
 import os
 import shutil
 import tempfile
 import unittest
+from contextlib import redirect_stdout
 
 from continuum.release import cli, github_api
 from test_release_github_api import FakeGitHub
@@ -545,6 +547,18 @@ class ExecuteTests(CliTestCase):
         code = self.main(self.fixture.args("execute"))
         self.assertEqual(code, cli.EXIT_FAILED)
         self.assertEqual(self.payload()["code"], "notes-changed")
+
+    def test_a_stage_failure_prints_its_reason(self):
+        buffer = io.StringIO()
+        with redirect_stdout(buffer):
+            code = self.main(
+                self.fixture.args("plan", **{"--version": "9.9.9"})
+            )
+        self.assertEqual(code, cli.EXIT_FAILED)
+        output = buffer.getvalue()
+        self.assertIn("failure:", output)
+        self.assertIn("notes-version-missing", output)
+        self.assertIn("9.9.9", output)
 
 
 class ConfigurationTests(CliTestCase):

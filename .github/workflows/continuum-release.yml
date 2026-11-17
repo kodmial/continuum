@@ -139,7 +139,7 @@ on:
     outputs:
       status:
         description: Final release status (released, no-op, prepared, failed)
-        value: ${{ jobs.publish.outputs.status || jobs.prepare.outputs.status || jobs.plan.outputs.status }}
+        value: ${{ jobs.publish.outputs.status || jobs.plan.outputs.status }}
       version:
         description: Agreed release version
         value: ${{ jobs.plan.outputs.version }}
@@ -451,10 +451,20 @@ jobs:
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: continuum-release-prepared
-          path: |
-            prepared/
-            evidence/
+          # Only the receipts cross this boundary. Uploading `prepared/` as the
+          # artifact root keeps the download at `prepared/receipt-*.json`, which
+          # is exactly the path the build leg imports.
+          path: prepared/
           if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload preparation evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: continuum-release-prepare-evidence
+          path: evidence/
+          if-no-files-found: warn
           retention-days: 14
 
   build:
@@ -592,10 +602,20 @@ jobs:
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: continuum-release-build-${{ matrix.id }}
-          path: |
-            bundle/
-            evidence/
+          # The artifact root is the bundle directory, so the publish job finds
+          # `receipt-<target>.json` and every declared asset at the top of the
+          # merged download instead of under a `bundle/` prefix.
+          path: bundle/
           if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload this target's build evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: continuum-release-evidence-${{ matrix.id }}
+          path: evidence/
+          if-no-files-found: warn
           retention-days: 14
 
   publish:

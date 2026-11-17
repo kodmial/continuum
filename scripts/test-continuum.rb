@@ -11808,7 +11808,12 @@ class ContinuumTest < Minitest::Test
   end
 
   def test_application_release_builds_each_target_from_the_same_exact_commit
-    jobs = yaml(release_workflow_path).fetch('jobs')
+    workflow = yaml(release_workflow_path)
+    jobs = workflow.fetch('jobs')
+    engine_repository = events(workflow).fetch('workflow_call').fetch('inputs')
+                                .fetch('continuum_engine_repository')
+    assert_equal 'kodmial/continuum', engine_repository.fetch('default'),
+                 'the engine repository defaults to the audited Continuum repository'
     plan = release_job_body('plan')
     assert_includes plan, '^[0-9a-f]{40}$',
                     'the plan must reject anything but an exact lowercase commit'
@@ -11822,26 +11827,40 @@ class ContinuumTest < Minitest::Test
       refute_nil engine, "#{name} must check out the Continuum engine"
       assert_equal '${{ inputs.source_sha }}', consumer.fetch('with').fetch('ref'),
                    "#{name} must check out the exact requested commit, not a branch head"
-      assert_equal 'kodmial/continuum', engine.fetch('with').fetch('repository')
+      assert_equal '${{ inputs.continuum_engine_repository }}', engine.fetch('with').fetch('repository'),
+                   "#{name} must use the audited engine repository selected by the caller"
       assert_equal '${{ inputs.continuum_ref }}', engine.fetch('with').fetch('ref')
     end
 
     upload = jobs.fetch('build').fetch('steps').find { |step| step['uses'].to_s.include?('upload-artifact@') }
     refute_nil upload, 'each build leg must publish its bundle and receipt'
     assert_equal 'continuum-release-build-${{ matrix.id }}', upload.fetch('with').fetch('name')
+    assert_equal 'bundle/', upload.fetch('with').fetch('path').strip,
+                 'the artifact root must be the bundle directory so the merged download keeps receipts at the top level'
     build_body = release_job_body('build')
     assert_includes build_body, '--target "$TARGET_ID"'
     assert_includes build_body, '--bundle-out bundle'
     assert_includes build_body, '--receipt-import "$receipt"'
 
+    prepared_uploads = jobs.fetch('prepare').fetch('steps')
+                             .select { |step| step['uses'].to_s.include?('upload-artifact@') }
+    prepared = prepared_uploads.find { |step| step.fetch('with', {})['name'] == 'continuum-release-prepared' }
+    refute_nil prepared, 'preparation must publish its receipts'
+    assert_equal 'prepared/', prepared.fetch('with').fetch('path').strip,
+                 'the prepared artifact root must be the receipt directory'
+
     downloads = jobs.fetch('publish').fetch('steps')
                      .select { |step| step['uses'].to_s.include?('download-artifact@') }
     builds = downloads.find { |step| step.fetch('with', {})['pattern'] == 'continuum-release-build-*' }
     refute_nil builds, 'publish must import every build leg, not one of them'
+    assert_equal 'artifacts', builds.fetch('with').fetch('path')
+    assert_equal true, builds.fetch('with').fetch('merge-multiple'),
+                 'the publish job needs one flat set of receipts and assets'
     publish_body = release_job_body('publish')
     assert_includes publish_body, '--artifact-dir artifacts'
     assert_includes publish_body, '--asset-receipt'
     assert_includes publish_body, '--receipt-import "$receipt"'
+    assert_includes publish_body, 'for receipt in artifacts/receipt-*.json'
   end
 
   def test_application_release_runs_its_engine_on_a_windows_runner

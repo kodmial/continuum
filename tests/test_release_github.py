@@ -181,7 +181,9 @@ class DraftTests(GitHubTestCase):
     def test_a_draft_is_created_holding_every_asset(self):
         result = self.publisher.draft(self.request())
         self.assertTrue(result.ok)
-        self.assertEqual(result.outcome, contract.PUBLISHED)
+        self.assertTrue(result.drafted)
+        self.assertFalse(result.published)
+        self.assertEqual(result.outcome, contract.DRAFTED)
         self.assertEqual(result.code, "drafted")
         self.assertTrue(self.repository.releases["v1.4.0"].draft)
         self.assertEqual(

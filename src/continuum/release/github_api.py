@@ -319,6 +319,17 @@ class GitHubApi:
         )
 
     def find_release(self, tag: str) -> Optional[Mapping[str, Any]]:
+        """Find a release by tag, including a draft.
+
+        `GET /releases/tags/{tag}` does not return drafts, even to a token with
+        push access; it answers 404 for the draft this same run just created.
+        That is not a detail a resume can ignore: the draft stage creates the
+        release, and the publish stage then has to read it back by tag. So the
+        tag endpoint is tried first (it is the cheap, direct answer for a
+        published release) and a miss falls back to enumerating releases, which
+        does include drafts.
+        """
+
         encoded = urllib.parse.quote(tag, safe="")
         response = self._call(
             "GET",
@@ -326,7 +337,29 @@ class GitHubApi:
             allow_missing=True,
             context=f"look up release {tag}",
         )
-        return None if response is None else response.json()
+        if response is not None:
+            return response.json()
+        page = 1
+        while True:
+            listing = self._call(
+                "GET",
+                self._api(f"/releases?per_page=100&page={page}"),
+                context=f"list releases to find draft {tag}",
+            )
+            assert listing is not None
+            payload = listing.json()
+            if not isinstance(payload, list):
+                raise PortFailure(
+                    f"the release listing was not a list while looking for {tag}",
+                    code="malformed-response",
+                    retryable=False,
+                )
+            for candidate in payload:
+                if str(candidate.get("tag_name") or "") == tag:
+                    return candidate
+            if len(payload) < 100:
+                return None
+            page += 1
 
     def create_release(
         self,

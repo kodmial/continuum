@@ -882,8 +882,10 @@ def _print_human(description: Dict[str, Any]) -> None:
                 identity=publication.get("identity", ""),
             )
         )
-    if description.get("failure"):
-        failure = description["failure"]
+    failure = description.get("failure") or (
+        description.get("outcome") or {}
+    ).get("failure")
+    if failure:
         print(f"  failure: {failure.get('code', '')}: {failure.get('summary', '')}")
 
 
