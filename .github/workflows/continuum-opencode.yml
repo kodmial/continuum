@@ -4876,6 +4876,7 @@ jobs:
           fi
 
       - name: Ask CodeRabbit to verify every original finding
+        id: coderabbit_verification
         if: github.event_name == 'workflow_dispatch' && inputs.mode == 'coderabbit-fix' && steps.unresolved_batch.outputs.skip != 'true'
         uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
         env:
@@ -5062,8 +5063,11 @@ jobs:
                 /^[1-9][0-9]*$/.test(repairRunAttempt) &&
                 entries.every(entry =>
                   Number.isInteger(entry.reviewId) && entry.reviewId > 0);
+              const outcomeDigest = outcomePublishable
+                ? repairOutcomeDigest(entries)
+                : null;
               const outcomeMarker = outcomePublishable
-                ? repairOutcomeMarker(entries, repairOutcomeDigest(entries))
+                ? repairOutcomeMarker(entries, outcomeDigest)
                 : null;
               const totalHandoffComments = Number(pr.data.comments || 0);
               const lastHandoffPage = Math.max(
@@ -5098,6 +5102,19 @@ jobs:
                 return !outcomeMarker || body.includes(outcomeMarker);
               });
               if (trustedDuplicate) return;
+              // Run-scoped provenance: the batcher cannot read workflow
+              // dispatch inputs, and its run evidence (run path, display
+              // title, attempt) never names the PR HEAD or finding set that
+              // was inspected. Publish one run-scoped identity so the
+              // no-change guard can require evidence produced by the run
+              // itself instead of trusting the handoff comment alone.
+              if (outcomePublishable) {
+                core.setOutput(
+                  'provenance',
+                  `${repairBaseSha}-${outcomeDigest}-` +
+                    `${repairRunAttempt}-${repairChanged}`
+                );
+              }
               const body = [marker];
               if (outcomeMarker) body.push(outcomeMarker);
               body.push(
@@ -5200,6 +5217,39 @@ jobs:
                 );
               }
             }
+
+      - name: Publish repair provenance
+        if: >-
+          github.event_name == 'workflow_dispatch' &&
+          inputs.mode == 'coderabbit-fix' &&
+          steps.coderabbit_verification.outputs.provenance != ''
+        shell: bash
+        run: |
+          set -euo pipefail
+          # The no-change guard suppresses a duplicate repair only when the run
+          # itself proves which HEAD and finding set it inspected. Workflow-run
+          # metadata cannot carry that identity: dispatch inputs are not exposed
+          # and `head_sha` is the dispatch ref (the default branch), not the PR
+          # HEAD. Publish the inspected SHA, finding digest, attempt, and
+          # published outcome as a per-run artifact name instead. Retention
+          # bounds the evidence; a missing or expired artifact defers
+          # suppression rather than suppressing on a comment alone.
+          mkdir -p "${RUNNER_TEMP:-/tmp}/continuum-repair-provenance"
+          printf '%s\n' "${{ steps.coderabbit_verification.outputs.provenance }}" \
+            > "${RUNNER_TEMP:-/tmp}/continuum-repair-provenance/provenance.txt"
+
+      - name: Upload repair provenance artifact
+        if: >-
+          github.event_name == 'workflow_dispatch' &&
+          inputs.mode == 'coderabbit-fix' &&
+          steps.coderabbit_verification.outputs.provenance != ''
+        continue-on-error: true
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: continuum-repair-provenance-${{ steps.coderabbit_verification.outputs.provenance }}
+          path: ${{ runner.temp }}/continuum-repair-provenance
+          if-no-files-found: error
+          retention-days: 30
 
       - name: Resolve merge conflict with main
         if: github.event_name == 'workflow_dispatch' && inputs.mode == 'resolve-conflict' && steps.recovery_restore.outputs.skip_opencode != 'true'

@@ -632,7 +632,9 @@ jobs:
             // original finding would otherwise be re-dispatched forever after
             // each CodeRabbit reply. A handoff comment alone is not proof:
             // corroborate the matching Actions run, its successful repair
-            // step, and the published no-change result before suppressing.
+            // step, the published no-change result, and the run-scoped
+            // provenance artifact that binds the inspected HEAD and finding
+            // digest to that run before suppressing.
             const opencodeWorkflow = String(
               process.env.CONTINUUM_OPENCODE_WORKFLOW ||
                 'continuum-opencode.yml'
@@ -739,6 +741,19 @@ jobs:
                 } catch (err) {
                   evidence.error = err;
                 }
+                if (!evidence.error) {
+                  // Run-scoped provenance is fetched separately so a
+                  // temporary read failure defers instead of being mistaken
+                  // for a run that never published evidence.
+                  try {
+                    evidence.artifacts =
+                      (await github.rest.actions.listWorkflowRunArtifacts({
+                        owner, repo, run_id: runId, per_page: 100,
+                      })).data;
+                  } catch (err) {
+                    evidence.artifactsError = err;
+                  }
+                }
                 outcomeRunCache.set(runId, evidence);
               }
               if (evidence.error || !evidence.run) {
@@ -797,6 +812,30 @@ jobs:
                   repairStep.status !== 'completed' ||
                   repairStep.conclusion !== 'success') {
                 return { state: 'none', reason: 'repair-step-not-successful' };
+              }
+              if (evidence.artifactsError) {
+                return defer('run-provenance-unreadable');
+              }
+              // The outcome marker alone cannot prove which HEAD or finding
+              // set the named run inspected: a workflow_dispatch run on the
+              // default branch reports that ref as `head_sha`, and dispatch
+              // inputs are not exposed by the Actions API. Require the
+              // run-scoped provenance artifact instead. Its name is produced
+              // by the run itself and binds this run to the inspected HEAD,
+              // the published finding digest, the attempt, and the outcome.
+              const expectedProvenanceName =
+                `continuum-repair-provenance-${attrs.head}-` +
+                `${attrs.digest}-${attrs.attempt}-${attrs.changed}`;
+              const runArtifacts = Array.isArray(evidence.artifacts?.artifacts)
+                ? evidence.artifacts.artifacts : [];
+              if (!runArtifacts.some(artifact =>
+                artifact?.name === expectedProvenanceName &&
+                artifact.expired !== true)) {
+                // The run published no recoverable proof of the HEAD and
+                // finding set it inspected, so the outcome is not verified.
+                // Never suppress on a comment alone; leave the finding on the
+                // normal dispatch path so fresh evidence can be produced.
+                return { state: 'none', reason: 'run-provenance-unverified' };
               }
               const runStart = Date.parse(
                 run.run_started_at || run.created_at || ''
@@ -1125,6 +1164,19 @@ jobs:
                 } catch (err) {
                   evidence.error = err;
                 }
+                if (!evidence.error) {
+                  // Run-scoped provenance is fetched separately so a
+                  // temporary read failure defers instead of being mistaken
+                  // for a run that never published evidence.
+                  try {
+                    evidence.artifacts =
+                      (await github.rest.actions.listWorkflowRunArtifacts({
+                        owner, repo, run_id: runId, per_page: 100,
+                      })).data;
+                  } catch (err) {
+                    evidence.artifactsError = err;
+                  }
+                }
                 runCache.set(runId, evidence);
               }
               if (evidence.error || !evidence.run) {
@@ -1183,6 +1235,30 @@ jobs:
                   repairStep.status !== 'completed' ||
                   repairStep.conclusion !== 'success') {
                 return { state: 'none', reason: 'repair-step-not-successful' };
+              }
+              if (evidence.artifactsError) {
+                return defer('run-provenance-unreadable');
+              }
+              // The outcome marker alone cannot prove which HEAD or finding
+              // set the named run inspected: a workflow_dispatch run on the
+              // default branch reports that ref as `head_sha`, and dispatch
+              // inputs are not exposed by the Actions API. Require the
+              // run-scoped provenance artifact instead. Its name is produced
+              // by the run itself and binds this run to the inspected HEAD,
+              // the published finding digest, the attempt, and the outcome.
+              const expectedProvenanceName =
+                `continuum-repair-provenance-${attrs.head}-` +
+                `${attrs.digest}-${attrs.attempt}-${attrs.changed}`;
+              const runArtifacts = Array.isArray(evidence.artifacts?.artifacts)
+                ? evidence.artifacts.artifacts : [];
+              if (!runArtifacts.some(artifact =>
+                artifact?.name === expectedProvenanceName &&
+                artifact.expired !== true)) {
+                // The run published no recoverable proof of the HEAD and
+                // finding set it inspected, so the outcome is not verified.
+                // Never suppress on a comment alone; leave the finding on the
+                // normal dispatch path so fresh evidence can be produced.
+                return { state: 'none', reason: 'run-provenance-unverified' };
               }
               const runStart = Date.parse(
                 run.run_started_at || run.created_at || ''

@@ -60,6 +60,7 @@ def run_handoff(changed, head=HEAD, inspected=None, run_id=RUN_ID, attempt=1,
 const posted = [];
 const notices = [];
 const warnings = [];
+const out = {{}};
 const head = {json.dumps(head)};
 const inspected = {json.dumps(inspected or head)};
 const issueComments = {json.dumps(list(existing))};
@@ -73,6 +74,7 @@ process.env.REPAIR_RUN_ATTEMPT = {json.dumps(str(attempt))};
 const context = {{repo: {{owner: 'kodmial', repo: 'continuum'}}}};
 const core = {{
   setFailed: message => {{ throw new Error(message); }},
+  setOutput: (key, value) => {{ out[key] = String(value); }},
   notice: message => notices.push(message),
   warning: message => warnings.push(message),
 }};
@@ -110,7 +112,7 @@ const github = {{
         fixture
         + "\nasync function run(){\n"
         + textwrap.indent(source, "  ")
-        + "\n}\nrun().then(() => process.stdout.write(JSON.stringify({posted, notices, warnings})))\n"
+        + "\n}\nrun().then(() => process.stdout.write(JSON.stringify({out, posted, notices, warnings})))\n"
         + ".catch(error => { console.error(error); process.exit(1); });\n"
     )
     return _node(script)
@@ -198,9 +200,39 @@ def base_jobs(repair_conclusion="success"):
     }
 
 
+def provenance_artifacts(*comment_groups):
+    """Run-scoped provenance artifact names implied by published markers."""
+    names = []
+    for group in comment_groups:
+        for comment in group or []:
+            if not isinstance(comment, dict):
+                continue
+            match = re.search(
+                r"<!--\s*opencode-coderabbit-repair-outcome\s+([^>]*?)\s*-->",
+                str(comment.get("body") or ""),
+            )
+            if not match:
+                continue
+            attrs = {
+                key.lower(): value
+                for key, value in re.findall(
+                    r"([a-z_]+)=([^\s>]+)", match.group(1), re.IGNORECASE
+                )
+            }
+            names.append(
+                "continuum-repair-provenance-"
+                f"{attrs.get('head')}-{attrs.get('digest')}-"
+                f"{attrs.get('attempt')}-{attrs.get('changed')}"
+            )
+    return [
+        {"id": index + 1, "name": name, "expired": False}
+        for index, name in enumerate(dict.fromkeys(names))
+    ]
+
+
 def collect_step(items, issue_comments, review_comments=None, head=HEAD,
                  run=None, jobs=None, runs_error=False, issue_error=False,
-                 threads=None):
+                 threads=None, artifacts=None, artifacts_error=False):
     source = js_for_step(BATCHER, "Collect all unresolved findings")
     review_comments = (
         base_review_comments(head=head) if review_comments is None
@@ -213,6 +245,10 @@ def collect_step(items, issue_comments, review_comments=None, head=HEAD,
         ]}}
         for item in items
     ]
+    artifacts = (
+        provenance_artifacts(issue_comments)
+        if artifacts is None else artifacts
+    )
     fixture = f"""
 const head = {json.dumps(head)};
 process.env.COMMENT_PAT = 'test-pat';
@@ -279,6 +315,10 @@ const github = {{
       listJobsForWorkflowRun: async () => ({{
         data: {json.dumps(jobs if jobs is not None else base_jobs())},
       }}),
+      listWorkflowRunArtifacts: async () => {{
+        if ({str(artifacts_error).lower()}) throw new Error('artifacts unavailable');
+        return {{data: {{artifacts: {json.dumps(artifacts)}}}}};
+      }},
     }},
   }},
 }};
@@ -295,13 +335,18 @@ const github = {{
 
 def dispatch_step(items, issue_comment_rounds, review_comments=None, head=HEAD,
                   cutoff=None, run=None, jobs=None, runs_error=False,
-                  issue_error_rounds=(), caller="batch", run_rounds=None):
+                  issue_error_rounds=(), caller="batch", run_rounds=None,
+                  artifacts=None, artifacts_error=False):
     source = js_for_step(BATCHER, "Dispatch one batched repair to canonical OpenCode")
     review_comments = (
         base_review_comments(head=head) if review_comments is None
         else review_comments
     )
     run_rounds = run_rounds or [run or base_run()]
+    artifacts = (
+        provenance_artifacts(*issue_comment_rounds)
+        if artifacts is None else artifacts
+    )
     caller_source = (
         "on:\n  workflow_dispatch:\n    inputs:\n      unresolved_items_json:\n"
         if caller == "batch"
@@ -365,6 +410,10 @@ const github = {{
       listJobsForWorkflowRun: async () => ({{
         data: {json.dumps(jobs if jobs is not None else base_jobs())},
       }}),
+      listWorkflowRunArtifacts: async () => {{
+        if ({str(artifacts_error).lower()}) throw new Error('artifacts unavailable');
+        return {{data: {{artifacts: {json.dumps(artifacts)}}}}};
+      }},
     }},
     repos: {{getContent: async () => ({{data: {{
       content: Buffer.from({json.dumps(caller_source)}).toString('base64'),
@@ -641,6 +690,88 @@ class NoChangeGuardTests(unittest.TestCase):
         self.assertEqual(len(dispatched["posted"]), 1)
         self.assertIn("no-change-awaiting-review-or-evidence",
                       dispatched["posted"][0])
+
+    def test_handoff_publishes_run_scoped_provenance_identity(self):
+        # The repair run must publish the identity the no-change guard can
+        # only obtain from run-scoped evidence: the inspected HEAD, the
+        # finding digest, the attempt, and the published outcome.
+        result = run_handoff("false")
+        digest = outcome_digest(result["posted"][0])
+        self.assertEqual(
+            result["out"].get("provenance"),
+            f"{HEAD}-{digest}-1-false",
+        )
+        changed = run_handoff("true")
+        changed_digest = outcome_digest(changed["posted"][0])
+        self.assertEqual(
+            changed["out"].get("provenance"),
+            f"{HEAD}-{changed_digest}-1-true",
+        )
+
+    def test_missing_expired_or_mismatched_provenance_artifact_never_suppresses(self):
+        issue_comments, _, digest = self.ready_state()
+        expected = provenance_artifacts(issue_comments)[0]["name"]
+        # Timestamp the verification request after the handoff so the
+        # pending-handoff rule does not mask the provenance decision.
+        comments = base_review_comments()
+        comments[1] = run_review_comment(
+            FINDING + 1,
+            f"<!-- opencode-coderabbit-verification review={REVIEW} "
+            f"finding={FINDING} head={HEAD} -->",
+            in_reply_to_id=FINDING, author="kodmial",
+            created_at="2026-11-16T20:25:00Z",
+        )
+        cases = {
+            "missing": [],
+            "expired": [{"id": 1, "name": expected, "expired": True}],
+            "stale-digest": [
+                {"id": 1, "name": expected.replace(digest, "f" * 64),
+                 "expired": False},
+            ],
+            "other-head": [
+                {"id": 1, "name": expected.replace(HEAD, "b" * 40),
+                 "expired": False},
+            ],
+            "changed-outcome": [
+                {"id": 1, "name": expected[:-len("false")] + "true",
+                 "expired": False},
+            ],
+        }
+        # Baseline: the matching artifact is the only difference between the
+        # verified no-change suppression and the cases below.
+        matched = dispatch_step(
+            items_for(), [issue_comments], review_comments=comments,
+            cutoff=100000,
+        )
+        self.assertEqual(len(matched["dispatches"]), 0)
+        self.assertEqual(len(matched["posted"]), 1)
+        self.assertIn(
+            "no-change-awaiting-review-or-evidence", matched["posted"][0]
+        )
+        for name, artifacts in cases.items():
+            with self.subTest(case=name):
+                collected = collect_step(
+                    items_for(), issue_comments, review_comments=comments,
+                    artifacts=artifacts,
+                )
+                self.assertEqual(collected["out"]["should_run"], "true")
+                dispatched = dispatch_step(
+                    items_for(), [issue_comments], review_comments=comments,
+                    cutoff=100000, artifacts=artifacts,
+                )
+                self.assertEqual(len(dispatched["dispatches"]), 1)
+                self.assertFalse(any(
+                    "continuum-coderabbit-no-change-guard" in body
+                    for body in dispatched["posted"]
+                ))
+        # A temporarily unreadable artifact list defers instead of suppressing
+        # or dispatching a duplicate repair.
+        unreadable = dispatch_step(
+            items_for(), [issue_comments], review_comments=comments,
+            cutoff=100000, artifacts_error=True,
+        )
+        self.assertEqual(len(unreadable["dispatches"]), 0)
+        self.assertEqual(unreadable["posted"], [])
 
     def test_final_check_refreshes_run_evidence_cached_before_completion(self):
         # The preliminary check caches an in-progress run. The run completes

@@ -296,7 +296,20 @@ APPROVED_454_TELEMETRY_OPENCODE_SHA256 = (
 # keeps both intentional behaviors in one file, so the active pin below covers
 # the combined scheduler-origin, #460 resume, #454 telemetry, and #467
 # no-change-guard bytes; unrelated drift still fails closed.
+# 2026-11-17 (#469 review): suppressing a same-HEAD no-change redispatch needs
+# run-scoped evidence, because a workflow_dispatch run on the default branch
+# reports that ref as `head_sha` and the Actions API never exposes dispatch
+# inputs. The reviewed artifact therefore publishes the inspected HEAD, the
+# finding digest, the attempt, and the published outcome as a per-run
+# artifact name, and the batcher suppresses only when that artifact matches.
+# The pin advances once for this additive provenance step; every previously
+# reviewed invariant above is retained unchanged.
 APPROVED_467_NO_CHANGE_OPENCODE_SHA256 = (
+    "1e3510f29e59daa33a6ad0aa4aa020d562427ac54aee44155a8d4621476330b8"
+)
+# Retained for audit: the reviewed #467 artifact before the run-scoped
+# provenance artifact was added for the #469 review repair.
+APPROVED_469_PRE_PROVENANCE_OPENCODE_SHA256 = (
     "37523b5d6a8a18ae975dcc6cc5b45d8c957142f3005936baf0182219003dff47"
 )
 # Retained for audit: the reviewed #467 artifact before main's #454 telemetry
@@ -2735,8 +2748,9 @@ class ProtectedBaselineTests(unittest.TestCase):
                     # #454 adds bounded telemetry on top of the deliberate
                     # scheduler-origin recovery correction, #450's
                     # chat-ownership change, main's #460 generation-2 resume
-                    # repair, and this branch's #467 no-change guard, with
-                    # full-file digests and executable regression tests.
+                    # repair, and this branch's #467 no-change guard, plus the
+                    # run-scoped provenance artifact the #469 review requires,
+                    # with full-file digests and executable regression tests.
                     self.assertEqual(
                         protected_file_digest(path),
                         APPROVED_467_NO_CHANGE_OPENCODE_SHA256,
