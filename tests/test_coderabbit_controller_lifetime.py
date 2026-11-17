@@ -77,7 +77,7 @@ class CodeRabbitControllerLifetimeContract(unittest.TestCase):
         ):
             with self.subTest(path=path.name):
                 body = path.read_text(encoding="utf-8")
-                guard = body.split("jobs:\\n  call:\\n", 1)[1].split("    uses:", 1)[0]
+                guard = body.split("jobs:\n  call:\n", 1)[1].split("    uses:", 1)[0]
                 for fragment in (
                     "github.event_name != 'pull_request_review'",
                     "github.event.review.user.login == 'coderabbitai[bot]'",
