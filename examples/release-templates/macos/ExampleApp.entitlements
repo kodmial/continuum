@@ -6,8 +6,8 @@
   This neutral example deliberately grants no special capability. Add only the
   entitlements your application actually needs, and treat each one as a
   security decision. The historical Apple adapter passes this path to
-  `codesign --entitlements` for both the binary and the app bundle so the
-  product keeps one identity.
+  the codesign entitlements option for both the binary and the app bundle so
+  the product keeps one identity.
 -->
 <plist version="1.0">
 <dict/>
