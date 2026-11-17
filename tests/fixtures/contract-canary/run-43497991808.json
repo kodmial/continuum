@@ -1,0 +1,21 @@
+{
+  "databaseId": 43497991808,
+  "url": "https://github.com/kodmial/continuum/actions/runs/43497991808",
+  "workflow": "Contract qualification canary",
+  "headSha": "e7f745eb3680ece0337c9af051d691a484f8aba4",
+  "createdAt": "2026-11-13T20:03:36Z",
+  "failedJob": "canary / Live canary",
+  "failedStep": "Observe the live canary task",
+  "jobs": [
+    {
+      "name": "qualify / Qualify",
+      "conclusion": "success"
+    },
+    {
+      "name": "canary / Live canary",
+      "conclusion": "failure"
+    }
+  ],
+  "canary_issue_env": "",
+  "error": "CONTINUUM_CANARY_ISSUE must name the live canary issue; refusing to report canary success without an observed task."
+}

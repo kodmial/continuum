@@ -237,6 +237,17 @@ APPROVED_448_REPAIR_OPENCODE_SHA256 = (
 # countdown separator, so "**13 minutes**" keeps its exact window instead of
 # falling back to 65 minutes. The workflow-local retry parsers carry the same
 # normalization.
+# kodmial/continuum#459 repair (review 5909047979): repair evidence is now
+# published before the CodeRabbit verification handoff. A failed handoff after
+# a successful push used to skip both receipt steps (they required success()),
+# leaving the pushed commit unattested and blocking canary completion and
+# replacement. The receipt is written first, publication survives earlier step
+# failures, transient status failures are retried, and dedicated recovery steps
+# re-publish the status and receipt without a second repair run. When both
+# in-job retry budgets are exhausted, a fresh-runner post-failure job re-attests
+# the exact original base/head from the failed job's outputs and publishes a
+# receipt, because a later repair run would snapshot the already pushed head as
+# its own base and could never attest the original commit.
 APPROVED_450_SERIALIZED_OPENCODE_SHA256 = (
     "bd629cdefde4e5a19156c925f52e91507dd056bb71c070f75ee07bd7ed5afb48"
 )
@@ -251,6 +262,24 @@ APPROVED_450_SERIALIZED_OPENCODE_SHA256 = (
 APPROVED_SCHEDULER_ORIGIN_OPENCODE_SHA256 = (
     "bd629cdefde4e5a19156c925f52e91507dd056bb71c070f75ee07bd7ed5afb48"
 )
+# 2026-11-15: deliberate kodmial/continuum#458 publication-attestation change.
+# Completion evidence must prove the worker run published the implementation
+# PR, not just that a run with a matching branch id and title succeeded: a
+# no-op run exits successfully. The worker now writes and uploads a run-scoped
+# publication receipt immediately after it creates or updates the task PR, and
+# the canary consumes that receipt as completion evidence. Later automation
+# repairs now publish an authenticated commit status binding their exact base,
+# head, and PR, plus a run-scoped receipt binding that status URL to the repair
+# run and pushed commit, so a manual commit cannot impersonate the bot identity.
+# Ordinary and batch review repairs both attest. Keep the scheduler origin
+# digest above for audit and pin the full current artifact; any further drift
+# still fails closed.
+# 2026-11-16 (#462 merge): main's fix for the optional
+# CONTINUUM_429_LEGACY_REF mirror in the 429 evacuation helper is merged into
+# this branch. The resolved artifact is exactly the reviewed #458 content above
+# plus that single #462 hunk (the helper no longer dereferences the optional
+# variable under `set -u`), so the full-file pin advances to the combined
+# merged artifact. Any unrelated byte drift still fails closed.
 # kodmial/continuum#454: the reviewed #448, #450, and scheduler-origin pins
 # above stay for audit. This task deliberately adds one bounded, privacy-safe
 # telemetry artifact upload step (always(), continue-on-error,
@@ -293,10 +322,44 @@ APPROVED_CI_REPAIR_SYNC_OPENCODE_SHA256 = (
 # evacuation path cannot crash under `set -u`; this pin covers the combined
 # #460 + #462 bytes, and the executable #462 legacies above run from the same
 # scripts module. The digest is re-pinned after the merge; no other byte changed.
-# Merging main into #455: the #454 telemetry upload step is additive to this
-# reviewed #460 + #462 artifact, so the merged bytes are pinned above by
-# APPROVED_454_TELEMETRY_OPENCODE_SHA256. This digest stays for audit and any
-# further byte drift still fails closed.
+# 2026-11-16 merge: the protected workflow now carries both the reviewed
+# #458 publication-attestation bytes and main's #460 generation-2
+# checkpoint-resume bytes (including the #462 legacy-mirror default).
+# Pin the exact combined artifact; unrelated byte drift still fails closed.
+APPROVED_458_460_MERGED_OPENCODE_SHA256 = (
+    "c7f3fde52e3a6b97be8ce4713565277bdad9d04847a3084c228567f66d92d64b"
+)
+# Merging main into #455: the #454 telemetry upload step is additive to the
+# reviewed #458 + #460 + #462 artifact, so this active pin covers the combined
+# bytes. The earlier #458/#460 and #454 pins stay for audit and any further
+# byte drift still fails closed.
+APPROVED_458_460_455_MERGED_OPENCODE_SHA256 = (
+    "43fe7886c93cfff2d0ebf646ed3744a32c083d433acaf5db6da20a40d2a7f196"
+)
+# PR #459 review 5935178627 repair: recover the issue publication receipt
+# after an upload failure or a duplicate-guard-skipped rerun, preserving the
+# identity recorded at creation and never creating another PR. The upload
+# failure is continued so the recovered run still satisfies the canary's
+# completed-success worker requirement. Pin the exact workflow bytes;
+# unrelated drift still fails closed.
+APPROVED_459_REVIEW_OPENCODE_SHA256 = (
+    "98d11bb92fbb11007c25588fde700c703b58a1eb5cf1ee4be48a3533b8b16b8d"
+)
+# 2026-11-17 merge of main into #459: the protected workflow now carries both
+# the reviewed PR #459 publication-attestation repair above and main's
+# #339eb2f CI-repair/main-sync publication fence, which discards a stale
+# CI-fix push only after proving the remote head advanced. The earlier #454,
+# CI-repair-sync, and #459 review pins stay for audit; this active pin covers
+# the combined bytes and any unrelated drift still fails closed.
+# 2026-11-17 second #459 review repair: publication identity is recorded as a
+# trusted PR marker comment (never inferred from the branch or PR body),
+# conflict repair binds the canonical task to the worker branch plus its run,
+# and the merged-CI-repair bytes above stay audit-only.
+APPROVED_459_CI_REPAIR_SYNC_MERGED_OPENCODE_SHA256 = (
+    "aae989612b0a80eb8b6415a6ca1b39d6ea23654b0dc5df6da83e6c5959a0c474"
+)
+# The prior #460 resume pin stays for audit; any further byte drift still
+# fails closed.
 APPROVED_460_RESUME_OPENCODE_SHA256 = (
     "cf4593df8d89f638986426f3dc48fe62544617c40e3d3bcccfe14113fa07de4e"
 )
@@ -2721,14 +2784,14 @@ class ProtectedBaselineTests(unittest.TestCase):
                     self.assertIn("CONTINUUM_OPENCODE_PUBLISH_RACE_RETRY_REQUIRED", original)
                     self.assertIn("steps.model_route.outputs.model", original)
                 if path == ".github/workflows/continuum-opencode.yml":
-                    # The #454 telemetry and #460 recovery pins remain audited
-                    # above; #339eb2f intentionally fences live OpenCode
-                    # repair against main-sync and skips stale CI-fix pushes.
-                    # Exact-file integrity is still enforced byte-for-byte.
+                    # #458 publication attestation, main's #460 resume repair,
+                    # main's #454 telemetry upload, and main's reviewed
+                    # CI-repair/main-sync fence all share this artifact, with
+                    # full-file digests and executable regression tests.
                     self.assertEqual(
                         protected_file_digest(path),
-                        APPROVED_CI_REPAIR_SYNC_OPENCODE_SHA256,
-                        f"{path}: unexpected drift outside #454 telemetry on the scheduler-origin #450 serialized CodeRabbit chat owner and #460 resume repair",
+                        APPROVED_459_CI_REPAIR_SYNC_MERGED_OPENCODE_SHA256,
+                        f"{path}: unexpected drift outside the PR #459 review repair merged with main's CI-repair/main-sync fence",
                     )
                 else:
                     # The self-dogfood caller is the dispatchable surface
@@ -2813,7 +2876,7 @@ class ProtectedBaselineTests(unittest.TestCase):
         # therefore be dirty in this pre-commit worktree; any unapproved byte
         # change still fails the exact digest assertions above.
         approved = {
-            ".github/workflows/continuum-opencode.yml": APPROVED_CI_REPAIR_SYNC_OPENCODE_SHA256,
+            ".github/workflows/continuum-opencode.yml": APPROVED_459_CI_REPAIR_SYNC_MERGED_OPENCODE_SHA256,
             ".github/workflows/opencode.yml": APPROVED_350_SELF_CALLER_SHA256,
         }
         for path in PROTECTED_FILES:

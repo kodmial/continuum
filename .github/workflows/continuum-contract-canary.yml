@@ -4,6 +4,13 @@ name: Contract canary
 # observes a real scheduled canary task on current `main`. This is a separate
 # reusable workflow so the pull-request qualification caller never needs the
 # issue/action writes that live-canary recovery requires.
+#
+# kodmial/continuum#458: the scheduled canary no longer requires an operator to
+# configure CONTINUUM_CANARY_ISSUE. It discovers exactly one repository-owned
+# canary issue (or creates a bounded replacement after the previous canary is
+# conclusively complete and the seven-day window elapsed). Bootstrap is only
+# allowed in kodmial/continuum; an installed consumer keeps the explicit
+# CONTINUUM_CANARY_ISSUE override and never bootstraps.
 
 on:
   workflow_call:
@@ -31,8 +38,9 @@ on:
     secrets:
       TAP_PAT:
         description: >-
-          Classic PAT used only to read the canary issue and dispatch bounded
-          recovery; the canary fails closed when it is absent.
+          Classic PAT used only to read the canary issue, create the bounded
+          owned canary in kodmial/continuum, and dispatch bounded recovery; the
+          canary fails closed when it is absent.
         required: false
 
 permissions: {}
@@ -41,9 +49,8 @@ jobs:
   canary:
     name: Live canary
     # Layer 3 observes a real canary task on current main. It runs in its own
-    # job because it needs issue writes (recovery comment/dispatch) while the
-    # qualify job checks out and executes untrusted PR code and must not hold
-    # them.
+    # job because it needs issue writes (bootstrap/recovery) while the qualify
+    # job checks out and executes untrusted PR code and must not hold them.
     runs-on: ubuntu-latest
     timeout-minutes: ${{ fromJSON(inputs.timeout_minutes || vars.CONTINUUM_CONTRACT_TIMEOUT_MINUTES || '15') }}
 
@@ -83,17 +90,489 @@ jobs:
         with:
           python-version: '3.12'
 
+      - name: Resolve or bootstrap the live canary task
+        id: resolve
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.TAP_PAT }}
+          CANARY_ISSUE_OVERRIDE: ${{ vars.CONTINUUM_CANARY_ISSUE }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${GH_TOKEN:-}" ]]; then
+            echo "::error::TAP_PAT is required to resolve, bootstrap, and observe the live canary; refusing to report success."
+            exit 1
+          fi
+          configured="${CANARY_ISSUE_OVERRIDE:-}"
+          if [[ -n "$configured" ]]; then
+            if ! [[ "$configured" =~ ^[1-9][0-9]*$ ]]; then
+              echo "::error::CONTINUUM_CANARY_ISSUE must be a positive integer when provided; refusing to guess the live canary issue."
+              exit 1
+            fi
+            echo "issue_number=$configured" >> "$GITHUB_OUTPUT"
+            echo "created=false" >> "$GITHUB_OUTPUT"
+            echo "resolution=configured-override"
+            exit 0
+          fi
+          if [[ "${GITHUB_REPOSITORY}" != "kodmial/continuum" ]]; then
+            echo "::error::Live-canary bootstrap is only allowed in kodmial/continuum; refusing to create an issue in ${GITHUB_REPOSITORY}."
+            exit 1
+          fi
+
+          observation_dir="$RUNNER_TEMP/continuum-canary"
+          mkdir -p "$observation_dir"
+          gh api --paginate \
+            "repos/$GITHUB_REPOSITORY/issues?state=all&per_page=100&sort=created&direction=desc" \
+            | jq -s 'add // []' > "$observation_dir/issues.json"
+          # Paginate the full PR history: an old canary PR must never fall out
+          # of a bounded page and look absent, which would block the 7-day
+          # replacement decision. Normalize REST fields to the gh shape the
+          # Python probes already consume.
+          gh api --paginate \
+            "repos/$GITHUB_REPOSITORY/pulls?state=all&per_page=100&sort=updated&direction=desc" \
+            | jq -s 'add // [] | map({number, state, body, title, headRefName: .head.ref, headRefOid: .head.sha, updatedAt: .updated_at, mergedAt: .merged_at, mergeCommit: (if .merge_commit_sha then {oid: .merge_commit_sha} else null end), url: .html_url})' \
+            > "$observation_dir/pulls.json"
+          gh run list --repo "$GITHUB_REPOSITORY" --limit 200 \
+            --json databaseId,status,conclusion,createdAt,startedAt,headBranch,displayTitle,name,workflowName,headSha,event \
+            > "$observation_dir/runs.json"
+
+          PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=src OBSERVATION_DIR="$observation_dir" \
+            CANARY_REPO="$GITHUB_REPOSITORY" \
+            python3 - <<'PY'
+          import io
+          import json
+          import os
+          import subprocess
+          import tempfile
+          import zipfile
+          from datetime import datetime, timezone
+          from continuum import contract_canary as canary
+
+          root = os.environ["OBSERVATION_DIR"]
+          def load(name):
+              with open(os.path.join(root, name), encoding="utf-8") as handle:
+                  return json.load(handle)
+
+          def save(name, payload):
+              with open(os.path.join(root, name), "w", encoding="utf-8") as handle:
+                  json.dump(payload, handle, sort_keys=True)
+
+          def implementation_commits(number, branch):
+              """Return the implementation PR's full commit history.
+
+              Trusted continuity is judged from GitHub's own PR commit order,
+              and each commit carries the API-written repair statuses that
+              authenticate later automation. A failed or malformed read is
+              fatal instead of silently accepting a receipt that only names an
+              older commit.
+              """
+              if not number:
+                  return []
+              proc = subprocess.run(
+                  [
+                      "gh", "api", "--paginate", "--slurp",
+                      "repos/{}/pulls/{}/commits?per_page=100".format(
+                          os.environ["GITHUB_REPOSITORY"], number
+                      ),
+                  ],
+                  check=False, capture_output=True, text=True,
+              )
+              if proc.returncode != 0:
+                  raise SystemExit(
+                      "could not read commits for implementation PR #{}; "
+                      "refusing incomplete publication continuity: {}".format(
+                          number, (proc.stderr or "").strip()[:500]
+                      )
+                  )
+              try:
+                  pages = json.loads(proc.stdout)
+              except ValueError:
+                  raise SystemExit(
+                      "implementation PR #{} commit history could not be "
+                      "parsed".format(number)
+                  )
+              commits = []
+              for page in pages if isinstance(pages, list) else [pages]:
+                  if isinstance(page, list):
+                      commits.extend(page)
+                  elif isinstance(page, dict):
+                      commits.append(page)
+              repo = os.environ["GITHUB_REPOSITORY"]
+              for commit in commits:
+                  sha = str(commit.get("sha") or "").strip()
+                  if not sha:
+                      continue
+                  statuses = subprocess.run(
+                      [
+                          "gh", "api", "--paginate", "--slurp",
+                          "repos/{}/commits/{}/statuses?per_page=100".format(
+                              repo, sha
+                          ),
+                      ],
+                      check=False, capture_output=True, text=True,
+                  )
+                  if statuses.returncode != 0:
+                      raise SystemExit(
+                          "could not read commit statuses for {}; refusing "
+                          "incomplete publication continuity: {}".format(
+                              sha, (statuses.stderr or "").strip()[:500]
+                          )
+                      )
+                  try:
+                      pages = json.loads(statuses.stdout)
+                  except ValueError:
+                      raise SystemExit(
+                          "commit statuses for {} could not be parsed".format(
+                              sha
+                          )
+                      )
+                  parsed_statuses = []
+                  for page in pages if isinstance(pages, list) else [pages]:
+                      if isinstance(page, list):
+                          parsed_statuses.extend(page)
+                      elif isinstance(page, dict):
+                          parsed_statuses.append(page)
+                  for status in parsed_statuses:
+                      if not isinstance(status, dict):
+                          continue
+                      if str(status.get("context") or "") != canary.CANARY_REPAIR_STATUS_CONTEXT:
+                          continue
+                      run_id = canary.repair_status_run_id(status, repo)
+                      if run_id is None:
+                          continue
+                      status["publication"] = repair_publication(
+                          run_id, commit, number, branch
+                      )
+                  commit["statuses"] = parsed_statuses
+              return commits
+
+          def worker_publication(run_id):
+              """Return the run-scoped publication receipt, or None when absent.
+
+              A failed read is fatal: a stale snapshot must never stand in for
+              the run's own publication evidence.
+              """
+              repo = os.environ["GITHUB_REPOSITORY"]
+              listing = subprocess.run(
+                  [
+                      "gh", "api", "--paginate", "--jq",
+                      ".artifacts[] | [.id, .name, .expired] | @tsv",
+                      "repos/{}/actions/runs/{}/artifacts?per_page=100".format(
+                          repo, run_id
+                      ),
+                  ],
+                  check=False, capture_output=True, text=True,
+              )
+              if listing.returncode != 0:
+                  raise SystemExit(
+                      "could not read publication artifacts for worker run {}: {}".format(
+                          run_id, (listing.stderr or "").strip()[:500]
+                      )
+                  )
+              candidates = []
+              for line in listing.stdout.splitlines():
+                  fields = line.split("\t")
+                  if len(fields) != 3 or not fields[0].isdigit():
+                      continue
+                  artifact_id, name, expired = fields
+                  if str(expired).strip().lower() == "true":
+                      continue
+                  if not name.startswith(canary.CANARY_PUBLICATION_ARTIFACT_PREFIX):
+                      continue
+                  candidates.append((int(artifact_id), name))
+              if not candidates:
+                  return None
+              _, name = max(candidates)
+              target = tempfile.mkdtemp(
+                  prefix="continuum-publication-",
+                  dir=os.environ.get("RUNNER_TEMP") or None,
+              )
+              download = subprocess.run(
+                  [
+                      "gh", "run", "download", str(run_id),
+                      "--repo", repo, "--name", name, "--dir", target,
+                  ],
+                  check=False, capture_output=True, text=True,
+              )
+              if download.returncode != 0:
+                  raise SystemExit(
+                      "could not download publication receipt {} from worker run {}: {}".format(
+                          name, run_id, (download.stderr or "").strip()[:500]
+                      )
+                  )
+              try:
+                  with open(
+                      os.path.join(target, "publication.json"), encoding="utf-8"
+                  ) as handle:
+                      return json.load(handle)
+              except (OSError, ValueError):
+                  raise SystemExit(
+                      "publication receipt {} from worker run {} is unreadable".format(
+                          name, run_id
+                      )
+                  )
+
+          def repair_publication(run_id, commit, pr_number, branch):
+              """Return the receipt that attests this status's exact commit.
+
+              A rerun of one repair workflow keeps its run id while it can push
+              another commit, so the newest receipt may describe a later commit
+              than the status being checked. Read every candidate receipt and
+              let the module select the one binding this run, PR, branch, direct
+              parent, and pushed commit. A failed read is fatal. An absent match
+              leaves the status unverified instead of falling back to URL alone.
+              """
+              repo = os.environ["GITHUB_REPOSITORY"]
+              listing = subprocess.run(
+                  [
+                      "gh", "api", "--paginate", "--jq",
+                      ".artifacts[] | [.id, .name, .expired] | @tsv",
+                      "repos/{}/actions/runs/{}/artifacts?per_page=100".format(
+                          repo, run_id
+                      ),
+                  ],
+                  check=False, capture_output=True, text=True,
+              )
+              if listing.returncode != 0:
+                  raise SystemExit(
+                      "could not read repair publication artifacts for run {}: {}".format(
+                          run_id, (listing.stderr or "").strip()[:500]
+                      )
+                  )
+              candidates = canary.publication_artifacts(
+                  listing.stdout,
+                  canary.CANARY_REPAIR_PUBLICATION_ARTIFACT_PREFIX,
+              )
+              if not candidates:
+                  return None
+              parents = commit.get("parents")
+              parent = (
+                  parents[0]
+                  if isinstance(parents, list) and parents
+                  else {}
+              )
+              base = (
+                  str(parent.get("sha") or "").strip()
+                  if isinstance(parent, dict)
+                  else ""
+              )
+              receipts = []
+              for artifact_id, name in sorted(candidates, reverse=True):
+                  # Fetch each receipt by artifact id. Downloading by name can
+                  # resolve to another attempt's same-named artifact, which
+                  # would lose the receipt for an earlier repair commit.
+                  download = subprocess.run(
+                      [
+                          "gh", "api",
+                          "repos/{}/actions/artifacts/{}/zip".format(
+                              repo, artifact_id
+                          ),
+                      ],
+                      check=False, capture_output=True,
+                  )
+                  if download.returncode != 0:
+                      raise SystemExit(
+                          "could not download repair publication receipt {} from run {}: {}".format(
+                              name,
+                              run_id,
+                              (download.stderr or b"")
+                              .decode("utf-8", "replace")
+                              .strip()[:500],
+                          )
+                      )
+                  try:
+                      with zipfile.ZipFile(
+                          io.BytesIO(download.stdout or b"")
+                      ) as archive:
+                          with archive.open("publication.json") as handle:
+                              receipts.append(
+                                  json.loads(handle.read().decode("utf-8"))
+                              )
+                  except (
+                      OSError, KeyError, ValueError, zipfile.BadZipFile,
+                  ):
+                      raise SystemExit(
+                          "repair publication receipt {} from run {} cannot be read".format(
+                              name, run_id
+                          )
+                      )
+              return canary.select_repair_publication(
+                  receipts,
+                  run_id,
+                  base,
+                  str(commit.get("sha") or "").strip(),
+                  pr_number,
+                  repo,
+                  branch,
+              )
+
+          issues = load("issues.json")
+          pulls = load("pulls.json")
+          runs = load("runs.json")
+          repo = os.environ["CANARY_REPO"]
+
+          # A closed canary is only reusable when its merged PR carries
+          # exact-HEAD CI/contract evidence. Fetch runs for that exact head
+          # rather than trusting a bounded global run page.
+          candidate = canary.select_canary_issue(issues, expected_repo=repo)
+          publication = None
+          commits = []
+          if candidate is not None and candidate.state == "closed":
+              latest = canary.select_implementation_pr(candidate.number, pulls)
+              commits = implementation_commits(
+                  (latest or {}).get("number"), (latest or {}).get("headRefName")
+              )
+              head = str((latest or {}).get("headRefOid") or "").strip().lower()
+              if head:
+                  proc = subprocess.run(
+                      [
+                          "gh", "run", "list", "--repo", os.environ["GITHUB_REPOSITORY"],
+                          "--commit", head, "--limit", "100",
+                          "--json", "databaseId,status,conclusion,createdAt,startedAt,headBranch,displayTitle,name,workflowName,headSha,event",
+                      ],
+                      check=True, capture_output=True, text=True,
+                  )
+                  runs = canary.merge_exact_head_runs(
+                      runs, head, json.loads(proc.stdout)
+                  )
+              # The bounded global run page can miss the worker run, and an
+              # exact-HEAD lookup cannot find a run that finished before the
+              # implementation commit existed. Fetch the id embedded in the
+              # implementation branch directly, and fail closed when that
+              # direct read fails instead of trusting a stale snapshot row.
+              bound = canary.completion_worker_run_id(latest, candidate.number)
+              if bound is not None:
+                  proc = subprocess.run(
+                      [
+                          "gh", "run", "view", str(bound),
+                          "--repo", os.environ["GITHUB_REPOSITORY"],
+                          "--json", "databaseId,status,conclusion,createdAt,startedAt,headBranch,displayTitle,name,workflowName,headSha,event",
+                      ],
+                      check=False, capture_output=True, text=True,
+                  )
+                  if proc.returncode != 0:
+                      raise SystemExit(
+                          "could not read bound worker run {} for canary issue #{}; "
+                          "refusing stale evidence: {}".format(
+                              bound,
+                              candidate.number,
+                              (proc.stderr or "").strip()[:500],
+                          )
+                      )
+                  runs = canary.merge_bound_worker_run(
+                      runs, json.loads(proc.stdout)
+                  )
+                  publication = worker_publication(bound)
+
+          decision = canary.resolve_canary(
+              issues,
+              pull_requests=pulls,
+              runs=runs,
+              expected_repo=repo,
+              now=datetime.now(timezone.utc),
+              worker_publication=publication,
+              pull_request_commits=commits,
+          )
+          payload = {
+              "action": decision.action,
+              "issue_number": decision.issue_number,
+              "reason": decision.reason,
+              "detail": decision.detail,
+              "previous_issue_number": decision.previous_issue_number,
+          }
+          if decision.action == "create":
+              title, body = canary.build_canary_issue(
+                  nonce="{}-{}".format(
+                      os.environ.get("GITHUB_RUN_ID", "unknown"),
+                      os.environ.get("GITHUB_RUN_ATTEMPT", "1"),
+                  ),
+                  run_id=os.environ.get("GITHUB_RUN_ID", ""),
+                  run_attempt=os.environ.get("GITHUB_RUN_ATTEMPT", ""),
+                  repo=repo,
+              )
+              with open(os.path.join(root, "issue-body.md"), "w", encoding="utf-8") as handle:
+                  handle.write(body)
+              payload["title"] = title
+          save("decision.json", payload)
+          print("Canary resolution: {} ({})".format(decision.action, decision.detail))
+          PY
+
+          action="$(jq -r '.action' "$observation_dir/decision.json")"
+          case "$action" in
+            observe)
+              issue_number="$(jq -r '.issue_number' "$observation_dir/decision.json")"
+              if ! [[ "$issue_number" =~ ^[1-9][0-9]*$ ]]; then
+                echo "::error::Live-canary discovery returned no usable issue number."
+                exit 1
+              fi
+              echo "issue_number=$issue_number" >> "$GITHUB_OUTPUT"
+              echo "created=false" >> "$GITHUB_OUTPUT"
+              echo "resolution=$(jq -r '.reason' "$observation_dir/decision.json")"
+              ;;
+            create)
+              title="$(jq -r '.title' "$observation_dir/decision.json")"
+              url="$(gh issue create --repo "$GITHUB_REPOSITORY" \
+                --title "$title" \
+                --body-file "$observation_dir/issue-body.md" \
+                --label "automation:ready")"
+              issue_number="$(grep -oE '[0-9]+$' <<<"$url" | tail -n 1 || true)"
+              if ! [[ "$issue_number" =~ ^[1-9][0-9]*$ ]]; then
+                echo "::error::Created live canary issue but could not determine its number; refusing to continue."
+                exit 1
+              fi
+              # Re-read the complete inventory and require the new issue to be
+              # the only open owned canary. If metadata is temporarily
+              # unreadable or another open canary appeared, fail closed; never
+              # fan out a second active canary.
+              gh api --paginate \
+                "repos/$GITHUB_REPOSITORY/issues?state=all&per_page=100&sort=created&direction=desc" \
+                | jq -s 'add // []' > "$observation_dir/issues-after-create.json"
+              # The heredoc body and its terminator must stay at the run-script
+              # base indentation: a shell heredoc does not trim leading spaces
+              # from the body or terminator, so indenting them with the `case`
+              # branch would make both the shell and Python parse them wrongly.
+              PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=src OBSERVATION_DIR="$observation_dir" \
+                CANARY_REPO="$GITHUB_REPOSITORY" CANARY_CREATED="$issue_number" \
+                python3 - <<'PY'
+          import json
+          import os
+          from continuum import contract_canary as canary
+
+          root = os.environ["OBSERVATION_DIR"]
+          with open(os.path.join(root, "issues-after-create.json"), encoding="utf-8") as handle:
+              issues = json.load(handle)
+          created = int(os.environ["CANARY_CREATED"])
+          selected = canary.select_canary_issue(
+              issues, expected_repo=os.environ["CANARY_REPO"]
+          )
+          if selected is None or selected.number != created:
+              raise SystemExit(
+                  "created live canary issue #%d is not uniquely discoverable; "
+                  "refusing to report canary success" % created
+              )
+          print("Bootstrapped live canary issue #%d (owned marker verified)." % created)
+          PY
+              echo "issue_number=$issue_number" >> "$GITHUB_OUTPUT"
+              echo "created=true" >> "$GITHUB_OUTPUT"
+              echo "resolution=$(jq -r '.reason' "$observation_dir/decision.json")"
+              ;;
+            *)
+              echo "::error::Live-canary discovery returned unsupported action '$action'."
+              exit 1
+              ;;
+          esac
+
       - name: Observe the live canary task
         id: canary
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.TAP_PAT }}
-          CANARY_ISSUE: ${{ vars.CONTINUUM_CANARY_ISSUE }}
+          CANARY_ISSUE: ${{ steps.resolve.outputs.issue_number }}
+          CANARY_CREATED: ${{ steps.resolve.outputs.created }}
           SCHEDULER_WORKFLOW: ${{ vars.CONTINUUM_SCHEDULER_WORKFLOW || 'automation.yml' }}
         run: |
           set -euo pipefail
-          if ! [[ "${CANARY_ISSUE:-}" =~ ^[0-9]+$ ]]; then
-            echo "::error::CONTINUUM_CANARY_ISSUE must name the live canary issue; refusing to report canary success without an observed task."
+          if ! [[ "${CANARY_ISSUE:-}" =~ ^[1-9][0-9]*$ ]]; then
+            echo "::error::CONTINUUM_CANARY_ISSUE was not configured and live-canary bootstrap produced no issue; refusing to report canary success without an observed task."
             exit 1
           fi
           observation_dir="$RUNNER_TEMP/continuum-canary"
@@ -105,17 +584,33 @@ jobs:
             "repos/$GITHUB_REPOSITORY/issues/$CANARY_ISSUE/comments?per_page=100" \
             | jq -s 'add // []' > "$observation_dir/comments.json"
           gh run list --repo "$GITHUB_REPOSITORY" --limit 200 \
-            --json databaseId,status,conclusion,createdAt,startedAt,headBranch,displayTitle,name \
+            --json databaseId,status,conclusion,createdAt,startedAt,headBranch,displayTitle,name,workflowName,headSha,event \
             > "$observation_dir/runs.json"
-          gh pr list --repo "$GITHUB_REPOSITORY" --state all --limit 200 \
-            --json number,state,body,title,headRefName,updatedAt,mergedAt,reviewDecision \
+          # Paginate the full PR history: an old canary PR must never fall out
+          # of a bounded page and look absent, which would block the 7-day
+          # replacement decision. Normalize REST fields to the gh shape the
+          # Python probes already consume.
+          gh api --paginate \
+            "repos/$GITHUB_REPOSITORY/pulls?state=all&per_page=100&sort=updated&direction=desc" \
+            | jq -s 'add // [] | map({number, state, body, title, headRefName: .head.ref, headRefOid: .head.sha, updatedAt: .updated_at, mergedAt: .merged_at, mergeCommit: (if .merge_commit_sha then {oid: .merge_commit_sha} else null end), url: .html_url})' \
             > "$observation_dir/pulls.json"
+          # REST pull objects do not carry reviewDecision. Enrich the small
+          # open-PR set so the canary still distinguishes review from merge;
+          # closed history stays fully paginated above so old canary PRs are
+          # never hidden by a bounded page.
+          gh pr list --repo "$GITHUB_REPOSITORY" --state open --limit 1000 \
+            --json number,reviewDecision > "$observation_dir/review-decisions.json"
           PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=src OBSERVATION_DIR="$observation_dir" \
-            CANARY_ISSUE="$CANARY_ISSUE" SCHEDULER_WORKFLOW="$SCHEDULER_WORKFLOW" \
+            CANARY_ISSUE="$CANARY_ISSUE" CANARY_CREATED="$CANARY_CREATED" \
+            SCHEDULER_WORKFLOW="$SCHEDULER_WORKFLOW" \
             python3 - <<'PY'
+          import io
           import json
           import os
           import subprocess
+          import tempfile
+          import zipfile
+          from continuum import contract_canary as canary
           from continuum import contract_observation as observation
           from continuum import contract_qualification as contract
 
@@ -124,25 +619,407 @@ jobs:
               with open(os.path.join(root, name), encoding="utf-8") as handle:
                   return json.load(handle)
 
+          def save(name, payload):
+              with open(os.path.join(root, name), "w", encoding="utf-8") as handle:
+                  json.dump(payload, handle, sort_keys=True)
+
+          def implementation_commits(number, branch):
+              """Return the implementation PR's full commit history.
+
+              Trusted continuity is judged from GitHub's own PR commit order,
+              and each commit carries the API-written repair statuses that
+              authenticate later automation. A failed or malformed read is
+              fatal instead of silently accepting a receipt that only names an
+              older commit.
+              """
+              if not number:
+                  return []
+              proc = subprocess.run(
+                  [
+                      "gh", "api", "--paginate", "--slurp",
+                      "repos/{}/pulls/{}/commits?per_page=100".format(
+                          os.environ["GITHUB_REPOSITORY"], number
+                      ),
+                  ],
+                  check=False, capture_output=True, text=True,
+              )
+              if proc.returncode != 0:
+                  raise SystemExit(
+                      "could not read commits for implementation PR #{}; "
+                      "refusing incomplete publication continuity: {}".format(
+                          number, (proc.stderr or "").strip()[:500]
+                      )
+                  )
+              try:
+                  pages = json.loads(proc.stdout)
+              except ValueError:
+                  raise SystemExit(
+                      "implementation PR #{} commit history could not be "
+                      "parsed".format(number)
+                  )
+              commits = []
+              for page in pages if isinstance(pages, list) else [pages]:
+                  if isinstance(page, list):
+                      commits.extend(page)
+                  elif isinstance(page, dict):
+                      commits.append(page)
+              repo = os.environ["GITHUB_REPOSITORY"]
+              for commit in commits:
+                  sha = str(commit.get("sha") or "").strip()
+                  if not sha:
+                      continue
+                  statuses = subprocess.run(
+                      [
+                          "gh", "api", "--paginate", "--slurp",
+                          "repos/{}/commits/{}/statuses?per_page=100".format(
+                              repo, sha
+                          ),
+                      ],
+                      check=False, capture_output=True, text=True,
+                  )
+                  if statuses.returncode != 0:
+                      raise SystemExit(
+                          "could not read commit statuses for {}; refusing "
+                          "incomplete publication continuity: {}".format(
+                              sha, (statuses.stderr or "").strip()[:500]
+                          )
+                      )
+                  try:
+                      pages = json.loads(statuses.stdout)
+                  except ValueError:
+                      raise SystemExit(
+                          "commit statuses for {} could not be parsed".format(
+                              sha
+                          )
+                      )
+                  parsed_statuses = []
+                  for page in pages if isinstance(pages, list) else [pages]:
+                      if isinstance(page, list):
+                          parsed_statuses.extend(page)
+                      elif isinstance(page, dict):
+                          parsed_statuses.append(page)
+                  for status in parsed_statuses:
+                      if not isinstance(status, dict):
+                          continue
+                      if str(status.get("context") or "") != canary.CANARY_REPAIR_STATUS_CONTEXT:
+                          continue
+                      run_id = canary.repair_status_run_id(status, repo)
+                      if run_id is None:
+                          continue
+                      status["publication"] = repair_publication(
+                          run_id, commit, number, branch
+                      )
+                  commit["statuses"] = parsed_statuses
+              return commits
+
+          def worker_publication(run_id):
+              """Return the run-scoped publication receipt, or None when absent.
+
+              A failed read is fatal: a stale snapshot must never stand in for
+              the run's own publication evidence.
+              """
+              repo = os.environ["GITHUB_REPOSITORY"]
+              listing = subprocess.run(
+                  [
+                      "gh", "api", "--paginate", "--jq",
+                      ".artifacts[] | [.id, .name, .expired] | @tsv",
+                      "repos/{}/actions/runs/{}/artifacts?per_page=100".format(
+                          repo, run_id
+                      ),
+                  ],
+                  check=False, capture_output=True, text=True,
+              )
+              if listing.returncode != 0:
+                  raise SystemExit(
+                      "could not read publication artifacts for worker run {}: {}".format(
+                          run_id, (listing.stderr or "").strip()[:500]
+                      )
+                  )
+              candidates = []
+              for line in listing.stdout.splitlines():
+                  fields = line.split("\t")
+                  if len(fields) != 3 or not fields[0].isdigit():
+                      continue
+                  artifact_id, name, expired = fields
+                  if str(expired).strip().lower() == "true":
+                      continue
+                  if not name.startswith(canary.CANARY_PUBLICATION_ARTIFACT_PREFIX):
+                      continue
+                  candidates.append((int(artifact_id), name))
+              if not candidates:
+                  return None
+              _, name = max(candidates)
+              target = tempfile.mkdtemp(
+                  prefix="continuum-publication-",
+                  dir=os.environ.get("RUNNER_TEMP") or None,
+              )
+              download = subprocess.run(
+                  [
+                      "gh", "run", "download", str(run_id),
+                      "--repo", repo, "--name", name, "--dir", target,
+                  ],
+                  check=False, capture_output=True, text=True,
+              )
+              if download.returncode != 0:
+                  raise SystemExit(
+                      "could not download publication receipt {} from worker run {}: {}".format(
+                          name, run_id, (download.stderr or "").strip()[:500]
+                      )
+                  )
+              try:
+                  with open(
+                      os.path.join(target, "publication.json"), encoding="utf-8"
+                  ) as handle:
+                      return json.load(handle)
+              except (OSError, ValueError):
+                  raise SystemExit(
+                      "publication receipt {} from worker run {} is unreadable".format(
+                          name, run_id
+                      )
+                  )
+
+          def repair_publication(run_id, commit, pr_number, branch):
+              """Return the receipt that attests this status's exact commit.
+
+              A rerun of one repair workflow keeps its run id while it can push
+              another commit, so the newest receipt may describe a later commit
+              than the status being checked. Read every candidate receipt and
+              let the module select the one binding this run, PR, branch, direct
+              parent, and pushed commit. A failed read is fatal. An absent match
+              leaves the status unverified instead of falling back to URL alone.
+              """
+              repo = os.environ["GITHUB_REPOSITORY"]
+              listing = subprocess.run(
+                  [
+                      "gh", "api", "--paginate", "--jq",
+                      ".artifacts[] | [.id, .name, .expired] | @tsv",
+                      "repos/{}/actions/runs/{}/artifacts?per_page=100".format(
+                          repo, run_id
+                      ),
+                  ],
+                  check=False, capture_output=True, text=True,
+              )
+              if listing.returncode != 0:
+                  raise SystemExit(
+                      "could not read repair publication artifacts for run {}: {}".format(
+                          run_id, (listing.stderr or "").strip()[:500]
+                      )
+                  )
+              candidates = canary.publication_artifacts(
+                  listing.stdout,
+                  canary.CANARY_REPAIR_PUBLICATION_ARTIFACT_PREFIX,
+              )
+              if not candidates:
+                  return None
+              parents = commit.get("parents")
+              parent = (
+                  parents[0]
+                  if isinstance(parents, list) and parents
+                  else {}
+              )
+              base = (
+                  str(parent.get("sha") or "").strip()
+                  if isinstance(parent, dict)
+                  else ""
+              )
+              receipts = []
+              for artifact_id, name in sorted(candidates, reverse=True):
+                  # Fetch each receipt by artifact id. Downloading by name can
+                  # resolve to another attempt's same-named artifact, which
+                  # would lose the receipt for an earlier repair commit.
+                  download = subprocess.run(
+                      [
+                          "gh", "api",
+                          "repos/{}/actions/artifacts/{}/zip".format(
+                              repo, artifact_id
+                          ),
+                      ],
+                      check=False, capture_output=True,
+                  )
+                  if download.returncode != 0:
+                      raise SystemExit(
+                          "could not download repair publication receipt {} from run {}: {}".format(
+                              name,
+                              run_id,
+                              (download.stderr or b"")
+                              .decode("utf-8", "replace")
+                              .strip()[:500],
+                          )
+                      )
+                  try:
+                      with zipfile.ZipFile(
+                          io.BytesIO(download.stdout or b"")
+                      ) as archive:
+                          with archive.open("publication.json") as handle:
+                              receipts.append(
+                                  json.loads(handle.read().decode("utf-8"))
+                              )
+                  except (
+                      OSError, KeyError, ValueError, zipfile.BadZipFile,
+                  ):
+                      raise SystemExit(
+                          "repair publication receipt {} from run {} cannot be read".format(
+                              name, run_id
+                          )
+                      )
+              return canary.select_repair_publication(
+                  receipts,
+                  run_id,
+                  base,
+                  str(commit.get("sha") or "").strip(),
+                  pr_number,
+                  repo,
+                  branch,
+              )
+
+          def outcome(evidence, detail, **fields):
+              payload = {"evidence": evidence, "detail": detail}
+              payload.update(fields)
+              save("outcome.json", payload)
+
           issue_number = int(os.environ["CANARY_ISSUE"])
+          created = os.environ.get("CANARY_CREATED") == "true"
+          issue = load("issue.json")
+          runs = load("runs.json")
+          pulls = load("pulls.json")
+          comments = load("comments.json")
+          review_decisions = {
+              int(item["number"]): item.get("reviewDecision")
+              for item in load("review-decisions.json")
+              if str(item.get("number") or "").isdigit()
+          }
+          for pull in pulls:
+              number = str(pull.get("number") or "")
+              if number.isdigit():
+                  pull["reviewDecision"] = review_decisions.get(int(number))
+
+          observation_pulls = canary.observation_pull_requests(
+              issue_number, issue.get("state"), pulls
+          )
           observed = observation.observe_canary(
-              load("issue.json"),
-              runs=load("runs.json"),
-              pull_requests=load("pulls.json"),
-              comments=load("comments.json"),
+              issue,
+              runs=runs,
+              pull_requests=observation_pulls,
+              comments=comments,
               canary_id="canary-main",
+              repository=os.environ["GITHUB_REPOSITORY"],
           )
           if observed.failure:
               raise SystemExit("live canary failed: " + observed.failure)
           if observed.completed:
-              print("Live canary issue #%d completed with a merged implementation PR." % issue_number)
+              latest = canary.select_implementation_pr(issue_number, pulls)
+              commits = implementation_commits(
+                  (latest or {}).get("number"), (latest or {}).get("headRefName")
+              )
+              head = str((latest or {}).get("headRefOid") or "").strip().lower()
+              if head:
+                  proc = subprocess.run(
+                      [
+                          "gh", "run", "list", "--repo", os.environ["GITHUB_REPOSITORY"],
+                          "--commit", head, "--limit", "100",
+                          "--json", "databaseId,status,conclusion,createdAt,startedAt,headBranch,displayTitle,name,workflowName,headSha,event",
+                      ],
+                      check=True, capture_output=True, text=True,
+                  )
+                  runs = canary.merge_exact_head_runs(
+                      runs, head, json.loads(proc.stdout)
+                  )
+              # The bounded global run page can miss the worker run, and an
+              # exact-HEAD lookup cannot find a run that finished before the
+              # implementation commit existed. Fetch the id embedded in the
+              # implementation branch directly, and fail closed when that
+              # direct read fails instead of trusting a stale snapshot row.
+              publication = None
+              bound = canary.completion_worker_run_id(latest, issue_number)
+              if bound is not None:
+                  proc = subprocess.run(
+                      [
+                          "gh", "run", "view", str(bound),
+                          "--repo", os.environ["GITHUB_REPOSITORY"],
+                          "--json", "databaseId,status,conclusion,createdAt,startedAt,headBranch,displayTitle,name,workflowName,headSha,event",
+                      ],
+                      check=False, capture_output=True, text=True,
+                  )
+                  if proc.returncode != 0:
+                      raise SystemExit(
+                          "could not read bound worker run {} for canary issue #{}; "
+                          "refusing stale evidence: {}".format(
+                              bound,
+                              issue_number,
+                              (proc.stderr or "").strip()[:500],
+                          )
+                      )
+                  runs = canary.merge_bound_worker_run(
+                      runs, json.loads(proc.stdout)
+                  )
+                  publication = worker_publication(bound)
+              worker = canary.completion_worker_run(issue_number, runs, latest) or {}
+              worker_run_id = worker.get("databaseId") or worker.get("id")
+              problem = canary.validate_completed_canary(
+                  latest, runs, issue_number, publication,
+                  pull_request_commits=commits,
+                  expected_repo=os.environ["GITHUB_REPOSITORY"],
+              )
+              if problem:
+                  raise SystemExit("live canary completion is not trustworthy: " + problem)
+              merge = (latest or {}).get("mergeCommit") or {}
+              merge_sha = str(merge.get("oid") or "").strip()
+              age = canary._age_seconds(
+                  issue.get("createdAt") or issue.get("created_at"), None
+              )
+              print(
+                  "Completed live canary issue #%d PR #%s head=%s merge=%s worker_run=%s age_seconds=%s"
+                  % (
+                      issue_number,
+                      (latest or {}).get("number", "-"),
+                      head or "-",
+                      merge_sha or "-",
+                      worker_run_id or "-",
+                      age if age is not None else "-",
+                  )
+              )
+              outcome(
+                  "completed",
+                  "merged PR with exact-HEAD CI/contract and OpenCode worker evidence",
+                  issue=issue_number,
+                  pr=(latest or {}).get("number"),
+                  run=worker_run_id,
+                  head_sha=head,
+                  merge_sha=merge_sha,
+                  age_seconds=age,
+              )
               raise SystemExit(0)
+
           verdict = contract.evaluate_canary(observed.state)
-          print("Observed live canary: %s -> %s (%s)" % (observed.state, verdict.outcome, verdict.detail))
+          print(
+              "Observed live canary: %s -> %s (%s)"
+              % (observed.state, verdict.outcome, verdict.detail)
+          )
           if verdict.outcome == contract.CANARY_PROGRESS:
+              if created and observed.state.stage == "admission":
+                  outcome(
+                      "bootstrapped",
+                      "created issue waits for scheduler admission",
+                      issue=issue_number,
+                      stage=observed.state.stage,
+                      age_seconds=observed.state.stage_elapsed_seconds,
+                  )
+              else:
+                  outcome(
+                      "progress",
+                      verdict.reason,
+                      issue=issue_number,
+                      pr=observed.state.pr_number,
+                      run=observed.state.run_id,
+                      stage=observed.state.stage,
+                      age_seconds=observed.state.stage_elapsed_seconds,
+                  )
               raise SystemExit(0)
           if verdict.outcome == contract.CANARY_STALLED_FAILED:
-              raise SystemExit("live canary stalled and exhausted its bounded recovery budget: " + verdict.detail)
+              raise SystemExit(
+                  "live canary stalled and exhausted its bounded recovery budget: "
+                  + verdict.detail
+              )
           # Bounded autonomous recovery: wake the scheduler that owns the
           # canary reservation and record the attempt on the issue. The next
           # scheduled canary run re-observes the real stage.
@@ -177,8 +1054,46 @@ jobs:
               ],
               check=True,
           )
-          print("Dispatched bounded canary recovery attempt %d/%d." % (attempt, contract.MAX_CANARY_RECOVERY_ATTEMPTS))
+          print(
+              "Dispatched bounded canary recovery attempt %d/%d."
+              % (attempt, contract.MAX_CANARY_RECOVERY_ATTEMPTS)
+          )
+          outcome(
+              "recovering",
+              verdict.reason,
+              issue=issue_number,
+              pr=observed.state.pr_number,
+              run=observed.state.run_id,
+              stage=observed.state.stage,
+              age_seconds=observed.state.stage_elapsed_seconds,
+              attempt=attempt,
+          )
           PY
+
+          if [[ -f "$observation_dir/outcome.json" ]]; then
+            echo "evidence=$(jq -r '.evidence' "$observation_dir/outcome.json")" >> "$GITHUB_OUTPUT"
+            echo "detail=$(jq -r '.detail' "$observation_dir/outcome.json")" >> "$GITHUB_OUTPUT"
+            {
+              echo "## Live canary evidence"
+              echo
+              echo "| Field | Value |"
+              echo "| --- | --- |"
+              jq -r '
+                "| evidence | `\(.evidence)` |",
+                "| detail | \(.detail) |",
+                (.issue // empty | "| issue | #\(.) |"),
+                (.pr // empty | "| pull request | #\(.) |"),
+                (.run // empty | "| run id | \(.) |"),
+                (.stage // empty | "| stage | \(.) |"),
+                (.age_seconds // empty | "| age (seconds) | \(.) |"),
+                (.head_sha // empty | "| PR head | `\(.)` |"),
+                (.merge_sha // empty | "| merge commit | `\(.)` |"),
+                (.attempt // empty | "| recovery attempt | \(.) |")
+              ' "$observation_dir/outcome.json"
+              echo
+              echo "Action run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
 
       - name: Publish live canary result
         if: always()
@@ -186,22 +1101,39 @@ jobs:
         env:
           TARGET_SHA: ${{ steps.target.outputs.sha }}
           CANARY_OUTCOME: ${{ steps.canary.outcome }}
+          CANARY_EVIDENCE: ${{ steps.canary.outputs.evidence }}
+          CANARY_DETAIL: ${{ steps.canary.outputs.detail }}
           STATUS_CONTEXT: ${{ inputs.status_context || vars.CONTINUUM_CONTRACT_STATUS_CONTEXT || 'continuum/contract-qualification' }}-canary
           PUBLISH_STATUS: ${{ inputs.publish_status || vars.CONTINUUM_PUBLISH_STATUS || 'true' }}
         with:
           script: |
-            const passed = process.env.CANARY_OUTCOME === 'success';
+            const evidence = process.env.CANARY_EVIDENCE || '';
+            const passed = process.env.CANARY_OUTCOME === 'success' && evidence === 'completed';
+            const pending = process.env.CANARY_OUTCOME === 'success' &&
+              ['progress', 'recovering', 'bootstrapped'].includes(evidence);
             if (process.env.PUBLISH_STATUS === 'true') {
+              const state = passed ? 'success' : pending ? 'pending' : 'failure';
+              const description = passed
+                ? 'Live canary completed through a merged PR'
+                : pending
+                  ? `Live canary in progress (${evidence || 'waiting'})`
+                  : 'Live canary failed or stalled';
               await github.rest.repos.createCommitStatus({
                 owner: context.repo.owner,
                 repo: context.repo.repo,
                 sha: process.env.TARGET_SHA,
-                state: passed ? 'success' : 'failure',
+                state,
                 context: process.env.STATUS_CONTEXT,
-                description: passed ? 'Live canary progressed within its deadline' : 'Live canary failed or stalled',
+                description,
                 target_url: `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
               });
             }
-            if (!passed) {
+            if (pending) {
+              core.notice(
+                `Live canary evidence is ${evidence}: ${process.env.CANARY_DETAIL || 'waiting'}. ` +
+                'This run is not a completed end-to-end pass.'
+              );
+            }
+            if (!passed && !pending) {
               core.setFailed('Live canary failed for the exact HEAD.');
             }

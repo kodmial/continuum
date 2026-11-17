@@ -1,0 +1,2346 @@
+"""Bootstrap and verify the live contract-qualification canary (kodmial/continuum#458).
+
+Layer 3 used to require an operator to configure ``CONTINUUM_CANARY_ISSUE``.
+This module owns the deterministic half of the replacement: discover exactly
+one repository-owned canary issue, fail closed on ambiguous or unreadable
+metadata, and only create a fresh issue after the previous one is conclusively
+complete and the documented seven-day window has elapsed.
+
+The module is deliberately free of network access. The workflow fetches GitHub
+state with ``gh`` and passes the JSON here, which keeps every decision
+deterministic and unit-testable. Standard library only.
+"""
+
+from __future__ import annotations
+
+import re
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from typing import Any, Mapping, Optional, Sequence, Tuple
+
+from .contract_observation import _latest_pr, observe_canary
+from .contract_qualification import (
+    GATE_PASS,
+    ContractQualificationError,
+    GateEvidence,
+    evaluate_regression_gate,
+    is_full_sha,
+    worker_evidence_for_issue,
+)
+
+#: Only Continuum's own dogfood repository may bootstrap a canary issue.
+CANARY_OWNER_REPO = "kodmial/continuum"
+
+#: Stable canary identity. It is part of the issue marker and never changes.
+CANARY_TASK_ID = "canary-main"
+
+#: The scheduler's explicit admission label required on a live canary issue.
+CANARY_READY_LABEL = "automation:ready"
+
+#: At most one fresh canary issue per this documented window.
+CANARY_WINDOW_SECONDS = 7 * 24 * 60 * 60
+
+#: The only repository path a canary task may touch. It is documentation-only
+#: and outside every product, workflow, consumer, and release surface.
+CANARY_FIXTURE_PATH = "docs/contract-canary-fixture.txt"
+
+#: Stable title prefix for the owned canary issue.
+CANARY_TITLE = "[continuum-canary] live contract qualification (automated, do not edit)"
+
+#: Artifact name prefix of the run-scoped publication receipt the OpenCode
+#: worker uploads when it publishes the task pull request. Only the owning run
+#: can attach an artifact to itself, so a manual PR cannot borrow another run's
+#: id to look like live lifecycle evidence.
+CANARY_PUBLICATION_ARTIFACT_PREFIX = "continuum-task-publication"
+
+#: Commit-status context a workflow-owned repair sets through the authenticated
+#: API after it pushes a new commit. Git author/committer fields are forgeable;
+#: a status on the exact commit is not part of the commit object a manual
+#: author can spoof. The status is only accepted together with the run-scoped
+#: receipt the same repair run uploads, so its target URL must identify that
+#: run instead of merely pointing at any Actions run.
+CANARY_REPAIR_STATUS_CONTEXT = "continuum/repair-publication"
+
+#: Artifact name prefix of the run-scoped receipt a repair run uploads after it
+#: pushes a commit. Only the owning run can attach an artifact to itself, so a
+#: manually created status cannot borrow another run's URL as repair evidence.
+CANARY_REPAIR_PUBLICATION_ARTIFACT_PREFIX = "continuum-repair-publication"
+
+#: Exact marker prefix. A body containing this prefix is treated as canary
+#: metadata and must therefore be valid, owned, and single.
+CANARY_MARKER_PREFIX = "<!-- continuum-contract-canary"
+
+_TRUSTED_ASSOCIATIONS = frozenset({"OWNER", "MEMBER", "COLLABORATOR"})
+_TRUSTED_LOGINS = frozenset({"github-actions[bot]"})
+#: GitHub's own signed commit actor. Native main-sync merge commits are created
+#: server-side and carry a verified signature; an ordinary web-editor commit
+#: also uses ``web-flow`` but has a single parent, so it is not a merge.
+_MAIN_SYNC_COMMIT_LOGIN = "web-flow"
+_MARKER_RE = re.compile(
+    r"\A<!-- continuum-contract-canary "
+    r"repo=(?P<repo>[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+) "
+    r"task=(?P<task>[A-Za-z0-9_.-]+) -->\Z"
+)
+_SAFE_TOKEN_RE = re.compile(r"\A[A-Za-z0-9._-]{1,120}\Z")
+_IMPLEMENTATION_BRANCH_RE = re.compile(
+    r"\Aopencode/issue(?P<issue>\d+)-(?P<run>\d+)\Z"
+)
+_REPAIR_STATUS_TARGET_RE = re.compile(
+    r"\Ahttps://github\.com/"
+    r"(?P<repo>[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)"
+    r"/actions/runs/(?P<run>[1-9][0-9]*)/?\Z"
+)
+#: GitHub auto-close keywords pointing at an issue in this repository. The
+#: lifecycle writes ``Closes #<issue>`` in its implementation PR, so this is the
+#: only body shape that may attribute a merged PR to the canary issue. A bare
+#: number (``Closes 100``) and a reference to another repository are not
+#: closing references to this repository's issue.
+_CLOSING_REFERENCE_RE = re.compile(
+    r"\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\b"
+    r"\s*:?\s*"
+    r"(?:"
+    r"#(?P<issue>\d+)"
+    r"|(?P<repo>[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)#(?P<cross_issue>\d+)"
+    r"|https?://github\.com/(?P<url_repo>[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)"
+    r"/issues/(?P<url_issue>\d+)"
+    r")"
+    r"(?![\w/-])",
+    re.IGNORECASE,
+)
+_FENCE_OPEN_RE = re.compile(r"^[ \t]{0,3}(?P<fence>`{3,}|~{3,})")
+_FENCE_CLOSE_RE = re.compile(r"^[ \t]{0,3}(?P<fence>`{3,}|~{3,})[ \t]*$")
+_ATX_HEADING_RE = re.compile(r"^[ \t]{0,3}#{1,6}(?:[ \t]|$)")
+_THEMATIC_BREAK_RE = re.compile(
+    r"^[ \t]{0,3}(?:(?:\*[ \t]*){3,}|(?:-[ \t]*){3,}|(?:_[ \t]*){3,})[ \t]*$"
+)
+_BLOCK_QUOTE_RE = re.compile(r" {0,3}>[ \t]?")
+_LIST_MARKER_RE = re.compile(r"(?:[-+*]|(?P<number>\d{1,9})[.)])")
+_TASK_CHECKBOX_RE = re.compile(r"\[[ xX]\](?:[ \t]+|$)")
+_HTML_PRE_OPEN_RE = re.compile(r"<pre(?=[\s/>])", re.IGNORECASE)
+_HTML_PRE_CLOSE_RE = re.compile(r"</pre\s*>", re.IGNORECASE)
+_HTML_CODE_OPEN_RE = re.compile(r"<code(?=[\s/>])", re.IGNORECASE)
+_HTML_CODE_CLOSE_RE = re.compile(r"</code\s*>", re.IGNORECASE)
+#: A raw HTML start or end tag. Attributes are tag syntax, not rendered text,
+#: so a closing keyword inside one never closes an issue. Quoted attribute
+#: values may contain ``>`` without ending the tag.
+_HTML_TAG_RE = re.compile(
+    r"</?[A-Za-z][A-Za-z0-9-]*"
+    r"(?:\s+[A-Za-z_:][A-Za-z0-9_.:-]*"
+    r"(?:\s*=\s*(?:[^\"'=<>`\x00-\x20]+|'[^']*'|\"[^\"]*\"))?"
+    r")*\s*/?>"
+)
+
+
+def _expand_tabs(line: str) -> str:
+    """Expand tabs to GFM's four-column tab stops."""
+    expanded = []
+    column = 0
+    for char in line:
+        if char == "\t":
+            width = 4 - (column % 4)
+            expanded.append(" " * width)
+            column += width
+        else:
+            expanded.append(char)
+            column += 1
+    return "".join(expanded)
+
+
+def _expand_tabs_in_text(text: str) -> str:
+    """Expand tabs per line so columns and string indexes stay aligned."""
+    return "\n".join(_expand_tabs(line) for line in text.split("\n"))
+
+
+def _leading_columns(line: str) -> int:
+    """Return the column width of the line's leading whitespace."""
+    column = 0
+    for char in line:
+        if char == " ":
+            column += 1
+        elif char == "\t":
+            column += 4 - (column % 4)
+        else:
+            break
+    return column
+
+
+def _list_item_layout(
+    line: str,
+    block_boundary: bool,
+    list_content_column: Optional[int] = None,
+) -> Optional[Tuple[int, Optional[int]]]:
+    """Return a list item's content column and its code-block continuation column.
+
+    GFM consumes a list marker plus one space, so five or more spaces after the
+    marker leave at least four columns of indentation. Such content is an
+    indented code block nested in the list item, not operative prose, and the
+    second tuple item is then the minimum column of its continuation lines.
+
+    An ordered list that starts with a number other than 1 cannot interrupt a
+    paragraph, so it is only a list item at a block boundary. A marker nested
+    in an open list item may be indented up to three columns past that item's
+    content column.
+    """
+    text = _expand_tabs(line)
+    leading = _leading_columns(text)
+    if list_content_column is not None and leading >= list_content_column:
+        base = list_content_column
+    else:
+        base = 0
+    position = base
+    nested = False
+    content_column = None
+    while position < len(text):
+        marker_start = position
+        spaces = 0
+        while spaces < 3 and marker_start < len(text) and text[marker_start] == " ":
+            marker_start += 1
+            spaces += 1
+        match = _LIST_MARKER_RE.match(text, marker_start)
+        if match is None:
+            if content_column is None:
+                return None
+            return (content_column, None)
+        number = match.group("number")
+        if (
+            number is not None
+            and int(number) != 1
+            and not nested
+            and not block_boundary
+        ):
+            return None
+        marker_end = match.end()
+        whitespace_end = marker_end
+        while whitespace_end < len(text) and text[whitespace_end] == " ":
+            whitespace_end += 1
+        if whitespace_end == len(text):
+            # A bare marker, or a marker followed only by whitespace, is an
+            # empty list item. Its content column is one past the marker, so
+            # content indented four more columns is a code block in the item.
+            content_column = marker_end + 1
+            return (content_column, content_column + 4)
+        if whitespace_end == marker_end:
+            if content_column is None:
+                return None
+            return (content_column, None)
+        if whitespace_end - marker_end >= 5:
+            content_column = marker_end + 1
+            return (content_column, content_column + 4)
+        content_column = whitespace_end
+        position = whitespace_end
+        nested = True
+    if content_column is None:
+        return None
+    return (content_column, None)
+
+
+def _strip_block_quotes(
+    line: str, limit: Optional[int] = None
+) -> Tuple[int, str]:
+    """Return the block-quote depth and the remaining line content.
+
+    GFM removes each leading ``>`` marker (plus one optional following space or
+    tab) before deciding whether the content starts with four spaces of code
+    indentation. Nested quotes therefore need every marker stripped, not just
+    the outermost one.
+
+    ``limit`` stops after that many markers. An active list item uses it so a
+    quote nested at the item's content column is not mistaken for another
+    enclosing quote.
+    """
+    depth = 0
+    position = 0
+    while limit is None or depth < limit:
+        match = _BLOCK_QUOTE_RE.match(line, position)
+        if match is None:
+            break
+        depth += 1
+        position = match.end()
+    return depth, line[position:]
+
+
+def _strip_block_quotes_from(line: str, start: int) -> Tuple[int, str]:
+    """Strip block-quote markers beginning at ``start`` in ``line``.
+
+    A list item's content column can start its own block quote, so the markers
+    then begin after the item's indentation instead of at column zero. The
+    returned content starts at the innermost quote's content.
+    """
+    depth = 0
+    position = start
+    while True:
+        match = _BLOCK_QUOTE_RE.match(line, position)
+        if match is None:
+            return depth, line[position:]
+        depth += 1
+        position = match.end()
+
+
+def _alternating_code_indent(line: str, block_boundary: bool) -> Optional[int]:
+    """Return continuation indentation for code after alternating containers.
+
+    A list item's content may itself contain a block quote whose content is
+    another list item, and so on. The list marker hides its content column, so
+    five or more spaces after any marker in that chain open an indented code
+    block rather than operative prose. The returned value is the indentation a
+    continuation line needs after the active list item's own quote markers have
+    been stripped, matching ``_consume_indented_code``'s measurement.
+    """
+    cursor = 0
+    pending = 0
+    saw_list = False
+    saw_quote = False
+    while cursor < len(line):
+        layout = _list_item_layout(line[cursor:], block_boundary)
+        if layout is not None:
+            content_column, code_indent = layout
+            saw_list = True
+            if code_indent is not None:
+                return pending + code_indent
+            pending += content_column
+            cursor += content_column
+        depth, stripped = _strip_block_quotes_from(line, cursor)
+        if depth:
+            saw_quote = True
+            pending = 0
+            cursor += len(line[cursor:]) - len(stripped)
+            continue
+        break
+    if saw_list and saw_quote and _leading_columns(line[cursor:]) >= 4:
+        return pending + 4
+    return None
+
+
+def _fence_open(line: str) -> Optional[re.Match]:
+    """Return a valid GFM fence opener for one line, or ``None``.
+
+    A backtick fence's info string may not contain a backtick. GitHub renders
+    such a line as ordinary prose, so treating it as a fence would hide an
+    operative closing reference that follows it.
+    """
+    opener = _FENCE_OPEN_RE.match(line)
+    if opener is None:
+        return None
+    if opener.group("fence")[0] == "`" and "`" in line[opener.end():]:
+        return None
+    return opener
+
+
+def _parse_fence_chain(
+    text: str, block_boundary: bool
+) -> Tuple[Optional[re.Match], list]:
+    """Return a fence opener and its alternating list/quote containers.
+
+    ``text`` starts after every container already consumed by the caller. The
+    remainder may still contain list items and block quotes whose markers hide
+    a fence opener, so walk them in order. Each descriptor is either
+    ``("list", content_column)`` or ``("quote", 0)``. Five or more spaces after
+    a list marker open an indented code block, so that is not a fence.
+    """
+    containers = []
+    cursor = 0
+    while cursor < len(text):
+        layout = _list_item_layout(text[cursor:], block_boundary)
+        if layout is not None:
+            content_column, code_indent = layout
+            if code_indent is not None:
+                return None, containers
+            containers.append(("list", content_column))
+            cursor += content_column
+        depth, stripped = _strip_block_quotes_from(text, cursor)
+        if depth:
+            containers.extend(("quote", 0) for _ in range(depth))
+            cursor += len(text[cursor:]) - len(stripped)
+            continue
+        break
+    opener = _fence_open(text[cursor:])
+    if opener is None:
+        return None, containers
+    return opener, containers
+
+
+def _consume_container_fence(
+    text: str,
+    end: int,
+    cursor: int,
+    fence: str,
+    containers: Sequence[Tuple[str, int]],
+) -> int:
+    """Return the last offset of a fenced code block inside its containers.
+
+    Every continuation line must still belong to the opener's list items and
+    block quotes. A list item accepts indentation from its content column, or a
+    blank line, while a block quote requires its own marker; a blank line
+    without that marker ends the quote and therefore the fence. The block also
+    ends at its closing fence.
+    """
+    while cursor < len(text):
+        next_end = text.find("\n", cursor)
+        if next_end == -1:
+            next_end = len(text)
+        raw = text[cursor:next_end]
+        position = 0
+        inside = True
+        for kind, column in containers:
+            if kind == "quote":
+                marker = _BLOCK_QUOTE_RE.match(raw, position)
+                if marker is None:
+                    inside = False
+                    break
+                position = marker.end()
+                continue
+            content = raw[position:]
+            if not content.strip():
+                position = len(raw)
+                continue
+            if _leading_columns(content) < column:
+                inside = False
+                break
+            position += column
+        if not inside:
+            break
+        closing = _FENCE_CLOSE_RE.match(raw[position:])
+        if (
+            closing is not None
+            and closing.group("fence")[0] == fence[0]
+            and len(closing.group("fence")) >= len(fence)
+        ):
+            end = next_end
+            break
+        end = next_end
+        cursor = next_end + 1 if next_end < len(text) else len(text)
+    return end
+
+
+def _consume_indented_code(
+    text: str,
+    end: int,
+    cursor: int,
+    quote_depth: int,
+    required_indent: int,
+    list_content_column: Optional[int] = None,
+    inner_depth: int = 0,
+    strip_quotes: bool = True,
+) -> int:
+    """Return the last offset of a code block's continuation lines.
+
+    ``end`` is the end of the opening line and ``cursor`` the start of the next
+    line. Lines continue while they stay inside the same quote depth and keep
+    the required indentation, or are blank. With ``inner_depth`` the quote
+    markers start at the list item's content column, so they are stripped from
+    there instead of from column zero. ``strip_quotes`` is false for an HTML
+    ``<pre>`` block, where only the enclosing container's quote markers are
+    structural and any further markers are inert preformatted text.
+    """
+    while cursor < len(text):
+        next_end = text.find("\n", cursor)
+        if next_end == -1:
+            next_end = len(text)
+        raw = text[cursor:next_end]
+        if inner_depth:
+            outer_depth, content = _strip_block_quotes(raw, quote_depth)
+            if outer_depth < quote_depth:
+                break
+            next_inner, content = _strip_block_quotes_from(
+                content, list_content_column
+            )
+            if next_inner < inner_depth and raw.strip():
+                break
+        else:
+            depth, content = _strip_block_quotes(
+                raw, quote_depth if not strip_quotes else None
+            )
+            if depth < quote_depth:
+                break
+        if (
+            _leading_columns(content) >= required_indent
+            or not content.strip()
+        ):
+            end = next_end
+            cursor = next_end + 1 if next_end < len(text) else len(text)
+            continue
+        break
+    return end
+
+
+def _blank_markdown(text: str) -> str:
+    """Replace an inert Markdown span while preserving its line breaks."""
+    return "".join("\n" if char == "\n" else "\x00" for char in text)
+
+
+def _inline_link_tail_end(text: str, index: int) -> Optional[int]:
+    """Return the end of a well-formed inline link tail starting at ``](``.
+
+    GitHub renders only a link's label. Its destination and optional title are
+    not operative prose, so a closing keyword in a title must not attribute a
+    PR. A malformed tail returns ``None`` so its text stays visible rather than
+    hiding a possible reference.
+    """
+    length = len(text)
+    if not text.startswith("](", index):
+        return None
+
+    def skip_space(position: int) -> int:
+        while position < length and text[position] in " \t\n":
+            position += 1
+        return position
+
+    cursor = skip_space(index + 2)
+    if cursor >= length:
+        return None
+    if text[cursor] == "<":
+        cursor += 1
+        while cursor < length:
+            char = text[cursor]
+            if char == "\\" and cursor + 1 < length:
+                cursor += 2
+                continue
+            if char == ">":
+                cursor += 1
+                break
+            if char == "\n":
+                return None
+            cursor += 1
+        else:
+            return None
+    elif text[cursor] not in ")\"'":
+        depth = 0
+        while cursor < length:
+            char = text[cursor]
+            if char == "\\" and cursor + 1 < length:
+                cursor += 2
+                continue
+            if char in " \t\n" and depth == 0:
+                break
+            if char == "(":
+                depth += 1
+            elif char == ")":
+                if depth == 0:
+                    break
+                depth -= 1
+            cursor += 1
+
+    cursor = skip_space(cursor)
+    if cursor < length and text[cursor] in "\"'(":
+        opener = text[cursor]
+        closer = ")" if opener == "(" else opener
+        cursor += 1
+        while cursor < length:
+            char = text[cursor]
+            if char == "\\" and cursor + 1 < length:
+                cursor += 2
+                continue
+            if char == closer:
+                cursor += 1
+                break
+            cursor += 1
+        else:
+            return None
+        cursor = skip_space(cursor)
+    if cursor < length and text[cursor] == ")":
+        return cursor + 1
+    return None
+
+
+def _reference_definition_end(text: str) -> Optional[int]:
+    """Return the end of a link reference definition starting at index zero.
+
+    A reference definition is block-level and renders nothing, including its
+    label, destination, and optional title. A malformed definition returns
+    ``None`` so its text stays visible rather than hiding a possible reference.
+    Titles may follow the destination on the next line and may span lines, but
+    never cross a blank line.
+    """
+    length = len(text)
+    if not text.startswith("["):
+        return None
+
+    cursor = 1
+    label_has_content = False
+    while cursor < length:
+        char = text[cursor]
+        if char == "\\" and cursor + 1 < length:
+            label_has_content = True
+            cursor += 2
+            continue
+        if char == "[":
+            return None
+        if char == "]":
+            break
+        if not char.isspace():
+            label_has_content = True
+        cursor += 1
+    else:
+        return None
+    if not label_has_content or cursor - 1 > 999:
+        return None
+
+    cursor += 1
+    while cursor < length and text[cursor] in " \t":
+        cursor += 1
+    if cursor >= length or text[cursor] != ":":
+        return None
+    cursor += 1
+    while cursor < length and text[cursor] in " \t":
+        cursor += 1
+    if cursor < length and text[cursor] == "\n":
+        cursor += 1
+        while cursor < length and text[cursor] in " \t":
+            cursor += 1
+        if cursor >= length or text[cursor] == "\n":
+            return None
+    if cursor >= length:
+        return None
+
+    if text[cursor] == "<":
+        cursor += 1
+        while cursor < length:
+            char = text[cursor]
+            if char == "\\" and cursor + 1 < length:
+                cursor += 2
+                continue
+            if char == ">":
+                cursor += 1
+                break
+            if char in "\n<":
+                return None
+            cursor += 1
+        else:
+            return None
+    else:
+        start = cursor
+        depth = 0
+        while cursor < length:
+            char = text[cursor]
+            if char == "\\" and cursor + 1 < length:
+                cursor += 2
+                continue
+            if char in " \t\n":
+                break
+            if char == "(":
+                depth += 1
+            elif char == ")":
+                if depth == 0:
+                    return None
+                depth -= 1
+            cursor += 1
+        if cursor == start or depth:
+            return None
+    destination_end = cursor
+
+    title_start = cursor
+    while title_start < length and text[title_start] in " \t":
+        title_start += 1
+    title_after_line_break = False
+    if title_start < length and text[title_start] == "\n":
+        look = title_start + 1
+        while look < length and text[look] in " \t":
+            look += 1
+        if look < length and text[look] in "\"'(":
+            title_start = look
+            title_after_line_break = True
+        else:
+            return destination_end
+    if title_start < length and text[title_start] in "\"'(":
+        opener = text[title_start]
+        closer = ")" if opener == "(" else opener
+        cursor = title_start + 1
+        while cursor < length:
+            char = text[cursor]
+            if char == "\\" and cursor + 1 < length:
+                cursor += 2
+                continue
+            if char == closer:
+                cursor += 1
+                rest = cursor
+                while rest < length and text[rest] in " \t":
+                    rest += 1
+                if rest < length and text[rest] != "\n":
+                    # A title must be followed only by whitespace. Otherwise
+                    # GitHub ends the definition at its destination and renders
+                    # the title text as ordinary prose, so it stays visible.
+                    return destination_end if title_after_line_break else None
+                return cursor
+            if char == "\n":
+                look = cursor + 1
+                while look < length and text[look] in " \t":
+                    look += 1
+                if look >= length or text[look] == "\n":
+                    return None
+            cursor += 1
+        return None
+    if title_start < length and text[title_start] != "\n":
+        return None
+    return destination_end
+
+
+def _container_line_content(
+    raw: str, containers: Sequence[Tuple[str, int]]
+) -> Optional[str]:
+    """Return a line's content after its active container markers."""
+    position = 0
+    for kind, column in containers:
+        if kind == "quote":
+            marker = _BLOCK_QUOTE_RE.match(raw, position)
+            if marker is None:
+                return None
+            position = marker.end()
+            continue
+        content = raw[position:]
+        if not content.strip():
+            position = len(raw)
+            continue
+        if _leading_columns(content) < column:
+            return None
+        position += column
+    return raw[position:]
+
+
+def _reference_definition_span(
+    text: str,
+    line_end: int,
+    cursor: int,
+    remainder: str,
+    containers: Sequence[Tuple[str, int]],
+    block_boundary: bool,
+) -> Optional[Tuple[int, int]]:
+    """Return absolute start and end offsets for a reference definition."""
+    extra_start = 0
+    extra_containers = []
+    while extra_start < len(remainder):
+        layout = _list_item_layout(remainder[extra_start:], block_boundary)
+        if layout is not None:
+            content_column, code_indent = layout
+            if code_indent is not None:
+                return None
+            extra_containers.append(("list", content_column))
+            extra_start += content_column
+        depth, stripped = _strip_block_quotes_from(remainder, extra_start)
+        if depth:
+            extra_containers.extend(("quote", 0) for _ in range(depth))
+            extra_start += len(remainder[extra_start:]) - len(stripped)
+            continue
+        break
+
+    first = remainder[extra_start:]
+    leading = 0
+    while leading < 3 and leading < len(first) and first[leading] == " ":
+        leading += 1
+    first = first[leading:]
+    if not first.startswith("["):
+        return None
+    first_abs = line_end - len(remainder) + extra_start + leading
+    all_containers = list(containers) + extra_containers
+    parts = [first]
+    starts = [first_abs]
+    while cursor < len(text):
+        next_end = text.find("\n", cursor)
+        if next_end == -1:
+            next_end = len(text)
+        raw = text[cursor:next_end]
+        content = _container_line_content(raw, all_containers)
+        if content is None or not content.strip():
+            break
+        parts.append(content)
+        starts.append(cursor + len(raw) - len(content))
+        cursor = next_end + 1 if next_end < len(text) else len(text)
+
+    logical = "\n".join(parts)
+    end = _reference_definition_end(logical)
+    if end is None:
+        return None
+    line_index = logical.count("\n", 0, end)
+    line_start = logical.rfind("\n", 0, end) + 1
+    if line_index >= len(starts):
+        return None
+    end_abs = starts[line_index] + (end - line_start)
+    if end_abs <= first_abs:
+        return None
+    return first_abs, end_abs
+
+
+def _visible_markdown(body: object) -> str:
+    """Return the part of a PR body where GitHub acts on closing keywords.
+
+    Closing phrases inside HTML comments, HTML ``<pre>`` and ``<code>``
+    elements, fenced code blocks, indented code blocks, and inline code spans
+    are examples, not operative references. Raw HTML tag syntax is inert too:
+    GitHub renders an attribute value as markup, not visible text, so a closing
+    keyword there never closes an issue, while text between tags stays
+    operative. A Markdown link's destination and title are also inert, because
+    GitHub renders only its label. A reference definition renders nothing at
+    all. Blanking those spans with a
+    non-whitespace sentinel keeps them from matching and prevents adjacent
+    visible text from joining into a new closing reference. GitHub renders
+    ``<pre>`` content as inert preformatted text and ``<code>`` content as code,
+    so a closing keyword there never closes the issue. An unclosed block-level
+    ``<pre>`` stays inert to the end of its block quote or list item container.
+
+    An indented line opens a code block only at a block boundary, because GFM
+    renders a four-space or tab-indented line that directly follows a paragraph
+    line as a lazy paragraph continuation. A heading or thematic break ends its
+    block too, so an indented line directly after one is already code. Once
+    opened, the block continues across blank lines and still-indented lines,
+    just as GFM renders it. Block-quote markers are stripped before those
+    decisions, so an indented code block nested in a quote is inert too. A
+    block quote can also start at a list item's content column, so its markers
+    are stripped there before the same decisions. A list marker hides its
+    item's content column, so five or more spaces after the marker open an
+    indented code block inside the list item, and a fence immediately after the
+    marker stays inert until its closing fence or the end of the item. Quote
+    and list containers may
+    alternate inside a list item; each list marker in that chain hides its own
+    content column. Tabs are expanded at their GFM column before these decisions
+    so a tab-indented container is measured in its Markdown context. A line that
+    leaves an active list item ends that item, so its quote markers are stripped
+    again and its content starts at a block boundary.
+    """
+    text = _expand_tabs_in_text(str(body or ""))
+    visible = []
+    brackets = []
+    index = 0
+    line_start = True
+    block_boundary = True
+    line_blank = True
+    line_ends_block = False
+    structural_prefix_end = 0
+    list_content_column = None
+    list_quote_depth = None
+    list_inner_quote_depth = 0
+    reference_continuation_line = -1
+    while index < len(text):
+        if line_start and text[index] != "\n":
+            line_end = text.find("\n", index)
+            if line_end == -1:
+                line_end = len(text)
+            line = text[index:line_end]
+            while True:
+                quote_limit = (
+                    list_quote_depth if list_content_column is not None else None
+                )
+                quote_depth, content = _strip_block_quotes(line, quote_limit)
+                structural_prefix_end = index + len(line) - len(content)
+                line_ends_block = (
+                    _ATX_HEADING_RE.match(content) is not None
+                    or _THEMATIC_BREAK_RE.match(content) is not None
+                )
+                if (
+                    list_content_column is not None
+                    and quote_depth != list_quote_depth
+                ):
+                    list_content_column = None
+                    list_quote_depth = None
+                    list_inner_quote_depth = 0
+                    block_boundary = True
+                    continue
+                layout = (
+                    None
+                    if line_ends_block
+                    else _list_item_layout(
+                        content, block_boundary, list_content_column
+                    )
+                )
+                if layout is not None:
+                    list_content_column, list_code_indent = layout
+                    list_quote_depth = quote_depth
+                    list_inner_quote_depth = 0
+                else:
+                    list_code_indent = None
+                    if (
+                        content.strip()
+                        and list_content_column is not None
+                        and _leading_columns(content) < list_content_column
+                    ):
+                        list_content_column = None
+                        list_quote_depth = None
+                        list_inner_quote_depth = 0
+                        block_boundary = True
+                        continue
+                break
+            previous_inner_depth = list_inner_quote_depth
+            inner_depth = 0
+            if list_content_column is not None:
+                inner_depth, inner_content = _strip_block_quotes_from(
+                    content, list_content_column
+                )
+                if inner_depth:
+                    content = inner_content
+                    structural_prefix_end = index + len(line) - len(content)
+                    list_code_indent = None
+            list_inner_quote_depth = inner_depth
+            if inner_depth:
+                line_ends_block = (
+                    _ATX_HEADING_RE.match(content) is not None
+                    or _THEMATIC_BREAK_RE.match(content) is not None
+                )
+            inner_boundary = (
+                inner_depth > 0 and inner_depth != previous_inner_depth
+            )
+            if inner_depth and list_content_column is not None:
+                nested_code_indent = _alternating_code_indent(
+                    content, block_boundary or inner_boundary
+                )
+                if nested_code_indent is not None:
+                    list_code_indent = nested_code_indent
+            containers = [("quote", 0)] * quote_depth
+            if list_content_column is not None:
+                containers.append(("list", list_content_column))
+                if inner_depth:
+                    containers.extend([("quote", 0)] * inner_depth)
+                    remainder = content
+                else:
+                    remainder = content[list_content_column:]
+            else:
+                remainder = content
+            opener, extra_containers = _parse_fence_chain(
+                remainder, block_boundary or inner_boundary
+            )
+            if opener is not None:
+                containers.extend(extra_containers)
+                fence = opener.group("fence")
+                end = _consume_container_fence(
+                    text,
+                    line_end,
+                    line_end + 1 if line_end < len(text) else len(text),
+                    fence,
+                    containers,
+                )
+                visible.append(_blank_markdown(text[index:end]))
+                index = end
+                line_start = False
+                block_boundary = True
+                line_blank = True
+                continue
+            required_indent = (
+                4
+                if list_content_column is None or inner_depth
+                else list_content_column + 4
+            )
+            if (
+                (block_boundary or inner_boundary)
+                and _leading_columns(content) >= required_indent
+                and index != reference_continuation_line
+            ):
+                end = _consume_indented_code(
+                    text,
+                    line_end,
+                    line_end + 1 if line_end < len(text) else len(text),
+                    quote_depth,
+                    required_indent,
+                    list_content_column,
+                    inner_depth,
+                )
+                visible.append(_blank_markdown(text[index:end]))
+                index = end
+                line_start = False
+                block_boundary = True
+                line_blank = True
+                continue
+            if list_code_indent is not None:
+                end = _consume_indented_code(
+                    text,
+                    line_end,
+                    line_end + 1 if line_end < len(text) else len(text),
+                    quote_depth,
+                    list_code_indent,
+                    list_content_column,
+                )
+                visible.append(_blank_markdown(text[index:end]))
+                index = end
+                line_start = False
+                block_boundary = True
+                line_blank = True
+                continue
+            if block_boundary or inner_boundary or layout is not None:
+                reference = _reference_definition_span(
+                    text,
+                    line_end,
+                    line_end + 1 if line_end < len(text) else len(text),
+                    remainder,
+                    containers,
+                    block_boundary or inner_boundary,
+                )
+                if reference is not None:
+                    _, end = reference
+                    visible.append(_blank_markdown(text[index:end]))
+                    next_line = text.find("\n", end)
+                    # A reference definition is extracted from its paragraph,
+                    # so an immediately following indented line is a lazy
+                    # paragraph continuation, not an indented code block. A
+                    # blank line must separate them before code can start.
+                    reference_continuation_line = (
+                        next_line + 1 if next_line != -1 else -1
+                    )
+                    index = end
+                    line_start = False
+                    block_boundary = True
+                    line_blank = True
+                    continue
+        if text.startswith("<!--", index):
+            close = text.find("-->", index + 4)
+            end = len(text) if close == -1 else close + 3
+            visible.append(_blank_markdown(text[index:end]))
+            line_begin = text.rfind("\n", 0, index) + 1
+            rest_end = text.find("\n", end)
+            if rest_end == -1:
+                rest_end = len(text)
+            line_blank = (
+                not text[line_begin:index].strip()
+                and not text[end:rest_end].strip()
+            )
+            index = end
+            line_start = index > 0 and text[index - 1] == "\n"
+            continue
+        pre_open = _HTML_PRE_OPEN_RE.match(text, index)
+        if pre_open is not None:
+            tag_end = text.find(">", pre_open.end())
+            if tag_end != -1:
+                end = tag_end + 1
+                closing = _HTML_PRE_CLOSE_RE.search(text, end)
+                if closing is not None:
+                    end = closing.end()
+                else:
+                    line_begin = text.rfind("\n", 0, index) + 1
+                    _, prefix = _strip_block_quotes(
+                        text[line_begin:index],
+                        list_quote_depth
+                        if list_content_column is not None
+                        else None,
+                    )
+                    if list_content_column is not None and len(
+                        prefix
+                    ) >= list_content_column:
+                        _, prefix = _strip_block_quotes(
+                            prefix[list_content_column:]
+                        )
+                        checkbox = _TASK_CHECKBOX_RE.match(prefix)
+                        if checkbox is not None:
+                            prefix = prefix[checkbox.end():]
+                    if not prefix.strip() and _leading_columns(prefix) <= 3:
+                        # A block-level <pre> without a closing tag runs to
+                        # the end of its container, just as GFM renders it.
+                        # Container markers are stripped first, so a block
+                        # quote or list item cannot hide the block-level
+                        # opening. A task-list checkbox is item syntax, not
+                        # content, so it does not hide the opening either.
+                        required_indent = (
+                            0
+                            if inner_depth
+                            else (list_content_column or 0)
+                        )
+                        end = _consume_indented_code(
+                            text,
+                            line_end,
+                            line_end + 1 if line_end < len(text) else len(text),
+                            quote_depth,
+                            required_indent,
+                            list_content_column,
+                            inner_depth,
+                            strip_quotes=False,
+                        )
+                visible.append(_blank_markdown(text[index:end]))
+                line_begin = text.rfind("\n", 0, index) + 1
+                rest_end = text.find("\n", end)
+                if rest_end == -1:
+                    rest_end = len(text)
+                line_blank = (
+                    not text[line_begin:index].strip()
+                    and not text[end:rest_end].strip()
+                )
+                index = end
+                line_start = index > 0 and text[index - 1] == "\n"
+                continue
+        code_open = _HTML_CODE_OPEN_RE.match(text, index)
+        if code_open is not None:
+            tag_end = text.find(">", code_open.end())
+            if tag_end != -1:
+                end = tag_end + 1
+                if text[tag_end - 1] != "/":
+                    closing = _HTML_CODE_CLOSE_RE.search(text, end)
+                    if closing is not None:
+                        end = closing.end()
+                    else:
+                        # An unclosed <code> element keeps rendering later text
+                        # as code, so it is inert through the document end.
+                        end = len(text)
+                visible.append(_blank_markdown(text[index:end]))
+                line_begin = text.rfind("\n", 0, index) + 1
+                rest_end = text.find("\n", end)
+                if rest_end == -1:
+                    rest_end = len(text)
+                line_blank = (
+                    not text[line_begin:index].strip()
+                    and not text[end:rest_end].strip()
+                )
+                index = end
+                line_start = index > 0 and text[index - 1] == "\n"
+                continue
+        tag = _HTML_TAG_RE.match(text, index)
+        if tag is not None:
+            end = tag.end()
+            visible.append(_blank_markdown(text[index:end]))
+            line_begin = text.rfind("\n", 0, index) + 1
+            rest_end = text.find("\n", end)
+            if rest_end == -1:
+                rest_end = len(text)
+            line_blank = (
+                not text[line_begin:index].strip()
+                and not text[end:rest_end].strip()
+            )
+            index = end
+            line_start = index > 0 and text[index - 1] == "\n"
+            continue
+        if text[index] == "`":
+            run_end = index
+            while run_end < len(text) and text[run_end] == "`":
+                run_end += 1
+            run = text[index:run_end]
+            search = run_end
+            close = -1
+            while True:
+                candidate = text.find(run, search)
+                if candidate == -1:
+                    break
+                candidate_end = candidate + len(run)
+                if (
+                    (candidate == 0 or text[candidate - 1] != "`")
+                    and (candidate_end == len(text) or text[candidate_end] != "`")
+                ):
+                    line_begin = text.rfind("\n", 0, candidate) + 1
+                    line_end = text.find("\n", candidate)
+                    if line_end == -1:
+                        line_end = len(text)
+                    prefix = text[line_begin:candidate]
+                    if (
+                        not prefix.strip()
+                        and _leading_columns(prefix) <= 3
+                        and _fence_open(text[line_begin:line_end]) is not None
+                    ):
+                        # A block-level fence interrupts the paragraph, so its
+                        # backticks cannot close an inline code span above it.
+                        break
+                    close = candidate
+                    break
+                search = candidate_end
+                while search < len(text) and text[search] == "`":
+                    search += 1
+            if close != -1:
+                end = close + len(run)
+                visible.append(_blank_markdown(text[index:end]))
+                index = end
+                line_start = index > 0 and text[index - 1] == "\n"
+                line_blank = False
+                continue
+            visible.append(run)
+            index = run_end
+            line_start = False
+            line_blank = False
+            continue
+        char = text[index]
+        if char == "[" and (index == 0 or text[index - 1] != "\\"):
+            brackets.append(index)
+        elif char == "]" and (index == 0 or text[index - 1] != "\\"):
+            opener = brackets.pop() if brackets else None
+            if opener is not None:
+                end = _inline_link_tail_end(text, index)
+                if end is not None:
+                    visible.append(char)
+                    visible.append(_blank_markdown(text[index + 1:end]))
+                    index = end
+                    line_start = False
+                    line_blank = False
+                    continue
+        visible.append(char)
+        index += 1
+        if char == "\n":
+            block_boundary = line_blank or line_ends_block
+            line_blank = True
+            line_ends_block = False
+            line_start = True
+        else:
+            if not char.isspace() and index > structural_prefix_end:
+                line_blank = False
+            line_start = False
+    return "".join(visible)
+
+
+class CanaryBootstrapError(ValueError):
+    """Raised when live-canary ownership cannot be proven safely."""
+
+
+@dataclass(frozen=True)
+class CanaryIssue:
+    """A validated repository-owned canary issue."""
+
+    number: int
+    state: str
+    labels: Tuple[str, ...]
+    created_at: str
+    closed_at: str
+    author: str
+    author_association: str
+    body: str
+    raw: Mapping[str, Any]
+
+
+@dataclass(frozen=True)
+class CanaryDecision:
+    """Deterministic outcome of live-canary discovery."""
+
+    action: str  # observe | create
+    issue_number: Optional[int]
+    reason: str
+    detail: str
+    created_at: str = ""
+    age_seconds: Optional[int] = None
+    completed: bool = False
+    previous_issue_number: Optional[int] = None
+
+
+def _parse_time(value: object) -> Optional[datetime]:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    normalized = text[:-1] + "+00:00" if text.endswith("Z") else text
+    try:
+        parsed = datetime.fromisoformat(normalized)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _now(now: Optional[datetime]) -> datetime:
+    return now.astimezone(timezone.utc) if now else datetime.now(timezone.utc)
+
+
+def _age_seconds(value: object, now: Optional[datetime]) -> Optional[int]:
+    parsed = _parse_time(value)
+    if parsed is None:
+        return None
+    return max(0, int((_now(now) - parsed).total_seconds()))
+
+
+def _labels(issue: Mapping[str, Any]) -> Tuple[str, ...]:
+    names = []
+    for label in issue.get("labels") or []:
+        if isinstance(label, Mapping):
+            name = str(label.get("name") or "").strip()
+        else:
+            name = str(label or "").strip()
+        if name:
+            names.append(name)
+    return tuple(names)
+
+
+def _marker(body: object, expected_repo: str) -> Optional[Tuple[str, str]]:
+    """Return ``(repo, task)`` for exactly one valid marker line, or ``None``.
+
+    A body with no marker at all is not canary metadata. Once the canary marker
+    prefix appears anywhere in the body, however, the body must carry exactly
+    one well-formed marker line that starts with that prefix, for this
+    repository and task. A prefix embedded in other text is misplaced
+    metadata, so it is rejected instead of skipped: a malformed marker must
+    never be ignored in a way that authorizes creating another canary. Anything
+    else is forged, stale, or ambiguous metadata and fails closed.
+    """
+    lines = []
+    for raw_line in str(body or "").splitlines():
+        line = raw_line.strip()
+        if CANARY_MARKER_PREFIX not in line:
+            continue
+        if not line.startswith(CANARY_MARKER_PREFIX):
+            raise CanaryBootstrapError(
+                "canary marker is misplaced; refusing to ignore forged metadata"
+            )
+        lines.append(line)
+    if not lines:
+        return None
+    if len(lines) != 1:
+        raise CanaryBootstrapError(
+            "canary marker is duplicated; refusing to guess issue ownership"
+        )
+    match = _MARKER_RE.match(lines[0])
+    if match is None:
+        raise CanaryBootstrapError(
+            "canary marker is malformed; refusing to use forged metadata"
+        )
+    repo = match.group("repo")
+    task = match.group("task")
+    if repo.lower() != str(expected_repo or "").strip().lower():
+        raise CanaryBootstrapError(
+            "canary marker names another repository; refusing to touch it"
+        )
+    if task != CANARY_TASK_ID:
+        raise CanaryBootstrapError(
+            "canary marker names another task; refusing to guess ownership"
+        )
+    return repo, task
+
+
+def _trusted_author(issue: Mapping[str, Any], expected_repo: str) -> Tuple[str, str]:
+    user = issue.get("user") or {}
+    login = str(user.get("login") or "").strip()
+    association = str(issue.get("author_association") or "").strip().upper()
+    owner = str(expected_repo or "").split("/", 1)[0].lower()
+    trusted = (
+        association in _TRUSTED_ASSOCIATIONS
+        or login.lower() in _TRUSTED_LOGINS
+        or (owner and login.lower() == owner)
+    )
+    if not trusted:
+        raise CanaryBootstrapError(
+            "canary marker is authored by an untrusted actor; refusing forged metadata"
+        )
+    return login, association
+
+
+def _owned_issue(issue: Mapping[str, Any], expected_repo: str) -> CanaryIssue:
+    try:
+        number = int(issue.get("number"))
+    except (TypeError, ValueError):
+        raise CanaryBootstrapError("canary issue has no numeric number")
+    if number < 1:
+        raise CanaryBootstrapError("canary issue number must be positive")
+    state = str(issue.get("state") or "").strip().lower()
+    if state not in ("open", "closed"):
+        raise CanaryBootstrapError(
+            "canary issue #{} has an unknown state {!r}".format(number, state)
+        )
+    labels = _labels(issue)
+    if CANARY_READY_LABEL not in labels:
+        raise CanaryBootstrapError(
+            "canary issue #{} is missing the required {} label".format(
+                number, CANARY_READY_LABEL
+            )
+        )
+    created_at = str(issue.get("created_at") or issue.get("createdAt") or "").strip()
+    if _parse_time(created_at) is None:
+        raise CanaryBootstrapError(
+            "canary issue #{} has no usable creation timestamp".format(number)
+        )
+    author, association = _trusted_author(issue, expected_repo)
+    return CanaryIssue(
+        number=number,
+        state=state,
+        labels=labels,
+        created_at=created_at,
+        closed_at=str(issue.get("closed_at") or issue.get("closedAt") or "").strip(),
+        author=author,
+        author_association=association,
+        body=str(issue.get("body") or ""),
+        raw=issue,
+    )
+
+
+def select_canary_issue(
+    issues: Sequence[Mapping[str, Any]],
+    expected_repo: str = CANARY_OWNER_REPO,
+) -> Optional[CanaryIssue]:
+    """Return the current owned canary issue, or ``None`` when none exists.
+
+    Pull requests are ignored. Any issue carrying the canary marker must be a
+    fully valid, labelled, trusted canary. Historical *closed* canaries are
+    expected after a replacement, so only multiple *open* canaries are an
+    ownership conflict. When every owned canary is closed, the newest one is
+    the current canary and older ones remain immutable history.
+    """
+    found = []
+    for raw in issues or []:
+        if not isinstance(raw, Mapping):
+            raise CanaryBootstrapError("canary inventory contains a non-object entry")
+        if raw.get("pull_request"):
+            continue
+        marker = _marker(raw.get("body"), expected_repo)
+        if marker is None:
+            continue
+        found.append(_owned_issue(raw, expected_repo))
+    active = [item for item in found if item.state == "open"]
+    if len(active) > 1:
+        raise CanaryBootstrapError(
+            "multiple open owned canary issues exist ({}) ; refusing to duplicate canary work".format(
+                ", ".join("#{}".format(item.number) for item in sorted(active, key=lambda item: item.number))
+            )
+        )
+    if active:
+        return active[0]
+    if not found:
+        return None
+    return max(found, key=lambda item: (_parse_time(item.created_at), item.number))
+
+
+def _configured_number(value: object) -> int:
+    text = str(value if value is not None else "").strip()
+    if re.fullmatch(r"[1-9][0-9]*", text) is None:
+        raise CanaryBootstrapError(
+            "CONTINUUM_CANARY_ISSUE must be a positive integer when provided"
+        )
+    return int(text)
+
+
+def _pr_attributes_issue(pr: Mapping[str, Any], issue_number: int) -> bool:
+    """Whether the lifecycle itself attributed ``pr`` to ``issue_number``.
+
+    Completion is stricter than ordinary liveness: the implementation PR must
+    use the lifecycle's canonical ``opencode/issue<N>-`` branch or carry an
+    operative GitHub auto-close keyword for the issue. A PR that merely mentions
+    the issue number, or only shows the keyword in a Markdown example, is not
+    completion evidence.
+    """
+    branch = str(
+        pr.get("headRefName") or pr.get("head_ref_name") or ""
+    ).strip()
+    if branch.startswith("opencode/issue{}-".format(issue_number)):
+        return True
+    body = _visible_markdown(pr.get("body"))
+    expected_repo = CANARY_OWNER_REPO.lower()
+    for match in _CLOSING_REFERENCE_RE.finditer(body):
+        number = (
+            match.group("issue")
+            or match.group("cross_issue")
+            or match.group("url_issue")
+        )
+        if int(number) != issue_number:
+            continue
+        repo = match.group("repo") or match.group("url_repo")
+        if repo is None or repo.lower() == expected_repo:
+            return True
+    return False
+
+
+def _implementation_worker_run_id(
+    pr: Mapping[str, Any], issue_number: int
+) -> Optional[int]:
+    branch = str(
+        pr.get("headRefName") or pr.get("head_ref_name") or ""
+    ).strip()
+    match = _IMPLEMENTATION_BRANCH_RE.match(branch)
+    if match is None or int(match.group("issue")) != issue_number:
+        return None
+    return int(match.group("run"))
+
+
+def completion_worker_run_id(
+    pull_request: Optional[Mapping[str, Any]], issue_number: int
+) -> Optional[int]:
+    """Worker run id bound by the implementation branch, if it carries one.
+
+    Completion callers use this to fetch the bound run directly, so a worker
+    run that falls outside a bounded global inventory is still retrievable by
+    its trusted id instead of looking absent.
+    """
+    if not pull_request:
+        return None
+    return _implementation_worker_run_id(pull_request, issue_number)
+
+
+def _positive_int(value: object) -> Optional[int]:
+    try:
+        number = int(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None
+    return number if number > 0 else None
+
+
+def _commit_sha(commit: object) -> str:
+    if not isinstance(commit, Mapping):
+        return ""
+    return str(commit.get("sha") or commit.get("oid") or "").strip().lower()
+
+
+def _commit_person(
+    commit: Mapping[str, Any], role: str
+) -> Tuple[str, str, str]:
+    """Return normalized ``(login, name, email)`` for one commit identity."""
+    direct = commit.get(role)
+    login = name = email = ""
+    if isinstance(direct, Mapping):
+        login = str(direct.get("login") or "").strip().lower()
+        name = str(direct.get("name") or "").strip()
+        email = str(direct.get("email") or "").strip().lower()
+    else:
+        login = str(commit.get(role + "_login") or "").strip().lower()
+        name = str(commit.get(role + "_name") or "").strip()
+        email = str(commit.get(role + "_email") or "").strip().lower()
+    payload = commit.get("commit")
+    if isinstance(payload, Mapping):
+        nested = payload.get(role)
+        if isinstance(nested, Mapping):
+            name = name or str(nested.get("name") or "").strip()
+            email = email or str(nested.get("email") or "").strip().lower()
+    return login, name, email
+
+
+def _commit_verified(commit: Mapping[str, Any]) -> bool:
+    payload = commit.get("commit")
+    verification = (
+        payload.get("verification") if isinstance(payload, Mapping) else None
+    )
+    if not isinstance(verification, Mapping):
+        verification = commit.get("verification")
+    return bool(
+        isinstance(verification, Mapping)
+        and verification.get("verified") is True
+    )
+
+
+def _commit_parent_count(commit: Mapping[str, Any]) -> int:
+    parents = commit.get("parents")
+    return len(parents) if isinstance(parents, Sequence) else 0
+
+
+def _commit_parent_shas(commit: object) -> List[str]:
+    """Return the normalized parent SHAs declared by one commit record.
+
+    GitHub's PR commit history carries each commit's own ``parents`` links, so
+    continuity is proved from graph ancestry rather than from the order the
+    commits happen to be listed in.
+    """
+    if not isinstance(commit, Mapping):
+        return []
+    parents = commit.get("parents")
+    if not isinstance(parents, (list, tuple)):
+        return []
+    shas = []
+    for parent in parents:
+        if isinstance(parent, Mapping):
+            sha = str(
+                parent.get("sha") or parent.get("oid") or ""
+            ).strip().lower()
+        elif isinstance(parent, str):
+            sha = parent.strip().lower()
+        else:
+            continue
+        if is_full_sha(sha):
+            shas.append(sha)
+    return shas
+
+
+def _is_authenticated_main_sync_commit(commit: object) -> bool:
+    """Whether GitHub itself signed this commit as a native main-sync merge.
+
+    The PR commit history is the only ordering authority, but its author and
+    committer name/email fields are user-controlled. Only a server-signed,
+    two-parent ``web-flow`` merge is trusted here; ordinary web-editor commits
+    also use ``web-flow`` yet have one parent, and Actions commits are unsigned
+    and require the authenticated repair status instead.
+    """
+    if not isinstance(commit, Mapping):
+        return False
+    committer_login, _, _ = _commit_person(commit, "committer")
+    return (
+        committer_login == _MAIN_SYNC_COMMIT_LOGIN
+        and _commit_parent_count(commit) >= 2
+        and _commit_verified(commit)
+    )
+
+
+def publication_artifacts(listing: object, prefix: str) -> list:
+    """Return ``(artifact_id, name)`` candidates from a run-artifact listing.
+
+    The run artifacts endpoint lists every attempt of a rerun, so one repair
+    run can hold more than one receipt. Keep every live prefix-matching
+    artifact so callers can fetch each receipt by its stable artifact id
+    instead of a name that another attempt can also use.
+    """
+    candidates = []
+    wanted = str(prefix or "")
+    if not wanted:
+        return candidates
+    for line in str(listing or "").splitlines():
+        fields = line.split("\t")
+        if len(fields) != 3 or not fields[0].isdigit():
+            continue
+        artifact_id, name, expired = fields
+        if str(expired).strip().lower() == "true":
+            continue
+        if not name.startswith(wanted):
+            continue
+        candidates.append((int(artifact_id), name))
+    return candidates
+
+
+def repair_status_run_id(
+    status: Mapping[str, Any], expected_repo: str
+) -> Optional[int]:
+    """Return the same-repository run id named by a repair status URL."""
+    target = str(status.get("target_url") or "").strip()
+    match = _REPAIR_STATUS_TARGET_RE.match(target)
+    if match is None:
+        return None
+    if match.group("repo").lower() != str(expected_repo or "").strip().lower():
+        return None
+    return int(match.group("run"))
+
+
+def repair_publication_matches(
+    publication: object,
+    run_id: int,
+    base_sha: str,
+    head_sha: str,
+    pr_number: Optional[int],
+    expected_repo: str,
+    head_branch: str,
+) -> bool:
+    """Whether a repair receipt belongs to the run, PR, and commit it attests."""
+    if not isinstance(publication, Mapping):
+        return False
+    base = str(base_sha or "").strip().lower()
+    head = str(head_sha or "").strip().lower()
+    if not is_full_sha(base) or not is_full_sha(head):
+        return False
+    if _positive_int(publication.get("schema_version")) != 1:
+        return False
+    if (
+        str(publication.get("repo") or "").strip().lower()
+        != str(expected_repo or "").strip().lower()
+    ):
+        return False
+    if _positive_int(publication.get("run_id")) != run_id:
+        return False
+    expected_pr = _positive_int(pr_number)
+    if expected_pr is None:
+        return False
+    if _positive_int(publication.get("pr_number")) != expected_pr:
+        return False
+    if str(publication.get("base_sha") or "").strip().lower() != base:
+        return False
+    if str(publication.get("head_sha") or "").strip().lower() != head:
+        return False
+    if head_branch and str(publication.get("branch") or "").strip() != head_branch:
+        return False
+    return True
+
+
+def select_repair_publication(
+    publications: Sequence[object],
+    run_id: int,
+    base_sha: str,
+    head_sha: str,
+    pr_number: Optional[int],
+    expected_repo: str = CANARY_OWNER_REPO,
+    head_branch: str = "",
+) -> Optional[Mapping[str, Any]]:
+    """Return the receipt that attests one status's exact commit.
+
+    A rerun of the same repair workflow keeps its run id while it can push
+    another commit. Its run artifacts then hold one receipt per attempt, so the
+    newest receipt can describe a later commit than the status being checked.
+    A receipt is eligible only when it binds this run, PR, branch, direct
+    parent, and pushed commit; the newest receipt is never assumed to match.
+    """
+    for publication in publications or ():
+        if isinstance(publication, Mapping) and repair_publication_matches(
+            publication,
+            run_id,
+            base_sha,
+            head_sha,
+            pr_number,
+            expected_repo,
+            head_branch,
+        ):
+            return publication
+    return None
+
+
+def _commit_has_repair_status(
+    commit: Mapping[str, Any],
+    base_sha: str,
+    pr_number: Optional[int],
+    expected_repo: str,
+    head_branch: str = "",
+) -> bool:
+    """Whether an authenticated repair workflow attested this exact commit.
+
+    The status is written through GitHub's API after the repair pushes, and its
+    description binds the direct parent, this commit, and the PR. A manual
+    commit can copy the bot name and email but cannot create this status without
+    first running the authenticated repair workflow that owns the push. The
+    creator must be the repository owner's PAT identity (or the Actions bot),
+    so an unrelated collaborator cannot authorize a manual commit. The target
+    URL must name this repository's run, and that run's own publication receipt
+    must bind the same run, PR, branch, parent, and pushed commit. A manually
+    created status cannot borrow an unrelated run URL as repair evidence.
+    """
+    statuses = commit.get("statuses")
+    if not isinstance(statuses, Sequence):
+        return False
+    sha = _commit_sha(commit)
+    expected = "pr={} base={} head={}".format(
+        pr_number, base_sha[:12], sha[:12]
+    )
+    owner = str(expected_repo or "").split("/", 1)[0].strip().lower()
+    trusted_creators = {owner, "github-actions[bot]"}
+    for status in statuses:
+        if not isinstance(status, Mapping):
+            continue
+        if str(status.get("context") or "") != CANARY_REPAIR_STATUS_CONTEXT:
+            continue
+        if str(status.get("state") or "") != "success":
+            continue
+        if str(status.get("description") or "").strip() != expected:
+            continue
+        creator = status.get("creator")
+        login = (
+            str(creator.get("login") or "").strip().lower()
+            if isinstance(creator, Mapping)
+            else ""
+        )
+        if login not in trusted_creators:
+            continue
+        run_id = repair_status_run_id(status, expected_repo)
+        if run_id is None:
+            continue
+        if not repair_publication_matches(
+            status.get("publication"),
+            run_id,
+            base_sha,
+            sha,
+            pr_number,
+            expected_repo,
+            head_branch,
+        ):
+            continue
+        return True
+    return False
+
+
+def _validate_publication_continuity(
+    head: str,
+    published: str,
+    commits: Sequence[Mapping[str, Any]],
+    pr_number: Optional[int] = None,
+    expected_repo: str = CANARY_OWNER_REPO,
+    head_branch: str = "",
+) -> Optional[str]:
+    """Return a failure reason unless authenticated commits connect published to head.
+
+    The worker receipt names the commit the worker actually published. A later
+    CodeRabbit/CI repair or a native main-sync may advance the same PR branch
+    before merge. Completion may only cross that gap through the PR's own
+    commit history. Continuity is derived from the commits' ``parents`` links:
+    every commit reachable from the final head but not from the published
+    commit must be trusted. List position is never evidence, because a manual
+    commit with an earlier committer date sorts before the published commit and
+    can be smuggled in as the second parent of a signed merge. A commit in that
+    reachable set is trusted only when GitHub signed it as a two-parent
+    ``web-flow`` merge, or when the repair workflow published an authenticated
+    status whose own run receipt binds its direct parent, this exact commit,
+    the PR, and the branch. A plain commit that merely copies the Actions bot
+    identity is not evidence.
+    """
+    entries = [
+        commit for commit in commits or [] if isinstance(commit, Mapping)
+    ]
+    if not entries:
+        return (
+            "worker publication receipt published another commit without a "
+            "PR commit history to prove trusted continuity"
+        )
+    history = {}
+    order = []
+    for commit in entries:
+        sha = _commit_sha(commit)
+        if not sha or sha in history:
+            continue
+        history[sha] = commit
+        order.append(sha)
+    if head not in history:
+        return (
+            "worker publication receipt PR history does not contain the final "
+            "head"
+        )
+    if published not in history:
+        return (
+            "worker publication receipt published a commit outside the final "
+            "PR history"
+        )
+
+    def reachable(start: str) -> set:
+        seen = set()
+        pending = [start]
+        while pending:
+            sha = pending.pop()
+            if sha in seen:
+                continue
+            seen.add(sha)
+            pending.extend(_commit_parent_shas(history.get(sha)))
+        return seen
+
+    head_history = reachable(head)
+    if published not in head_history:
+        return (
+            "worker publication receipt published a commit that is not behind "
+            "the final head"
+        )
+    published_history = reachable(published)
+    after_publication = [
+        sha
+        for sha in order
+        if sha in head_history and sha not in published_history
+    ]
+    if not after_publication:
+        return (
+            "worker publication receipt has no PR commit history proving "
+            "trusted continuity to the final head"
+        )
+    for sha in after_publication:
+        commit = history[sha]
+        if _is_authenticated_main_sync_commit(commit):
+            continue
+        if any(
+            _commit_has_repair_status(
+                commit,
+                parent,
+                pr_number,
+                expected_repo,
+                head_branch,
+            )
+            for parent in _commit_parent_shas(commit)
+        ):
+            continue
+        return (
+            "worker publication receipt has unauthenticated commit {} after "
+            "publication".format(sha or "<unknown>")
+        )
+    return None
+
+
+def validate_worker_publication(
+    pull_request: Optional[Mapping[str, Any]],
+    worker_run: Optional[Mapping[str, Any]],
+    publication: object,
+    issue_number: int,
+    expected_repo: str = CANARY_OWNER_REPO,
+    pull_request_commits: Sequence[Mapping[str, Any]] = (),
+) -> Optional[str]:
+    """Return a failure reason unless the worker run published this PR.
+
+    A successful worker run is not by itself proof that it published the
+    implementation PR: the worker exits successfully when it has nothing to
+    publish. The worker therefore uploads a run-scoped publication receipt as a
+    workflow artifact when (and only when) it creates or updates the task PR.
+    The receipt binds the run id, canonical task branch, issue, PR number, and
+    published commit; only the owning run can attach an artifact to itself, so
+    a manual PR that merely reuses a run id in its branch name is not lifecycle
+    evidence. The published commit may sit behind the final head when automation
+    added repair or main-sync commits afterwards. In that case the PR's commit
+    history must prove continuity from the published commit to the final head:
+    a later commit is accepted only when GitHub signed it as a native main-sync
+    merge, or when the authenticated repair workflow status and that run's own
+    publication receipt attest it, its direct parent, and this PR. Commit-name
+    spoofing alone never qualifies. The
+    exact-head CI and contract checks still target the final head. A published
+    commit that cannot be connected that way never satisfies the receipt.
+    """
+    if not pull_request:
+        return "no implementation PR carries the worker publication receipt"
+    if not isinstance(worker_run, Mapping):
+        return "worker run for the publication receipt is absent"
+    if not isinstance(publication, Mapping):
+        return "worker publication receipt is absent"
+    if _positive_int(publication.get("schema_version")) != 1:
+        return "worker publication receipt has an unsupported schema"
+    repo = str(publication.get("repo") or "").strip().lower()
+    if repo != str(expected_repo or "").strip().lower():
+        return "worker publication receipt names another repository"
+    if _positive_int(publication.get("issue")) != int(issue_number):
+        return "worker publication receipt names another issue"
+    run_id = _evidence_run_id(worker_run)
+    if run_id is None:
+        return "worker publication receipt has no run identity"
+    if _positive_int(publication.get("run_id")) != run_id:
+        return "worker publication receipt belongs to another run"
+    branch = str(
+        pull_request.get("headRefName") or pull_request.get("head_ref_name") or ""
+    ).strip()
+    if not branch or str(publication.get("branch") or "").strip() != branch:
+        return "worker publication receipt belongs to another branch"
+    if _positive_int(publication.get("pr_number")) != _positive_int(
+        pull_request.get("number")
+    ):
+        return "worker publication receipt belongs to another pull request"
+    head = str(
+        pull_request.get("headRefOid") or pull_request.get("head_sha") or ""
+    ).strip().lower()
+    if not is_full_sha(head):
+        return "implementation PR has no full head for the publication receipt"
+    published = str(publication.get("head_sha") or "").strip().lower()
+    if not is_full_sha(published):
+        return "worker publication receipt has no full published commit"
+    if published != head:
+        continuity = _validate_publication_continuity(
+            head,
+            published,
+            pull_request_commits,
+            _positive_int(pull_request.get("number")),
+            expected_repo,
+            branch,
+        )
+        if continuity:
+            return continuity
+    return None
+
+
+def select_implementation_pr(
+    issue_number: int,
+    pull_requests: Sequence[Mapping[str, Any]],
+) -> Optional[Mapping[str, Any]]:
+    """Return the newest lifecycle-attributed implementation PR for the issue."""
+    attributed = [
+        pr
+        for pr in pull_requests or []
+        if isinstance(pr, Mapping) and _pr_attributes_issue(pr, issue_number)
+    ]
+    return _latest_pr(issue_number, attributed, repository=CANARY_OWNER_REPO)
+
+
+def observation_pull_requests(
+    issue_number: int,
+    issue_state: object,
+    pull_requests: Sequence[Mapping[str, Any]] = (),
+) -> Sequence[Mapping[str, Any]]:
+    """Return the pull-request inventory ``observe_canary`` should inspect.
+
+    An open canary keeps the full inventory so the loose liveness matcher can
+    find its current implementation PR. A closed canary must use only the
+    lifecycle-attributed implementation PR; otherwise a newer PR that merely
+    mentions the issue can hide a valid completion. When no PR is attributed,
+    retain the full inventory so observation still fails closed with the
+    existing unmerged-PR diagnostic.
+    """
+    pulls = list(pull_requests or ())
+    if str(issue_state or "").strip().lower() != "closed":
+        return pulls
+    attributed = select_implementation_pr(issue_number, pulls)
+    return [attributed] if attributed is not None else pulls
+
+
+def merge_exact_head_runs(
+    runs: Sequence[Mapping[str, Any]],
+    head_sha: object,
+    exact_head_runs: Sequence[Mapping[str, Any]],
+) -> list:
+    """Replace snapshot run records for one head with an exact-HEAD fetch.
+
+    ``evaluate_regression_gate`` consumes the newest record for the target
+    head, so a stale snapshot success must never shadow a fresher exact-HEAD
+    failure. Records for other heads are preserved.
+    """
+    target = str(head_sha or "").strip().lower()
+    snapshot = list(runs or [])
+    if target:
+        snapshot = [
+            run
+            for run in snapshot
+            if not (
+                isinstance(run, Mapping)
+                and str(run.get("headSha") or run.get("head_sha") or "")
+                .strip()
+                .lower()
+                == target
+            )
+        ]
+    return snapshot + list(exact_head_runs or [])
+
+
+def _evidence_run_id(run: Mapping[str, Any]) -> Optional[int]:
+    for key in ("databaseId", "id"):
+        try:
+            value = int(run.get(key))
+        except (TypeError, ValueError):
+            continue
+        if value > 0:
+            return value
+    return None
+
+
+def merge_bound_worker_run(
+    runs: Sequence[Mapping[str, Any]],
+    worker_run: Mapping[str, Any],
+) -> list:
+    """Replace one snapshot worker record with a direct by-id fetch.
+
+    The bounded global run inventory can omit a worker run that finished before
+    the implementation commit existed, where an exact-HEAD lookup cannot find
+    it either. Completion therefore fetches the run id embedded in the
+    implementation branch directly. Keeping exactly one record per run id
+    prevents a stale snapshot row from shadowing the fetched evidence.
+    """
+    snapshot = list(runs or [])
+    if not isinstance(worker_run, Mapping):
+        return snapshot
+    bound = _evidence_run_id(worker_run)
+    if bound is None:
+        return snapshot
+    snapshot = [
+        run
+        for run in snapshot
+        if not (
+            isinstance(run, Mapping) and _evidence_run_id(run) == bound
+        )
+    ]
+    return snapshot + [worker_run]
+
+
+def _gate_evidence(runs: Sequence[Mapping[str, Any]]) -> list:
+    evidence = []
+    for run in runs or []:
+        if not isinstance(run, Mapping):
+            continue
+        name = str(run.get("name") or run.get("workflowName") or "").strip()
+        sha = str(run.get("headSha") or run.get("head_sha") or "").strip().lower()
+        if not name or not sha:
+            continue
+        conclusion = run.get("conclusion")
+        evidence.append(
+            GateEvidence(
+                name,
+                sha,
+                str(run.get("status") or "").strip().lower(),
+                str(conclusion).strip().lower() if conclusion is not None else None,
+                run_id=_evidence_run_id(run),
+                display_title=str(
+                    run.get("displayTitle") or run.get("display_title") or ""
+                ).strip(),
+                head_branch=str(
+                    run.get("headBranch") or run.get("head_branch") or ""
+                ).strip(),
+            )
+        )
+    return evidence
+
+
+def completion_worker_run(
+    issue_number: int,
+    runs: Sequence[Mapping[str, Any]],
+    pull_request: Optional[Mapping[str, Any]] = None,
+) -> Optional[Mapping[str, Any]]:
+    """Return the raw worker run whose evidence validates completion.
+
+    Completion records this run's id, so selection must use the same
+    issue-bound OpenCode worker evidence as :func:`validate_completed_canary`.
+    The implementation branch embeds the publishing run id, and the run's own
+    canonical title must bind that id to this issue. A PR without that binding
+    has no worker evidence to record, so a run whose title merely names the
+    issue is never selected.
+    """
+    expected = (
+        _implementation_worker_run_id(pull_request, issue_number)
+        if pull_request
+        else None
+    )
+    if expected is None:
+        return None
+    selected = worker_evidence_for_issue(
+        _gate_evidence(runs), issue_number, run_id=expected
+    )
+    if selected is None or selected.run_id is None:
+        return None
+    for run in runs or []:
+        if (
+            isinstance(run, Mapping)
+            and _evidence_run_id(run) == selected.run_id
+        ):
+            return run
+    return None
+
+
+def validate_completed_canary(
+    pull_request: Optional[Mapping[str, Any]],
+    runs: Sequence[Mapping[str, Any]],
+    issue_number: int,
+    worker_publication: object = None,
+    pull_request_commits: Sequence[Mapping[str, Any]] = (),
+    expected_repo: str = CANARY_OWNER_REPO,
+) -> Optional[str]:
+    """Return a failure reason unless a completed canary PR has exact-HEAD evidence.
+
+    A closed canary issue only proves a live E2E run when its implementation PR
+    is attributed to that issue by the lifecycle, is merged, carries a full
+    head and merge commit, has completed successful ``CI`` and ``Contract
+    qualification`` runs for that exact head, and has a completed successful
+    OpenCode worker run bound to the canary issue. The binding has three
+    halves: the run id embedded in the canonical ``opencode/issue<N>-<run>``
+    branch, the run's own canonical title naming this issue (its ``OpenCode
+    issue #N`` or 429 recovery identity), and the run-scoped publication
+    receipt that the worker uploads only when it publishes this exact PR. So
+    neither a manual PR with only a closing keyword, a PR reusing an unrelated
+    issue's run id, nor a PR borrowing the id of a successful no-op run ever
+    satisfies it. A worker-published commit may sit behind the final head when
+    automation later repairs the branch; ``pull_request_commits`` must then
+    prove that every intervening commit is either a GitHub-signed main-sync
+    merge or carries the authenticated repair-publication status. A plain
+    commit that copies the bot identity is not automation evidence. Evidence
+    for any other SHA is stale and never satisfies the check; a manually
+    implemented PR with no worker run is not live lifecycle proof.
+    ``expected_repo`` is the repository observed by this qualification run. A
+    consumer that selects its canary through ``CONTINUUM_CANARY_ISSUE`` keeps
+    its own receipts, so the publication check must compare against that
+    observed repository instead of the bootstrap owner. The bootstrap
+    restriction itself stays in :func:`resolve_canary`.
+    """
+    if not pull_request:
+        return "no merged implementation PR references the canary issue"
+    if not _pr_attributes_issue(pull_request, issue_number):
+        return (
+            "implementation PR is not attributed to canary issue #{}"
+            .format(issue_number)
+        )
+    merged_at = pull_request.get("mergedAt") or pull_request.get("merged_at")
+    if not merged_at:
+        return "implementation PR is not merged"
+    head = str(
+        pull_request.get("headRefOid") or pull_request.get("head_ref_oid") or ""
+    ).strip().lower()
+    if not is_full_sha(head):
+        return "merged implementation PR has no full headRefOid"
+    merge_commit = pull_request.get("mergeCommit") or pull_request.get("merge_commit") or {}
+    merge_oid = (
+        str(merge_commit.get("oid") or "").strip().lower()
+        if isinstance(merge_commit, Mapping)
+        else ""
+    )
+    if not is_full_sha(merge_oid):
+        return "merged implementation PR has no full merge commit"
+    evidence = _gate_evidence(runs)
+    worker_run_id = _implementation_worker_run_id(pull_request, issue_number)
+    if worker_run_id is None:
+        return (
+            "merged implementation PR has no worker run binding; expected the "
+            "canonical opencode/issue{}-<run> branch".format(issue_number)
+        )
+    verdict = evaluate_regression_gate(
+        head,
+        evidence,
+        worker_issue_number=issue_number,
+        worker_run_id=worker_run_id,
+    )
+    if verdict.outcome != GATE_PASS:
+        return (
+            "merged implementation PR lacks exact-HEAD CI/contract and "
+            "worker evidence: " + verdict.reason
+        )
+    publication_problem = validate_worker_publication(
+        pull_request,
+        completion_worker_run(issue_number, runs, pull_request),
+        worker_publication,
+        issue_number,
+        expected_repo=expected_repo,
+        pull_request_commits=pull_request_commits,
+    )
+    if publication_problem:
+        return publication_problem
+    return None
+
+
+def resolve_canary(
+    issues: Sequence[Mapping[str, Any]],
+    pull_requests: Sequence[Mapping[str, Any]] = (),
+    runs: Sequence[Mapping[str, Any]] = (),
+    configured_issue: object = None,
+    expected_repo: str = CANARY_OWNER_REPO,
+    now: Optional[datetime] = None,
+    read_error: object = None,
+    pagination_complete: bool = True,
+    worker_publication: object = None,
+    pull_request_commits: Sequence[Mapping[str, Any]] = (),
+) -> CanaryDecision:
+    """Decide whether to observe the existing canary or create a fresh one.
+
+    ``read_error`` and ``pagination_complete`` model an unreadable inventory:
+    every read failure (403/429/422/5xx, timeout, truncated pagination) fails
+    closed and never creates a duplicate issue. ``worker_publication`` is the
+    run-scoped publication receipt fetched from the bound worker run; without
+    it a closed canary is not trustworthy completion evidence.
+    ``pull_request_commits`` is that implementation PR's commit history; its
+    authenticated repair-publication statuses prove continuity when automation
+    repaired the branch after the worker published it.
+    """
+    if read_error not in (None, ""):
+        raise CanaryBootstrapError(
+            "canary inventory read failed ({}); refusing to create a duplicate "
+            "issue from incomplete metadata".format(read_error)
+        )
+    if not pagination_complete:
+        raise CanaryBootstrapError(
+            "canary inventory pagination was incomplete; refusing to create a "
+            "duplicate issue from partial metadata"
+        )
+    if configured_issue not in (None, ""):
+        number = _configured_number(configured_issue)
+        return CanaryDecision(
+            action="observe",
+            issue_number=number,
+            reason="configured-override",
+            detail="CONTINUUM_CANARY_ISSUE selects the live canary issue",
+        )
+    if str(expected_repo or "").strip().lower() != CANARY_OWNER_REPO:
+        raise CanaryBootstrapError(
+            "live-canary bootstrap is only allowed in {}; refusing to touch {}"
+            .format(CANARY_OWNER_REPO, expected_repo or "<unknown>")
+        )
+    issue = select_canary_issue(issues, expected_repo)
+    if issue is None:
+        return CanaryDecision(
+            action="create",
+            issue_number=None,
+            reason="initial-bootstrap",
+            detail="no repository-owned canary issue exists",
+        )
+    age = _age_seconds(issue.created_at, now)
+    if age is None:
+        raise CanaryBootstrapError(
+            "canary issue #{} has no usable creation timestamp".format(issue.number)
+        )
+    if issue.state == "open":
+        return CanaryDecision(
+            action="observe",
+            issue_number=issue.number,
+            reason="active-canary",
+            detail="the owned canary issue is open",
+            created_at=issue.created_at,
+            age_seconds=age,
+            completed=False,
+        )
+    implementation_pr = select_implementation_pr(issue.number, pull_requests)
+    # A closed canary's completion must be judged from its lifecycle-attributed
+    # implementation PR. The looser liveness matcher may select a newer
+    # unrelated PR that only mentions the issue, which would hide a valid
+    # completion (or let an unrelated merged PR stand in for it).
+    completion_prs = observation_pull_requests(
+        issue.number, issue.state, pull_requests
+    )
+    try:
+        observed = observe_canary(
+            issue.raw,
+            runs=runs,
+            pull_requests=completion_prs,
+            now=now,
+            repository=expected_repo,
+        )
+    except ContractQualificationError as exc:
+        raise CanaryBootstrapError(
+            "previous canary #{} could not be evaluated: {}".format(issue.number, exc)
+        )
+    if observed.failure:
+        raise CanaryBootstrapError(
+            "previous canary #{} is not conclusively complete: {}".format(
+                issue.number, observed.failure
+            )
+        )
+    if not observed.completed:
+        raise CanaryBootstrapError(
+            "previous canary #{} is closed without a merged implementation PR".format(
+                issue.number
+            )
+        )
+    problem = validate_completed_canary(
+        implementation_pr,
+        runs,
+        issue.number,
+        worker_publication,
+        pull_request_commits,
+        expected_repo=expected_repo,
+    )
+    if problem:
+        raise CanaryBootstrapError(
+            "previous canary #{} completion is not trustworthy: {}".format(
+                issue.number, problem
+            )
+        )
+    if age >= CANARY_WINDOW_SECONDS:
+        return CanaryDecision(
+            action="create",
+            issue_number=None,
+            reason="window-elapsed",
+            detail=(
+                "previous canary #{} completed and the {}-day window elapsed"
+                .format(issue.number, CANARY_WINDOW_SECONDS // (24 * 60 * 60))
+            ),
+            created_at=issue.created_at,
+            age_seconds=age,
+            completed=True,
+            previous_issue_number=issue.number,
+        )
+    return CanaryDecision(
+        action="observe",
+        issue_number=issue.number,
+        reason="completed-canary",
+        detail="the owned canary completed inside the freshness window",
+        created_at=issue.created_at,
+        age_seconds=age,
+        completed=True,
+    )
+
+
+def _safe_token(value: object, name: str, allow_empty: bool = False) -> str:
+    text = str(value or "").strip()
+    if not text and allow_empty:
+        return ""
+    if _SAFE_TOKEN_RE.fullmatch(text) is None:
+        raise CanaryBootstrapError(
+            "{} must match [A-Za-z0-9._-] and be at most 120 characters".format(name)
+        )
+    return text
+
+
+def build_canary_issue(
+    *,
+    nonce: object,
+    run_id: object = "",
+    run_attempt: object = "",
+    repo: str = CANARY_OWNER_REPO,
+) -> Tuple[str, str]:
+    """Return the stable title and bounded body for a fresh canary issue."""
+    nonce_text = _safe_token(nonce, "canary nonce")
+    run_id_text = _safe_token(run_id, "run_id", allow_empty=True)
+    attempt_text = _safe_token(run_attempt, "run_attempt", allow_empty=True)
+    expected = str(repo or "").strip()
+    if expected.lower() != CANARY_OWNER_REPO:
+        raise CanaryBootstrapError(
+            "canary issues may only be created in {}".format(CANARY_OWNER_REPO)
+        )
+    marker = "<!-- continuum-contract-canary repo={} task={} -->".format(
+        CANARY_OWNER_REPO, CANARY_TASK_ID
+    )
+    body = "\n".join(
+        [
+            marker,
+            "⚡ **Continuum · contract-canary**",
+            "<!-- continuum-origin role=continuum component=contract-canary -->",
+            "",
+            "# Automated live canary",
+            "",
+            "This issue is repository-owned and is generated by the scheduled Contract",
+            "qualification canary. It is intentionally harmless. The normal issue",
+            "scheduler owns the implementation; do not ask for human input.",
+            "",
+            "## Task",
+            "",
+            "Create or replace only `{}`. Its entire content must be exactly:".format(
+                CANARY_FIXTURE_PATH
+            ),
+            "",
+            "```",
+            "continuum-canary nonce={}".format(nonce_text),
+            "```",
+            "",
+            "Do not modify any other file, workflow, configuration, or consumer repository.",
+            "",
+            "## Definition of Done",
+            "",
+            "- [ ] `{}` contains exactly `continuum-canary nonce={}` and no other content."
+            .format(CANARY_FIXTURE_PATH, nonce_text),
+            "- [ ] The implementation PR closes this issue.",
+            "- [ ] The ordinary CI and Contract qualification checks pass on the exact PR HEAD.",
+            "- [ ] The guarded merge path merges the PR and source-issue reconciliation closes this issue.",
+            "",
+            "Canary run: `{}` attempt `{}` (automation metadata; not a secret).".format(
+                run_id_text or "unknown", attempt_text or "unknown"
+            ),
+            "",
+        ]
+    )
+    return CANARY_TITLE, body
