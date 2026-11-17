@@ -263,6 +263,14 @@ APPROVED_SCHEDULER_ORIGIN_OPENCODE_SHA256 = (
 APPROVED_454_TELEMETRY_OPENCODE_SHA256 = (
     "c740682de530c242cc5904d0c53d8a2eed6cbb6900347ea453fbc03de4917249"
 )
+
+# 2026-11-17: explicitly reviewed CI-repair/main-sync race fix. The exact
+# protected workflow digest advances only for the verified non-destructive
+# CI-fix publication fence; the prior #454 telemetry digest remains immutable
+# above for historical audit. The new exact pin rejects any unrelated drift.
+APPROVED_CI_REPAIR_SYNC_OPENCODE_SHA256 = (
+    "aec3ba6c112b329a92fb3319b71ab1ecce458e93f746a2addff1f704d9856a7f"
+)
 # 2026-11-16: intentional generation-2 checkpoint-resume correction
 # (kodmial/continuum#460). A validated generation-2+ legacy mirror may resume
 # only when its immutable metadata binds the same durable ref/operation/issue
@@ -2713,14 +2721,13 @@ class ProtectedBaselineTests(unittest.TestCase):
                     self.assertIn("CONTINUUM_OPENCODE_PUBLISH_RACE_RETRY_REQUIRED", original)
                     self.assertIn("steps.model_route.outputs.model", original)
                 if path == ".github/workflows/continuum-opencode.yml":
-                    # #454 adds bounded telemetry on top of the deliberate
-                    # scheduler-origin recovery correction, #450's
-                    # chat-ownership change, and main's #460 generation-2
-                    # resume repair, with full-file digests and executable
-                    # regression tests.
+                    # The #454 telemetry and #460 recovery pins remain audited
+                    # above; #339eb2f intentionally fences live OpenCode
+                    # repair against main-sync and skips stale CI-fix pushes.
+                    # Exact-file integrity is still enforced byte-for-byte.
                     self.assertEqual(
                         protected_file_digest(path),
-                        APPROVED_454_TELEMETRY_OPENCODE_SHA256,
+                        APPROVED_CI_REPAIR_SYNC_OPENCODE_SHA256,
                         f"{path}: unexpected drift outside #454 telemetry on the scheduler-origin #450 serialized CodeRabbit chat owner and #460 resume repair",
                     )
                 else:
@@ -2806,7 +2813,7 @@ class ProtectedBaselineTests(unittest.TestCase):
         # therefore be dirty in this pre-commit worktree; any unapproved byte
         # change still fails the exact digest assertions above.
         approved = {
-            ".github/workflows/continuum-opencode.yml": APPROVED_454_TELEMETRY_OPENCODE_SHA256,
+            ".github/workflows/continuum-opencode.yml": APPROVED_CI_REPAIR_SYNC_OPENCODE_SHA256,
             ".github/workflows/opencode.yml": APPROVED_350_SELF_CALLER_SHA256,
         }
         for path in PROTECTED_FILES:
