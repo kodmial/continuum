@@ -1,0 +1,23 @@
+{
+  "base_ref": "main",
+  "base_sha": "7161637977171df43cb7cfeaca3bc6de679d896c",
+  "branch": "opencode/issue477-44127187786",
+  "capability_number": "",
+  "checkpoint_ref": "opencode/429-checkpoint-opencode-429-issue-issue477-gen-1",
+  "failure_kind": "quota_429",
+  "generation": 1,
+  "head_ref": "opencode/issue477-44127187786",
+  "head_sha": "5d7ac00af4858592b9ca819588be83d7e7d8b9c6",
+  "issue_number": "477",
+  "mode": "issue",
+  "operation_id": "opencode-429-issue-issue477",
+  "pr_number": "",
+  "qualification_number": "",
+  "repository": "kodmial/continuum",
+  "required_sha": "",
+  "review_id": "",
+  "run_id": "",
+  "schema_version": 1,
+  "stage": "implementation-incomplete",
+  "unresolved_items_json": ""
+}
