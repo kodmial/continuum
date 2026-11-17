@@ -727,6 +727,44 @@ class CheckpointHoldReleaseTests(unittest.TestCase):
                     [],
                 )
 
+    def test_a_reused_release_claim_requires_the_unchanged_consumer_base(self):
+        for name, update, reason in (
+            ("changed", {"baseSha": "f" * 40}, "base-changed"),
+            ("unavailable", {"baseError": 403}, "base-unavailable"),
+        ):
+            with self.subTest(name=name):
+                scenario = self.base_scenario()
+                scenario.update(update)
+                # A durable claim already exists. Reusing it is authorized
+                # only while the consumer base it rejected against is
+                # provably unchanged.
+                scenario["comments"].append(
+                    {
+                        "id": 2,
+                        "body": release_marker(),
+                        "user": {"login": "github-actions[bot]"},
+                        "author_association": "OWNER",
+                        "created_at": "2026-11-17T09:05:00Z",
+                    }
+                )
+                result = self.run_scenario(scenario)
+                for controller in ("scheduler", "watchdog"):
+                    self.assertTrue(result[controller]["blocked"], controller)
+                    self.assertFalse(
+                        result[controller]["release"]["released"], controller
+                    )
+                    self.assertEqual(
+                        result[controller]["release"]["reason"],
+                        reason,
+                        controller,
+                    )
+                releases = [
+                    c for c in result["comments"]
+                    if "resume-release" in c["body"]
+                ]
+                self.assertEqual(len(releases), 1)
+                self.assertEqual(int(releases[0]["id"]), 2)
+
     def test_comment_claim_or_arbitrary_commit_is_not_fix_provenance(self):
         scenario = self.base_scenario()
         scenario["manifest"] = None
