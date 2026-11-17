@@ -7511,6 +7511,41 @@ class ContinuumTest < Minitest::Test
     assert_includes repair, 'Never weaken, delete, skip, or special-case a validation merely to make CI green.'
     assert_includes repair, 'No authoritative task issue was resolved for this legacy PR. Do not fabricate one'
   end
+
+  # kodmial/continuum#295: a conflict repair must edit a PR against its
+  # canonical task, never against whatever issue the mutable PR body names at
+  # repair time. The canonical task therefore comes from the worker branch and
+  # the bound run identity, and a PR that cannot be bound fails closed.
+  def test_opencode_conflict_repair_binds_the_canonical_task_not_the_pr_body
+    body = workflow_body('continuum-opencode.yml')
+
+    resolver = step_body(body, 'Resolve authoritative task context')
+    refute_nil resolver, 'the shared task-context resolver step is missing'
+    assert_includes resolver, "inputs.mode == 'resolve-conflict'",
+                    'the resolver must run for conflict repair too'
+    assert_includes resolver, "mode === 'resolve-conflict'"
+    assert_includes resolver, "source = 'canonical-worker-branch'",
+                    'conflict repair must bind the task through the worker branch'
+    assert_includes resolver, 'github.rest.actions.getWorkflowRun',
+                    'the branch binding must be confirmed by the worker run itself'
+    assert_includes resolver, '/^opencode\\/issue(\\d+)-(\\d+)$/i',
+                    'the canonical branch identity is issue plus run id'
+    assert_includes resolver, 'runBindsIssue',
+                    'the run display title must confirm it owns the issue'
+
+    conflict = step_body(body, 'Resolve merge conflict with main')
+    refute_nil conflict, 'the conflict-repair step is missing'
+    assert_includes conflict, "snapshot reference cannot be bound to the PR's canonical task",
+                    'a PR without a resolvable task must stop the repair, not trust its body'
+    assert_includes conflict, '"$(tr \'[:upper:]\' \'[:lower:]\' <<<"$REF_REPO")" != "$(tr \'[:upper:]\' \'[:lower:]\' <<<"$TASK_REPO")"',
+                    'the snapshot reference must match the canonical task repository'
+    assert_includes conflict, '"$REF_ISSUE" != "$TASK_NUMBER"',
+                    'the snapshot reference must match the canonical task issue'
+    assert_includes conflict, 'legacy, pre-guard PR',
+                    'pre-guard PRs must keep their explicit unprotected path'
+    refute_includes conflict, 'snapshot reference $REF_REPO#$REF_ISSUE does not match expected task',
+                    'conflict repair must not compare against an unbound expectation'
+  end
   # A task implementation command must obey the same dependency/DoR gate as
   # the scheduler. Manual /oc is not an escape hatch that may turn a blocked
   # tracking issue into a partial PR.

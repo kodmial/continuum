@@ -351,8 +351,12 @@ APPROVED_459_REVIEW_OPENCODE_SHA256 = (
 # CI-fix push only after proving the remote head advanced. The earlier #454,
 # CI-repair-sync, and #459 review pins stay for audit; this active pin covers
 # the combined bytes and any unrelated drift still fails closed.
+# 2026-11-17 second #459 review repair: publication identity is recorded as a
+# trusted PR marker comment (never inferred from the branch or PR body),
+# conflict repair binds the canonical task to the worker branch plus its run,
+# and the merged-CI-repair bytes above stay audit-only.
 APPROVED_459_CI_REPAIR_SYNC_MERGED_OPENCODE_SHA256 = (
-    "a8d028a7f02cd74678f843ecc658956d40a9d9c24736db9038b17be43558c824"
+    "aae989612b0a80eb8b6415a6ca1b39d6ea23654b0dc5df6da83e6c5959a0c474"
 )
 # The prior #460 resume pin stays for audit; any further byte drift still
 # fails closed.

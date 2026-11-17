@@ -958,6 +958,7 @@ jobs:
               problem = canary.validate_completed_canary(
                   latest, runs, issue_number, publication,
                   pull_request_commits=commits,
+                  expected_repo=os.environ["GITHUB_REPOSITORY"],
               )
               if problem:
                   raise SystemExit("live canary completion is not trustworthy: " + problem)

@@ -225,7 +225,7 @@ def pr_commit(
     author="github-actions[bot]",
     committer="github-actions[bot]",
     message="fix: canary implementation",
-    parents=1,
+    parents=(),
     verified=False,
     statuses=(),
 ):
@@ -260,10 +260,7 @@ def pr_commit(
                 "reason": "valid" if verified else "unsigned",
             },
         },
-        "parents": [
-            {"sha": "{:040x}".format(index + 1)}
-            for index in range(parents)
-        ],
+        "parents": [{"sha": parent} for parent in parents],
         "statuses": list(statuses),
     }
 
@@ -839,19 +836,21 @@ class CompletionEvidenceTest(unittest.TestCase):
             pr_commit(
                 OTHER_HEAD,
                 message="fix: address CodeRabbit findings",
+                parents=(published,),
                 statuses=[repair_status(published, OTHER_HEAD)],
             ),
             pr_commit(
                 WORKER_HEAD,
                 author="kodmial",
                 committer="web-flow",
-                parents=2,
+                parents=(OTHER_HEAD, "1" * 40),
                 verified=True,
                 message="Merge branch 'main' into opencode/issue100-9001",
             ),
             pr_commit(
                 HEAD,
                 message="fix: repair blocking workflow",
+                parents=(WORKER_HEAD,),
                 statuses=[repair_status(WORKER_HEAD, HEAD)],
             ),
         ]
@@ -880,6 +879,7 @@ class CompletionEvidenceTest(unittest.TestCase):
             pr_commit(
                 OTHER_HEAD,
                 message="fix: address CodeRabbit findings",
+                parents=(published,),
                 statuses=[
                     repair_status(
                         published, OTHER_HEAD, publication_payload=first
@@ -889,6 +889,7 @@ class CompletionEvidenceTest(unittest.TestCase):
             pr_commit(
                 HEAD,
                 message="fix: repair blocking workflow",
+                parents=(OTHER_HEAD,),
                 statuses=[
                     repair_status(
                         OTHER_HEAD, HEAD, publication_payload=second
@@ -916,8 +917,9 @@ class CompletionEvidenceTest(unittest.TestCase):
                 author="github-actions[bot]",
                 committer="github-actions[bot]",
                 message="fix: manually spoofed as automation",
+                parents=(published,),
             ),
-            pr_commit(HEAD),
+            pr_commit(HEAD, parents=(OTHER_HEAD,)),
         ]
         problem = canary.validate_completed_canary(
             pr(), exact_head_runs(), 100, receipt, commits
@@ -997,11 +999,13 @@ class CompletionEvidenceTest(unittest.TestCase):
                     pr_commit(
                         OTHER_HEAD,
                         message="fix: address CodeRabbit findings",
+                        parents=(published,),
                         statuses=[repair_status(published, OTHER_HEAD)],
                     ),
                     pr_commit(
                         HEAD,
                         message="fix: repair blocking workflow",
+                        parents=(OTHER_HEAD,),
                         statuses=[repair],
                     ),
                 ]
@@ -1019,24 +1023,139 @@ class CompletionEvidenceTest(unittest.TestCase):
                 OTHER_HEAD,
                 author="kodmial",
                 committer="web-flow",
-                parents=1,
+                parents=(published,),
                 verified=True,
                 message="edit from the GitHub web editor",
             ),
-            pr_commit(HEAD),
+            pr_commit(HEAD, parents=(OTHER_HEAD,)),
         ]
         problem = canary.validate_completed_canary(
             pr(), exact_head_runs(), 100, receipt, commits
         )
         self.assertIn("unauthenticated commit", problem)
 
+    def test_commit_listed_before_publication_cannot_ride_a_signed_merge(self):
+        """Continuity is parent ancestry, never commit-list position.
+
+        ``pulls/{n}/commits`` is ordered by committer date, so a manual commit
+        with an earlier date is listed before the worker's published commit. A
+        later GitHub-signed two-parent merge can then carry that manual commit
+        into the final head. Only the set reachable from the head but not from
+        the published commit may be trusted.
+        """
+        published = "e" * 40
+        manual = "f" * 40
+        commits = [
+            pr_commit(manual, author="kodmial", committer="kodmial"),
+            pr_commit(published, message="fix: implement issue #100"),
+            pr_commit(
+                HEAD,
+                author="kodmial",
+                committer="web-flow",
+                parents=(published, manual),
+                verified=True,
+                message="Merge branch 'main' into opencode/issue100-9001",
+            ),
+        ]
+        problem = canary.validate_completed_canary(
+            pr(),
+            exact_head_runs(),
+            100,
+            publication(head=published),
+            commits,
+        )
+        self.assertIn("unauthenticated commit " + manual, problem)
+
+    def test_trusted_commit_listed_before_publication_still_passes(self):
+        """A trusted descendant stays trusted when its date sorts it first."""
+        published = "e" * 40
+        commits = [
+            pr_commit(
+                OTHER_HEAD,
+                message="fix: address CodeRabbit findings",
+                parents=(published,),
+                statuses=[repair_status(published, OTHER_HEAD)],
+            ),
+            pr_commit(published, message="fix: implement issue #100"),
+            pr_commit(
+                HEAD,
+                message="fix: repair blocking workflow",
+                parents=(OTHER_HEAD,),
+                statuses=[repair_status(OTHER_HEAD, HEAD)],
+            ),
+        ]
+        self.assertIsNone(
+            canary.validate_completed_canary(
+                pr(),
+                exact_head_runs(),
+                100,
+                publication(head=published),
+                commits,
+            )
+        )
+
+    def test_publication_must_be_an_ancestor_of_the_final_head(self):
+        """A listing that does not connect published to head fails closed."""
+        published = "e" * 40
+        commits = [
+            pr_commit(published),
+            pr_commit(HEAD, parents=("f" * 40,)),
+        ]
+        problem = canary.validate_completed_canary(
+            pr(),
+            exact_head_runs(),
+            100,
+            publication(head=published),
+            commits,
+        )
+        self.assertIn("not behind the final head", problem)
+
+    def test_publication_receipt_uses_the_observed_repository(self):
+        """A consumer canary receipt names the consumer repository."""
+        consumer = "acme/app"
+        receipt = publication(repo=consumer)
+        self.assertIsNone(
+            canary.validate_completed_canary(
+                pr(),
+                exact_head_runs(),
+                100,
+                receipt,
+                expected_repo=consumer,
+            )
+        )
+        problem = canary.validate_completed_canary(
+            pr(), exact_head_runs(), 100, receipt
+        )
+        self.assertIn("another repository", problem)
+
+    def test_both_completion_paths_forward_the_observed_repository(self):
+        workflow = (
+            ROOT / ".github/workflows/continuum-contract-canary.yml"
+        ).read_text(encoding="utf-8")
+        self.assertIn(
+            'expected_repo=os.environ["GITHUB_REPOSITORY"]', workflow
+        )
+        source = (ROOT / "src/continuum/contract_canary.py").read_text(
+            encoding="utf-8"
+        )
+        self.assertEqual(
+            source.count("expected_repo=expected_repo,"),
+            2,
+            "both completion paths must validate against the observed repository",
+        )
+
     def test_untrusted_commit_after_publication_fails(self):
         published = "e" * 40
         receipt = publication(head=published)
         commits = [
             pr_commit(published, message="fix: implement issue #100"),
-            pr_commit(OTHER_HEAD, committer="kodmial", author="kodmial"),
-            pr_commit(HEAD),
+            pr_commit(
+                OTHER_HEAD,
+                committer="kodmial",
+                author="kodmial",
+                parents=(published,),
+            ),
+            pr_commit(HEAD, parents=(OTHER_HEAD,)),
         ]
         problem = canary.validate_completed_canary(
             pr(), exact_head_runs(), 100, receipt, commits
@@ -1047,7 +1166,7 @@ class CompletionEvidenceTest(unittest.TestCase):
         receipt = publication(head=OTHER_HEAD)
         commits = [
             pr_commit("e" * 40),
-            pr_commit(HEAD),
+            pr_commit(HEAD, parents=("e" * 40,)),
         ]
         problem = canary.validate_completed_canary(
             pr(), exact_head_runs(), 100, receipt, commits
@@ -1075,7 +1194,9 @@ class CompletionEvidenceTest(unittest.TestCase):
             pull_request_commits=[
                 pr_commit(published),
                 pr_commit(
-                    HEAD, statuses=[repair_status(published, HEAD)]
+                    HEAD,
+                    parents=(published,),
+                    statuses=[repair_status(published, HEAD)],
                 ),
             ],
         )
@@ -2778,7 +2899,9 @@ class WorkflowContractTest(unittest.TestCase):
             self.assertEqual(
                 producer["outputs"][output],
                 "${{ steps.implement_issue.outputs.%s || "
-                "steps.recover_issue_branch.outputs.%s }}" % (value, value),
+                "steps.recover_issue_branch.outputs.%s || "
+                "steps.publication_recovery.outputs.%s }}"
+                % (value, value, value),
             )
         # The upload failure is tracked separately from the job result so the
         # completed worker run stays successful while the receipt is recovered.
@@ -2808,6 +2931,32 @@ class WorkflowContractTest(unittest.TestCase):
                     'echo "%s=$' % output, step["run"]
                 )
             self.assertIn('>> "$GITHUB_OUTPUT"', step["run"])
+            # The published identity must be recorded as a trusted marker on
+            # the PR at creation, so a later receipt recovery never has to
+            # infer a commit from the branch or the mutable PR body.
+            self.assertIn("continuum-task-publication", step["run"])
+            self.assertIn("gh pr comment", step["run"])
+
+        # A rerun whose duplicate guard skipped publication re-attests only the
+        # identity the publishing run recorded, and forwards it onward.
+        rerun_recovery = next(
+            item
+            for item in producer["steps"]
+            if item.get("id") == "publication_recovery"
+        )
+        rerun_script = rerun_recovery["run"]
+        self.assertIn("continuum-task-publication", rerun_script)
+        self.assertIn("gh api --paginate --slurp", rerun_script)
+        self.assertIn("author_association", rerun_script)
+        self.assertIn('PUBLICATION_ISSUE="$ISSUE_NUMBER"', rerun_script)
+        self.assertIn('PUBLICATION_RUN="$GITHUB_RUN_ID"', rerun_script)
+        self.assertNotIn("pulls/$EXISTING_PR/commits?per_page=1", rerun_script)
+        self.assertNotIn("PR_CREATED_AT", rerun_script)
+        for output in expected:
+            self.assertIn(
+                'echo "%s=$' % output, rerun_script
+            )
+        self.assertIn('>> "$GITHUB_OUTPUT"', rerun_script)
 
         recovery = jobs["recover-issue-publication"]
         self.assertEqual(recovery["needs"], "opencode")
@@ -2851,6 +3000,8 @@ class WorkflowContractTest(unittest.TestCase):
         self.assertIn('"repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER"', script)
         self.assertIn('"opencode/issue${ISSUE_NUMBER}-"*', script)
         self.assertIn("compare/${HEAD_SHA}...${PR_HEAD}", script)
+        self.assertIn('PR_REPO="$(jq -r', script)
+        self.assertIn('"$PR_REPO" == "$GITHUB_REPOSITORY"', script)
         self.assertIn("{schema_version: 1, repo: $repo", script)
         self.assertIn("head_sha: $head", script)
         self.assertIn("Publication receipt already exists", script)

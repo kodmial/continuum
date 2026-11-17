@@ -927,11 +927,11 @@ jobs:
       # the identity recorded at creation is the only remaining evidence. Both
       # publish paths record it here so the recovery job never has to infer a
       # PR or commit, and never creates one.
-      publication_issue: ${{ steps.implement_issue.outputs.publication_issue || steps.recover_issue_branch.outputs.publication_issue }}
-      publication_attempt: ${{ steps.implement_issue.outputs.publication_attempt || steps.recover_issue_branch.outputs.publication_attempt }}
-      publication_branch: ${{ steps.implement_issue.outputs.publication_branch || steps.recover_issue_branch.outputs.publication_branch }}
-      publication_pr_number: ${{ steps.implement_issue.outputs.publication_pr_number || steps.recover_issue_branch.outputs.publication_pr_number }}
-      publication_head_sha: ${{ steps.implement_issue.outputs.publication_head_sha || steps.recover_issue_branch.outputs.publication_head_sha }}
+      publication_issue: ${{ steps.implement_issue.outputs.publication_issue || steps.recover_issue_branch.outputs.publication_issue || steps.publication_recovery.outputs.publication_issue }}
+      publication_attempt: ${{ steps.implement_issue.outputs.publication_attempt || steps.recover_issue_branch.outputs.publication_attempt || steps.publication_recovery.outputs.publication_attempt }}
+      publication_branch: ${{ steps.implement_issue.outputs.publication_branch || steps.recover_issue_branch.outputs.publication_branch || steps.publication_recovery.outputs.publication_branch }}
+      publication_pr_number: ${{ steps.implement_issue.outputs.publication_pr_number || steps.recover_issue_branch.outputs.publication_pr_number || steps.publication_recovery.outputs.publication_pr_number }}
+      publication_head_sha: ${{ steps.implement_issue.outputs.publication_head_sha || steps.recover_issue_branch.outputs.publication_head_sha || steps.publication_recovery.outputs.publication_head_sha }}
       # A receipt upload failure must not fail an otherwise successful worker
       # run, or the recovered receipt could never satisfy the canary's
       # completed-success worker requirement. Keep the pre-continue-on-error
@@ -1253,7 +1253,8 @@ jobs:
         id: task_context
         if: >-
           (github.event_name == 'workflow_dispatch' &&
-           (inputs.mode == 'issue' || inputs.mode == 'ci-fix')) ||
+           (inputs.mode == 'issue' || inputs.mode == 'ci-fix' ||
+            inputs.mode == 'resolve-conflict')) ||
           needs.admit.outputs.route == 'issue'
         uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
         env:
@@ -1284,6 +1285,18 @@ jobs:
             const apiBase = String(process.env.GITHUB_API_URL || 'https://api.github.com')
               .replace(/\/+$/, '');
 
+            function runBindsIssue(run, issueNumber) {
+              const title = String(run?.display_title || '').trim();
+              const direct = title.match(/^OpenCode issue #(\d+)$/);
+              if (direct) return Number(direct[1]) === issueNumber;
+              const recovery = title.match(/^OpenCode 429 recovery (\S+) gen (\d+)$/);
+              if (recovery) {
+                const issue = recovery[1].match(/(?:^|-)issue(\d+)(?:-|$)/);
+                return issue !== null && Number(issue[1]) === issueNumber;
+              }
+              return false;
+            }
+
             async function fetchWithTapPat(path, description) {
               if (!tapPat) {
                 throw new Error(`${description} requires TAP_PAT.`);
@@ -1313,6 +1326,66 @@ jobs:
               taskRepository = repository;
               taskNumber = issueEventNumber;
               source = 'issue-dispatch';
+            } else if (mode === 'resolve-conflict') {
+              if (!Number.isInteger(prNumber) || prNumber <= 0) {
+                core.setFailed('Conflict repair has no valid pull request number.');
+                return;
+              }
+              let pr;
+              try {
+                ({ data: pr } = await github.rest.pulls.get({
+                  owner, repo, pull_number: prNumber,
+                }));
+              } catch (err) {
+                core.setFailed(`Conflict repair could not fetch pull request #${prNumber}: ${err.message || err}`);
+                return;
+              }
+              prTitle = String(pr.title || '');
+              prBody = String(pr.body || '');
+              // The PR body belongs to the PR author, so it can never define
+              // the canonical task. Bind the conflict repair to the worker
+              // run named by the canonical task branch instead: the branch
+              // must live in this repository and the run's own title must
+              // name the same issue. An unbound PR fails closed here and the
+              // snapshot guard below refuses to trust its mutable reference.
+              const headFullName = String(pr.head?.repo?.full_name || '').toLowerCase();
+              const branchIdentity = String(pr.head?.ref || '').match(
+                /^opencode\/issue(\d+)-(\d+)$/i
+              );
+              if (!branchIdentity || headFullName !== repository.toLowerCase()) {
+                core.setOutput('present', 'false');
+                core.setOutput('source', 'none');
+                core.notice(
+                  'Conflict repair found no canonical worker task branch; the PR snapshot reference cannot be bound to a task.'
+                );
+                return;
+              }
+              const boundIssue = Number(branchIdentity[1]);
+              const boundRunId = Number(branchIdentity[2]);
+              let boundRun;
+              try {
+                ({ data: boundRun } = await github.rest.actions.getWorkflowRun({
+                  owner, repo, run_id: boundRunId,
+                }));
+              } catch (err) {
+                core.setOutput('present', 'false');
+                core.setOutput('source', 'none');
+                core.notice(
+                  `Conflict repair could not read worker run ${boundRunId} named by '${pr.head?.ref}'; the PR snapshot reference cannot be bound to a task.`
+                );
+                return;
+              }
+              if (!runBindsIssue(boundRun, boundIssue)) {
+                core.setOutput('present', 'false');
+                core.setOutput('source', 'none');
+                core.notice(
+                  `Worker run ${boundRunId} does not bind issue #${boundIssue}; the PR snapshot reference cannot be bound to a task.`
+                );
+                return;
+              }
+              taskRepository = repository;
+              taskNumber = boundIssue;
+              source = 'canonical-worker-branch';
             } else if (mode === 'ci-fix') {
               if (!Number.isInteger(prNumber) || prNumber <= 0) {
                 core.setFailed('CI repair has no valid pull request number.');
@@ -2625,9 +2698,10 @@ jobs:
       # forever. A rerun keeps the run id but finds the existing
       # `opencode/issue<N>-<run>` PR, so the duplicate guard skipped both the
       # implementation and the receipt upload. Re-attest the identity this run
-      # recorded at creation, without creating or changing any PR. Only a PR
-      # whose head ref embeds this run id is recoverable here: an artifact can
-      # only be attached to its own workflow run.
+      # recorded at creation, without creating or changing any PR. The branch
+      # name and the PR body are author-controlled, so recovery reads only the
+      # trusted marker comment the publishing run wrote, never an inferred
+      # commit.
       - name: Recover publication receipt for an existing PR
         id: publication_recovery
         if: >-
@@ -2656,40 +2730,33 @@ jobs:
             echo "Publication receipt already exists for run $GITHUB_RUN_ID; nothing to recover."
             exit 0
           fi
-          # The identity recorded at creation: this run id (embedded in the
-          # branch), this issue, this PR, this attempt, and the task commit. The
-          # oldest PR commit is the commit this run pushed; later repair commits
-          # still have to prove continuity separately, so recovery never widens
-          # what completion may accept.
-          PR_JSON="$(gh api "repos/$GITHUB_REPOSITORY/pulls/$EXISTING_PR")"
+          PR_JSON="$(gh api "repos/$GITHUB_REPOSITORY/pulls/$EXISTING_PR")" \
+            || { echo "::error::Could not read PR #$EXISTING_PR; refusing to recover an unidentified publication."; exit 1; }
+          PR_REPO="$(jq -r '.head.repo.full_name // ""' <<<"$PR_JSON")"
+          PR_BRANCH="$(jq -r '.head.ref // ""' <<<"$PR_JSON")"
           PR_HEAD="$(jq -r '.head.sha // ""' <<<"$PR_JSON")"
-          PR_CREATED_AT="$(jq -r '.created_at // ""' <<<"$PR_JSON")"
+          [[ "$PR_REPO" == "$GITHUB_REPOSITORY" && "$PR_BRANCH" == "$EXPECTED_BRANCH" ]] \
+            || { echo "::error::PR #$EXISTING_PR is not this run's branch in $GITHUB_REPOSITORY ('$PR_REPO:$PR_BRANCH'); refusing to attest."; exit 1; }
           [[ "$PR_HEAD" =~ ^[0-9a-f]{40}$ ]] \
             || { echo "::error::Could not read PR #$EXISTING_PR head; refusing to attest."; exit 1; }
-          TASK_COMMIT="$(gh api "repos/$GITHUB_REPOSITORY/pulls/$EXISTING_PR/commits?per_page=1" --jq '.[0].sha // empty')"
-          [[ "$TASK_COMMIT" =~ ^[0-9a-f]{40}$ ]] \
-            || { echo "::error::Could not recover the published task commit for PR #$EXISTING_PR; refusing to attest."; exit 1; }
-          ANCESTRY="$(gh api "repos/$GITHUB_REPOSITORY/compare/${TASK_COMMIT}...${PR_HEAD}" --jq .status)"
+          if ! COMMENTS_JSON="$(gh api --paginate --slurp "repos/$GITHUB_REPOSITORY/issues/$EXISTING_PR/comments?per_page=100" | jq 'add // []')"; then
+            echo "::error::Could not read PR #$EXISTING_PR comments; refusing to recover an unidentified publication."
+            exit 1
+          fi
+          IDENTITY="$(COMMENTS_JSON="$COMMENTS_JSON" PUBLICATION_REPO="$GITHUB_REPOSITORY" PUBLICATION_ISSUE="$ISSUE_NUMBER" PUBLICATION_RUN="$GITHUB_RUN_ID" PUBLICATION_BRANCH="$EXPECTED_BRANCH" PUBLICATION_PR="$EXISTING_PR" python3 -c 'import json,os,re; pat=re.compile(r"<!--\s*continuum-task-publication\s+repo=([A-Za-z0-9_.\-]+/[A-Za-z0-9_.\-]+)\s+issue=(\d+)\s+run=(\d+)\s+attempt=(\d+)\s+branch=(\S+)\s+pr=(\d+)\s+head=([0-9a-fA-F]{40})\s*-->"); trusted={"OWNER","MEMBER","COLLABORATOR"}; repo=(os.environ.get("PUBLICATION_REPO") or "").lower(); issue=os.environ.get("PUBLICATION_ISSUE") or ""; run=os.environ.get("PUBLICATION_RUN") or ""; branch=os.environ.get("PUBLICATION_BRANCH") or ""; pr=os.environ.get("PUBLICATION_PR") or ""; data=json.loads(os.environ.get("COMMENTS_JSON") or "[]"); out=[(m.group(4),m.group(7).lower()) for c in reversed(data if isinstance(data,list) else []) if isinstance(c,dict) for u in [c.get("user") if isinstance(c.get("user"),dict) else {}] for m in [pat.search(str(c.get("body") or ""))] if m and m.group(1).lower()==repo and m.group(2)==issue and m.group(3)==run and m.group(5)==branch and m.group(6)==pr and (str(c.get("author_association") or "").upper() in trusted or str(u.get("login") or "").lower()=="github-actions[bot]")]; print(" ".join(out[0]) if out else "",end="")')"
+          read -r PUBLISHED_ATTEMPT RECORDED_HEAD <<<"$IDENTITY" || true
+          if [[ -z "${PUBLISHED_ATTEMPT:-}" || -z "${RECORDED_HEAD:-}" ]]; then
+            echo "::warning::PR #$EXISTING_PR carries no trusted publication identity comment for run $GITHUB_RUN_ID; nowhere is a published commit inferred, so this rerun cannot re-attest it."
+            exit 0
+          fi
+          ANCESTRY="$(gh api "repos/$GITHUB_REPOSITORY/compare/${RECORDED_HEAD}...${PR_HEAD}" --jq .status)"
           case "$ANCESTRY" in
             ahead|identical) ;;
             *)
-              echo "::error::Recovered task commit $TASK_COMMIT is not behind PR #$EXISTING_PR head $PR_HEAD; refusing to attest."
+              echo "::error::Recorded task commit $RECORDED_HEAD is not behind PR #$EXISTING_PR head $PR_HEAD; refusing to attest."
               exit 1
               ;;
           esac
-          # The creation attempt is the last attempt that had started when the PR
-          # was created. A read failure falls back to this attempt, which is the
-          # same truthful value when no rerun happened.
-          PUBLISHED_ATTEMPT="$GITHUB_RUN_ATTEMPT"
-          if [[ -n "$PR_CREATED_AT" ]]; then
-            for attempt in $(seq 1 "$GITHUB_RUN_ATTEMPT"); do
-              ATTEMPT_STARTED_AT="$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/attempts/$attempt" --jq '.run_started_at // ""' 2>/dev/null || true)"
-              [[ -n "$ATTEMPT_STARTED_AT" ]] || continue
-              if [[ ! "$PR_CREATED_AT" < "$ATTEMPT_STARTED_AT" ]]; then
-                PUBLISHED_ATTEMPT="$attempt"
-              fi
-            done
-          fi
           PUBLICATION_DIR="${RUNNER_TEMP:-/tmp}/continuum-task-publication"
           mkdir -p "$PUBLICATION_DIR"
           jq -n \
@@ -2699,10 +2766,19 @@ jobs:
             --arg attempt "$PUBLISHED_ATTEMPT" \
             --arg branch "$EXPECTED_BRANCH" \
             --arg pr "$EXISTING_PR" \
-            --arg head "$TASK_COMMIT" \
+            --arg head "$RECORDED_HEAD" \
             '{schema_version: 1, repo: $repo, issue: ($issue | tonumber), run_id: $run, run_attempt: $attempt, branch: $branch, pr_number: ($pr | tonumber), head_sha: $head}' \
             > "$PUBLICATION_DIR/publication.json"
           echo "present=true" >> "$GITHUB_OUTPUT"
+          # Forward the recorded identity to the fresh-runner recovery job so a
+          # failed upload here is still retried from the same evidence.
+          {
+            echo "publication_issue=$ISSUE_NUMBER"
+            echo "publication_attempt=$PUBLISHED_ATTEMPT"
+            echo "publication_branch=$EXPECTED_BRANCH"
+            echo "publication_pr_number=$EXISTING_PR"
+            echo "publication_head_sha=$RECORDED_HEAD"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Upload recovered OpenCode publication receipt
         id: upload_publication_recovery
@@ -3292,6 +3368,21 @@ jobs:
           continuum_assert_no_stop "$GITHUB_REPOSITORY" "$ISSUE_NUMBER" || exit 1
           RECOVER_PR_URL="$(gh pr create --repo "$GITHUB_REPOSITORY" --base main --head "$CURRENT_BRANCH" --title "$TITLE" --body "$BODY")"
           RECOVER_PR_NUMBER="$(gh pr view "$RECOVER_PR_URL" --repo "$GITHUB_REPOSITORY" --json number --jq .number)"
+          # Record the publication identity this run created, exactly like the
+          # normal publish path, so a failed receipt upload stays recoverable
+          # without inferring a commit from the branch or the PR body.
+          RECOVER_HEAD_SHA="$(git rev-parse HEAD)"
+          PUBLICATION_IDENTITY="<!-- continuum-task-publication repo=${GITHUB_REPOSITORY} issue=${ISSUE_NUMBER} run=${GITHUB_RUN_ID} attempt=${GITHUB_RUN_ATTEMPT} branch=${CURRENT_BRANCH} pr=${RECOVER_PR_NUMBER} head=${RECOVER_HEAD_SHA} -->
+          <!-- continuum-origin role=continuum component=opencode -->"
+          for publish_attempt in 1 2 3; do
+            if gh pr comment "$RECOVER_PR_NUMBER" --repo "$GITHUB_REPOSITORY" --body "$PUBLICATION_IDENTITY" >/dev/null 2>&1; then
+              break
+            fi
+            if [[ "$publish_attempt" -eq 3 ]]; then
+              echo "::warning::Could not record the OpenCode publication identity comment; a failed receipt upload may not be recoverable."
+            fi
+            sleep $((publish_attempt * 5))
+          done
           # kodmial/continuum#458: bind this recovered publication to this run
           # with the same run-scoped receipt the normal publish path uploads.
           [[ "$ISSUE_NUMBER" =~ ^[1-9][0-9]*$ ]] || { echo "::error::Could not determine the recovered issue number; refusing to attest publication."; exit 1; }
@@ -4128,6 +4219,22 @@ jobs:
               --body "$PR_BODY")"
             PR_NUMBER="$(gh pr view "$PR_URL" --repo "$GITHUB_REPOSITORY" --json number --jq .number)"
           fi
+
+          # Record the publication identity this run created. The PR body and
+          # the branch name are author-controlled, so a rerun's receipt
+          # recovery reads this trusted marker instead of inferring the
+          # published commit from the PR's first commit.
+          PUBLICATION_IDENTITY="<!-- continuum-task-publication repo=${GITHUB_REPOSITORY} issue=${ISSUE_NUMBER} run=${GITHUB_RUN_ID} attempt=${GITHUB_RUN_ATTEMPT} branch=${BRANCH} pr=${PR_NUMBER} head=${TASK_COMMIT} -->
+          <!-- continuum-origin role=continuum component=opencode -->"
+          for publish_attempt in 1 2 3; do
+            if gh pr comment "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --body "$PUBLICATION_IDENTITY" >/dev/null 2>&1; then
+              break
+            fi
+            if [[ "$publish_attempt" -eq 3 ]]; then
+              echo "::warning::Could not record the OpenCode publication identity comment; a failed receipt upload may not be recoverable."
+            fi
+            sleep $((publish_attempt * 5))
+          done
 
           if [[ -n "$CI_WORKFLOW_ID" ]]; then
             gh workflow run "$CI_WORKFLOW_ID" --repo "$GITHUB_REPOSITORY" --ref "$BASE_REF" -f "pr_number=$PR_NUMBER" \
@@ -5091,9 +5198,10 @@ jobs:
         run: |
           set -euo pipefail
           # kodmial/continuum#295: frozen task-spec guard for conflict
-          # repair. Same contract as the CodeRabbit repair guard above: the
-          # PR's snapshot reference is pinned, the live issue is re-read,
-          # drift stops the repair, legacy PRs proceed explicitly
+          # repair. The PR's snapshot reference is pinned, its canonical task
+          # is resolved from the worker branch and run identity (never from
+          # the mutable PR body), the live issue is re-read, drift or a task
+          # mismatch stops the repair, and legacy PRs proceed explicitly
           # unprotected.
           if [[ -n "${PR_NUMBER:-}" ]]; then
             if ! REPAIR_PR_BODY="$(gh pr view "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --json body --jq '.body // ""' 2>/dev/null)"; then
@@ -5118,15 +5226,22 @@ jobs:
                 echo "::error::PR #$PR_NUMBER snapshot reference is for generation $REF_GENERATION, expected generation 1 (stale contract); refusing repair."
                 exit 1
               fi
-              if [[ "${TASK_CONTEXT_PRESENT:-}" == "true" ]]; then
-                if [[ -n "${TASK_REPO:-}" && "$(tr '[:upper:]' '[:lower:]' <<<"$REF_REPO")" != "$(tr '[:upper:]' '[:lower:]' <<<"$TASK_REPO")" ]]; then
-                  echo "::error::PR #$PR_NUMBER snapshot reference $REF_REPO#$REF_ISSUE does not match expected task $TASK_REPO#${TASK_NUMBER:-} (wrong issue); refusing repair."
-                  exit 1
-                fi
-                if [[ -n "${TASK_NUMBER:-}" && "$REF_ISSUE" != "$TASK_NUMBER" ]]; then
-                  echo "::error::PR #$PR_NUMBER snapshot reference #$REF_ISSUE does not match expected task #${TASK_NUMBER} on $REF_REPO (wrong issue); refusing repair."
-                  exit 1
-                fi
+              # The PR body is mutable, so its snapshot reference never binds
+              # the canonical task by itself. Conflict repair must compare it
+              # with the task resolved from the PR's canonical worker branch;
+              # a PR that cannot be bound that way fails closed instead of
+              # trusting whichever issue the body names.
+              if [[ "${TASK_CONTEXT_PRESENT:-}" != "true" || -z "${TASK_REPO:-}" || -z "${TASK_NUMBER:-}" ]]; then
+                echo "::error::PR #$PR_NUMBER snapshot reference cannot be bound to the PR's canonical task; refusing conflict repair."
+                exit 1
+              fi
+              if [[ "$(tr '[:upper:]' '[:lower:]' <<<"$REF_REPO")" != "$(tr '[:upper:]' '[:lower:]' <<<"$TASK_REPO")" ]]; then
+                echo "::error::PR #$PR_NUMBER snapshot reference $REF_REPO#$REF_ISSUE does not match the PR's canonical task $TASK_REPO#${TASK_NUMBER} (wrong issue); refusing repair."
+                exit 1
+              fi
+              if [[ "$REF_ISSUE" != "$TASK_NUMBER" ]]; then
+                echo "::error::PR #$PR_NUMBER snapshot reference #$REF_ISSUE does not match the PR's canonical task #${TASK_NUMBER} on $REF_REPO (wrong issue); refusing repair."
+                exit 1
               fi
               # The PR body is mutable, so the reference alone never defines
               # the contract: require it to match the durable snapshot comment
@@ -6165,10 +6280,10 @@ jobs:
     needs: opencode
     # A failed `Upload OpenCode publication receipt` step leaves the PR in place
     # without the run-scoped receipt the canary requires. A rerun cannot repair
-    # it: the duplicate guard sees the existing `opencode/issue<N>-` PR and
-    # skips both implementation and the upload. Re-attest the identity the
-    # publish step recorded as job outputs, on a fresh runner, without creating
-    # or changing any PR.
+    # it directly: the duplicate guard sees the existing `opencode/issue<N>-`
+    # PR and skips both implementation and the upload, so it forwards the
+    # identity recorded at creation instead of inferring one. Re-attest that
+    # identity here, on a fresh runner, without creating or changing any PR.
     if: >-
       !cancelled() &&
       (needs.opencode.result == 'failure' ||
@@ -6210,8 +6325,11 @@ jobs:
             || { echo "::error::Could not read PR #$PR_NUMBER for publication recovery; refusing to attest."; exit 1; }
           PR_BRANCH="$(jq -r '.head.ref // ""' <<<"$PR_JSON")"
           PR_HEAD="$(jq -r '.head.sha // ""' <<<"$PR_JSON")"
+          PR_REPO="$(jq -r '.head.repo.full_name // ""' <<<"$PR_JSON")"
           [[ "$PR_BRANCH" == "$BRANCH" ]] \
             || { echo "::error::PR #$PR_NUMBER head is '$PR_BRANCH', not the recorded '$BRANCH'; refusing to attest."; exit 1; }
+          [[ "$PR_REPO" == "$GITHUB_REPOSITORY" ]] \
+            || { echo "::error::PR #$PR_NUMBER head repository is '$PR_REPO', not '$GITHUB_REPOSITORY'; refusing to attest another repository's PR."; exit 1; }
           [[ "$PR_HEAD" =~ ^[0-9a-f]{40}$ ]] \
             || { echo "::error::Could not read PR #$PR_NUMBER head; refusing to attest."; exit 1; }
           ANCESTRY="$(gh api "repos/$GITHUB_REPOSITORY/compare/${HEAD_SHA}...${PR_HEAD}" --jq .status 2>/dev/null)" \
