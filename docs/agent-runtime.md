@@ -1,5 +1,15 @@
 # Prebuilt immutable agent runtime; zero-idle per-job ephemeral runners
 
+> **Status (2026-11-16).** `src/continuum/agent_runtime.py` is an implemented
+> reference contract with deterministic, in-memory `FakeProvider` coverage. It
+> is **not** a deployed cloud-provider control plane, and this document is
+> **not** evidence of external golden-image/JIT provisioning. The deployed
+> GitHub-hosted path is the separate `.github/actions/agent-toolchain` cache on
+> fresh `ubuntu-latest` VMs; its limited cold/warm and small-inference evidence
+> is documented in [the toolchain cache guide](agent-toolchain-cache.md).
+> GCE/EC2/Azure/custom image and JIT provisioning remain unverified, and no
+> present-tense production or external-consumer E2E claim is made for them.
+
 Implements kodmial/continuum#179. Agent execution is fast **without keeping
 live runner instances waiting between jobs**. The optimization target is
 **warm image/cache, zero warm compute**:
@@ -29,7 +39,9 @@ instance.
 
 Reference implementation: `src/continuum/agent_runtime.py` (standard library
 only). Deterministic coverage: `tests/test_agent_runtime.py` (20 cases from
-the task specification).
+the task specification). The reference controller runs against an in-memory
+fake provider; no real cloud account or external compute is provisioned by
+these tests.
 
 ## Zero idle live instances (non-negotiable)
 
@@ -77,6 +89,12 @@ Continuum owns one versioned manifest (`AgentManifest`,
 | Utilities | `bash curl git gh jq python3` |
 | Base image | per `(os, arch)` in `BASE_IMAGES` |
 | Probes | `opencode --version`, `pr-agent --version`, `runner --version` |
+
+The table records the reference-profile constants in
+`src/continuum/agent_runtime.py`. They are not the deployed GitHub-hosted
+manifest: `.github/actions/agent-toolchain/toolchain.json` currently pins
+OpenCode `2.2.6` and PR-Agent `0.46.0` for that separate cache path, and the
+reference constant does not select the hosted binary.
 
 The contract produces Linux, macOS, and Windows manifests from the same
 schema — never one universal Linux image. Runner software updates happen by
@@ -229,11 +247,11 @@ immutable digest; it never repairs a mutable runner.
 
 ## Platform requirements
 
-| Profile | Image kind | Compute | Qualification |
+| Profile | Image kind | Compute | Qualification status |
 | --- | --- | --- | --- |
-| Linux | golden image | fresh instance per job, zero idle | deterministic + live Linux job |
-| macOS | VM template/snapshot | fresh instance per job, zero idle | consumer-owned macOS/Swift fixture |
-| Windows | prepared image | fresh instance per job, zero idle | deterministic contract qualification |
+| Linux | golden image | fresh instance per job, zero idle | deterministic reference coverage; the separate hosted Linux toolchain cache has limited cold/warm evidence |
+| macOS | VM template/snapshot | fresh instance per job, zero idle | consumer-owned macOS/Swift fixture required; not live-verified here |
+| Windows | prepared image | fresh instance per job, zero idle | deterministic contract qualification only |
 
 Unsupported platforms are never advertised (`canonical_manifest` fails
 closed). A macOS + Swift/OpenCode qualification fixture remains mandatory for that
@@ -252,12 +270,14 @@ different unpinned agent runtime (every reconstruction path re-pins exact
 versions and fails closed on mismatch). Core runs only on free anonymous
 models and never requires, reads, or forwards a paid provider key.
 
-## Live qualification
+## Live qualification evidence contract
 
-`live_qualification_evidence` proves the architecture with real controller
-jobs for Linux and a consumer-owned macOS/Swift fixture: start at zero live
-instances, queue a real job, record profile + image digest, prove a new
-provider instance was created after demand, prove OpenCode/PR-Agent was
+`live_qualification_evidence` is the evidence record that a future deployed
+external-provider qualification must supply; its presence in the reference
+model does not mean such a run has happened. A live claim requires linked
+workflow-run IDs and recorded evidence for all of the following: start at
+zero live instances, queue a real job, record profile + image digest, prove a
+new provider instance was created after demand, prove OpenCode/PR-Agent was
 already present (validated image identity before task execution), prove no
 per-run installer ran, prove exactly one job ran, prove the instance and
 per-job network attachment were destroyed, prove idle count returned to
@@ -267,3 +287,10 @@ runner or persistent egress object exists, and prove orphan reconciliation
 with one controlled stale-resource scenario. Record workflow run IDs, image
 identity, provider instance identity, lifecycle timestamps, and cleanup
 evidence; avoid publishing unnecessary raw network-address data.
+
+No external-provider live evidence is linked in this repository generation.
+The [live-status table](technical-overview.md#what-has-been-live-qualified)
+records hosted Linux toolchain cold/warm restore and a small inference as
+historical evidence for OpenCode `1.19.3` only. That evidence does not qualify
+the current hosted pin, OpenCode `2.2.6`, and it is not a real external
+consumer or JIT provider E2E.

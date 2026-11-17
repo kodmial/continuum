@@ -45,6 +45,14 @@ CANARY_RECOVERY_MARKER = "<!-- continuum-canary-recovery"
 
 _ISSUE_REF_RE = re.compile(r"(?<![0-9A-Za-z_])#(\d+)(?![0-9])")
 _BRANCH_ISSUE_RE = re.compile(r"(?:^|/)issue(\d+)(?:-|$)")
+_QUALIFIED_ISSUE_REF_RE = re.compile(
+    r"(?<![\w.-])(?P<repo>[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)#(?P<issue>\d+)(?!\d)"
+)
+_ISSUE_URL_RE = re.compile(
+    r"https?://github\.com/(?P<repo>[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)"
+    r"/issues/(?P<issue>\d+)(?!\d)",
+    re.IGNORECASE,
+)
 
 
 @dataclass(frozen=True)
@@ -149,6 +157,41 @@ def _pr_matches_issue(pr: Mapping[str, Any], issue_number: int) -> bool:
     return False
 
 
+def _references_issue_in_repository(
+    value: object, issue_number: int, repository: object
+) -> bool:
+    """Whether ``value`` has a repository-qualified or issue-URL reference."""
+    text = str(value or "")
+    expected = str(repository or "").strip().lower()
+    if not text or not expected:
+        return False
+    for pattern in (_QUALIFIED_ISSUE_REF_RE, _ISSUE_URL_RE):
+        for match in pattern.finditer(text):
+            if int(match.group("issue")) != issue_number:
+                continue
+            if match.group("repo").lower() == expected:
+                return True
+    return False
+
+
+def _pr_references_issue(
+    pr: Mapping[str, Any], issue_number: int, repository: object = ""
+) -> bool:
+    """Match every closing-reference form GitHub supports for an issue.
+
+    ``_pr_matches_issue`` remains the liveness matcher. Completion additionally
+    accepts repository-qualified references and issue URLs, but only for the
+    observed repository so another repository's identically numbered issue is
+    not mistaken for this one.
+    """
+    if _pr_matches_issue(pr, issue_number):
+        return True
+    for key in ("body", "title"):
+        if _references_issue_in_repository(pr.get(key), issue_number, repository):
+            return True
+    return False
+
+
 def _pr_number(pr: Mapping[str, Any]) -> Optional[int]:
     try:
         number = int(pr.get("number"))
@@ -245,10 +288,14 @@ def observe_reservation(
 
 
 def _latest_pr(
-    issue_number: int, pull_requests: Sequence[Mapping[str, Any]]
+    issue_number: int,
+    pull_requests: Sequence[Mapping[str, Any]],
+    repository: object = "",
 ) -> Optional[Mapping[str, Any]]:
     matches = [
-        pr for pr in pull_requests or [] if _pr_matches_issue(pr, issue_number)
+        pr
+        for pr in pull_requests or []
+        if _pr_references_issue(pr, issue_number, repository)
     ]
     if not matches:
         return None
@@ -316,6 +363,7 @@ def observe_canary(
     comments: Sequence[Mapping[str, Any]] = (),
     canary_id: str = "canary-main",
     now: Optional[datetime] = None,
+    repository: object = "",
 ) -> CanaryObservation:
     """Read a live canary task's current stage from real GitHub state.
 
@@ -333,7 +381,7 @@ def observe_canary(
     matching_runs.sort(
         key=lambda run: str(_run_started_at(run) or ""), reverse=True
     )
-    pr = _latest_pr(number, pull_requests)
+    pr = _latest_pr(number, pull_requests, repository=repository)
     active = _active_runs(matching_runs)
     recovery_attempts = sum(
         1

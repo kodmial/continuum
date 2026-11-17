@@ -913,6 +913,31 @@ jobs:
 
     outputs:
       restart_required: ${{ steps.runner_recovery.outputs.restart_required }}
+      # kodmial/continuum#458: a failed status publication must remain
+      # recoverable from the exact base/head this run pushed. Job outputs
+      # survive a failed job, so the recovery job never has to infer the
+      # original commit from a later repair run's base.
+      repair_base_sha: ${{ steps.repair_publication.outputs.base_sha }}
+      repair_head_sha: ${{ steps.repair_publication.outputs.head_sha }}
+      repair_pr_number: ${{ steps.repair_publication.outputs.pr_number }}
+      repair_branch: ${{ steps.repair_publication.outputs.branch }}
+      # kodmial/continuum#458, PR #459 review: the initial issue publication
+      # receipt is uploaded by a separate step. If that upload fails after the
+      # PR exists, a rerun skips implementation through the duplicate guard, so
+      # the identity recorded at creation is the only remaining evidence. Both
+      # publish paths record it here so the recovery job never has to infer a
+      # PR or commit, and never creates one.
+      publication_issue: ${{ steps.implement_issue.outputs.publication_issue || steps.recover_issue_branch.outputs.publication_issue || steps.publication_recovery.outputs.publication_issue }}
+      publication_attempt: ${{ steps.implement_issue.outputs.publication_attempt || steps.recover_issue_branch.outputs.publication_attempt || steps.publication_recovery.outputs.publication_attempt }}
+      publication_branch: ${{ steps.implement_issue.outputs.publication_branch || steps.recover_issue_branch.outputs.publication_branch || steps.publication_recovery.outputs.publication_branch }}
+      publication_pr_number: ${{ steps.implement_issue.outputs.publication_pr_number || steps.recover_issue_branch.outputs.publication_pr_number || steps.publication_recovery.outputs.publication_pr_number }}
+      publication_head_sha: ${{ steps.implement_issue.outputs.publication_head_sha || steps.recover_issue_branch.outputs.publication_head_sha || steps.publication_recovery.outputs.publication_head_sha }}
+      # A receipt upload failure must not fail an otherwise successful worker
+      # run, or the recovered receipt could never satisfy the canary's
+      # completed-success worker requirement. Keep the pre-continue-on-error
+      # outcome so the recovery job still re-attests the receipt.
+      publication_upload_outcome: ${{ steps.upload_publication.outcome }}
+      publication_recovery_upload_outcome: ${{ steps.upload_publication_recovery.outcome }}
 
     steps:
       - name: Checkout repository
@@ -1228,7 +1253,8 @@ jobs:
         id: task_context
         if: >-
           (github.event_name == 'workflow_dispatch' &&
-           (inputs.mode == 'issue' || inputs.mode == 'ci-fix')) ||
+           (inputs.mode == 'issue' || inputs.mode == 'ci-fix' ||
+            inputs.mode == 'resolve-conflict')) ||
           needs.admit.outputs.route == 'issue'
         uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
         env:
@@ -1259,6 +1285,18 @@ jobs:
             const apiBase = String(process.env.GITHUB_API_URL || 'https://api.github.com')
               .replace(/\/+$/, '');
 
+            function runBindsIssue(run, issueNumber) {
+              const title = String(run?.display_title || '').trim();
+              const direct = title.match(/^OpenCode issue #(\d+)$/);
+              if (direct) return Number(direct[1]) === issueNumber;
+              const recovery = title.match(/^OpenCode 429 recovery (\S+) gen (\d+)$/);
+              if (recovery) {
+                const issue = recovery[1].match(/(?:^|-)issue(\d+)(?:-|$)/);
+                return issue !== null && Number(issue[1]) === issueNumber;
+              }
+              return false;
+            }
+
             async function fetchWithTapPat(path, description) {
               if (!tapPat) {
                 throw new Error(`${description} requires TAP_PAT.`);
@@ -1288,6 +1326,66 @@ jobs:
               taskRepository = repository;
               taskNumber = issueEventNumber;
               source = 'issue-dispatch';
+            } else if (mode === 'resolve-conflict') {
+              if (!Number.isInteger(prNumber) || prNumber <= 0) {
+                core.setFailed('Conflict repair has no valid pull request number.');
+                return;
+              }
+              let pr;
+              try {
+                ({ data: pr } = await github.rest.pulls.get({
+                  owner, repo, pull_number: prNumber,
+                }));
+              } catch (err) {
+                core.setFailed(`Conflict repair could not fetch pull request #${prNumber}: ${err.message || err}`);
+                return;
+              }
+              prTitle = String(pr.title || '');
+              prBody = String(pr.body || '');
+              // The PR body belongs to the PR author, so it can never define
+              // the canonical task. Bind the conflict repair to the worker
+              // run named by the canonical task branch instead: the branch
+              // must live in this repository and the run's own title must
+              // name the same issue. An unbound PR fails closed here and the
+              // snapshot guard below refuses to trust its mutable reference.
+              const headFullName = String(pr.head?.repo?.full_name || '').toLowerCase();
+              const branchIdentity = String(pr.head?.ref || '').match(
+                /^opencode\/issue(\d+)-(\d+)$/i
+              );
+              if (!branchIdentity || headFullName !== repository.toLowerCase()) {
+                core.setOutput('present', 'false');
+                core.setOutput('source', 'none');
+                core.notice(
+                  'Conflict repair found no canonical worker task branch; the PR snapshot reference cannot be bound to a task.'
+                );
+                return;
+              }
+              const boundIssue = Number(branchIdentity[1]);
+              const boundRunId = Number(branchIdentity[2]);
+              let boundRun;
+              try {
+                ({ data: boundRun } = await github.rest.actions.getWorkflowRun({
+                  owner, repo, run_id: boundRunId,
+                }));
+              } catch (err) {
+                core.setOutput('present', 'false');
+                core.setOutput('source', 'none');
+                core.notice(
+                  `Conflict repair could not read worker run ${boundRunId} named by '${pr.head?.ref}'; the PR snapshot reference cannot be bound to a task.`
+                );
+                return;
+              }
+              if (!runBindsIssue(boundRun, boundIssue)) {
+                core.setOutput('present', 'false');
+                core.setOutput('source', 'none');
+                core.notice(
+                  `Worker run ${boundRunId} does not bind issue #${boundIssue}; the PR snapshot reference cannot be bound to a task.`
+                );
+                return;
+              }
+              taskRepository = repository;
+              taskNumber = boundIssue;
+              source = 'canonical-worker-branch';
             } else if (mode === 'ci-fix') {
               if (!Number.isInteger(prNumber) || prNumber <= 0) {
                 core.setFailed('CI repair has no valid pull request number.');
@@ -2495,6 +2593,12 @@ jobs:
                 'skipping duplicate OpenCode run.'
               );
               core.setOutput('skip', 'true');
+              // The receipt-only recovery path needs the existing PR identity.
+              // Its head ref proves whether this PR was published by this very
+              // workflow run (a rerun keeps the run id) or by an earlier run
+              // whose artifacts this run cannot restore.
+              core.setOutput('pr_number', String(existing.number));
+              core.setOutput('head_ref', String(existing.head?.ref || ''));
               return;
             }
 
@@ -2589,6 +2693,103 @@ jobs:
               );
               core.setOutput('skip', 'false');
             }
+      # kodmial/continuum#458, PR #459 review: an artifact upload failure after
+      # `gh pr create` would otherwise leave this run's publication unattested
+      # forever. A rerun keeps the run id but finds the existing
+      # `opencode/issue<N>-<run>` PR, so the duplicate guard skipped both the
+      # implementation and the receipt upload. Re-attest the identity this run
+      # recorded at creation, without creating or changing any PR. The branch
+      # name and the PR body are author-controlled, so recovery reads only the
+      # trusted marker comment the publishing run wrote, never an inferred
+      # commit.
+      - name: Recover publication receipt for an existing PR
+        id: publication_recovery
+        if: >-
+          steps.duplicate_guard.outputs.skip == 'true' &&
+          steps.duplicate_guard.outputs.pr_number != ''
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.TAP_PAT }}
+          ISSUE_NUMBER: ${{ inputs.issue_number || github.event.issue.number }}
+          EXISTING_PR: ${{ steps.duplicate_guard.outputs.pr_number }}
+          EXISTING_BRANCH: ${{ steps.duplicate_guard.outputs.head_ref }}
+        run: |
+          set -euo pipefail
+          EXPECTED_BRANCH="opencode/issue${ISSUE_NUMBER}-${GITHUB_RUN_ID}"
+          if [[ "$EXISTING_BRANCH" != "$EXPECTED_BRANCH" ]]; then
+            echo "::notice::PR #$EXISTING_PR belongs to '$EXISTING_BRANCH', not this run's '$EXPECTED_BRANCH'; refusing to attest another run's publication."
+            exit 0
+          fi
+          [[ "$ISSUE_NUMBER" =~ ^[1-9][0-9]*$ && "$EXISTING_PR" =~ ^[1-9][0-9]*$ ]] \
+            || { echo "::error::Publication recovery has no issue or PR identity; refusing to attest."; exit 1; }
+          # An existing non-expired receipt already attests this run, so recovery
+          # is idempotent and never piles up duplicate artifacts on every rerun.
+          PRESENT="$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/artifacts?per_page=100" \
+            --jq '[.artifacts[] | select((.expired | tostring) != "true") | select(.name | startswith("continuum-task-publication"))] | length')"
+          if [[ "$PRESENT" != "0" ]]; then
+            echo "Publication receipt already exists for run $GITHUB_RUN_ID; nothing to recover."
+            exit 0
+          fi
+          PR_JSON="$(gh api "repos/$GITHUB_REPOSITORY/pulls/$EXISTING_PR")" \
+            || { echo "::error::Could not read PR #$EXISTING_PR; refusing to recover an unidentified publication."; exit 1; }
+          PR_REPO="$(jq -r '.head.repo.full_name // ""' <<<"$PR_JSON")"
+          PR_BRANCH="$(jq -r '.head.ref // ""' <<<"$PR_JSON")"
+          PR_HEAD="$(jq -r '.head.sha // ""' <<<"$PR_JSON")"
+          [[ "$PR_REPO" == "$GITHUB_REPOSITORY" && "$PR_BRANCH" == "$EXPECTED_BRANCH" ]] \
+            || { echo "::error::PR #$EXISTING_PR is not this run's branch in $GITHUB_REPOSITORY ('$PR_REPO:$PR_BRANCH'); refusing to attest."; exit 1; }
+          [[ "$PR_HEAD" =~ ^[0-9a-f]{40}$ ]] \
+            || { echo "::error::Could not read PR #$EXISTING_PR head; refusing to attest."; exit 1; }
+          if ! COMMENTS_JSON="$(gh api --paginate --slurp "repos/$GITHUB_REPOSITORY/issues/$EXISTING_PR/comments?per_page=100" | jq 'add // []')"; then
+            echo "::error::Could not read PR #$EXISTING_PR comments; refusing to recover an unidentified publication."
+            exit 1
+          fi
+          IDENTITY="$(COMMENTS_JSON="$COMMENTS_JSON" PUBLICATION_REPO="$GITHUB_REPOSITORY" PUBLICATION_ISSUE="$ISSUE_NUMBER" PUBLICATION_RUN="$GITHUB_RUN_ID" PUBLICATION_BRANCH="$EXPECTED_BRANCH" PUBLICATION_PR="$EXISTING_PR" python3 -c 'import json,os,re; pat=re.compile(r"<!--\s*continuum-task-publication\s+repo=([A-Za-z0-9_.\-]+/[A-Za-z0-9_.\-]+)\s+issue=(\d+)\s+run=(\d+)\s+attempt=(\d+)\s+branch=(\S+)\s+pr=(\d+)\s+head=([0-9a-fA-F]{40})\s*-->"); trusted={"OWNER","MEMBER","COLLABORATOR"}; repo=(os.environ.get("PUBLICATION_REPO") or "").lower(); issue=os.environ.get("PUBLICATION_ISSUE") or ""; run=os.environ.get("PUBLICATION_RUN") or ""; branch=os.environ.get("PUBLICATION_BRANCH") or ""; pr=os.environ.get("PUBLICATION_PR") or ""; data=json.loads(os.environ.get("COMMENTS_JSON") or "[]"); out=[(m.group(4),m.group(7).lower()) for c in reversed(data if isinstance(data,list) else []) if isinstance(c,dict) for u in [c.get("user") if isinstance(c.get("user"),dict) else {}] for m in [pat.search(str(c.get("body") or ""))] if m and m.group(1).lower()==repo and m.group(2)==issue and m.group(3)==run and m.group(5)==branch and m.group(6)==pr and (str(c.get("author_association") or "").upper() in trusted or str(u.get("login") or "").lower()=="github-actions[bot]")]; print(" ".join(out[0]) if out else "",end="")')"
+          read -r PUBLISHED_ATTEMPT RECORDED_HEAD <<<"$IDENTITY" || true
+          if [[ -z "${PUBLISHED_ATTEMPT:-}" || -z "${RECORDED_HEAD:-}" ]]; then
+            echo "::warning::PR #$EXISTING_PR carries no trusted publication identity comment for run $GITHUB_RUN_ID; nowhere is a published commit inferred, so this rerun cannot re-attest it."
+            exit 0
+          fi
+          ANCESTRY="$(gh api "repos/$GITHUB_REPOSITORY/compare/${RECORDED_HEAD}...${PR_HEAD}" --jq .status)"
+          case "$ANCESTRY" in
+            ahead|identical) ;;
+            *)
+              echo "::error::Recorded task commit $RECORDED_HEAD is not behind PR #$EXISTING_PR head $PR_HEAD; refusing to attest."
+              exit 1
+              ;;
+          esac
+          PUBLICATION_DIR="${RUNNER_TEMP:-/tmp}/continuum-task-publication"
+          mkdir -p "$PUBLICATION_DIR"
+          jq -n \
+            --arg repo "$GITHUB_REPOSITORY" \
+            --arg issue "$ISSUE_NUMBER" \
+            --arg run "$GITHUB_RUN_ID" \
+            --arg attempt "$PUBLISHED_ATTEMPT" \
+            --arg branch "$EXPECTED_BRANCH" \
+            --arg pr "$EXISTING_PR" \
+            --arg head "$RECORDED_HEAD" \
+            '{schema_version: 1, repo: $repo, issue: ($issue | tonumber), run_id: $run, run_attempt: $attempt, branch: $branch, pr_number: ($pr | tonumber), head_sha: $head}' \
+            > "$PUBLICATION_DIR/publication.json"
+          echo "present=true" >> "$GITHUB_OUTPUT"
+          # Forward the recorded identity to the fresh-runner recovery job so a
+          # failed upload here is still retried from the same evidence.
+          {
+            echo "publication_issue=$ISSUE_NUMBER"
+            echo "publication_attempt=$PUBLISHED_ATTEMPT"
+            echo "publication_branch=$EXPECTED_BRANCH"
+            echo "publication_pr_number=$EXISTING_PR"
+            echo "publication_head_sha=$RECORDED_HEAD"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Upload recovered OpenCode publication receipt
+        id: upload_publication_recovery
+        if: steps.publication_recovery.outputs.present == 'true'
+        continue-on-error: true
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: continuum-task-publication-${{ github.run_attempt }}-recovery
+          path: ${{ runner.temp }}/continuum-task-publication/publication.json
+          if-no-files-found: error
+
       - name: Remove duplicate-run decision engine
         if: always()
         shell: bash
@@ -3049,6 +3250,7 @@ jobs:
       # this recovery path makes the workflow lossless if a future OpenCode
       # version, shell indirection, or tool bypass still changes branches.
       - name: Recover agent-managed issue branch
+        id: recover_issue_branch
         if: >-
           steps.issue_readiness.outputs.ready != 'false' &&
           needs.admit.outputs.route == 'issue'
@@ -3164,9 +3366,51 @@ jobs:
             BODY="$(printf '%s\n%s\n\nRecovered automatically after the OpenCode agent changed branches during issue #%s execution.\n\nCloses #%s' "$TASK_MARKER" "$RECOVER_SNAPSHOT_REF" "$ISSUE_NUMBER" "$ISSUE_NUMBER")"
           fi
           continuum_assert_no_stop "$GITHUB_REPOSITORY" "$ISSUE_NUMBER" || exit 1
-          gh pr create --repo "$GITHUB_REPOSITORY" --base main --head "$CURRENT_BRANCH" --title "$TITLE" --body "$BODY"
+          RECOVER_PR_URL="$(gh pr create --repo "$GITHUB_REPOSITORY" --base main --head "$CURRENT_BRANCH" --title "$TITLE" --body "$BODY")"
+          RECOVER_PR_NUMBER="$(gh pr view "$RECOVER_PR_URL" --repo "$GITHUB_REPOSITORY" --json number --jq .number)"
+          # Record the publication identity this run created, exactly like the
+          # normal publish path, so a failed receipt upload stays recoverable
+          # without inferring a commit from the branch or the PR body.
+          RECOVER_HEAD_SHA="$(git rev-parse HEAD)"
+          PUBLICATION_IDENTITY="<!-- continuum-task-publication repo=${GITHUB_REPOSITORY} issue=${ISSUE_NUMBER} run=${GITHUB_RUN_ID} attempt=${GITHUB_RUN_ATTEMPT} branch=${CURRENT_BRANCH} pr=${RECOVER_PR_NUMBER} head=${RECOVER_HEAD_SHA} -->
+          <!-- continuum-origin role=continuum component=opencode -->"
+          for publish_attempt in 1 2 3; do
+            if gh pr comment "$RECOVER_PR_NUMBER" --repo "$GITHUB_REPOSITORY" --body "$PUBLICATION_IDENTITY" >/dev/null 2>&1; then
+              break
+            fi
+            if [[ "$publish_attempt" -eq 3 ]]; then
+              echo "::warning::Could not record the OpenCode publication identity comment; a failed receipt upload may not be recoverable."
+            fi
+            sleep $((publish_attempt * 5))
+          done
+          # kodmial/continuum#458: bind this recovered publication to this run
+          # with the same run-scoped receipt the normal publish path uploads.
+          [[ "$ISSUE_NUMBER" =~ ^[1-9][0-9]*$ ]] || { echo "::error::Could not determine the recovered issue number; refusing to attest publication."; exit 1; }
+          [[ "$RECOVER_PR_NUMBER" =~ ^[1-9][0-9]*$ ]] || { echo "::error::Could not determine the recovered pull-request number; refusing to attest publication."; exit 1; }
+          PUBLICATION_DIR="${RUNNER_TEMP:-/tmp}/continuum-task-publication"
+          mkdir -p "$PUBLICATION_DIR"
+          jq -n \
+            --arg repo "$GITHUB_REPOSITORY" \
+            --arg issue "$ISSUE_NUMBER" \
+            --arg run "$GITHUB_RUN_ID" \
+            --arg attempt "$GITHUB_RUN_ATTEMPT" \
+            --arg branch "$CURRENT_BRANCH" \
+            --arg pr "$RECOVER_PR_NUMBER" \
+            --arg head "$(git rev-parse HEAD)" \
+            '{schema_version: 1, repo: $repo, issue: ($issue | tonumber), run_id: $run, run_attempt: $attempt, branch: $branch, pr_number: ($pr | tonumber), head_sha: $head}' \
+            > "$PUBLICATION_DIR/publication.json"
+          # Record the same identity as job outputs so a failed receipt upload
+          # can still be recovered on a fresh runner from this run's evidence.
+          {
+            echo "publication_issue=$ISSUE_NUMBER"
+            echo "publication_attempt=$GITHUB_RUN_ATTEMPT"
+            echo "publication_branch=$CURRENT_BRANCH"
+            echo "publication_pr_number=$RECOVER_PR_NUMBER"
+            echo "publication_head_sha=$(git rev-parse HEAD)"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Implement issue
+        id: implement_issue
         if: >-
           steps.issue_readiness.outputs.ready != 'false' &&
           ((github.event_name == 'workflow_dispatch' && inputs.mode == 'issue') ||
@@ -3976,6 +4220,22 @@ jobs:
             PR_NUMBER="$(gh pr view "$PR_URL" --repo "$GITHUB_REPOSITORY" --json number --jq .number)"
           fi
 
+          # Record the publication identity this run created. The PR body and
+          # the branch name are author-controlled, so a rerun's receipt
+          # recovery reads this trusted marker instead of inferring the
+          # published commit from the PR's first commit.
+          PUBLICATION_IDENTITY="<!-- continuum-task-publication repo=${GITHUB_REPOSITORY} issue=${ISSUE_NUMBER} run=${GITHUB_RUN_ID} attempt=${GITHUB_RUN_ATTEMPT} branch=${BRANCH} pr=${PR_NUMBER} head=${TASK_COMMIT} -->
+          <!-- continuum-origin role=continuum component=opencode -->"
+          for publish_attempt in 1 2 3; do
+            if gh pr comment "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --body "$PUBLICATION_IDENTITY" >/dev/null 2>&1; then
+              break
+            fi
+            if [[ "$publish_attempt" -eq 3 ]]; then
+              echo "::warning::Could not record the OpenCode publication identity comment; a failed receipt upload may not be recoverable."
+            fi
+            sleep $((publish_attempt * 5))
+          done
+
           if [[ -n "$CI_WORKFLOW_ID" ]]; then
             gh workflow run "$CI_WORKFLOW_ID" --repo "$GITHUB_REPOSITORY" --ref "$BASE_REF" -f "pr_number=$PR_NUMBER" \
               || echo "::warning::Could not dispatch $CI_WORKFLOW_ID for PR #$PR_NUMBER"
@@ -3984,6 +4244,54 @@ jobs:
             "repos/$GITHUB_REPOSITORY/git/refs/heads/$CHECKPOINT_BRANCH" \
             >/dev/null 2>&1 || true
           echo "Created/updated PR #$PR_NUMBER for issue #$ISSUE_NUMBER."
+
+          # kodmial/continuum#458: a successful run is not by itself proof that
+          # it published this PR (the worker also exits successfully when it
+          # has nothing to publish). Upload a run-scoped publication receipt so
+          # canary completion can bind this exact run to this exact PR. Only
+          # the owning run can attach an artifact to itself, so a manual PR
+          # that merely reuses this run id in its branch name cannot pass.
+          [[ "$ISSUE_NUMBER" =~ ^[1-9][0-9]*$ ]] || { echo "::error::Could not determine the published issue number; refusing to attest publication."; exit 1; }
+          [[ "$PR_NUMBER" =~ ^[1-9][0-9]*$ ]] || { echo "::error::Could not determine the published pull-request number; refusing to attest publication."; exit 1; }
+          PUBLICATION_DIR="${RUNNER_TEMP:-/tmp}/continuum-task-publication"
+          mkdir -p "$PUBLICATION_DIR"
+          jq -n \
+            --arg repo "$GITHUB_REPOSITORY" \
+            --arg issue "$ISSUE_NUMBER" \
+            --arg run "$GITHUB_RUN_ID" \
+            --arg attempt "$GITHUB_RUN_ATTEMPT" \
+            --arg branch "$BRANCH" \
+            --arg pr "$PR_NUMBER" \
+            --arg head "$TASK_COMMIT" \
+            '{schema_version: 1, repo: $repo, issue: ($issue | tonumber), run_id: $run, run_attempt: $attempt, branch: $branch, pr_number: ($pr | tonumber), head_sha: $head}' \
+            > "$PUBLICATION_DIR/publication.json"
+          # Record the same identity as job outputs so a failed receipt upload
+          # can still be recovered on a fresh runner from this run's evidence.
+          {
+            echo "publication_issue=$ISSUE_NUMBER"
+            echo "publication_attempt=$GITHUB_RUN_ATTEMPT"
+            echo "publication_branch=$BRANCH"
+            echo "publication_pr_number=$PR_NUMBER"
+            echo "publication_head_sha=$TASK_COMMIT"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Upload OpenCode publication receipt
+        id: upload_publication
+        # The PR is already published at this point. A transient artifact
+        # service failure must be recovered by the receipt-only job without
+        # turning the completed publication into a failed worker run, which
+        # would be permanently ineligible as canary completion evidence.
+        continue-on-error: true
+        if: >-
+          success() &&
+          steps.duplicate_guard.outputs.skip != 'true' &&
+          ((github.event_name == 'workflow_dispatch' && inputs.mode == 'issue') ||
+           needs.admit.outputs.route == 'issue')
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: continuum-task-publication-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/continuum-task-publication/publication.json
+          if-no-files-found: ignore
 
       - name: Attest successful OpenCode issue execution
         if: >-
@@ -4861,13 +5169,685 @@ jobs:
               exit 76
             fi
           fi
-          if [[ -n "${UNRESOLVED_ITEMS_JSON:-}" ]]; then
-            if [[ "$(git rev-list --count "${REPAIR_BASE_SHA}"..HEAD)" -gt 0 ]]; then
-              echo "changed=true" >> "$GITHUB_OUTPUT"
+          # https://github.com/kodmial/continuum/pull/459: the ordinary
+          # review-driven repair path (no unresolved batch payload) publishes
+          # exactly like the batch path. Always report whether this run pushed
+          # a commit so the authenticated publication status is never skipped.
+          if [[ "$(git rev-list --count "${REPAIR_BASE_SHA}"..HEAD)" -gt 0 ]]; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          fi
+          echo "base_sha=${REPAIR_BASE_SHA}" >> "$GITHUB_OUTPUT"
+          echo "head_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Resolve merge conflict with main
+        id: resolve_conflict
+        if: github.event_name == 'workflow_dispatch' && inputs.mode == 'resolve-conflict' && steps.recovery_restore.outputs.skip_opencode != 'true'
+        env:
+          OPENCODE_MODEL: ${{ steps.model_route.outputs.model }}
+          GITHUB_TOKEN: ${{ secrets.TAP_PAT }}
+          GH_TOKEN: ${{ secrets.TAP_PAT }}
+          PR_NUMBER: ${{ inputs.pr_number }}
+          HEAD_REF: ${{ inputs.head_ref }}
+          CONFLICT_STRATEGY: ${{ inputs.conflict_strategy || 'merge' }}
+          TASK_CONTEXT_PRESENT: ${{ steps.task_context.outputs.present }}
+          TASK_REPO: ${{ steps.task_context.outputs.task_repo }}
+          TASK_NUMBER: ${{ steps.task_context.outputs.task_number }}
+          RECOVERY_GENERATION_IN: ${{ inputs.recovery_generation }}
+        run: |
+          set -euo pipefail
+          # kodmial/continuum#295: frozen task-spec guard for conflict
+          # repair. The PR's snapshot reference is pinned, its canonical task
+          # is resolved from the worker branch and run identity (never from
+          # the mutable PR body), the live issue is re-read, drift or a task
+          # mismatch stops the repair, and legacy PRs proceed explicitly
+          # unprotected.
+          if [[ -n "${PR_NUMBER:-}" ]]; then
+            if ! REPAIR_PR_BODY="$(gh pr view "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --json body --jq '.body // ""' 2>/dev/null)"; then
+              echo "::error::Could not fetch PR #$PR_NUMBER body for snapshot verification; refusing repair."
+              exit 1
+            fi
+            REPAIR_SNAPSHOT_REF="$(grep -oE '<!--[[:space:]]*continuum-task-snapshot-ref[^>]*-->' <<<"$REPAIR_PR_BODY" | head -n 1 || true)"
+            if [[ -z "$REPAIR_SNAPSHOT_REF" ]]; then
+              echo "::notice::PR #$PR_NUMBER carries no task snapshot reference (legacy, pre-guard PR); conflict repair proceeds explicitly without drift protection."
             else
-              echo "changed=false" >> "$GITHUB_OUTPUT"
+              REF_REPO="$(sed -nE 's/.*repo=([A-Za-z0-9_.\-]+\/[A-Za-z0-9_.\-]+).*/\1/p' <<<"$REPAIR_SNAPSHOT_REF" | head -n 1)"
+              REF_ISSUE="$(sed -nE 's/.*issue=([0-9]+).*/\1/p' <<<"$REPAIR_SNAPSHOT_REF" | head -n 1)"
+              REF_TITLE_SHA="$(sed -nE 's/.*title-sha256=([0-9a-fA-F]{64}).*/\1/p' <<<"$REPAIR_SNAPSHOT_REF" | head -n 1 | tr 'A-F' 'a-f')"
+              REF_BODY_SHA="$(sed -nE 's/.*body-sha256=([0-9a-fA-F]{64}).*/\1/p' <<<"$REPAIR_SNAPSHOT_REF" | head -n 1 | tr 'A-F' 'a-f')"
+              REF_GENERATION="$(sed -nE 's/.*generation=([0-9]+).*/\1/p' <<<"$REPAIR_SNAPSHOT_REF" | head -n 1)"
+              REF_SPEC_SHA="$(sed -nE 's/.*spec-sha256=([0-9a-fA-F]{64}).*/\1/p' <<<"$REPAIR_SNAPSHOT_REF" | head -n 1 | tr 'A-F' 'a-f')"
+              if [[ -z "$REF_REPO" || -z "$REF_ISSUE" || -z "$REF_GENERATION" || -z "$REF_TITLE_SHA" || -z "$REF_BODY_SHA" || -z "$REF_SPEC_SHA" ]]; then
+                echo "::error::PR #$PR_NUMBER snapshot reference is malformed; refusing conflict repair without a verifiable contract."
+                exit 1
+              fi
+              if [[ "$REF_GENERATION" != "1" ]]; then
+                echo "::error::PR #$PR_NUMBER snapshot reference is for generation $REF_GENERATION, expected generation 1 (stale contract); refusing repair."
+                exit 1
+              fi
+              # The PR body is mutable, so its snapshot reference never binds
+              # the canonical task by itself. Conflict repair must compare it
+              # with the task resolved from the PR's canonical worker branch;
+              # a PR that cannot be bound that way fails closed instead of
+              # trusting whichever issue the body names.
+              if [[ "${TASK_CONTEXT_PRESENT:-}" != "true" || -z "${TASK_REPO:-}" || -z "${TASK_NUMBER:-}" ]]; then
+                echo "::error::PR #$PR_NUMBER snapshot reference cannot be bound to the PR's canonical task; refusing conflict repair."
+                exit 1
+              fi
+              if [[ "$(tr '[:upper:]' '[:lower:]' <<<"$REF_REPO")" != "$(tr '[:upper:]' '[:lower:]' <<<"$TASK_REPO")" ]]; then
+                echo "::error::PR #$PR_NUMBER snapshot reference $REF_REPO#$REF_ISSUE does not match the PR's canonical task $TASK_REPO#${TASK_NUMBER} (wrong issue); refusing repair."
+                exit 1
+              fi
+              if [[ "$REF_ISSUE" != "$TASK_NUMBER" ]]; then
+                echo "::error::PR #$PR_NUMBER snapshot reference #$REF_ISSUE does not match the PR's canonical task #${TASK_NUMBER} on $REF_REPO (wrong issue); refusing repair."
+                exit 1
+              fi
+              # The PR body is mutable, so the reference alone never defines
+              # the contract: require it to match the durable snapshot comment
+              # before comparing live text. A PR-body edit that retargets the
+              # ref shas to an edited issue otherwise passes verification.
+              if ! SNAP_COMMENTS_JSON="$(gh api "repos/$REF_REPO/issues/$REF_ISSUE/comments?per_page=100&page=1" 2>/dev/null)"; then
+                echo "::error::Could not list task snapshot comments for $REF_REPO#$REF_ISSUE; refusing conflict repair."
+                exit 1
+              fi
+              SNAP_PINNED="$(SNAP_COMMENTS_JSON="$SNAP_COMMENTS_JSON" SNAP_REF_REPO="$REF_REPO" SNAP_REF_ISSUE="$REF_ISSUE" SNAP_REF_GENERATION="$REF_GENERATION" python3 -c 'import json,os,re; data=json.loads(os.environ.get("SNAP_COMMENTS_JSON") or "[]"); repo=(os.environ.get("SNAP_REF_REPO") or "").lower(); issue=os.environ.get("SNAP_REF_ISSUE") or ""; gen=os.environ.get("SNAP_REF_GENERATION") or ""; pat=re.compile(r"<!--\s*continuum-task-snapshot\s+repo=([A-Za-z0-9_.\-]+/[A-Za-z0-9_.\-]+)\s+issue=(\d+)\s+generation=(\d+)\s+title-sha256=([0-9a-fA-F]{64})\s+body-sha256=([0-9a-fA-F]{64})\s+spec-sha256=([0-9a-fA-F]{64})\s*-->"); trusted={"OWNER","MEMBER","COLLABORATOR"}; out=[(m.group(4).lower(),m.group(5).lower(),m.group(6).lower()) for c in data if isinstance(c,dict) for u in [c.get("user") if isinstance(c.get("user"),dict) else {}] for m in [pat.search(str(c.get("body") or ""))] if m and m.group(1).lower()==repo and m.group(2)==issue and m.group(3)==gen and (str(c.get("author_association") or "").upper() in trusted or str(u.get("login") or "").lower()=="github-actions[bot]")]; print("\n".join(out[0]) if out else "",end="")')"
+              SNAP_PINNED_TITLE_SHA="$(sed -n '1p' <<<"$SNAP_PINNED")"
+              SNAP_PINNED_BODY_SHA="$(sed -n '2p' <<<"$SNAP_PINNED")"
+              SNAP_PINNED_SPEC_SHA="$(sed -n '3p' <<<"$SNAP_PINNED")"
+              if [[ -z "$SNAP_PINNED_TITLE_SHA" || -z "$SNAP_PINNED_BODY_SHA" || -z "$SNAP_PINNED_SPEC_SHA" ]]; then
+                echo "::error::No trusted task snapshot comment found for $REF_REPO#$REF_ISSUE; refusing conflict repair."
+                exit 1
+              fi
+              if [[ "$SNAP_PINNED_TITLE_SHA" != "$REF_TITLE_SHA" || "$SNAP_PINNED_BODY_SHA" != "$REF_BODY_SHA" || "$SNAP_PINNED_SPEC_SHA" != "$REF_SPEC_SHA" ]]; then
+                echo "::error::PR #$PR_NUMBER snapshot reference does not match the durable task snapshot comment; refusing repair."
+                exit 1
+              fi
+              if ! REPAIR_LIVE_JSON="$(gh issue view "$REF_ISSUE" --repo "$REF_REPO" --json title,body 2>/dev/null)"; then
+                echo "::error::Could not fetch live task $REF_REPO#$REF_ISSUE for snapshot verification; refusing repair."
+                exit 1
+              fi
+              if [[ -z "$REPAIR_LIVE_JSON" ]]; then
+                echo "::error::Could not fetch live task $REF_REPO#$REF_ISSUE for snapshot verification; refusing conflict repair."
+                exit 1
+              fi
+              REPAIR_DIGESTS="$(REPAIR_LIVE_JSON="$REPAIR_LIVE_JSON" python3 -c 'import hashlib,json,os,unicodedata; norm=lambda v: unicodedata.normalize("NFC", v.replace("\r\n","\n").replace("\r","\n")); data=json.loads(os.environ.get("REPAIR_LIVE_JSON") or "{}"); title=norm(data.get("title") or ""); body=norm(data.get("body") or ""); title_sha=hashlib.sha256(title.encode("utf-8")).hexdigest(); body_sha=hashlib.sha256(body.encode("utf-8")).hexdigest(); spec_sha=hashlib.sha256((title_sha+":"+body_sha).encode("ascii")).hexdigest(); print(title_sha); print(body_sha); print(spec_sha)')"
+              LIVE_TITLE_SHA="$(sed -n '1p' <<<"$REPAIR_DIGESTS")"
+              LIVE_BODY_SHA="$(sed -n '2p' <<<"$REPAIR_DIGESTS")"
+              LIVE_SPEC_SHA="$(sed -n '3p' <<<"$REPAIR_DIGESTS")"
+              if [[ "$LIVE_TITLE_SHA" != "$REF_TITLE_SHA" || "$LIVE_BODY_SHA" != "$REF_BODY_SHA" || "$LIVE_SPEC_SHA" != "$REF_SPEC_SHA" ]]; then
+                gh pr comment "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" \
+                  --body "$(printf '%s\n%s\n%s\n%s' '<!-- continuum-task-snapshot-drift -->' '⚡ **Continuum · opencode**' '<!-- continuum-origin role=continuum component=opencode -->' "Task contract drift detected for $REF_REPO#$REF_ISSUE: the live issue no longer matches the PR's pinned snapshot. Conflict repair is stopped for this generation; open a new follow-up issue with an explicit dependency instead of editing the working issue.")" >/dev/null 2>&1 || true
+                echo "::error::Task contract drift detected for $REF_REPO#$REF_ISSUE (PR #$PR_NUMBER). Conflict repair stopped; open a new follow-up issue instead of editing the working issue."
+                exit 1
+              fi
+              echo "Task snapshot verified for $REF_REPO#$REF_ISSUE before conflict repair of PR #$PR_NUMBER."
             fi
           fi
+          # shellcheck disable=SC1091
+          source "${RUNNER_TEMP:-/tmp}/continuum-429-evacuate.sh" 2>/dev/null || true
+          # shellcheck disable=SC1090
+          source "${RUNNER_TEMP:-/tmp}/continuum-pr-staging.sh"
+          # kodmial/continuum#302: conflict repair updates only the exact
+          # current PR head. HEAD_REF must be a proven non-default ref
+          # before the agent runs and again before the push below.
+          continuum_assert_safe_push() {
+            local dest="${1:-}"
+            local repo="${2:-$GITHUB_REPOSITORY}"
+            dest="${dest#refs/heads/}"
+            dest="$(printf '%s' "$dest" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+            if [[ -z "$dest" ]]; then echo "::error::Continuum branch safety: refusing code push with an empty destination." >&2; return 1; fi
+            case "$dest" in HEAD|@|FETCH_HEAD|ORIG_HEAD|MERGE_HEAD) echo "::error::Continuum branch safety: refusing ambiguous push destination '$dest'." >&2; return 1;; esac
+            case "$dest" in *".."*|*"~"*|*"^"*|*"?"*|*"*"*|*"["*|*" "*|*"@{"*) echo "::error::Continuum branch safety: refusing ambiguous push destination '$dest'." >&2; return 1;; esac
+            case "$dest" in -*|/*|*/|*.lock) echo "::error::Continuum branch safety: refusing ambiguous push destination '$dest'." >&2; return 1;; esac
+            if [[ "$dest" == *"//"* ]]; then echo "::error::Continuum branch safety: refusing ambiguous push destination '$dest'." >&2; return 1; fi
+            local default_branch=""
+            default_branch="$(gh api "repos/$repo" --jq .default_branch 2>/dev/null || true)"
+            default_branch="${default_branch#refs/heads/}"
+            default_branch="$(printf '%s' "$default_branch" | tr -d '[:space:]')"
+            if [[ -z "$default_branch" ]]; then echo "::error::Continuum branch safety: repository default branch is undiscoverable for '$repo'; refusing code push to '$dest'." >&2; return 1; fi
+            if [[ "$dest" == "$default_branch" ]]; then echo "::error::Continuum branch safety: refusing code push to the default branch '$dest'. Recovery resumes the same PR branch; only the PR merge operation may update the default branch." >&2; return 1; fi
+          }
+          continuum_assert_safe_push "$HEAD_REF" || exit 1
+          # `workflow_call` cannot declare an enumerated input, so validate the
+          # strategy here rather than interpolating an unvalidated value.
+          case "$CONFLICT_STRATEGY" in
+            merge | checkout) ;;
+            *)
+              echo "::error::Unsupported conflict_strategy '$CONFLICT_STRATEGY'; expected 'merge' or 'checkout'."
+              exit 1
+              ;;
+          esac
+
+          # The two strategies need genuinely different instructions, so the
+          # whole strategy-dependent block is chosen, not a single interpolated
+          # verb. `merge` must not rebase; `checkout` re-checks main over the
+          # branch and therefore has to be pushed with force-with-lease.
+          if [[ "$CONFLICT_STRATEGY" == "checkout" ]]; then
+            read -r -d '' STRATEGY_BLOCK <<'BLOCK' || true
+            - Fetch the current origin/main and check it out over the current PR
+              branch (`git checkout origin/main -- .`), then re-apply the PR's own
+              intent on top of that tree by hand.
+            - Every file that both sides changed must end up containing the
+              intended behavior from BOTH the PR and main; resolving a conflict
+              by taking either side wholesale is a failure.
+            - Leave the reconciled tree as working-tree changes; the workflow
+              publishes the result. Never rebase, force-push, or reset.
+          BLOCK
+          else
+            read -r -d '' STRATEGY_BLOCK <<'BLOCK' || true
+            - Fetch the current origin/main and merge it into the current PR
+              branch, resolving the conflicts as part of that merge without
+              committing yet (leave the merge result staged/unstaged for the
+              workflow to commit).
+            - Resolve every merge conflict while preserving the intended behavior
+              from both the PR and main; do not discard unrelated changes from
+              either side.
+            - Leave the merge result uncommitted for the workflow to publish.
+              Never rebase, force-push, or reset away either side.
+          BLOCK
+          fi
+          PROMPT=$(cat <<EOF
+          Resolve the merge conflict between pull request #${PR_NUMBER} and the current main branch.
+
+          Context:
+          - The current checkout is the existing PR head branch: ${HEAD_REF}.
+          - This workflow was dispatched only after GitHub reported that the PR cannot
+            be updated cleanly from main.
+          - The consumer selected the conflict strategy: ${CONFLICT_STRATEGY}.
+
+          Requirements:
+          ${STRATEGY_BLOCK}
+          - Work only in the current checked-out PR branch. Do not create or switch to
+            another branch and do not create a new pull request.
+          - Do not commit, push, switch branches, rebase, or reset; the workflow
+            owns Git state and publishes the merge result as a bot-identity
+            commit after this run. Leave the resolved tree as working-tree
+            changes (including the merge state).
+          - Run the relevant tests, linters, or validation after resolving the conflicts.
+          - Keep all comments and commit messages in English.
+          EOF
+          )
+          OPENCODE_RUN_LOG="$(mktemp)"
+          set +e
+          continuum-opencode run --auto --model "$OPENCODE_MODEL" "$PROMPT" 2>&1 | tee "$OPENCODE_RUN_LOG"
+          OPENCODE_RUN_RC=${PIPESTATUS[0]}
+          set -e
+          # The provider can report exit 1 after the wrapper has already
+          # identified a 429/unavailable failure. Honor the durable marker:
+          # evacuate the dirty tree instead of losing completed agent edits.
+          if [[ "$OPENCODE_RUN_RC" -ne 0 ]]; then
+            if [[ -f "${RUNNER_TEMP:-/tmp}/continuum-opencode-upstream-unavailable" ]]; then
+              OPENCODE_RUN_RC=76
+            elif [[ -f "${RUNNER_TEMP:-/tmp}/continuum-opencode-429" ]]; then
+              OPENCODE_RUN_RC=75
+            fi
+          fi
+          if [[ "$OPENCODE_RUN_RC" -eq 75 || "$OPENCODE_RUN_RC" -eq 76 ]]; then
+            # kodmial/continuum#290: 429 burns this VM. Workflow-owned
+            # evacuation preserves the conflict-repair working tree, the exact
+            # PR HEAD identity, and the review-repair stage to the durable
+            # recovery ref. No second model call on this VM; exit 75.
+            rm -f "$OPENCODE_RUN_LOG"
+            CONFLICT_BASE_SHA="$(git rev-parse HEAD)"
+            CONTINUUM_INFRA_FAILURE_REASON=quota_429
+            [[ "$OPENCODE_RUN_RC" -eq 76 ]] && CONTINUUM_INFRA_FAILURE_REASON=unavailable
+            continuum_infra_evacuate "opencode-429-resolve-conflict-pr${PR_NUMBER}" "review-repair" "resolve-conflict" "" "$PR_NUMBER" "$CONFLICT_BASE_SHA" "$CONTINUUM_INFRA_FAILURE_REASON"
+          fi
+          rm -f "$OPENCODE_RUN_LOG"
+          if [[ "$OPENCODE_RUN_RC" -ne 0 ]]; then
+            exit "$OPENCODE_RUN_RC"
+          fi
+
+          # kodmial/continuum#260: deterministic ownership — the workflow owns
+          # the final conflict-repair commit with the bot identity plus the
+          # component trailer. Never rebase or reset away either side.
+          # kodmial/continuum#413: exclude only workflow-owned artifacts at
+          # the publish boundary; legitimate merge edits and declared
+          # submodules stay intact, and an unknown Gitlink fails closed.
+          CONFLICT_BASE_SHA="$(git rev-parse HEAD)"
+          continuum_stage_publishable || exit 1
+          if ! git diff --cached --quiet; then
+            git commit -m "fix: resolve merge conflict with main for PR #${PR_NUMBER}" -m "Continuum-Component: opencode"
+          fi
+          CONFLICT_HEAD_SHA="$(git rev-parse HEAD)"
+          if [[ "$(git rev-list --count "origin/${HEAD_REF}"..HEAD)" -gt 0 ]]; then
+            # kodmial/continuum#302: conflict repair publishes only to the
+            # proven non-default PR head asserted on entry.
+            continuum_assert_safe_push "${HEAD_REF}" || exit 1
+            git push origin "HEAD:${HEAD_REF}"
+          fi
+          if [[ "$CONFLICT_HEAD_SHA" != "$CONFLICT_BASE_SHA" ]]; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          fi
+          echo "base_sha=$CONFLICT_BASE_SHA" >> "$GITHUB_OUTPUT"
+          echo "head_sha=$CONFLICT_HEAD_SHA" >> "$GITHUB_OUTPUT"
+
+      - name: Fix failed blocking workflow
+        id: ci_fix
+        if: github.event_name == 'workflow_dispatch' && inputs.mode == 'ci-fix' && steps.recovery_restore.outputs.skip_opencode != 'true'
+        env:
+          OPENCODE_MODEL: ${{ steps.model_route.outputs.model }}
+          GITHUB_TOKEN: ${{ secrets.TAP_PAT }}
+          GH_TOKEN: ${{ secrets.TAP_PAT }}
+          PR_NUMBER: ${{ inputs.pr_number }}
+          RUN_ID: ${{ inputs.run_id }}
+          HEAD_REF: ${{ inputs.head_ref }}
+          TASK_CONTEXT_PRESENT: ${{ steps.task_context.outputs.present }}
+          TASK_CONTEXT_SOURCE: ${{ steps.task_context.outputs.source }}
+          TASK_REPO: ${{ steps.task_context.outputs.task_repo }}
+          TASK_NUMBER: ${{ steps.task_context.outputs.task_number }}
+          TASK_TITLE: ${{ steps.task_context.outputs.task_title }}
+          TASK_BODY: ${{ steps.task_context.outputs.task_body }}
+          TASK_URL: ${{ steps.task_context.outputs.task_url }}
+          PR_TITLE: ${{ steps.task_context.outputs.pr_title }}
+          PR_BODY: ${{ steps.task_context.outputs.pr_body }}
+          RECOVERY_GENERATION_IN: ${{ inputs.recovery_generation }}
+        run: |
+          set -euo pipefail
+          # shellcheck disable=SC1091
+          source "${RUNNER_TEMP:-/tmp}/continuum-429-evacuate.sh" 2>/dev/null || true
+          # shellcheck disable=SC1090
+          source "${RUNNER_TEMP:-/tmp}/continuum-pr-staging.sh"
+          # kodmial/continuum#302: CI repair updates only the exact current
+          # PR head. HEAD_REF must be a proven non-default ref before the
+          # agent runs and again before the push below.
+          continuum_assert_safe_push() {
+            local dest="${1:-}"
+            local repo="${2:-$GITHUB_REPOSITORY}"
+            dest="${dest#refs/heads/}"
+            dest="$(printf '%s' "$dest" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+            if [[ -z "$dest" ]]; then echo "::error::Continuum branch safety: refusing code push with an empty destination." >&2; return 1; fi
+            case "$dest" in HEAD|@|FETCH_HEAD|ORIG_HEAD|MERGE_HEAD) echo "::error::Continuum branch safety: refusing ambiguous push destination '$dest'." >&2; return 1;; esac
+            case "$dest" in *".."*|*"~"*|*"^"*|*"?"*|*"*"*|*"["*|*" "*|*"@{"*) echo "::error::Continuum branch safety: refusing ambiguous push destination '$dest'." >&2; return 1;; esac
+            case "$dest" in -*|/*|*/|*.lock) echo "::error::Continuum branch safety: refusing ambiguous push destination '$dest'." >&2; return 1;; esac
+            if [[ "$dest" == *"//"* ]]; then echo "::error::Continuum branch safety: refusing ambiguous push destination '$dest'." >&2; return 1; fi
+            local default_branch=""
+            default_branch="$(gh api "repos/$repo" --jq .default_branch 2>/dev/null || true)"
+            default_branch="${default_branch#refs/heads/}"
+            default_branch="$(printf '%s' "$default_branch" | tr -d '[:space:]')"
+            if [[ -z "$default_branch" ]]; then echo "::error::Continuum branch safety: repository default branch is undiscoverable for '$repo'; refusing code push to '$dest'." >&2; return 1; fi
+            if [[ "$dest" == "$default_branch" ]]; then echo "::error::Continuum branch safety: refusing code push to the default branch '$dest'. Recovery resumes the same PR branch; only the PR merge operation may update the default branch." >&2; return 1; fi
+          }
+          continuum_assert_safe_push "$HEAD_REF" || exit 1
+
+          # kodmial/continuum#295: frozen task-spec guard for CI repair.
+          # Same contract as the CodeRabbit repair guard: the PR's snapshot
+          # reference is pinned, the live issue is re-read, drift stops the
+          # repair, legacy PRs proceed explicitly unprotected.
+          if [[ -n "${PR_NUMBER:-}" ]]; then
+            if ! REPAIR_PR_BODY="$(gh pr view "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --json body --jq '.body // ""' 2>/dev/null)"; then
+              echo "::error::Could not fetch PR #$PR_NUMBER body for snapshot verification; refusing repair."
+              exit 1
+            fi
+            REPAIR_SNAPSHOT_REF="$(grep -oE '<!--[[:space:]]*continuum-task-snapshot-ref[^>]*-->' <<<"$REPAIR_PR_BODY" | head -n 1 || true)"
+            if [[ -z "$REPAIR_SNAPSHOT_REF" ]]; then
+              echo "::notice::PR #$PR_NUMBER carries no task snapshot reference (legacy, pre-guard PR); CI repair proceeds explicitly without drift protection."
+            else
+              REF_REPO="$(sed -nE 's/.*repo=([A-Za-z0-9_.\-]+\/[A-Za-z0-9_.\-]+).*/\1/p' <<<"$REPAIR_SNAPSHOT_REF" | head -n 1)"
+              REF_ISSUE="$(sed -nE 's/.*issue=([0-9]+).*/\1/p' <<<"$REPAIR_SNAPSHOT_REF" | head -n 1)"
+              REF_TITLE_SHA="$(sed -nE 's/.*title-sha256=([0-9a-fA-F]{64}).*/\1/p' <<<"$REPAIR_SNAPSHOT_REF" | head -n 1 | tr 'A-F' 'a-f')"
+              REF_BODY_SHA="$(sed -nE 's/.*body-sha256=([0-9a-fA-F]{64}).*/\1/p' <<<"$REPAIR_SNAPSHOT_REF" | head -n 1 | tr 'A-F' 'a-f')"
+              REF_GENERATION="$(sed -nE 's/.*generation=([0-9]+).*/\1/p' <<<"$REPAIR_SNAPSHOT_REF" | head -n 1)"
+              REF_SPEC_SHA="$(sed -nE 's/.*spec-sha256=([0-9a-fA-F]{64}).*/\1/p' <<<"$REPAIR_SNAPSHOT_REF" | head -n 1 | tr 'A-F' 'a-f')"
+              if [[ -z "$REF_REPO" || -z "$REF_ISSUE" || -z "$REF_GENERATION" || -z "$REF_TITLE_SHA" || -z "$REF_BODY_SHA" || -z "$REF_SPEC_SHA" ]]; then
+                echo "::error::PR #$PR_NUMBER snapshot reference is malformed; refusing CI repair without a verifiable contract."
+                exit 1
+              fi
+              if [[ "$REF_GENERATION" != "1" ]]; then
+                echo "::error::PR #$PR_NUMBER snapshot reference is for generation $REF_GENERATION, expected generation 1 (stale contract); refusing repair."
+                exit 1
+              fi
+              if [[ "${TASK_CONTEXT_PRESENT:-}" == "true" ]]; then
+                if [[ -n "${TASK_REPO:-}" && "$(tr '[:upper:]' '[:lower:]' <<<"$REF_REPO")" != "$(tr '[:upper:]' '[:lower:]' <<<"$TASK_REPO")" ]]; then
+                  echo "::error::PR #$PR_NUMBER snapshot reference $REF_REPO#$REF_ISSUE does not match expected task $TASK_REPO#${TASK_NUMBER:-} (wrong issue); refusing repair."
+                  exit 1
+                fi
+                if [[ -n "${TASK_NUMBER:-}" && "$REF_ISSUE" != "$TASK_NUMBER" ]]; then
+                  echo "::error::PR #$PR_NUMBER snapshot reference #$REF_ISSUE does not match expected task #${TASK_NUMBER} on $REF_REPO (wrong issue); refusing repair."
+                  exit 1
+                fi
+              fi
+              # The PR body is mutable, so the reference alone never defines
+              # the contract: require it to match the durable snapshot comment
+              # before comparing live text. A PR-body edit that retargets the
+              # ref shas to an edited issue otherwise passes verification.
+              if ! SNAP_COMMENTS_JSON="$(gh api "repos/$REF_REPO/issues/$REF_ISSUE/comments?per_page=100&page=1" 2>/dev/null)"; then
+                echo "::error::Could not list task snapshot comments for $REF_REPO#$REF_ISSUE; refusing CI repair."
+                exit 1
+              fi
+              SNAP_PINNED="$(SNAP_COMMENTS_JSON="$SNAP_COMMENTS_JSON" SNAP_REF_REPO="$REF_REPO" SNAP_REF_ISSUE="$REF_ISSUE" SNAP_REF_GENERATION="$REF_GENERATION" python3 -c 'import json,os,re; data=json.loads(os.environ.get("SNAP_COMMENTS_JSON") or "[]"); repo=(os.environ.get("SNAP_REF_REPO") or "").lower(); issue=os.environ.get("SNAP_REF_ISSUE") or ""; gen=os.environ.get("SNAP_REF_GENERATION") or ""; pat=re.compile(r"<!--\s*continuum-task-snapshot\s+repo=([A-Za-z0-9_.\-]+/[A-Za-z0-9_.\-]+)\s+issue=(\d+)\s+generation=(\d+)\s+title-sha256=([0-9a-fA-F]{64})\s+body-sha256=([0-9a-fA-F]{64})\s+spec-sha256=([0-9a-fA-F]{64})\s*-->"); trusted={"OWNER","MEMBER","COLLABORATOR"}; out=[(m.group(4).lower(),m.group(5).lower(),m.group(6).lower()) for c in data if isinstance(c,dict) for u in [c.get("user") if isinstance(c.get("user"),dict) else {}] for m in [pat.search(str(c.get("body") or ""))] if m and m.group(1).lower()==repo and m.group(2)==issue and m.group(3)==gen and (str(c.get("author_association") or "").upper() in trusted or str(u.get("login") or "").lower()=="github-actions[bot]")]; print("\n".join(out[0]) if out else "",end="")')"
+              SNAP_PINNED_TITLE_SHA="$(sed -n '1p' <<<"$SNAP_PINNED")"
+              SNAP_PINNED_BODY_SHA="$(sed -n '2p' <<<"$SNAP_PINNED")"
+              SNAP_PINNED_SPEC_SHA="$(sed -n '3p' <<<"$SNAP_PINNED")"
+              if [[ -z "$SNAP_PINNED_TITLE_SHA" || -z "$SNAP_PINNED_BODY_SHA" || -z "$SNAP_PINNED_SPEC_SHA" ]]; then
+                echo "::error::No trusted task snapshot comment found for $REF_REPO#$REF_ISSUE; refusing CI repair."
+                exit 1
+              fi
+              if [[ "$SNAP_PINNED_TITLE_SHA" != "$REF_TITLE_SHA" || "$SNAP_PINNED_BODY_SHA" != "$REF_BODY_SHA" || "$SNAP_PINNED_SPEC_SHA" != "$REF_SPEC_SHA" ]]; then
+                echo "::error::PR #$PR_NUMBER snapshot reference does not match the durable task snapshot comment; refusing repair."
+                exit 1
+              fi
+              if ! REPAIR_LIVE_JSON="$(gh issue view "$REF_ISSUE" --repo "$REF_REPO" --json title,body 2>/dev/null)"; then
+                echo "::error::Could not fetch live task $REF_REPO#$REF_ISSUE for snapshot verification; refusing repair."
+                exit 1
+              fi
+              if [[ -z "$REPAIR_LIVE_JSON" ]]; then
+                echo "::error::Could not fetch live task $REF_REPO#$REF_ISSUE for snapshot verification; refusing CI repair."
+                exit 1
+              fi
+              REPAIR_DIGESTS="$(REPAIR_LIVE_JSON="$REPAIR_LIVE_JSON" python3 -c 'import hashlib,json,os,unicodedata; norm=lambda v: unicodedata.normalize("NFC", v.replace("\r\n","\n").replace("\r","\n")); data=json.loads(os.environ.get("REPAIR_LIVE_JSON") or "{}"); title=norm(data.get("title") or ""); body=norm(data.get("body") or ""); title_sha=hashlib.sha256(title.encode("utf-8")).hexdigest(); body_sha=hashlib.sha256(body.encode("utf-8")).hexdigest(); spec_sha=hashlib.sha256((title_sha+":"+body_sha).encode("ascii")).hexdigest(); print(title_sha); print(body_sha); print(spec_sha)')"
+              LIVE_TITLE_SHA="$(sed -n '1p' <<<"$REPAIR_DIGESTS")"
+              LIVE_BODY_SHA="$(sed -n '2p' <<<"$REPAIR_DIGESTS")"
+              LIVE_SPEC_SHA="$(sed -n '3p' <<<"$REPAIR_DIGESTS")"
+              if [[ "$LIVE_TITLE_SHA" != "$REF_TITLE_SHA" || "$LIVE_BODY_SHA" != "$REF_BODY_SHA" || "$LIVE_SPEC_SHA" != "$REF_SPEC_SHA" ]]; then
+                gh pr comment "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" \
+                  --body "$(printf '%s\n%s\n%s\n%s' '<!-- continuum-task-snapshot-drift -->' '⚡ **Continuum · opencode**' '<!-- continuum-origin role=continuum component=opencode -->' "Task contract drift detected for $REF_REPO#$REF_ISSUE: the live issue no longer matches the PR's pinned snapshot. CI repair is stopped for this generation; open a new follow-up issue with an explicit dependency instead of editing the working issue.")" >/dev/null 2>&1 || true
+                echo "::error::Task contract drift detected for $REF_REPO#$REF_ISSUE (PR #$PR_NUMBER). CI repair stopped; open a new follow-up issue instead of editing the working issue."
+                exit 1
+              fi
+              echo "Task snapshot verified for $REF_REPO#$REF_ISSUE before CI repair of PR #$PR_NUMBER."
+            fi
+          fi
+
+          if [[ "$TASK_CONTEXT_PRESENT" == "true" ]]; then
+            TASK_CONTEXT_BLOCK="$(cat <<EOF
+          Authoritative task (resolved via ${TASK_CONTEXT_SOURCE}):
+          ${TASK_REPO}#${TASK_NUMBER}
+          ${TASK_URL}
+
+          Task title:
+          ${TASK_TITLE}
+
+          Task specification / Definition of Done:
+          ${TASK_BODY}
+          EOF
+            )"
+          else
+            TASK_CONTEXT_BLOCK="No authoritative task issue was resolved for this legacy PR. Do not fabricate one; constrain changes to the existing PR intent and the concrete failing validation."
+          fi
+
+          PROMPT=$(cat <<EOF
+          Repair pull request #${PR_NUMBER} without losing the task contract.
+
+          ${TASK_CONTEXT_BLOCK}
+
+          Current PR:
+          Title: ${PR_TITLE}
+          Body:
+          ${PR_BODY}
+
+          Failure evidence:
+          - Current checkout/PR head branch: ${HEAD_REF}.
+          - Failed blocking workflow run id: ${RUN_ID}.
+          - Inspect that exact run, failed jobs and logs using GitHub CLI/API before changing code.
+
+          Requirements:
+          - When authoritative task context is present, treat its specification and Definition of Done as authoritative, exactly as the initial implementation run does.
+          - Use the PR diff and failed workflow logs to diagnose the defect; they do not replace or narrow the task contract.
+          - Identify the concrete workflow failure and fix the root cause while preserving the complete task intent.
+          - Never weaken, delete, skip, or special-case a validation merely to make CI green. If a validation assertion is stale, change it only after proving from the authoritative task and current implementation contract that the assertion is wrong.
+          - Keep the change scoped to the failure and task contract; do not make unrelated refactors.
+          - If the failure is clearly transient or external infrastructure, do not make a speculative code change; explain the reason in the existing PR conversation.
+          - Work only in the current checked-out PR branch. Do not create or switch to another branch and do not create a new pull request.
+          - Run the repository's complete relevant validation locally after the final edit when possible.
+          - Do not commit, push, switch branches, rebase, or reset; the workflow
+            owns Git state and publishes the repair as a bot-identity commit
+            after this run. Leave fixes as working-tree changes.
+          - Keep all comments and commit messages in English.
+          EOF
+          )
+          OPENCODE_RUN_LOG="$(mktemp)"
+          set +e
+          continuum-opencode run --auto --model "$OPENCODE_MODEL" "$PROMPT" 2>&1 | tee "$OPENCODE_RUN_LOG"
+          OPENCODE_RUN_RC=${PIPESTATUS[0]}
+          set -e
+          # The provider can report exit 1 after the wrapper has already
+          # identified a 429/unavailable failure. Honor the durable marker:
+          # evacuate the dirty tree instead of losing completed agent edits.
+          if [[ "$OPENCODE_RUN_RC" -ne 0 ]]; then
+            if [[ -f "${RUNNER_TEMP:-/tmp}/continuum-opencode-upstream-unavailable" ]]; then
+              OPENCODE_RUN_RC=76
+            elif [[ -f "${RUNNER_TEMP:-/tmp}/continuum-opencode-429" ]]; then
+              OPENCODE_RUN_RC=75
+            fi
+          fi
+          if [[ "$OPENCODE_RUN_RC" -eq 75 || "$OPENCODE_RUN_RC" -eq 76 ]]; then
+            # kodmial/continuum#290: 429 burns this VM. Workflow-owned
+            # evacuation preserves the CI-repair working tree, the exact PR
+            # HEAD identity, and the review-repair stage to the durable
+            # recovery ref. No second model call on this VM; exit 75.
+            rm -f "$OPENCODE_RUN_LOG"
+            CI_BASE_SHA="$(git rev-parse HEAD)"
+            CONTINUUM_INFRA_FAILURE_REASON=quota_429
+            [[ "$OPENCODE_RUN_RC" -eq 76 ]] && CONTINUUM_INFRA_FAILURE_REASON=unavailable
+            continuum_infra_evacuate "opencode-429-ci-fix-pr${PR_NUMBER}-run${RUN_ID}" "review-repair" "ci-fix" "" "$PR_NUMBER" "$CI_BASE_SHA" "$CONTINUUM_INFRA_FAILURE_REASON"
+          fi
+          rm -f "$OPENCODE_RUN_LOG"
+          if [[ "$OPENCODE_RUN_RC" -ne 0 ]]; then
+            exit "$OPENCODE_RUN_RC"
+          fi
+
+          # kodmial/continuum#260: deterministic ownership — the workflow owns
+          # the final repair commit with the bot identity plus the component
+          # trailer. The agent never commits.
+          BEFORE_SHA=$(git rev-parse HEAD)
+          # kodmial/continuum#413: the CI repair publishes through the same
+          # deterministic boundary as issue mode; workflow-only files never
+          # enter the PR, and an unknown Gitlink fails closed before push.
+          continuum_stage_publishable || exit 1
+          if ! git diff --cached --quiet; then
+            git commit -m "fix: repair blocking workflow for PR #${PR_NUMBER}" -m "Continuum-Component: opencode"
+            # kodmial/continuum#302: publish only to the proven PR ref.
+            # The PR may advance during CI-fix; never overwrite its history.
+            # The newer HEAD is evaluated by its own exact-HEAD CI-repair gate.
+            continuum_assert_safe_push "${HEAD_REF}" || exit 1
+            if ! git fetch --no-tags origin "refs/heads/${HEAD_REF}"; then
+              echo "::error::Cannot verify remote CI-repair PR head."
+              exit 1
+            fi
+            REMOTE_HEAD="$(git rev-parse FETCH_HEAD)"
+            if [[ "$REMOTE_HEAD" != "$BEFORE_SHA" ]]; then
+              echo "::notice::CI-repair PR #${PR_NUMBER}: superseded by remote HEAD $REMOTE_HEAD (base $BEFORE_SHA); stale fix discarded."
+              exit 0
+            fi
+            if ! git push origin "HEAD:${HEAD_REF}"; then
+              # Recheck the actual ref: reject a transport/auth failure, but
+              # treat a proved concurrent head advance as a stale no-op.
+              if git fetch --no-tags origin "refs/heads/${HEAD_REF}"; then
+                REMOTE_HEAD="$(git rev-parse FETCH_HEAD)"
+                if [[ "$REMOTE_HEAD" != "$BEFORE_SHA" ]]; then
+                  echo "::notice::CI-repair PR #${PR_NUMBER}: superseded during push by $REMOTE_HEAD; new-head CI owns recovery."
+                  exit 0
+                fi
+              fi
+              echo "::error::CI-repair push failed without confirmed HEAD advance."
+              exit 1
+            fi
+          fi
+          AFTER_SHA=$(git rev-parse HEAD)
+          if [[ "$AFTER_SHA" != "$BEFORE_SHA" ]]; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          fi
+          echo "base_sha=$BEFORE_SHA" >> "$GITHUB_OUTPUT"
+          echo "head_sha=$AFTER_SHA" >> "$GITHUB_OUTPUT"
+
+          # If the agent correctly decided there is no code fix to make (for
+          # example a transient runner/network failure), retry the evaluated
+          # workflow without changing the PR. Prefer only failed jobs, then fall
+          # back to a full rerun for cancelled/timed-out runs that have no
+          # rerunnable failed-job subset.
+          if [[ "$AFTER_SHA" == "$BEFORE_SHA" ]]; then
+            echo "OpenCode produced no new commit; retrying the evaluated workflow."
+            gh run rerun "$RUN_ID" --failed || gh run rerun "$RUN_ID"
+          fi
+
+      # https://github.com/kodmial/continuum/pull/459: evidence is published
+      # before the CodeRabbit verification handoff, because a failed handoff
+      # must never leave a pushed repair unattested. The receipt is written
+      # first so a status API failure cannot discard it, every attestation step
+      # runs even after an earlier step failed, and dedicated recovery steps
+      # retry a failed status or receipt instead of requiring a second repair
+      # run.
+      - name: Prepare authenticated repair publication receipt
+        id: repair_publication
+        if: >-
+          !cancelled() &&
+          (steps.coderabbit_repair.outputs.changed == 'true' ||
+           steps.resolve_conflict.outputs.changed == 'true' ||
+           steps.ci_fix.outputs.changed == 'true')
+        env:
+          CODERABBIT_BASE_SHA: ${{ steps.coderabbit_repair.outputs.base_sha }}
+          CODERABBIT_HEAD_SHA: ${{ steps.coderabbit_repair.outputs.head_sha }}
+          CONFLICT_BASE_SHA: ${{ steps.resolve_conflict.outputs.base_sha }}
+          CONFLICT_HEAD_SHA: ${{ steps.resolve_conflict.outputs.head_sha }}
+          CI_BASE_SHA: ${{ steps.ci_fix.outputs.base_sha }}
+          CI_HEAD_SHA: ${{ steps.ci_fix.outputs.head_sha }}
+          PR_NUMBER: ${{ inputs.pr_number }}
+          HEAD_REF: ${{ inputs.head_ref }}
+        run: |
+          set -euo pipefail
+          base="${CODERABBIT_BASE_SHA:-}"
+          head="${CODERABBIT_HEAD_SHA:-}"
+          if [[ -z "$base" ]]; then
+            base="${CONFLICT_BASE_SHA:-}"
+            head="${CONFLICT_HEAD_SHA:-}"
+          fi
+          if [[ -z "$base" ]]; then
+            base="${CI_BASE_SHA:-}"
+            head="${CI_HEAD_SHA:-}"
+          fi
+          [[ "$base" =~ ^[0-9a-f]{40}$ && "$head" =~ ^[0-9a-f]{40}$ ]] \
+            || { echo "::error::Repair publication has no full base/head commit; refusing to attest continuity."; exit 1; }
+          [[ "$base" != "$head" ]] \
+            || { echo "::error::Repair publication reported no new commit; refusing to attest continuity."; exit 1; }
+          [[ "$PR_NUMBER" =~ ^[1-9][0-9]*$ && -n "$HEAD_REF" ]] \
+            || { echo "::error::Repair publication has no PR or branch identity; refusing to attest continuity."; exit 1; }
+          echo "base_sha=$base" >> "$GITHUB_OUTPUT"
+          echo "head_sha=$head" >> "$GITHUB_OUTPUT"
+          # Keep the PR and branch with the commit identity so the post-failure
+          # recovery job can re-attest the exact original publication.
+          echo "pr_number=$PR_NUMBER" >> "$GITHUB_OUTPUT"
+          echo "branch=$HEAD_REF" >> "$GITHUB_OUTPUT"
+
+          # The status alone names a run URL, which a repository owner could
+          # copy onto a manual commit. The receipt is scoped to this very run
+          # so canary completion can prove the run, PR, branch, parent, and
+          # pushed commit all belong together. Writing it before the status
+          # call keeps that evidence when only the status API fails.
+          REPAIR_RECEIPT_DIR="${RUNNER_TEMP:-/tmp}/continuum-repair-publication"
+          mkdir -p "$REPAIR_RECEIPT_DIR"
+          jq -n \
+            --arg repo "$GITHUB_REPOSITORY" \
+            --arg run "$GITHUB_RUN_ID" \
+            --arg attempt "$GITHUB_RUN_ATTEMPT" \
+            --arg pr "$PR_NUMBER" \
+            --arg branch "$HEAD_REF" \
+            --arg base "$base" \
+            --arg head "$head" \
+            '{schema_version:1, repo:$repo, run_id:$run, run_attempt:$attempt, pr_number:($pr | tonumber), branch:$branch, base_sha: $base, head_sha: $head}' \
+            > "$REPAIR_RECEIPT_DIR/publication.json"
+
+      - name: Upload authenticated repair publication receipt
+        id: upload_repair_publication
+        if: >-
+          !cancelled() &&
+          steps.repair_publication.outputs.head_sha != ''
+        # A failed upload is recovered by the step below instead of failing the
+        # job, so the attestation still completes and verification can proceed.
+        continue-on-error: true
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: continuum-repair-publication-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/continuum-repair-publication/publication.json
+          if-no-files-found: error
+
+      - name: Record authenticated repair publication
+        id: repair_status
+        if: >-
+          !cancelled() &&
+          steps.repair_publication.outputs.head_sha != ''
+        # A failed status call is recovered below against the already pushed
+        # commit instead of failing the job before recovery can run.
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.TAP_PAT }}
+          BASE_SHA: ${{ steps.repair_publication.outputs.base_sha }}
+          HEAD_SHA: ${{ steps.repair_publication.outputs.head_sha }}
+          PR_NUMBER: ${{ inputs.pr_number }}
+        run: |
+          set -euo pipefail
+          base="$BASE_SHA"
+          head="$HEAD_SHA"
+          [[ "$base" =~ ^[0-9a-f]{40}$ && "$head" =~ ^[0-9a-f]{40}$ ]] \
+            || { echo "::error::Repair publication has no full base/head commit; refusing to attest continuity."; exit 1; }
+          # Commit author/committer fields are user-controlled. This status is
+          # API-authenticated and bound to the direct parent and exact pushed
+          # commit, so a manual commit cannot impersonate an automation repair.
+          for attempt in 1 2 3; do
+            if gh api --method POST "repos/$GITHUB_REPOSITORY/statuses/$head" \
+              -f state=success \
+              -f context=continuum/repair-publication \
+              -f description="pr=${PR_NUMBER} base=${base:0:12} head=${head:0:12}" \
+              -f target_url="https://github.com/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
+              >/dev/null; then
+              echo "CREATED_REPAIR_STATUS=$head" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            [[ "$attempt" -eq 3 ]] && break
+            sleep $((attempt * 5))
+          done
+          echo "::error::CONTINUUM_REPAIR_PUBLICATION_RETRY_REQUIRED"
+          echo "::error::Continuum could not publish the authenticated repair status for $head."
+          exit 1
+
+      - name: Recover authenticated repair publication status
+        if: >-
+          !cancelled() &&
+          steps.repair_publication.outputs.head_sha != '' &&
+          steps.repair_status.outcome == 'failure'
+        env:
+          GH_TOKEN: ${{ secrets.TAP_PAT }}
+          BASE_SHA: ${{ steps.repair_publication.outputs.base_sha }}
+          HEAD_SHA: ${{ steps.repair_publication.outputs.head_sha }}
+          PR_NUMBER: ${{ inputs.pr_number }}
+        run: |
+          set -euo pipefail
+          base="$BASE_SHA"
+          head="$HEAD_SHA"
+          # The same idempotent attestation for the already pushed commit, so a
+          # transient status API failure cannot leave the repair unattested.
+          for attempt in 1 2 3; do
+            if gh api --method POST "repos/$GITHUB_REPOSITORY/statuses/$head" \
+              -f state=success \
+              -f context=continuum/repair-publication \
+              -f description="pr=${PR_NUMBER} base=${base:0:12} head=${head:0:12}" \
+              -f target_url="https://github.com/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
+              >/dev/null; then
+              echo "CREATED_REPAIR_STATUS=$head" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            [[ "$attempt" -eq 3 ]] && break
+            sleep $((attempt * 5))
+          done
+          echo "::error::CONTINUUM_REPAIR_PUBLICATION_RETRY_REQUIRED"
+          echo "::error::Continuum could not recover the authenticated repair status for $head; rerun the publication before accepting completion."
+          exit 1
+
+      - name: Recover authenticated repair publication receipt
+        if: >-
+          !cancelled() &&
+          steps.repair_publication.outputs.head_sha != '' &&
+          steps.upload_repair_publication.outcome == 'failure'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: continuum-repair-publication-${{ github.run_attempt }}-recovery
+          path: ${{ runner.temp }}/continuum-repair-publication/publication.json
+          if-no-files-found: error
 
       - name: Ask CodeRabbit to verify every original finding
         if: github.event_name == 'workflow_dispatch' && inputs.mode == 'coderabbit-fix' && steps.unresolved_batch.outputs.skip != 'true'
@@ -5124,485 +6104,6 @@ jobs:
               }
             }
 
-      - name: Resolve merge conflict with main
-        if: github.event_name == 'workflow_dispatch' && inputs.mode == 'resolve-conflict' && steps.recovery_restore.outputs.skip_opencode != 'true'
-        env:
-          OPENCODE_MODEL: ${{ steps.model_route.outputs.model }}
-          GITHUB_TOKEN: ${{ secrets.TAP_PAT }}
-          GH_TOKEN: ${{ secrets.TAP_PAT }}
-          PR_NUMBER: ${{ inputs.pr_number }}
-          HEAD_REF: ${{ inputs.head_ref }}
-          CONFLICT_STRATEGY: ${{ inputs.conflict_strategy || 'merge' }}
-          TASK_CONTEXT_PRESENT: ${{ steps.task_context.outputs.present }}
-          TASK_REPO: ${{ steps.task_context.outputs.task_repo }}
-          TASK_NUMBER: ${{ steps.task_context.outputs.task_number }}
-          RECOVERY_GENERATION_IN: ${{ inputs.recovery_generation }}
-        run: |
-          set -euo pipefail
-          # kodmial/continuum#295: frozen task-spec guard for conflict
-          # repair. Same contract as the CodeRabbit repair guard above: the
-          # PR's snapshot reference is pinned, the live issue is re-read,
-          # drift stops the repair, legacy PRs proceed explicitly
-          # unprotected.
-          if [[ -n "${PR_NUMBER:-}" ]]; then
-            if ! REPAIR_PR_BODY="$(gh pr view "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --json body --jq '.body // ""' 2>/dev/null)"; then
-              echo "::error::Could not fetch PR #$PR_NUMBER body for snapshot verification; refusing repair."
-              exit 1
-            fi
-            REPAIR_SNAPSHOT_REF="$(grep -oE '<!--[[:space:]]*continuum-task-snapshot-ref[^>]*-->' <<<"$REPAIR_PR_BODY" | head -n 1 || true)"
-            if [[ -z "$REPAIR_SNAPSHOT_REF" ]]; then
-              echo "::notice::PR #$PR_NUMBER carries no task snapshot reference (legacy, pre-guard PR); conflict repair proceeds explicitly without drift protection."
-            else
-              REF_REPO="$(sed -nE 's/.*repo=([A-Za-z0-9_.\-]+\/[A-Za-z0-9_.\-]+).*/\1/p' <<<"$REPAIR_SNAPSHOT_REF" | head -n 1)"
-              REF_ISSUE="$(sed -nE 's/.*issue=([0-9]+).*/\1/p' <<<"$REPAIR_SNAPSHOT_REF" | head -n 1)"
-              REF_TITLE_SHA="$(sed -nE 's/.*title-sha256=([0-9a-fA-F]{64}).*/\1/p' <<<"$REPAIR_SNAPSHOT_REF" | head -n 1 | tr 'A-F' 'a-f')"
-              REF_BODY_SHA="$(sed -nE 's/.*body-sha256=([0-9a-fA-F]{64}).*/\1/p' <<<"$REPAIR_SNAPSHOT_REF" | head -n 1 | tr 'A-F' 'a-f')"
-              REF_GENERATION="$(sed -nE 's/.*generation=([0-9]+).*/\1/p' <<<"$REPAIR_SNAPSHOT_REF" | head -n 1)"
-              REF_SPEC_SHA="$(sed -nE 's/.*spec-sha256=([0-9a-fA-F]{64}).*/\1/p' <<<"$REPAIR_SNAPSHOT_REF" | head -n 1 | tr 'A-F' 'a-f')"
-              if [[ -z "$REF_REPO" || -z "$REF_ISSUE" || -z "$REF_GENERATION" || -z "$REF_TITLE_SHA" || -z "$REF_BODY_SHA" || -z "$REF_SPEC_SHA" ]]; then
-                echo "::error::PR #$PR_NUMBER snapshot reference is malformed; refusing conflict repair without a verifiable contract."
-                exit 1
-              fi
-              if [[ "$REF_GENERATION" != "1" ]]; then
-                echo "::error::PR #$PR_NUMBER snapshot reference is for generation $REF_GENERATION, expected generation 1 (stale contract); refusing repair."
-                exit 1
-              fi
-              if [[ "${TASK_CONTEXT_PRESENT:-}" == "true" ]]; then
-                if [[ -n "${TASK_REPO:-}" && "$(tr '[:upper:]' '[:lower:]' <<<"$REF_REPO")" != "$(tr '[:upper:]' '[:lower:]' <<<"$TASK_REPO")" ]]; then
-                  echo "::error::PR #$PR_NUMBER snapshot reference $REF_REPO#$REF_ISSUE does not match expected task $TASK_REPO#${TASK_NUMBER:-} (wrong issue); refusing repair."
-                  exit 1
-                fi
-                if [[ -n "${TASK_NUMBER:-}" && "$REF_ISSUE" != "$TASK_NUMBER" ]]; then
-                  echo "::error::PR #$PR_NUMBER snapshot reference #$REF_ISSUE does not match expected task #${TASK_NUMBER} on $REF_REPO (wrong issue); refusing repair."
-                  exit 1
-                fi
-              fi
-              # The PR body is mutable, so the reference alone never defines
-              # the contract: require it to match the durable snapshot comment
-              # before comparing live text. A PR-body edit that retargets the
-              # ref shas to an edited issue otherwise passes verification.
-              if ! SNAP_COMMENTS_JSON="$(gh api "repos/$REF_REPO/issues/$REF_ISSUE/comments?per_page=100&page=1" 2>/dev/null)"; then
-                echo "::error::Could not list task snapshot comments for $REF_REPO#$REF_ISSUE; refusing conflict repair."
-                exit 1
-              fi
-              SNAP_PINNED="$(SNAP_COMMENTS_JSON="$SNAP_COMMENTS_JSON" SNAP_REF_REPO="$REF_REPO" SNAP_REF_ISSUE="$REF_ISSUE" SNAP_REF_GENERATION="$REF_GENERATION" python3 -c 'import json,os,re; data=json.loads(os.environ.get("SNAP_COMMENTS_JSON") or "[]"); repo=(os.environ.get("SNAP_REF_REPO") or "").lower(); issue=os.environ.get("SNAP_REF_ISSUE") or ""; gen=os.environ.get("SNAP_REF_GENERATION") or ""; pat=re.compile(r"<!--\s*continuum-task-snapshot\s+repo=([A-Za-z0-9_.\-]+/[A-Za-z0-9_.\-]+)\s+issue=(\d+)\s+generation=(\d+)\s+title-sha256=([0-9a-fA-F]{64})\s+body-sha256=([0-9a-fA-F]{64})\s+spec-sha256=([0-9a-fA-F]{64})\s*-->"); trusted={"OWNER","MEMBER","COLLABORATOR"}; out=[(m.group(4).lower(),m.group(5).lower(),m.group(6).lower()) for c in data if isinstance(c,dict) for u in [c.get("user") if isinstance(c.get("user"),dict) else {}] for m in [pat.search(str(c.get("body") or ""))] if m and m.group(1).lower()==repo and m.group(2)==issue and m.group(3)==gen and (str(c.get("author_association") or "").upper() in trusted or str(u.get("login") or "").lower()=="github-actions[bot]")]; print("\n".join(out[0]) if out else "",end="")')"
-              SNAP_PINNED_TITLE_SHA="$(sed -n '1p' <<<"$SNAP_PINNED")"
-              SNAP_PINNED_BODY_SHA="$(sed -n '2p' <<<"$SNAP_PINNED")"
-              SNAP_PINNED_SPEC_SHA="$(sed -n '3p' <<<"$SNAP_PINNED")"
-              if [[ -z "$SNAP_PINNED_TITLE_SHA" || -z "$SNAP_PINNED_BODY_SHA" || -z "$SNAP_PINNED_SPEC_SHA" ]]; then
-                echo "::error::No trusted task snapshot comment found for $REF_REPO#$REF_ISSUE; refusing conflict repair."
-                exit 1
-              fi
-              if [[ "$SNAP_PINNED_TITLE_SHA" != "$REF_TITLE_SHA" || "$SNAP_PINNED_BODY_SHA" != "$REF_BODY_SHA" || "$SNAP_PINNED_SPEC_SHA" != "$REF_SPEC_SHA" ]]; then
-                echo "::error::PR #$PR_NUMBER snapshot reference does not match the durable task snapshot comment; refusing repair."
-                exit 1
-              fi
-              if ! REPAIR_LIVE_JSON="$(gh issue view "$REF_ISSUE" --repo "$REF_REPO" --json title,body 2>/dev/null)"; then
-                echo "::error::Could not fetch live task $REF_REPO#$REF_ISSUE for snapshot verification; refusing repair."
-                exit 1
-              fi
-              if [[ -z "$REPAIR_LIVE_JSON" ]]; then
-                echo "::error::Could not fetch live task $REF_REPO#$REF_ISSUE for snapshot verification; refusing conflict repair."
-                exit 1
-              fi
-              REPAIR_DIGESTS="$(REPAIR_LIVE_JSON="$REPAIR_LIVE_JSON" python3 -c 'import hashlib,json,os,unicodedata; norm=lambda v: unicodedata.normalize("NFC", v.replace("\r\n","\n").replace("\r","\n")); data=json.loads(os.environ.get("REPAIR_LIVE_JSON") or "{}"); title=norm(data.get("title") or ""); body=norm(data.get("body") or ""); title_sha=hashlib.sha256(title.encode("utf-8")).hexdigest(); body_sha=hashlib.sha256(body.encode("utf-8")).hexdigest(); spec_sha=hashlib.sha256((title_sha+":"+body_sha).encode("ascii")).hexdigest(); print(title_sha); print(body_sha); print(spec_sha)')"
-              LIVE_TITLE_SHA="$(sed -n '1p' <<<"$REPAIR_DIGESTS")"
-              LIVE_BODY_SHA="$(sed -n '2p' <<<"$REPAIR_DIGESTS")"
-              LIVE_SPEC_SHA="$(sed -n '3p' <<<"$REPAIR_DIGESTS")"
-              if [[ "$LIVE_TITLE_SHA" != "$REF_TITLE_SHA" || "$LIVE_BODY_SHA" != "$REF_BODY_SHA" || "$LIVE_SPEC_SHA" != "$REF_SPEC_SHA" ]]; then
-                gh pr comment "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" \
-                  --body "$(printf '%s\n%s\n%s\n%s' '<!-- continuum-task-snapshot-drift -->' '⚡ **Continuum · opencode**' '<!-- continuum-origin role=continuum component=opencode -->' "Task contract drift detected for $REF_REPO#$REF_ISSUE: the live issue no longer matches the PR's pinned snapshot. Conflict repair is stopped for this generation; open a new follow-up issue with an explicit dependency instead of editing the working issue.")" >/dev/null 2>&1 || true
-                echo "::error::Task contract drift detected for $REF_REPO#$REF_ISSUE (PR #$PR_NUMBER). Conflict repair stopped; open a new follow-up issue instead of editing the working issue."
-                exit 1
-              fi
-              echo "Task snapshot verified for $REF_REPO#$REF_ISSUE before conflict repair of PR #$PR_NUMBER."
-            fi
-          fi
-          # shellcheck disable=SC1091
-          source "${RUNNER_TEMP:-/tmp}/continuum-429-evacuate.sh" 2>/dev/null || true
-          # shellcheck disable=SC1090
-          source "${RUNNER_TEMP:-/tmp}/continuum-pr-staging.sh"
-          # kodmial/continuum#302: conflict repair updates only the exact
-          # current PR head. HEAD_REF must be a proven non-default ref
-          # before the agent runs and again before the push below.
-          continuum_assert_safe_push() {
-            local dest="${1:-}"
-            local repo="${2:-$GITHUB_REPOSITORY}"
-            dest="${dest#refs/heads/}"
-            dest="$(printf '%s' "$dest" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
-            if [[ -z "$dest" ]]; then echo "::error::Continuum branch safety: refusing code push with an empty destination." >&2; return 1; fi
-            case "$dest" in HEAD|@|FETCH_HEAD|ORIG_HEAD|MERGE_HEAD) echo "::error::Continuum branch safety: refusing ambiguous push destination '$dest'." >&2; return 1;; esac
-            case "$dest" in *".."*|*"~"*|*"^"*|*"?"*|*"*"*|*"["*|*" "*|*"@{"*) echo "::error::Continuum branch safety: refusing ambiguous push destination '$dest'." >&2; return 1;; esac
-            case "$dest" in -*|/*|*/|*.lock) echo "::error::Continuum branch safety: refusing ambiguous push destination '$dest'." >&2; return 1;; esac
-            if [[ "$dest" == *"//"* ]]; then echo "::error::Continuum branch safety: refusing ambiguous push destination '$dest'." >&2; return 1; fi
-            local default_branch=""
-            default_branch="$(gh api "repos/$repo" --jq .default_branch 2>/dev/null || true)"
-            default_branch="${default_branch#refs/heads/}"
-            default_branch="$(printf '%s' "$default_branch" | tr -d '[:space:]')"
-            if [[ -z "$default_branch" ]]; then echo "::error::Continuum branch safety: repository default branch is undiscoverable for '$repo'; refusing code push to '$dest'." >&2; return 1; fi
-            if [[ "$dest" == "$default_branch" ]]; then echo "::error::Continuum branch safety: refusing code push to the default branch '$dest'. Recovery resumes the same PR branch; only the PR merge operation may update the default branch." >&2; return 1; fi
-          }
-          continuum_assert_safe_push "$HEAD_REF" || exit 1
-          # `workflow_call` cannot declare an enumerated input, so validate the
-          # strategy here rather than interpolating an unvalidated value.
-          case "$CONFLICT_STRATEGY" in
-            merge | checkout) ;;
-            *)
-              echo "::error::Unsupported conflict_strategy '$CONFLICT_STRATEGY'; expected 'merge' or 'checkout'."
-              exit 1
-              ;;
-          esac
-
-          # The two strategies need genuinely different instructions, so the
-          # whole strategy-dependent block is chosen, not a single interpolated
-          # verb. `merge` must not rebase; `checkout` re-checks main over the
-          # branch and therefore has to be pushed with force-with-lease.
-          if [[ "$CONFLICT_STRATEGY" == "checkout" ]]; then
-            read -r -d '' STRATEGY_BLOCK <<'BLOCK' || true
-            - Fetch the current origin/main and check it out over the current PR
-              branch (`git checkout origin/main -- .`), then re-apply the PR's own
-              intent on top of that tree by hand.
-            - Every file that both sides changed must end up containing the
-              intended behavior from BOTH the PR and main; resolving a conflict
-              by taking either side wholesale is a failure.
-            - Leave the reconciled tree as working-tree changes; the workflow
-              publishes the result. Never rebase, force-push, or reset.
-          BLOCK
-          else
-            read -r -d '' STRATEGY_BLOCK <<'BLOCK' || true
-            - Fetch the current origin/main and merge it into the current PR
-              branch, resolving the conflicts as part of that merge without
-              committing yet (leave the merge result staged/unstaged for the
-              workflow to commit).
-            - Resolve every merge conflict while preserving the intended behavior
-              from both the PR and main; do not discard unrelated changes from
-              either side.
-            - Leave the merge result uncommitted for the workflow to publish.
-              Never rebase, force-push, or reset away either side.
-          BLOCK
-          fi
-          PROMPT=$(cat <<EOF
-          Resolve the merge conflict between pull request #${PR_NUMBER} and the current main branch.
-
-          Context:
-          - The current checkout is the existing PR head branch: ${HEAD_REF}.
-          - This workflow was dispatched only after GitHub reported that the PR cannot
-            be updated cleanly from main.
-          - The consumer selected the conflict strategy: ${CONFLICT_STRATEGY}.
-
-          Requirements:
-          ${STRATEGY_BLOCK}
-          - Work only in the current checked-out PR branch. Do not create or switch to
-            another branch and do not create a new pull request.
-          - Do not commit, push, switch branches, rebase, or reset; the workflow
-            owns Git state and publishes the merge result as a bot-identity
-            commit after this run. Leave the resolved tree as working-tree
-            changes (including the merge state).
-          - Run the relevant tests, linters, or validation after resolving the conflicts.
-          - Keep all comments and commit messages in English.
-          EOF
-          )
-          OPENCODE_RUN_LOG="$(mktemp)"
-          set +e
-          continuum-opencode run --auto --model "$OPENCODE_MODEL" "$PROMPT" 2>&1 | tee "$OPENCODE_RUN_LOG"
-          OPENCODE_RUN_RC=${PIPESTATUS[0]}
-          set -e
-          # The provider can report exit 1 after the wrapper has already
-          # identified a 429/unavailable failure. Honor the durable marker:
-          # evacuate the dirty tree instead of losing completed agent edits.
-          if [[ "$OPENCODE_RUN_RC" -ne 0 ]]; then
-            if [[ -f "${RUNNER_TEMP:-/tmp}/continuum-opencode-upstream-unavailable" ]]; then
-              OPENCODE_RUN_RC=76
-            elif [[ -f "${RUNNER_TEMP:-/tmp}/continuum-opencode-429" ]]; then
-              OPENCODE_RUN_RC=75
-            fi
-          fi
-          if [[ "$OPENCODE_RUN_RC" -eq 75 || "$OPENCODE_RUN_RC" -eq 76 ]]; then
-            # kodmial/continuum#290: 429 burns this VM. Workflow-owned
-            # evacuation preserves the conflict-repair working tree, the exact
-            # PR HEAD identity, and the review-repair stage to the durable
-            # recovery ref. No second model call on this VM; exit 75.
-            rm -f "$OPENCODE_RUN_LOG"
-            CONFLICT_BASE_SHA="$(git rev-parse HEAD)"
-            CONTINUUM_INFRA_FAILURE_REASON=quota_429
-            [[ "$OPENCODE_RUN_RC" -eq 76 ]] && CONTINUUM_INFRA_FAILURE_REASON=unavailable
-            continuum_infra_evacuate "opencode-429-resolve-conflict-pr${PR_NUMBER}" "review-repair" "resolve-conflict" "" "$PR_NUMBER" "$CONFLICT_BASE_SHA" "$CONTINUUM_INFRA_FAILURE_REASON"
-          fi
-          rm -f "$OPENCODE_RUN_LOG"
-          if [[ "$OPENCODE_RUN_RC" -ne 0 ]]; then
-            exit "$OPENCODE_RUN_RC"
-          fi
-
-          # kodmial/continuum#260: deterministic ownership — the workflow owns
-          # the final conflict-repair commit with the bot identity plus the
-          # component trailer. Never rebase or reset away either side.
-          # kodmial/continuum#413: exclude only workflow-owned artifacts at
-          # the publish boundary; legitimate merge edits and declared
-          # submodules stay intact, and an unknown Gitlink fails closed.
-          continuum_stage_publishable || exit 1
-          if ! git diff --cached --quiet; then
-            git commit -m "fix: resolve merge conflict with main for PR #${PR_NUMBER}" -m "Continuum-Component: opencode"
-          fi
-          if [[ "$(git rev-list --count "origin/${HEAD_REF}"..HEAD)" -gt 0 ]]; then
-            # kodmial/continuum#302: conflict repair publishes only to the
-            # proven non-default PR head asserted on entry.
-            continuum_assert_safe_push "${HEAD_REF}" || exit 1
-            git push origin "HEAD:${HEAD_REF}"
-          fi
-
-      - name: Fix failed blocking workflow
-        if: github.event_name == 'workflow_dispatch' && inputs.mode == 'ci-fix' && steps.recovery_restore.outputs.skip_opencode != 'true'
-        env:
-          OPENCODE_MODEL: ${{ steps.model_route.outputs.model }}
-          GITHUB_TOKEN: ${{ secrets.TAP_PAT }}
-          GH_TOKEN: ${{ secrets.TAP_PAT }}
-          PR_NUMBER: ${{ inputs.pr_number }}
-          RUN_ID: ${{ inputs.run_id }}
-          HEAD_REF: ${{ inputs.head_ref }}
-          TASK_CONTEXT_PRESENT: ${{ steps.task_context.outputs.present }}
-          TASK_CONTEXT_SOURCE: ${{ steps.task_context.outputs.source }}
-          TASK_REPO: ${{ steps.task_context.outputs.task_repo }}
-          TASK_NUMBER: ${{ steps.task_context.outputs.task_number }}
-          TASK_TITLE: ${{ steps.task_context.outputs.task_title }}
-          TASK_BODY: ${{ steps.task_context.outputs.task_body }}
-          TASK_URL: ${{ steps.task_context.outputs.task_url }}
-          PR_TITLE: ${{ steps.task_context.outputs.pr_title }}
-          PR_BODY: ${{ steps.task_context.outputs.pr_body }}
-          RECOVERY_GENERATION_IN: ${{ inputs.recovery_generation }}
-        run: |
-          set -euo pipefail
-          # shellcheck disable=SC1091
-          source "${RUNNER_TEMP:-/tmp}/continuum-429-evacuate.sh" 2>/dev/null || true
-          # shellcheck disable=SC1090
-          source "${RUNNER_TEMP:-/tmp}/continuum-pr-staging.sh"
-          # kodmial/continuum#302: CI repair updates only the exact current
-          # PR head. HEAD_REF must be a proven non-default ref before the
-          # agent runs and again before the push below.
-          continuum_assert_safe_push() {
-            local dest="${1:-}"
-            local repo="${2:-$GITHUB_REPOSITORY}"
-            dest="${dest#refs/heads/}"
-            dest="$(printf '%s' "$dest" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
-            if [[ -z "$dest" ]]; then echo "::error::Continuum branch safety: refusing code push with an empty destination." >&2; return 1; fi
-            case "$dest" in HEAD|@|FETCH_HEAD|ORIG_HEAD|MERGE_HEAD) echo "::error::Continuum branch safety: refusing ambiguous push destination '$dest'." >&2; return 1;; esac
-            case "$dest" in *".."*|*"~"*|*"^"*|*"?"*|*"*"*|*"["*|*" "*|*"@{"*) echo "::error::Continuum branch safety: refusing ambiguous push destination '$dest'." >&2; return 1;; esac
-            case "$dest" in -*|/*|*/|*.lock) echo "::error::Continuum branch safety: refusing ambiguous push destination '$dest'." >&2; return 1;; esac
-            if [[ "$dest" == *"//"* ]]; then echo "::error::Continuum branch safety: refusing ambiguous push destination '$dest'." >&2; return 1; fi
-            local default_branch=""
-            default_branch="$(gh api "repos/$repo" --jq .default_branch 2>/dev/null || true)"
-            default_branch="${default_branch#refs/heads/}"
-            default_branch="$(printf '%s' "$default_branch" | tr -d '[:space:]')"
-            if [[ -z "$default_branch" ]]; then echo "::error::Continuum branch safety: repository default branch is undiscoverable for '$repo'; refusing code push to '$dest'." >&2; return 1; fi
-            if [[ "$dest" == "$default_branch" ]]; then echo "::error::Continuum branch safety: refusing code push to the default branch '$dest'. Recovery resumes the same PR branch; only the PR merge operation may update the default branch." >&2; return 1; fi
-          }
-          continuum_assert_safe_push "$HEAD_REF" || exit 1
-
-          # kodmial/continuum#295: frozen task-spec guard for CI repair.
-          # Same contract as the CodeRabbit repair guard: the PR's snapshot
-          # reference is pinned, the live issue is re-read, drift stops the
-          # repair, legacy PRs proceed explicitly unprotected.
-          if [[ -n "${PR_NUMBER:-}" ]]; then
-            if ! REPAIR_PR_BODY="$(gh pr view "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --json body --jq '.body // ""' 2>/dev/null)"; then
-              echo "::error::Could not fetch PR #$PR_NUMBER body for snapshot verification; refusing repair."
-              exit 1
-            fi
-            REPAIR_SNAPSHOT_REF="$(grep -oE '<!--[[:space:]]*continuum-task-snapshot-ref[^>]*-->' <<<"$REPAIR_PR_BODY" | head -n 1 || true)"
-            if [[ -z "$REPAIR_SNAPSHOT_REF" ]]; then
-              echo "::notice::PR #$PR_NUMBER carries no task snapshot reference (legacy, pre-guard PR); CI repair proceeds explicitly without drift protection."
-            else
-              REF_REPO="$(sed -nE 's/.*repo=([A-Za-z0-9_.\-]+\/[A-Za-z0-9_.\-]+).*/\1/p' <<<"$REPAIR_SNAPSHOT_REF" | head -n 1)"
-              REF_ISSUE="$(sed -nE 's/.*issue=([0-9]+).*/\1/p' <<<"$REPAIR_SNAPSHOT_REF" | head -n 1)"
-              REF_TITLE_SHA="$(sed -nE 's/.*title-sha256=([0-9a-fA-F]{64}).*/\1/p' <<<"$REPAIR_SNAPSHOT_REF" | head -n 1 | tr 'A-F' 'a-f')"
-              REF_BODY_SHA="$(sed -nE 's/.*body-sha256=([0-9a-fA-F]{64}).*/\1/p' <<<"$REPAIR_SNAPSHOT_REF" | head -n 1 | tr 'A-F' 'a-f')"
-              REF_GENERATION="$(sed -nE 's/.*generation=([0-9]+).*/\1/p' <<<"$REPAIR_SNAPSHOT_REF" | head -n 1)"
-              REF_SPEC_SHA="$(sed -nE 's/.*spec-sha256=([0-9a-fA-F]{64}).*/\1/p' <<<"$REPAIR_SNAPSHOT_REF" | head -n 1 | tr 'A-F' 'a-f')"
-              if [[ -z "$REF_REPO" || -z "$REF_ISSUE" || -z "$REF_GENERATION" || -z "$REF_TITLE_SHA" || -z "$REF_BODY_SHA" || -z "$REF_SPEC_SHA" ]]; then
-                echo "::error::PR #$PR_NUMBER snapshot reference is malformed; refusing CI repair without a verifiable contract."
-                exit 1
-              fi
-              if [[ "$REF_GENERATION" != "1" ]]; then
-                echo "::error::PR #$PR_NUMBER snapshot reference is for generation $REF_GENERATION, expected generation 1 (stale contract); refusing repair."
-                exit 1
-              fi
-              if [[ "${TASK_CONTEXT_PRESENT:-}" == "true" ]]; then
-                if [[ -n "${TASK_REPO:-}" && "$(tr '[:upper:]' '[:lower:]' <<<"$REF_REPO")" != "$(tr '[:upper:]' '[:lower:]' <<<"$TASK_REPO")" ]]; then
-                  echo "::error::PR #$PR_NUMBER snapshot reference $REF_REPO#$REF_ISSUE does not match expected task $TASK_REPO#${TASK_NUMBER:-} (wrong issue); refusing repair."
-                  exit 1
-                fi
-                if [[ -n "${TASK_NUMBER:-}" && "$REF_ISSUE" != "$TASK_NUMBER" ]]; then
-                  echo "::error::PR #$PR_NUMBER snapshot reference #$REF_ISSUE does not match expected task #${TASK_NUMBER} on $REF_REPO (wrong issue); refusing repair."
-                  exit 1
-                fi
-              fi
-              # The PR body is mutable, so the reference alone never defines
-              # the contract: require it to match the durable snapshot comment
-              # before comparing live text. A PR-body edit that retargets the
-              # ref shas to an edited issue otherwise passes verification.
-              if ! SNAP_COMMENTS_JSON="$(gh api "repos/$REF_REPO/issues/$REF_ISSUE/comments?per_page=100&page=1" 2>/dev/null)"; then
-                echo "::error::Could not list task snapshot comments for $REF_REPO#$REF_ISSUE; refusing CI repair."
-                exit 1
-              fi
-              SNAP_PINNED="$(SNAP_COMMENTS_JSON="$SNAP_COMMENTS_JSON" SNAP_REF_REPO="$REF_REPO" SNAP_REF_ISSUE="$REF_ISSUE" SNAP_REF_GENERATION="$REF_GENERATION" python3 -c 'import json,os,re; data=json.loads(os.environ.get("SNAP_COMMENTS_JSON") or "[]"); repo=(os.environ.get("SNAP_REF_REPO") or "").lower(); issue=os.environ.get("SNAP_REF_ISSUE") or ""; gen=os.environ.get("SNAP_REF_GENERATION") or ""; pat=re.compile(r"<!--\s*continuum-task-snapshot\s+repo=([A-Za-z0-9_.\-]+/[A-Za-z0-9_.\-]+)\s+issue=(\d+)\s+generation=(\d+)\s+title-sha256=([0-9a-fA-F]{64})\s+body-sha256=([0-9a-fA-F]{64})\s+spec-sha256=([0-9a-fA-F]{64})\s*-->"); trusted={"OWNER","MEMBER","COLLABORATOR"}; out=[(m.group(4).lower(),m.group(5).lower(),m.group(6).lower()) for c in data if isinstance(c,dict) for u in [c.get("user") if isinstance(c.get("user"),dict) else {}] for m in [pat.search(str(c.get("body") or ""))] if m and m.group(1).lower()==repo and m.group(2)==issue and m.group(3)==gen and (str(c.get("author_association") or "").upper() in trusted or str(u.get("login") or "").lower()=="github-actions[bot]")]; print("\n".join(out[0]) if out else "",end="")')"
-              SNAP_PINNED_TITLE_SHA="$(sed -n '1p' <<<"$SNAP_PINNED")"
-              SNAP_PINNED_BODY_SHA="$(sed -n '2p' <<<"$SNAP_PINNED")"
-              SNAP_PINNED_SPEC_SHA="$(sed -n '3p' <<<"$SNAP_PINNED")"
-              if [[ -z "$SNAP_PINNED_TITLE_SHA" || -z "$SNAP_PINNED_BODY_SHA" || -z "$SNAP_PINNED_SPEC_SHA" ]]; then
-                echo "::error::No trusted task snapshot comment found for $REF_REPO#$REF_ISSUE; refusing CI repair."
-                exit 1
-              fi
-              if [[ "$SNAP_PINNED_TITLE_SHA" != "$REF_TITLE_SHA" || "$SNAP_PINNED_BODY_SHA" != "$REF_BODY_SHA" || "$SNAP_PINNED_SPEC_SHA" != "$REF_SPEC_SHA" ]]; then
-                echo "::error::PR #$PR_NUMBER snapshot reference does not match the durable task snapshot comment; refusing repair."
-                exit 1
-              fi
-              if ! REPAIR_LIVE_JSON="$(gh issue view "$REF_ISSUE" --repo "$REF_REPO" --json title,body 2>/dev/null)"; then
-                echo "::error::Could not fetch live task $REF_REPO#$REF_ISSUE for snapshot verification; refusing repair."
-                exit 1
-              fi
-              if [[ -z "$REPAIR_LIVE_JSON" ]]; then
-                echo "::error::Could not fetch live task $REF_REPO#$REF_ISSUE for snapshot verification; refusing CI repair."
-                exit 1
-              fi
-              REPAIR_DIGESTS="$(REPAIR_LIVE_JSON="$REPAIR_LIVE_JSON" python3 -c 'import hashlib,json,os,unicodedata; norm=lambda v: unicodedata.normalize("NFC", v.replace("\r\n","\n").replace("\r","\n")); data=json.loads(os.environ.get("REPAIR_LIVE_JSON") or "{}"); title=norm(data.get("title") or ""); body=norm(data.get("body") or ""); title_sha=hashlib.sha256(title.encode("utf-8")).hexdigest(); body_sha=hashlib.sha256(body.encode("utf-8")).hexdigest(); spec_sha=hashlib.sha256((title_sha+":"+body_sha).encode("ascii")).hexdigest(); print(title_sha); print(body_sha); print(spec_sha)')"
-              LIVE_TITLE_SHA="$(sed -n '1p' <<<"$REPAIR_DIGESTS")"
-              LIVE_BODY_SHA="$(sed -n '2p' <<<"$REPAIR_DIGESTS")"
-              LIVE_SPEC_SHA="$(sed -n '3p' <<<"$REPAIR_DIGESTS")"
-              if [[ "$LIVE_TITLE_SHA" != "$REF_TITLE_SHA" || "$LIVE_BODY_SHA" != "$REF_BODY_SHA" || "$LIVE_SPEC_SHA" != "$REF_SPEC_SHA" ]]; then
-                gh pr comment "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" \
-                  --body "$(printf '%s\n%s\n%s\n%s' '<!-- continuum-task-snapshot-drift -->' '⚡ **Continuum · opencode**' '<!-- continuum-origin role=continuum component=opencode -->' "Task contract drift detected for $REF_REPO#$REF_ISSUE: the live issue no longer matches the PR's pinned snapshot. CI repair is stopped for this generation; open a new follow-up issue with an explicit dependency instead of editing the working issue.")" >/dev/null 2>&1 || true
-                echo "::error::Task contract drift detected for $REF_REPO#$REF_ISSUE (PR #$PR_NUMBER). CI repair stopped; open a new follow-up issue instead of editing the working issue."
-                exit 1
-              fi
-              echo "Task snapshot verified for $REF_REPO#$REF_ISSUE before CI repair of PR #$PR_NUMBER."
-            fi
-          fi
-
-          if [[ "$TASK_CONTEXT_PRESENT" == "true" ]]; then
-            TASK_CONTEXT_BLOCK="$(cat <<EOF
-          Authoritative task (resolved via ${TASK_CONTEXT_SOURCE}):
-          ${TASK_REPO}#${TASK_NUMBER}
-          ${TASK_URL}
-
-          Task title:
-          ${TASK_TITLE}
-
-          Task specification / Definition of Done:
-          ${TASK_BODY}
-          EOF
-            )"
-          else
-            TASK_CONTEXT_BLOCK="No authoritative task issue was resolved for this legacy PR. Do not fabricate one; constrain changes to the existing PR intent and the concrete failing validation."
-          fi
-
-          PROMPT=$(cat <<EOF
-          Repair pull request #${PR_NUMBER} without losing the task contract.
-
-          ${TASK_CONTEXT_BLOCK}
-
-          Current PR:
-          Title: ${PR_TITLE}
-          Body:
-          ${PR_BODY}
-
-          Failure evidence:
-          - Current checkout/PR head branch: ${HEAD_REF}.
-          - Failed blocking workflow run id: ${RUN_ID}.
-          - Inspect that exact run, failed jobs and logs using GitHub CLI/API before changing code.
-
-          Requirements:
-          - When authoritative task context is present, treat its specification and Definition of Done as authoritative, exactly as the initial implementation run does.
-          - Use the PR diff and failed workflow logs to diagnose the defect; they do not replace or narrow the task contract.
-          - Identify the concrete workflow failure and fix the root cause while preserving the complete task intent.
-          - Never weaken, delete, skip, or special-case a validation merely to make CI green. If a validation assertion is stale, change it only after proving from the authoritative task and current implementation contract that the assertion is wrong.
-          - Keep the change scoped to the failure and task contract; do not make unrelated refactors.
-          - If the failure is clearly transient or external infrastructure, do not make a speculative code change; explain the reason in the existing PR conversation.
-          - Work only in the current checked-out PR branch. Do not create or switch to another branch and do not create a new pull request.
-          - Run the repository's complete relevant validation locally after the final edit when possible.
-          - Do not commit, push, switch branches, rebase, or reset; the workflow
-            owns Git state and publishes the repair as a bot-identity commit
-            after this run. Leave fixes as working-tree changes.
-          - Keep all comments and commit messages in English.
-          EOF
-          )
-          OPENCODE_RUN_LOG="$(mktemp)"
-          set +e
-          continuum-opencode run --auto --model "$OPENCODE_MODEL" "$PROMPT" 2>&1 | tee "$OPENCODE_RUN_LOG"
-          OPENCODE_RUN_RC=${PIPESTATUS[0]}
-          set -e
-          # The provider can report exit 1 after the wrapper has already
-          # identified a 429/unavailable failure. Honor the durable marker:
-          # evacuate the dirty tree instead of losing completed agent edits.
-          if [[ "$OPENCODE_RUN_RC" -ne 0 ]]; then
-            if [[ -f "${RUNNER_TEMP:-/tmp}/continuum-opencode-upstream-unavailable" ]]; then
-              OPENCODE_RUN_RC=76
-            elif [[ -f "${RUNNER_TEMP:-/tmp}/continuum-opencode-429" ]]; then
-              OPENCODE_RUN_RC=75
-            fi
-          fi
-          if [[ "$OPENCODE_RUN_RC" -eq 75 || "$OPENCODE_RUN_RC" -eq 76 ]]; then
-            # kodmial/continuum#290: 429 burns this VM. Workflow-owned
-            # evacuation preserves the CI-repair working tree, the exact PR
-            # HEAD identity, and the review-repair stage to the durable
-            # recovery ref. No second model call on this VM; exit 75.
-            rm -f "$OPENCODE_RUN_LOG"
-            CI_BASE_SHA="$(git rev-parse HEAD)"
-            CONTINUUM_INFRA_FAILURE_REASON=quota_429
-            [[ "$OPENCODE_RUN_RC" -eq 76 ]] && CONTINUUM_INFRA_FAILURE_REASON=unavailable
-            continuum_infra_evacuate "opencode-429-ci-fix-pr${PR_NUMBER}-run${RUN_ID}" "review-repair" "ci-fix" "" "$PR_NUMBER" "$CI_BASE_SHA" "$CONTINUUM_INFRA_FAILURE_REASON"
-          fi
-          rm -f "$OPENCODE_RUN_LOG"
-          if [[ "$OPENCODE_RUN_RC" -ne 0 ]]; then
-            exit "$OPENCODE_RUN_RC"
-          fi
-
-          # kodmial/continuum#260: deterministic ownership — the workflow owns
-          # the final repair commit with the bot identity plus the component
-          # trailer. The agent never commits.
-          BEFORE_SHA=$(git rev-parse HEAD)
-          # kodmial/continuum#413: the CI repair publishes through the same
-          # deterministic boundary as issue mode; workflow-only files never
-          # enter the PR, and an unknown Gitlink fails closed before push.
-          continuum_stage_publishable || exit 1
-          if ! git diff --cached --quiet; then
-            git commit -m "fix: repair blocking workflow for PR #${PR_NUMBER}" -m "Continuum-Component: opencode"
-            # kodmial/continuum#302: publish only to the proven PR ref.
-            # The PR may advance during CI-fix; never overwrite its history.
-            # The newer HEAD is evaluated by its own exact-HEAD CI-repair gate.
-            continuum_assert_safe_push "${HEAD_REF}" || exit 1
-            if ! git fetch --no-tags origin "refs/heads/${HEAD_REF}"; then
-              echo "::error::Cannot verify remote CI-repair PR head."
-              exit 1
-            fi
-            REMOTE_HEAD="$(git rev-parse FETCH_HEAD)"
-            if [[ "$REMOTE_HEAD" != "$BEFORE_SHA" ]]; then
-              echo "::notice::CI-repair PR #${PR_NUMBER}: superseded by remote HEAD $REMOTE_HEAD (base $BEFORE_SHA); stale fix discarded."
-              exit 0
-            fi
-            if ! git push origin "HEAD:${HEAD_REF}"; then
-              # Recheck the actual ref: reject a transport/auth failure, but
-              # treat a proved concurrent head advance as a stale no-op.
-              if git fetch --no-tags origin "refs/heads/${HEAD_REF}"; then
-                REMOTE_HEAD="$(git rev-parse FETCH_HEAD)"
-                if [[ "$REMOTE_HEAD" != "$BEFORE_SHA" ]]; then
-                  echo "::notice::CI-repair PR #${PR_NUMBER}: superseded during push by $REMOTE_HEAD; new-head CI owns recovery."
-                  exit 0
-                fi
-              fi
-              echo "::error::CI-repair push failed without confirmed HEAD advance."
-              exit 1
-            fi
-          fi
-          AFTER_SHA=$(git rev-parse HEAD)
-
-          # If the agent correctly decided there is no code fix to make (for
-          # example a transient runner/network failure), retry the evaluated
-          # workflow without changing the PR. Prefer only failed jobs, then fall
-          # back to a full rerun for cancelled/timed-out runs that have no
-          # rerunnable failed-job subset.
-          if [[ "$AFTER_SHA" == "$BEFORE_SHA" ]]; then
-            echo "OpenCode produced no new commit; retrying the evaluated workflow."
-            gh run rerun "$RUN_ID" --failed || gh run rerun "$RUN_ID"
-          fi
-
       - name: Re-run the consumer blocking CI workflow for this head
         if: >-
           github.event_name == 'workflow_dispatch' &&
@@ -5697,6 +6198,181 @@ jobs:
           gh api --method DELETE \
             "repos/${GITHUB_REPOSITORY}/issues/${PR_NUMBER}/labels/opencode-conflict-repair" \
             >/dev/null 2>&1 || true
+
+  recover-repair-publication:
+    name: Recover authenticated repair publication
+    needs: opencode
+    # The primary status write and its in-job retry both target the commit
+    # this run already pushed. If both exhaust their budgets the job fails, and
+    # a later repair run cannot substitute: its snapshot base would be this
+    # run's head, so it would never attest the original commit. Re-attest the
+    # exact base/head from the failed job's outputs here, on a fresh runner.
+    if: >-
+      !cancelled() &&
+      needs.opencode.result == 'failure'
+    runs-on: ubuntu-latest
+    timeout-minutes: ${{ fromJSON(vars.AUTOMATION_ATTEMPTS_TIMEOUT_MINUTES || '10') }}
+
+    permissions: {}
+
+    steps:
+      - name: Republish authenticated repair publication after retry exhaustion
+        env:
+          GH_TOKEN: ${{ secrets.TAP_PAT }}
+          BASE_SHA: ${{ needs.opencode.outputs.repair_base_sha }}
+          HEAD_SHA: ${{ needs.opencode.outputs.repair_head_sha }}
+          PR_NUMBER: ${{ needs.opencode.outputs.repair_pr_number }}
+          HEAD_REF: ${{ needs.opencode.outputs.repair_branch }}
+        run: |
+          set -euo pipefail
+          base="$BASE_SHA"
+          head="$HEAD_SHA"
+          if [[ -z "$base" && -z "$head" ]]; then
+            echo "No repair publication was prepared for this run; nothing to recover."
+            exit 0
+          fi
+          [[ "$base" =~ ^[0-9a-f]{40}$ && "$head" =~ ^[0-9a-f]{40}$ ]] \
+            || { echo "::error::Recovered repair publication has no full base/head commit; refusing to attest continuity."; exit 1; }
+          [[ "$base" != "$head" ]] \
+            || { echo "::error::Recovered repair publication reported no new commit; refusing to attest continuity."; exit 1; }
+          [[ "$PR_NUMBER" =~ ^[1-9][0-9]*$ && -n "$HEAD_REF" ]] \
+            || { echo "::error::Recovered repair publication has no PR or branch identity; refusing to attest continuity."; exit 1; }
+          RECOVERY_DIR="${RUNNER_TEMP:-/tmp}/continuum-repair-publication-recovery"
+          mkdir -p "$RECOVERY_DIR"
+          jq -n \
+            --arg repo "$GITHUB_REPOSITORY" \
+            --arg run "$GITHUB_RUN_ID" \
+            --arg attempt "$GITHUB_RUN_ATTEMPT" \
+            --arg pr "$PR_NUMBER" \
+            --arg branch "$HEAD_REF" \
+            --arg base "$base" \
+            --arg head "$head" \
+            '{schema_version:1, repo:$repo, run_id:$run, run_attempt:$attempt, pr_number:($pr | tonumber), branch:$branch, base_sha: $base, head_sha: $head}' \
+            > "$RECOVERY_DIR/publication.json"
+          for attempt in 1 2 3; do
+            if gh api --method POST "repos/$GITHUB_REPOSITORY/statuses/$head" \
+              -f state=success \
+              -f context=continuum/repair-publication \
+              -f description="pr=${PR_NUMBER} base=${base:0:12} head=${head:0:12}" \
+              -f target_url="https://github.com/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
+              >/dev/null; then
+              exit 0
+            fi
+            [[ "$attempt" -eq 3 ]] && break
+            sleep $((attempt * 5))
+          done
+          echo "::error::CONTINUUM_REPAIR_PUBLICATION_RETRY_REQUIRED"
+          echo "::error::Continuum could not recover the authenticated repair status for $head after the retry budget."
+          exit 1
+
+      - name: Upload recovered authenticated repair publication receipt
+        if: >-
+          !cancelled() &&
+          needs.opencode.outputs.repair_head_sha != ''
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: continuum-repair-publication-${{ github.run_attempt }}-job-recovery
+          path: ${{ runner.temp }}/continuum-repair-publication-recovery/publication.json
+          if-no-files-found: error
+
+  recover-issue-publication:
+    name: Recover authenticated issue publication receipt
+    needs: opencode
+    # A failed `Upload OpenCode publication receipt` step leaves the PR in place
+    # without the run-scoped receipt the canary requires. A rerun cannot repair
+    # it directly: the duplicate guard sees the existing `opencode/issue<N>-`
+    # PR and skips both implementation and the upload, so it forwards the
+    # identity recorded at creation instead of inferring one. Re-attest that
+    # identity here, on a fresh runner, without creating or changing any PR.
+    if: >-
+      !cancelled() &&
+      (needs.opencode.result == 'failure' ||
+       needs.opencode.outputs.publication_upload_outcome == 'failure' ||
+       needs.opencode.outputs.publication_recovery_upload_outcome == 'failure')
+    runs-on: ubuntu-latest
+    timeout-minutes: ${{ fromJSON(vars.AUTOMATION_ATTEMPTS_TIMEOUT_MINUTES || '10') }}
+
+    permissions: {}
+
+    steps:
+      - name: Republish the OpenCode publication receipt from the recorded identity
+        id: republish_issue_publication
+        env:
+          GH_TOKEN: ${{ secrets.TAP_PAT }}
+          ISSUE_NUMBER: ${{ needs.opencode.outputs.publication_issue }}
+          BRANCH: ${{ needs.opencode.outputs.publication_branch }}
+          PR_NUMBER: ${{ needs.opencode.outputs.publication_pr_number }}
+          HEAD_SHA: ${{ needs.opencode.outputs.publication_head_sha }}
+          PUBLICATION_ATTEMPT: ${{ needs.opencode.outputs.publication_attempt }}
+        run: |
+          set -euo pipefail
+          if [[ -z "$ISSUE_NUMBER$BRANCH$PR_NUMBER$HEAD_SHA" ]]; then
+            echo "No issue publication was recorded for this run; nothing to recover."
+            exit 0
+          fi
+          [[ "$ISSUE_NUMBER" =~ ^[1-9][0-9]*$ && "$PR_NUMBER" =~ ^[1-9][0-9]*$ ]] \
+            || { echo "::error::Recovered publication has no issue or pull-request identity; refusing to attest."; exit 1; }
+          [[ "$HEAD_SHA" =~ ^[0-9a-f]{40}$ ]] \
+            || { echo "::error::Recovered publication has no full task commit; refusing to attest."; exit 1; }
+          [[ "$BRANCH" == "opencode/issue${ISSUE_NUMBER}-"* ]] \
+            || { echo "::error::Recovered publication branch '$BRANCH' is not this issue's task branch; refusing to attest."; exit 1; }
+          [[ "${PUBLICATION_ATTEMPT:-}" =~ ^[1-9][0-9]*$ ]] \
+            || { echo "::error::Recovered publication has no valid run attempt; refusing to attest."; exit 1; }
+          # The identity is only trustworthy when the PR it names still exists
+          # with this branch and contains this commit. Verify both before
+          # attesting; a deleted or retargeted PR must never inherit a receipt.
+          PR_JSON="$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER" 2>/dev/null)" \
+            || { echo "::error::Could not read PR #$PR_NUMBER for publication recovery; refusing to attest."; exit 1; }
+          PR_BRANCH="$(jq -r '.head.ref // ""' <<<"$PR_JSON")"
+          PR_HEAD="$(jq -r '.head.sha // ""' <<<"$PR_JSON")"
+          PR_REPO="$(jq -r '.head.repo.full_name // ""' <<<"$PR_JSON")"
+          [[ "$PR_BRANCH" == "$BRANCH" ]] \
+            || { echo "::error::PR #$PR_NUMBER head is '$PR_BRANCH', not the recorded '$BRANCH'; refusing to attest."; exit 1; }
+          [[ "$PR_REPO" == "$GITHUB_REPOSITORY" ]] \
+            || { echo "::error::PR #$PR_NUMBER head repository is '$PR_REPO', not '$GITHUB_REPOSITORY'; refusing to attest another repository's PR."; exit 1; }
+          [[ "$PR_HEAD" =~ ^[0-9a-f]{40}$ ]] \
+            || { echo "::error::Could not read PR #$PR_NUMBER head; refusing to attest."; exit 1; }
+          ANCESTRY="$(gh api "repos/$GITHUB_REPOSITORY/compare/${HEAD_SHA}...${PR_HEAD}" --jq .status 2>/dev/null)" \
+            || { echo "::error::Could not compare recovered task commit with PR #$PR_NUMBER; refusing to attest."; exit 1; }
+          case "$ANCESTRY" in
+            ahead|identical) ;;
+            *)
+              echo "::error::Recovered task commit $HEAD_SHA is not behind PR #$PR_NUMBER head $PR_HEAD; refusing to attest."
+              exit 1
+              ;;
+          esac
+          # A failed action can still have uploaded its artifact, and a worker
+          # failure after a successful upload needs no extra receipt. Recovery
+          # is idempotent, so a rerun of this job never piles up duplicates.
+          PRESENT="$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/artifacts?per_page=100" \
+            --jq '[.artifacts[] | select((.expired | tostring) != "true") | select(.name | startswith("continuum-task-publication"))] | length')"
+          if [[ "$PRESENT" != "0" ]]; then
+            echo "Publication receipt already exists for run $GITHUB_RUN_ID; nothing to recover."
+            exit 0
+          fi
+          RECOVERY_DIR="${RUNNER_TEMP:-/tmp}/continuum-task-publication-recovery"
+          mkdir -p "$RECOVERY_DIR"
+          jq -n \
+            --arg repo "$GITHUB_REPOSITORY" \
+            --arg issue "$ISSUE_NUMBER" \
+            --arg run "$GITHUB_RUN_ID" \
+            --arg attempt "$PUBLICATION_ATTEMPT" \
+            --arg branch "$BRANCH" \
+            --arg pr "$PR_NUMBER" \
+            --arg head "$HEAD_SHA" \
+            '{schema_version: 1, repo: $repo, issue: ($issue | tonumber), run_id: $run, run_attempt: $attempt, branch: $branch, pr_number: ($pr | tonumber), head_sha: $head}' \
+            > "$RECOVERY_DIR/publication.json"
+          echo "present=true" >> "$GITHUB_OUTPUT"
+
+      - name: Upload recovered OpenCode publication receipt
+        if: >-
+          !cancelled() &&
+          steps.republish_issue_publication.outputs.present == 'true'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: continuum-task-publication-${{ needs.opencode.outputs.publication_attempt || github.run_attempt }}-job-recovery
+          path: ${{ runner.temp }}/continuum-task-publication-recovery/publication.json
+          if-no-files-found: error
 
   cleanup-workflow-repair-lock:
     name: Release workflow-repair lock

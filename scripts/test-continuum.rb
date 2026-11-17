@@ -7511,6 +7511,41 @@ class ContinuumTest < Minitest::Test
     assert_includes repair, 'Never weaken, delete, skip, or special-case a validation merely to make CI green.'
     assert_includes repair, 'No authoritative task issue was resolved for this legacy PR. Do not fabricate one'
   end
+
+  # kodmial/continuum#295: a conflict repair must edit a PR against its
+  # canonical task, never against whatever issue the mutable PR body names at
+  # repair time. The canonical task therefore comes from the worker branch and
+  # the bound run identity, and a PR that cannot be bound fails closed.
+  def test_opencode_conflict_repair_binds_the_canonical_task_not_the_pr_body
+    body = workflow_body('continuum-opencode.yml')
+
+    resolver = step_body(body, 'Resolve authoritative task context')
+    refute_nil resolver, 'the shared task-context resolver step is missing'
+    assert_includes resolver, "inputs.mode == 'resolve-conflict'",
+                    'the resolver must run for conflict repair too'
+    assert_includes resolver, "mode === 'resolve-conflict'"
+    assert_includes resolver, "source = 'canonical-worker-branch'",
+                    'conflict repair must bind the task through the worker branch'
+    assert_includes resolver, 'github.rest.actions.getWorkflowRun',
+                    'the branch binding must be confirmed by the worker run itself'
+    assert_includes resolver, '/^opencode\\/issue(\\d+)-(\\d+)$/i',
+                    'the canonical branch identity is issue plus run id'
+    assert_includes resolver, 'runBindsIssue',
+                    'the run display title must confirm it owns the issue'
+
+    conflict = step_body(body, 'Resolve merge conflict with main')
+    refute_nil conflict, 'the conflict-repair step is missing'
+    assert_includes conflict, "snapshot reference cannot be bound to the PR's canonical task",
+                    'a PR without a resolvable task must stop the repair, not trust its body'
+    assert_includes conflict, '"$(tr \'[:upper:]\' \'[:lower:]\' <<<"$REF_REPO")" != "$(tr \'[:upper:]\' \'[:lower:]\' <<<"$TASK_REPO")"',
+                    'the snapshot reference must match the canonical task repository'
+    assert_includes conflict, '"$REF_ISSUE" != "$TASK_NUMBER"',
+                    'the snapshot reference must match the canonical task issue'
+    assert_includes conflict, 'legacy, pre-guard PR',
+                    'pre-guard PRs must keep their explicit unprotected path'
+    refute_includes conflict, 'snapshot reference $REF_REPO#$REF_ISSUE does not match expected task',
+                    'conflict repair must not compare against an unbound expectation'
+  end
   # A task implementation command must obey the same dependency/DoR gate as
   # the scheduler. Manual /oc is not an escape hatch that may turn a blocked
   # tracking issue into a partial PR.
@@ -7634,7 +7669,7 @@ class ContinuumTest < Minitest::Test
     assert_includes body, "core.setOutput('ready', 'false');"
     assert_includes body, 'Continuum will not create a partial PR for a blocked/umbrella task.'
 
-    assert_match(/- name: Implement issue\n\s+if: >-\n\s+steps\.issue_readiness\.outputs\.ready != 'false'/, body)
+    assert_match(/- name: Implement issue\n\s+id: implement_issue\n\s+if: >-\n\s+steps\.issue_readiness\.outputs\.ready != 'false'/, body)
     assert_match(/- name: Restore verified cached OpenCode for coder and repair\n\s+id: cached_opencode\n\s+if: steps\.issue_readiness\.outputs\.ready != 'false'/, body)
     assert_includes body, 'Do not turn a tracking/umbrella issue or a task with unmet prerequisites into a partial PR.'
   end
@@ -7690,7 +7725,7 @@ class ContinuumTest < Minitest::Test
 
   def test_coderabbit_fix_survives_concurrent_pr_head_advance
     body = workflow_body('continuum-opencode.yml')
-    step = body[/^\s+- name: Fix CodeRabbit review findings\n(.*?)(?=^\s+- name: Ask CodeRabbit to verify every original finding)/m, 1]
+    step = body[/^\s+- name: Fix CodeRabbit review findings\n(.*?)(?=^\s+- name: Resolve merge conflict with main)/m, 1]
     refute_nil step, 'CodeRabbit fix step is missing'
 
     assert_includes step, 'REPAIR_BASE_SHA="$(git rev-parse HEAD)"'
@@ -7707,7 +7742,7 @@ class ContinuumTest < Minitest::Test
 
   def test_coderabbit_fix_verification_uses_published_branch_ref
     body = workflow_body('continuum-opencode.yml')
-    step = body[/^\s+- name: Ask CodeRabbit to verify every original finding\n(.*?)(?=^\s+- name: Resolve merge conflict with main)/m, 1]
+    step = body[/^\s+- name: Ask CodeRabbit to verify every original finding\n(.*?)(?=^\s+- name: Re-run the consumer blocking CI workflow for this head)/m, 1]
     refute_nil step, 'CodeRabbit verification step is missing'
 
     assert_includes step, 'github.rest.git.getRef({'

@@ -57,8 +57,31 @@ validation engine.
 
 ## 2. Inspect and pin Continuum
 
-Choose a reviewed revision. A full commit SHA is best for a reproducible test;
-a tag or `main` is acceptable only when you understand that it moves.
+Choose one ref policy for the first run:
+
+- **Reproducible (recommended):** use the same full commit SHA for the
+  installer, the installed callers, and the project-owned `ci.yml`. The
+  caller `uses:` ref and `continuum_ref:` must match.
+- **Deliberately moving:** keep both the caller `uses:` ref and
+  `continuum_ref:` on `main`, and install from `main` as well. This is valid
+  only when you choose it for both references and accept that the workflow
+  and its engine move together. Never mix a pinned caller with an unpinned
+  `continuum_ref:` or the reverse.
+
+Unlike the installed callers, `continuum-validation.yml` takes its revision
+only from the caller's `uses:` ref; the `continuum_ref:` value in the
+project-owned `ci.yml` has no effect on the engine revision. The installed
+callers (for example `continuum-opencode.yml`) do read `continuum_ref:` to
+select their engine checkout, so the matching policy above applies to them.
+The rewrite below still updates both lines so the sample stays consistent.
+
+The steps below implement the reproducible path. The example `ci.yml` ships
+with the moving `main` references; the rewrite below changes the `uses:` ref
+(and the inert `continuum_ref:`) to the selected SHA. For the deliberately
+moving alternative, **replace** the `export CONTINUUM_REF=...`
+assignment in the next shell block with `export CONTINUUM_REF=main` **before**
+downloading the installer, so the downloaded script matches the selected ref.
+Do not run the pinned assignment and then try to override it from above.
 
 ```sh
 export CONTINUUM_REF="$(git -C "$CONTINUUM_DIR" rev-parse HEAD)"
@@ -107,15 +130,26 @@ PY
 The script fails instead of silently skipping a replacement when the example
 `ci.yml` drifts, so CI cannot be left unpinned by an unmatched constant.
 
-You can also create the installer locally from the checkout and pass the ref
-explicitly:
+For the deliberate moving alternative, skip the `ci.yml` rewrite and install
+with that same ref. If `../continuum-install.sh` was already downloaded from a
+pinned checkout, re-download it after setting `CONTINUUM_REF=main` so the
+installer matches the selected ref; the checked-in sample already contains
+`uses: ...@main` and `continuum_ref: main`.
+
+Alternatively, use the local installer **only for the full-SHA pinned
+path** when the Continuum checkout is at exactly that commit. Keep the
+verification and installation in one conditional command: a mismatch must
+prevent the installer from running.
 
 ```sh
-bash "$CONTINUUM_DIR/install.sh" . "$CONTINUUM_REF" core
+test "${#CONTINUUM_REF}" -eq 40 &&
+  test "$(git -C "$CONTINUUM_DIR" rev-parse HEAD)" = "$CONTINUUM_REF" &&
+  bash "$CONTINUUM_DIR/install.sh" . "$CONTINUUM_REF" core
 ```
 
-Use the downloaded `../continuum-install.sh` instead if you are not working from
-a trusted local checkout.
+Do **not** use the local-checkout alternative for the moving `main` path;
+use the downloaded `../continuum-install.sh` at the selected ref instead.
+Setting `CONTINUUM_REF` alone never updates an existing installer.
 
 ## 3. Install the core callers
 

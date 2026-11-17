@@ -105,7 +105,18 @@ class CoverageTests(unittest.TestCase):
         # kodmial/continuum#446 adds the dispatched-receipt correlation step,
         # which binds TAP_PAT twice (env token + github-script token) under one
         # exactly-once claim identity.
-        self.assertEqual(len(bindings), 127)
+        # kodmial/continuum#458 adds the canary resolve/bootstrap step, which
+        # creates the labelled task through the same fan-out actor the
+        # scheduler observes.
+        # Authenticated repair-publication statuses add one same-repo PAT
+        # binding beside the repair push it attests, plus one recovery binding
+        # that re-publishes the same attestation after a transient API failure,
+        # plus one fresh-runner post-failure binding that recovers the exact
+        # original commit after both retry budgets are exhausted.
+        # PR #459 review adds receipt-only publication recovery for a skipped
+        # duplicate rerun and a fresh-runner post-failure job, two same-repo PAT
+        # bindings beside the publication evidence they re-attest.
+        self.assertEqual(len(bindings), 133)
         gaps = inventory.coverage_gaps(WORKFLOWS_DIR)
         self.assertEqual(gaps, [], f"uninventoried TAP_PAT bindings: {gaps}")
 
