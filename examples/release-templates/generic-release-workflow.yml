@@ -23,7 +23,7 @@ name: Continuum release
 # a release and triggers one cannot say which code was under test when the token
 # was in scope.
 #
-# The split is the security property, not a convenience:
+# The split reduces exposure, but it is not by itself the security property:
 #
 #   resolve       no token. Reads policy, writes the matrix every job shares.
 #   target        no token. Builds from the pinned ref, writes one fragment.
@@ -35,6 +35,11 @@ name: Continuum release
 # publisher even if the build asks for one. Everything that can write lives in
 # the transaction, which only runs after every fragment exists and has been
 # checked against the matrix.
+#
+# The transaction still checks out the same source tree and runs its release CLI
+# with GITHUB_TOKEN in scope, set from secrets.RELEASE_TOKEN, so a modified CLI
+# can read that credential. Qualification requires the transaction to run from a
+# separately trusted engine, not from the source tree it publishes.
 on:
   workflow_call:
     inputs:

@@ -62,11 +62,23 @@ deliberately not a macOS script:
   `environment` (the example uses `release`, whose protection rules are the
   caller's responsibility).
 
-The privilege split is the security property, not a convenience. A source tree
-being built is untrusted input; the job that runs it must not be able to reach a
-release destination. The archived workflow grants `contents: read` by default
-and raises only the transaction job to `contents: write`. Every secret is
-declared by name, and each one is bound to the adapter that reads it.
+The privilege split reduces exposure, but it is not by itself the security
+boundary. A source tree being built is untrusted input, so the target job that
+runs it is given no publishing credential and no release destination. The
+archived workflow grants `contents: read` by default and raises only the
+transaction job to `contents: write`. Every secret is declared by name, and each
+one is bound to the adapter that reads it.
+
+One gap remains, and it is part of why this material is unqualified. The
+transaction job also checks out `source_sha` and runs
+`PYTHONPATH=src python3 -m continuum.cli` from that tree with `GITHUB_TOKEN` in
+its environment, set from `secrets.RELEASE_TOKEN`. A modified CLI in the source
+tree can therefore read the publishing credential, so keeping the token out of
+the target jobs does not establish the boundary on its own. A later qualified
+design must run every job that holds `RELEASE_TOKEN` from a separately trusted
+engine, such as a Continuum checkout pinned to a reviewed ref, instead of
+executing the release source tree. Until that engine-distribution decision is
+implemented and qualified, the split is only a reduction in exposure.
 
 The historical release core behind that workflow had this stage chain:
 
@@ -235,8 +247,9 @@ unqualified today:
    caller's `source_sha` and expects the release CLI under `src/continuum` in
    that tree. Current Continuum consumers install thin callers and keep engine
    code in Continuum; they do not vendor `src/continuum`. A future design must
-   decide how the pinned release engine reaches the job before the workflow can
-   run.
+   decide how a separately trusted, pinned release engine reaches the job before
+   the workflow can run, because the transaction executes with `RELEASE_TOKEN`
+   in scope.
 9. **No current qualification evidence.** Historical tests and historical
    release-core documentation are not live evidence for current main. They also
    do not demonstrate a complete macOS build, sign, package, draft, and publish
@@ -260,7 +273,9 @@ working:
    environment, and a disposable test signing certificate. Do not migrate a
    production consumer in the same step.
 5. Qualify secret isolation: resolve and target jobs hold no publishing token;
-   only the transaction does; Apple material reaches only the Apple row.
+   only the transaction does; Apple material reaches only the Apple row. Run
+   the transaction from a separately trusted engine, not from the release
+   source tree, because the source CLI executes with `RELEASE_TOKEN` in scope.
 6. Qualify failure and recovery semantics: incomplete fragment sets are refused,
    mid-publish interruption resumes or reports safely, and a duplicate event
    cannot publish twice.
