@@ -55,7 +55,7 @@ class CodeRabbitControllerLifetimeContract(unittest.TestCase):
             with self.subTest(entry=entry.name):
                 text = entry.read_text(encoding="utf-8")
                 # Not a post-admission filter in reusable jobs.controller.
-                caller_if = text.split("jobs:\\n  call:\\n", 1)[1].split(
+                caller_if = text.split("jobs:\n  call:\n", 1)[1].split(
                     "    uses:", 1
                 )[0]
                 self.assertIn("github.event_name != 'issue_comment'", caller_if)
