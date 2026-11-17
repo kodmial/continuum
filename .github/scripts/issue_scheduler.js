@@ -3090,7 +3090,7 @@ module.exports = async function runIssueScheduler({ github, context, core }) {
   for (const run of workflowRuns) {
     const isOpenCodeWorkflow =
       run.path === opencodeWorkflowPath ||
-      run.name === opencodeWorkflowName;
+      (!run.path && run.name === opencodeWorkflowName);
     // kodmial/continuum#350: a fresh-VM 429 resumption is a
     // workflow_dispatch run. It must count as authoritative
     // in-flight work exactly like an issue_comment run, or lease
@@ -3481,6 +3481,19 @@ module.exports = async function runIssueScheduler({ github, context, core }) {
           keepReservation: true,
           recoveryPending: true,
           reason: 'checkpoint-awaiting-recovery',
+          checkpointSha: checkpoint.refSha,
+        };
+      }
+      if (state === 'backoff') {
+        // next_due is the watchdog's earliest retry time, NOT expiration.
+        // An authenticated, unchanged 429 checkpoint still belongs to the
+        // recovery controller after that instant. Releasing it would let the
+        // ordinary scheduler burn the issue dispatch budget and pause work.
+        return {
+          ...base,
+          keepReservation: true,
+          recoveryPending: true,
+          reason: 'backoff-awaiting-watchdog',
           checkpointSha: checkpoint.refSha,
         };
       }
