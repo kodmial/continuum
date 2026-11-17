@@ -358,6 +358,56 @@ APPROVED_459_REVIEW_OPENCODE_SHA256 = (
 APPROVED_459_CI_REPAIR_SYNC_MERGED_OPENCODE_SHA256 = (
     "aae989612b0a80eb8b6415a6ca1b39d6ea23654b0dc5df6da83e6c5959a0c474"
 )
+# 2026-11-16 (#467): the canonical coderabbit-fix completion handoff now emits
+# a trusted `changed` result plus a durable, run-bound no-change outcome marker
+# so the batcher can suppress same-HEAD duplicate redispatches. The marker binds
+# the inspected base SHA, so a concurrent branch advance makes the outcome stale
+# instead of suppressing a repair on a commit the model never saw. This advances
+# the full-file pin to the reviewed no-change-guard artifact; every existing
+# 429/task-admission/verification invariant above is retained unchanged.
+# Merging main's #454 telemetry upload step into this reviewed #467 artifact
+# keeps both intentional behaviors in one file, so the active pin below covers
+# the combined scheduler-origin, #460 resume, #454 telemetry, and #467
+# no-change-guard bytes; unrelated drift still fails closed.
+# 2026-11-17 (#469 review): suppressing a same-HEAD no-change redispatch needs
+# run-scoped evidence, because a workflow_dispatch run on the default branch
+# reports that ref as `head_sha` and the Actions API never exposes dispatch
+# inputs. The reviewed artifact therefore publishes the inspected HEAD, the
+# finding digest, the attempt, and the published outcome as a per-run
+# artifact name, and the batcher suppresses only when that artifact matches.
+# The pin advances once for this additive provenance step; every previously
+# reviewed invariant above is retained unchanged.
+# 2026-11-17 (#469 validation repair): merging main's reviewed CI-repair/
+# main-sync fence (339eb2f) into this branch combines those exact bytes with
+# the unchanged #467 no-change-guard bytes, so the active pin advances to that
+# verified union. The delta against the previous pin is only main's fence; no
+# #467 byte changed.
+APPROVED_467_NO_CHANGE_OPENCODE_SHA256 = (
+    "79f64d53f6eafc2e03cf6100b3c6369bd6ff2e0de1e083e08ea8469c0db96d4f"
+)
+# Retained for audit: the reviewed #467 union before main's CI-repair/main-sync
+# fence was merged into this branch.
+APPROVED_467_PRE_CI_REPAIR_SYNC_OPENCODE_SHA256 = (
+    "1e3510f29e59daa33a6ad0aa4aa020d562427ac54aee44155a8d4621476330b8"
+)
+# Retained for audit: the reviewed #467 artifact before the run-scoped
+# provenance artifact was added for the #469 review repair.
+APPROVED_469_PRE_PROVENANCE_OPENCODE_SHA256 = (
+    "37523b5d6a8a18ae975dcc6cc5b45d8c957142f3005936baf0182219003dff47"
+)
+# Retained for audit: the reviewed #467 artifact before main's #454 telemetry
+# upload step was merged into this branch.
+APPROVED_467_PRE_MERGE_OPENCODE_SHA256 = (
+    "fc6620d539658f7058fadf121b7bde98738fd1c02b9407d54b34dbcba364922e"
+)
+
+# 2026-11-17 (#459 + #469): protected OpenCode workflow combines the
+# reviewed issue-publication recovery and main-sync fence from #459 with
+# the run-scoped no-change repair provenance from #469. Keep earlier immutable
+# workflow digests for audit; this exact union is the active safety pin.
+APPROVED_459_469_MERGED_OPENCODE_SHA256 = (
+    "46b0e0bdf21022aaaf4a62ed3d8dc8fbd64de7bd0a60e68a7fcbc6e608ee65c3"
+)
 # The prior #460 resume pin stays for audit; any further byte drift still
 # fails closed.
 APPROVED_460_RESUME_OPENCODE_SHA256 = (
@@ -2790,8 +2840,8 @@ class ProtectedBaselineTests(unittest.TestCase):
                     # full-file digests and executable regression tests.
                     self.assertEqual(
                         protected_file_digest(path),
-                        APPROVED_459_CI_REPAIR_SYNC_MERGED_OPENCODE_SHA256,
-                        f"{path}: unexpected drift outside the PR #459 review repair merged with main's CI-repair/main-sync fence",
+                        APPROVED_459_469_MERGED_OPENCODE_SHA256,
+                        f"{path}: unexpected drift outside combined reviewed PR #459 and #469 provenance workflow",
                     )
                 else:
                     # The self-dogfood caller is the dispatchable surface
@@ -2876,7 +2926,7 @@ class ProtectedBaselineTests(unittest.TestCase):
         # therefore be dirty in this pre-commit worktree; any unapproved byte
         # change still fails the exact digest assertions above.
         approved = {
-            ".github/workflows/continuum-opencode.yml": APPROVED_459_CI_REPAIR_SYNC_MERGED_OPENCODE_SHA256,
+            ".github/workflows/continuum-opencode.yml": APPROVED_459_469_MERGED_OPENCODE_SHA256,
             ".github/workflows/opencode.yml": APPROVED_350_SELF_CALLER_SHA256,
         }
         for path in PROTECTED_FILES:

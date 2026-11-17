@@ -5850,6 +5850,7 @@ jobs:
           if-no-files-found: error
 
       - name: Ask CodeRabbit to verify every original finding
+        id: coderabbit_verification
         if: github.event_name == 'workflow_dispatch' && inputs.mode == 'coderabbit-fix' && steps.unresolved_batch.outputs.skip != 'true'
         uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
         env:
@@ -5857,9 +5858,13 @@ jobs:
           REVIEW_ID: ${{ inputs.review_id }}
           UNRESOLVED_ITEMS_JSON: ${{ steps.unresolved_batch.outputs.items_json || inputs.unresolved_items_json }}
           REPAIR_CHANGED: ${{ steps.coderabbit_repair.outputs.changed }}
+          REPAIR_BASE_SHA: ${{ steps.coderabbit_repair.outputs.base_sha }}
+          REPAIR_RUN_ID: ${{ github.run_id }}
+          REPAIR_RUN_ATTEMPT: ${{ github.run_attempt }}
         with:
           github-token: ${{ secrets.TAP_PAT }}
           script: |
+            const crypto = require('crypto');
             const owner = context.repo.owner;
             const repo = context.repo.repo;
             const pullNumber = Number(process.env.PR_NUMBER);
@@ -5941,10 +5946,47 @@ jobs:
             // answer and keeps dispatching repair batches instead of asking
             // CodeRabbit to verify the repair outcome. The marker is posted
             // outside the review thread, so it never consumes chat quota.
+            const repairChanged = String(
+              process.env.REPAIR_CHANGED || ''
+            ).trim();
+            // The commit this run actually inspected. A no-change result is
+            // only valid for exactly that commit, so the outcome marker binds
+            // the inspected SHA rather than whatever the branch points at
+            // later. A concurrent trusted push therefore makes the outcome
+            // stale instead of silently suppressing a repair on a commit the
+            // model never saw.
+            const repairBaseSha = String(
+              process.env.REPAIR_BASE_SHA || ''
+            ).trim();
+            const repairRunId = String(
+              process.env.REPAIR_RUN_ID || ''
+            ).trim();
+            const repairRunAttempt = String(
+              process.env.REPAIR_RUN_ATTEMPT || ''
+            ).trim();
             const verificationPendingMarker = entries =>
               `<!-- opencode-coderabbit-verification-pending head=${headSha} ` +
               `findings=${entries.map(entry => entry.findingId).join(',')} ` +
               `answers=${entries.map(entry => entry.answerId).join(',')} -->`;
+            // One durable, machine-readable outcome accompanies the legacy
+            // pending marker. It binds the published Git result to the exact
+            // OpenCode run so the batcher can independently corroborate a
+            // completed no-change repair instead of trusting a comment alone.
+            // The legacy marker stays byte-identical for older consumers.
+            const repairOutcomeMarker = (entries, digest) =>
+              `<!-- opencode-coderabbit-repair-outcome v=1 ` +
+              `repo=${owner}/${repo} pr=${pullNumber} head=${repairBaseSha} ` +
+              `findings=${entries.map(entry => entry.findingId).join(',')} ` +
+              `digest=${digest} run=${repairRunId} ` +
+              `attempt=${repairRunAttempt} changed=${repairChanged} -->`;
+            const repairOutcomeDigest = entries => {
+              const identity = entries.slice()
+                .sort((a, b) => a.findingId - b.findingId)
+                .map(entry => [Number(entry.reviewId), Number(entry.findingId)]);
+              return crypto.createHash('sha256')
+                .update(repairBaseSha + '\n' + JSON.stringify(identity))
+                .digest('hex');
+            };
             // Auto-merge consumes this handoff only from the account that
             // posts it with TAP_PAT (or github-actions[bot]). Deduplicate
             // against that same trusted set: a foreign comment carrying a
@@ -5968,16 +6010,19 @@ jobs:
                 const findingId = Number(attempt.findingId);
                 if (!Number.isInteger(findingId) || findingId <= 0) continue;
                 const answerId = Number(attempt.answerId);
-                byFinding.set(
-                  findingId,
-                  Number.isInteger(answerId) && answerId > 0 ? answerId : 0
-                );
+                const reviewId = Number(attempt.reviewId);
+                byFinding.set(findingId, {
+                  answerId:
+                    Number.isInteger(answerId) && answerId > 0 ? answerId : 0,
+                  reviewId,
+                });
               }
               const entries = [...byFinding.keys()]
                 .sort((a, b) => a - b)
                 .map(findingId => ({
                   findingId,
-                  answerId: byFinding.get(findingId),
+                  answerId: byFinding.get(findingId).answerId,
+                  reviewId: byFinding.get(findingId).reviewId,
                 }));
               if (!entries.length) return;
               // The triggering answer id makes the handoff unique to one
@@ -5985,6 +6030,19 @@ jobs:
               // while a later answer that selects a new repair always
               // publishes a new handoff for its own verification.
               const marker = verificationPendingMarker(entries);
+              const outcomePublishable =
+                (repairChanged === 'true' || repairChanged === 'false') &&
+                /^[0-9a-f]{40}$/.test(repairBaseSha) &&
+                /^[1-9][0-9]*$/.test(repairRunId) &&
+                /^[1-9][0-9]*$/.test(repairRunAttempt) &&
+                entries.every(entry =>
+                  Number.isInteger(entry.reviewId) && entry.reviewId > 0);
+              const outcomeDigest = outcomePublishable
+                ? repairOutcomeDigest(entries)
+                : null;
+              const outcomeMarker = outcomePublishable
+                ? repairOutcomeMarker(entries, outcomeDigest)
+                : null;
               const totalHandoffComments = Number(pr.data.comments || 0);
               const lastHandoffPage = Math.max(
                 1,
@@ -6009,20 +6067,48 @@ jobs:
                 const login = String(
                   comment.user?.login || comment.author?.login || ''
                 ).trim().toLowerCase();
-                return trustedHandoffAuthors.has(login) &&
-                  (comment.body || '').includes(marker);
+                if (!trustedHandoffAuthors.has(login)) return false;
+                const body = comment.body || '';
+                if (!body.includes(marker)) return false;
+                // A legacy handoff predates the outcome marker. Publish the
+                // upgrade once so a completed no-change run gains the
+                // independently verifiable provenance the guard needs.
+                return !outcomeMarker || body.includes(outcomeMarker);
               });
               if (trustedDuplicate) return;
+              // Run-scoped provenance: the batcher cannot read workflow
+              // dispatch inputs, and its run evidence (run path, display
+              // title, attempt) never names the PR HEAD or finding set that
+              // was inspected. Publish one run-scoped identity so the
+              // no-change guard can require evidence produced by the run
+              // itself instead of trusting the handoff comment alone.
+              if (outcomePublishable) {
+                core.setOutput(
+                  'provenance',
+                  `${repairBaseSha}-${outcomeDigest}-` +
+                    `${repairRunAttempt}-${repairChanged}`
+                );
+              }
+              const body = [marker];
+              if (outcomeMarker) body.push(outcomeMarker);
+              body.push(
+                '⚡ **Continuum · opencode**',
+                '<!-- continuum-origin role=continuum component=opencode -->',
+              );
+              if (repairChanged === 'false') {
+                body.push(
+                  `Canonical repair finished for ${entries.length} CodeRabbit finding(s) at HEAD \`${repairBaseSha || headSha}\` with **no code change**. The original review stays open and blocking pending independent verification or external evidence (reason: \`no-change-awaiting-review-or-evidence\`); this is not approval or successful qualification.`
+                );
+              } else {
+                body.push(
+                  `Canonical repair finished for ${entries.length} CodeRabbit finding(s) at HEAD \`${headSha}\`; serialized auto-merge owns verification.`
+                );
+              }
               await github.rest.issues.createComment({
                 owner,
                 repo,
                 issue_number: pullNumber,
-                body: [
-                  marker,
-                  '⚡ **Continuum · opencode**',
-                  '<!-- continuum-origin role=continuum component=opencode -->',
-                  `Canonical repair finished for ${entries.length} CodeRabbit finding(s) at HEAD \`${headSha}\`; serialized auto-merge owns verification.`,
-                ].join('\n'),
+                body: body.join('\n'),
               });
             };
 
@@ -6032,6 +6118,7 @@ jobs:
                 batchItems.map(item => ({
                   findingId: item.finding_id,
                   answerId: item.unresolved_id,
+                  reviewId: item.review_id,
                 }))
               );
               core.notice(
@@ -6058,6 +6145,7 @@ jobs:
                   return {
                     findingId: finding.id,
                     answerId: latestAnswer ? latestAnswer.id : 0,
+                    reviewId,
                   };
                 })
               );
@@ -6103,6 +6191,39 @@ jobs:
                 );
               }
             }
+
+      - name: Publish repair provenance
+        if: >-
+          github.event_name == 'workflow_dispatch' &&
+          inputs.mode == 'coderabbit-fix' &&
+          steps.coderabbit_verification.outputs.provenance != ''
+        shell: bash
+        run: |
+          set -euo pipefail
+          # The no-change guard suppresses a duplicate repair only when the run
+          # itself proves which HEAD and finding set it inspected. Workflow-run
+          # metadata cannot carry that identity: dispatch inputs are not exposed
+          # and `head_sha` is the dispatch ref (the default branch), not the PR
+          # HEAD. Publish the inspected SHA, finding digest, attempt, and
+          # published outcome as a per-run artifact name instead. Retention
+          # bounds the evidence; a missing or expired artifact defers
+          # suppression rather than suppressing on a comment alone.
+          mkdir -p "${RUNNER_TEMP:-/tmp}/continuum-repair-provenance"
+          printf '%s\n' "${{ steps.coderabbit_verification.outputs.provenance }}" \
+            > "${RUNNER_TEMP:-/tmp}/continuum-repair-provenance/provenance.txt"
+
+      - name: Upload repair provenance artifact
+        if: >-
+          github.event_name == 'workflow_dispatch' &&
+          inputs.mode == 'coderabbit-fix' &&
+          steps.coderabbit_verification.outputs.provenance != ''
+        continue-on-error: true
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: continuum-repair-provenance-${{ steps.coderabbit_verification.outputs.provenance }}
+          path: ${{ runner.temp }}/continuum-repair-provenance
+          if-no-files-found: error
+          retention-days: 30
 
       - name: Re-run the consumer blocking CI workflow for this head
         if: >-
