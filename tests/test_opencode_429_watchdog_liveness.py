@@ -293,6 +293,13 @@ class MockGithub {
 }
 
 function mockFetch(url) {
+  if (/\/rate_limit$/.test(String(url))) {
+    return Promise.resolve({
+      ok: true,
+      status: 200,
+      json: async () => ({ resources: { core: { remaining: 1000, limit: 5000 } } }),
+    });
+  }
   if (/\/actions\/jobs\/[^/]+\/logs$/.test(String(url))) {
     return Promise.resolve({
       ok: true,
