@@ -295,17 +295,17 @@ class MockGithub {
 function mockFetch(url) {
   // The production watchdog now checks GitHub's free core-budget endpoint
   // before starting any 429 checkpoint work. This is a GitHub REST fixture,
-  // never a simulated OpenCode provider response.
+  // never a simulated OpenCode provider response. Individual scenarios may
+  // override the reported budget to exercise the exhausted/low deferral path.
   if (/\/rate_limit$/.test(String(url))) {
+    const budget = scenario.rateLimit || {
+      limit: 5000,
+      remaining: scenario.restRemaining === undefined ? 4500 : scenario.restRemaining,
+    };
     return Promise.resolve({
       ok: true,
       status: 200,
-      json: async () => ({
-        resources: { core: {
-          limit: 5000,
-          remaining: scenario.restRemaining === undefined ? 4500 : scenario.restRemaining,
-        } },
-      }),
+      json: async () => ({ resources: { core: budget } }),
     });
   }
   if (/\/actions\/jobs\/[^/]+\/logs$/.test(String(url))) {
