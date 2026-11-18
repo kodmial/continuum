@@ -248,6 +248,11 @@ PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=src python3 -m unittest -v \
   scripts.test_opencode_429_evacuator.IssueResumeSupersessionTest.test_current_generation_resumes \
   scripts.test_opencode_429_evacuator.IssueResumeSupersessionTest.test_unreadable_durable_state_fails_closed
 
+# Executable Layer 2 qualification-workflow regression contract (#480): run the
+# actual `Run Layer 2 lifecycle integration probe` step with only `gh` faked.
+PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=src python3 -m unittest -v \
+  scripts.test_contract_qualification_workflow
+
 mkdir -p "$PWD/.opencode-tmp/bin"
 # Pin both the installer URL and its content: the tag can move and a
 # compromised download would otherwise execute with this script's privileges.
