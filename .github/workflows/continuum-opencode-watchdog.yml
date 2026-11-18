@@ -2155,7 +2155,10 @@ jobs:
             // label-free scans always read the newest page and rotate through
             // one older page per pass (oldest-first), so an old checkpoint is
             // eventually inspected instead of only ever seeing page one.
-            const DISCOVERY_LIMIT = 100;
+            // The cap must fit a full newest and rotating page for every
+            // label and for the label-free scan, or the last entries of a
+            // rotating page are silently dropped.
+            const DISCOVERY_LIMIT = 102;
             const LABEL_DISCOVERY_SHARE = 50;
             const LABEL_FREE_PAGE_SIZE = 25;
             const ROTATION_INTERVAL_MS = 15 * 60 * 1000;
@@ -2204,13 +2207,13 @@ jobs:
             // its slice on the newest page and half on one rotating older page
             // (oldest-first), so a ready-only checkpoint beyond the first
             // batch is still reached instead of every pass selecting the same
-            // prefix.
-            const perLabelLimit = Math.max(
-              1, Math.floor(LABEL_DISCOVERY_SHARE / discoveryLabels.length)
-            );
+            // prefix. The per-label limit covers both pages in full: rounding
+            // the page size up must not leave the last issue of a rotating
+            // page unreadable on every pass.
             const labelPageSize = Math.max(
-              1, Math.ceil(perLabelLimit / 2)
+              1, Math.ceil(LABEL_DISCOVERY_SHARE / (2 * discoveryLabels.length))
             );
+            const perLabelLimit = labelPageSize * 2;
             for (const label of discoveryLabels) {
               const labelLimit = Math.min(
                 DISCOVERY_LIMIT, reserved.length + perLabelLimit
@@ -2419,6 +2422,46 @@ jobs:
                   issue.number + ': active competing run ' + competing.id +
                   ' owns the work (op=' + state.operation + ' gen=' +
                   state.generation + ').'
+                );
+                continue;
+              }
+              // Native GitHub dependencies are authoritative. The scheduler
+              // releases an in-progress reservation when an open blocker
+              // exists, so a checkpoint that lost its labels must not be
+              // redispatched until that blocker is closed.
+              let nativeBlockers;
+              try {
+                nativeBlockers = await readGithub.paginate(
+                  'GET /repos/{owner}/{repo}/issues/{issue_number}/dependencies/blocked_by',
+                  {
+                    owner,
+                    repo,
+                    issue_number: issue.number,
+                    per_page: 100,
+                    headers: {
+                      'X-GitHub-Api-Version': '2026-03-10',
+                    },
+                  }
+                );
+              } catch (err) {
+                core.warning(
+                  'OpenCode durable 429 recovery cannot verify native blockers ' +
+                  'for issue #' + issue.number + ' (op=' + state.operation +
+                  ' gen=' + state.generation + ' checkpoint=' +
+                  state.checkpointRef + '); failing closed for this pass.'
+                );
+                continue;
+              }
+              const openNativeBlockers = nativeBlockers.filter(
+                blocker => blocker.state === 'open'
+              );
+              if (openNativeBlockers.length > 0) {
+                core.notice(
+                  'OpenCode durable 429 recovery leaves issue #' +
+                  issue.number + ' alone: native blocker ' +
+                  openNativeBlockers.map(
+                    blocker => '#' + blocker.number
+                  ).join(', ') + ' is still open.'
                 );
                 continue;
               }

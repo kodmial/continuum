@@ -373,7 +373,17 @@ class MockGithub {
       endpoint: { DEFAULTS: { baseUrl: 'https://api.github.com' } },
     };
     this.paginate = async (method, params) => {
-      if (typeof method === 'string') return [];
+      if (typeof method === 'string') {
+        if (/dependencies\/blocked_by$/.test(method)) {
+          if (scenario.blockedByError) {
+            throw apiError(
+              scenario.blockedByError, 'native blocker listing failed'
+            );
+          }
+          return (scenario.blockedBy || []).map(blocker => ({ ...blocker }));
+        }
+        return [];
+      }
       const first = await method(params);
       if (
         first && first.data &&
@@ -1695,6 +1705,98 @@ class WatchdogHarness(unittest.TestCase):
                     self.assert_one_current_dispatch(result, NEW_SHA)
                 else:
                     self.assert_no_dispatch(result)
+
+    def test_scheduled_labeled_scan_covers_thirteenth_item_of_rotating_page(self):
+        # Two discovery labels give each label a 13-entry page. The rotating
+        # page budget must accept all 13 entries; otherwise a checkpoint in
+        # the last slot is skipped on every rotation.
+        scenario = self.durable_scenario()
+        interval_ms = 15 * 60 * 1000
+        page_size = 13
+        total_issues = 201
+        last_page = (total_issues + page_size - 1) // page_size
+        # The 13th slot of page 4, older than the newest page.
+        checkpoint_index = 3 * page_size + (page_size - 1)
+        checkpoint_page = checkpoint_index // page_size + 1
+        base = datetime(2026, 10, 1, tzinfo=timezone.utc)
+        issues = []
+        for index in range(total_issues):
+            updated = (base + timedelta(minutes=index)).strftime(
+                "%Y-%m-%dT%H:%M:%SZ"
+            )
+            if index == checkpoint_index:
+                issues.append(
+                    {
+                        "number": 382,
+                        "state": "open",
+                        "title": "P0: durable recovery",
+                        "labels": [{"name": "automation:ready"}],
+                        "updated_at": updated,
+                    }
+                )
+            else:
+                issues.append(
+                    {
+                        "number": 900 + index,
+                        "state": "open",
+                        "title": "ready backlog " + str(index),
+                        "labels": [{"name": "automation:ready"}],
+                        "updated_at": updated,
+                    }
+                )
+        scenario["issues"] = issues
+        base_bucket = int(time.time() * 1000) // interval_ms
+
+        def bucket_for_page(page):
+            bucket = base_bucket - (base_bucket % last_page) + (page - 1)
+            return bucket - last_page if bucket > base_bucket else bucket
+
+        for page, dispatched in ((1, False), (checkpoint_page, True)):
+            with self.subTest(page=page):
+                scenario["now"] = bucket_for_page(page) * interval_ms
+                result = self.run_scenario(scenario)
+                if dispatched:
+                    self.assert_one_current_dispatch(result, NEW_SHA)
+                else:
+                    self.assert_no_dispatch(result)
+
+    def test_scheduled_label_free_native_blocker_is_not_resumed(self):
+        # The scheduler releases the reservation when a native blocker is
+        # open. Durable discovery must not redispatch that checkpoint just
+        # because it no longer carries either label.
+        scenario = self.durable_scenario()
+        scenario["issues"][0]["labels"] = []
+        scenario["blockedBy"] = [{"number": 900, "state": "open"}]
+        result = self.run_scenario(scenario)
+        self.assert_no_dispatch(result)
+        self.assertTrue(
+            any(
+                "native blocker #900 is still open" in " ".join(line)
+                for line in result["notices"]
+            ),
+            result["notices"],
+        )
+
+    def test_scheduled_label_free_closed_native_blocker_is_resumed(self):
+        scenario = self.durable_scenario()
+        scenario["issues"][0]["labels"] = []
+        scenario["blockedBy"] = [{"number": 900, "state": "closed"}]
+        result = self.run_scenario(scenario)
+        self.assert_one_current_dispatch(result, NEW_SHA)
+
+    def test_scheduled_label_free_blocker_lookup_failure_fails_closed(self):
+        scenario = self.durable_scenario()
+        scenario["issues"][0]["labels"] = []
+        scenario["blockedByError"] = 502
+        result = self.run_scenario(scenario)
+        self.assert_no_dispatch(result)
+        self.assertTrue(
+            any(
+                "cannot verify native blockers" in " ".join(line)
+                for line in result["notices"]
+            ),
+            result["notices"],
+        )
 
     def normal_retry_scenario(self):
         # A failed OpenCode issue run without a 429 marker reaches the normal
