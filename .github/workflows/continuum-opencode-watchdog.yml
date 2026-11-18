@@ -2151,9 +2151,9 @@ jobs:
             //
             // The scan is bounded, but the budget is partitioned: label
             // queries can never consume the whole cap, so a large labeled
-            // backlog cannot starve the label-free scan. That scan always
-            // reads the newest page and rotates through one older page per
-            // pass (oldest-first), so an old label-free checkpoint is
+            // backlog cannot starve the label-free scan. Both labeled and
+            // label-free scans always read the newest page and rotate through
+            // one older page per pass (oldest-first), so an old checkpoint is
             // eventually inspected instead of only ever seeing page one.
             const DISCOVERY_LIMIT = 100;
             const LABEL_DISCOVERY_SHARE = 50;
@@ -2181,46 +2181,81 @@ jobs:
               const match = link.match(/[?&]page=(\d+)[^>]*>;\s*rel="last"/);
               return match ? Number(match[1]) : 0;
             };
-            const rememberLabelFree = (response, limit) => {
+            const rememberIssues = (response, limit, accept) => {
               for (const issue of listedIssues(response)) {
                 if (reserved.length >= limit) break;
                 if (!issue || issue.pull_request) continue;
                 if (seen.has(Number(issue.number))) continue;
-                const names = issueLabelNames(issue);
-                if (
-                  names.has(inProgressLabel) ||
-                  (readyLabel && names.has(readyLabel))
-                ) continue;
+                if (accept && !accept(issue)) continue;
                 seen.add(Number(issue.number));
                 reserved.push(issue);
               }
             };
+            const rememberLabelFree = (response, limit) => {
+              rememberIssues(response, limit, issue => {
+                const names = issueLabelNames(issue);
+                return !names.has(inProgressLabel) &&
+                  !(readyLabel && names.has(readyLabel));
+              });
+            };
             // Label queries share a bounded half of the cap. Splitting that
             // share across the labels keeps a busy in-progress queue from
-            // hiding ready-only checkpoints as well.
+            // hiding ready-only checkpoints as well. Each label spends half of
+            // its slice on the newest page and half on one rotating older page
+            // (oldest-first), so a ready-only checkpoint beyond the first
+            // batch is still reached instead of every pass selecting the same
+            // prefix.
             const perLabelLimit = Math.max(
               1, Math.floor(LABEL_DISCOVERY_SHARE / discoveryLabels.length)
+            );
+            const labelPageSize = Math.max(
+              1, Math.ceil(perLabelLimit / 2)
             );
             for (const label of discoveryLabels) {
               const labelLimit = Math.min(
                 DISCOVERY_LIMIT, reserved.length + perLabelLimit
               );
-              const response = await readGithub.rest.issues.listForRepo({
-                owner,
-                repo,
-                state: 'open',
-                labels: label,
-                sort: 'updated',
-                direction: 'desc',
-                per_page: 100,
-                page: 1,
-              });
-              for (const issue of listedIssues(response)) {
-                if (reserved.length >= labelLimit) break;
-                if (!issue || issue.pull_request) continue;
-                if (seen.has(Number(issue.number))) continue;
-                seen.add(Number(issue.number));
-                reserved.push(issue);
+              const newestResponse =
+                await readGithub.rest.issues.listForRepo({
+                  owner,
+                  repo,
+                  state: 'open',
+                  labels: label,
+                  sort: 'updated',
+                  direction: 'desc',
+                  per_page: labelPageSize,
+                  page: 1,
+                });
+              rememberIssues(newestResponse, labelLimit);
+              const newestLabeled = listedIssues(newestResponse);
+              if (
+                newestLabeled.length >= labelPageSize &&
+                reserved.length < labelLimit
+              ) {
+                const lastPage = listedLastPage(newestResponse) ||
+                  ROTATION_FALLBACK_PAGES;
+                const rotatingPage = 1 + (
+                  Math.floor(Date.now() / ROTATION_INTERVAL_MS) % lastPage
+                );
+                try {
+                  const rotatingResponse =
+                    await readGithub.rest.issues.listForRepo({
+                      owner,
+                      repo,
+                      state: 'open',
+                      labels: label,
+                      sort: 'updated',
+                      direction: 'asc',
+                      per_page: labelPageSize,
+                      page: rotatingPage,
+                    });
+                  rememberIssues(rotatingResponse, labelLimit);
+                } catch (err) {
+                  core.warning(
+                    'OpenCode durable 429 recovery could not list older ' +
+                    'issues labeled ' + label + ': ' + (err.message || err)
+                  );
+                }
               }
             }
             // A checkpointed issue may carry neither the reservation nor the

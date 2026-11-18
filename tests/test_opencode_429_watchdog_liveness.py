@@ -1640,6 +1640,62 @@ class WatchdogHarness(unittest.TestCase):
         result = self.run_scenario(scenario)
         self.assert_one_current_dispatch(result, NEW_SHA)
 
+    def test_scheduled_labeled_scan_rotates_to_an_older_page(self):
+        # A ready-only checkpoint can sit beyond the newest labeled page. Each
+        # pass must spend part of the label budget on a rotating oldest-first
+        # page so successive passes eventually reach it, instead of always
+        # selecting the same first batch.
+        scenario = self.durable_scenario()
+        interval_ms = 15 * 60 * 1000
+        page_size = 13  # ceil(per-label share / 2) for two labels
+        total_issues = 201
+        last_page = (total_issues + page_size - 1) // page_size
+        # Beyond the newest 100 labeled issues, but not the oldest page, so the
+        # old newest-page-one scan could never reach it.
+        checkpoint_index = 50
+        checkpoint_page = checkpoint_index // page_size + 1
+        base = datetime(2026, 10, 1, tzinfo=timezone.utc)
+        issues = []
+        for index in range(total_issues):
+            updated = (base + timedelta(minutes=index)).strftime(
+                "%Y-%m-%dT%H:%M:%SZ"
+            )
+            if index == checkpoint_index:
+                issues.append(
+                    {
+                        "number": 382,
+                        "state": "open",
+                        "title": "P0: durable recovery",
+                        "labels": [{"name": "automation:ready"}],
+                        "updated_at": updated,
+                    }
+                )
+            else:
+                issues.append(
+                    {
+                        "number": 900 + index,
+                        "state": "open",
+                        "title": "ready backlog " + str(index),
+                        "labels": [{"name": "automation:ready"}],
+                        "updated_at": updated,
+                    }
+                )
+        scenario["issues"] = issues
+        base_bucket = int(time.time() * 1000) // interval_ms
+
+        def bucket_for_page(page):
+            bucket = base_bucket - (base_bucket % last_page) + (page - 1)
+            return bucket - last_page if bucket > base_bucket else bucket
+
+        for page, dispatched in ((1, False), (checkpoint_page, True)):
+            with self.subTest(page=page):
+                scenario["now"] = bucket_for_page(page) * interval_ms
+                result = self.run_scenario(scenario)
+                if dispatched:
+                    self.assert_one_current_dispatch(result, NEW_SHA)
+                else:
+                    self.assert_no_dispatch(result)
+
     def normal_retry_scenario(self):
         # A failed OpenCode issue run without a 429 marker reaches the normal
         # watchdog retry path (not `recoverFrom429OnFreshVm`).

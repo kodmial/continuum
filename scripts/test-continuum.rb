@@ -7550,10 +7550,14 @@ class ContinuumTest < Minitest::Test
     assert_includes watchdog, "READY_LABEL: ${{ inputs.ready_label || vars.AUTOMATION_READY_LABEL || 'automation:ready' }}"
     assert_includes watchdog, "process.env.READY_LABEL || 'automation:ready'"
     assert_includes watchdog, 'discoveryLabels.push(readyLabel)'
-    # A labeled backlog may not consume the whole discovery cap, and the
-    # label-free scan must reach older pages instead of only page one.
+    # A labeled backlog may not consume the whole discovery cap, and both
+    # labeled and label-free scans must rotate to older pages instead of only
+    # ever reading page one.
     assert_includes watchdog, 'const LABEL_DISCOVERY_SHARE = 50'
     assert_includes watchdog, 'const LABEL_FREE_PAGE_SIZE = 25'
+    assert_includes watchdog, 'const labelPageSize = Math.max('
+    assert_includes watchdog, 'rememberIssues(newestResponse, labelLimit)'
+    assert_includes watchdog, 'rememberIssues(rotatingResponse, labelLimit)'
     assert_includes watchdog, 'listedLastPage(newestResponse)'
     assert_includes watchdog, 'Math.floor(Date.now() / ROTATION_INTERVAL_MS)'
     assert_includes watchdog, "direction: 'asc'"
