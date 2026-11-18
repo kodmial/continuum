@@ -7503,6 +7503,438 @@ class ContinuumTest < Minitest::Test
     assert_includes stdout, 'checkpoint-resume-hold-selector: PASS'
   end
 
+  # kodmial/continuum#487: the scheduler owns the one narrow admission that
+  # supersedes the historical generation-2 `wrong-generation` checkpoint hold
+  # after PR #461 is proven present in the executing engine. AA #534 is only a
+  # regression fixture; production must not name that task.
+  def test_scheduler_releases_only_the_proven_wrong_generation_hold_once
+    scheduler = File.read(File.join(ROOT, '.github/scripts/issue_scheduler.js'))
+    scheduler_start = scheduler.index('  const checkpointResumeBlockedMarkerRe =')
+    scheduler_finish = scheduler.index('  const ownerResumeMarkerRe =', scheduler_start)
+    refute_nil scheduler_start, 'the scheduler checkpoint hold is missing'
+    refute_nil scheduler_finish, 'the scheduler checkpoint hold boundary moved'
+    scheduler_hold = scheduler[scheduler_start...scheduler_finish]
+
+    # The fix identity is versioned by its merge commit; the AA fixture never
+    # leaks into the production script.
+    refute_includes scheduler, 'kodmial/aa'
+    refute_includes scheduler, 'issue534'
+    assert_includes scheduler, "'d063e72900790a647a9709771f477085b8141d83'",
+                    'the release must prove the PR #461 merge commit'
+
+    # The single decision is shared by reservation reconciliation, candidate
+    # selection, and the JIT pre-dispatch read; there is no second claim
+    # system and no bypass of the existing lease/stop/pause guards.
+    assert_includes scheduler, 'const resumeHold = await checkpointResumeHold('
+    assert_includes scheduler, 'const candidateResumeHold = await checkpointResumeHold('
+    assert_includes scheduler, 'const freshResumeHold = await checkpointResumeHold('
+    assert_includes scheduler, 'checkpointWrongGenerationRelease('
+
+    fresh_hold_at = scheduler.index('const freshResumeHold = await checkpointResumeHold(')
+    refute_nil fresh_hold_at, 'the JIT hold read is missing'
+    assert_operator scheduler.index('(pauseOnFailure && freshLabels.has(pausedLabel))'),
+                    :<, fresh_hold_at,
+                    'the paused guard must still precede the JIT hold read'
+    assert_operator scheduler.index('if (readyLabel && !freshLabels.has(readyLabel))'),
+                    :<, fresh_hold_at,
+                    'automation:ready must still be required before a release could dispatch'
+    assert_operator scheduler.index('const freshStop = await terminalGenerationStop('),
+                    :<, fresh_hold_at,
+                    'the terminal stop guard must still precede the JIT hold read'
+    assert_operator scheduler.index('if (pauseOnFailure && labels.has(pausedLabel))'),
+                    :<, scheduler.index('const candidateResumeHold = await checkpointResumeHold('),
+                    'the paused guard must still precede candidate hold filtering'
+    assert_operator scheduler.index("labels.has(qualifyingLabel) || labels.has(blockedLabel)"),
+                    :<, scheduler.index('const candidateResumeHold = await checkpointResumeHold('),
+                    'the blocked/qualifying guard must still precede candidate hold filtering'
+    assert_operator scheduler.index('if (readyLabel && !labels.has(readyLabel))'),
+                    :<, scheduler.index('const candidateResumeHold = await checkpointResumeHold('),
+                    'automation:ready must still gate candidate admission'
+    assert_operator scheduler.index('const localStop = await terminalGenerationStop('),
+                    :<, scheduler.index('const candidateResumeHold = await checkpointResumeHold('),
+                    'a terminal stop must still precede candidate hold filtering'
+    assert_operator scheduler.index('openPrIssues.has(issueNumber) ||'),
+                    :<, scheduler.index('const resumeHold = await checkpointResumeHold('),
+                    'active PR/run fencing must still precede reservation reconciliation'
+
+    harness = <<~JS
+      const assert = require('assert');
+      const path = require('path');
+      const core = { warning: () => {}, notice: () => {}, info: () => {} };
+      const owner = 'kodmial';
+      let resetMarkers = false;
+      let engineHeadOverride = '';
+
+      function isTrustedStopComment(c, trustedOwner = owner) {
+        const association = String(c.author_association || '').toUpperCase();
+        if (['OWNER', 'MEMBER', 'COLLABORATOR'].includes(association)) return true;
+        const login = String(c.user?.login || '').toLowerCase();
+        if (login === 'github-actions[bot]') return true;
+        return login === String(trustedOwner || '').toLowerCase();
+      }
+      function stopOrderKey(c) {
+        return String(c.created_at || '') + '#' +
+          String(c.id || 0).padStart(12, '0');
+      }
+      function isCanonicalSchedulerDispatch(comment) {
+        const author = String(comment?.user?.login || '').toLowerCase();
+        if (author !== String(owner).toLowerCase() && author !== 'github-actions[bot]') {
+          return false;
+        }
+        const body = String(comment?.body || '').replace(/\\r\\n/g, '\\n').trimEnd();
+        const receipt = body.startsWith('/oc\\n\\n') ? body.slice(5) : body;
+        const lines = receipt.split('\\n');
+        return lines.length === 4 &&
+          lines[0] === '<!-- issue-scheduler-dispatch -->' &&
+          lines[1] === '⚡ **Continuum · issue-scheduler**' &&
+          lines[2] === '<!-- continuum-origin role=continuum component=issue-scheduler -->' &&
+          /^Automatically dispatched by the issue scheduler \\((?:priority:p[0-2]|no explicit priority)\\)\\.$/.test(lines[3]);
+      }
+      const execFileSync = () => engineHeadOverride;
+    #{scheduler_hold}
+
+      const sha = '4a6e1eb11b2ab6e4ce233a610b177d4e7bc59ecb';
+      const baseSha = '705d8e53fdd83a3c17ead5723afb707d8f3fcd80';
+      const spec = '456f396895a33ec247e65308865c1728aad67e44a473a6f3d2f00b81d2babbb2';
+      const otherSha = 'f'.repeat(40);
+      const fixSha = 'd063e72900790a647a9709771f477085b8141d83';
+      const engineHead = 'e'.repeat(40);
+      const mergedAt = '2026-11-16T19:58:07Z';
+      const snapshotAt = '2026-11-15T20:58:08Z';
+      const holdAt = '2026-11-15T22:09:48Z';
+
+      const comment = (id, body, at, login = 'kodmial') => ({
+        id, body, created_at: at,
+        user: { login },
+        author_association: login === 'kodmial' ? 'OWNER' : 'NONE'
+      });
+      const snapshot = value =>
+        '<!-- continuum-task-snapshot repo=kodmial/aa issue=534 generation=1 ' +
+        'title-sha256=' + 'a'.repeat(64) + ' body-sha256=' + 'b'.repeat(64) +
+        ' spec-sha256=' + value + ' -->';
+      const hold = (generation = 2, reason = 'wrong-generation') =>
+        '<!-- continuum-checkpoint-resume-blocked repo=kodmial/aa issue=534 ' +
+        'generation=' + generation + ' operation=opencode-429-issue-issue534 ' +
+        'checkpoint=opencode/checkpoint-issue534 checkpoint_sha=' + sha +
+        ' base_ref=main base_sha=' + baseSha + ' snapshot=' + spec +
+        ' reason=' + reason + ' episode=43763622351-1 -->';
+      const dispatch = [
+        '<!-- issue-scheduler-dispatch -->',
+        '⚡ **Continuum · issue-scheduler**',
+        '<!-- continuum-origin role=continuum component=issue-scheduler -->',
+        'Automatically dispatched by the issue scheduler (priority:p0).'
+      ].join('\\n');
+
+      const makeClient = (overrides = {}) => {
+        const config = Object.assign({
+          refs: {
+            'opencode/checkpoint-issue534': sha,
+            'opencode/429-checkpoint-opencode-429-issue-issue534-gen-2': sha,
+            'main': baseSha
+          },
+          compareStatus: 'ahead',
+          mergedAt: mergedAt,
+          mergeSha: fixSha,
+          pullError: false,
+          compareError: false
+        }, overrides);
+        return {
+          rest: {
+            git: {
+              getRef: async ({ ref }) => {
+                const raw = String(ref);
+                const name = raw.startsWith('heads/') ? raw.slice(6) : raw;
+                const tip = config.refs[name];
+                if (tip === undefined) {
+                  const error = new Error('missing ref');
+                  error.status = 404;
+                  throw error;
+                }
+                if (tip === 'error') {
+                  const error = new Error('denied ref');
+                  error.status = 403;
+                  throw error;
+                }
+                return { data: { object: { sha: tip } } };
+              }
+            },
+            pulls: {
+              get: async () => {
+                if (config.pullError) {
+                  const error = new Error('rate limited');
+                  error.status = 429;
+                  throw error;
+                }
+                return { data: {
+                  merged: true,
+                  merged_at: config.mergedAt,
+                  merge_commit_sha: config.mergeSha
+                } };
+              }
+            },
+            repos: {
+              compareCommits: async () => {
+                if (config.compareError) {
+                  const error = new Error('upstream failure');
+                  error.status = 502;
+                  throw error;
+                }
+                return { data: { status: config.compareStatus } };
+              }
+            }
+          }
+        };
+      };
+
+      const snapshotComment = comment(1, snapshot(spec), snapshotAt);
+      const holdComment = comment(2, hold(), holdAt);
+      const baseComments = [snapshotComment, holdComment];
+      const holdMarker = checkpointResumeHoldMarker(
+        holdComment, 'kodmial/aa', 534
+      );
+      const identity = wrongGenerationReleaseIdentity(holdMarker, 534);
+
+      const release = (comments, overrides = {}) => {
+        const trusted = comments.filter(c => isTrustedStopComment(c, owner));
+        const {
+          authoritativeSnapshot = spec,
+          ...clientOverrides
+        } = overrides;
+        return checkpointWrongGenerationRelease(
+          holdMarker, identity, 534, trusted, authoritativeSnapshot,
+          makeClient(clientOverrides), 'kodmial', 'aa'
+        );
+      };
+      const markerOf = body => checkpointResumeHoldMarker(
+        comment(9, body, holdAt), 'kodmial/aa', 534
+      );
+
+      (async () => {
+        engineHeadOverride = engineHead;
+        assert.ok(identity, 'the fixture must expose a release identity');
+        assert.equal(identity.legacyRef, 'opencode/checkpoint-issue534');
+        assert.deepEqual(identity.durableRefs, [
+          'opencode/429-checkpoint-opencode-429-issue-issue534-gen-2'
+        ]);
+
+        // Narrow identity: another reason, generation, operation, or ref is
+        // never eligible even when every other premise looks similar.
+        assert.equal(
+          wrongGenerationReleaseIdentity(markerOf(hold(3)), 534), null,
+          'recovery generation 3 must not release'
+        );
+        assert.equal(
+          wrongGenerationReleaseIdentity(markerOf(hold(1)), 534), null,
+          'recovery generation 1 must not release'
+        );
+        assert.equal(
+          wrongGenerationReleaseIdentity(
+            markerOf(hold(2, 'verification-failed')), 534
+          ), null, 'another rejection reason must not release'
+        );
+        assert.equal(
+          wrongGenerationReleaseIdentity(markerOf(hold().replace(
+            'operation=opencode-429-issue-issue534',
+            'operation=opencode-429-issue-issue999'
+          )), 534), null, 'another operation must not release'
+        );
+        assert.equal(
+          wrongGenerationReleaseIdentity(markerOf(hold().replace(
+            'checkpoint=opencode/checkpoint-issue534',
+            'checkpoint=opencode/checkpoint-issue999'
+          )), 534), null, 'another checkpoint ref must not release'
+        );
+        assert.equal(
+          wrongGenerationReleaseIdentity(markerOf(hold().replace(
+            'checkpoint=opencode/checkpoint-issue534',
+            'checkpoint=opencode/infra-checkpoint-opencode-429-issue-issue534-gen-2'
+          )), 534), null, 'an infra durable checkpoint must not release'
+        );
+        assert.equal(
+          checkpointResumeHoldMarker(holdComment, 'kodmial/continuum', 534),
+          null, 'another repository must not inherit the AA hold'
+        );
+        assert.equal(
+          checkpointResumeHoldMarker(holdComment, 'kodmial/aa', 535),
+          null, 'another issue must not inherit the AA hold'
+        );
+
+        // Positive: the real AA #534 identity plus a proven engine upgrade is
+        // permission to run the validator once.
+        assert.equal(await release(baseComments), true,
+          'the proven fix must release the historical hold');
+        assert.equal(await release(baseComments, { compareStatus: 'identical' }),
+          true, 'an identical engine HEAD must release');
+
+        // Fail closed on absent proof: older engine, API errors, malformed
+        // merge metadata, and base/snapshot/ref drift all keep the hold.
+        assert.equal(await release(baseComments, { compareStatus: 'behind' }),
+          false, 'an engine before the fix must keep the hold');
+        assert.equal(await release(baseComments, { compareStatus: 'diverged' }),
+          false, 'a diverged engine must keep the hold');
+        assert.equal(await release(baseComments, { compareError: true }),
+          false, 'an unreadable compare must keep the hold');
+        assert.equal(await release(baseComments, { pullError: true }),
+          false, 'an unreadable fix PR must keep the hold');
+        assert.equal(await release(baseComments, { mergeSha: otherSha }),
+          false, 'a different merge commit must keep the hold');
+        assert.equal(await release(baseComments, { mergedAt: '' }),
+          false, 'an unreadable merge timestamp must keep the hold');
+        assert.equal(await release([holdComment], {
+          authoritativeSnapshot: null
+        }), false, 'a hold without the authoritative snapshot pin must stay');
+        assert.equal(await release([holdComment], {
+          authoritativeSnapshot: otherSha
+        }), false, 'a different pinned snapshot must keep the hold');
+
+        const refsWithoutLegacy = {
+          'opencode/429-checkpoint-opencode-429-issue-issue534-gen-2': sha,
+          'main': baseSha
+        };
+        const refsWithoutDurable = {
+          'opencode/checkpoint-issue534': sha,
+          'main': baseSha
+        };
+        const refsLegacyMismatch = {
+          'opencode/checkpoint-issue534': otherSha,
+          'opencode/429-checkpoint-opencode-429-issue-issue534-gen-2': sha,
+          'main': baseSha
+        };
+        const refsDurableMismatch = {
+          'opencode/checkpoint-issue534': sha,
+          'opencode/429-checkpoint-opencode-429-issue-issue534-gen-2': otherSha,
+          'main': baseSha
+        };
+        const refsDurableError = {
+          'opencode/checkpoint-issue534': sha,
+          'opencode/429-checkpoint-opencode-429-issue-issue534-gen-2': 'error',
+          'main': baseSha
+        };
+        const refsBaseMissing = {
+          'opencode/checkpoint-issue534': sha,
+          'opencode/429-checkpoint-opencode-429-issue-issue534-gen-2': sha
+        };
+        assert.equal(await release(baseComments, { refs: refsWithoutLegacy }),
+          false, 'a missing legacy ref must keep the hold');
+        assert.equal(await release(baseComments, { refs: refsWithoutDurable }),
+          false, 'a missing durable ref must keep the hold');
+        assert.equal(await release(baseComments, { refs: refsLegacyMismatch }),
+          false, 'a moved legacy ref is not an override');
+        assert.equal(await release(baseComments, { refs: refsDurableMismatch }),
+          false, 'a moved durable ref is not an override');
+        assert.equal(await release(baseComments, { refs: refsDurableError }),
+          false, 'an unreadable durable ref must keep the hold');
+        assert.equal(await release(baseComments, { refs: refsBaseMissing }),
+          false, 'an unreadable base ref must keep the hold');
+
+        engineHeadOverride = fixSha;
+        assert.equal(await release(baseComments, {
+          refs: {
+            'opencode/checkpoint-issue534': sha,
+            'opencode/429-checkpoint-opencode-429-issue-issue534-gen-2': sha,
+            'main': otherSha
+          },
+          compareStatus: 'diverged'
+        }), false, 'a rewritten base must keep the hold');
+
+        // Exactly one ordinary dispatch: the canonical receipt after the merge
+        // consumes the release, and a repeated identical hold cannot reopen it.
+        engineHeadOverride = engineHead;
+        const beforeMerge = comment(3, dispatch, '2026-11-15T23:00:00Z');
+        const afterMerge = comment(4, dispatch, '2026-11-18T10:00:00Z');
+        assert.equal(await release([...baseComments, beforeMerge]), true,
+          'a dispatch before the merge is history, not consumption');
+        assert.equal(await release([...baseComments, afterMerge]), false,
+          'a canonical dispatch after the merge consumes the release');
+        assert.equal(
+          await release([
+            ...baseComments,
+            comment(5, hold(), '2026-11-18T11:00:00Z'),
+            afterMerge
+          ]), false,
+          'a repeated identical hold must not reopen the consumed release'
+        );
+        const durableHold = comment(
+          6,
+          hold().replace(
+            'checkpoint=opencode/checkpoint-issue534',
+            'checkpoint=opencode/429-checkpoint-opencode-429-issue-issue534-gen-2'
+          ),
+          '2026-11-18T11:00:00Z'
+        );
+        assert.ok(
+          await checkpointResumeHold(
+            'kodmial', 'aa', 534,
+            [snapshotComment, holdComment, afterMerge, durableHold],
+            makeClient()
+          ),
+          'the durable ref spelling of the same hold must stay consumed'
+        );
+
+        resetMarkers = true;
+        assert.equal(await release(baseComments), false,
+          'reset_markers must fail closed');
+        resetMarkers = false;
+
+        // The same decision is visible through the one hold entry point used
+        // by reconciliation, candidate filtering, and JIT dispatch.
+        engineHeadOverride = engineHead;
+        assert.equal(
+          await checkpointResumeHold(
+            'kodmial', 'aa', 534, baseComments, makeClient()
+          ), null,
+          'a proven engine must lift the hold for one dispatch'
+        );
+        assert.ok(
+          await checkpointResumeHold(
+            'kodmial', 'aa', 534, [...baseComments, afterMerge], makeClient()
+          ),
+          'the canonical dispatch after the merge must keep the hold'
+        );
+        assert.ok(
+          await checkpointResumeHold(
+            'kodmial', 'aa', 534,
+            [snapshotComment, comment(2, hold(2, 'verification-failed'), holdAt)],
+            makeClient()
+          ),
+          'an unrelated verification-failed hold must stay'
+        );
+        assert.ok(
+          await checkpointResumeHold(
+            'kodmial', 'aa', 534,
+            [snapshotComment, comment(2, hold(3), holdAt)],
+            makeClient()
+          ),
+          'a recovery generation 3 hold must stay'
+        );
+        resetMarkers = true;
+        assert.ok(
+          await checkpointResumeHold(
+            'kodmial', 'aa', 534, baseComments, makeClient()
+          ),
+          'reset_markers must keep the hold at the entry point'
+        );
+        resetMarkers = false;
+        assert.ok(
+          await checkpointResumeHold(
+            'kodmial', 'aa', 534, baseComments,
+            makeClient({ compareStatus: 'behind' })
+          ),
+          'an engine before the fix must keep the hold at the entry point'
+        );
+
+        console.log('wrong-generation-release: PASS');
+      })().catch((error) => {
+        console.error(error);
+        process.exitCode = 1;
+      });
+    JS
+
+    stdout, stderr, status = Open3.capture3('node', '-e', harness, chdir: ROOT)
+    assert status.success?, stderr
+    assert_includes stdout, 'wrong-generation-release: PASS'
+  end
+
   # kodmial/continuum#266: the optional `automation:ready` admission gate.
   # Empty configuration preserves current behavior; when configured, automatic
   # dispatch admits only issues carrying the label. Priority stays a ranking

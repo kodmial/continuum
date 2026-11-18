@@ -750,12 +750,331 @@ module.exports = async function runIssueScheduler({ github, context, core }) {
   const checkpointSnapshotMarkerRe =
     /<!--\s*continuum-task-snapshot\s+repo=([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)\s+issue=(\d+)\s+generation=(\d+)\s+title-sha256=([0-9a-fA-F]{64})\s+body-sha256=([0-9a-fA-F]{64})\s+spec-sha256=([0-9a-fA-F]{64})\s*-->/;
 
+  // The only historical rejection this engine may supersede is the
+  // generation-2 durable-checkpoint rejection that PR #461 fixed. The
+  // identity is the immutable merge commit of that fix, never a task or
+  // repository fixture: a consumer whose engine checkout predates it keeps
+  // the hold, and no other reason, generation, or operation is affected.
+  const checkpointWrongGenerationFix = Object.freeze({
+    repository: 'kodmial/continuum',
+    pullRequest: 461,
+    mergeSha: 'd063e72900790a647a9709771f477085b8141d83',
+  });
+
+  // Parse one comment into the same durable hold identity the generic loop
+  // uses. Keeping one parser means the release decision and the hold decision
+  // can never disagree about a marker's repo, issue, or recovery generation.
+  function checkpointResumeHoldMarker(comment, wantedRepo, issueNumber) {
+    const match = String(comment.body || '').match(
+      checkpointResumeBlockedMarkerRe
+    );
+    if (!match) return null;
+    if (
+      match[1].toLowerCase() !== wantedRepo ||
+      Number(match[2]) !== issueNumber
+    ) {
+      return null;
+    }
+    const generation = Number(match[3]);
+    if (!Number.isInteger(generation) || generation < 1) return null;
+    return {
+      created_at: comment.created_at || '',
+      id: comment.id || 0,
+      generation,
+      operation: match[4],
+      checkpointRef: match[5],
+      checkpointSha: match[6].toLowerCase(),
+      baseRef: match[7],
+      baseSha: match[8].toLowerCase(),
+      snapshotSpec: match[9].toLowerCase(),
+      reason: match[10],
+    };
+  }
+
+  // The release is scoped by the hold's own immutable identity:
+  //   * reason=wrong-generation on recovery generation 2 (task generation 1
+  //     is a different concept and never qualifies);
+  //   * the operation is scoped to this issue, so a hold copied from another
+  //     task cannot release;
+  //   * the recorded ref is the issue's legacy alias or the exact durable
+  //     generation-2 namespace derived from that operation.
+  function wrongGenerationReleaseIdentity(marker, issueNumber) {
+    if (!marker || marker.reason !== 'wrong-generation') return null;
+    if (Number(marker.generation) !== 2) return null;
+    const operation = String(marker.operation || '');
+    if (!/^opencode-[A-Za-z0-9-]+$/.test(operation)) return null;
+    if (!operation.split('-').includes('issue' + issueNumber)) return null;
+    const legacyRef = 'opencode/checkpoint-issue' + issueNumber;
+    // PR #461 only covers the 429 evacuation namespace. An `infra` durable
+    // checkpoint is a different recovery identity and keeps its hold.
+    const durableRefs = [
+      'opencode/429-checkpoint-' + operation + '-gen-2',
+    ];
+    const recordedRef = String(marker.checkpointRef || '');
+    if (recordedRef !== legacyRef && !durableRefs.includes(recordedRef)) {
+      return null;
+    }
+    return {
+      operation,
+      legacyRef,
+      durableRefs,
+      snapshotSpec: String(marker.snapshotSpec || '').toLowerCase(),
+      baseRef: String(marker.baseRef || ''),
+      baseSha: String(marker.baseSha || '').toLowerCase(),
+    };
+  }
+
+  // The same persisted hold can be republished with either ref spelling
+  // (legacy alias or its durable generation-2 ref) while naming the same
+  // immutable checkpoint commit. Consumption must follow the operation and
+  // commit, not the spelling, or a repeat rejection after the single allowed
+  // dispatch could reopen the override by switching ref names.
+  function sameWrongGenerationHoldIdentity(left, right) {
+    return Boolean(left && right) &&
+      left.reason === right.reason &&
+      Number(left.generation) === Number(right.generation) &&
+      left.operation === right.operation &&
+      left.checkpointSha === right.checkpointSha &&
+      left.baseRef === right.baseRef &&
+      left.baseSha === right.baseSha &&
+      left.snapshotSpec === right.snapshotSpec;
+  }
+
+  // Resolve the immutable commit a ref currently publishes. `missing` and
+  // `error` are deliberately different: only a 404 is a material premise
+  // change, while an unreadable ref must keep the deterministic hold.
+  async function checkpointReferenceTip(
+    client, targetOwner, targetRepo, refName
+  ) {
+    try {
+      const response = await client.rest.git.getRef({
+        owner: targetOwner,
+        repo: targetRepo,
+        ref: 'heads/' + String(refName || '').replace(/^refs\/heads\//, ''),
+      });
+      const tip = String(response?.data?.object?.sha || '').toLowerCase();
+      return /^[0-9a-f]{40}$/.test(tip) ? { tip } : { error: true };
+    } catch (err) {
+      if (err && err.status === 404) return { missing: true };
+      return { error: true };
+    }
+  }
+
+  // Read the checked-out engine's exact commit. The scheduler checkout is
+  // shallow (`fetch-depth: 1`), so local ancestry is unavailable; the engine
+  // identity must come from the immutable HEAD commit and be compared through
+  // the GitHub API below.
+  function checkpointEngineHead() {
+    const root = path.join(
+      process.env.GITHUB_WORKSPACE || process.cwd(),
+      '.continuum-engine'
+    );
+    try {
+      const head = String(
+        execFileSync('git', ['-C', root, 'rev-parse', 'HEAD'], {
+          encoding: 'utf8',
+          stdio: ['ignore', 'pipe', 'pipe'],
+        }) || ''
+      ).trim().toLowerCase();
+      return /^[0-9a-f]{40}$/.test(head) ? head : '';
+    } catch (err) {
+      return '';
+    }
+  }
+
+  // Return the fix's merge timestamp only when the executing engine can be
+  // proven to contain it, otherwise 0. Any read failure is an absent proof:
+  // the caller keeps the hold instead of assuming the fix.
+  async function checkpointWrongGenerationFixMergedAt(client) {
+    const head = checkpointEngineHead();
+    if (!head) return 0;
+    const [fixOwner, fixRepo] = checkpointWrongGenerationFix.repository
+      .split('/');
+    let pull;
+    try {
+      pull = (await client.rest.pulls.get({
+        owner: fixOwner,
+        repo: fixRepo,
+        pull_number: checkpointWrongGenerationFix.pullRequest,
+      })).data;
+    } catch (err) {
+      return 0;
+    }
+    if (!pull || pull.merged !== true) return 0;
+    if (
+      String(pull.merge_commit_sha || '').toLowerCase() !==
+      checkpointWrongGenerationFix.mergeSha
+    ) {
+      return 0;
+    }
+    const mergedAt = Date.parse(pull.merged_at || '');
+    if (!Number.isFinite(mergedAt)) return 0;
+    if (head === checkpointWrongGenerationFix.mergeSha) return mergedAt;
+    let comparison;
+    try {
+      comparison = (await client.rest.repos.compareCommits({
+        owner: fixOwner,
+        repo: fixRepo,
+        base: checkpointWrongGenerationFix.mergeSha,
+        head,
+      })).data;
+    } catch (err) {
+      return 0;
+    }
+    const status = String(comparison?.status || '');
+    if (status !== 'ahead' && status !== 'identical') return 0;
+    return mergedAt;
+  }
+
+  // Decide whether the persisted wrong-generation rejection is superseded.
+  // This is permission to run the existing validator once, never a claim that
+  // the checkpoint itself is valid: the executor repeats every provenance,
+  // metadata, ancestry, and verification check before using saved work.
+  async function checkpointWrongGenerationRelease(
+    marker, identity, issueNumber, trusted, authoritativeSnapshot,
+    client, targetOwner, targetRepo
+  ) {
+    const deny = reason => {
+      core.info(
+        'Wrong-generation checkpoint hold on #' + issueNumber +
+        ' is kept: ' + reason + '.'
+      );
+      return false;
+    };
+    if (resetMarkers) {
+      return deny('reset_markers is enabled');
+    }
+    // The authoritative pin is the task contract. Without it there is no
+    // proof that the held snapshot is still the pinned one, so nothing is
+    // released.
+    if (!authoritativeSnapshot) {
+      return deny('no authoritative pinned task snapshot is present');
+    }
+    if (authoritativeSnapshot !== identity.snapshotSpec) {
+      return deny('the authoritative task snapshot moved');
+    }
+
+    const mergedAt = await checkpointWrongGenerationFixMergedAt(client);
+    if (!mergedAt) {
+      return deny(
+        'the executing Continuum engine cannot be proven to contain the PR ' +
+        '#' + checkpointWrongGenerationFix.pullRequest + ' fix'
+      );
+    }
+
+    // Exactly one ordinary dispatch consumes this release. The original hold
+    // is the earliest marker with this identity, so a repeated identical
+    // episode after the dispatch cannot reopen the override. A canonical
+    // scheduler dispatch is the existing receipt with its unchanged format.
+    let originalHoldAt = Date.parse(marker.created_at || '');
+    if (!Number.isFinite(originalHoldAt)) {
+      return deny('the original hold timestamp is unreadable');
+    }
+    const wantedRepo = (targetOwner + '/' + targetRepo).toLowerCase();
+    for (const comment of trusted) {
+      const candidate = checkpointResumeHoldMarker(
+        comment, wantedRepo, issueNumber
+      );
+      if (!candidate || !sameWrongGenerationHoldIdentity(candidate, marker)) {
+        continue;
+      }
+      const at = Date.parse(candidate.created_at || '');
+      if (!Number.isFinite(at)) {
+        return deny('an original hold timestamp is unreadable');
+      }
+      if (at < originalHoldAt) originalHoldAt = at;
+    }
+    for (const comment of trusted) {
+      if (!isCanonicalSchedulerDispatch(comment)) continue;
+      const at = Date.parse(comment.created_at || '');
+      if (
+        !Number.isFinite(at) ||
+        (at > mergedAt && at > originalHoldAt)
+      ) {
+        return deny(
+          'a canonical scheduler dispatch after the fix already consumed ' +
+          'the single release'
+        );
+      }
+    }
+
+    // Both spellings of the checkpoint must exist and publish exactly the
+    // held commit. A moved, missing, ambiguous, or unreadable ref keeps the
+    // hold; the override never makes a checkpoint readable that is not.
+    const legacy = await checkpointReferenceTip(
+      client, targetOwner, targetRepo, identity.legacyRef
+    );
+    if (!legacy.tip) {
+      return deny('the legacy checkpoint ref is not readable');
+    }
+    if (legacy.tip !== marker.checkpointSha) {
+      return deny('the legacy checkpoint ref does not publish the held commit');
+    }
+    let durableFound = 0;
+    for (const durableRef of identity.durableRefs) {
+      const durable = await checkpointReferenceTip(
+        client, targetOwner, targetRepo, durableRef
+      );
+      if (durable.missing) continue;
+      if (!durable.tip) {
+        return deny('a durable generation-2 checkpoint ref is not readable');
+      }
+      durableFound += 1;
+      if (durable.tip !== marker.checkpointSha) {
+        return deny(
+          'a durable generation-2 checkpoint ref does not publish the ' +
+          'held commit'
+        );
+      }
+    }
+    if (durableFound === 0) {
+      return deny('no durable generation-2 checkpoint ref is published');
+    }
+
+    // The recorded base must still be on the task repository's base lineage.
+    // Later commits are allowed (the executor validates against the original
+    // immutable base), but a rewritten or deleted base is drift.
+    if (
+      !identity.baseRef ||
+      !/^[0-9a-f]{40}$/.test(identity.baseSha)
+    ) {
+      return deny('the hold has no usable base identity');
+    }
+    const base = await checkpointReferenceTip(
+      client, targetOwner, targetRepo,
+      identity.baseRef.replace(/^refs\/heads\//, '')
+    );
+    if (!base.tip) {
+      return deny('the base ref is not readable');
+    }
+    if (base.tip !== identity.baseSha) {
+      let comparison;
+      try {
+        comparison = (await client.rest.repos.compareCommits({
+          owner: targetOwner,
+          repo: targetRepo,
+          base: identity.baseSha,
+          head: base.tip,
+        })).data;
+      } catch (err) {
+        return deny('the base lineage cannot be compared');
+      }
+      const status = String(comparison?.status || '');
+      if (status !== 'ahead' && status !== 'identical') {
+        return deny('the base ref no longer contains the held base commit');
+      }
+    }
+    return true;
+  }
+
   // A deterministic checkpoint-continuation rejection is persisted as a
   // typed marker. It is not an owner pause and not a terminal generation
   // stop: the saved checkpoint is preserved and the scheduler only holds
   // this exact identity. A changed checkpoint tip, a different authoritative
   // pinned task snapshot, or checkpoint deletion are the only material
-  // premise changes.
+  // premise changes. The one exception is the versioned wrong-generation
+  // release below: a *proven engine upgrade* supersedes that historical
+  // rejection without touching the saved checkpoint.
   //
   // A manual owner /oc is not a release here. The owner command already
   // starts its own OpenCode issue run through the `issue_comment` trigger,
@@ -773,7 +1092,10 @@ module.exports = async function runIssueScheduler({ github, context, core }) {
   //   * the rejection marker's `generation` is the *recovery* generation of
   //     the run that rejected the resume, and 429 evacuation generations can
   //     be above 1. The rejection is bound to the checkpoint identity, so a
-  //     marker from any recovery generation >= 1 applies its hold;
+  //     marker from any recovery generation >= 1 applies its hold; only the
+  //     exact generation-2 wrong-generation identity above may be released by
+  //     a proven engine upgrade, and that release never touches this
+  //     generation filter;
   //   * a `continuum-task-snapshot` marker's `generation` is the *task*
   //     generation, which the workflow pins to 1 (`continuum-opencode.yml`).
   //     Only that generation can release the hold with a different spec.
@@ -787,26 +1109,10 @@ module.exports = async function runIssueScheduler({ github, context, core }) {
     );
     let marker = null;
     for (const comment of trusted) {
-      const match = String(comment.body || '').match(
-        checkpointResumeBlockedMarkerRe
+      const candidate = checkpointResumeHoldMarker(
+        comment, wantedRepo, issueNumber
       );
-      if (!match) continue;
-      if (
-        match[1].toLowerCase() !== wantedRepo ||
-        Number(match[2]) !== issueNumber ||
-        Number(match[3]) < 1
-      ) continue;
-      const candidate = {
-        created_at: comment.created_at || '',
-        id: comment.id || 0,
-        operation: match[4],
-        checkpointRef: match[5],
-        checkpointSha: match[6].toLowerCase(),
-        baseRef: match[7],
-        baseSha: match[8].toLowerCase(),
-        snapshotSpec: match[9].toLowerCase(),
-        reason: match[10],
-      };
+      if (!candidate) continue;
       if (!marker || stopOrderKey(candidate) > stopOrderKey(marker)) {
         marker = candidate;
       }
@@ -852,6 +1158,36 @@ module.exports = async function runIssueScheduler({ github, context, core }) {
       authoritativeSnapshot !== marker.snapshotSpec
     ) {
       return null;
+    }
+
+    // A proven engine upgrade supersedes the one historical rejection that
+    // PR #461 fixed. The release is checked before the material-premise ref
+    // read because it requires both ref spellings to exist at the held SHA.
+    // Everything else (labels, owner stop, active runs, JIT re-reads) remains
+    // outside this function and still applies to the resulting dispatch.
+    const releaseIdentity = wrongGenerationReleaseIdentity(
+      marker, issueNumber
+    );
+    if (releaseIdentity) {
+      const released = await checkpointWrongGenerationRelease(
+        marker,
+        releaseIdentity,
+        issueNumber,
+        trusted,
+        authoritativeSnapshot,
+        client,
+        targetOwner,
+        targetRepo
+      );
+      if (released) {
+        core.notice(
+          'Released the historical wrong-generation checkpoint hold on #' +
+          issueNumber + ' for exactly one ordinary scheduler dispatch; the ' +
+          'executor still revalidates the generation-2 durable checkpoint ' +
+          'and preserves the saved work.'
+        );
+        return null;
+      }
     }
 
     // A changed or deleted durable checkpoint ref is a material premise
