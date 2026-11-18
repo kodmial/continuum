@@ -3603,6 +3603,376 @@ class ContinuumTest < Minitest::Test
     refute_includes doc, 'CRON_JOB_ORG_API_KEY'
   end
 
+  # Minimal GitHub Actions expression evaluator for job-level `if:`
+  # conditions. Only the operators and functions used by automation.yml are
+  # supported: &&, ||, !, ==, !=, parentheses, string/number literals, dotted
+  # context lookups, and startsWith()/contains()/fromJSON(). Evaluation follows
+  # GitHub's short-circuit, truthiness, and loose-equality rules so the routing
+  # tests exercise the checked-in YAML conditions rather than a hand-written
+  # model of them.
+  class GithubExpression
+    TOKEN = /
+      \s*(?:
+        (?<string>'(?:[^']|'')*')
+      | (?<number>-?\d+(?:\.\d+)?)
+      | (?<op>&&|\|\||==|!=|\(|\)|,|!)
+      | (?<ident>[A-Za-z_][A-Za-z0-9_]*)
+      | (?<dot>\.)
+      | (?<bad>\S)
+      )
+    /x
+
+    class ExpressionError < StandardError; end
+
+    def initialize(text, context)
+      @context = context
+      @tokens = tokenize(text)
+      @index = 0
+    end
+
+    def evaluate
+      value = parse_or
+      raise ExpressionError, "unexpected token #{peek.inspect}" if peek
+
+      value
+    end
+
+    def truthy?
+      GithubExpression.truthy?(evaluate)
+    end
+
+    def self.truthy?(value)
+      return false if value.nil? || value == false
+      return false if value.is_a?(Numeric) && value.zero?
+      return false if value.is_a?(String) && value.empty?
+
+      true
+    end
+
+    private
+
+    def tokenize(text)
+      tokens = []
+      position = 0
+      while position < text.length
+        match = TOKEN.match(text, position)
+        if match.nil?
+          break if text[position..].strip.empty?
+
+          raise ExpressionError, "cannot tokenize expression at #{text[position..].inspect}"
+        end
+        position = match.end(0)
+        if match[:bad]
+          raise ExpressionError, "unsupported token #{match[:bad].inspect}"
+        elsif match[:string]
+          tokens << [:string, match[:string][1...-1].gsub("''", "'")]
+        elsif match[:number]
+          raw = match[:number]
+          tokens << [:number, raw.include?('.') ? raw.to_f : raw.to_i]
+        elsif match[:op]
+          tokens << [:op, match[:op]]
+        elsif match[:ident]
+          tokens << [:ident, match[:ident]]
+        elsif match[:dot]
+          tokens << [:dot, nil]
+        end
+      end
+      tokens
+    end
+
+    def peek
+      @tokens[@index]
+    end
+
+    def accept(kind, value = nil)
+      token = peek
+      return nil unless token
+      return nil unless token[0] == kind
+      return nil if value && token[1] != value
+
+      @index += 1
+      token
+    end
+
+    def expect(kind, value = nil)
+      token = accept(kind, value)
+      return token if token
+
+      raise ExpressionError, "expected #{kind} #{value.inspect}, got #{peek.inspect}"
+    end
+
+    def parse_or
+      value = parse_and
+      while accept(:op, '||')
+        right = parse_and
+        value = GithubExpression.truthy?(value) ? value : right
+      end
+      value
+    end
+
+    def parse_and
+      value = parse_equality
+      while accept(:op, '&&')
+        right = parse_equality
+        value = GithubExpression.truthy?(value) ? right : value
+      end
+      value
+    end
+
+    def parse_equality
+      value = parse_unary
+      loop do
+        if accept(:op, '==')
+          value = equals(value, parse_unary)
+        elsif accept(:op, '!=')
+          value = !equals(value, parse_unary)
+        else
+          return value
+        end
+      end
+    end
+
+    def parse_unary
+      return !GithubExpression.truthy?(parse_unary) if accept(:op, '!')
+
+      parse_primary
+    end
+
+    def parse_primary
+      token = peek
+      raise ExpressionError, 'unexpected end of expression' unless token
+
+      if token[0] == :op && token[1] == '('
+        @index += 1
+        value = parse_or
+        expect(:op, ')')
+        return value
+      end
+      if %i[string number].include?(token[0])
+        @index += 1
+        return token[1]
+      end
+      raise ExpressionError, "unexpected token #{token.inspect}" unless token[0] == :ident
+
+      @index += 1
+      name = token[1]
+      case name.downcase
+      when 'true' then return true
+      when 'false' then return false
+      when 'null', 'nil' then return nil
+      end
+      if accept(:op, '(')
+        args = []
+        unless accept(:op, ')')
+          loop do
+            args << parse_or
+            break if accept(:op, ')')
+
+            expect(:op, ',')
+          end
+        end
+        return call(name, args)
+      end
+
+      value = @context[name]
+      while accept(:dot)
+        key = expect(:ident)[1]
+        value = value.is_a?(Hash) ? value[key] : nil
+      end
+      value
+    end
+
+    def call(name, args)
+      case name.downcase
+      when 'startswith'
+        raise ExpressionError, 'startsWith() expects two arguments' unless args.length == 2
+
+        stringify(args[0]).downcase.start_with?(stringify(args[1]).downcase)
+      when 'contains'
+        raise ExpressionError, 'contains() expects two arguments' unless args.length == 2
+
+        haystack = args[0]
+        needle = args[1]
+        if haystack.is_a?(Array)
+          haystack.any? { |item| equals(item, needle) }
+        else
+          stringify(haystack).downcase.include?(stringify(needle).downcase)
+        end
+      when 'fromjson'
+        raise ExpressionError, 'fromJSON() expects one argument' unless args.length == 1
+
+        JSON.parse(stringify(args[0]))
+      else
+        raise ExpressionError, "unsupported function #{name.inspect}"
+      end
+    end
+
+    def stringify(value)
+      case value
+      when nil then ''
+      when true then 'true'
+      when false then 'false'
+      else value.to_s
+      end
+    end
+
+    # GitHub compares strings case-insensitively and coerces mismatched types
+    # to numbers before comparing them.
+    def equals(left, right)
+      return left.casecmp?(right) if left.is_a?(String) && right.is_a?(String)
+      return left == right if left.class == right.class
+
+      number(left) == number(right)
+    end
+
+    def number(value)
+      case value
+      when nil then 0
+      when true then 1
+      when false then 0
+      when Numeric then value
+      when String then Float(value)
+      else Float::NAN
+      end
+    rescue ArgumentError
+      Float::NAN
+    end
+  end
+
+  # The jobs whose admission decides whether an external wake is narrow. The
+  # repair job is dispatch-free, but it is part of the route so a future change
+  # cannot make this selector admit it.
+  AUTOMATION_ROUTING_JOBS = %w[
+    scheduler
+    watchdog
+    repair
+    auto-merge
+    global-pr-watchdog
+  ].freeze
+
+  def automation_job_conditions
+    yaml(File.join(ROOT, '.github/workflows/automation.yml')).fetch('jobs').to_h do |name, job|
+      [name, job.fetch('if')]
+    end
+  end
+
+  def automation_event_context(event_name, inputs: {}, actor: 'kodmial', comment: nil,
+                               action: nil, schedule: nil, workflow_run: nil)
+    {
+      'github' => {
+        'event_name' => event_name,
+        'actor' => actor,
+        'repository_owner' => 'kodmial',
+        'event' => {
+          'comment' => comment || {},
+          'action' => action,
+          'schedule' => schedule,
+          'workflow_run' => workflow_run || {}
+        }
+      },
+      'inputs' => inputs
+    }
+  end
+
+  def automation_routing(conditions, event_name, **context)
+    routing_context = automation_event_context(event_name, **context)
+    conditions.to_h do |name, condition|
+      [name, GithubExpression.new(condition, routing_context).truthy?]
+    end
+  end
+
+  def automation_route(*jobs)
+    AUTOMATION_ROUTING_JOBS.to_h { |job| [job, jobs.include?(job)] }
+  end
+
+  # #470: `auto_merge_only` is a dispatch mode selector, not just an input
+  # declaration. Evaluate the checked-in job conditions so removing or widening
+  # the guard fails here, not only in a live workflow run.
+  def test_auto_merge_only_dispatch_routing_selects_only_auto_merge
+    automation = yaml(File.join(ROOT, '.github/workflows/automation.yml'))
+    selector = events(automation).fetch('workflow_dispatch').fetch('inputs').fetch('auto_merge_only')
+    assert_equal 'boolean', selector.fetch('type')
+    assert_equal false, selector.fetch('default')
+    assert_equal false, selector.fetch('required')
+
+    conditions = automation_job_conditions
+    narrow = automation_route('auto-merge')
+
+    # REST dispatch sends input values as strings; the typed workflow input may
+    # surface the same value as a JSON boolean.
+    [true, 'true'].each do |auto_merge_only|
+      ['false', 'true'].each do |periodic_wake|
+        inputs = {'periodic_wake' => periodic_wake, 'auto_merge_only' => auto_merge_only}
+        assert_equal narrow, automation_routing(conditions, 'workflow_dispatch', inputs: inputs),
+                     "auto_merge_only=#{auto_merge_only.inspect} " \
+                     "periodic_wake=#{periodic_wake.inspect} must admit only auto-merge"
+      end
+    end
+
+    assert_equal narrow,
+                 automation_routing(conditions, 'workflow_dispatch',
+                                    inputs: {'auto_merge_only' => true}),
+                 'a narrow manual test may send auto_merge_only alone'
+  end
+
+  # Omitting the selector, or sending false, must keep the previous broad
+  # manual dispatch: scheduler, watchdog, auto-merge, and the periodic-only
+  # global watchdog when periodic_wake=true.
+  def test_auto_merge_only_omitted_or_false_preserves_ordinary_dispatch_routing
+    conditions = automation_job_conditions
+    ordinary = automation_route('scheduler', 'watchdog', 'auto-merge')
+    periodic = automation_route('scheduler', 'watchdog', 'auto-merge', 'global-pr-watchdog')
+
+    [
+      ['omitted selector', {}, ordinary],
+      ['boolean false selector', {'auto_merge_only' => false}, ordinary],
+      ['REST string false selector', {'auto_merge_only' => 'false'}, ordinary],
+      ['omitted selector with periodic wake', {'periodic_wake' => 'true'}, periodic],
+      ['boolean false selector with periodic wake',
+       {'periodic_wake' => 'true', 'auto_merge_only' => false}, periodic],
+      ['REST string false selector with periodic wake',
+       {'periodic_wake' => 'true', 'auto_merge_only' => 'false'}, periodic]
+    ].each do |label, inputs, expected|
+      assert_equal expected, automation_routing(conditions, 'workflow_dispatch', inputs: inputs), label
+    end
+  end
+
+  # Native events do not carry dispatch inputs. Their routing must stay exactly
+  # as it was before the selector existed.
+  def test_auto_merge_only_selector_does_not_change_native_event_routing
+    conditions = automation_job_conditions
+    auto_merge = automation_route('auto-merge')
+    scheduler = automation_route('scheduler')
+
+    cases = [
+      ['primary schedule', 'schedule', {schedule: '*/15 * * * *'},
+       automation_route('scheduler', 'watchdog')],
+      ['safety-net schedule', 'schedule', {schedule: '17,47 * * * *'},
+       automation_route('auto-merge', 'global-pr-watchdog')],
+      ['issues', 'issues', {}, scheduler],
+      ['owner /oc comment', 'issue_comment', {comment: {'body' => '/oc'}}, scheduler],
+      ['non-owner /oc comment', 'issue_comment',
+       {comment: {'body' => '/oc'}, actor: 'someone-else'}, automation_route],
+      ['ordinary prose comment', 'issue_comment',
+       {comment: {'body' => 'ordinary prose'}}, automation_route],
+      ['pull request repair', 'pull_request_target', {action: 'opened'}, automation_route('repair')],
+      ['pull request close', 'pull_request_target', {action: 'closed'}, scheduler],
+      ['OpenCode completion', 'workflow_run',
+       {workflow_run: {'path' => '.github/workflows/opencode.yml'}},
+       automation_route('scheduler', 'watchdog')],
+      ['CI completion', 'workflow_run',
+       {workflow_run: {'path' => '.github/workflows/ci.yml'}},
+       automation_route('repair', 'auto-merge')],
+      ['push', 'push', {}, auto_merge],
+      ['status', 'status', {}, auto_merge],
+      ['review', 'pull_request_review', {}, auto_merge],
+      ['review comment', 'pull_request_review_comment', {}, auto_merge]
+    ]
+    cases.each do |label, event_name, context, expected|
+      assert_equal expected, automation_routing(conditions, event_name, **context), label
+    end
+  end
+
   # The unified scheduler and child review must share the configured labels.
   # A parent clears stale child pauses in the same scheduler that selects local
   # and delegated tasks, so a hardcoded label would split the one queue.
