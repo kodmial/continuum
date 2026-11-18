@@ -33,6 +33,13 @@ from continuum.periodic_wake import (
     scheduling_window_start,
 )
 
+try:
+    from tests.test_scheduler_self_wakeup import SELF_SCHEDULER as AUTOMATION
+    from tests.test_scheduler_self_wakeup import render_run_name
+except ImportError:
+    from test_scheduler_self_wakeup import SELF_SCHEDULER as AUTOMATION
+    from test_scheduler_self_wakeup import render_run_name
+
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 SCHEDULER = ROOT / ".github" / "workflows" / "continuum-issue-scheduler.yml"
 STUB = ROOT / ".github" / "caller-stubs" / "continuum-issue-scheduler.yml"
@@ -360,6 +367,51 @@ class WorkflowGateTests(unittest.TestCase):
         self.assertNotIn("CRON_JOB_ORG_API_KEY", doc)
         self.assertNotIn("api.cron-job.org", doc)
 
+    def test_self_dogfood_auto_merge_backstop_is_documented_exactly(self):
+        doc = (ROOT / "docs" / "cron-job-org.md").read_text(encoding="utf-8")
+
+        # The #375 consumer instructions stay intact.
+        self.assertIn(
+            "https://api.github.com/repos/OWNER/REPO/actions/workflows/"
+            "continuum-issue-scheduler.yml/dispatches",
+            doc,
+        )
+        self.assertIn(
+            '{"ref":"main","inputs":{"periodic_wake":"true"}}',
+            doc,
+        )
+
+        heading = "## Self-dogfood auto-merge-only backstop"
+        self.assertIn(heading, doc)
+        section = doc.split(heading, 1)[1]
+        self.assertIn(
+            "https://api.github.com/repos/kodmial/continuum/actions/workflows/"
+            "automation.yml/dispatches",
+            section,
+        )
+        self.assertIn("**Method**: `POST`", section)
+        self.assertIn(
+            '{"ref":"main","inputs":{"periodic_wake":"true",'
+            '"auto_merge_only":"true"}}',
+            section,
+        )
+        self.assertIn("periodic_wake=true", section)
+        self.assertIn("auto_merge_only=true", section)
+        self.assertIn("Never send only `periodic_wake=true`", section)
+        self.assertIn("Actions: write", section)
+        self.assertIn("fine-grained", section.lower())
+        self.assertIn("Never put a token", section)
+        self.assertIn("`17,47 * * * *`", section)
+        self.assertIn("`:19`", section)
+        self.assertIn("`:49`", section)
+        self.assertIn("HTTP `204`", section)
+        self.assertIn("not** that reconciliation succeeded", section)
+        self.assertIn("manual operator step", section)
+        self.assertIn("Nothing here provisions or reads cron-job.org", section)
+        for status in ("`401`", "`403`", "`404`", "`422`", "Token expiry"):
+            with self.subTest(status=status):
+                self.assertIn(status, section)
+
 
 class ExtractedGateScriptTests(unittest.TestCase):
     """Execute the real workflow step with a fake gh, not a copy."""
@@ -486,6 +538,46 @@ class ExtractedGateScriptTests(unittest.TestCase):
                 self.assertEqual(0, result.returncode, result.stderr)
                 self.assertEqual("true", outputs["run"])
                 self.assertEqual("window-due", outputs["reason"])
+
+    @unittest.skipUnless(shutil.which("jq"), "jq is required")
+    def test_successful_narrow_run_does_not_satisfy_the_periodic_window(self):
+        # A successful narrow automation dispatch runs only `auto-merge`; its
+        # run title must not let the next periodic dispatch skip the window.
+        workflow = yaml.safe_load(AUTOMATION.read_text(encoding="utf-8"))
+        narrow = render_run_name(
+            workflow["run-name"],
+            "workflow_dispatch",
+            inputs={"periodic_wake": "true", "auto_merge_only": "true"},
+        )
+        broad = render_run_name(
+            workflow["run-name"],
+            "workflow_dispatch",
+            inputs={"periodic_wake": "true"},
+        )
+        for label, title, expected_run, expected_reason in (
+            ("narrow", narrow, "true", "window-due"),
+            ("broad", broad, "false", "duplicate-window"),
+        ):
+            with self.subTest(label=label):
+                result, outputs, _ = self._run(
+                    caller_event="workflow_dispatch",
+                    periodic="true",
+                    runs={
+                        "workflow_runs": [
+                            {
+                                "id": 1,
+                                "event": "workflow_dispatch",
+                                "status": "completed",
+                                "conclusion": "success",
+                                "display_title": title,
+                                "head_branch": "main",
+                            }
+                        ]
+                    },
+                )
+                self.assertEqual(0, result.returncode, result.stderr)
+                self.assertEqual(expected_run, outputs["run"])
+                self.assertEqual(expected_reason, outputs["reason"])
 
     def test_duplicate_periodic_window_is_a_cheap_noop(self):
         result, outputs, calls = self._run(

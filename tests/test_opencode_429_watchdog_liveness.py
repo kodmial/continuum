@@ -379,11 +379,13 @@ class MockGithub {
 function mockFetch(url) {
   // The production watchdog checks GitHub's free core-budget endpoint before
   // starting any 429 checkpoint work. This is a GitHub REST fixture, never a
-  // simulated OpenCode provider response. `rateLimitBudget` models the whole
-  // endpoint (including an unavailable one); `restRemaining` is the shorthand
-  // used by exhaustion-only scenarios.
+  // simulated OpenCode provider response. Individual scenarios may override
+  // the reported budget to exercise the exhausted/low deferral path:
+  // `rateLimitBudget`/`rateLimit` model the whole endpoint (including an
+  // unavailable one); `restRemaining` is the shorthand used by
+  // exhaustion-only scenarios.
   if (/\/rate_limit$/.test(String(url))) {
-    const budget = scenario.rateLimitBudget || {
+    const budget = scenario.rateLimitBudget || scenario.rateLimit || {
       limit: 5000,
       remaining: scenario.restRemaining === undefined ? 4500 : scenario.restRemaining,
     };
