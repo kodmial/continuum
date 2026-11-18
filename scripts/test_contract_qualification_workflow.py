@@ -8,15 +8,17 @@ its shell/``gh``/Python orchestration could still pass every helper test.
 
 These tests extract that *exact* step by name from the production workflow and
 run it as GitHub Actions would (``bash -e -o pipefail``) with an isolated
-``gh`` on ``PATH``. Only the external GitHub boundary is faked; the observation
-and qualification modules are the real ``src/continuum`` code. No network,
-dispatch, issue write or sleep is involved.
+``gh`` on ``PATH`` and a minimal environment that carries no live workflow
+context. Only the external GitHub boundary is faked; the observation and
+qualification modules are the real ``src/continuum`` code. No network, dispatch,
+issue write or sleep is involved.
 """
 
 from __future__ import annotations
 
 import json
 import os
+import shlex
 import shutil
 import subprocess
 import tempfile
@@ -24,6 +26,7 @@ import textwrap
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
+from unittest import mock
 
 import yaml
 
@@ -37,6 +40,50 @@ TARGET_SHA = "4" * 40
 ISSUE_NUMBER = 42
 RUN_ID = 777
 PASS_LINE = "Layer 2 lifecycle probe passed for HEAD " + TARGET_SHA
+
+#: Fields the production inventory queries must request, keyed by the command
+#: that issues them. Real ``gh`` omits every field absent from ``--json``, so
+#: dropping any one of these silently narrows the observation contract.
+INVENTORY_FIELDS = {
+    "gh issue list": (
+        "number",
+        "state",
+        "labels",
+        "createdAt",
+        "updatedAt",
+        "closedAt",
+        "body",
+        "title",
+    ),
+    "gh run list": (
+        "databaseId",
+        "status",
+        "conclusion",
+        "createdAt",
+        "startedAt",
+        "headBranch",
+        "displayTitle",
+        "name",
+    ),
+    "gh pr list": (
+        "number",
+        "state",
+        "body",
+        "title",
+        "headRefName",
+        "updatedAt",
+        "mergedAt",
+        "reviewDecision",
+    ),
+}
+
+#: The only inherited variable. Everything else is set explicitly below so the
+#: live workflow context (``GITHUB_*``/``GH_*`` tokens, SHAs and event paths)
+#: cannot leak into the harness and authenticate against real GitHub.
+INHERITED_ENV = ("PATH",)
+
+#: GitHub variables the production step legitimately needs, with fixture values.
+FIXTURE_GITHUB_ENV = frozenset({"GITHUB_REPOSITORY", "GH_TOKEN"})
 
 FAKE_GH = r'''#!/usr/bin/env python3
 """Deterministic stand-in for the GitHub CLI inventory/read boundary."""
@@ -122,10 +169,16 @@ def fail(kind):
 
 
 def option(name):
-    try:
-        return args[args.index(name) + 1]
-    except (ValueError, IndexError):
-        return None
+    for position, argument in enumerate(args):
+        if argument == name:
+            try:
+                return args[position + 1]
+            except IndexError:
+                return None
+        prefix = name + "="
+        if argument.startswith(prefix):
+            return argument[len(prefix):]
+    return None
 
 
 def require_inventory(kind, required_fields, required_options):
@@ -275,6 +328,110 @@ def owner_comment(
     }
 
 
+def requested_json_fields(arguments):
+    """Return the ``--json`` field list from a parsed argument vector."""
+
+    for position, argument in enumerate(arguments):
+        if argument == "--json":
+            if position + 1 >= len(arguments):
+                raise AssertionError("--json without a field list: %r" % (arguments,))
+            return arguments[position + 1].split(",")
+        if argument.startswith("--json="):
+            return argument[len("--json="):].split(",")
+    raise AssertionError("no --json option in %r" % (arguments,))
+
+
+def command_line_tokens(script, command):
+    """Return the source span and shell tokens of ``command``'s logical line.
+
+    The production step is shell. Locating its arguments by raw string indexing
+    breaks on a behavior-preserving reformat (quoting the field list, joining it
+    with ``--json=``, or continuing it on the next line), so consume the whole
+    logical line instead and tokenise it with :mod:`shlex`, as the shell does.
+    Callers then work on arguments rather than on source text.
+    """
+
+    start = script.index(command)
+    end = start
+    quote = ""
+    while end < len(script):
+        character = script[end]
+        if quote:
+            if character == "\\" and quote == '"':
+                end += 2
+                continue
+            if character == quote:
+                quote = ""
+            end += 1
+            continue
+        if character in "'\"":
+            quote = character
+            end += 1
+            continue
+        if character == "\\":
+            end += 2
+            continue
+        if character == "\n":
+            break
+        end += 1
+    tokens = shlex.split(script[start:end].replace("\\\n", " "))
+    words = command.split()
+    if tokens[: len(words)] != words:
+        raise AssertionError(
+            "could not parse %r invocation from %r" % (command, script[start:end])
+        )
+    return start, end, tokens
+
+
+def json_option_span(script, command):
+    """Return ``(marker, fields_start, fields_end, fields)`` for one command."""
+
+    start, end, tokens = command_line_tokens(script, command)
+    fields = requested_json_fields(tokens)
+    marker = script.index("--json", start, end)
+    field_list = ",".join(fields)
+    fields_start = script.find(field_list, marker, end)
+    if fields_start < 0:
+        raise AssertionError(
+            "could not locate --json fields for %r in %r" % (command, script[start:end])
+        )
+    fields_end = fields_start + len(field_list)
+    return marker, fields_start, fields_end, fields
+
+
+def drop_json_field(script, command, field):
+    """Return ``script`` with ``field`` removed from the command's ``--json``."""
+
+    _, fields_start, fields_end, fields = json_option_span(script, command)
+    if field not in fields:
+        raise AssertionError("%r does not request %r" % (command, field))
+    remaining = [name for name in fields if name != field]
+    if not remaining:
+        raise AssertionError("%r must request more than %r" % (command, field))
+    return script[:fields_start] + ",".join(remaining) + script[fields_end:]
+
+
+def reformat_json_option(script, command, style):
+    """Rewrite a command's ``--json`` option without changing its meaning."""
+
+    marker, fields_start, fields_end, _ = json_option_span(script, command)
+    fields_text = script[fields_start:fields_end]
+    if style == "equals":
+        option_text = "--json=" + fields_text
+    elif style == "quoted":
+        option_text = '--json "' + fields_text + '"'
+    elif style == "continuation":
+        option_text = "--json \\\n  " + fields_text
+    else:
+        raise AssertionError("unknown --json style %r" % (style,))
+    # Replacing from the marker drops any original opening quote, so consume a
+    # matching closing quote as well instead of leaving it behind.
+    replacement_end = fields_end
+    if script[replacement_end:replacement_end + 1] in ("'", '"'):
+        replacement_end += 1
+    return script[:marker] + option_text + script[replacement_end:]
+
+
 class Layer2Harness:
     """Shared subprocess harness; mixes into ``unittest.TestCase`` classes."""
 
@@ -303,6 +460,8 @@ class Layer2Harness:
         runner_temp.mkdir()
         home = workdir / "home"
         home.mkdir()
+        tmp_dir = workdir / "tmp"
+        tmp_dir.mkdir()
         (state / "gh.log").write_text("", encoding="utf-8")
 
         fixtures = {
@@ -326,22 +485,18 @@ class Layer2Harness:
         script_path = workdir / "step.sh"
         script_path.write_text(step_script, encoding="utf-8")
 
-        env = {
-            key: value
-            for key, value in os.environ.items()
-            if key
-            not in {
-                "GITHUB_REPOSITORY",
-                "TARGET_SHA",
-                "RUNNER_TEMP",
-                "GH_TOKEN",
-                "PYTHONPATH",
-            }
-        }
+        # Build a minimal deterministic environment instead of copying the
+        # parent one. In CI the real workflow context is present in
+        # ``os.environ``; inheriting it would let a direct ``$GITHUB_TOKEN``,
+        # ``$GITHUB_SHA`` or ``$GITHUB_EVENT_PATH`` read inside the production
+        # step (or ``src/continuum``) authenticate against live GitHub or
+        # behave differently in CI than locally. Only ``PATH`` is inherited.
+        env = {key: os.environ[key] for key in INHERITED_ENV if key in os.environ}
+        env.setdefault("PATH", os.defpath)
         env.update(
             {
-                "PATH": str(bin_dir) + os.pathsep + os.environ.get("PATH", ""),
                 "HOME": str(home),
+                "TMPDIR": str(tmp_dir),
                 "RUNNER_TEMP": str(runner_temp),
                 "GITHUB_REPOSITORY": REPOSITORY,
                 "TARGET_SHA": TARGET_SHA,
@@ -354,6 +509,17 @@ class Layer2Harness:
                 "LC_ALL": "C.UTF-8",
             }
         )
+        env["PATH"] = str(bin_dir) + os.pathsep + env["PATH"]
+        leaked = sorted(
+            key
+            for key in env
+            if key.startswith(("GH_", "GITHUB_")) and key not in FIXTURE_GITHUB_ENV
+        )
+        if leaked:
+            self.fail(
+                "harness environment leaks live GitHub context: " + ", ".join(leaked)
+            )
+        self.last_env = env
         completed = subprocess.run(
             [
                 "bash",
@@ -414,55 +580,74 @@ class Layer2WorkflowStepTest(Layer2Harness, unittest.TestCase):
         )
         self.assertIn("--state open", issue_list)
         self.assertIn("--label automation:in-progress", issue_list)
-        requested_fields = set(issue_list.split("--json ", 1)[1].split(","))
+        requested_fields = set(requested_json_fields(shlex.split(issue_list)))
         self.assertLessEqual(
-            {
-                "number",
-                "state",
-                "labels",
-                "createdAt",
-                "updatedAt",
-                "closedAt",
-                "body",
-                "title",
-            },
+            set(INVENTORY_FIELDS["gh issue list"]),
             requested_fields,
             issue_list,
         )
 
     def test_inventory_queries_must_request_every_consumed_field(self):
-        """The fake ``gh`` rejects a list query that dropped a consumed field.
+        """Every consumed field must be load-bearing in every list query.
 
         Real ``gh`` omits fields absent from ``--json``; the harness must show
         the same gap rather than serving a fixture that is richer than the
-        query. Both the run and PR inventory queries are exercised.
+        query. All three inventory queries are exercised, and every field is
+        dropped in turn, including ``labels``: without the guard a dropped
+        ``labels`` field would hide a stranded reservation and pass green.
         """
 
         production = load_layer2_step()["run"]
-        for command, field in (
-            ("gh run list", "status"),
-            ("gh pr list", "headRefName"),
-        ):
-            with self.subTest(command=command, field=field):
-                start = production.index(command)
-                fields_start = production.index("--json ", start) + len("--json ")
-                field_line = production[fields_start:].split("\n", 1)[0]
-                requested = field_line.split(",")
-                self.assertIn(field, requested, field_line)
-                mutated = (
-                    production[:fields_start]
-                    + ",".join(name for name in requested if name != field)
-                    + production[fields_start + len(field_line):]
-                )
-                self.assertNotEqual(production, mutated)
+        for command, fields in INVENTORY_FIELDS.items():
+            for field in fields:
+                with self.subTest(command=command, field=field):
+                    mutated = drop_json_field(production, command, field)
+                    self.assertNotEqual(production, mutated)
+                    completed = self.run_layer2(
+                        issues=[issue()],
+                        runs=[live_run()],
+                        step_script=mutated,
+                    )
+                    self.assert_failed_without_pass(completed)
+                    self.assertIn("dropped observation contract", completed.stderr)
+                    self.assertIn(field, completed.stderr)
+
+    def test_dropped_labels_would_hide_a_stranded_reservation(self):
+        """Show why the inventory guard is load-bearing, not decorative.
+
+        Real ``gh`` omits fields absent from ``--json``. If the issue query
+        dropped ``labels``, the stranded reservation would not even be selected
+        as an observation and the production stranded-reservation assertion
+        would pass green. The fake ``gh`` field guard above is what turns that
+        silent omission into a failure.
+        """
+
+        unlabelled = issue()
+        unlabelled.pop("labels")
+        completed = self.run_layer2(
+            issues=[unlabelled],
+            runs=[],
+            pulls=[],
+        )
+        self.assert_passed(completed)
+        self.assertIn("Observed 0 real reservation(s); none stranded.", completed.stdout)
+
+    def test_json_query_reformatting_keeps_the_same_contract(self):
+        """A behavior-preserving ``--json`` reformat must not break the test."""
+
+        production = load_layer2_step()["run"]
+        for style in ("equals", "quoted", "continuation"):
+            with self.subTest(style=style):
+                reformatted = production
+                for command in INVENTORY_FIELDS:
+                    reformatted = reformat_json_option(reformatted, command, style)
+                self.assertNotEqual(production, reformatted)
                 completed = self.run_layer2(
                     issues=[issue()],
                     runs=[live_run()],
-                    step_script=mutated,
+                    step_script=reformatted,
                 )
-                self.assert_failed_without_pass(completed)
-                self.assertIn("dropped observation contract", completed.stderr)
-                self.assertIn(field, completed.stderr)
+                self.assert_passed(completed)
 
     def test_healthy_open_implementation_pr_is_accepted(self):
         completed = self.run_layer2(
@@ -488,6 +673,44 @@ class Layer2WorkflowStepTest(Layer2Harness, unittest.TestCase):
         completed = self.run_layer2(issues=[], runs=[], pulls=[])
         self.assert_passed(completed)
         self.assertIn("Observed 0 real reservation(s); none stranded.", completed.stdout)
+
+    def test_harness_does_not_inherit_live_github_context(self):
+        """A real CI workflow context must not reach the faked step.
+
+        The fake ``gh`` protects ``gh`` calls, but a direct ``$GITHUB_TOKEN`` or
+        ``$GITHUB_EVENT_PATH`` read in the production step or ``src/continuum``
+        must not be able to authenticate against live GitHub or observe runner
+        state. Patch the parent environment with a live-looking context and
+        prove none of it survives into the subprocess.
+        """
+
+        live = {
+            "GITHUB_TOKEN": "live-workflow-token",
+            "GITHUB_SHA": "f" * 40,
+            "GITHUB_EVENT_PATH": "/live/event.json",
+            "GITHUB_WORKSPACE": "/live/workspace",
+            "GITHUB_EVENT_NAME": "pull_request",
+            "GITHUB_ACTIONS": "true",
+            "GITHUB_RUN_ID": "123456",
+            "GH_HOST": "github.example",
+            "GH_ENTERPRISE_TOKEN": "live-enterprise-token",
+            "GH_CONFIG_DIR": "/live/gh",
+        }
+        with mock.patch.dict(os.environ, live):
+            completed = self.run_layer2(issues=[issue()], runs=[live_run()])
+        self.assert_passed(completed)
+        self.assertEqual(
+            {key for key in self.last_env if key.startswith("GITHUB_")},
+            {"GITHUB_REPOSITORY"},
+        )
+        self.assertEqual(
+            {key for key in self.last_env if key.startswith("GH_")},
+            {"GH_TOKEN"},
+        )
+        self.assertEqual(self.last_env["GITHUB_REPOSITORY"], REPOSITORY)
+        self.assertEqual(self.last_env["GH_TOKEN"], "fixture-token-not-used")
+        for key, value in live.items():
+            self.assertNotIn(value, self.last_env.values(), key)
 
     def test_stranded_reservation_fails_with_the_issue_id(self):
         # The independent deterministic assertions in the same step still pass;
