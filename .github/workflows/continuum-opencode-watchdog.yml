@@ -1308,9 +1308,62 @@ jobs:
                 kind: 'invalid', reason: 'manifest-schema',
               });
             }
+            // Every manifest entry stays visible: truncating the list would
+            // silently strand every hold whose fix sorts after the cap, with
+            // no warning and no way to release it.
             return (checkpointValidatorFixManifestCache = {
-              kind: 'ok', fixes: manifest.fixes.slice(0, 20),
+              kind: 'ok', fixes: manifest.fixes,
             });
+          }
+          // The ticket premise is an *independently approved* fix, not merely
+          // any non-author review. `pulls.listReviews` exposes COMMENTED
+          // reviews from anyone who can read a public repository, and an
+          // unresolved CHANGES_REQUESTED is an objection, so neither may
+          // authorize a one-time re-admission. Only the latest decision state
+          // per reviewer counts (COMMENTED and DISMISSED never override an
+          // earlier decision), at least one independent reviewer must have
+          // approved, and no independent reviewer may still be objecting.
+          // Approvals come from trusted reviewers (write access) or installed
+          // bot apps; a drive-by approval has no write association.
+          function checkpointFixIndependentlyApproved(reviews, author) {
+            const latest = new Map();
+            for (const review of reviews || []) {
+              const login = String(
+                review && review.user && review.user.login || ''
+              ).toLowerCase();
+              if (!login || login === author) continue;
+              const association = String(
+                review && review.author_association || ''
+              ).toUpperCase();
+              const trusted = ['OWNER', 'MEMBER', 'COLLABORATOR'].includes(
+                association
+              ) || login.endsWith('[bot]');
+              if (!trusted) continue;
+              const state = String(
+                review && review.state || ''
+              ).toUpperCase();
+              if (state !== 'APPROVED' && state !== 'CHANGES_REQUESTED') {
+                continue;
+              }
+              const at = new Date(
+                review && (review.submitted_at || review.created_at) || 0
+              ).getTime();
+              const id = Number(review && review.id || 0);
+              const previous = latest.get(login);
+              if (
+                !previous ||
+                at > previous.at ||
+                (at === previous.at && id >= previous.id)
+              ) {
+                latest.set(login, { at, id, state });
+              }
+            }
+            let approved = false;
+            for (const entry of latest.values()) {
+              if (entry.state === 'CHANGES_REQUESTED') return false;
+              if (entry.state === 'APPROVED') approved = true;
+            }
+            return approved;
           }
           async function verifyCheckpointValidatorFix(hold, client) {
             if (
@@ -1377,20 +1430,9 @@ jobs:
               } catch (err) {
                 continue;
               }
-              const independentlyReviewed = (reviews || []).some(review => {
-                const login = String(
-                  review && review.user && review.user.login || ''
-                ).toLowerCase();
-                const state = String(
-                  review && review.state || ''
-                ).toUpperCase();
-                return Boolean(login) &&
-                  login !== author &&
-                  ['APPROVED', 'CHANGES_REQUESTED', 'COMMENTED'].includes(
-                    state
-                  );
-              });
-              if (!independentlyReviewed) continue;
+              if (!checkpointFixIndependentlyApproved(reviews, author)) {
+                continue;
+              }
               let files;
               try {
                 files = await filesFor(pullRequest);
@@ -2122,6 +2164,19 @@ jobs:
               checkpointFixableHoldReasons.has(marker.reason) &&
               options.allowRelease !== false
             ) {
+              // Some routes must finish their own stand-down fences before
+              // minting the durable release claim: a minted claim survives the
+              // pass and a later pass may consume it as authorization. Those
+              // routes defer the mint and re-evaluate once the pass is
+              // cleared to dispatch.
+              if (options.deferRelease === true) {
+                return {
+                  blocked: false,
+                  marker,
+                  release: null,
+                  releaseDeferred: true,
+                };
+              }
               const release = await evaluateCheckpointResumeRelease({
                 issueNumber: wantedIssue,
                 hold: marker,
@@ -2661,36 +2716,40 @@ jobs:
             // retry path evaluates the deterministic checkpoint-resume
             // hold. A held checkpoint/base/snapshot identity already failed
             // resume verification, so never create a recovery claim or
-            // dispatch it again: stop the pass instead.
+            // dispatch it again: stop the pass instead. A fixable hold may
+            // still be released, but its durable release claim is minted
+            // only after every stand-down fence below has cleared.
             let checkpointRelease = null;
+            let deferredCheckpointHold = null;
+            const checkpointHoldOptions = {
+              controller: 'opencode-watchdog',
+              // A verified validator fix may release the stale hold, but
+              // only while no other OpenCode run owns this exact work.
+              // The current (finished) run is excluded; any queued or
+              // in-progress run for this issue or recovery identity keeps
+              // the fail-closed hold. An unreadable inventory throws and
+              // the release stays blocked.
+              liveOverlap: async () => {
+                const activeRuns = await listActiveOpenCodeRuns();
+                return activeRuns.some(candidate => {
+                  if (
+                    String(candidate.id) ===
+                    String(run && run.id || '')
+                  ) return false;
+                  if (!isOpenCodeWorkflowCandidate(candidate)) {
+                    return false;
+                  }
+                  return candidate.display_title ===
+                      'OpenCode issue #' + issueText ||
+                    candidate.display_title ===
+                      recoveryRunName(operation, generation);
+                });
+              },
+            };
             if (mode === 'issue') {
               const hold = await checkpointResumeHold(
                 issueText, comments, checkpointRef,
-                {
-                  controller: 'opencode-watchdog',
-                  // A verified validator fix may release the stale hold, but
-                  // only while no other OpenCode run owns this exact work.
-                  // The current (finished) run is excluded; any queued or
-                  // in-progress run for this issue or recovery identity keeps
-                  // the fail-closed hold. An unreadable inventory throws and
-                  // the release stays blocked.
-                  liveOverlap: async () => {
-                    const activeRuns = await listActiveOpenCodeRuns();
-                    return activeRuns.some(candidate => {
-                      if (
-                        String(candidate.id) ===
-                        String(run && run.id || '')
-                      ) return false;
-                      if (!isOpenCodeWorkflowCandidate(candidate)) {
-                        return false;
-                      }
-                      return candidate.display_title ===
-                          'OpenCode issue #' + issueText ||
-                        candidate.display_title ===
-                          recoveryRunName(operation, generation);
-                    });
-                  },
-                }
+                { ...checkpointHoldOptions, deferRelease: true }
               );
               if (hold.blocked) {
                 core.notice(
@@ -2703,7 +2762,14 @@ jobs:
                 );
                 return;
               }
-              if (
+              if (hold.releaseDeferred) {
+                // Do not mint the durable release claim yet. Publication,
+                // observed-run, routing and claim fences below may still
+                // stand this pass down, and a leftover claim would authorize
+                // a later pass to resume beside whatever caused the
+                // stand-down. Mint once this pass is cleared to dispatch.
+                deferredCheckpointHold = hold;
+              } else if (
                 hold.release &&
                 hold.release.released &&
                 hold.release.fresh &&
@@ -2717,8 +2783,7 @@ jobs:
                   'resumption and the watchdog stands down.'
                 );
                 return;
-              }
-              if (hold.release && hold.release.released) {
+              } else if (hold.release && hold.release.released) {
                 checkpointRelease = hold.release;
               }
             }
@@ -3124,6 +3189,53 @@ jobs:
                 return;
               }
             }
+            // Only now, after every earlier fence cleared and the claim is
+            // held, mint the durable release claim. A pass that stood down
+            // above therefore cannot leave a claim behind for another pass
+            // to consume as authorization.
+            if (deferredCheckpointHold) {
+              const deferred = await checkpointResumeHold(
+                issueText, comments, checkpointRef, checkpointHoldOptions
+              );
+              if (
+                !deferred ||
+                deferred.blocked ||
+                !deferred.release ||
+                !deferred.release.released
+              ) {
+                const standDownReason = String(
+                  deferred &&
+                  deferred.release &&
+                  deferred.release.reason ||
+                  deferred && deferred.marker && deferred.marker.reason ||
+                  'hold-not-released'
+                );
+                await deleteRecoveryClaim(claim);
+                core.notice(
+                  'OpenCode infrastructure operation ' + operation +
+                  ' generation ' + generation +
+                  ' could not re-admit its held checkpoint (' +
+                  standDownReason +
+                  '); no release claim or dispatch was created.'
+                );
+                return;
+              }
+              if (
+                deferred.release.fresh &&
+                deferred.release.owner &&
+                deferred.release.owner !== 'opencode-watchdog'
+              ) {
+                await deleteRecoveryClaim(claim);
+                core.notice(
+                  'OpenCode infrastructure operation ' + operation +
+                  ' generation ' + generation + ' was released by ' +
+                  deferred.release.owner + '; that controller owns the fresh ' +
+                  'resumption and the watchdog stands down.'
+                );
+                return;
+              }
+              checkpointRelease = deferred.release;
+            }
             // The release claim, when one authorized this pass, is spent
             // durably before the dispatch so no later pass can resume the same
             // checkpoint/base/snapshot again.
@@ -3137,6 +3249,30 @@ jobs:
               });
               if (!checkpointConsumption.consumed) {
                 await deleteRecoveryClaim(claim);
+                // A release minted by this pass is not spent; delete it so a
+                // later pass cannot consume a claim this stood-down pass left
+                // behind. A pre-existing claim is left untouched.
+                const releaseCommentId = Number(
+                  deferredCheckpointHold &&
+                  checkpointRelease &&
+                  checkpointRelease.marker &&
+                  checkpointRelease.marker.commentId || 0
+                );
+                if (releaseCommentId > 0) {
+                  try {
+                    await github.rest.issues.deleteComment({
+                      owner,
+                      repo,
+                      comment_id: releaseCommentId,
+                    });
+                  } catch (cleanupErr) {
+                    core.warning(
+                      'Checkpoint release claim cleanup failed for #' +
+                      threadNumber + ': ' +
+                      (cleanupErr.message || cleanupErr)
+                    );
+                  }
+                }
                 core.notice(
                   'OpenCode infrastructure operation ' + operation +
                   ' generation ' + generation +

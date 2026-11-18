@@ -221,6 +221,17 @@ const writeGithub = {
           if (dispatchFailure) {
             const failure = dispatchFailure;
             dispatchFailure = null;
+            if (failure.acceptedWithLostResponse) {
+              // GitHub accepted the dispatch but the response was lost: the
+              // trigger comment is visible even though the call threw.
+              comments.push({
+                id: nextCommentId++,
+                body,
+                user: { login: 'github-actions[bot]' },
+                author_association: 'OWNER',
+                created_at: new Date().toISOString(),
+              });
+            }
             throw apiError(
               failure.status || 0, failure.message || 'dispatch failed'
             );
@@ -459,6 +470,16 @@ async function runWatchdog() {
       targetRepo: scenario.repo || 'continuum',
       issueNumber: Number(scenario.issue || 534),
       writeClient: writeGithub,
+      observeDispatch: Object.prototype.hasOwnProperty.call(
+        scenario, 'dispatchObserved'
+      )
+        ? async () => {
+            if (scenario.dispatchProbeError) {
+              throw apiError(scenario.dispatchProbeError, 'probe failed');
+            }
+            return scenario.dispatchObserved;
+          }
+        : undefined,
     });
   }
   // A second scheduler pass over the same durable history proves an
@@ -608,9 +629,9 @@ class CheckpointHoldReleaseTests(unittest.TestCase):
             },
         )
 
-    def test_lost_dispatch_response_keeps_the_receipt_and_next_pass_blocks(self):
-        # An accepted dispatch whose response was lost must keep the receipt,
-        # so the next scheduler pass cannot attribute the same release again.
+    def test_unverifiable_lost_dispatch_response_keeps_the_receipt(self):
+        # Without a dispatch probe an ambiguous outcome cannot prove the
+        # runner did not start, so the receipt stays fail-closed.
         for status in (0, 408, 500):
             with self.subTest(status=status):
                 scenario = self.base_scenario()
@@ -659,6 +680,80 @@ class CheckpointHoldReleaseTests(unittest.TestCase):
                     1,
                 )
 
+    def test_ambiguous_dispatch_without_an_observed_run_retries_once(self):
+        # A transient 5xx before GitHub accepted the dispatch must not leave
+        # the release spent forever. The probe proves no run/comment exists,
+        # the receipt is rolled back, and a later pass retries exactly once.
+        for status in (0, 408, 500):
+            with self.subTest(status=status):
+                scenario = self.base_scenario()
+                scenario["consumeSchedulerRelease"] = True
+                scenario["dispatchFailure"] = {
+                    "status": status,
+                    "dispatchAttempted": True,
+                }
+                scenario["dispatchObserved"] = False
+                scenario["consumeSchedulerReleaseAgain"] = True
+                result = self.run_scenario(scenario)
+                self.assertTrue(result["consumption"]["consumed"])
+                self.assertTrue(result["settlement"]["released"])
+                self.assertFalse(result["settlement"]["preserved"])
+                self.assertEqual(
+                    result["settlement"]["verified"], "not-observed"
+                )
+                self.assertFalse(result["schedulerAgain"]["blocked"])
+                self.assertTrue(
+                    result["schedulerAgain"]["release"]["released"]
+                )
+                self.assertTrue(result["retryConsumption"]["consumed"])
+                self.assertEqual(
+                    len(
+                        [
+                            c for c in result["comments"]
+                            if "resume-consumed" in c["body"]
+                        ]
+                    ),
+                    1,
+                )
+
+    def test_ambiguous_dispatch_with_an_observed_run_keeps_the_receipt(self):
+        # A lost response whose trigger actually landed must keep the receipt
+        # so the next pass cannot resume the same checkpoint twice.
+        for status in (0, 408, 500):
+            with self.subTest(status=status):
+                scenario = self.base_scenario()
+                scenario["consumeSchedulerRelease"] = True
+                scenario["dispatchFailure"] = {
+                    "status": status,
+                    "dispatchAttempted": True,
+                }
+                scenario["dispatchObserved"] = True
+                scenario["consumeSchedulerReleaseAgain"] = True
+                result = self.run_scenario(scenario)
+                self.assertTrue(result["settlement"]["preserved"])
+                self.assertFalse(result["settlement"]["released"])
+                self.assertEqual(
+                    result["settlement"]["verified"], "observed"
+                )
+                self.assertTrue(result["schedulerAgain"]["blocked"])
+                self.assertIsNone(result["retryConsumption"])
+
+    def test_ambiguous_dispatch_with_an_unreadable_probe_keeps_the_receipt(self):
+        scenario = self.base_scenario()
+        scenario["consumeSchedulerRelease"] = True
+        scenario["dispatchFailure"] = {
+            "status": 500,
+            "dispatchAttempted": True,
+        }
+        scenario["dispatchObserved"] = False
+        scenario["dispatchProbeError"] = 502
+        scenario["consumeSchedulerReleaseAgain"] = True
+        result = self.run_scenario(scenario)
+        self.assertTrue(result["settlement"]["preserved"])
+        self.assertFalse(result["settlement"]["released"])
+        self.assertTrue(result["schedulerAgain"]["blocked"])
+        self.assertIsNone(result["retryConsumption"])
+
     def test_rejected_dispatch_releases_the_receipt_and_allows_one_retry(self):
         # A 4xx rejection proves the dispatch did not happen. The receipt is
         # rolled back, so the next pass replays the same claim exactly once.
@@ -705,10 +800,10 @@ class CheckpointHoldReleaseTests(unittest.TestCase):
                     1,
                 )
 
-    def test_production_dispatch_lost_response_spends_the_release(self):
-        # The checked-in dispatch block, not a helper call, decides whether a
-        # lost response keeps the receipt. Once spent, a later full scheduler
-        # pass must stand down without dispatching again.
+    def test_production_dispatch_lost_response_without_a_trigger_retries_once(self):
+        # The checked-in dispatch block probes for its durable side effect.
+        # When the lost response left no trigger comment, the receipt is
+        # rolled back and a later full pass dispatches exactly once more.
         for status in (0, 408, 500):
             with self.subTest(status=status):
                 scenario = self.base_scenario()
@@ -721,8 +816,41 @@ class CheckpointHoldReleaseTests(unittest.TestCase):
                 self.assertEqual(
                     first["dispatch"]["error"]["status"], status
                 )
-                # The dispatch was attempted and the receipt it spent before
-                # the ambiguous failure is still present.
+                self.assertEqual(first["dispatchAttempts"], 1)
+                self.assertEqual(first["receipts"], 0)
+                self.assertEqual(first["releases"], 1)
+                self.assertFalse(second["blocked"])
+                self.assertTrue(second["release"]["released"])
+                self.assertTrue(
+                    second["dispatch"]["pass"]["consumption"]["consumed"]
+                )
+                self.assertIsNone(second["dispatch"]["error"])
+                self.assertEqual(second["dispatchAttempts"], 2)
+                self.assertEqual(second["receipts"], 1)
+                self.assertEqual(second["releases"], 1)
+                self.assertEqual(result["dispatchAttempts"], 2)
+
+    def test_production_dispatch_lost_response_with_a_visible_trigger_stays_spent(self):
+        # A lost response whose `/oc` trigger comment is visible proves the
+        # dispatch landed. The receipt stays spent and the next pass stands
+        # down instead of dispatching a second resumption.
+        for status in (0, 408, 500):
+            with self.subTest(status=status):
+                scenario = self.base_scenario()
+                scenario["productionDispatchPasses"] = [
+                    {
+                        "failure": {
+                            "status": status,
+                            "acceptedWithLostResponse": True,
+                        },
+                    },
+                    {},
+                ]
+                result = self.run_scenario(scenario)
+                first, second = result["productionPasses"]
+                self.assertEqual(
+                    first["dispatch"]["error"]["status"], status
+                )
                 self.assertEqual(first["dispatchAttempts"], 1)
                 self.assertEqual(first["receipts"], 1)
                 self.assertEqual(first["releases"], 1)
@@ -735,7 +863,6 @@ class CheckpointHoldReleaseTests(unittest.TestCase):
                 self.assertIsNone(second["dispatch"])
                 self.assertEqual(second["dispatchAttempts"], 1)
                 self.assertEqual(second["receipts"], 1)
-                self.assertEqual(second["releases"], 1)
                 self.assertEqual(result["dispatchAttempts"], 1)
 
     def test_production_dispatch_confirmed_rejection_retries_once(self):
@@ -1141,6 +1268,65 @@ class CheckpointHoldReleaseTests(unittest.TestCase):
                 ]
             },
             "no-review": {"reviews": []},
+            "changes-requested-only": {
+                "reviews": [
+                    {
+                        "user": {"login": "outside-reviewer"},
+                        "state": "CHANGES_REQUESTED",
+                    }
+                ]
+            },
+            "commented-only": {
+                "reviews": [
+                    {
+                        "user": {"login": "drive-by-commenter"},
+                        "state": "COMMENTED",
+                    }
+                ]
+            },
+            "untrusted-approval": {
+                "reviews": [
+                    {
+                        "user": {"login": "random-reader"},
+                        "state": "APPROVED",
+                        "author_association": "NONE",
+                    }
+                ]
+            },
+            "dismissed-only": {
+                "reviews": [
+                    {
+                        "user": {"login": "outside-reviewer"},
+                        "state": "DISMISSED",
+                    }
+                ]
+            },
+            "approval-withdrawn": {
+                "reviews": [
+                    {
+                        "user": {"login": "outside-reviewer"},
+                        "state": "APPROVED",
+                        "submitted_at": "2026-11-17T10:00:00Z",
+                    },
+                    {
+                        "user": {"login": "outside-reviewer"},
+                        "state": "CHANGES_REQUESTED",
+                        "submitted_at": "2026-11-17T11:00:00Z",
+                    },
+                ]
+            },
+            "approval-plus-live-objection": {
+                "reviews": [
+                    {
+                        "user": {"login": "approver"},
+                        "state": "APPROVED",
+                    },
+                    {
+                        "user": {"login": "objector"},
+                        "state": "CHANGES_REQUESTED",
+                    },
+                ]
+            },
             "wrong-path": {"files": [{"filename": "README.md"}]},
             "fix-not-contained": {"compareStatus": "behind"},
             "pull-unavailable": {"pullError": 403},
@@ -1166,6 +1352,47 @@ class CheckpointHoldReleaseTests(unittest.TestCase):
                     [],
                     name,
                 )
+
+    def test_a_trusted_human_approval_releases_the_hold(self):
+        scenario = self.base_scenario()
+        scenario["reviews"] = [
+            {
+                "user": {"login": "maintainer"},
+                "state": "APPROVED",
+                "author_association": "MEMBER",
+            }
+        ]
+        result = self.run_scenario(scenario)
+        for name in ("scheduler", "watchdog"):
+            self.assertFalse(result[name]["blocked"], name)
+            self.assertTrue(result[name]["release"]["released"], name)
+
+    def test_a_fix_past_the_old_manifest_cap_still_releases(self):
+        """Every manifest entry is considered; no silent 20-entry truncation.
+
+        A cap silently ignored later fixes, so an older hold could never be
+        released even though its validator fix was present and verifiable.
+        """
+
+        scenario = self.base_scenario()
+        fixes = [
+            {
+                "id": "unrelated-fix-" + str(index),
+                "pull_request": 900 + index,
+                "merge_sha": ("%040x" % (index + 1)),
+                "reasons": ["unrelated-reason-" + str(index)],
+            }
+            for index in range(25)
+        ]
+        fixes.append(manifest()["fixes"][0])
+        scenario["manifest"] = {"schema_version": 1, "fixes": fixes}
+        result = self.run_scenario(scenario)
+        for name in ("scheduler", "watchdog"):
+            self.assertFalse(result[name]["blocked"], name)
+            self.assertTrue(result[name]["release"]["released"], name)
+            self.assertEqual(
+                result[name]["release"]["fix"]["id"], FIX_ID, name
+            )
 
     def test_unverifiable_checkpoint_ref_never_releases_a_verified_fix(self):
         """A failed checkpoint-ref read must keep the hold, not authorize it.

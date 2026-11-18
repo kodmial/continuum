@@ -1044,9 +1044,55 @@ module.exports = async function runIssueScheduler({ github, context, core }) {
     }
     checkpointValidatorFixManifestCache = {
       kind: 'ok',
-      fixes: manifest.fixes.slice(0, 20),
+      // Never truncate: a capped list silently ignores later fixes and leaves
+      // their holds permanently unreleasable.
+      fixes: manifest.fixes,
     };
     return checkpointValidatorFixManifestCache;
+  }
+
+  // An independently reviewed fix means an independent, trusted reviewer
+  // approved it and no independent reviewer still objects.
+  // `pulls.listReviews` returns COMMENTED reviews from anyone who can read a
+  // public repository, so a drive-by comment must not count; the same holds
+  // for a drive-by approval without write association. Only the latest
+  // decision state per reviewer does (COMMENTED/DISMISSED never override an
+  // earlier decision).
+  function checkpointFixIndependentlyApproved(reviews, author) {
+    const latest = new Map();
+    for (const review of reviews || []) {
+      const login = String(
+        review && review.user && review.user.login || ''
+      ).toLowerCase();
+      if (!login || login === author) continue;
+      const association = String(
+        review && review.author_association || ''
+      ).toUpperCase();
+      const trusted = ['OWNER', 'MEMBER', 'COLLABORATOR'].includes(
+        association
+      ) || login.endsWith('[bot]');
+      if (!trusted) continue;
+      const state = String(review && review.state || '').toUpperCase();
+      if (state !== 'APPROVED' && state !== 'CHANGES_REQUESTED') continue;
+      const at = new Date(
+        review && (review.submitted_at || review.created_at) || 0
+      ).getTime();
+      const id = Number(review && review.id || 0);
+      const previous = latest.get(login);
+      if (
+        !previous ||
+        at > previous.at ||
+        (at === previous.at && id >= previous.id)
+      ) {
+        latest.set(login, { at, id, state });
+      }
+    }
+    let approved = false;
+    for (const entry of latest.values()) {
+      if (entry.state === 'CHANGES_REQUESTED') return false;
+      if (entry.state === 'APPROVED') approved = true;
+    }
+    return approved;
   }
 
   async function verifyCheckpointValidatorFix(hold, client) {
@@ -1106,15 +1152,9 @@ module.exports = async function runIssueScheduler({ github, context, core }) {
       } catch (err) {
         continue;
       }
-      const independentlyReviewed = (reviews || []).some(review => {
-        const login = String(
-          review && review.user && review.user.login || ''
-        ).toLowerCase();
-        const state = String(review && review.state || '').toUpperCase();
-        return Boolean(login) &&
-          login !== author &&
-          ['APPROVED', 'CHANGES_REQUESTED', 'COMMENTED'].includes(state);
-      });
+      const independentlyReviewed = checkpointFixIndependentlyApproved(
+        reviews, author
+      );
       if (!independentlyReviewed) continue;
       let files;
       try {
@@ -1409,11 +1449,15 @@ module.exports = async function runIssueScheduler({ github, context, core }) {
   }
 
   // Roll back the consumption receipt only when the dispatch provably did not
-  // happen. An ambiguous outcome leaves the receipt spent so no later pass can
-  // authorize the same resumption twice.
+  // happen. A 4xx rejection proves that directly; an ambiguous transport,
+  // timeout, or 5xx outcome is probed for the dispatch's durable side effect
+  // (a created run or the trigger comment). When the probe proves no side
+  // effect exists, the receipt is rolled back so a later pass can retry
+  // exactly once instead of stalling the hold forever behind a spent receipt.
+  // An inconclusive probe still preserves the receipt.
   async function settleCheckpointResumeConsumptionFailure({
     consumption, dispatchAttempted, error, targetOwner, targetRepo,
-    issueNumber, writeClient,
+    issueNumber, writeClient, observeDispatch,
   }) {
     if (!consumption || !consumption.consumed) {
       return { released: false, preserved: false };
@@ -1427,12 +1471,101 @@ module.exports = async function runIssueScheduler({ github, context, core }) {
       });
       return { released: true, preserved: false };
     }
+    if (typeof observeDispatch === 'function') {
+      let observed = null;
+      try {
+        observed = await observeDispatch();
+      } catch (probeErr) {
+        core.warning(
+          'Checkpoint resume dispatch verification for #' + issueNumber +
+          ' is unavailable: ' + (probeErr.message || probeErr)
+        );
+      }
+      if (observed === false) {
+        await releaseCheckpointResumeConsumption({
+          targetOwner,
+          targetRepo,
+          commentId: consumption.commentId,
+          writeClient,
+        });
+        core.warning(
+          'Checkpoint resume consumption for #' + issueNumber +
+          ' was rolled back because the ambiguous dispatch left no ' +
+          'observable run or trigger comment: ' + (error.message || error)
+        );
+        return {
+          released: true, preserved: false, verified: 'not-observed',
+        };
+      }
+      if (observed === true) {
+        return { released: false, preserved: true, verified: 'observed' };
+      }
+    }
     core.warning(
       'Checkpoint resume consumption for #' + issueNumber +
       ' is preserved because the dispatch outcome is unknown: ' +
       (error.message || error)
     );
     return { released: false, preserved: true };
+  }
+
+  // A workflow_dispatch is observable only once GitHub materializes the run.
+  // Poll briefly so an accepted dispatch is not mistaken for a lost one; an
+  // unreadable inventory returns null and keeps the receipt fail-closed.
+  async function workflowDispatchObservedSince(workflow, sinceMs) {
+    for (let attempt = 0; attempt < 5; attempt += 1) {
+      let runs;
+      try {
+        const { data } = await readGithub.rest.actions.listWorkflowRuns({
+          owner,
+          repo,
+          workflow_id: workflow,
+          per_page: 30,
+        });
+        runs = data && data.workflow_runs || [];
+      } catch (err) {
+        return null;
+      }
+      if (
+        runs.some(run =>
+          new Date(
+            run.created_at || run.run_started_at || 0
+          ).getTime() >= sinceMs - 5000
+        )
+      ) return true;
+      if (attempt < 4) {
+        await new Promise(resolve => setTimeout(resolve, 3000));
+      }
+    }
+    return false;
+  }
+
+  // A comment-triggered dispatch is observable through the trigger comment
+  // itself. A lost response whose comment landed must keep the receipt: the
+  // issue_comment run may still start.
+  async function commentDispatchObservedSince(
+    issueNumber, body, sinceMs
+  ) {
+    let fresh;
+    try {
+      fresh = await readGithub.paginate(
+        readGithub.rest.issues.listComments,
+        {
+          owner,
+          repo,
+          issue_number: issueNumber,
+          per_page: 100,
+        }
+      );
+    } catch (err) {
+      return null;
+    }
+    const wanted = String(body || '');
+    return (fresh || []).some(comment =>
+      String(comment && comment.body || '') === wanted &&
+      new Date(comment && comment.created_at || 0).getTime() >=
+        sinceMs - 5000
+    );
   }
 
   // The release is bound to the consumer base the held run rejected against.
@@ -4328,9 +4461,19 @@ module.exports = async function runIssueScheduler({ github, context, core }) {
         /<!--\s*continuum-task-snapshot-ref\s+repo=([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)\s+issue=(\d+)\s+generation=(\d+)\s+title-sha256=([0-9a-fA-F]{64})\s+body-sha256=([0-9a-fA-F]{64})\s+spec-sha256=([0-9a-fA-F]{64})\s*-->/g;
       let pulls;
       try {
+        // The publication must be on this exact branch, so ask GitHub for
+        // that head instead of paginating every pull request in the
+        // repository. A full `state: all` scan here is O(pull requests) on
+        // every recovery evaluation and can exhaust the shared PAT budget.
         pulls = await readGithub.paginate(
           readGithub.rest.pulls.list,
-          { owner, repo, state: 'all', per_page: 100 }
+          {
+            owner,
+            repo,
+            state: 'all',
+            head: owner + ':' + branch,
+            per_page: 100,
+          }
         );
       } catch (err) {
         return {
@@ -5501,10 +5644,15 @@ module.exports = async function runIssueScheduler({ github, context, core }) {
     // a later scheduler pass (including one that reconciles the reservation
     // away before checking the lease) can never authorize a second
     // resumption of the identical checkpoint/base/snapshot. The receipt is
-    // rolled back only when the dispatch provably did not happen, leaving the
-    // claim retryable; an ambiguous dispatch keeps it spent.
+    // rolled back when the dispatch provably did not happen (a 4xx rejection
+    // or an ambiguous outcome whose durable side effect is absent), leaving
+    // the claim retryable; an observed or unverifiable ambiguous dispatch
+    // keeps it spent.
     let checkpointConsumption = null;
     let dispatchAttempted = false;
+    let observeDispatch = null;
+    let dispatchStartedAt = 0;
+    let dispatchTriggerBody = '';
     try {
       if (freshRelease && freshRelease.released) {
         checkpointConsumption = await consumeCheckpointResumeRelease({
@@ -5580,6 +5728,9 @@ module.exports = async function runIssueScheduler({ github, context, core }) {
           body: markerComment,
         });
         dispatchAttempted = true;
+        dispatchStartedAt = Date.now();
+        observeDispatch = () =>
+          workflowDispatchObservedSince(route.workflow, dispatchStartedAt);
         await dispatchWorkflow(route.workflow, {
           ...route.inputs,
           issue_number: String(issue.number),
@@ -5594,6 +5745,10 @@ module.exports = async function runIssueScheduler({ github, context, core }) {
         // Inlined rather than routed through dispatchWorkflow so
         // the dispatched mode stays visible at the call site.
         dispatchAttempted = true;
+        dispatchStartedAt = Date.now();
+        observeDispatch = () => workflowDispatchObservedSince(
+          opencodeWorkflowPath, dispatchStartedAt
+        );
         await github.request(
           'POST /repos/{owner}/{repo}/actions/workflows/{workflow_id}/dispatches',
           {
@@ -5609,11 +5764,16 @@ module.exports = async function runIssueScheduler({ github, context, core }) {
         );
       } else {
         dispatchAttempted = true;
+        dispatchStartedAt = Date.now();
+        dispatchTriggerBody = ['/oc', '', markerComment].join('\n');
+        observeDispatch = () => commentDispatchObservedSince(
+          issue.number, dispatchTriggerBody, dispatchStartedAt
+        );
         await github.rest.issues.createComment({
           owner,
           repo,
           issue_number: issue.number,
-          body: ['/oc', '', markerComment].join('\n'),
+          body: dispatchTriggerBody,
         });
       }
     } catch (err) {
@@ -5625,6 +5785,7 @@ module.exports = async function runIssueScheduler({ github, context, core }) {
         targetRepo: repo,
         issueNumber: issue.number,
         writeClient: github,
+        observeDispatch,
       });
       await removeLabel(issue.number, inProgressLabel);
       throw err;

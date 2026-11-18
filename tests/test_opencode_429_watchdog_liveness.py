@@ -2583,7 +2583,8 @@ class WatchdogHarness(unittest.TestCase):
         )
         self.assertTrue(
             any(
-                "deterministic checkpoint resume rejection" in " ".join(line)
+                "could not re-admit its held checkpoint "
+                "(release-blocked-by-live-overlap)" in " ".join(line)
                 for line in result["notices"]
             ),
             result["notices"],
@@ -2595,6 +2596,38 @@ class WatchdogHarness(unittest.TestCase):
         result = self.run_scenario(scenario)
         self.assert_no_dispatch(result)
         self.assertEqual(self.release_comments(result), [])
+
+    def test_verified_fix_mints_no_release_when_publication_stands_down(self):
+        """A later stand-down must not leave a release claim behind.
+
+        The restart route previously minted the durable release before its
+        publication/observed/routing/claim fences. A pass that stood down
+        here left an unconsumed claim that a later pass could consume as
+        authorization. The claim is now minted only once the pass is otherwise
+        cleared to dispatch.
+        """
+        scenario = self.restart_recovery_scenario()
+        scenario["pulls"] = [
+            validator_fix_pull(),
+            {
+                "number": 900,
+                "state": "open",
+                "merged": False,
+                "user": {"login": "kodmial"},
+                "head": {
+                    "ref": AA_HEAD_REF,
+                    "sha": AA_CHECKPOINT_SHA,
+                    "repo": {"full_name": OWNER + "/" + REPO},
+                },
+            },
+        ]
+        result = self.run_scenario(scenario)
+        self.assert_no_dispatch(result)
+        self.assertEqual(
+            self.release_comments(result), [],
+            "a stand-down after the hold check must not mint a release claim",
+        )
+        self.assertEqual(self.consumption_comments(result), [])
 
     def aa_durable_green_run_scenario(self):
         """AA #534 operational shape on the scheduled durable-recovery route.
