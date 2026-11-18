@@ -6461,6 +6461,72 @@ class ContinuumTest < Minitest::Test
                  'the README must say plainly that no workflow reads a paid provider key')
   end
 
+  # The repository documents its user-facing contract in exactly two languages.
+  # Keep the seven English guide paths stable, require the Russian counterpart
+  # beside each one, and require the same explicit language switch on every
+  # pair so navigation cannot silently regress to English-only.
+  def test_readme_and_user_guides_are_bilingual
+    guides = %w[
+      quickstart
+      technical-overview
+      consumer-variables
+      parent-child-delegation
+      contract-qualification
+      cron-job-org
+      release-templates
+    ]
+    readme_en = File.read(File.join(ROOT, 'README.md'))
+    readme_ru = File.read(File.join(ROOT, 'README.ru.md'))
+
+    assert_includes readme_en, '[Русский](README.ru.md)'
+    assert_includes readme_ru, '[English](README.md)'
+    assert_includes readme_en, '](docs/quickstart.md)',
+                    'the English README must link the English Quick Start'
+    assert_includes readme_ru, '](docs/quickstart.ru.md)',
+                    'the Russian README must link the Russian Quick Start'
+    refute_includes readme_ru, '](docs/quickstart.md)',
+                    'the Russian README must not send readers to the English Quick Start'
+
+    guides.each do |guide|
+      english_path = File.join(ROOT, "docs/#{guide}.md")
+      russian_path = File.join(ROOT, "docs/#{guide}.ru.md")
+      assert File.exist?(english_path), "missing English guide docs/#{guide}.md"
+      assert File.exist?(russian_path), "missing Russian guide docs/#{guide}.ru.md"
+
+      english = File.read(english_path)
+      russian = File.read(russian_path)
+      switch = "[English](#{guide}.md) | [Русский](#{guide}.ru.md)"
+      assert_includes english, switch,
+                      "docs/#{guide}.md must offer the English | Русский switch"
+      assert_includes russian, switch,
+                      "docs/#{guide}.ru.md must offer the English | Русский switch"
+      assert_match(/[А-Яа-я]/, russian,
+                   "docs/#{guide}.ru.md must contain Russian text")
+
+      assert_includes readme_en, "](docs/#{guide}.md)",
+                      "README.md must link docs/#{guide}.md"
+      assert_includes readme_ru, "](docs/#{guide}.ru.md)",
+                      "README.ru.md must link docs/#{guide}.ru.md"
+    end
+  end
+
+  # The documented `CONTINUUM_OPENCODE_VERSION` default comes from the checked
+  # action manifest, not from a hand-maintained copy. Keep both language
+  # editions tied to the manifest pin so a version bump cannot leave a stale
+  # default in one of them.
+  def test_consumer_variables_document_current_opencode_manifest_version
+    manifest = JSON.parse(
+      File.read(File.join(ROOT, '.github/actions/agent-toolchain/toolchain.json'))
+    )
+    version = manifest.fetch('opencode_version')
+
+    %w[docs/consumer-variables.md docs/consumer-variables.ru.md].each do |path|
+      document = File.read(File.join(ROOT, path))
+      assert_includes document, "| `CONTINUUM_OPENCODE_VERSION` | `#{version}`",
+                      "#{path} must document the action manifest's OpenCode default"
+    end
+  end
+
   # CONTRIBUTING and the issue chooser are reporter-facing entry points. Point
   # both at GitHub's repository security policy entrypoint rather than a fixed
   # blob path, so neither strands a report while the policy file's merge

@@ -1,11 +1,19 @@
 # Continuum contract qualification (kodmial/continuum#286)
 
+[English](contract-qualification.md) | [Русский](contract-qualification.ru.md)
+
 One merge-blocking qualification contract with three layers. The
 deterministic rules live in `src/continuum/contract_qualification.py`;
 the executable gate is the reusable workflow
 `continuum-contract-qualification.yml` (surfaced as the **Contract
 qualification** check); the merge enforcement lives in both merge
 reconcilers.
+
+| Layer | Runs on | Proves |
+| --- | --- | --- |
+| 1 — deterministic regression | Every Continuum pull request | The exact PR HEAD passes the full contract suite. |
+| 2 — lifecycle integration | Every Continuum pull request | Reservation, recovery, dedup, and exact-HEAD merge semantics work end to end. |
+| 3 — live canary | A bounded schedule plus manual dispatch | Real issue/PR/run state advances on current `main`, or fails loudly. |
 
 ## Layer 1 — deterministic regression gate (every Continuum PR)
 
@@ -145,7 +153,11 @@ job in one run. Both routes drive the same single canary implementation.
 
 ## Main-branch safety (server-side, required)
 
-Code cannot protect `main` by itself. Configure GitHub branch protection
+> [!IMPORTANT]
+> Code cannot protect `main` by itself. Without server-side branch protection,
+> a human or misconfigured workflow can still write directly to `main`.
+
+Configure GitHub branch protection
 (a ruleset) on `main` with all of the following:
 
 - Require a pull request before merging; no direct pushes.

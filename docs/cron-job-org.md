@@ -1,9 +1,17 @@
 # Optional external periodic wake with cron-job.org
 
+[English](cron-job-org.md) | [Русский](cron-job-org.ru.md)
+
 Continuum's native GitHub `schedule` is fully operational and remains the
 authoritative timer. This page describes an **optional** manual backstop: a
 cron-job.org job that sends an authenticated GitHub REST `workflow_dispatch` to
 the installed **Issue scheduler** caller.
+
+> [!WARNING]
+> Treat the cron-job.org token as a credential. Use a short-lived fine-grained
+> token with only **Actions: write** and store it exclusively in the
+> `Authorization` header. Never put a token in a repository, URL, query string,
+> issue, log, or screenshot.
 
 Nothing is provisioned automatically. Continuum does not read a cron-job.org
 API key, does not create or sync jobs, and does not change `install.sh` or

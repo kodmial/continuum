@@ -1,7 +1,16 @@
 # Consumer contract
 
+[English](consumer-variables.md) | [Русский](consumer-variables.ru.md)
+
 Continuum is configured by the **calling repository**. Generic engines do not
 carry defaults copied from any existing consumer.
+
+> [!NOTE]
+> Reusable-workflow inputs take precedence over repository variables. In the
+> validation engine, an empty input falls through to the matching
+> `CONTINUUM_*` repository variable; in the agent path,
+> `CONTINUUM_OPENCODE_VERSION` overrides the checked action manifest only when
+> it is an exact SemVer.
 
 ## Validation
 
@@ -17,8 +26,8 @@ repository variable shown below.
 | `CONTINUUM_BUILD_COMMAND` | empty | Consumer build hook. |
 | `CONTINUUM_TEST_COMMAND` | empty | Consumer test hook. |
 | `CONTINUUM_VALIDATION_COMMAND` | empty | Additional validation hook. |
-| `CONTINUUM_PACKAGE_COMMAND` | empty | Consumer packaging hook. |
-| `CONTINUUM_RELEASE_COMMAND` | empty | Consumer release hook. |
+| `CONTINUUM_PACKAGE_COMMAND` | empty | Final packaging validation hook, run after build/test/validation. |
+| `CONTINUUM_RELEASE_COMMAND` | empty | Final release validation hook, run after the package hook. |
 | `CONTINUUM_AUTO_DETECT` | `true` | Detect and validate Python/Node/PHP/Java/Go/Rust, Docker and shell. |
 | `CONTINUUM_NODE_VERSION` | empty | Optional Node.js version setup for explicit consumer hooks. |
 | `CONTINUUM_PHP_VERSION` | empty | Optional PHP version setup for explicit consumer hooks. |
@@ -147,7 +156,7 @@ never clears a lock another approved workflow still needs.
 | `AUTOMATION_OPENCODE_RUNNER` | `ubuntu-latest` | Runner used by OpenCode. |
 | `AUTOMATION_OPENCODE_TIMEOUT_MINUTES` | `180` | OpenCode timeout. |
 | `CONTINUUM_AGENT_PREPARE_COMMAND` | empty | Consumer-owned toolchain/environment setup run after checkout. |
-| `CONTINUUM_OPENCODE_VERSION` | `1.19.3` (action manifest default) | Exact SemVer override to the shared hosted OpenCode cache bootstrap; invalid or unavailable pins fail closed, no moving `latest`. Used by coder, PR-Agent review/repair and delegated Child agent jobs. When unset, `toolchain.json` is authoritative; PR-Agent separately validates its own pinned wheel digest. |
+| `CONTINUUM_OPENCODE_VERSION` | `2.2.6` (action manifest default) | Exact SemVer override to the shared hosted OpenCode cache bootstrap; invalid or unavailable pins fail closed, no moving `latest`. The repository variable takes precedence only when set to an exact SemVer; when unset, `.github/actions/agent-toolchain/toolchain.json` is authoritative (`2.2.6` at this baseline). Used by coder, PR-Agent review/repair and delegated Child agent jobs. PR-Agent separately validates its own pinned wheel digest. |
 | `CONTINUUM_IMAGE_DIGEST` | empty | **Legacy native-image/profile digest, preserved for compatibility** with the reusable `image_digest` inputs (which still forward `inputs.image_digest || vars.CONTINUUM_IMAGE_DIGEST`). Before Work Lock #67, Linux GitHub-hosted OpenCode jobs treated this as a possible preinstalled-runtime stamp and otherwise ran an inline cold installer; this was a misleading warm-cache proxy on freshly provisioned hosted VMs. **After #67 migration**, the six active GitHub-hosted coding/review/repair/delegation workflows instead restore and verify OpenCode binaries using `agent-toolchain` + `actions/cache`, so setting this variable cannot create a hosted warm hit. Consumers with a real separately qualified native golden-image provider may still use the digest as a profile identity; those backends and macOS/Windows are not qualified by hosted cache tests. Legacy caller inputs remain accepted, but should not be interpreted as hosted cache pins. |
 | `CONTINUUM_RUNTIME_PRESET` | `agent-linux` | Named ephemeral runtime preset (`agent-linux`, `agent-macos`, `agent-windows`, ...). Strict presets keep `idle_instances: 0` and `max_uses_per_instance: 1`; they cannot be retuned into persistent waiting runners. |
 | `CONTINUUM_RUNTIME_PROVIDER` | `github-hosted` | Provider backend for ephemeral instances (`github-hosted`, `gce`, `ec2`, `azure`, `custom`). |
@@ -208,11 +217,18 @@ publication are not part of the Swift profile.
 | `AUTOMATION_QUALIFYING_LABEL` | `automation:qualifying` | Implementation-merged capabilities waiting on mandatory live qualification. |
 | `AUTOMATION_BLOCKED_LABEL` | `automation:blocked` | Capabilities whose mandatory qualification failed and need repair. |
 | `AUTOMATION_READY_LABEL` | empty | Optional admission label for automatic implementation. When set (for example `automation:ready`), the scheduler auto-dispatches only issues carrying that label; empty keeps the current behavior. Qualification dispatch and manual owner `/oc` never require it. |
-| `CONTINUUM_CHILD_OWNED_MARKER` | `<!-- continuum-child-owned -->` | Current delegated-child ownership marker. |
-| `CONTINUUM_LEGACY_CHILD_OWNED_MARKER` | empty | Optional legacy marker supplied by a migrating consumer. |
 | `CONTINUUM_REVIEW_PROVIDER` | `none` | Authoritative review selector: `none`, `coderabbit`, or `pr-agent`. |
 | `CONTINUUM_CONTRACT_GATE_WORKFLOW_NAME` | `Continuum Contract Gate` | Workflow name for the owner-armed resume Contract Gate. The exact-HEAD gate is required in every repository; this variable only renames the required workflow. |
-| `CONTINUUM_VERSION_FILE` | empty | Optional version file used only by the generic stale-release-run optimization. |
+| `CONTINUUM_VERSION_FILE` | empty | Optional repository-relative path to a version file. Used only by generic housekeeping: cancelling stale `Release` runs for an already-published version and identifying release-automation pull requests for review labelling. Unset disables those optimizations; it does not enable release automation. |
+
+> [!IMPORTANT]
+> `AUTOMATION_READY_LABEL` is empty by default. While it is empty, the
+> scheduler may enqueue any eligible open issue. Set it before opening issues.
+
+The deprecated `child_owned_marker` and `legacy_child_owned_marker`
+`workflow_call` inputs are still accepted so older callers keep working, but
+issue body markers no longer affect scheduler admission. Verified child routing
+uses `CONTINUUM_ROLE` and the relationship variables above.
 
 ### Required Contract Gate workflow
 

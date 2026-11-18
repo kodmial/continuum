@@ -1,5 +1,8 @@
 # Release workflow reference templates (historical, inactive)
 
+[English](release-templates.md) | [Русский](release-templates.ru.md)
+
+> [!WARNING]
 > **Status: ARCHIVED / HISTORICAL / INACTIVE / UNQUALIFIED.**
 >
 > Everything on this page describes reference material under
