@@ -118,8 +118,9 @@ run.
   the required checks green for the exact pull-request head being merged.
 - Do not include secrets, tokens, or consumer data in code, logs, issues, or
   pull requests.
-- Never edit a consumer repository as part of a Continuum pull request. Installer
-  behavior is documented in [README.md](README.md#install).
+- Never edit a consumer repository as part of a Continuum pull request.
+  Installer behavior is documented in the
+  [technical overview](docs/technical-overview.md#install).
 
 ## Issues and support
 
