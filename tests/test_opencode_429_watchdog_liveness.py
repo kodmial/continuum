@@ -125,6 +125,15 @@ function makeRest() {
       },
       listComments: async () => state.comments.map(comment => ({ ...comment })),
       createComment: async ({ issue_number, body }) => {
+        if (
+          Object.prototype.hasOwnProperty.call(
+            scenario, 'retryCommentError'
+          ) &&
+          String(body || '').includes('/oc') &&
+          String(body || '').includes('Automatic recovery retry')
+        ) {
+          throw apiError(scenario.retryCommentError, 'retry comment failed');
+        }
         const comment = {
           id: state.nextCommentId++,
           body,
@@ -222,6 +231,12 @@ function makeRest() {
       },
       reRunWorkflow: async () => ({ data: {} }),
       createWorkflowDispatch: async ({ workflow_id, ref, inputs }) => {
+        if (
+          Object.prototype.hasOwnProperty.call(scenario, 'dispatchError') &&
+          !scenario.dispatchAccepted
+        ) {
+          throw apiError(scenario.dispatchError, 'dispatch failed');
+        }
         const identity = JSON.parse(inputs.recovery_identity || '{}');
         const runId = Number(scenario.dispatchedRunId || 5001);
         state.dispatches.push({ workflow_id, ref, inputs });
@@ -241,6 +256,9 @@ function makeRest() {
         };
         state.runs.set(String(runId), run);
         state.workflowRuns.push(run);
+        if (Object.prototype.hasOwnProperty.call(scenario, 'dispatchError')) {
+          throw apiError(scenario.dispatchError, 'dispatch response lost');
+        }
         return { data: {} };
       },
     },
@@ -733,7 +751,7 @@ class WatchdogHarness(unittest.TestCase):
         TMP_PARENT.mkdir(parents=True, exist_ok=True)
         cls.source = watchdog_script()
 
-    def run_scenario(self, scenario, env=None):
+    def run_scenario(self, scenario, env=None, allow_script_errors=False):
         workdir = Path(tempfile.mkdtemp(prefix="watchdog-", dir=str(TMP_PARENT)))
         try:
             source_path = workdir / "watchdog.js"
@@ -774,7 +792,10 @@ class WatchdogHarness(unittest.TestCase):
             self.assertTrue(result_path.is_file(), completed.stderr)
             result = json.loads(result_path.read_text(encoding="utf-8"))
             self.assertNotIn("harnessError", result, result.get("harnessError"))
-            self.assertEqual(result.get("scriptErrors"), [], result.get("notices"))
+            if not allow_script_errors:
+                self.assertEqual(
+                    result.get("scriptErrors"), [], result.get("notices")
+                )
             return result
         finally:
             shutil.rmtree(workdir, ignore_errors=True)
@@ -2038,6 +2059,12 @@ class WatchdogHarness(unittest.TestCase):
             if "continuum-checkpoint-resume-release" in comment["body"]
         ]
 
+    def consumption_comments(self, result):
+        return [
+            comment["body"] for comment in result["comments"]
+            if "continuum-checkpoint-resume-consumed" in comment["body"]
+        ]
+
     def test_ready_only_stale_hold_is_held_before_the_fix_is_verified(self):
         result = self.run_scenario(
             self.stale_hold_retry_scenario(),
@@ -2107,6 +2134,68 @@ class WatchdogHarness(unittest.TestCase):
             len(self.retried_bodies(result)), 1,
             "the released hold must allow exactly one fresh retry",
         )
+
+    def test_lost_fresh_vm_dispatch_response_keeps_the_consumption_receipt(self):
+        # GitHub may accept the dispatch before the response is lost. The run
+        # can then finish without a PR, so the receipt must stay spent.
+        scenario = self.verified_fix(self.restart_recovery_scenario())
+        scenario["dispatchError"] = 0
+        scenario["dispatchAccepted"] = True
+        result = self.run_scenario(scenario)
+        self.assertEqual(len(result["dispatches"]), 1, result["dispatches"])
+        self.assertEqual(
+            len(self.consumption_comments(result)), 1, result["comments"]
+        )
+        self.assertTrue(
+            any(
+                "preserved its checkpoint consumption receipt" in
+                " ".join(line)
+                for line in result["notices"]
+            ),
+            result["notices"],
+        )
+
+    def test_confirmed_fresh_vm_dispatch_rejection_releases_the_receipt(self):
+        # A definitive 4xx proves the dispatch did not happen, so the claim
+        # remains retryable instead of being spent by an infrastructure error.
+        scenario = self.verified_fix(self.restart_recovery_scenario())
+        scenario["dispatchError"] = 422
+        result = self.run_scenario(scenario)
+        self.assertEqual(result["dispatches"], [], result["dispatches"])
+        self.assertEqual(self.consumption_comments(result), [], result["comments"])
+        self.assertEqual(len(self.release_comments(result)), 1, result["comments"])
+
+    def test_lost_retry_comment_response_keeps_the_consumption_receipt(self):
+        # The `/oc` trigger comment is itself the dispatch. A lost response
+        # may still have posted it, so the receipt must not be rolled back.
+        scenario = self.verified_fix(self.stale_hold_retry_scenario())
+        scenario["retryCommentError"] = 0
+        result = self.run_scenario(
+            scenario, env={"MAX_RECOVERY_RETRIES": "1"},
+            allow_script_errors=True,
+        )
+        self.assertEqual(self.retried_bodies(result), [], result["comments"])
+        self.assertEqual(
+            len(self.consumption_comments(result)), 1, result["comments"]
+        )
+        self.assertTrue(
+            any(
+                "retry dispatch outcome is unknown" in " ".join(line)
+                for line in result["notices"]
+            ),
+            result["notices"],
+        )
+
+    def test_confirmed_retry_comment_rejection_releases_the_receipt(self):
+        scenario = self.verified_fix(self.stale_hold_retry_scenario())
+        scenario["retryCommentError"] = 422
+        result = self.run_scenario(
+            scenario, env={"MAX_RECOVERY_RETRIES": "1"},
+            allow_script_errors=True,
+        )
+        self.assertEqual(self.retried_bodies(result), [], result["comments"])
+        self.assertEqual(self.consumption_comments(result), [], result["comments"])
+        self.assertEqual(len(self.release_comments(result)), 1, result["comments"])
 
     def restart_recovery_scenario(self, hold_ref=AA_DURABLE_REF):
         """Runner-restart route: `recoverFrom429OnFreshVm` owns re-admission."""

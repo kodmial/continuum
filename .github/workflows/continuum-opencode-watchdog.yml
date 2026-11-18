@@ -1656,6 +1656,15 @@ jobs:
             }
             return { consumed: true, commentId: ownId, attempt };
           }
+          // A dispatch (workflow dispatch or trigger comment) is only proven
+          // not to have happened when GitHub rejected the request with a
+          // client error. A transport error, timeout, or 5xx may mean the
+          // request was accepted before its response was lost, so the
+          // consumption receipt must survive.
+          function checkpointDispatchFailureIsDefinitive(error) {
+            const status = Number(error && error.status || 0);
+            return status >= 400 && status < 500 && status !== 408;
+          }
           // The release is bound to the consumer base the held run rejected
           // against. A moved base changes the premise, and an unreadable base
           // cannot prove it unchanged, so neither may authorize a resumption.
@@ -2998,9 +3007,24 @@ jobs:
               });
             } catch (dispatchErr) {
               const status = Number(dispatchErr && dispatchErr.status || 0);
-              if (checkpointConsumption && checkpointConsumption.consumed) {
+              if (
+                checkpointConsumption &&
+                checkpointConsumption.consumed &&
+                checkpointDispatchFailureIsDefinitive(dispatchErr)
+              ) {
                 await releaseCheckpointResumeConsumption(
                   checkpointConsumption.commentId
+                );
+              } else if (
+                checkpointConsumption &&
+                checkpointConsumption.consumed
+              ) {
+                core.warning(
+                  'OpenCode infrastructure operation ' + operation +
+                  ' generation ' + generation +
+                  ' preserved its checkpoint consumption receipt because ' +
+                  'the dispatch outcome is unknown (' +
+                  (dispatchErr.message || dispatchErr) + ').'
                 );
               }
               await deleteRecoveryClaim(claim);
@@ -3855,9 +3879,18 @@ jobs:
               ].join('\n'),
             });
           } catch (err) {
-            if (retryConsumption) {
+            if (
+              retryConsumption &&
+              checkpointDispatchFailureIsDefinitive(err)
+            ) {
               await releaseCheckpointResumeConsumption(
                 retryConsumption.commentId
+              );
+            } else if (retryConsumption) {
+              core.warning(
+                'Issue #' + issueNumber +
+                ' preserved its checkpoint consumption receipt because the ' +
+                'retry dispatch outcome is unknown: ' + (err.message || err)
               );
             }
             await removeLabel(inProgressLabel);

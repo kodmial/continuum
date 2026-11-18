@@ -1395,6 +1395,15 @@ module.exports = async function runIssueScheduler({ github, context, core }) {
     }
   }
 
+  // A dispatch (workflow dispatch or trigger comment) is only proven not to
+  // have happened when GitHub rejected the request with a client error. A
+  // transport error, timeout, or 5xx may mean the request was accepted before
+  // its response was lost, so the consumption receipt must survive.
+  function checkpointDispatchFailureIsDefinitive(error) {
+    const status = Number(error && error.status || 0);
+    return status >= 400 && status < 500 && status !== 408;
+  }
+
   // The release is bound to the consumer base the held run rejected against.
   // A moved base changes the premise, and an unreadable base cannot prove it
   // unchanged, so neither may authorize a new resumption.
@@ -5419,8 +5428,10 @@ module.exports = async function runIssueScheduler({ github, context, core }) {
     // a later scheduler pass (including one that reconciles the reservation
     // away before checking the lease) can never authorize a second
     // resumption of the identical checkpoint/base/snapshot. The receipt is
-    // rolled back if the dispatch below fails, leaving the claim retryable.
+    // rolled back only when the dispatch provably did not happen, leaving the
+    // claim retryable; an ambiguous dispatch keeps it spent.
     let checkpointConsumption = null;
+    let dispatchAttempted = false;
     try {
       if (freshRelease && freshRelease.released) {
         checkpointConsumption = await consumeCheckpointResumeRelease({
@@ -5495,6 +5506,7 @@ module.exports = async function runIssueScheduler({ github, context, core }) {
           issue_number: issue.number,
           body: markerComment,
         });
+        dispatchAttempted = true;
         await dispatchWorkflow(route.workflow, {
           ...route.inputs,
           issue_number: String(issue.number),
@@ -5508,6 +5520,7 @@ module.exports = async function runIssueScheduler({ github, context, core }) {
         });
         // Inlined rather than routed through dispatchWorkflow so
         // the dispatched mode stays visible at the call site.
+        dispatchAttempted = true;
         await github.request(
           'POST /repos/{owner}/{repo}/actions/workflows/{workflow_id}/dispatches',
           {
@@ -5522,6 +5535,7 @@ module.exports = async function runIssueScheduler({ github, context, core }) {
           }
         );
       } else {
+        dispatchAttempted = true;
         await github.rest.issues.createComment({
           owner,
           repo,
@@ -5531,12 +5545,23 @@ module.exports = async function runIssueScheduler({ github, context, core }) {
       }
     } catch (err) {
       if (checkpointConsumption && checkpointConsumption.consumed) {
-        await releaseCheckpointResumeConsumption({
-          targetOwner: owner,
-          targetRepo: repo,
-          commentId: checkpointConsumption.commentId,
-          writeClient: github,
-        });
+        if (
+          !dispatchAttempted ||
+          checkpointDispatchFailureIsDefinitive(err)
+        ) {
+          await releaseCheckpointResumeConsumption({
+            targetOwner: owner,
+            targetRepo: repo,
+            commentId: checkpointConsumption.commentId,
+            writeClient: github,
+          });
+        } else {
+          core.warning(
+            'Checkpoint resume consumption for #' + issue.number +
+            ' is preserved because the dispatch outcome is unknown: ' +
+            (err.message || err)
+          );
+        }
       }
       await removeLabel(issue.number, inProgressLabel);
       throw err;

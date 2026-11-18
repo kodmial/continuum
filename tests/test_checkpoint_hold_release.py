@@ -274,7 +274,7 @@ async function runScheduler() {
     'const stopOrderKey = entry => String(entry.created_at || "") + "#" + ' +
       'String(entry.id || 0).padStart(12, "0");\n' +
     schedulerSource +
-    '\nreturn { hold: checkpointResumeHold, released: () => checkpointResumeHoldRelease, consume: consumeCheckpointResumeRelease };'
+    '\nreturn { hold: checkpointResumeHold, released: () => checkpointResumeHoldRelease, consume: consumeCheckpointResumeRelease, dispatchFailureIsDefinitive: checkpointDispatchFailureIsDefinitive };'
   );
   const api = await factory(writeGithub, core, scenario.owner || 'kodmial', readGithub);
   lastSchedulerApi = api;
@@ -363,6 +363,12 @@ async function runWatchdog() {
     scheduler,
     consumption,
     duplicateConsumption,
+    schedulerDispatchFailureClassification: Object.fromEntries(
+      [0, 408, 403, 422, 429, 500].map(status => [
+        String(status),
+        lastSchedulerApi.dispatchFailureIsDefinitive({ status }),
+      ])
+    ),
     // A second scheduler pass over the same durable history proves an
     // unconsumed release is reusable and a consumed one is spent.
     schedulerAgain: await runScheduler(),
@@ -453,6 +459,27 @@ class CheckpointHoldReleaseTests(unittest.TestCase):
                 }
             ],
         }
+
+    def test_dispatch_failure_only_releases_receipts_for_rejected_requests(self):
+        result = self.run_scenario(self.base_scenario())
+        # Transport errors/timeouts (0, 408) and server failures (500) cannot
+        # prove the dispatch did not happen. A 4xx rejection can.
+        self.assertEqual(
+            result["schedulerDispatchFailureClassification"],
+            {
+                "0": False,
+                "408": False,
+                "403": True,
+                "422": True,
+                "429": True,
+                "500": False,
+            },
+        )
+        scheduler = SCHEDULER.read_text(encoding="utf-8")
+        self.assertIn(
+            "!dispatchAttempted ||\n          checkpointDispatchFailureIsDefinitive(err)",
+            scheduler,
+        )
 
     def test_both_controllers_hold_until_the_manifest_fix_is_verifiable(self):
         scenario = self.base_scenario()
