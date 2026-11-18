@@ -984,6 +984,17 @@ module.exports = async function runIssueScheduler({ github, context, core }) {
       }
       if (at < originalHoldAt) originalHoldAt = at;
     }
+    // Only the historical rejection PR #461 fixed may be superseded. A hold
+    // first published at or after the fix merge is not that rejection: it can
+    // be produced by an executor still running a pre-fix engine ref, or by a
+    // republished hold, and any canonical dispatch that ran before it would
+    // not be newer than it. The release is fail-closed, so such a hold stays.
+    if (originalHoldAt >= mergedAt) {
+      return deny(
+        'the original hold does not predate the PR #' +
+        checkpointWrongGenerationFix.pullRequest + ' fix merge'
+      );
+    }
     for (const comment of trusted) {
       if (!isCanonicalSchedulerDispatch(comment)) continue;
       const at = Date.parse(comment.created_at || '');

@@ -7871,6 +7871,52 @@ class ContinuumTest < Minitest::Test
           ]), false,
           'a repeated identical hold must not reopen the consumed release'
         );
+
+        // The historical rejection is the one published before the fix merge.
+        // A generation-2 hold first published after it (an executor on a
+        // pre-fix engine ref, or a republished hold) is not stale and stays.
+        const lateHoldAt = '2026-11-18T11:00:00Z';
+        const lateHoldComment = comment(2, hold(), lateHoldAt);
+        const preHoldDispatch = comment(7, dispatch, '2026-11-18T10:00:00Z');
+        const lateMarker = checkpointResumeHoldMarker(
+          lateHoldComment, 'kodmial/aa', 534
+        );
+        assert.equal(
+          await checkpointWrongGenerationRelease(
+            lateMarker, wrongGenerationReleaseIdentity(lateMarker, 534), 534,
+            [snapshotComment, preHoldDispatch, lateHoldComment], spec,
+            makeClient(), 'kodmial', 'aa'
+          ), false,
+          'a dispatch older than a post-merge hold must not release it'
+        );
+        assert.equal(
+          await checkpointWrongGenerationRelease(
+            lateMarker, wrongGenerationReleaseIdentity(lateMarker, 534), 534,
+            [snapshotComment, lateHoldComment], spec, makeClient(),
+            'kodmial', 'aa'
+          ), false,
+          'a hold published after the fix merge must not release'
+        );
+        const atMergeComment = comment(2, hold(), mergedAt);
+        const atMergeMarker = checkpointResumeHoldMarker(
+          atMergeComment, 'kodmial/aa', 534
+        );
+        assert.equal(
+          await checkpointWrongGenerationRelease(
+            atMergeMarker, wrongGenerationReleaseIdentity(atMergeMarker, 534),
+            534, [snapshotComment, atMergeComment], spec, makeClient(),
+            'kodmial', 'aa'
+          ), false,
+          'a hold published at the fix merge must not release'
+        );
+        assert.ok(
+          await checkpointResumeHold(
+            'kodmial', 'aa', 534, [snapshotComment, lateHoldComment],
+            makeClient()
+          ),
+          'the hold entry point must keep a post-merge hold'
+        );
+
         const durableHold = comment(
           6,
           hold().replace(
