@@ -6817,9 +6817,12 @@ class ContinuumTest < Minitest::Test
     assert_includes scheduler, 'await dispatchWorkflow(childWorkerWorkflow, {'
     assert_includes scheduler, 'local_opencode_pr_tasks'
     assert_includes scheduler, 'local_opencode_run_tasks'
-    assert_includes scheduler, '($runs | length) >= 100',
-                    'a full third Actions-run page must fail closed as unknown'
-    assert_includes scheduler, 'then "__unknown__" else empty end'
+    assert_includes scheduler, 'GITHUB_REPOSITORY="$child_repo" bash "$active_script" snapshot',
+                    'child-local inventory must use status-filtered active-only discovery'
+    refute_includes scheduler, 'repos/$child_repo/actions/runs?per_page=100&page=$page',
+                    'a long completed-history page must never block ready child issues'
+    assert_includes scheduler, 'local_opencode_run_tasks="__unknown__"',
+                    'a failed active-only lookup must remain fail-closed'
     assert_includes scheduler, 'local_override_active "$task_number"'
     assert_includes scheduler, 'sort_by(._rank, .number)'
     assert_includes scheduler, 'else 3'
