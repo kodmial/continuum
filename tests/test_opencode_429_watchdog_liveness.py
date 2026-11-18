@@ -16,6 +16,7 @@ import shutil
 import subprocess
 import tempfile
 import textwrap
+import time
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -121,7 +122,28 @@ function makeRest() {
             )
           );
         }
-        return items.map(issue => ({ ...issue }));
+        if (params.sort === 'updated') {
+          const key = issue => String(
+            issue.updated_at || issue.created_at || ''
+          ) + '#' + String(issue.number).padStart(12, '0');
+          items.sort((left, right) => key(left) < key(right) ? -1 : 1);
+          if (params.direction === 'desc') items.reverse();
+        }
+        const currentPage = Number(params.page || 1);
+        const perPage = Number(params.per_page || 30);
+        const start = (currentPage - 1) * perPage;
+        const pageItems = items.slice(start, start + perPage);
+        const lastPage = Math.max(1, Math.ceil(items.length / perPage));
+        pageItems.headers = {
+          link: items.length > perPage
+            ? '<https://api.github.com/issues?page=' +
+              (currentPage < lastPage ? currentPage + 1 : lastPage) +
+              '>; rel="next", ' +
+              '<https://api.github.com/issues?page=' + lastPage +
+              '>; rel="last"'
+            : '',
+        };
+        return pageItems;
       },
       listComments: async () => state.comments.map(comment => ({ ...comment })),
       createComment: async ({ issue_number, body }) => {
@@ -413,6 +435,23 @@ function mockFetch(url) {
 
 const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor;
 
+// Shadow the global Date only when a scenario pins the clock, so discovery
+// rotation (and the ordering relative to it) is deterministic in tests.
+const ScenarioDate = class extends Date {
+  constructor(...args) {
+    super(...(args.length === 0
+      ? [Object.prototype.hasOwnProperty.call(scenario, 'now')
+        ? scenario.now
+        : Date.now()]
+      : args));
+  }
+  static now() {
+    return Object.prototype.hasOwnProperty.call(scenario, 'now')
+      ? scenario.now
+      : Date.now();
+  }
+};
+
 async function runOnce() {
   const core = {
     notice: (...args) => state.notices.push(['notice', ...args.map(String)]),
@@ -427,12 +466,12 @@ async function runOnce() {
   };
   const fn = new AsyncFunction(
     'github', 'context', 'core', 'fetch', 'require', 'process', 'Buffer',
-    'setTimeout', source
+    'setTimeout', 'Date', source
   );
   try {
     await fn(
       new MockGithub(), context, core, mockFetch, require, process, Buffer,
-      (callback) => setTimeout(callback, 0)
+      (callback) => setTimeout(callback, 0), ScenarioDate
     );
   } catch (error) {
     state.scriptErrors.push(String(error && error.stack || error));
@@ -1543,6 +1582,61 @@ class WatchdogHarness(unittest.TestCase):
         # still find the trusted checkpoint.
         scenario = self.durable_scenario()
         scenario["issues"][0]["labels"] = []
+        result = self.run_scenario(scenario)
+        self.assert_one_current_dispatch(result, NEW_SHA)
+
+    def test_scheduled_label_free_scan_is_not_starved_by_labeled_backlog(self):
+        # A labeled backlog used to be able to fill the whole discovery cap
+        # before the label-free scan ran. The label budget is partitioned, so
+        # a checkpoint that lost both labels is still found.
+        scenario = self.durable_scenario()
+        checkpoint = {
+            "number": 382,
+            "state": "open",
+            "title": "P0: durable recovery",
+            "labels": [],
+            "updated_at": "2026-11-17T12:00:00Z",
+        }
+        backlog = [
+            {
+                "number": 900 + index,
+                "state": "open",
+                "title": "labeled backlog " + str(index),
+                "labels": [{"name": "automation:in-progress"}],
+                "updated_at": "2026-11-01T00:00:00Z",
+            }
+            for index in range(120)
+        ]
+        scenario["issues"] = backlog + [checkpoint]
+        result = self.run_scenario(scenario)
+        self.assert_one_current_dispatch(result, NEW_SHA)
+
+    def test_scheduled_label_free_scan_rotates_to_an_older_page(self):
+        # Newest-first page one is not enough: an older label-free checkpoint
+        # sits beyond the first 100 open issues. Pin the clock to a bucket
+        # whose oldest-first rotation lands on page one, where this
+        # checkpoint is the oldest open issue.
+        scenario = self.durable_scenario()
+        scenario["now"] = (int(time.time()) // 4500) * 4500 * 1000
+        newer = [
+            {
+                "number": 1000 + index,
+                "state": "open",
+                "title": "newer label-free issue " + str(index),
+                "labels": [],
+                "updated_at": "2026-11-17T" + str(index // 60).zfill(2) +
+                    ":" + str(index % 60).zfill(2) + ":00Z",
+            }
+            for index in range(120)
+        ]
+        checkpoint = {
+            "number": 382,
+            "state": "open",
+            "title": "P0: durable recovery",
+            "labels": [],
+            "updated_at": "2026-10-01T00:00:00Z",
+        }
+        scenario["issues"] = newer + [checkpoint]
         result = self.run_scenario(scenario)
         self.assert_one_current_dispatch(result, NEW_SHA)
 
