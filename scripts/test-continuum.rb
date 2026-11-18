@@ -6511,14 +6511,42 @@ class ContinuumTest < Minitest::Test
   end
 
   # The documented `CONTINUUM_OPENCODE_VERSION` default comes from the checked
-  # action manifest, not from a hand-maintained copy. Keep both language
-  # editions tied to the manifest pin so a version bump cannot leave a stale
-  # default in one of them.
-  def test_consumer_variables_document_current_opencode_manifest_version
+  # action manifest, not from a hand-maintained copy. Every page that quotes the
+  # live pin must agree with it, not just the first cell of the variables table:
+  # a version literal on an OpenCode line that is neither the manifest pin nor a
+  # recorded historical pin is a stale copy left behind by a bump. Historical
+  # pins are curated here on purpose so genuine evidence stays quotable.
+  def test_docs_track_current_opencode_manifest_version
     manifest = JSON.parse(
       File.read(File.join(ROOT, '.github/actions/agent-toolchain/toolchain.json'))
     )
     version = manifest.fetch('opencode_version')
+    pr_agent_version = manifest.fetch('pr_agent_version')
+    allowed = [version, pr_agent_version, '1.18.34', '1.19.3']
+
+    %w[
+      docs/consumer-variables.md
+      docs/consumer-variables.ru.md
+      docs/agent-toolchain-cache.md
+      docs/technical-overview.md
+      docs/technical-overview.ru.md
+      docs/agent-runtime.md
+      docs/pr-agent-opencode.md
+    ].each do |path|
+      document = File.read(File.join(ROOT, path))
+      assert_includes document, version,
+                      "#{path} must document the action manifest's OpenCode default"
+
+      # Only OpenCode-pin sentences carry the version under test; versions that
+      # belong to another tool on the same sentence (PR-Agent, CI tooling) are
+      # allowed so this test does not police unrelated pins.
+      pin_lines = document.each_line.select { |line| line.match?(/opencode|current|текущ|cache key/i) }
+      quoted = pin_lines.join.scan(/(?<![\d.])\d+\.\d+\.\d+(?![\d.])/).uniq
+      stale = quoted - allowed
+      assert_empty stale,
+                   "#{path} quotes OpenCode version #{stale.join(', ')} while the " \
+                   "action manifest pins #{version}"
+    end
 
     %w[docs/consumer-variables.md docs/consumer-variables.ru.md].each do |path|
       document = File.read(File.join(ROOT, path))
