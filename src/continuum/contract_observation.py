@@ -483,7 +483,13 @@ def observe_canary(
 def select_observations(
     issues: Iterable[Mapping[str, Any]],
 ) -> List[Mapping[str, Any]]:
-    """Return only issues carrying the reservation label."""
+    """Return only issues carrying the reservation label.
+
+    This is a filter, not an observability check: an issue whose ``labels``
+    array is absent or empty is dropped. A caller reading a label-filtered
+    query must verify the label is present for every returned issue and fail
+    closed first, otherwise an unreadable payload narrows to zero reservations.
+    """
     return [
         issue for issue in issues or [] if IN_PROGRESS_LABEL in _labels(issue)
     ]

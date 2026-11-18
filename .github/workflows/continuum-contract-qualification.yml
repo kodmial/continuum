@@ -240,7 +240,38 @@ jobs:
               with open(os.path.join(root, name), encoding="utf-8") as handle:
                   return json.load(handle)
 
-          issues = observation.select_observations(load("issues.json"))
+          issues_payload = load("issues.json")
+          # The inventory query filters on the reservation label, so every
+          # issue that comes back is a reservation and its `labels` array must
+          # be observable and carry that label. A missing `labels` key and the
+          # real `gh` shape `labels: []` are both unreadable evidence: filtering
+          # them out would report zero reservations and qualify green while a
+          # stranded reservation exists. Fail closed instead.
+          if not isinstance(issues_payload, list):
+              raise SystemExit(
+                  "issue inventory is not a list (reservation state unobservable)"
+              )
+          unobservable = []
+          for item in issues_payload:
+              if not isinstance(item, dict):
+                  unobservable.append("?")
+                  continue
+              labels = item.get("labels")
+              if not isinstance(labels, list):
+                  unobservable.append(str(item.get("number", "?")))
+                  continue
+              names = [
+                  label.get("name") if isinstance(label, dict) else label
+                  for label in labels
+              ]
+              if observation.IN_PROGRESS_LABEL not in names:
+                  unobservable.append(str(item.get("number", "?")))
+          if unobservable:
+              raise SystemExit(
+                  "issue inventory label unobservable (reservation state "
+                  "unknown) for: %s" % ", ".join(unobservable)
+              )
+          issues = observation.select_observations(issues_payload)
           runs = load("runs.json")
           pulls = load("pulls.json")
           # The last 200 Actions runs are a fast path, not exhaustive evidence:

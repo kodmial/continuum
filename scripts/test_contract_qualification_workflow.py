@@ -13,16 +13,13 @@ context. Only the external GitHub boundary is faked; the observation and
 qualification modules are the real ``src/continuum`` code. No network, dispatch,
 issue write or sleep is involved.
 
-Known production gap (reported, not fixed here): the inventory query filters on
-``automation:in-progress``, but
-:func:`continuum.contract_observation.select_observations` drops any issue whose
-``labels`` array is absent or empty. Real ``gh issue list --json labels``
-returns ``labels: []`` for an issue without the label, so such a payload
-currently reports zero reservations and qualifies green. Issue #480 authorizes
-only this test file and its single validator invocation, so the fail-closed
-runtime guard belongs to a separate owner-approved fix.
-:meth:`Layer2WorkflowStepTest.test_label_less_payload_is_a_documented_false_success`
-pins the present behavior and must be inverted when that fix lands.
+Reservation state is read from a label-filtered inventory query, so every issue
+that comes back is a reservation and its ``labels`` array must carry
+``automation:in-progress``. A missing ``labels`` key and the real ``gh`` shape
+``labels: []`` are both unreadable evidence; the production step now fails
+closed for either instead of reporting zero reservations and qualifying green.
+:meth:`Layer2WorkflowStepTest.test_label_less_payload_fails_closed` pins that
+guard for both payload shapes.
 """
 
 from __future__ import annotations
@@ -807,22 +804,16 @@ class Layer2WorkflowStepTest(Layer2Harness, unittest.TestCase):
                     self.assertIn("dropped observation contract", completed.stderr)
                     self.assertIn(field, completed.stderr)
 
-    def test_label_less_payload_is_a_documented_false_success(self):
-        """Characterize the label-less payload gap; a runtime fix is out of scope.
+    def test_label_less_payload_fails_closed(self):
+        """An unreadable reservation label must fail, never qualify green.
 
         The inventory query filters on ``automation:in-progress``, so an open
         issue in the payload is a reservation even when its ``labels`` array is
         absent or empty. Real ``gh issue list --json labels`` returns
-        ``labels: []`` for an issue without the reservation label, and
-        ``select_observations`` drops both shapes, so the step reports zero
-        reservations and qualifies green instead of failing closed.
-
-        Issue #480 authorizes only this test file and its single validator
-        invocation, so a fail-closed guard belongs to a separate
-        owner-approved runtime fix. This test records the current observable
-        behavior; when that fix lands, invert it to require a nonzero exit and
-        an explicit unobservable-reservation diagnostic for both payload
-        shapes.
+        ``labels: []`` when the field carries no reservation label, and a
+        missing key is just as unreadable. ``select_observations`` would drop
+        both shapes, report zero reservations and qualify green while a
+        stranded reservation exists, so the production step must reject them.
         """
 
         missing_key = issue()
@@ -835,8 +826,12 @@ class Layer2WorkflowStepTest(Layer2Harness, unittest.TestCase):
         ):
             with self.subTest(payload=name):
                 completed = self.run_layer2(issues=[payload], runs=[], pulls=[])
-                self.assert_passed(completed)
+                self.assert_failed_without_pass(completed)
                 self.assertIn(
+                    "reservation state unknown", completed.stderr
+                )
+                self.assertIn(str(ISSUE_NUMBER), completed.stderr)
+                self.assertNotIn(
                     "Observed 0 real reservation(s); none stranded.",
                     completed.stdout,
                 )
