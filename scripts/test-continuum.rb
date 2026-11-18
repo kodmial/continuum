@@ -6821,6 +6821,8 @@ class ContinuumTest < Minitest::Test
     assert_includes scheduler,
                     'GITHUB_REPOSITORY="$child_repo" bash "$active_script" snapshot --output "$child_active_file"',
                     'child-local run inventory must use the status-filtered, bounded active-run discovery helper'
+    refute_includes scheduler, 'repos/$child_repo/actions/runs?per_page=100&page=$page',
+                    'a long completed-history page must never block ready child issues'
     assert_includes scheduler, 'local_opencode_run_tasks="__unknown__"',
                     'an unreadable child-local run inventory must fail closed as unknown'
     active_runs_helper = File.read(
