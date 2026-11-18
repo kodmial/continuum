@@ -293,6 +293,17 @@ class MockGithub {
 }
 
 function mockFetch(url) {
+  // The watchdog now probes the installation REST budget before scanning.
+  // A normal pass must observe a healthy budget; individual scenarios may
+  // override it to exercise the exhausted/low deferral path.
+  if (/\/rate_limit$/.test(String(url))) {
+    const budget = scenario.rateLimit || { limit: 5000, remaining: 5000, reset: 0 };
+    return Promise.resolve({
+      ok: true,
+      status: 200,
+      json: async () => ({ resources: { core: budget } }),
+    });
+  }
   if (/\/actions\/jobs\/[^/]+\/logs$/.test(String(url))) {
     return Promise.resolve({
       ok: true,
