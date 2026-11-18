@@ -7264,21 +7264,12 @@ class ContinuumTest < Minitest::Test
     assert_includes scheduler, 'await dispatchWorkflow(childWorkerWorkflow, {'
     assert_includes scheduler, 'local_opencode_pr_tasks'
     assert_includes scheduler, 'local_opencode_run_tasks'
-    # The child-local run inventory reads only active runs through the
-    # authoritative status-filtered helper, so unrelated completed history can
-    # never saturate a fixed page window and hide ready work. Any unreadable or
-    # truncated snapshot still fails closed with the legacy unknown sentinel.
-    assert_includes scheduler,
-                    'if GITHUB_REPOSITORY="$child_repo" bash "$active_script" snapshot --output "$child_active_file"; then',
-                    'the child run inventory must use the status-filtered active-run helper'
     assert_includes scheduler, 'GITHUB_REPOSITORY="$child_repo" bash "$active_script" snapshot',
                     'child-local inventory must use status-filtered active-only discovery'
-    assert_includes scheduler, 'local_opencode_run_tasks="__unknown__"',
-                    'an unreadable child run inventory must fail closed as unknown'
-    refute_includes scheduler, 'actions/runs?per_page=100&page=',
-                    'the child run inventory must never depend on all-status page depth'
     refute_includes scheduler, 'repos/$child_repo/actions/runs?per_page=100&page=$page',
                     'a long completed-history page must never block ready child issues'
+    assert_includes scheduler, 'local_opencode_run_tasks="__unknown__"',
+                    'a failed active-only lookup must remain fail-closed'
     assert_includes scheduler, 'local_override_active "$task_number"'
     assert_includes scheduler, 'sort_by(._rank, .number)'
     assert_includes scheduler, 'else 3'

@@ -108,10 +108,20 @@ independent clean-review evidence. The core `CI` caller does not provide the
 gate, so configure the
 [required Contract Gate workflow](consumer-variables.md#required-contract-gate-workflow)
 before the predecessor pull request runs; its evidence must belong to that
-predecessor PR's exact HEAD. The binding is the canonical
-`opencode/issue<N>-` branch, or — for an owner-authored normal fix branch — the
-exact `continuum-task-context` and `continuum-task-snapshot-ref` markers in the
-PR body verified against the durable snapshot comment on the predecessor issue;
+predecessor PR's exact HEAD.
+
+The exact HEAD also needs independent clean-review evidence in one of two
+forms: a `continuum/pr-agent-review` commit status in `success` state whose
+description is `PR-Agent review complete: clean`, or an `APPROVED`
+pull-request review on that exact commit from a reviewer who is neither the PR
+author nor a bot account. That evidence does not have to exist before the
+predecessor pull request merges, but it must be present on the exact HEAD the
+evaluator checks; until it is, owner-armed recovery stays paused.
+
+The binding is the canonical `opencode/issue<N>-` branch, or — for an
+owner-authored normal fix branch — the exact `continuum-task-context` and
+`continuum-task-snapshot-ref` markers in the PR body verified against the
+durable snapshot comment on the predecessor issue;
 titles are never used. Continuum then removes only that target's
 `automation:paused` label and lets the existing checkpoint/watchdog recovery
 path continue; it does not edit the task snapshot, start a new generation, or
@@ -187,7 +197,10 @@ its configuration. The detailed lifecycle routes are documented in
 7. Add the
    [required Contract Gate workflow](consumer-variables.md#required-contract-gate-workflow);
    the core `CI` caller does not include it, and owner-armed resume later needs
-   exact-HEAD gate evidence on the predecessor PR.
+   exact-HEAD gate evidence on the predecessor PR. The installer never edits
+   this project-owned workflow, so pin both of its refs to the same reviewed
+   installation revision yourself (a full commit SHA is the reproducible
+   choice).
 8. Open an ordinary issue without the ready label and confirm it is not
    dispatched. Then open a harmless issue with the label and follow it through
    the run, PR, CI, optional review, and merge.
