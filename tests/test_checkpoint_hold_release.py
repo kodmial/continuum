@@ -109,6 +109,7 @@ const scenario = JSON.parse(fs.readFileSync(process.argv[2], 'utf8'));
 const schedulerSource = fs.readFileSync(process.argv[3], 'utf8');
 const watchdogSource = fs.readFileSync(process.argv[4], 'utf8');
 const resultPath = process.argv[5];
+const dispatchSource = fs.readFileSync(process.argv[6], 'utf8');
 
 function apiError(status, message) {
   const error = new Error(message || ('HTTP ' + status));
@@ -120,6 +121,8 @@ const comments = (scenario.comments || []).map(comment => ({ ...comment }));
 let nextCommentId = scenario.nextCommentId || 1000;
 let raceInjected = false;
 let lastSchedulerApi = null;
+let dispatchFailure = null;
+let dispatchAttempts = 0;
 
 const listReviews = async () => ({ data: scenario.reviews || [] });
 const listFiles = async () => ({ data: scenario.files || [] });
@@ -210,6 +213,19 @@ const writeGithub = {
     },
     issues: {
       createComment: async ({ body }) => {
+        // Only the `comment` dispatch mode posts an `/oc` command. A
+        // configured failure makes that production dispatch call throw, so
+        // the scheduler's own settlement logic runs unchanged.
+        if (String(body || '').startsWith('/oc')) {
+          dispatchAttempts += 1;
+          if (dispatchFailure) {
+            const failure = dispatchFailure;
+            dispatchFailure = null;
+            throw apiError(
+              failure.status || 0, failure.message || 'dispatch failed'
+            );
+          }
+        }
         const comment = {
           id: nextCommentId++,
           body,
@@ -264,7 +280,7 @@ const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor;
 
 async function runScheduler() {
   const factory = new AsyncFunction(
-    'github', 'core', 'owner', 'readGithub',
+    'github', 'core', 'owner', 'repo', 'readGithub', 'issueNumber',
     'const isTrustedStopComment = (comment, trustedOwner) => {' +
       'const association = String(comment.author_association || "").toUpperCase();' +
       'if (["OWNER", "MEMBER", "COLLABORATOR"].includes(association)) return true;' +
@@ -273,10 +289,42 @@ async function runScheduler() {
     '};' +
     'const stopOrderKey = entry => String(entry.created_at || "") + "#" + ' +
       'String(entry.id || 0).padStart(12, "0");\n' +
+    // The production dispatch block is exercised with only its surrounding
+    // loop, label, and route bindings stubbed. The consumption receipt,
+    // dispatchAttempted flag, settlement, and receipt rollback all come from
+    // the checked-in scheduler source.
+    'const addLabel = async () => {};\n' +
+    'const removeLabel = async () => {};\n' +
+    'const executionRoutes = [];\n' +
+    "const opencodeDispatch = 'comment';\n" +
+    'const dispatchWorkflow = async () => {};\n' +
+    "const dispatchRef = 'main';\n" +
+    "const opencodeWorkflowPath = '.github/workflows/continuum-opencode.yml';\n" +
+    'const resetMarkers = false;\n' +
+    'const inProgressLabel = "automation:in-progress";\n' +
+    'const priority = null;\n' +
+    "const dispatchMarker = '<!-- issue-scheduler-dispatch -->';\n" +
+    'const isCanonicalSchedulerDispatch = () => false;\n' +
     schedulerSource +
-    '\nreturn { hold: checkpointResumeHold, released: () => checkpointResumeHoldRelease, consume: consumeCheckpointResumeRelease, dispatchFailureIsDefinitive: checkpointDispatchFailureIsDefinitive, settleConsumptionFailure: settleCheckpointResumeConsumptionFailure };'
+    '\nconst runDispatch = async (freshRelease) => {\n' +
+    '  let pass = null;\n' +
+    '  const targets = [{ number: Number(issueNumber), labels: [] }];\n' +
+    '  for (const issue of targets) {\n' +
+    dispatchSource +
+    '\n    pass = { consumption: checkpointConsumption, dispatchAttempted };\n' +
+    '  }\n' +
+    '  return pass;\n' +
+    '};\n' +
+    '\nreturn { hold: checkpointResumeHold, released: () => checkpointResumeHoldRelease, consume: consumeCheckpointResumeRelease, dispatchFailureIsDefinitive: checkpointDispatchFailureIsDefinitive, settleConsumptionFailure: settleCheckpointResumeConsumptionFailure, dispatch: runDispatch };'
   );
-  const api = await factory(writeGithub, core, scenario.owner || 'kodmial', readGithub);
+  const api = await factory(
+    writeGithub,
+    core,
+    scenario.owner || 'kodmial',
+    scenario.repo || 'continuum',
+    readGithub,
+    Number(scenario.issue || 534)
+  );
   lastSchedulerApi = api;
   const hold = await api.hold(
     scenario.owner || 'kodmial',
@@ -288,6 +336,43 @@ async function runScheduler() {
     { controller: 'issue-scheduler', writeClient: writeGithub }
   );
   return { blocked: Boolean(hold), hold: hold || null, release: api.released() };
+}
+
+// One production scheduler pass: re-evaluate the durable release from the
+// current comment history, then run the checked-in dispatch block with the
+// real consumption, dispatchAttempted, and settlement code.
+async function runProductionDispatchPass(step) {
+  const evaluated = await runScheduler();
+  let dispatched = null;
+  if (evaluated.release && evaluated.release.released && lastSchedulerApi) {
+    dispatchFailure = step && step.failure ? step.failure : null;
+    try {
+      const pass = await lastSchedulerApi.dispatch(evaluated.release);
+      dispatched = { pass, error: null };
+    } catch (err) {
+      dispatched = {
+        pass: null,
+        error: {
+          status: Number(err && err.status || 0),
+          message: String(err && err.message || err),
+        },
+      };
+    } finally {
+      dispatchFailure = null;
+    }
+  }
+  return {
+    blocked: evaluated.blocked,
+    release: evaluated.release,
+    dispatch: dispatched,
+    dispatchAttempts,
+    receipts: comments.filter(comment =>
+      String(comment.body || '').includes('resume-consumed')
+    ).length,
+    releases: comments.filter(comment =>
+      String(comment.body || '').includes('resume-release')
+    ).length,
+  };
 }
 
 async function runWatchdog() {
@@ -392,12 +477,18 @@ async function runWatchdog() {
       controller: 'issue-scheduler',
     });
   }
+  const productionPasses = [];
+  for (const step of scenario.productionDispatchPasses || []) {
+    productionPasses.push(await runProductionDispatchPass(step));
+  }
   const result = {
     scheduler,
     consumption,
     duplicateConsumption,
     settlement,
     retryConsumption,
+    productionPasses,
+    dispatchAttempts,
     schedulerDispatchFailureClassification: Object.fromEntries(
       [0, 408, 403, 422, 429, 500].map(status => [
         String(status),
@@ -436,6 +527,12 @@ class CheckpointHoldReleaseTests(unittest.TestCase):
             "          const TASK_SNAPSHOT_GENERATION = 1;",
             "          async function discoverDurableRecoveryCandidates() {",
         )
+        cls.dispatch_source = segment(
+            SCHEDULER,
+            "    let checkpointConsumption = null;\n"
+            "    let dispatchAttempted = false;",
+            "    core.notice(\n      'Dispatched issue #",
+        )
 
     def run_scenario(self, scenario):
         workdir = Path(tempfile.mkdtemp(prefix="hold-release-", dir=str(TMP_PARENT)))
@@ -443,17 +540,19 @@ class CheckpointHoldReleaseTests(unittest.TestCase):
             scenario_path = workdir / "scenario.json"
             scheduler_path = workdir / "scheduler.js"
             watchdog_path = workdir / "watchdog.js"
+            dispatch_path = workdir / "dispatch.js"
             harness_path = workdir / "harness.js"
             result_path = workdir / "result.json"
             scenario_path.write_text(json.dumps(scenario), encoding="utf-8")
             scheduler_path.write_text(self.scheduler_source, encoding="utf-8")
             watchdog_path.write_text(self.watchdog_source, encoding="utf-8")
+            dispatch_path.write_text(self.dispatch_source, encoding="utf-8")
             harness_path.write_text(NODE_HARNESS, encoding="utf-8")
             completed = subprocess.run(
                 [
                     "node", str(harness_path), str(scenario_path),
                     str(scheduler_path), str(watchdog_path),
-                    str(result_path),
+                    str(result_path), str(dispatch_path),
                 ],
                 capture_output=True,
                 text=True,
@@ -605,6 +704,76 @@ class CheckpointHoldReleaseTests(unittest.TestCase):
                     ),
                     1,
                 )
+
+    def test_production_dispatch_lost_response_spends_the_release(self):
+        # The checked-in dispatch block, not a helper call, decides whether a
+        # lost response keeps the receipt. Once spent, a later full scheduler
+        # pass must stand down without dispatching again.
+        for status in (0, 408, 500):
+            with self.subTest(status=status):
+                scenario = self.base_scenario()
+                scenario["productionDispatchPasses"] = [
+                    {"failure": {"status": status}},
+                    {},
+                ]
+                result = self.run_scenario(scenario)
+                first, second = result["productionPasses"]
+                self.assertEqual(
+                    first["dispatch"]["error"]["status"], status
+                )
+                # The dispatch was attempted and the receipt it spent before
+                # the ambiguous failure is still present.
+                self.assertEqual(first["dispatchAttempts"], 1)
+                self.assertEqual(first["receipts"], 1)
+                self.assertEqual(first["releases"], 1)
+                self.assertTrue(second["blocked"])
+                self.assertFalse(second["release"]["released"])
+                self.assertEqual(
+                    second["release"]["reason"],
+                    "release-consumed-or-superseded",
+                )
+                self.assertIsNone(second["dispatch"])
+                self.assertEqual(second["dispatchAttempts"], 1)
+                self.assertEqual(second["receipts"], 1)
+                self.assertEqual(second["releases"], 1)
+                self.assertEqual(result["dispatchAttempts"], 1)
+
+    def test_production_dispatch_confirmed_rejection_retries_once(self):
+        # A confirmed 4xx rejection means the dispatch never happened. The
+        # checked-in settlement deletes the receipt, so the next full
+        # scheduler pass reuses the same release and dispatches exactly once
+        # more.
+        for status in (403, 422):
+            with self.subTest(status=status):
+                scenario = self.base_scenario()
+                scenario["productionDispatchPasses"] = [
+                    {"failure": {"status": status}},
+                    {},
+                ]
+                result = self.run_scenario(scenario)
+                first, second = result["productionPasses"]
+                self.assertEqual(
+                    first["dispatch"]["error"]["status"], status
+                )
+                # The receipt written before the rejected dispatch is rolled
+                # back, leaving the release unconsumed and retryable.
+                self.assertEqual(first["dispatchAttempts"], 1)
+                self.assertEqual(first["receipts"], 0)
+                self.assertEqual(first["releases"], 1)
+                self.assertFalse(second["blocked"])
+                self.assertTrue(second["release"]["released"])
+                self.assertEqual(
+                    second["release"]["marker"]["commentId"],
+                    first["release"]["marker"]["commentId"],
+                )
+                self.assertTrue(
+                    second["dispatch"]["pass"]["consumption"]["consumed"]
+                )
+                self.assertIsNone(second["dispatch"]["error"])
+                self.assertEqual(second["dispatchAttempts"], 2)
+                self.assertEqual(second["receipts"], 1)
+                self.assertEqual(second["releases"], 1)
+                self.assertEqual(result["dispatchAttempts"], 2)
 
     def test_both_controllers_hold_until_the_manifest_fix_is_verifiable(self):
         scenario = self.base_scenario()
