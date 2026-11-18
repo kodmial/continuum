@@ -240,7 +240,41 @@ jobs:
               with open(os.path.join(root, name), encoding="utf-8") as handle:
                   return json.load(handle)
 
-          issues = observation.select_observations(load("issues.json"))
+          def validated_issue_inventory(raw):
+              # `gh issue list --json` is documented to emit a JSON list and
+              # the query is already label-filtered, so any other shape is an
+              # unreadable or inconsistent inventory, not an empty reservation
+              # set. Fail closed instead of letting select_observations drop
+              # rows and report a false green.
+              if not isinstance(raw, list):
+                  raise SystemExit(
+                      "issue inventory must be a JSON list, got "
+                      + type(raw).__name__
+                  )
+              for index, issue in enumerate(raw):
+                  if not isinstance(issue, dict):
+                      raise SystemExit(
+                          "issue inventory entry %d is not a JSON object (%s)"
+                          % (index, type(issue).__name__)
+                      )
+                  number = issue.get("number")
+                  label = "?" if number in (None, "") else str(number)
+                  if not isinstance(issue.get("labels"), list):
+                      raise SystemExit(
+                          "issue #%s has no labels list in the filtered "
+                          "issue inventory" % label
+                      )
+                  if contract.IN_PROGRESS_LABEL not in observation._labels(issue):
+                      raise SystemExit(
+                          "issue #%s is missing the %s label in the filtered "
+                          "issue inventory"
+                          % (label, contract.IN_PROGRESS_LABEL)
+                      )
+              return raw
+
+          issues = observation.select_observations(
+              validated_issue_inventory(load("issues.json"))
+          )
           runs = load("runs.json")
           pulls = load("pulls.json")
           # The last 200 Actions runs are a fast path, not exhaustive evidence:
