@@ -1404,6 +1404,33 @@ module.exports = async function runIssueScheduler({ github, context, core }) {
     return status >= 400 && status < 500 && status !== 408;
   }
 
+  // Roll back the consumption receipt only when the dispatch provably did not
+  // happen. An ambiguous outcome leaves the receipt spent so no later pass can
+  // authorize the same resumption twice.
+  async function settleCheckpointResumeConsumptionFailure({
+    consumption, dispatchAttempted, error, targetOwner, targetRepo,
+    issueNumber, writeClient,
+  }) {
+    if (!consumption || !consumption.consumed) {
+      return { released: false, preserved: false };
+    }
+    if (!dispatchAttempted || checkpointDispatchFailureIsDefinitive(error)) {
+      await releaseCheckpointResumeConsumption({
+        targetOwner,
+        targetRepo,
+        commentId: consumption.commentId,
+        writeClient,
+      });
+      return { released: true, preserved: false };
+    }
+    core.warning(
+      'Checkpoint resume consumption for #' + issueNumber +
+      ' is preserved because the dispatch outcome is unknown: ' +
+      (error.message || error)
+    );
+    return { released: false, preserved: true };
+  }
+
   // The release is bound to the consumer base the held run rejected against.
   // A moved base changes the premise, and an unreadable base cannot prove it
   // unchanged, so neither may authorize a new resumption.
@@ -5544,25 +5571,15 @@ module.exports = async function runIssueScheduler({ github, context, core }) {
         });
       }
     } catch (err) {
-      if (checkpointConsumption && checkpointConsumption.consumed) {
-        if (
-          !dispatchAttempted ||
-          checkpointDispatchFailureIsDefinitive(err)
-        ) {
-          await releaseCheckpointResumeConsumption({
-            targetOwner: owner,
-            targetRepo: repo,
-            commentId: checkpointConsumption.commentId,
-            writeClient: github,
-          });
-        } else {
-          core.warning(
-            'Checkpoint resume consumption for #' + issue.number +
-            ' is preserved because the dispatch outcome is unknown: ' +
-            (err.message || err)
-          );
-        }
-      }
+      await settleCheckpointResumeConsumptionFailure({
+        consumption: checkpointConsumption,
+        dispatchAttempted,
+        error: err,
+        targetOwner: owner,
+        targetRepo: repo,
+        issueNumber: issue.number,
+        writeClient: github,
+      });
       await removeLabel(issue.number, inProgressLabel);
       throw err;
     }

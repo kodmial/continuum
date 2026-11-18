@@ -274,7 +274,7 @@ async function runScheduler() {
     'const stopOrderKey = entry => String(entry.created_at || "") + "#" + ' +
       'String(entry.id || 0).padStart(12, "0");\n' +
     schedulerSource +
-    '\nreturn { hold: checkpointResumeHold, released: () => checkpointResumeHoldRelease, consume: consumeCheckpointResumeRelease, dispatchFailureIsDefinitive: checkpointDispatchFailureIsDefinitive };'
+    '\nreturn { hold: checkpointResumeHold, released: () => checkpointResumeHoldRelease, consume: consumeCheckpointResumeRelease, dispatchFailureIsDefinitive: checkpointDispatchFailureIsDefinitive, settleConsumptionFailure: settleCheckpointResumeConsumptionFailure };'
   );
   const api = await factory(writeGithub, core, scenario.owner || 'kodmial', readGithub);
   lastSchedulerApi = api;
@@ -328,6 +328,8 @@ async function runWatchdog() {
   const scheduler = await runScheduler();
   let consumption = null;
   let duplicateConsumption = null;
+  let settlement = null;
+  let retryConsumption = null;
   if (scenario.consumeSchedulerRelease && scheduler.release &&
       scheduler.release.released && lastSchedulerApi) {
     consumption = await lastSchedulerApi.consume({
@@ -359,19 +361,50 @@ async function runWatchdog() {
       });
     }
   }
+  if (scenario.dispatchFailure && consumption && lastSchedulerApi) {
+    const failure = scenario.dispatchFailure;
+    settlement = await lastSchedulerApi.settleConsumptionFailure({
+      consumption,
+      dispatchAttempted: failure.dispatchAttempted !== false,
+      error: apiError(
+        failure.status || 0,
+        failure.message || 'dispatch failed'
+      ),
+      targetOwner: scenario.owner || 'kodmial',
+      targetRepo: scenario.repo || 'continuum',
+      issueNumber: Number(scenario.issue || 534),
+      writeClient: writeGithub,
+    });
+  }
+  // A second scheduler pass over the same durable history proves an
+  // unconsumed release is reusable and a consumed one is spent.
+  const schedulerAgain = await runScheduler();
+  if (scenario.consumeSchedulerReleaseAgain && schedulerAgain.release &&
+      schedulerAgain.release.released && lastSchedulerApi) {
+    retryConsumption = await lastSchedulerApi.consume({
+      targetOwner: scenario.owner || 'kodmial',
+      targetRepo: scenario.repo || 'continuum',
+      issueNumber: Number(scenario.issue || 534),
+      hold: schedulerAgain.release.marker,
+      release: schedulerAgain.release,
+      readClient: readGithub,
+      writeClient: writeGithub,
+      controller: 'issue-scheduler',
+    });
+  }
   const result = {
     scheduler,
     consumption,
     duplicateConsumption,
+    settlement,
+    retryConsumption,
     schedulerDispatchFailureClassification: Object.fromEntries(
       [0, 408, 403, 422, 429, 500].map(status => [
         String(status),
         lastSchedulerApi.dispatchFailureIsDefinitive({ status }),
       ])
     ),
-    // A second scheduler pass over the same durable history proves an
-    // unconsumed release is reusable and a consumed one is spent.
-    schedulerAgain: await runScheduler(),
+    schedulerAgain,
     watchdog: await runWatchdog(),
     comments: comments.map(comment => ({ ...comment })),
     notices,
@@ -475,11 +508,103 @@ class CheckpointHoldReleaseTests(unittest.TestCase):
                 "500": False,
             },
         )
-        scheduler = SCHEDULER.read_text(encoding="utf-8")
-        self.assertIn(
-            "!dispatchAttempted ||\n          checkpointDispatchFailureIsDefinitive(err)",
-            scheduler,
-        )
+
+    def test_lost_dispatch_response_keeps_the_receipt_and_next_pass_blocks(self):
+        # An accepted dispatch whose response was lost must keep the receipt,
+        # so the next scheduler pass cannot attribute the same release again.
+        for status in (0, 408, 500):
+            with self.subTest(status=status):
+                scenario = self.base_scenario()
+                scenario["consumeSchedulerRelease"] = True
+                scenario["dispatchFailure"] = {
+                    "status": status,
+                    "dispatchAttempted": True,
+                }
+                scenario["consumeSchedulerReleaseAgain"] = True
+                result = self.run_scenario(scenario)
+                self.assertTrue(result["consumption"]["consumed"])
+                self.assertTrue(result["settlement"]["preserved"])
+                self.assertFalse(result["settlement"]["released"])
+                self.assertTrue(
+                    any(
+                        "dispatch outcome is unknown" in " ".join(line)
+                        for line in result["notices"]
+                    ),
+                    result["notices"],
+                )
+                self.assertTrue(result["schedulerAgain"]["blocked"])
+                self.assertFalse(
+                    result["schedulerAgain"]["release"]["released"]
+                )
+                self.assertEqual(
+                    result["schedulerAgain"]["release"]["reason"],
+                    "release-consumed-or-superseded",
+                )
+                self.assertIsNone(result["retryConsumption"])
+                self.assertEqual(
+                    len(
+                        [
+                            c for c in result["comments"]
+                            if "resume-release" in c["body"]
+                        ]
+                    ),
+                    1,
+                )
+                self.assertEqual(
+                    len(
+                        [
+                            c for c in result["comments"]
+                            if "resume-consumed" in c["body"]
+                        ]
+                    ),
+                    1,
+                )
+
+    def test_rejected_dispatch_releases_the_receipt_and_allows_one_retry(self):
+        # A 4xx rejection proves the dispatch did not happen. The receipt is
+        # rolled back, so the next pass replays the same claim exactly once.
+        for status in (403, 422):
+            with self.subTest(status=status):
+                scenario = self.base_scenario()
+                scenario["consumeSchedulerRelease"] = True
+                scenario["dispatchFailure"] = {
+                    "status": status,
+                    "dispatchAttempted": True,
+                }
+                scenario["consumeSchedulerReleaseAgain"] = True
+                result = self.run_scenario(scenario)
+                self.assertTrue(result["consumption"]["consumed"])
+                self.assertTrue(result["settlement"]["released"])
+                self.assertFalse(result["settlement"]["preserved"])
+                self.assertFalse(result["schedulerAgain"]["blocked"])
+                self.assertTrue(
+                    result["schedulerAgain"]["release"]["released"]
+                )
+                self.assertEqual(
+                    result["schedulerAgain"]["release"]["marker"][
+                        "commentId"
+                    ],
+                    result["scheduler"]["release"]["marker"]["commentId"],
+                )
+                self.assertTrue(result["retryConsumption"]["consumed"])
+                self.assertEqual(
+                    len(
+                        [
+                            c for c in result["comments"]
+                            if "resume-release" in c["body"]
+                        ]
+                    ),
+                    1,
+                )
+                self.assertEqual(
+                    len(
+                        [
+                            c for c in result["comments"]
+                            if "resume-consumed" in c["body"]
+                        ]
+                    ),
+                    1,
+                )
 
     def test_both_controllers_hold_until_the_manifest_fix_is_verifiable(self):
         scenario = self.base_scenario()
