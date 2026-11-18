@@ -281,10 +281,11 @@ jobs:
           git init -q "$repo"
           git -C "$repo" remote add origin https://github.com/kodmial/continuum.git
           git -C "$repo" sparse-checkout init --no-cone
-          git -C "$repo" sparse-checkout set --no-cone .github/scripts/ci_repair_admission.py .github/scripts/opencode_repair_state.py src/continuum
+          git -C "$repo" sparse-checkout set --no-cone .github/scripts/ci_repair_admission.py .github/scripts/ci_api_limit_recovery.py .github/scripts/opencode_repair_state.py src/continuum
           GIT_TERMINAL_PROMPT=0 git -C "$repo" -c credential.helper= fetch --no-tags --depth=1 origin "$CONTINUUM_REF"
           git -C "$repo" checkout --detach --force -q FETCH_HEAD
           test -f "$repo/.github/scripts/ci_repair_admission.py"
+          test -f "$repo/.github/scripts/ci_api_limit_recovery.py"
           test -f "$repo/.github/scripts/opencode_repair_state.py"
           test -f "$repo/src/continuum/opencode_repair_state.py"
 
@@ -293,6 +294,7 @@ jobs:
           GH_TOKEN: ${{ secrets.TAP_PAT }}
           REPAIR_STATE_HELPER: ${{ github.workspace }}/.continuum-repair-engine/.github/scripts/opencode_repair_state.py
           REPAIR_ADMISSION_HELPER: ${{ github.workspace }}/.continuum-repair-engine/.github/scripts/ci_repair_admission.py
+          CI_GITHUB_GUARD: ${{ github.workspace }}/.continuum-repair-engine/.github/scripts/ci_api_limit_recovery.py
           PR_NUMBER: ${{ inputs.pr_number }}
           REPORTED_HEAD_SHA: ${{ inputs.head_sha }}
           REPORTED_CONCLUSION: ${{ inputs.conclusion }}
@@ -450,6 +452,18 @@ jobs:
           case "$state" in
             failure)
               echo "Latest approved workflow '$failing_name' failed for $REPORTED_HEAD_SHA; entering the serialized exact-HEAD repair admission."
+              # Fail closed before any code repair: inspect actual failed job steps
+              # and emitted GitHub REST 403 errors. Never treat model-provider 429
+              # or a permission-only 403 as an infrastructure recovery signal.
+              ci_failure_kind="$(python3 -B "$CI_GITHUB_GUARD" gate \
+                --repository "$GITHUB_REPOSITORY" \
+                --run-id "${failing_run_id:-$REPORTED_RUN_ID}" \
+                --head-sha "$REPORTED_HEAD_SHA" \
+                --workflow "$CI_REPAIR_WORKFLOWS")" || ci_failure_kind=unknown
+              if [[ "$ci_failure_kind" != "code" ]]; then
+                echo "CI code repair held ($ci_failure_kind); existing CI cron owns verified GitHub REST 403 recovery."
+                exit 0
+              fi
               python3 -B "$REPAIR_ADMISSION_HELPER" \
                 --repository "$GITHUB_REPOSITORY" \
                 --pull-number "$PR_NUMBER" \
@@ -539,10 +553,11 @@ jobs:
           git init -q "$repo"
           git -C "$repo" remote add origin https://github.com/kodmial/continuum.git
           git -C "$repo" sparse-checkout init --no-cone
-          git -C "$repo" sparse-checkout set --no-cone .github/scripts/ci_repair_admission.py .github/scripts/opencode_repair_state.py src/continuum
+          git -C "$repo" sparse-checkout set --no-cone .github/scripts/ci_repair_admission.py .github/scripts/ci_api_limit_recovery.py .github/scripts/opencode_repair_state.py src/continuum
           GIT_TERMINAL_PROMPT=0 git -C "$repo" -c credential.helper= fetch --no-tags --depth=1 origin "$CONTINUUM_REF"
           git -C "$repo" checkout --detach --force -q FETCH_HEAD
           test -f "$repo/.github/scripts/ci_repair_admission.py"
+          test -f "$repo/.github/scripts/ci_api_limit_recovery.py"
           test -f "$repo/.github/scripts/opencode_repair_state.py"
           test -f "$repo/src/continuum/opencode_repair_state.py"
 
@@ -551,6 +566,7 @@ jobs:
           GH_TOKEN: ${{ secrets.TAP_PAT }}
           REPAIR_STATE_HELPER: ${{ github.workspace }}/.continuum-repair-engine/.github/scripts/opencode_repair_state.py
           REPAIR_ADMISSION_HELPER: ${{ github.workspace }}/.continuum-repair-engine/.github/scripts/ci_repair_admission.py
+          CI_GITHUB_GUARD: ${{ github.workspace }}/.continuum-repair-engine/.github/scripts/ci_api_limit_recovery.py
           RUN_ID: ${{ github.event.workflow_run.id }}
           RUN_NAME: ${{ github.event.workflow_run.name }}
           RUN_HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
@@ -747,6 +763,18 @@ jobs:
           case "$state" in
             failure)
               echo "Latest approved workflow '$failing_name' failed for $RUN_HEAD_SHA; entering the serialized exact-HEAD repair admission."
+              # Fail closed before any code repair: inspect actual failed job steps
+              # and emitted GitHub REST 403 errors. Never treat model-provider 429
+              # or a permission-only 403 as an infrastructure recovery signal.
+              ci_failure_kind="$(python3 -B "$CI_GITHUB_GUARD" gate \
+                --repository "$GITHUB_REPOSITORY" \
+                --run-id "${failing_run_id:-$RUN_ID}" \
+                --head-sha "$RUN_HEAD_SHA" \
+                --workflow "$CI_REPAIR_WORKFLOWS")" || ci_failure_kind=unknown
+              if [[ "$ci_failure_kind" != "code" ]]; then
+                echo "CI code repair held ($ci_failure_kind); existing CI cron owns verified GitHub REST 403 recovery."
+                exit 0
+              fi
               python3 -B "$REPAIR_ADMISSION_HELPER" \
                 --repository "$GITHUB_REPOSITORY" \
                 --pull-number "$pr" \
