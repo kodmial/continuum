@@ -6832,10 +6832,12 @@ class ContinuumTest < Minitest::Test
     assert_includes scheduler,
                     'GITHUB_REPOSITORY="$child_repo" bash "$active_script" snapshot --output "$child_active_file"',
                     'child run discovery must use the bounded, status-filtered active-run helper'
-    assert_includes scheduler, 'local_opencode_run_tasks="__unknown__"',
-                    'an unavailable child run snapshot must fail closed as unknown'
+    refute_includes scheduler, 'repos/$child_repo/actions/runs?per_page=100&page=$page',
+                    'a long completed-history page must never block ready child issues'
     refute_includes scheduler, 'actions/runs?per_page=100&page=',
                     'an all-status historical scan must never gate admission'
+    assert_includes scheduler, 'local_opencode_run_tasks="__unknown__"',
+                    'a failed active-only lookup must remain fail-closed'
     assert_includes scheduler, 'local_override_active "$task_number"'
     assert_includes scheduler, 'sort_by(._rank, .number)'
     assert_includes scheduler, 'else 3'
