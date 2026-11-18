@@ -1,6 +1,10 @@
 name: Continuum automation
+# A narrow `auto_merge_only` dispatch runs only `auto-merge`, so it is not a
+# scheduler pass. It therefore stamps distinct markers that the scheduler's
+# periodic window gate cannot read as completed scheduler evidence. Broad
+# dispatches keep the #375 markers unchanged.
 run-name: >-
-  Continuum automation ${{ contains(format(' {0} ', github.event.inputs.periodic_wake), ' true ') && '[continuum-periodic]' || github.event_name }} ${{ github.event_name == 'workflow_dispatch' && format('[continuum-wake:{0}]', github.event.inputs.periodic_wake) || '' }}
+  Continuum automation ${{ (github.event_name == 'workflow_dispatch' && (github.event.inputs.auto_merge_only == 'true' || github.event.inputs.auto_merge_only == true)) && '[continuum-auto-merge-only]' || (contains(format(' {0} ', github.event.inputs.periodic_wake), ' true ') && '[continuum-periodic]' || github.event_name) }} ${{ github.event_name == 'workflow_dispatch' && format('[continuum-wake:{0}]', (github.event.inputs.auto_merge_only == 'true' || github.event.inputs.auto_merge_only == true) && 'auto-merge-only' || github.event.inputs.periodic_wake) || '' }}
 
 on:
   workflow_dispatch:
@@ -10,6 +14,15 @@ on:
         required: false
         type: string
         default: "false"
+      auto_merge_only:
+        description: >-
+          Narrow external/manual dispatch to the existing auto-merge caller.
+          Other jobs keep their ordinary dispatch behavior when this is
+          false or omitted; it is a mode selector, never an authorization
+          override.
+        required: false
+        type: boolean
+        default: false
   schedule:
     - cron: "*/15 * * * *"
     - cron: "17,47 * * * *"
@@ -49,7 +62,9 @@ jobs:
     # commands; an owner who manually copies a marker is intentionally
     # suppressed too, so a manual wake must omit it.
     if: >-
-      (github.event_name == 'schedule' && github.event.schedule == '*/15 * * * *') ||
+      inputs.auto_merge_only != true &&
+      inputs.auto_merge_only != 'true' &&
+      ((github.event_name == 'schedule' && github.event.schedule == '*/15 * * * *') ||
       github.event_name == 'workflow_dispatch' ||
       github.event_name == 'issues' ||
       (github.event_name == 'issue_comment' &&
@@ -83,7 +98,7 @@ jobs:
        !contains(github.event.comment.body, '<!-- issue-scheduler-dispatch -->') &&
        !contains(github.event.comment.body, '<!-- continuum-origin role=continuum component=opencode-watchdog -->')) ||
       (github.event_name == 'pull_request_target' && github.event.action == 'closed') ||
-      (github.event_name == 'workflow_run' && github.event.workflow_run.path == '.github/workflows/opencode.yml')
+      (github.event_name == 'workflow_run' && github.event.workflow_run.path == '.github/workflows/opencode.yml'))
     uses: ./.github/workflows/continuum-issue-scheduler.yml
     secrets: inherit
     with:
@@ -95,11 +110,13 @@ jobs:
 
   watchdog:
     if: >-
-      (github.event_name == 'workflow_run' &&
+      inputs.auto_merge_only != true &&
+      inputs.auto_merge_only != 'true' &&
+      ((github.event_name == 'workflow_run' &&
        github.event.workflow_run.path == '.github/workflows/opencode.yml') ||
       (github.event_name == 'schedule' &&
        github.event.schedule == '*/15 * * * *') ||
-      github.event_name == 'workflow_dispatch'
+      github.event_name == 'workflow_dispatch')
     uses: ./.github/workflows/continuum-opencode-watchdog.yml
     secrets: inherit
     with:
@@ -148,8 +165,10 @@ jobs:
     # explicit `periodic_wake=true` signal (or the 17,47 cron slot) may spend
     # the cross-repository TAP_PAT on the global watchdog.
     if: >-
-      (github.event_name == 'schedule' && github.event.schedule == '17,47 * * * *') ||
-      (github.event_name == 'workflow_dispatch' && inputs.periodic_wake == 'true')
+      inputs.auto_merge_only != true &&
+      inputs.auto_merge_only != 'true' &&
+      ((github.event_name == 'schedule' && github.event.schedule == '17,47 * * * *') ||
+      (github.event_name == 'workflow_dispatch' && inputs.periodic_wake == 'true'))
     runs-on: ubuntu-latest
     timeout-minutes: 15
     concurrency:
