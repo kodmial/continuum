@@ -41,6 +41,7 @@ PASS_LINE = "Layer 2 lifecycle probe passed for HEAD " + TARGET_SHA
 FAKE_GH = r'''#!/usr/bin/env python3
 """Deterministic stand-in for the GitHub CLI inventory/read boundary."""
 
+import json
 import os
 import pathlib
 import sys
@@ -51,8 +52,67 @@ with (state / "gh.log").open("a", encoding="utf-8") as handle:
     handle.write(" ".join(args) + "\n")
 
 
+ISSUE_FIELDS = (
+    "number",
+    "state",
+    "labels",
+    "createdAt",
+    "updatedAt",
+    "closedAt",
+    "body",
+    "title",
+)
+RUN_FIELDS = (
+    "databaseId",
+    "status",
+    "conclusion",
+    "createdAt",
+    "startedAt",
+    "headBranch",
+    "displayTitle",
+    "name",
+)
+PULL_FIELDS = (
+    "number",
+    "state",
+    "body",
+    "title",
+    "headRefName",
+    "updatedAt",
+    "mergedAt",
+    "reviewDecision",
+)
+
+
 def emit(name):
     sys.stdout.write((state / name).read_text(encoding="utf-8"))
+    return 0
+
+
+def emit_requested(name):
+    """Emit a fixture carrying only the fields the caller asked ``gh`` for.
+
+    Real ``gh`` omits every field that is missing from ``--json``, so the
+    fixture must too: a query that silently drops a field the production step
+    consumes has to break here instead of passing against a richer object.
+    """
+
+    text = (state / name).read_text(encoding="utf-8")
+    try:
+        payload = json.loads(text)
+    except ValueError:
+        # Hand a malformed fixture to the production step unchanged so its own
+        # JSON handling fails exactly as it would against a broken ``gh``.
+        sys.stdout.write(text)
+        return 0
+    requested = set((option("--json") or "").split(","))
+    if isinstance(payload, list):
+        payload = [
+            {key: value for key, value in row.items() if key in requested}
+            if isinstance(row, dict) else row
+            for row in payload
+        ]
+    sys.stdout.write(json.dumps(payload))
     return 0
 
 
@@ -68,34 +128,42 @@ def option(name):
         return None
 
 
-def require_issue_inventory():
-    """Refuse an issue query that no longer asks for the reservation contract."""
+def require_inventory(kind, required_fields, required_options):
+    """Refuse a list query that no longer asks for the production contract."""
 
-    required_fields = {
-        "number",
-        "state",
-        "labels",
-        "createdAt",
-        "updatedAt",
-        "closedAt",
-        "body",
-        "title",
-    }
-    requested_fields = set((option("--json") or "").split(","))
     problems = []
-    if option("--state") != "open":
-        problems.append("--state open")
-    if option("--label") != "automation:in-progress":
-        problems.append("--label automation:in-progress")
-    missing_fields = sorted(required_fields - requested_fields)
+    for name, expected in required_options:
+        if option(name) != expected:
+            problems.append("{} {}".format(name, expected))
+    requested_fields = set((option("--json") or "").split(","))
+    missing_fields = sorted(set(required_fields) - requested_fields)
     if missing_fields:
         problems.append("--json fields " + ",".join(missing_fields))
     if problems:
         sys.stderr.write(
-            "fake gh: issue list dropped reservation contract (%s): %s\n"
-            % ("; ".join(problems), " ".join(args))
+            "fake gh: %s dropped observation contract (%s): %s\n"
+            % (kind, "; ".join(problems), " ".join(args))
         )
         sys.exit(3)
+
+
+def require_issue_inventory():
+    require_inventory(
+        "issue list",
+        ISSUE_FIELDS,
+        (("--state", "open"), ("--label", "automation:in-progress"),
+         ("--limit", "200")),
+    )
+
+
+def require_run_inventory():
+    require_inventory("run list", RUN_FIELDS, (("--limit", "200"),))
+
+
+def require_pull_inventory():
+    require_inventory(
+        "pr list", PULL_FIELDS, (("--state", "all"), ("--limit", "200"))
+    )
 
 
 failure = os.environ.get("FAKE_GH_FAIL", "")
@@ -103,11 +171,17 @@ if args[:2] == ["issue", "list"]:
     if failure == "issue-list":
         sys.exit(fail("issue-list"))
     require_issue_inventory()
-    sys.exit(emit("issues.json"))
+    sys.exit(emit_requested("issues.json"))
 if args[:2] == ["run", "list"]:
-    sys.exit(fail("run-list") if failure == "run-list" else emit("runs.json"))
+    if failure == "run-list":
+        sys.exit(fail("run-list"))
+    require_run_inventory()
+    sys.exit(emit_requested("runs.json"))
 if args[:2] == ["pr", "list"]:
-    sys.exit(fail("pr-list") if failure == "pr-list" else emit("pulls.json"))
+    if failure == "pr-list":
+        sys.exit(fail("pr-list"))
+    require_pull_inventory()
+    sys.exit(emit_requested("pulls.json"))
 if args[:3] == ["api", "--paginate", "--slurp"]:
     sys.exit(fail("api-comments") if failure == "api-comments" else emit("comments.json"))
 if args[:1] == ["api"] and "/actions/runs/" in args[-1]:
@@ -215,6 +289,7 @@ class Layer2Harness:
         action_run=None,
         failure="",
         fixture_overrides=None,
+        step_script=None,
     ):
         TMP_PARENT.mkdir(parents=True, exist_ok=True)
         workdir = Path(tempfile.mkdtemp(prefix="layer2-", dir=str(TMP_PARENT)))
@@ -247,7 +322,7 @@ class Layer2Harness:
         fake_gh.write_text(textwrap.dedent(FAKE_GH), encoding="utf-8")
         fake_gh.chmod(0o755)
 
-        step_script = load_layer2_step()["run"]
+        step_script = step_script or load_layer2_step()["run"]
         script_path = workdir / "step.sh"
         script_path.write_text(step_script, encoding="utf-8")
 
@@ -354,6 +429,40 @@ class Layer2WorkflowStepTest(Layer2Harness, unittest.TestCase):
             requested_fields,
             issue_list,
         )
+
+    def test_inventory_queries_must_request_every_consumed_field(self):
+        """The fake ``gh`` rejects a list query that dropped a consumed field.
+
+        Real ``gh`` omits fields absent from ``--json``; the harness must show
+        the same gap rather than serving a fixture that is richer than the
+        query. Both the run and PR inventory queries are exercised.
+        """
+
+        production = load_layer2_step()["run"]
+        for command, field in (
+            ("gh run list", "status"),
+            ("gh pr list", "headRefName"),
+        ):
+            with self.subTest(command=command, field=field):
+                start = production.index(command)
+                fields_start = production.index("--json ", start) + len("--json ")
+                field_line = production[fields_start:].split("\n", 1)[0]
+                requested = field_line.split(",")
+                self.assertIn(field, requested, field_line)
+                mutated = (
+                    production[:fields_start]
+                    + ",".join(name for name in requested if name != field)
+                    + production[fields_start + len(field_line):]
+                )
+                self.assertNotEqual(production, mutated)
+                completed = self.run_layer2(
+                    issues=[issue()],
+                    runs=[live_run()],
+                    step_script=mutated,
+                )
+                self.assert_failed_without_pass(completed)
+                self.assertIn("dropped observation contract", completed.stderr)
+                self.assertIn(field, completed.stderr)
 
     def test_healthy_open_implementation_pr_is_accepted(self):
         completed = self.run_layer2(
