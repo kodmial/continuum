@@ -225,6 +225,34 @@ jobs:
               'cannot perform same-repository watchdog reads.'
             );
           }
+          // Read-only installation REST budget check; /rate_limit does not
+          // consume the primary core budget. A scheduled wake probes again
+          // after GitHub resets it, without polling or waking OpenCode.
+          const isExhaustedGithubREST = (response) =>
+            response.status === 403 && response.headers.get('x-ratelimit-remaining') === '0';
+          let githubRateResponse;
+          try {
+            githubRateResponse = await fetch(String(process.env.GITHUB_API_URL || 'https://api.github.com').replace(/\/+$/, '') + '/rate_limit', {
+              headers: {
+                accept: 'application/vnd.github+json',
+                authorization: 'Bearer ' + readToken,
+              },
+            });
+          } catch (error) {
+            core.warning('GitHub REST budget cannot be checked; deferring watchdog to scheduled wake.');
+            return;
+          }
+          if (!githubRateResponse.ok) {
+            core.warning('GitHub REST budget endpoint unavailable; deferring watchdog to scheduled wake.');
+            return;
+          }
+          const coreBudget = (await githubRateResponse.json()).resources?.core;
+          if (!coreBudget || !Number.isFinite(Number(coreBudget.remaining)) ||
+              !Number.isFinite(Number(coreBudget.limit)) ||
+              Number(coreBudget.remaining) <= Math.max(500, Math.ceil(Number(coreBudget.limit) * 0.1))) {
+            core.notice('GitHub REST budget exhausted/low; watchdog defers to next scheduled wake.');
+            return;
+          }
           // 429 is a runner-lifecycle failure, not an issue/task failure.
           // kodmial/continuum#290: the burned runner already evacuated
           // workflow-owned state to a durable checkpoint ref and terminated
@@ -3083,6 +3111,12 @@ jobs:
                   }
                 );
               } catch (err) {
+                // GitHub REST installation 403 is not the OpenCode provider 429.
+                if (Number(err?.status) === 403 &&
+                    String((err?.response?.headers || err?.headers || {})['x-ratelimit-remaining']) === '0') {
+                  core.warning('GitHub REST rate limit exhausted; stop catch-up until scheduled wake.');
+                  return;
+                }
                 core.warning(
                   'OpenCode 429 catch-up could not list jobs for run ' +
                   candidate.id + ': ' + (err.message || err)
@@ -3110,7 +3144,13 @@ jobs:
                 } catch (err) {
                   continue;
                 }
-                if (!response.ok) continue;
+                if (!response.ok) {
+                  if (isExhaustedGithubREST(response)) {
+                    core.warning('GitHub REST 403 budget exhausted; stop catch-up until scheduled wake.');
+                    return;
+                  }
+                  continue;
+                }
                 const logText = await response.text();
                 const emitted = logText.split('\n').some(line =>
                   line.includes('##[error]') &&
@@ -3204,6 +3244,10 @@ jobs:
               }
             );
             if (!response.ok) {
+              if (isExhaustedGithubREST(response)) {
+                core.warning('GitHub REST 403 budget exhausted; stop this watchdog pass until scheduled wake.');
+                return;
+              }
               core.warning(
                 'Could not inspect job ' + job.id +
                 ' for 429 recovery marker: HTTP ' + response.status

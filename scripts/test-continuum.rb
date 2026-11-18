@@ -5262,7 +5262,7 @@ class ContinuumTest < Minitest::Test
                         pr_json:, workflows: 'CI', run_id: '39777697375',
                         repo: 'kodmial/nanodictate',
                         runs_json: { 'total_count' => 0, 'workflow_runs' => [] },
-                        runs_fail: false)
+                        runs_fail: false, ci_failure_kind: 'code')
     fixture do |dir|
       bin = File.join(dir, 'bin')
       FileUtils.mkdir_p(bin)
@@ -5271,6 +5271,8 @@ class ContinuumTest < Minitest::Test
       FileUtils.chmod(0o755, gh)
       admission = File.join(dir, 'ci_repair_admission.py')
       File.write(admission, REPAIR_FAKE_ADMISSION)
+      ci_guard = File.join(dir, 'ci_api_limit_recovery.py')
+      File.write(ci_guard, "import os\nprint(os.environ.get('FAKE_CI_FAILURE_KIND', 'code'))\n")
       script = File.join(dir, 'ci-repair.sh')
       File.write(script, repair_ci_script)
       pr_file = File.join(dir, 'pr.json')
@@ -5287,6 +5289,8 @@ class ContinuumTest < Minitest::Test
         'GH_TOKEN' => 'test-token',
         'REPAIR_STATE_HELPER' => File.join(ROOT, '.github/scripts/opencode_repair_state.py'),
         'REPAIR_ADMISSION_HELPER' => admission,
+        'CI_GITHUB_GUARD' => ci_guard,
+        'FAKE_CI_FAILURE_KIND' => ci_failure_kind,
         'GITHUB_REPOSITORY' => repo,
         'OWNER_LOGIN' => repo.split('/').first,
         'RUN_ID' => run_id,
@@ -5335,13 +5339,39 @@ class ContinuumTest < Minitest::Test
     step.fetch('run')
   end
 
+
+  # The production gate has independent Python evidence tests; the workflow
+  # shell contract must not spend any code-repair attempt on GitHub REST 403
+  # or an unverifiable API result. Both entry points share this decision.
+  def test_opencode_repair_holds_infrastructure_failure_without_code_dispatch
+    head = 'a' * 40
+    %w[github-403 unknown].each do |kind|
+      actual = run_repair_ci_job(
+        run_name: 'CI', conclusion: 'failure', pr_number: 238,
+        run_head_sha: head, pr_json: repair_pr_json(head_sha: head),
+        ci_failure_kind: kind
+      )
+      assert_empty actual.fetch(:dispatches)
+      assert_empty actual.fetch(:admissions)
+      assert_includes actual.fetch(:output), "CI code repair held (#{kind})"
+
+      reported = run_repair_dispatch_job(
+        conclusion: 'failure', pr_number: 238, head_sha: head,
+        pr_json: repair_pr_json(head_sha: head), ci_failure_kind: kind
+      )
+      assert_empty reported.fetch(:dispatches)
+      assert_empty reported.fetch(:admissions)
+      assert_includes reported.fetch(:output), "CI code repair held (#{kind})"
+    end
+  end
+
   # The reported-CI path shares the same per-head lock, so its success path
   # must apply the same approved-workflow safety check.
   def run_repair_dispatch_job(conclusion:, pr_number:, head_sha:, pr_json:,
                               workflows: 'CI', run_id: '39777697988',
                               repo: 'kodmial/nanodictate',
                               runs_json: { 'total_count' => 0, 'workflow_runs' => [] },
-                              runs_fail: false)
+                              runs_fail: false, ci_failure_kind: 'code')
     fixture do |dir|
       bin = File.join(dir, 'bin')
       FileUtils.mkdir_p(bin)
@@ -5350,6 +5380,8 @@ class ContinuumTest < Minitest::Test
       FileUtils.chmod(0o755, gh)
       admission = File.join(dir, 'ci_repair_admission.py')
       File.write(admission, REPAIR_FAKE_ADMISSION)
+      ci_guard = File.join(dir, 'ci_api_limit_recovery.py')
+      File.write(ci_guard, "import os\nprint(os.environ.get('FAKE_CI_FAILURE_KIND', 'code'))\n")
       script = File.join(dir, 'ci-repair-dispatch.sh')
       File.write(script, repair_dispatch_script)
       pr_file = File.join(dir, 'pr.json')
@@ -5366,6 +5398,8 @@ class ContinuumTest < Minitest::Test
         'GH_TOKEN' => 'test-token',
         'REPAIR_STATE_HELPER' => File.join(ROOT, '.github/scripts/opencode_repair_state.py'),
         'REPAIR_ADMISSION_HELPER' => admission,
+        'CI_GITHUB_GUARD' => ci_guard,
+        'FAKE_CI_FAILURE_KIND' => ci_failure_kind,
         'GITHUB_REPOSITORY' => repo,
         'OWNER_LOGIN' => repo.split('/').first,
         'PR_NUMBER' => pr_number.to_s,

@@ -70,6 +70,25 @@ class WatchdogPublishRaceTests(unittest.TestCase):
         )
         self.assertNotIn("if (logText.includes(publishRaceMarker))", source)
 
+    def test_github_rest_exhaustion_halts_both_log_scans(self):
+        source = WORKFLOW.read_text(encoding="utf-8")
+        self.assertIn("const isExhaustedGithubREST = (response)", source)
+        self.assertEqual(source.count("if (isExhaustedGithubREST(response))"), 2)
+        self.assertIn("githubRateResponse.json()).resources?.core", source)
+        # The catch-up guard must fall through to its original `continue` when
+        # the 403 is not budget exhaustion; compare structure, not indentation,
+        # because the body may be staged at a different column.
+        self.assertRegex(
+            source,
+            r"if \(isExhaustedGithubREST\(response\)\) \{\n"
+            r"\s+core\.warning\('GitHub REST 403 budget exhausted; "
+            r"stop catch-up until scheduled wake\.'\);\n"
+            r"\s+return;\n"
+            r"\s+\}\n"
+            r"\s+continue;",
+        )
+        self.assertIn("GitHub REST 403 budget exhausted; stop this watchdog pass", source)
+
 
 if __name__ == "__main__":
     unittest.main()

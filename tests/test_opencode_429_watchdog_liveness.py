@@ -359,10 +359,20 @@ class MockGithub {
 }
 
 function mockFetch(url) {
+  if (/\/rate_limit$/.test(String(url))) {
+    const budget = scenario.rateLimitBudget || { limit: 5000, remaining: 5000 };
+    return Promise.resolve({
+      ok: budget.httpStatus ? false : true,
+      status: budget.httpStatus || 200,
+      headers: { get: () => String(budget.remaining) },
+      json: async () => ({ resources: { core: budget } }),
+    });
+  }
   if (/\/actions\/jobs\/[^/]+\/logs$/.test(String(url))) {
     return Promise.resolve({
       ok: true,
       status: 200,
+      headers: { get: () => null },
       text: async () => scenario.jobLog || '',
     });
   }
@@ -774,6 +784,36 @@ class WatchdogHarness(unittest.TestCase):
 
     def assert_no_dispatch(self, result):
         self.assertEqual(result["dispatches"], [], result["dispatches"])
+
+    def test_exhausted_github_rest_budget_defers_to_scheduled_wake(self):
+        # A merged installation-wide REST budget must not be spent on (or
+        # mistaken for) OpenCode recovery; the scheduled wake re-probes it.
+        scenario = base_scenario()
+        scenario["rateLimitBudget"] = {"limit": 5000, "remaining": 100}
+        result = self.run_scenario(scenario)
+        self.assert_no_dispatch(result)
+        self.assertTrue(
+            any(
+                "GitHub REST budget exhausted/low" in " ".join(line)
+                for line in result["notices"]
+            ),
+            result["notices"],
+        )
+
+    def test_unavailable_github_rest_budget_endpoint_defers(self):
+        scenario = base_scenario()
+        scenario["rateLimitBudget"] = {
+            "limit": 5000, "remaining": 5000, "httpStatus": 502,
+        }
+        result = self.run_scenario(scenario)
+        self.assert_no_dispatch(result)
+        self.assertTrue(
+            any(
+                "GitHub REST budget endpoint unavailable" in " ".join(line)
+                for line in result["notices"]
+            ),
+            result["notices"],
+        )
 
     def test_382_old_failed_observed_run_does_not_own_newer_checkpoint(self):
         result = self.run_scenario(base_scenario())

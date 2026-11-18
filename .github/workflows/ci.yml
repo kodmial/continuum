@@ -74,6 +74,11 @@ jobs:
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           persist-credentials: false
+      - name: Recover proven GitHub REST 403 without launching OpenCode
+        if: github.event_name == 'schedule'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 -B .github/scripts/ci_api_limit_recovery.py reconcile
       - name: Verify GitHub jobs before any jobless CI repair recovery
         env:
           GH_TOKEN: ${{ secrets.TAP_PAT || github.token }}
