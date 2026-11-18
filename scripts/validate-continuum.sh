@@ -273,3 +273,4 @@ bash "$actionlint_installer" 1.7.12 "$PWD/.opencode-tmp/bin"
 
 PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=src python3 -m unittest -v \
   scripts.test_layer2_issue_inventory_guard
+PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=src python3 -m unittest -v scripts.test_contract_qualification_workflow
