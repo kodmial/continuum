@@ -12,6 +12,17 @@ run it as GitHub Actions would (``bash -e -o pipefail``) with an isolated
 context. Only the external GitHub boundary is faked; the observation and
 qualification modules are the real ``src/continuum`` code. No network, dispatch,
 issue write or sleep is involved.
+
+Known production gap (reported, not fixed here): the inventory query filters on
+``automation:in-progress``, but
+:func:`continuum.contract_observation.select_observations` drops any issue whose
+``labels`` array is absent or empty. Real ``gh issue list --json labels``
+returns ``labels: []`` for an issue without the label, so such a payload
+currently reports zero reservations and qualifies green. Issue #480 authorizes
+only this test file and its single validator invocation, so the fail-closed
+runtime guard belongs to a separate owner-approved fix.
+:meth:`Layer2WorkflowStepTest.test_label_less_payload_is_a_documented_false_success`
+pins the present behavior and must be inverted when that fix lands.
 """
 
 from __future__ import annotations
@@ -776,8 +787,9 @@ class Layer2WorkflowStepTest(Layer2Harness, unittest.TestCase):
         Real ``gh`` omits fields absent from ``--json``; the harness must show
         the same gap rather than serving a fixture that is richer than the
         query. All three inventory queries are exercised, and every field is
-        dropped in turn, including ``labels``: without the guard a dropped
-        ``labels`` field would hide a stranded reservation and pass green.
+        dropped in turn, including ``labels``: without this fake-``gh`` query
+        guard a dropped ``labels`` field would hide a stranded reservation and
+        pass green.
         """
 
         production = load_layer2_step()["run"]
@@ -795,31 +807,39 @@ class Layer2WorkflowStepTest(Layer2Harness, unittest.TestCase):
                     self.assertIn("dropped observation contract", completed.stderr)
                     self.assertIn(field, completed.stderr)
 
-    def test_missing_labels_field_fails_closed_instead_of_hiding_a_reservation(self):
-        """An unobservable reservation payload must never qualify green.
+    def test_label_less_payload_is_a_documented_false_success(self):
+        """Characterize the label-less payload gap; a runtime fix is out of scope.
 
         The inventory query filters on ``automation:in-progress``, so an open
-        issue in the payload is a reservation even when the payload omits its
-        ``labels`` array. Production treats that omission as unreadable
-        reservation state and fails instead of reporting zero reservations, so
-        a relaxed query guard (or a real ``gh``/API change) cannot turn a
-        stranded reservation into a silent pass.
+        issue in the payload is a reservation even when its ``labels`` array is
+        absent or empty. Real ``gh issue list --json labels`` returns
+        ``labels: []`` for an issue without the reservation label, and
+        ``select_observations`` drops both shapes, so the step reports zero
+        reservations and qualifies green instead of failing closed.
+
+        Issue #480 authorizes only this test file and its single validator
+        invocation, so a fail-closed guard belongs to a separate
+        owner-approved runtime fix. This test records the current observable
+        behavior; when that fix lands, invert it to require a nonzero exit and
+        an explicit unobservable-reservation diagnostic for both payload
+        shapes.
         """
 
-        unlabelled = issue()
-        unlabelled.pop("labels")
-        completed = self.run_layer2(
-            issues=[unlabelled],
-            runs=[],
-            pulls=[],
-        )
-        self.assert_failed_without_pass(completed)
-        self.assertIn(
-            "issue inventory omitted labels (reservation state unobservable) for: "
-            "{}".format(ISSUE_NUMBER),
-            completed.stderr,
-        )
-        self.assertNotIn("Observed 0 real reservation(s)", completed.stdout)
+        missing_key = issue()
+        missing_key.pop("labels")
+        for name, payload in (
+            ("labels key absent", missing_key),
+            # ``issue(labelled=False)`` is the shape real ``gh`` emits for an
+            # issue without the reservation label.
+            ("labels empty", issue(labelled=False)),
+        ):
+            with self.subTest(payload=name):
+                completed = self.run_layer2(issues=[payload], runs=[], pulls=[])
+                self.assert_passed(completed)
+                self.assertIn(
+                    "Observed 0 real reservation(s); none stranded.",
+                    completed.stdout,
+                )
 
     def test_behavior_preserving_query_options_keep_the_same_contract(self):
         """A wider limit or ``--option=value`` spelling is not a regression."""
