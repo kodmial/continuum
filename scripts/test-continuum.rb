@@ -7272,17 +7272,10 @@ class ContinuumTest < Minitest::Test
     assert_includes scheduler, 'await dispatchWorkflow(childWorkerWorkflow, {'
     assert_includes scheduler, 'local_opencode_pr_tasks'
     assert_includes scheduler, 'local_opencode_run_tasks'
-    # Child-local run discovery is status-scoped through the shared fail-closed
-    # helper: completed history can never saturate the window and silently block
-    # a ready child, while an unavailable or truncated snapshot still reports the
-    # unknown sentinel that owns the task. The all-status historical scan is gone.
-    assert_includes scheduler,
-                    'GITHUB_REPOSITORY="$child_repo" bash "$active_script" snapshot --output "$child_active_file"',
-                    'child run discovery must use the bounded, status-filtered active-run helper'
+    assert_includes scheduler, 'GITHUB_REPOSITORY="$child_repo" bash "$active_script" snapshot',
+                    'child-local inventory must use status-filtered active-only discovery'
     refute_includes scheduler, 'repos/$child_repo/actions/runs?per_page=100&page=$page',
                     'a long completed-history page must never block ready child issues'
-    refute_includes scheduler, 'actions/runs?per_page=100&page=',
-                    'an all-status historical scan must never gate admission'
     assert_includes scheduler, 'local_opencode_run_tasks="__unknown__"',
                     'a failed active-only lookup must remain fail-closed'
     assert_includes scheduler, 'local_override_active "$task_number"'

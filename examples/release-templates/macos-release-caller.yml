@@ -70,8 +70,10 @@ jobs:
     with:
       version: ${{ inputs.version }}
       source_sha: ${{ inputs.source_sha }}
-      # A manual selection has no pushed tag. The generic workflow treats the
-      # protected `release` environment as the second source of the version.
+      # A manual selection has no pushed tag, so this dispatch supplies the only
+      # version. The `release` environment, once the caller configures its
+      # protection rules, can require a human approval before the transaction
+      # publishes; that approval is a gate, not an independent version source.
       event: workflow-dispatch
       tag: ""
       channel: ${{ inputs.channel }}

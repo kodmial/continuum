@@ -163,9 +163,16 @@ The target example describes one direct-distribution SwiftPM product:
 - **Versioning:** the generic workflow takes an explicit `version` and an exact
   40-character `source_sha`. The historical bundle plan stamps both
   `CFBundleVersion` and `CFBundleShortVersionString` from the release version
-  before sealing. A tag-push event cross-checks the version against the pushed
-  tag; a dispatched release has no tag and relies on the protected environment
-  as the second source of the version.
+  before sealing. A tag-push event does not verify the pushed tag in the
+  historical flow: the workflow passes `tag`, but `cmd_transaction` does not
+  forward it to `load_event`, and `version_checks_for` derives `v<version>` from
+  the matrix, so the comparison only shows that the matrix agrees with itself.
+  Qualification requires an independent tag check, such as reading the tag ref
+  and comparing it to the requested version outside that code path. A
+  dispatched release supplies the only version and has no tag. The selected
+  environment's protection rules, which the caller must configure, can require
+  a human approval before publishing, but that approval is a possible gate, not
+  an independent version source or a version comparison.
 
 The historical `Info.plist` keys in the example are the minimum an `.app` is
 identified by. Replace the placeholder values, keep both version keys present,
@@ -309,8 +316,9 @@ working:
    mid-publish interruption resumes or reports safely, and a duplicate event
    cannot publish twice.
 7. Qualify the exact-head chain: selection -> version -> source commit -> build
-   -> sign -> verify -> draft -> publish, with checksums and an independent
-   review of the artifacts.
+   -> sign -> verify -> draft -> publish, with checksums, an independent check
+   that the repository's pushed tag matches the released version, and an
+   independent review of the artifacts.
 8. Treat Developer ID, notarization, App Store, installers, and downstream
    publishers as separate qualification work. Do not infer them from a passing
    self-signed macOS build.
