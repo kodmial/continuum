@@ -3927,6 +3927,13 @@ class ContinuumTest < Minitest::Test
       ['omitted selector', {}, ordinary],
       ['boolean false selector', {'auto_merge_only' => false}, ordinary],
       ['REST string false selector', {'auto_merge_only' => 'false'}, ordinary],
+      # The workflow input's real default is the string 'false'; evaluate that
+      # explicit value rather than a missing map key.
+      ['omitted selector with periodic false', {'periodic_wake' => 'false'}, ordinary],
+      ['boolean false selector with periodic false',
+       {'periodic_wake' => 'false', 'auto_merge_only' => false}, ordinary],
+      ['REST string false selector with periodic false',
+       {'periodic_wake' => 'false', 'auto_merge_only' => 'false'}, ordinary],
       ['omitted selector with periodic wake', {'periodic_wake' => 'true'}, periodic],
       ['boolean false selector with periodic wake',
        {'periodic_wake' => 'true', 'auto_merge_only' => false}, periodic],
