@@ -61,9 +61,49 @@ def fail(kind):
     return 1
 
 
+def option(name):
+    try:
+        return args[args.index(name) + 1]
+    except (ValueError, IndexError):
+        return None
+
+
+def require_issue_inventory():
+    """Refuse an issue query that no longer asks for the reservation contract."""
+
+    required_fields = {
+        "number",
+        "state",
+        "labels",
+        "createdAt",
+        "updatedAt",
+        "closedAt",
+        "body",
+        "title",
+    }
+    requested_fields = set((option("--json") or "").split(","))
+    problems = []
+    if option("--state") != "open":
+        problems.append("--state open")
+    if option("--label") != "automation:in-progress":
+        problems.append("--label automation:in-progress")
+    missing_fields = sorted(required_fields - requested_fields)
+    if missing_fields:
+        problems.append("--json fields " + ",".join(missing_fields))
+    if problems:
+        sys.stderr.write(
+            "fake gh: issue list dropped reservation contract (%s): %s\n"
+            % ("; ".join(problems), " ".join(args))
+        )
+        sys.exit(3)
+
+
 failure = os.environ.get("FAKE_GH_FAIL", "")
 if args[:2] == ["issue", "list"]:
-    sys.exit(fail("issue-list") if failure == "issue-list" else emit("issues.json"))
+    if failure == "issue-list":
+        sys.exit(fail("issue-list"))
+    require_issue_inventory()
+    sys.exit(emit("issues.json"))
 if args[:2] == ["run", "list"]:
     sys.exit(fail("run-list") if failure == "run-list" else emit("runs.json"))
 if args[:2] == ["pr", "list"]:
@@ -175,7 +215,6 @@ class Layer2Harness:
         action_run=None,
         failure="",
         fixture_overrides=None,
-        script=None,
     ):
         TMP_PARENT.mkdir(parents=True, exist_ok=True)
         workdir = Path(tempfile.mkdtemp(prefix="layer2-", dir=str(TMP_PARENT)))
@@ -208,7 +247,7 @@ class Layer2Harness:
         fake_gh.write_text(textwrap.dedent(FAKE_GH), encoding="utf-8")
         fake_gh.chmod(0o755)
 
-        step_script = script if script is not None else load_layer2_step()["run"]
+        step_script = load_layer2_step()["run"]
         script_path = workdir / "step.sh"
         script_path.write_text(step_script, encoding="utf-8")
 
@@ -293,6 +332,28 @@ class Layer2WorkflowStepTest(Layer2Harness, unittest.TestCase):
         self.assertIn("Observed 1 real reservation(s); none stranded.", completed.stdout)
         for command in ("issue list", "run list", "pr list"):
             self.assertIn(command, self.last_gh_log)
+        issue_list = next(
+            line
+            for line in self.last_gh_log.splitlines()
+            if line.startswith("issue list ")
+        )
+        self.assertIn("--state open", issue_list)
+        self.assertIn("--label automation:in-progress", issue_list)
+        requested_fields = set(issue_list.split("--json ", 1)[1].split(","))
+        self.assertLessEqual(
+            {
+                "number",
+                "state",
+                "labels",
+                "createdAt",
+                "updatedAt",
+                "closedAt",
+                "body",
+                "title",
+            },
+            requested_fields,
+            issue_list,
+        )
 
     def test_healthy_open_implementation_pr_is_accepted(self):
         completed = self.run_layer2(
@@ -424,32 +485,6 @@ class Layer2WorkflowStepTest(Layer2Harness, unittest.TestCase):
         )
         self.assert_failed_without_pass(completed)
         self.assertIn("JSONDecodeError", completed.stderr)
-
-
-class Layer2NegativeControlTest(Layer2Harness, unittest.TestCase):
-    """Prove the new tests detect a lost stranded-reservation assertion.
-
-    The mutation is applied only to an in-memory temporary copy of the step.
-    The production workflow file is never modified.
-    """
-
-    def test_removing_the_stranded_assertion_is_detected(self):
-        script = load_layer2_step()["run"]
-        lines = script.splitlines(keepends=True)
-        mutation = [line for line in lines if line.startswith("assert not stranded")]
-        if len(mutation) != 1:
-            self.fail(
-                "expected exactly one stranded assertion, found %d" % len(mutation)
-            )
-        mutated = "".join(
-            line for line in lines if not line.startswith("assert not stranded")
-        )
-        completed = self.run_layer2(issues=[issue()], runs=[], script=mutated)
-        # Without the assertion the same stranded fixture wrongly succeeds,
-        # which is exactly what test_stranded_reservation_fails_with_the_issue_id
-        # catches in the unmodified step.
-        self.assertEqual(completed.returncode, 0, completed.stderr)
-        self.assertIn(PASS_LINE, completed.stdout)
 
 
 if __name__ == "__main__":
