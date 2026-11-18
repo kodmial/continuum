@@ -882,10 +882,30 @@ module.exports = async function runIssueScheduler({ github, context, core }) {
     }
   }
 
+  // The fix proof is invariant for one scheduler pass: the checked-out engine
+  // HEAD and the fix PR's merge metadata cannot change while the pass runs.
+  // Reservation reconciliation, candidate selection, and the JIT pre-dispatch
+  // read all run against the same client, so key the memo on it and probe at
+  // most once per pass instead of paying a git subprocess plus two API reads
+  // per issue on every later wake.
+  const wrongGenerationFixProofCache = new WeakMap();
+
   // Return the fix's merge timestamp only when the executing engine can be
   // proven to contain it, otherwise 0. Any read failure is an absent proof:
   // the caller keeps the hold instead of assuming the fix.
   async function checkpointWrongGenerationFixMergedAt(client) {
+    const cacheable =
+      client !== null &&
+      (typeof client === 'object' || typeof client === 'function');
+    if (cacheable && wrongGenerationFixProofCache.has(client)) {
+      return wrongGenerationFixProofCache.get(client);
+    }
+    const mergedAt = await probeWrongGenerationFixMergedAt(client);
+    if (cacheable) wrongGenerationFixProofCache.set(client, mergedAt);
+    return mergedAt;
+  }
+
+  async function probeWrongGenerationFixMergedAt(client) {
     const head = checkpointEngineHead();
     if (!head) return 0;
     const [fixOwner, fixRepo] = checkpointWrongGenerationFix.repository
@@ -962,13 +982,16 @@ module.exports = async function runIssueScheduler({ github, context, core }) {
       );
     }
 
-    // Exactly one ordinary dispatch consumes this release. The original hold
-    // is the earliest marker with this identity, so a repeated identical
-    // episode after the dispatch cannot reopen the override. A canonical
-    // scheduler dispatch is the existing receipt with its unchanged format.
-    let originalHoldAt = Date.parse(marker.created_at || '');
-    if (!Number.isFinite(originalHoldAt)) {
-      return deny('the original hold timestamp is unreadable');
+    // Exactly one ordinary dispatch consumes this release. The decision is
+    // made on the latest hold with this identity, because that is the hold
+    // `checkpointResumeHold` selected: a historical pre-merge hold that was
+    // republished after the fix merge must not inherit the release, and no
+    // canonical dispatch needs to exist for that republished hold to stay.
+    // A canonical scheduler dispatch is the existing receipt with its
+    // unchanged format.
+    let latestHoldAt = Date.parse(marker.created_at || '');
+    if (!Number.isFinite(latestHoldAt)) {
+      return deny('the hold timestamp is unreadable');
     }
     const wantedRepo = (targetOwner + '/' + targetRepo).toLowerCase();
     for (const comment of trusted) {
@@ -980,18 +1003,19 @@ module.exports = async function runIssueScheduler({ github, context, core }) {
       }
       const at = Date.parse(candidate.created_at || '');
       if (!Number.isFinite(at)) {
-        return deny('an original hold timestamp is unreadable');
+        return deny('a hold timestamp is unreadable');
       }
-      if (at < originalHoldAt) originalHoldAt = at;
+      if (at > latestHoldAt) latestHoldAt = at;
     }
     // Only the historical rejection PR #461 fixed may be superseded. A hold
     // first published at or after the fix merge is not that rejection: it can
     // be produced by an executor still running a pre-fix engine ref, or by a
     // republished hold, and any canonical dispatch that ran before it would
-    // not be newer than it. The release is fail-closed, so such a hold stays.
-    if (originalHoldAt >= mergedAt) {
+    // not be newer than it. The release is fail-closed, so the latest hold
+    // must predate the merge or it stays.
+    if (latestHoldAt >= mergedAt) {
       return deny(
-        'the original hold does not predate the PR #' +
+        'the latest hold does not predate the PR #' +
         checkpointWrongGenerationFix.pullRequest + ' fix merge'
       );
     }
@@ -1000,7 +1024,7 @@ module.exports = async function runIssueScheduler({ github, context, core }) {
       const at = Date.parse(comment.created_at || '');
       if (
         !Number.isFinite(at) ||
-        (at > mergedAt && at > originalHoldAt)
+        (at > mergedAt && at > latestHoldAt)
       ) {
         return deny(
           'a canonical scheduler dispatch after the fix already consumed ' +

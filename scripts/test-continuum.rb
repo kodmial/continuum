@@ -7385,8 +7385,8 @@ class ContinuumTest < Minitest::Test
   def test_checkpoint_resume_hold_selects_the_executor_snapshot
     scheduler = File.read(File.join(ROOT, '.github/scripts/issue_scheduler.js'))
     scheduler_start = scheduler.index('  const checkpointResumeBlockedMarkerRe =')
-    scheduler_finish = scheduler.index('  const ownerResumeMarkerRe =', scheduler_start)
     refute_nil scheduler_start, 'the scheduler checkpoint hold is missing'
+    scheduler_finish = scheduler.index('  const ownerResumeMarkerRe =', scheduler_start)
     refute_nil scheduler_finish, 'the scheduler checkpoint hold boundary moved'
     scheduler_hold = scheduler[scheduler_start...scheduler_finish]
 
@@ -7510,8 +7510,8 @@ class ContinuumTest < Minitest::Test
   def test_scheduler_releases_only_the_proven_wrong_generation_hold_once
     scheduler = File.read(File.join(ROOT, '.github/scripts/issue_scheduler.js'))
     scheduler_start = scheduler.index('  const checkpointResumeBlockedMarkerRe =')
-    scheduler_finish = scheduler.index('  const ownerResumeMarkerRe =', scheduler_start)
     refute_nil scheduler_start, 'the scheduler checkpoint hold is missing'
+    scheduler_finish = scheduler.index('  const ownerResumeMarkerRe =', scheduler_start)
     refute_nil scheduler_finish, 'the scheduler checkpoint hold boundary moved'
     scheduler_hold = scheduler[scheduler_start...scheduler_finish]
 
@@ -7557,8 +7557,18 @@ class ContinuumTest < Minitest::Test
     assert_operator scheduler.index("labels.has(qualifyingLabel) || labels.has(blockedLabel)"),
                     :<, scheduler.index('const candidateResumeHold = await checkpointResumeHold('),
                     'the blocked/qualifying guard must still precede candidate hold filtering'
-    assert_operator scheduler.index('if (readyLabel && !labels.has(readyLabel))'),
-                    :<, scheduler.index('const candidateResumeHold = await checkpointResumeHold('),
+    candidate_hold_at = scheduler.index(
+      'const candidateResumeHold = await checkpointResumeHold('
+    )
+    candidate_loop_at = scheduler.index('const candidates = [];')
+    refute_nil candidate_loop_at, 'the candidate selection loop is missing'
+    assert_operator candidate_loop_at, :<, candidate_hold_at,
+                    'candidate selection must precede hold filtering'
+    assert_operator scheduler.index(
+                      'if (readyLabel && !labels.has(readyLabel))',
+                      candidate_loop_at
+                    ),
+                    :<, candidate_hold_at,
                     'automation:ready must still gate candidate admission'
     assert_operator scheduler.index('const localStop = await terminalGenerationStop('),
                     :<, scheduler.index('const candidateResumeHold = await checkpointResumeHold('),
@@ -7917,6 +7927,32 @@ class ContinuumTest < Minitest::Test
           'the hold entry point must keep a post-merge hold'
         );
 
+        // The release is decided on the latest hold with the identity, not on
+        // the earliest one. A historical pre-merge hold that is republished
+        // after the merge must stay even though no canonical dispatch exists
+        // to record a consumption: the republished hold is itself newer than
+        // the fix and is not the rejection PR #461 superseded.
+        const republishedHold = comment(5, hold(), lateHoldAt);
+        const republishedMarker = checkpointResumeHoldMarker(
+          republishedHold, 'kodmial/aa', 534
+        );
+        assert.equal(
+          await checkpointWrongGenerationRelease(
+            republishedMarker, wrongGenerationReleaseIdentity(
+              republishedMarker, 534
+            ), 534, [snapshotComment, holdComment, republishedHold], spec,
+            makeClient(), 'kodmial', 'aa'
+          ), false,
+          'a republished identical hold after the merge must keep the release'
+        );
+        assert.ok(
+          await checkpointResumeHold(
+            'kodmial', 'aa', 534,
+            [snapshotComment, holdComment, republishedHold], makeClient()
+          ),
+          'the selected post-merge hold must keep the release at the entry point'
+        );
+
         const durableHold = comment(
           6,
           hold().replace(
@@ -7985,6 +8021,34 @@ class ContinuumTest < Minitest::Test
           ),
           'an engine before the fix must keep the hold at the entry point'
         );
+
+        // The engine-upgrade proof is probed at most once per pass: every
+        // hold read for one client must reuse the same proof instead of
+        // repeating the git subprocess, pull, and compare reads.
+        let proofProbes = 0;
+        const countingClient = makeClient();
+        const readFixPull = countingClient.rest.pulls.get;
+        countingClient.rest.pulls.get = async args => {
+          proofProbes += 1;
+          return readFixPull(args);
+        };
+        assert.equal(
+          await checkpointWrongGenerationFixMergedAt(countingClient),
+          Date.parse(mergedAt),
+          'the proven fix must report its merge timestamp'
+        );
+        assert.equal(
+          await checkpointWrongGenerationFixMergedAt(countingClient),
+          Date.parse(mergedAt),
+          'the memoized proof must report the same merge timestamp'
+        );
+        assert.equal(proofProbes, 1,
+          'the engine-upgrade proof must be probed once per pass');
+        await checkpointResumeHold(
+          'kodmial', 'aa', 534, baseComments, countingClient
+        );
+        assert.equal(proofProbes, 1,
+          'a later hold read must reuse the pass proof, not reprobe');
 
         console.log('wrong-generation-release: PASS');
       })().catch((error) => {
