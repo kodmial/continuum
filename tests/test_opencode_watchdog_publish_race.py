@@ -65,6 +65,14 @@ class WatchdogPublishRaceTests(unittest.TestCase):
         )
         self.assertNotIn("if (logText.includes(publishRaceMarker))", source)
 
+    def test_github_rest_exhaustion_halts_both_log_scans(self):
+        source = WORKFLOW.read_text(encoding="utf-8")
+        self.assertIn("const isExhaustedGithubREST = (response)", source)
+        self.assertEqual(source.count("if (isExhaustedGithubREST(response))"), 2)
+        self.assertIn("githubRateResponse.json()).resources?.core", source)
+        self.assertIn("return;\n                    }\n                    continue;", source)
+        self.assertIn("GitHub REST 403 budget exhausted; stop this watchdog pass", source)
+
 
 if __name__ == "__main__":
     unittest.main()
