@@ -240,7 +240,22 @@ jobs:
               with open(os.path.join(root, name), encoding="utf-8") as handle:
                   return json.load(handle)
 
-          issues = observation.select_observations(load("issues.json"))
+          issues_payload = load("issues.json")
+          # The inventory query filters on the reservation label, so every
+          # issue that comes back is a reservation and must carry a `labels`
+          # array. A payload without one means the query narrowed or the API
+          # changed; fail closed instead of qualifying an issue whose
+          # reservation state is unobservable.
+          unlabelled = [
+              str(item.get("number", "?"))
+              for item in issues_payload
+              if not isinstance(item, dict) or "labels" not in item
+          ]
+          assert not unlabelled, (
+              "issue inventory omitted labels (reservation state unobservable) for: %s"
+              % ", ".join(unlabelled)
+          )
+          issues = observation.select_observations(issues_payload)
           runs = load("runs.json")
           pulls = load("pulls.json")
           # The last 200 Actions runs are a fast path, not exhaustive evidence:

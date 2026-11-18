@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shlex
 import shutil
 import subprocess
@@ -85,6 +86,43 @@ INHERITED_ENV = ("PATH",)
 #: GitHub variables the production step legitimately needs, with fixture values.
 FIXTURE_GITHUB_ENV = frozenset({"GITHUB_REPOSITORY", "GH_TOKEN"})
 
+#: Inventory window the production queries must keep at minimum. The fake
+#: ``gh`` guard rejects anything narrower; a wider window observes the same
+#: fields and is therefore still the same contract.
+MIN_INVENTORY_LIMIT = 200
+
+#: Variables the Actions runner itself injects into every step, so the workflow
+#: never declares them in ``env:``. Their fixture values are harness-owned:
+#: a step that starts depending on a new ambient variable must add it here.
+AMBIENT_RUNNER_ENV = frozenset(
+    {"GITHUB_REPOSITORY", "HOME", "PATH", "RUNNER_TEMP", "TMPDIR"}
+)
+
+#: Fixture values for the variables the Layer 2 step declares in ``env:``. The
+#: table is checked against the workflow in both directions (see
+#: :func:`layer2_env_fixtures`), so renaming or removing a declaration fails the
+#: harness instead of silently keeping a stale hardcoded name green.
+DECLARED_ENV_FIXTURES = {
+    "GH_TOKEN": "fixture-token-not-used",
+    "TARGET_SHA": TARGET_SHA,
+}
+
+#: Harness plumbing, not step inputs. These never appear in the workflow.
+HARNESS_INTERNAL_ENV = frozenset(
+    {
+        "FAKE_GH_FAIL",
+        "FAKE_GH_STATE",
+        "LANG",
+        "LC_ALL",
+        "PYTHONDONTWRITEBYTECODE",
+        "PYTHONIOENCODING",
+    }
+)
+
+#: Step inputs consumed by a tool rather than named in the script text. ``gh``
+#: reads ``GH_TOKEN`` from the environment itself, so a text scan cannot see it.
+TOOL_IMPLICIT_ENV = frozenset({"GH_TOKEN"})
+
 FAKE_GH = r'''#!/usr/bin/env python3
 """Deterministic stand-in for the GitHub CLI inventory/read boundary."""
 
@@ -129,6 +167,8 @@ PULL_FIELDS = (
     "mergedAt",
     "reviewDecision",
 )
+#: Minimum list window; mirrors ``MIN_INVENTORY_LIMIT`` in the harness module.
+MIN_LIMIT = 200
 
 
 def emit(name):
@@ -181,13 +221,39 @@ def option(name):
     return None
 
 
+def exactly(expected):
+    """Accept an option value equal to ``expected``."""
+
+    return lambda value: value == expected
+
+
+def at_least(minimum):
+    """Accept a numeric option value at or above ``minimum``."""
+
+    def check(value):
+        try:
+            return int(value) >= minimum
+        except (TypeError, ValueError):
+            return False
+
+    return check
+
+
 def require_inventory(kind, required_fields, required_options):
-    """Refuse a list query that no longer asks for the production contract."""
+    """Refuse a list query that no longer asks for the production contract.
+
+    Options are checked by meaning, not by spelling: ``--state open`` and
+    ``--state=open`` are the same request, and a wider ``--limit`` still
+    observes every field. Only a missing option, a different filter value or a
+    limit below the required floor narrows the observation, so only those
+    fail.
+    """
 
     problems = []
-    for name, expected in required_options:
-        if option(name) != expected:
-            problems.append("{} {}".format(name, expected))
+    for name, check in required_options:
+        value = option(name)
+        if value is None or not check(value):
+            problems.append("{} {!r}".format(name, value))
     requested_fields = set((option("--json") or "").split(","))
     missing_fields = sorted(set(required_fields) - requested_fields)
     if missing_fields:
@@ -204,18 +270,23 @@ def require_issue_inventory():
     require_inventory(
         "issue list",
         ISSUE_FIELDS,
-        (("--state", "open"), ("--label", "automation:in-progress"),
-         ("--limit", "200")),
+        (
+            ("--state", exactly("open")),
+            ("--label", exactly("automation:in-progress")),
+            ("--limit", at_least(MIN_LIMIT)),
+        ),
     )
 
 
 def require_run_inventory():
-    require_inventory("run list", RUN_FIELDS, (("--limit", "200"),))
+    require_inventory("run list", RUN_FIELDS, (("--limit", at_least(MIN_LIMIT)),))
 
 
 def require_pull_inventory():
     require_inventory(
-        "pr list", PULL_FIELDS, (("--state", "all"), ("--limit", "200"))
+        "pr list",
+        PULL_FIELDS,
+        (("--state", exactly("all")), ("--limit", at_least(MIN_LIMIT))),
     )
 
 
@@ -248,15 +319,20 @@ def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
-def load_layer2_step() -> dict:
-    """Return the production step object selected by its exact YAML name."""
+JOB_ID = "qualify"
 
-    data = yaml.safe_load(WORKFLOW.read_text(encoding="utf-8"))
-    matches = [
-        step
-        for step in data["jobs"]["qualify"]["steps"]
-        if step.get("name") == STEP_NAME
-    ]
+
+def load_layer2_job_and_step(data=None):
+    """Return the production job and step objects selected by exact YAML name.
+
+    ``data`` may be a pre-parsed workflow mapping, which lets tests mutate a
+    declaration and prove the harness reacts to it.
+    """
+
+    if data is None:
+        data = yaml.safe_load(WORKFLOW.read_text(encoding="utf-8"))
+    job = data["jobs"][JOB_ID]
+    matches = [step for step in job["steps"] if step.get("name") == STEP_NAME]
     if len(matches) != 1:
         raise AssertionError(
             "expected exactly one '%s' step, found %d" % (STEP_NAME, len(matches))
@@ -266,7 +342,52 @@ def load_layer2_step() -> dict:
         raise AssertionError("Layer 2 step no longer uses the bash shell")
     if "run" not in step:
         raise AssertionError("Layer 2 step has no inline run script")
-    return step
+    return job, step
+
+
+def load_layer2_step() -> dict:
+    """Return the production step object selected by its exact YAML name."""
+
+    return load_layer2_job_and_step()[1]
+
+
+def layer2_declared_env(data=None) -> dict:
+    """Return the Layer 2 step's effective ``env:`` declarations.
+
+    Job-level ``env:`` applies to every step, so the step's own declarations
+    win over it, as in GitHub Actions.
+    """
+
+    job, step = load_layer2_job_and_step(data)
+    declared = {}
+    declared.update(job.get("env") or {})
+    declared.update(step.get("env") or {})
+    return declared
+
+
+def layer2_env_fixtures(declared) -> dict:
+    """Return fixture values for every variable the workflow declares.
+
+    Requiring an exact match in both directions is the point: a renamed or
+    removed workflow variable leaves a stale fixture entry behind, and a new
+    declared variable with no fixture cannot be supplied, so neither case can
+    keep the contract green while the production step is broken.
+    """
+
+    names = set(declared)
+    stale = sorted(set(DECLARED_ENV_FIXTURES) - names)
+    if stale:
+        raise AssertionError(
+            "harness supplies env inputs the Layer 2 step no longer declares: "
+            + ", ".join(stale)
+        )
+    missing = sorted(names - set(DECLARED_ENV_FIXTURES))
+    if missing:
+        raise AssertionError(
+            "Layer 2 step declares env inputs with no harness fixture: "
+            + ", ".join(missing)
+        )
+    return {name: DECLARED_ENV_FIXTURES[name] for name in names}
 
 
 def issue(number: int = ISSUE_NUMBER, labelled: bool = True) -> dict:
@@ -326,6 +447,50 @@ def owner_comment(
             )
         ),
     }
+
+
+def option_value(arguments, name):
+    """Return the value of ``--name``/``--name=value`` from parsed tokens."""
+
+    for position, argument in enumerate(arguments):
+        if argument == name:
+            if position + 1 >= len(arguments):
+                raise AssertionError("%s without a value: %r" % (name, arguments))
+            return arguments[position + 1]
+        prefix = name + "="
+        if argument.startswith(prefix):
+            return argument[len(prefix):]
+    raise AssertionError("no %s option in %r" % (name, arguments))
+
+
+#: Shell and ``os.environ`` reads of an environment variable inside a step.
+ENV_REFERENCE_PATTERNS = (
+    re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}"),
+    re.compile(r"\$([A-Za-z_][A-Za-z0-9_]*)"),
+    re.compile(r"os\.environ\[\s*[\"']([A-Za-z_][A-Za-z0-9_]*)[\"']\s*\]"),
+    re.compile(r"os\.environ\.get\(\s*[\"']([A-Za-z_][A-Za-z0-9_]*)[\"']"),
+)
+
+#: ``NAME=value``/``export NAME=value`` assignments, including the inline
+#: ``NAME=value command`` prefix form. These names are script-local, not inputs.
+ENV_ASSIGNMENT_PATTERN = re.compile(
+    r"(?:^|[\s;(&|])(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)="
+)
+
+
+def environment_reads(script):
+    """Return the environment variable names a step script reads."""
+
+    reads = set()
+    for pattern in ENV_REFERENCE_PATTERNS:
+        reads.update(pattern.findall(script))
+    return reads
+
+
+def environment_assignments(script):
+    """Return the variable names a step script assigns itself."""
+
+    return set(ENV_ASSIGNMENT_PATTERN.findall(script))
 
 
 def requested_json_fields(arguments):
@@ -491,6 +656,13 @@ class Layer2Harness:
         # ``$GITHUB_SHA`` or ``$GITHUB_EVENT_PATH`` read inside the production
         # step (or ``src/continuum``) authenticate against live GitHub or
         # behave differently in CI than locally. Only ``PATH`` is inherited.
+        #
+        # Step inputs are derived from the workflow's own ``env:`` declarations
+        # instead of a hardcoded dictionary: the harness supplies a fixture for
+        # each declared name and refuses to run when the workflow and the
+        # fixture table disagree, so a renamed or removed variable cannot keep
+        # passing against a stale name.
+        declared = layer2_declared_env()
         env = {key: os.environ[key] for key in INHERITED_ENV if key in os.environ}
         env.setdefault("PATH", os.defpath)
         env.update(
@@ -499,8 +671,6 @@ class Layer2Harness:
                 "TMPDIR": str(tmp_dir),
                 "RUNNER_TEMP": str(runner_temp),
                 "GITHUB_REPOSITORY": REPOSITORY,
-                "TARGET_SHA": TARGET_SHA,
-                "GH_TOKEN": "fixture-token-not-used",
                 "FAKE_GH_STATE": str(state),
                 "FAKE_GH_FAIL": failure,
                 "PYTHONDONTWRITEBYTECODE": "1",
@@ -509,7 +679,14 @@ class Layer2Harness:
                 "LC_ALL": "C.UTF-8",
             }
         )
+        env.update(layer2_env_fixtures(declared))
         env["PATH"] = str(bin_dir) + os.pathsep + env["PATH"]
+        step_inputs = set(env) - HARNESS_INTERNAL_ENV - AMBIENT_RUNNER_ENV
+        if step_inputs != set(declared):
+            self.fail(
+                "harness supplies environment inputs the Layer 2 step does not "
+                "declare: " + ", ".join(sorted(step_inputs - set(declared)))
+            )
         leaked = sorted(
             key
             for key in env
@@ -578,9 +755,15 @@ class Layer2WorkflowStepTest(Layer2Harness, unittest.TestCase):
             for line in self.last_gh_log.splitlines()
             if line.startswith("issue list ")
         )
-        self.assertIn("--state open", issue_list)
-        self.assertIn("--label automation:in-progress", issue_list)
-        requested_fields = set(requested_json_fields(shlex.split(issue_list)))
+        issue_tokens = shlex.split(issue_list)
+        self.assertEqual(option_value(issue_tokens, "--state"), "open")
+        self.assertEqual(
+            option_value(issue_tokens, "--label"), "automation:in-progress"
+        )
+        self.assertGreaterEqual(
+            int(option_value(issue_tokens, "--limit")), MIN_INVENTORY_LIMIT
+        )
+        requested_fields = set(requested_json_fields(issue_tokens))
         self.assertLessEqual(
             set(INVENTORY_FIELDS["gh issue list"]),
             requested_fields,
@@ -612,14 +795,15 @@ class Layer2WorkflowStepTest(Layer2Harness, unittest.TestCase):
                     self.assertIn("dropped observation contract", completed.stderr)
                     self.assertIn(field, completed.stderr)
 
-    def test_dropped_labels_would_hide_a_stranded_reservation(self):
-        """Show why the inventory guard is load-bearing, not decorative.
+    def test_missing_labels_field_fails_closed_instead_of_hiding_a_reservation(self):
+        """An unobservable reservation payload must never qualify green.
 
-        Real ``gh`` omits fields absent from ``--json``. If the issue query
-        dropped ``labels``, the stranded reservation would not even be selected
-        as an observation and the production stranded-reservation assertion
-        would pass green. The fake ``gh`` field guard above is what turns that
-        silent omission into a failure.
+        The inventory query filters on ``automation:in-progress``, so an open
+        issue in the payload is a reservation even when the payload omits its
+        ``labels`` array. Production treats that omission as unreadable
+        reservation state and fails instead of reporting zero reservations, so
+        a relaxed query guard (or a real ``gh``/API change) cannot turn a
+        stranded reservation into a silent pass.
         """
 
         unlabelled = issue()
@@ -629,8 +813,88 @@ class Layer2WorkflowStepTest(Layer2Harness, unittest.TestCase):
             runs=[],
             pulls=[],
         )
+        self.assert_failed_without_pass(completed)
+        self.assertIn(
+            "issue inventory omitted labels (reservation state unobservable) for: "
+            "{}".format(ISSUE_NUMBER),
+            completed.stderr,
+        )
+        self.assertNotIn("Observed 0 real reservation(s)", completed.stdout)
+
+    def test_behavior_preserving_query_options_keep_the_same_contract(self):
+        """A wider limit or ``--option=value`` spelling is not a regression."""
+
+        production = load_layer2_step()["run"]
+        reformatted = production.replace("--limit 200", "--limit 500")
+        reformatted = reformatted.replace("--state open", "--state=open")
+        reformatted = reformatted.replace(
+            "--label automation:in-progress", "--label=automation:in-progress"
+        )
+        self.assertNotEqual(production, reformatted)
+        completed = self.run_layer2(
+            issues=[issue()],
+            runs=[live_run()],
+            step_script=reformatted,
+        )
         self.assert_passed(completed)
-        self.assertIn("Observed 0 real reservation(s); none stranded.", completed.stdout)
+
+    def test_narrowed_inventory_limit_is_rejected(self):
+        """A window below the required floor still narrows the observation."""
+
+        production = load_layer2_step()["run"]
+        narrowed = production.replace("--limit 200", "--limit 100")
+        self.assertNotEqual(production, narrowed)
+        completed = self.run_layer2(
+            issues=[issue()],
+            runs=[live_run()],
+            step_script=narrowed,
+        )
+        self.assert_failed_without_pass(completed)
+        self.assertIn("dropped observation contract", completed.stderr)
+
+    def test_step_reads_only_declared_or_provided_environment(self):
+        """Harness env must match the workflow and what the step reads.
+
+        The harness supplies fixtures for the step's declared ``env:`` only. If
+        the workflow renames a variable while the script still reads the old
+        name, the read has no declaration (and the declaration has no reader),
+        so this fails instead of passing against an injected stale name.
+        """
+
+        _, step = load_layer2_job_and_step()
+        declared = set(layer2_declared_env())
+        script = step["run"]
+        reads = environment_reads(script) - environment_assignments(script)
+        allowed = declared | AMBIENT_RUNNER_ENV | HARNESS_INTERNAL_ENV
+        self.assertEqual(
+            sorted(reads - allowed),
+            [],
+            "step reads environment inputs that are neither declared nor provided",
+        )
+        self.assertEqual(
+            sorted(declared - reads - TOOL_IMPLICIT_ENV),
+            [],
+            "step declares environment inputs it never reads",
+        )
+
+    def test_workflow_env_rename_breaks_the_harness(self):
+        """A declared-input rename or removal must fail, not stay green."""
+
+        for change in ("rename", "remove"):
+            with self.subTest(change=change):
+                data = yaml.safe_load(WORKFLOW.read_text(encoding="utf-8"))
+                _, step = load_layer2_job_and_step(data)
+                env = step["env"]
+                if change == "rename":
+                    env["TARGET_SHA_RENAMED"] = env.pop("TARGET_SHA")
+                else:
+                    env.pop("GH_TOKEN")
+                with self.assertRaises(AssertionError) as caught:
+                    layer2_env_fixtures(layer2_declared_env(data))
+                expected = (
+                    "TARGET_SHA" if change == "rename" else "GH_TOKEN"
+                )
+                self.assertIn(expected, str(caught.exception))
 
     def test_json_query_reformatting_keeps_the_same_contract(self):
         """A behavior-preserving ``--json`` reformat must not break the test."""
