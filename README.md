@@ -57,6 +57,8 @@ guaranteed.
   model.
 - [Optional periodic wake](docs/cron-job-org.md) — a manual scheduler backstop
   after merge.
+- [Release workflow reference templates](docs/release-templates.md) — historical,
+  inactive examples; not a supported release feature.
 
 ## Requirements and safety
 

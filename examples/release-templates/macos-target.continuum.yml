@@ -1,0 +1,84 @@
+# ILLUSTRATIVE TARGET CONFIGURATION - INACTIVE, NOT A WORKFLOW, NOT QUALIFIED.
+#
+# This is a policy/configuration example in the `.continuum.yml` schema used by
+# the historical Apple release adapter. It is not a GitHub Actions workflow:
+# there are no jobs, triggers, or `uses:` entries here. The executable caller
+# example is macos-release-caller.yml.
+#
+# Source of the schema shape:
+#   kodmial/continuum @ 0bbf57dbb8834d0aaef2cfb83f08ead7da623985
+#   src/continuum/config.py (blob 5d98dc854ba741dfd3036bbf1a5447accb218679)
+#   .continuum.yml example (blob 315416193ef79936f34bbed48693f0eb10ab4742)
+#
+# Every product name, bundle identifier, identity, and path below is a neutral
+# placeholder. Replace them with your own values; do not treat them as
+# production defaults. The two secret names are the conventional names the
+# historical Apple entrypoint reads; keep both sides in sync if you rename them.
+#
+# The historical Apple adapter was primarily a signing/verification plan for
+# macOS SwiftPM products. It did not implement Developer ID, notarization, the
+# App Store, installers, archive creation, or Homebrew/MacPorts publication.
+# Current main has no release engine at all. This file declares intent; it does
+# not make any of those paths runnable. See docs/release-templates.md.
+
+version: 1
+
+release:
+  targets:
+    - id: macos-app
+      adapter: apple
+      platform: macos
+      build_strategy: swiftpm
+      distribution: direct
+      # Both Apple architectures are declared. universal: false declares two
+      # per-architecture products; the consumer build must produce them,
+      # because this policy alone does not build or merge a universal binary.
+      architectures:
+        - arm64
+        - x86_64
+      universal: false
+      # Declared artifact formats. The historical adapter signs binaries and an
+      # .app bundle; it does not create these archives for you.
+      artifacts:
+        - tar.gz
+        - zip
+      # Hardened runtime is the protection an entitlement set is meaningful
+      # under. It is explicit rather than implied.
+      hardened_runtime: true
+      # These destinations are declarations only. The Apple adapter never
+      # uploads to a tap or a port tree; downstream publishing is a separate,
+      # unqualified concern.
+      publishers:
+        - homebrew
+        - macports
+      binaries:
+        - name: ExampleApp
+          # The same reverse-DNS identifier must be used by the binary and the
+          # bundle, and it must stay stable across releases. Changing it makes
+          # macOS treat the release as a different application.
+          identifier: com.example.app
+          entitlements: macos/ExampleApp.entitlements
+      app_bundle:
+        name: ExampleApp.app
+        identifier: com.example.app
+        # Schema-declared source path. The historical Apple plan did not read
+        # this field: it stamped both version keys into the built bundle's own
+        # Contents/Info.plist before sealing it. The file is illustrative.
+        info_plist: macos/Info.plist
+        entitlements: macos/ExampleApp.entitlements
+      signing:
+        # The historical first-class profile: a purpose-made self-signed
+        # certificate imported into a throwaway keychain for one job. It gives
+        # a stable identity without claiming Developer ID or notarization.
+        mode: self-signed-stable
+        # Replace with the exact common name of your certificate. The plan pins
+        # this value and fails if a different certificate signed the artifact.
+        identity: ExampleApp CI Signing
+        p12_secret: CONTINUUM_APPLE_P12
+        password_secret: CONTINUUM_APPLE_P12_PASSWORD
+        # No secure timestamp by default: the historical design keeps
+        # re-runs byte-identical so published checksums stay true.
+        timestamp: false
+        # A missing certificate must fail the release, not silently produce an
+        # ad-hoc signature that loses the stable identity and its permissions.
+        allow_adhoc_fallback: false

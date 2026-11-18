@@ -1,0 +1,312 @@
+# ARCHIVED TECHNOLOGY-SPECIFIC EXAMPLE - OPTIONAL, NOT THE DEFAULT ARCHITECTURE.
+# NOT QUALIFIED, NOT ACTIVE.
+#
+# Source: kodmial/continuum @ 0bbf57dbb8834d0aaef2cfb83f08ead7da623985
+#         .github/workflows/release-bun-binary.yml
+#         blob d87bd147aececda2e13dd6233cfe49cbb406742f
+#
+# This is a separate optional example recovered from the historical source. It
+# is not the generic release architecture, it is not installed by install.sh,
+# it is not under .github/workflows/, and it has not been qualified against
+# current main.
+#
+# The body below is the historical source verbatim, including its direct
+# publish step. It is reference material only: no trigger, tag, upload, or
+# publication can run from a file under examples/.
+
+name: Continuum release adapter - Bun binary
+
+on:
+  workflow_call:
+    inputs:
+      source_sha:
+        description: Exact consumer commit to release
+        required: true
+        type: string
+      package_dir:
+        description: Directory containing package.json
+        required: true
+        type: string
+      build_script:
+        description: Legacy Bun package script; optional when build_argv_json is provided
+        required: false
+        default: ""
+        type: string
+      build_argv_json:
+        description: Exact JSON argv array for the build command; executed without a shell
+        required: false
+        default: "[]"
+        type: string
+      build_env_json:
+        description: JSON object of non-secret build environment values
+        required: false
+        default: "{}"
+        type: string
+      binary_path:
+        description: Repository-relative path to the produced binary
+        required: true
+        type: string
+      asset_name:
+        description: GitHub Release asset filename
+        required: true
+        type: string
+      tag_prefix:
+        description: Prefix for immutable release tags
+        required: false
+        default: bun-v
+        type: string
+      bun_version:
+        description: Bun version used to build the binary
+        required: false
+        default: 1.3.14
+        type: string
+      prerelease:
+        description: Publish the GitHub Release as a prerelease
+        required: false
+        default: false
+        type: boolean
+      expected_version:
+        description: Optional exact output expected from the produced binary --version
+        required: false
+        default: ""
+        type: string
+      expected_sha256:
+        description: Optional exact SHA-256 expected from the produced binary
+        required: false
+        default: ""
+        type: string
+      expected_size_bytes:
+        description: Optional exact byte size expected from the produced binary
+        required: false
+        default: ""
+        type: string
+    secrets:
+      RELEASE_TOKEN:
+        description: Optional token used to publish immutable GitHub Releases when github.token is read-only
+        required: false
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Validate adapter inputs
+        shell: bash
+        env:
+          SOURCE_SHA: ${{ inputs.source_sha }}
+          PACKAGE_DIR: ${{ inputs.package_dir }}
+          BUILD_SCRIPT: ${{ inputs.build_script }}
+          BUILD_ARGV_JSON: ${{ inputs.build_argv_json }}
+          BUILD_ENV_JSON: ${{ inputs.build_env_json }}
+          BINARY_PATH: ${{ inputs.binary_path }}
+          ASSET_NAME: ${{ inputs.asset_name }}
+          TAG_PREFIX: ${{ inputs.tag_prefix }}
+          EXPECTED_VERSION: ${{ inputs.expected_version }}
+          EXPECTED_SHA256: ${{ inputs.expected_sha256 }}
+          EXPECTED_SIZE_BYTES: ${{ inputs.expected_size_bytes }}
+        run: |
+          set -euo pipefail
+          [[ "$SOURCE_SHA" =~ ^[0-9a-fA-F]{40}$ ]] || { echo "::error::source_sha must be a full 40-character commit SHA"; exit 1; }
+          [[ "$PACKAGE_DIR" =~ ^[A-Za-z0-9._/-]+$ ]] && [[ "$PACKAGE_DIR" != /* ]] && [[ "$PACKAGE_DIR" != *..* ]] || { echo "::error::invalid package_dir"; exit 1; }
+          [[ -z "$BUILD_SCRIPT" || "$BUILD_SCRIPT" =~ ^[A-Za-z0-9._:-]+$ ]] || { echo "::error::invalid build_script"; exit 1; }
+          [[ "$BINARY_PATH" =~ ^[A-Za-z0-9._/-]+$ ]] && [[ "$BINARY_PATH" != /* ]] && [[ "$BINARY_PATH" != *..* ]] || { echo "::error::invalid binary_path"; exit 1; }
+          [[ "$ASSET_NAME" =~ ^[A-Za-z0-9._-]+$ ]] || { echo "::error::invalid asset_name"; exit 1; }
+          [[ "$TAG_PREFIX" =~ ^[A-Za-z0-9._-]+$ ]] || { echo "::error::invalid tag_prefix"; exit 1; }
+
+          python3 - <<'PY'
+          import json, os, re
+          argv = json.loads(os.environ["BUILD_ARGV_JSON"])
+          env = json.loads(os.environ["BUILD_ENV_JSON"])
+          expected = os.environ.get("EXPECTED_VERSION", "")
+          if not isinstance(argv, list) or not all(isinstance(v, str) and v for v in argv):
+              raise SystemExit("build_argv_json must be a JSON array of non-empty strings")
+          if not isinstance(env, dict):
+              raise SystemExit("build_env_json must be a JSON object")
+          key = re.compile(r"^[A-Z_][A-Z0-9_]*$")
+          for name, value in env.items():
+              if not isinstance(name, str) or not key.fullmatch(name):
+                  raise SystemExit("invalid build environment key: %r" % (name,))
+              if not isinstance(value, str):
+                  raise SystemExit("build environment values must be strings")
+          if not argv and not os.environ.get("BUILD_SCRIPT"):
+              raise SystemExit("provide build_script or build_argv_json")
+          if "\n" in expected or "\r" in expected:
+              raise SystemExit("expected_version must be one line")
+          expected_sha = os.environ.get("EXPECTED_SHA256", "")
+          if expected_sha and not re.fullmatch(r"[0-9a-fA-F]{64}", expected_sha):
+              raise SystemExit("expected_sha256 must be exactly 64 hexadecimal characters")
+          expected_size = os.environ.get("EXPECTED_SIZE_BYTES", "")
+          if expected_size and (not expected_size.isdigit() or int(expected_size) < 1):
+              raise SystemExit("expected_size_bytes must be a positive integer")
+          PY
+
+      - name: Checkout exact consumer source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ inputs.source_sha }}
+          fetch-depth: 0
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: ${{ inputs.bun_version }}
+
+      - name: Install dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          bun install --frozen-lockfile
+
+      - name: Build standalone binary
+        shell: bash
+        env:
+          PACKAGE_DIR: ${{ inputs.package_dir }}
+          BUILD_SCRIPT: ${{ inputs.build_script }}
+          BUILD_ARGV_JSON: ${{ inputs.build_argv_json }}
+          BUILD_ENV_JSON: ${{ inputs.build_env_json }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, os, subprocess
+          argv = json.loads(os.environ["BUILD_ARGV_JSON"])
+          extra_env = json.loads(os.environ["BUILD_ENV_JSON"])
+          if not argv:
+              argv = ["bun", "run", "--cwd", os.environ["PACKAGE_DIR"], os.environ["BUILD_SCRIPT"]]
+          child_env = os.environ.copy()
+          child_env.update(extra_env)
+          print("build argv:", json.dumps(argv))
+          subprocess.run(argv, env=child_env, check=True)
+          PY
+
+      - name: Package immutable release assets
+        id: meta
+        shell: bash
+        env:
+          SOURCE_SHA: ${{ inputs.source_sha }}
+          PACKAGE_DIR: ${{ inputs.package_dir }}
+          BINARY_PATH: ${{ inputs.binary_path }}
+          ASSET_NAME: ${{ inputs.asset_name }}
+          TAG_PREFIX: ${{ inputs.tag_prefix }}
+          EXPECTED_VERSION: ${{ inputs.expected_version }}
+          EXPECTED_SHA256: ${{ inputs.expected_sha256 }}
+          EXPECTED_SIZE_BYTES: ${{ inputs.expected_size_bytes }}
+          BUILD_ARGV_JSON: ${{ inputs.build_argv_json }}
+        run: |
+          set -euo pipefail
+          test -f "$BINARY_PATH"
+          chmod +x "$BINARY_PATH"
+          BINARY_VERSION="$("$BINARY_PATH" --version | tr -d '\r\n')"
+          if [[ -n "$EXPECTED_VERSION" && "$BINARY_VERSION" != "$EXPECTED_VERSION" ]]; then
+            echo "::error::binary version '$BINARY_VERSION' does not match expected '$EXPECTED_VERSION'"
+            exit 1
+          fi
+
+          VERSION="$(bun -e 'const p = await Bun.file(process.argv[1]).json(); process.stdout.write(String(p.version ?? "0.0.0"))' "$PACKAGE_DIR/package.json")"
+          [[ "$VERSION" =~ ^[0-9A-Za-z._+-]+$ ]] || { echo "::error::invalid package version: $VERSION"; exit 1; }
+          SHORT_SHA="${SOURCE_SHA:0:12}"
+          TAG="${TAG_PREFIX}${VERSION}-${SHORT_SHA}"
+
+          mkdir -p release
+          install -m 0755 "$BINARY_PATH" "release/$ASSET_NAME"
+          (
+            cd release
+            sha256sum "$ASSET_NAME" | tee "$ASSET_NAME.sha256"
+          )
+
+          BINARY_SHA256="$(sha256sum "release/$ASSET_NAME" | awk '{print $1}')"
+          BINARY_SIZE="$(stat -c '%s' "release/$ASSET_NAME")"
+          if [[ -n "$EXPECTED_SHA256" && "${BINARY_SHA256,,}" != "${EXPECTED_SHA256,,}" ]]; then
+            echo "::error::produced binary SHA-256 does not match expected_sha256"
+            exit 1
+          fi
+          if [[ -n "$EXPECTED_SIZE_BYTES" && "$BINARY_SIZE" != "$EXPECTED_SIZE_BYTES" ]]; then
+            echo "::error::produced binary size does not match expected_size_bytes"
+            exit 1
+          fi
+          BUILD_MODE="$(python3 -c 'import json,os; print("argv" if json.loads(os.environ["BUILD_ARGV_JSON"]) else "script")')"
+          cat > "release/$ASSET_NAME.json" <<EOF
+          {
+            "adapter": "bun-binary",
+            "tag": "$TAG",
+            "source_sha": "$SOURCE_SHA",
+            "package_version": "$VERSION",
+            "binary_version": "$BINARY_VERSION",
+            "bun_version": "$(bun --version)",
+            "asset": "$ASSET_NAME",
+            "sha256": "$BINARY_SHA256",
+            "size_bytes": $BINARY_SIZE,
+            "build_mode": "$BUILD_MODE"
+          }
+          EOF
+
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "sha256=$BINARY_SHA256" >> "$GITHUB_OUTPUT"
+          echo "size=$BINARY_SIZE" >> "$GITHUB_OUTPUT"
+          echo "binary_version=$BINARY_VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Preserve release payload as Actions artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ${{ inputs.asset_name }}-${{ inputs.source_sha }}
+          path: |
+            release/${{ inputs.asset_name }}
+            release/${{ inputs.asset_name }}.sha256
+            release/${{ inputs.asset_name }}.json
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Publish GitHub Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_TOKEN || github.token }}
+          TAG: ${{ steps.meta.outputs.tag }}
+          ASSET_NAME: ${{ inputs.asset_name }}
+          SOURCE_SHA: ${{ inputs.source_sha }}
+          PRERELEASE: ${{ inputs.prerelease }}
+        run: |
+          set -euo pipefail
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Release $TAG already exists; treating the immutable release as complete."
+            exit 0
+          fi
+
+          EXTRA=()
+          [[ "$PRERELEASE" == "true" ]] && EXTRA+=(--prerelease)
+
+          gh release create "$TAG" \
+            "release/$ASSET_NAME" \
+            "release/$ASSET_NAME.sha256" \
+            "release/$ASSET_NAME.json" \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$SOURCE_SHA" \
+            --title "$ASSET_NAME $TAG" \
+            --generate-notes \
+            "${EXTRA[@]}"
+
+      - name: Release summary
+        shell: bash
+        env:
+          # Through the environment rather than spliced into the script. These
+          # are dispatch inputs, so they are caller-controlled text that the
+          # runner would substitute before the shell ever parsed it.
+          SUMMARY_TAG: ${{ steps.meta.outputs.tag }}
+          SUMMARY_SOURCE_SHA: ${{ inputs.source_sha }}
+          SUMMARY_ASSET: ${{ inputs.asset_name }}
+          SUMMARY_SHA256: ${{ steps.meta.outputs.sha256 }}
+          SUMMARY_BINARY_VERSION: ${{ steps.meta.outputs.binary_version }}
+          SUMMARY_SIZE: ${{ steps.meta.outputs.size }}
+        run: |
+          set -euo pipefail
+          {
+            echo "### Continuum bun-binary release"
+            echo "- tag: \`$SUMMARY_TAG\`"
+            echo "- source SHA: \`$SUMMARY_SOURCE_SHA\`"
+            echo "- asset: \`$SUMMARY_ASSET\`"
+            echo "- SHA-256: \`$SUMMARY_SHA256\`"
+            echo "- binary version: \`$SUMMARY_BINARY_VERSION\`"
+            echo "- size: \`$SUMMARY_SIZE bytes\`"
+          } >> "$GITHUB_STEP_SUMMARY"

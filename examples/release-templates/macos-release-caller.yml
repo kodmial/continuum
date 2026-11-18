@@ -1,0 +1,94 @@
+# ILLUSTRATIVE macOS RELEASE CALLER - INACTIVE, NOT INSTALLED, NOT QUALIFIED.
+#
+# This is a product-neutral example of the consumer side of the generic release
+# workflow. It lives under examples/ only: the workflow_dispatch trigger cannot
+# run while the file is here, and nothing in this directory is installed by
+# install.sh.
+#
+# It is a caller, not a release implementation. It selects a manual release
+# event and hands the exact version and source commit to the generic
+# `workflow_call` surface; the target policy in macos-target.continuum.yml says
+# what is built, signed, and declared for publication.
+#
+# Provenance of the called workflow:
+#   kodmial/continuum @ 0bbf57dbb8834d0aaef2cfb83f08ead7da623985
+#   .github/workflows/release.yml
+#
+# The historical ref below is used because that is where the archived workflow
+# actually existed. It is not a current-main release interface: current main has
+# no release engine or release CLI, so this example is not runnable as checked
+# in. Replace the ref only after the missing engine is restored and the complete
+# path has been qualified. See docs/release-templates.md.
+
+name: Example macOS release selection
+
+on:
+  # A consumer that releases from tags would select a tag-push event and derive
+  # version and tag from the pushed ref. This example stays manual so the exact
+  # version and source commit are explicit rather than inferred.
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Version to release, without the optional v prefix (for example 1.2.3)
+        required: true
+        type: string
+      source_sha:
+        description: Exact 40-character commit to release
+        required: true
+        type: string
+      channel:
+        description: Release channel
+        required: false
+        default: stable
+        type: string
+      prerelease:
+        description: Publish the GitHub Release as a prerelease
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+# One release per source commit, and never cancelled. The generic workflow
+# applies its own version-scoped concurrency group; this outer group keeps two
+# manual selections for the same commit from racing before they reach it.
+concurrency:
+  group: example-macos-release-${{ inputs.source_sha }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: Call the generic release workflow
+    # The called workflow's transaction job requests contents: write. A caller
+    # must grant at least that much or GitHub rejects the whole workflow at
+    # startup. The grant is scoped to this job, not the caller's default, and
+    # the generic workflow narrows it again for its own resolve and target jobs.
+    permissions:
+      contents: write
+    uses: kodmial/continuum/.github/workflows/release.yml@0bbf57dbb8834d0aaef2cfb83f08ead7da623985
+    with:
+      version: ${{ inputs.version }}
+      source_sha: ${{ inputs.source_sha }}
+      # A manual selection has no pushed tag, so this dispatch supplies the only
+      # version. The `release` environment, once the caller configures its
+      # protection rules, can require a human approval before the transaction
+      # publishes; that approval is a gate, not an independent version source.
+      event: workflow-dispatch
+      tag: ""
+      channel: ${{ inputs.channel }}
+      config_path: .continuum.yml
+      environment: release
+      # A macOS release must not silently degrade to an ad-hoc signature when
+      # the certificate is missing. The generic workflow still binds each
+      # secret only to the adapter that reads it.
+      signing_material: present
+      include_declared: false
+      prerelease: ${{ inputs.prerelease }}
+    secrets:
+      # Names only. The values are repository secrets and are never written
+      # into this example. RELEASE_TOKEN is the only publishing credential; the
+      # Apple certificate material is available only to the Apple target job.
+      RELEASE_TOKEN: ${{ secrets.RELEASE_TOKEN }}
+      CONTINUUM_APPLE_P12: ${{ secrets.CONTINUUM_APPLE_P12 }}
+      CONTINUUM_APPLE_P12_PASSWORD: ${{ secrets.CONTINUUM_APPLE_P12_PASSWORD }}
