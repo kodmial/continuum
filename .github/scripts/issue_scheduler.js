@@ -746,9 +746,40 @@ module.exports = async function runIssueScheduler({ github, context, core }) {
   // only the first such marker in a comment before checking its identity.
   // A `continuum-task-snapshot-ref` marker is a PR-body reference the
   // executor never treats as the authoritative pin, so it must not release
-  // this hold either.
-  const checkpointSnapshotMarkerRe =
-    /<!--\s*continuum-task-snapshot\s+repo=([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)\s+issue=(\d+)\s+generation=(\d+)\s+title-sha256=([0-9a-fA-F]{64})\s+body-sha256=([0-9a-fA-F]{64})\s+spec-sha256=([0-9a-fA-F]{64})\s*-->/;
+  // a hold or satisfy publication either. The earliest trusted pin for the
+  // task generation wins and later duplicates are ignored, never
+  // overwritten; an arbitrary commenter must never move the baseline by
+  // posting a forged marker.
+  function authoritativeTaskSnapshot(
+    comments, targetOwner, targetRepo, issueNumber, taskGeneration = 1
+  ) {
+    const wantedRepo = (targetOwner + '/' + targetRepo).toLowerCase();
+    const wantedGeneration = Number(taskGeneration) || 1;
+    const pinRe =
+      /<!--\s*continuum-task-snapshot\s+repo=([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)\s+issue=(\d+)\s+generation=(\d+)\s+title-sha256=([0-9a-fA-F]{64})\s+body-sha256=([0-9a-fA-F]{64})\s+spec-sha256=([0-9a-fA-F]{64})\s*-->/;
+    let selected = null;
+    let selectedOrder = '';
+    for (const comment of comments || []) {
+      if (!isTrustedStopComment(comment, targetOwner)) continue;
+      const match = String(comment.body || '').match(pinRe);
+      if (!match) continue;
+      if (
+        match[1].toLowerCase() !== wantedRepo ||
+        Number(match[2]) !== Number(issueNumber) ||
+        Number(match[3]) !== wantedGeneration
+      ) continue;
+      const order = stopOrderKey(comment);
+      if (selected === null || order < selectedOrder) {
+        selectedOrder = order;
+        selected = {
+          title: match[4].toLowerCase(),
+          body: match[5].toLowerCase(),
+          spec: match[6].toLowerCase(),
+        };
+      }
+    }
+    return selected;
+  }
 
   // A deterministic checkpoint-continuation rejection is persisted as a
   // typed marker. It is not an owner pause and not a terminal generation
@@ -829,42 +860,15 @@ module.exports = async function runIssueScheduler({ github, context, core }) {
     if (!marker) return null;
 
     // A different authoritative pinned snapshot is a material premise
-    // change. Select it exactly as the executor does: only the first
-    // `continuum-task-snapshot` marker in a comment is parsed, and identity
-    // is checked after that parse, so a comment whose first marker belongs
-    // to another repo/issue/generation is discarded whole. The earliest
-    // trusted snapshot for the task generation then wins and later
-    // duplicates are ignored, never overwritten. Comparing a later
-    // duplicate instead would dispatch against the earlier pin, or repeat
-    // the unchanged rejection when live content still matches that earlier
-    // pin. Only trusted comments can move a generation baseline: an
-    // arbitrary commenter must never release a deterministic hold by
-    // posting a forged snapshot marker.
-    let authoritativeSnapshot = null;
-    let authoritativeSnapshotOrder = '';
-    for (const comment of trusted) {
-      const match = String(comment.body || '').match(
-        checkpointSnapshotMarkerRe
-      );
-      if (!match) continue;
-      if (
-        match[1].toLowerCase() !== wantedRepo ||
-        Number(match[2]) !== issueNumber ||
-        Number(match[3]) !== wantedTaskGeneration
-      ) continue;
-      const order = (comment.created_at || '') + '#' +
-        String(comment.id || 0).padStart(12, '0');
-      if (
-        authoritativeSnapshot === null ||
-        order < authoritativeSnapshotOrder
-      ) {
-        authoritativeSnapshotOrder = order;
-        authoritativeSnapshot = match[6].toLowerCase();
-      }
-    }
+    // change. Comparing a later duplicate instead would dispatch against
+    // the earlier pin, or repeat the unchanged rejection when live content
+    // still matches that earlier pin.
+    const authoritativeSnapshot = authoritativeTaskSnapshot(
+      trusted, targetOwner, targetRepo, issueNumber, wantedTaskGeneration
+    );
     if (
       authoritativeSnapshot &&
-      authoritativeSnapshot !== marker.snapshotSpec
+      authoritativeSnapshot.spec !== marker.snapshotSpec
     ) {
       return null;
     }
@@ -4127,7 +4131,7 @@ module.exports = async function runIssueScheduler({ github, context, core }) {
   }
   
   async function evaluateScheduler429Recovery({
-    recovery, issueNumber,
+    recovery, issueNumber, comments,
   }) {
     const now = Date.now();
     // Fail-closed marker states are bounded by the marker comment's
@@ -4291,7 +4295,12 @@ module.exports = async function runIssueScheduler({ github, context, core }) {
         observedSteps,
       };
     }
-    async function schedulerPublishedIssuePullRequest(identity) {
+    // Publication evidence must prove this recovery published the saved work
+    // for the pinned task contract. A PR-body `continuum-task-snapshot-ref`
+    // on its own is a reference, never the authoritative pin: an older merged
+    // PR on the same branch with a missing or different snapshot must not
+    // satisfy a new checkpoint.
+    async function schedulerPublishedIssuePullRequest(identity, pinned) {
       const branch = String(
         identity && (identity.branch || identity.head_ref) || ''
       ).trim().replace(/^refs\/heads\//, '');
@@ -4300,6 +4309,23 @@ module.exports = async function runIssueScheduler({ github, context, core }) {
       if (!branch || !/^[0-9a-f]{40}$/.test(savedSha)) {
         return { kind: 'invalid', reason: 'recovery-identity-incomplete' };
       }
+      const pinnedSnapshot = pinned && {
+        title: String(pinned.title || '').toLowerCase(),
+        body: String(pinned.body || '').toLowerCase(),
+        spec: String(pinned.spec || '').toLowerCase(),
+      };
+      if (
+        !pinnedSnapshot ||
+        !/^[0-9a-f]{64}$/.test(pinnedSnapshot.title) ||
+        !/^[0-9a-f]{64}$/.test(pinnedSnapshot.body) ||
+        !/^[0-9a-f]{64}$/.test(pinnedSnapshot.spec)
+      ) {
+        // Without the authoritative pin there is nothing to bind the
+        // publication to; fail closed and keep the reservation.
+        return { kind: 'unavailable', status: 0 };
+      }
+      const snapshotRefRe =
+        /<!--\s*continuum-task-snapshot-ref\s+repo=([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)\s+issue=(\d+)\s+generation=(\d+)\s+title-sha256=([0-9a-fA-F]{64})\s+body-sha256=([0-9a-fA-F]{64})\s+spec-sha256=([0-9a-fA-F]{64})\s*-->/g;
       let pulls;
       try {
         pulls = await readGithub.paginate(
@@ -4324,6 +4350,20 @@ module.exports = async function runIssueScheduler({ github, context, core }) {
           Boolean(pull.merged_at) ||
           pull.merged === true;
         if (!published) continue;
+        // The publication must name the exact pinned task snapshot. Exactly
+        // one reference is accepted, so a duplicated or appended reference
+        // cannot smuggle a different contract into the evidence.
+        const refs = [...String(pull.body || '').matchAll(snapshotRefRe)];
+        if (refs.length !== 1) continue;
+        const ref = refs[0];
+        if (
+          String(ref[1]).toLowerCase() !== repoFullName.toLowerCase() ||
+          Number(ref[2]) !== Number(issueNumber) ||
+          Number(ref[3]) !== 1 ||
+          String(ref[4]).toLowerCase() !== pinnedSnapshot.title ||
+          String(ref[5]).toLowerCase() !== pinnedSnapshot.body ||
+          String(ref[6]).toLowerCase() !== pinnedSnapshot.spec
+        ) continue;
         const headSha = String(pull.head?.sha || '').toLowerCase();
         if (headSha === savedSha) return { kind: 'ok', published: true };
         if (!/^[0-9a-f]{40}$/.test(headSha)) {
@@ -4361,8 +4401,12 @@ module.exports = async function runIssueScheduler({ github, context, core }) {
         run.run.status === 'completed' &&
         run.run.conclusion === 'success'
       ) {
+        // The task generation is pinned to 1 by the opencode workflow.
+        const pinnedSnapshot = authoritativeTaskSnapshot(
+          comments, owner, repo, issueNumber, 1
+        );
         const publication = await schedulerPublishedIssuePullRequest(
-          checkpoint.identity
+          checkpoint.identity, pinnedSnapshot
         );
         if (publication.kind !== 'ok') {
           return keepRecoveryReservation('publication-unavailable');
@@ -4643,6 +4687,7 @@ module.exports = async function runIssueScheduler({ github, context, core }) {
     const recoveryEvaluation = await evaluateScheduler429Recovery({
       recovery: newestRecovery,
       issueNumber,
+      comments,
     });
     const hasFresh429Recovery = recoveryEvaluation.keepReservation;
     const latestDispatch = dispatches.at(-1);
@@ -5100,6 +5145,7 @@ module.exports = async function runIssueScheduler({ github, context, core }) {
       const candidateRecoveryEvaluation = await evaluateScheduler429Recovery({
         recovery: candidateRecovery,
         issueNumber: issue.number,
+        comments: candidateComments,
       });
       const watchdogOwned = candidateRecoveryEvaluation.keepReservation ||
         candidateRecoveryEvaluation.reason === 'checkpoint-unchanged';

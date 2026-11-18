@@ -33,6 +33,39 @@ OLD_SHA = "866301983c084f9d56eb3155066408af8006b361"
 NEW_SHA = "17f88cfcb02c122defc4840b73e316d96a426e03"
 OLD_RUN_ID = "39885792009"
 BASE_SHA = "0123456789abcdef0123456789abcdef01234567"
+SNAPSHOT_TITLE = "d" * 64
+SNAPSHOT_BODY = "e" * 64
+SNAPSHOT_SPEC = "c" * 64
+
+
+def snapshot_pin(spec=SNAPSHOT_SPEC, issue=382, generation=1):
+    return (
+        "<!-- continuum-task-snapshot repo=" + OWNER + "/" + REPO +
+        " issue=" + str(issue) + " generation=" + str(generation) +
+        " title-sha256=" + SNAPSHOT_TITLE +
+        " body-sha256=" + SNAPSHOT_BODY +
+        " spec-sha256=" + spec + " -->"
+    )
+
+
+def snapshot_ref(spec=SNAPSHOT_SPEC, issue=382, generation=1):
+    return (
+        "<!-- continuum-task-snapshot-ref repo=" + OWNER + "/" + REPO +
+        " issue=" + str(issue) + " generation=" + str(generation) +
+        " title-sha256=" + SNAPSHOT_TITLE +
+        " body-sha256=" + SNAPSHOT_BODY +
+        " spec-sha256=" + spec + " -->"
+    )
+
+
+def pin_comment(body=None):
+    return {
+        "id": 1,
+        "body": body if body is not None else snapshot_pin(),
+        "user": {"login": "github-actions[bot]"},
+        "author_association": "OWNER",
+        "created_at": "2026-10-20T12:00:00Z",
+    }
 
 
 def extract_function(body: str, name: str) -> str:
@@ -193,6 +226,7 @@ const factory = new AsyncFunction(
   const evaluation = await evaluate({
     recovery: scenario.recovery,
     issueNumber: scenario.issueNumber || 382,
+    comments: scenario.comments || [],
   });
   fs.writeFileSync(
     resultPath,
@@ -219,6 +253,9 @@ class SchedulerDurableRecoveryTests(unittest.TestCase):
         cls.source = "\n\n".join(
             extract_function(body, name)
             for name in (
+                "isTrustedStopComment",
+                "stopOrderKey",
+                "authoritativeTaskSnapshot",
                 "parseSchedulerCheckpointIdentity",
                 "fetchSchedulerRecoveryRun",
                 "readSchedulerCheckpointEvidence",
@@ -269,6 +306,7 @@ class SchedulerDurableRecoveryTests(unittest.TestCase):
                 "runId": OLD_RUN_ID,
             },
             "issueNumber": 382,
+            "comments": [pin_comment()],
             # The historical run is deliberately absent from the recent list.
             "workflowRuns": [
                 {
@@ -428,6 +466,7 @@ class SchedulerDurableRecoveryTests(unittest.TestCase):
             {
                 "number": 500,
                 "state": "open",
+                "body": snapshot_ref(),
                 "head": {
                     "ref": "opencode/issue382-39933043642",
                     "sha": NEW_SHA,
@@ -453,6 +492,7 @@ class SchedulerDurableRecoveryTests(unittest.TestCase):
                 "number": 500,
                 "state": "merged",
                 "merged_at": "2026-10-23T09:40:00Z",
+                "body": snapshot_ref(),
                 "head": {
                     "ref": "opencode/issue382-older-attempt",
                     "sha": OLD_SHA,
@@ -481,6 +521,7 @@ class SchedulerDurableRecoveryTests(unittest.TestCase):
             {
                 "number": 500,
                 "state": "open",
+                "body": snapshot_ref(),
                 "head": {
                     "ref": "opencode/issue382-39933043642",
                     "sha": OLD_SHA,
@@ -513,6 +554,7 @@ class SchedulerDurableRecoveryTests(unittest.TestCase):
             {
                 "number": 500,
                 "state": "open",
+                "body": snapshot_ref(),
                 "head": {
                     "ref": "opencode/issue382-39933043642",
                     "sha": descendant,
@@ -524,6 +566,75 @@ class SchedulerDurableRecoveryTests(unittest.TestCase):
         evaluation = self.run_scenario(scenario)["evaluation"]
         self.assertFalse(evaluation["keepReservation"])
         self.assertEqual(evaluation["reason"], "run-completed-success")
+
+    def test_publication_must_name_the_pinned_task_snapshot(self):
+        # A PR-body reference is only evidence when it names the authoritative
+        # pin: a missing, mismatched, duplicated, or foreign reference must
+        # never complete this recovery.
+        for name, body in (
+            ("missing", ""),
+            ("mismatched", snapshot_ref(spec="f" * 64)),
+            ("duplicated", snapshot_ref() + "\n" + snapshot_ref()),
+            ("foreign-issue", snapshot_ref(issue=999)),
+            ("foreign-generation", snapshot_ref(generation=2)),
+        ):
+            with self.subTest(name=name):
+                scenario = self.base_scenario()
+                scenario["exactRuns"][0]["conclusion"] = "success"
+                scenario["jobs"] = [
+                    {
+                        "id": 132975886955,
+                        "steps": [
+                            {"name": "Run OpenCode", "conclusion": "success"}
+                        ],
+                    }
+                ]
+                scenario["pulls"] = [
+                    {
+                        "number": 500,
+                        "state": "open",
+                        "body": body,
+                        "head": {
+                            "ref": "opencode/issue382-39933043642",
+                            "sha": NEW_SHA,
+                            "repo": {"full_name": "kodmial/continuum"},
+                        },
+                    }
+                ]
+                evaluation = self.run_scenario(scenario)["evaluation"]
+                self.assertTrue(evaluation["keepReservation"])
+                self.assertTrue(evaluation["recoveryPending"])
+                self.assertEqual(
+                    evaluation["reason"],
+                    "run-completed-success-without-publication",
+                )
+
+    def test_publication_without_an_authoritative_snapshot_pin_fails_closed(self):
+        scenario = self.base_scenario()
+        scenario["comments"] = []
+        scenario["exactRuns"][0]["conclusion"] = "success"
+        scenario["jobs"] = [
+            {
+                "id": 132975886955,
+                "steps": [{"name": "Run OpenCode", "conclusion": "success"}],
+            }
+        ]
+        scenario["pulls"] = [
+            {
+                "number": 500,
+                "state": "open",
+                "body": snapshot_ref(),
+                "head": {
+                    "ref": "opencode/issue382-39933043642",
+                    "sha": NEW_SHA,
+                    "repo": {"full_name": "kodmial/continuum"},
+                },
+            }
+        ]
+        evaluation = self.run_scenario(scenario)["evaluation"]
+        self.assertTrue(evaluation["keepReservation"])
+        self.assertTrue(evaluation["recoveryPending"])
+        self.assertEqual(evaluation["reason"], "publication-unavailable")
 
     def test_matching_publication_does_not_bypass_implementation_evidence(self):
         scenario = self.base_scenario()
@@ -541,6 +652,7 @@ class SchedulerDurableRecoveryTests(unittest.TestCase):
             {
                 "number": 500,
                 "state": "open",
+                "body": snapshot_ref(),
                 "head": {
                     "ref": "opencode/issue382-39933043642",
                     "sha": NEW_SHA,
