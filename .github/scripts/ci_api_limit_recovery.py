@@ -87,7 +87,13 @@ def has_github_primary_limit_error(log: str) -> bool:
 
 def classify_failure(run: dict, jobs: list, read_logs) -> str:
     """'github-403', 'code', or 'unknown'. Unknown must never dispatch OpenCode."""
-    if run.get("event") != "pull_request" or run.get("status") != "completed" or run.get("conclusion") != "failure":
+    if run.get("event") not in ("pull_request", "workflow_dispatch") or run.get("status") != "completed":
+        return "unknown"
+    # Preserve the existing CI Repair timeout contract. A timeout alone is
+    # not evidence of GitHub REST quota exhaustion or an OpenCode provider 429.
+    if run.get("conclusion") == "timed_out":
+        return "code"
+    if run.get("conclusion") != "failure":
         return "unknown"
     if not isinstance(jobs, list) or not jobs:
         return "unknown"

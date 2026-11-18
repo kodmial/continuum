@@ -359,8 +359,16 @@ class MockGithub {
 }
 
 function mockFetch(url) {
+  // The production watchdog checks GitHub's free core-budget endpoint before
+  // starting any 429 checkpoint work. This is a GitHub REST fixture, never a
+  // simulated OpenCode provider response. `rateLimitBudget` models the whole
+  // endpoint (including an unavailable one); `restRemaining` is the shorthand
+  // used by exhaustion-only scenarios.
   if (/\/rate_limit$/.test(String(url))) {
-    const budget = scenario.rateLimitBudget || { limit: 5000, remaining: 5000 };
+    const budget = scenario.rateLimitBudget || {
+      limit: 5000,
+      remaining: scenario.restRemaining === undefined ? 4500 : scenario.restRemaining,
+    };
     return Promise.resolve({
       ok: budget.httpStatus ? false : true,
       status: budget.httpStatus || 200,
@@ -812,6 +820,18 @@ class WatchdogHarness(unittest.TestCase):
                 "GitHub REST budget endpoint unavailable" in " ".join(line)
                 for line in result["notices"]
             ),
+            result["notices"],
+        )
+
+    def test_github_rest_budget_exhaustion_does_not_start_model_429_recovery(self):
+        # GitHub's core-REST quota and provider-side OpenCode 429 stay separate.
+        scenario = base_scenario()
+        scenario["restRemaining"] = 0
+        result = self.run_scenario(scenario)
+        self.assert_no_dispatch(result)
+        self.assertEqual(result["runLookups"], [])
+        self.assertTrue(
+            any("GitHub REST budget" in str(item) for item in result["notices"]),
             result["notices"],
         )
 

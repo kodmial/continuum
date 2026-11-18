@@ -34,6 +34,16 @@ class GitHub403RecoveryTests(unittest.TestCase):
             run(), jobs("Run validation contract"), lambda _: "##[error]API rate limit exceeded"
         ), "code")
 
+    def test_timeout_remains_code_repairable_without_github_403_evidence(self):
+        timed_out = dict(run(), conclusion="timed_out")
+        self.assertEqual(m.classify_failure(timed_out, [], lambda _: ""), "code")
+
+    def test_explicit_workflow_dispatch_report_remains_repairable(self):
+        dispatched = dict(run(), event="workflow_dispatch")
+        self.assertEqual(m.classify_failure(
+            dispatched, jobs("Run validation contract"), lambda _: ""
+        ), "code")
+
     def test_plain_permission_403_is_not_rate_exhaustion(self):
         self.assertEqual(m.classify_failure(
             run(), jobs(), lambda _: "##[error]Resource not accessible by integration (403)"
