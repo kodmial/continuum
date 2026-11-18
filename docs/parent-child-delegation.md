@@ -1,5 +1,7 @@
 # Parent/child delegated execution
 
+[English](parent-child-delegation.md) | [Русский](parent-child-delegation.ru.md)
+
 Continuum can execute work for a child repository from a parent repository
 without treating public/private visibility as a role.
 
@@ -37,6 +39,15 @@ environment values. The Continuum runtime reads the caller repository's Actions
 variables directly through the GitHub API inside the runner.
 
 ## Discovery and bidirectional verification
+
+```mermaid
+flowchart TD
+  P[Parent: CONTINUUM_CHILDREN contains id] --> D[Enumerate repositories visible to the token]
+  D --> C{Candidate has CONTINUUM_ROLE=child,<br/>matching CONTINUUM_CHILD_ID,<br/>and exact CONTINUUM_PARENT?}
+  C -->|all four conditions hold| V[Verified child relationship]
+  C -->|zero matches| Z[Fail closed]
+  C -->|multiple matches| Z
+```
 
 The parent uses its runtime token to enumerate repositories owned by the token
 holder **without any visibility filter**. For each candidate it reads the
@@ -240,6 +251,10 @@ CI, issue scheduling, OpenCode,
 release, Render, and artifact workflows. The token is supplied through the
 parent's existing `TAP_PAT` secret; it must be able to read the relevant Actions
 repository variables and operate on the selected child repositories.
+
+> [!IMPORTANT]
+> Install and verify `core` first. The `parent` set adds only child execution
+> wrappers; it does not replace the ordinary scheduler.
 
 Core workflow files may remain installed in a child repository. Role changes are
 configuration-only: setting or clearing `CONTINUUM_ROLE=child` never requires

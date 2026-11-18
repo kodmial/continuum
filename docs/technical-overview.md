@@ -1,5 +1,7 @@
 # Continuum technical overview
 
+[English](technical-overview.md) | [Русский](technical-overview.ru.md)
+
 This is the complete technical reference for Continuum. The concise entry
 point is the [README](../README.md), which also links to the
 [Quick Start](quickstart.md).
@@ -62,12 +64,14 @@ scenario. Parent/child delegated execution is an advanced, optional layer.
 
 ## Safety model
 
-1. **Human admission is explicit.** Set `AUTOMATION_READY_LABEL` (for example
-   to `automation:ready`) before opening issues. When the variable is set, the
-   scheduler auto-dispatches only issues carrying that label. When it is empty,
-   the scheduler keeps its historical behavior and may enqueue any eligible open
-   issue. Qualification dispatch and an owner's manual `/oc` command do not
-   require the label.
+> [!IMPORTANT]
+> Set `AUTOMATION_READY_LABEL` (for example `automation:ready`) **before opening
+> issues**. While it is empty, the scheduler keeps its historical behavior and
+> may enqueue any eligible open issue.
+
+1. **Human admission is explicit.** When the variable is set, the
+   scheduler auto-dispatches only issues carrying that label. Qualification
+   dispatch and an owner's manual `/oc` command do not require the label.
 2. **Automation writes through pull requests.** Installed workflows create
    branches and PRs; they do not push directly to `main`.
 3. **Every merge is exact-HEAD.** CI and review evidence must belong to the
@@ -157,19 +161,27 @@ the lifecycle. Continuum supplies:
 
 ## Architecture
 
-```text
-                    GitHub repository
-  issue (admitted)        branch + PR        CI / review / gates
-        |                     ^                      |
-        v                     |                      v
-  Issue scheduler  -->  OpenCode agent  -->  CI  -->  review?
-        |                     ^                      |
-        |                     |                      v
-        +---- repair / re-review loop <------ repair controller
-                                                     |
-                                                     v
-                                          exact-HEAD merge gate -> merge
+```mermaid
+flowchart LR
+  I[Admitted issue] --> S[Issue scheduler]
+  S --> O[OpenCode agent]
+  O --> P[Branch and pull request]
+  P --> C[Project CI]
+  C --> R{Review provider}
+  R -->|none| M[Exact-HEAD merge gate]
+  R -->|CodeRabbit or PR-Agent| V[Review evidence]
+  V --> M
+  M -->|all gates pass| D[Merge]
+  M -->|missing, stale, or red| F[Bounded repair]
+  F --> P
 ```
+
+In prose: the scheduler admits and reserves an issue, the OpenCode agent
+implements it on a branch and opens a pull request, the project-owned `CI`
+workflow validates that HEAD, an optional review provider adds independent
+evidence, and the merge gate merges only when every configured gate passes for
+the same HEAD. A repair path re-enters through a new HEAD, which invalidates
+the earlier evidence.
 
 Continuum's reusable workflows run from `kodmial/continuum` at the revision you
 pin. The consumer repository owns only the caller stubs, its own `ci.yml`, and
@@ -454,6 +466,11 @@ Swift-profile variable list.
 ## What has been live-qualified
 
 This section deliberately separates deterministic coverage from live evidence.
+
+> [!NOTE]
+> Documentation describes the contract; it is not itself proof that a route ran
+> in an external consumer repository. The table states the evidence level
+> plainly.
 
 | Route | Honest status |
 | --- | --- |

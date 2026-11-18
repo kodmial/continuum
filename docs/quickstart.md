@@ -1,9 +1,12 @@
 # Continuum Quick Start
 
+[English](quickstart.md) | [Русский](quickstart.ru.md)
+
 This walkthrough takes a **fresh, isolated test repository** from zero to one
 autonomous issue implementation. It deliberately starts with a negative check:
 an ordinary issue must not be dispatched before you explicitly admit it.
 
+> [!WARNING]
 > **Do not run this against an existing consumer repository.** Use a disposable
 > repository with no valuable work. The Create/Use/Actions steps in this document
 > were **not executed live** for this repository generation; see
@@ -203,6 +206,10 @@ the token in a tracked file.
 
 `AUTOMATION_READY_LABEL` is the important safety setting:
 
+> [!IMPORTANT]
+> Set `AUTOMATION_READY_LABEL` **before the first issue**. While the variable is
+> empty, the scheduler may enqueue any eligible open issue.
+
 - **set** to `automation:ready`: only issues carrying that label are
   automatically implemented;
 - **empty** (the historical default): the scheduler may enqueue any eligible
@@ -344,6 +351,9 @@ succeed.
 ## 9. Clean up
 
 For a disposable test repository:
+
+> [!CAUTION]
+> This permanently deletes the test repository and everything in it.
 
 ```sh
 gh repo delete "$TEST_REPO" --yes
