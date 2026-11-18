@@ -1007,6 +1007,59 @@ class CheckpointHoldReleaseTests(unittest.TestCase):
                 name,
             )
 
+    def test_a_released_retry_never_reopens_after_an_identical_rejection(self):
+        # One released retry, then a new rejection that repeats the exact
+        # checkpoint, base, snapshot, generation and reason. The surviving
+        # release and its consumption receipt are bound to that rejection
+        # history, so neither controller may admit a second resumption of the
+        # same identity.
+        scenario = self.base_scenario()
+        scenario["comments"].extend([
+            {
+                "id": 2,
+                "body": release_marker(),
+                "user": {"login": "github-actions[bot]"},
+                "author_association": "OWNER",
+                "created_at": "2026-11-17T12:00:00Z",
+            },
+            {
+                "id": 3,
+                "body": consumption_marker(2),
+                "user": {"login": "github-actions[bot]"},
+                "author_association": "OWNER",
+                "created_at": "2026-11-17T12:01:00Z",
+            },
+            {
+                "id": 4,
+                "body": hold_marker(),
+                "user": {"login": "github-actions[bot]"},
+                "author_association": "OWNER",
+                "created_at": "2026-11-17T12:05:00Z",
+            },
+        ])
+        result = self.run_scenario(scenario)
+        for name in ("scheduler", "watchdog"):
+            self.assertTrue(result[name]["blocked"], name)
+            self.assertFalse(result[name]["release"]["released"], name)
+            self.assertEqual(
+                result[name]["release"]["reason"],
+                "release-consumed-or-superseded",
+                name,
+            )
+        # The retried episode stays spent: no replacement release is minted
+        # and the single receipt still records the one resumed attempt.
+        self.assertEqual(
+            len([c for c in result["comments"] if "resume-release" in c["body"]]),
+            1,
+        )
+        self.assertEqual(
+            len([
+                c for c in result["comments"]
+                if "resume-consumed" in c["body"]
+            ]),
+            1,
+        )
+
     def test_non_fixable_hold_reason_stays_blocked_with_a_verified_fix(self):
         scenario = self.base_scenario()
         scenario["comments"][0]["body"] = hold_marker("checkpoint-missing")
