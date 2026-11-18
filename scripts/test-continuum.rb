@@ -7530,6 +7530,16 @@ class ContinuumTest < Minitest::Test
     assert_includes scheduler, 'const freshResumeHold = await checkpointResumeHold('
     assert_includes scheduler, 'checkpointWrongGenerationRelease('
 
+    # The release is admission only: it must not post a new marker/claim,
+    # mutate labels, delete history, or rewrite a checkpoint ref. The single
+    # consumed attempt is the existing canonical dispatch receipt, and every
+    # lease/stop/pause/active-run guard stays outside this decision.
+    refute_match(
+      /createComment|deleteComment|addLabel|removeLabel|createRef|updateRef|deleteRef|createDispatch|dispatchWorkflow/,
+      scheduler_hold,
+      'the hold release must not add a claim, marker, label, or move a checkpoint'
+    )
+
     fresh_hold_at = scheduler.index('const freshResumeHold = await checkpointResumeHold(')
     refute_nil fresh_hold_at, 'the JIT hold read is missing'
     assert_operator scheduler.index('(pauseOnFailure && freshLabels.has(pausedLabel))'),
@@ -7633,6 +7643,7 @@ class ContinuumTest < Minitest::Test
             'main': baseSha
           },
           compareStatus: 'ahead',
+          merged: true,
           mergedAt: mergedAt,
           mergeSha: fixSha,
           pullError: false,
@@ -7666,7 +7677,7 @@ class ContinuumTest < Minitest::Test
                   throw error;
                 }
                 return { data: {
-                  merged: true,
+                  merged: config.merged,
                   merged_at: config.mergedAt,
                   merge_commit_sha: config.mergeSha
                 } };
@@ -7776,6 +7787,12 @@ class ContinuumTest < Minitest::Test
           false, 'an unreadable compare must keep the hold');
         assert.equal(await release(baseComments, { pullError: true }),
           false, 'an unreadable fix PR must keep the hold');
+        assert.equal(await release(baseComments, { merged: false }),
+          false, 'an unmerged fix PR must keep the hold');
+        engineHeadOverride = '';
+        assert.equal(await release(baseComments), false,
+          'an unreadable engine HEAD must keep the hold');
+        engineHeadOverride = engineHead;
         assert.equal(await release(baseComments, { mergeSha: otherSha }),
           false, 'a different merge commit must keep the hold');
         assert.equal(await release(baseComments, { mergedAt: '' }),
