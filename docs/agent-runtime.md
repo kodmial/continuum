@@ -289,7 +289,7 @@ identity, provider instance identity, lifecycle timestamps, and cleanup
 evidence; avoid publishing unnecessary raw network-address data.
 
 No external-provider live evidence is linked in this repository generation.
-The [README live-status table](../README.md#what-has-been-live-qualified)
+The [live-status table](technical-overview.md#what-has-been-live-qualified)
 records hosted Linux toolchain cold/warm restore and a small inference as
 historical evidence for OpenCode `1.19.3` only. That evidence does not qualify
 the current hosted pin, OpenCode `2.2.6`, and it is not a real external
