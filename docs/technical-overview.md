@@ -98,6 +98,13 @@ owner-authored marker line on that issue:
 <!-- continuum-resume-after:v1 predecessor=374 -->
 ```
 
+Before posting the marker, set `AUTOMATION_READY_LABEL` (for example
+`automation:ready`) and apply that exact label, together with
+`automation:paused`, to the issue. Owner-armed recovery selects only paused
+issues that carry the configured ready label, so it requires a non-empty
+`AUTOMATION_READY_LABEL` as well as the label on the issue; labels on the issue
+alone do not qualify while the variable is empty.
+
 The line must be the first line of a comment from the repository owner as
 reported by the GitHub API; a bot, member, model, or prose-only mention cannot
 arm it. The marker is metadata, never an OpenCode command. It authorizes only
@@ -260,6 +267,7 @@ Example:
 name: CI
 on:
   push:
+    branches: [main]
   pull_request:
   workflow_dispatch:
 permissions:
@@ -313,6 +321,17 @@ can remove callers Continuum no longer ships. Deletion is fenced:
    remove;
 4. `--yes` or `CONTINUUM_INSTALL_ASSUME_YES=1` is the explicit opt-out;
 5. installing into Continuum's own checkout is refused before any write.
+
+Reinstalling updates the installed callers only; it does not touch the
+project-owned `CI` or Contract Gate workflows. On every upgrade, including
+after a security update, update both Continuum references in each of those
+workflows — the reusable-workflow `uses:` ref and the matching `continuum_ref:`
+input — to the same reviewed full commit SHA you installed from. Leaving either
+reference on a moving branch would let validation or Contract Gate evidence
+come from a revision you did not review. See [CI ownership](#ci-ownership) for
+the primary caller and
+[Required Contract Gate workflow](consumer-variables.md#required-contract-gate-workflow)
+for the gate.
 
 Do not hand-edit an installed `continuum-*.yml` caller. Put project-specific
 behavior in a project-owned workflow instead.
@@ -369,9 +388,20 @@ the relationship values in repository variables, not tracked files.
 
 The ordinary core `Issue scheduler` owns parent/child dispatch. The `parent` set
 adds only child execution wrappers. A child with `CONTINUUM_ROLE=child` never
-schedules local work; it verifies the relationship and wakes the parent. See
-[parent-child-delegation.md](parent-child-delegation.md) for the full
-contract, discovery rules, and failure semantics.
+schedules local work; it verifies the relationship and wakes the parent.
+
+The installed primary `CI` caller is not a child pull-request test gate:
+`continuum-validation.yml` skips its `Validate` job when
+`vars.CONTINUUM_ROLE == 'child'`, so the project test hook and auto-detection do
+not run there. For delegated child work, set `CONTINUUM_VALIDATION_SCRIPT` on
+the child to a repository-relative `.sh` path; delegated review loads that
+script from the child's base branch and runs it against the candidate worktree,
+and merge requires it to pass. If the child also needs a local pull-request
+check, add a separate project-owned workflow that runs the project's test
+command directly; do not rely on the installed `CI` caller for that check while
+the repository role is `child`. See
+[parent-child-delegation.md](parent-child-delegation.md#deterministic-child-validation)
+for the full contract, discovery rules, and failure semantics.
 
 ## Secrets and variables
 
@@ -385,10 +415,13 @@ Secret names are part of the interface and never change per consumer.
 | `CHILD_RUNTIME_REPOSITORIES` | Legacy parent configuration only | Optional compatibility path for pre-variable child relationships. |
 | `CONTINUUM_VERIFICATION_ATTESTATION_KEY` | Optional; enable signed resumable verification evidence | Optional HMAC-SHA256 key used only by the runner-side verification engine. The workflow keeps the value in a non-exported shell variable, writes it with `python -m continuum.verification provision-key` to a private file outside the task worktree, and passes only `CONTINUUM_VERIFICATION_ATTESTATION_KEY_FILE` to each verification call. The engine rejects the value form in its environment and removes the file after reading it. If omitted, a resumed run rebuilds the baseline and re-resolves the contract instead of trusting an attestation. |
 
-No paid provider key is part of the contract: **no workflow reads
-`OPENCODE_API_KEY`, `ANTHROPIC_API_KEY`, `GROQ_API_KEY`, or `GROQ.KEY`.** Core
-runs on free anonymous models. `secrets.GITHUB_TOKEN` is minted by GitHub
-automatically and is not a credential you define.
+No paid provider key is part of the contract. Core workflows do not use
+`OPENCODE_API_KEY`, `ANTHROPIC_API_KEY`, `GROQ_API_KEY`, or `GROQ.KEY` and run
+on free anonymous models. The optional PR-Agent canary also does not
+authenticate with them: when enabled, it reads the `OPENCODE_API_KEY`,
+`ANTHROPIC_API_KEY`, and `GROQ_API_KEY` repository variables only to fail
+closed if any is set. `secrets.GITHUB_TOKEN` is minted by GitHub automatically
+and is not a credential you define.
 
 Repository variables:
 

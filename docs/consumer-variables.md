@@ -239,12 +239,6 @@ non-empty `name:`. Otherwise every owner-armed resume decision is `NOOP`
 (`Contract Gate evidence is missing on the PR HEAD`) and the paused issue is
 never resumed.
 
-This gate is project-owned: the installer never creates or edits it. Pin both
-of its Continuum references yourself to the same reviewed full commit SHA you
-installed the callers from, as shown by `<reviewed-sha>` below. Leaving either
-reference on a moving branch would let the evidence come from a revision you
-did not review.
-
 ```yaml
 # .github/workflows/contract-gate.yml
 name: Continuum Contract Gate
@@ -259,9 +253,9 @@ permissions:
 
 jobs:
   validate:
-    uses: kodmial/continuum/.github/workflows/continuum-validation.yml@<reviewed-sha>
+    uses: kodmial/continuum/.github/workflows/continuum-validation.yml@main
     with:
-      continuum_ref: <reviewed-sha>
+      continuum_ref: main
       # Keep the gate's result distinct from the CI caller's
       # continuum/validation context so the two cannot overwrite each other.
       status_context: continuum/contract-gate

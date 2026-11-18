@@ -88,9 +88,12 @@ are documented in full.
 | `CHILD_RUNTIME_REPOSITORIES` | Legacy parent configuration only | Compatibility path for pre-variable child relationships. |
 | `CONTINUUM_VERIFICATION_ATTESTATION_KEY` | Optional signed resumable verification evidence | HMAC-SHA256 key used only by the runner-side verification engine. |
 
-No workflow reads a paid provider key (`OPENCODE_API_KEY`, `ANTHROPIC_API_KEY`,
-`GROQ_API_KEY`, or `GROQ.KEY`); core runs on free anonymous models and
-`secrets.GITHUB_TOKEN` is minted by GitHub automatically. The
+Core workflows do not use paid provider keys (`OPENCODE_API_KEY`,
+`ANTHROPIC_API_KEY`, `GROQ_API_KEY`, or `GROQ.KEY`) and run on free anonymous
+models. No workflow reads them to authenticate; the optional PR-Agent canary
+reads the `OPENCODE_API_KEY`, `ANTHROPIC_API_KEY`, and `GROQ_API_KEY` repository
+variables only to reject the run if any is set. `secrets.GITHUB_TOKEN` is
+minted by GitHub automatically. The
 [technical overview](docs/technical-overview.md#secrets-and-variables) explains
 each entry, the verification-key provisioning path, and the full repository
 variable defaults.

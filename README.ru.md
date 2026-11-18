@@ -92,10 +92,13 @@ Continuum — это переиспользуемая плоскость упр�
 | `CHILD_RUNTIME_REPOSITORIES` | Только для устаревшей конфигурации parent | Путь совместимости для связей дочерних репозиториев, задававшихся до появления переменных. |
 | `CONTINUUM_VERIFICATION_ATTESTATION_KEY` | Необязательные подписанные возобновляемые свидетельства проверки | Ключ HMAC-SHA256, используемый только движком проверки на раннере. |
 
-Ни один workflow не читает платный ключ провайдера (`OPENCODE_API_KEY`,
-`ANTHROPIC_API_KEY`, `GROQ_API_KEY` или `GROQ.KEY`); основные workflows работают
-на бесплатных анонимных моделях, а `secrets.GITHUB_TOKEN` создаётся GitHub
-автоматически. [Технический обзор](docs/technical-overview.md#secrets-and-variables)
+Основные workflows не используют платные ключи провайдеров (`OPENCODE_API_KEY`,
+`ANTHROPIC_API_KEY`, `GROQ_API_KEY` или `GROQ.KEY`) и работают на бесплатных
+анонимных моделях. Ни один workflow не читает их для аутентификации;
+необязательный canary PR-Agent читает переменные репозитория `OPENCODE_API_KEY`,
+`ANTHROPIC_API_KEY` и `GROQ_API_KEY` только чтобы отклонить запуск, если какая-либо
+из них задана. `secrets.GITHUB_TOKEN` создаётся GitHub автоматически.
+[Технический обзор](docs/technical-overview.md#secrets-and-variables)
 описывает каждый пункт, порядок подготовки ключа проверки и значения по
 умолчанию для переменных репозитория.
 
