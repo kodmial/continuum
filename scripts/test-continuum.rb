@@ -3798,6 +3798,13 @@ class ContinuumTest < Minitest::Test
         else
           stringify(haystack).downcase.include?(stringify(needle).downcase)
         end
+      when 'format'
+        raise ExpressionError, 'format() expects at least one argument' if args.empty?
+
+        stringify(args[0]).gsub(/\{(\d+)\}/) do
+          index = Regexp.last_match(1).to_i
+          stringify(args[index + 1])
+        end
       when 'fromjson'
         raise ExpressionError, 'fromJSON() expects one argument' unless args.length == 1
 
@@ -3864,6 +3871,10 @@ class ContinuumTest < Minitest::Test
         'actor' => actor,
         'repository_owner' => 'kodmial',
         'event' => {
+          # `run-name:` reads the raw dispatch payload; job conditions read the
+          # typed top-level `inputs` context. Mirror both so one context can
+          # evaluate either surface.
+          'inputs' => inputs,
           'comment' => comment || {},
           'action' => action,
           'schedule' => schedule,
@@ -3883,6 +3894,16 @@ class ContinuumTest < Minitest::Test
 
   def automation_route(*jobs)
     AUTOMATION_ROUTING_JOBS.to_h { |job| [job, jobs.include?(job)] }
+  end
+
+  # Render the checked-in `run-name:` template for an event so the periodic
+  # gate contract is asserted against the name the workflow actually produces.
+  def automation_run_name(event_name, **context)
+    template = yaml(File.join(ROOT, '.github/workflows/automation.yml')).fetch('run-name')
+    routing_context = automation_event_context(event_name, **context)
+    template.gsub(/\$\{\{(.*?)\}\}/m) do
+      GithubExpression.new(Regexp.last_match(1), routing_context).evaluate.to_s
+    end
   end
 
   # #470: `auto_merge_only` is a dispatch mode selector, not just an input
@@ -3941,6 +3962,55 @@ class ContinuumTest < Minitest::Test
        {'periodic_wake' => 'true', 'auto_merge_only' => 'false'}, periodic]
     ].each do |label, inputs, expected|
       assert_equal expected, automation_routing(conditions, 'workflow_dispatch', inputs: inputs), label
+    end
+  end
+
+  # #470 follow-up: a narrow dispatch runs only `auto-merge`, so its successful
+  # run must not satisfy the scheduler's periodic window gate. Evaluate the
+  # checked-in `run-name:` template and feed the produced titles through the
+  # real gate step; a broad periodic title stays the completion control.
+  def test_auto_merge_only_narrow_run_name_is_not_periodic_window_evidence
+    narrow = automation_run_name('workflow_dispatch',
+                                 inputs: {'periodic_wake' => 'true',
+                                          'auto_merge_only' => 'true'})
+    assert_includes narrow, '[continuum-auto-merge-only]'
+    assert_includes narrow, '[continuum-wake:auto-merge-only]'
+    refute_includes narrow, '[continuum-wake:true]'
+    refute_includes narrow, '[continuum-periodic]'
+
+    [true, 'true'].each do |selector|
+      title = automation_run_name('workflow_dispatch',
+                                  inputs: {'auto_merge_only' => selector})
+      assert_includes title, '[continuum-wake:auto-merge-only]',
+                      "auto_merge_only=#{selector.inspect} must produce the narrow marker"
+    end
+
+    broad = automation_run_name('workflow_dispatch', inputs: {'periodic_wake' => 'true'})
+    assert_equal 'Continuum automation [continuum-periodic] [continuum-wake:true]', broad
+
+    broad_disabled = automation_run_name('workflow_dispatch',
+                                         inputs: {'periodic_wake' => 'false'})
+    assert_equal 'Continuum automation workflow_dispatch [continuum-wake:false]',
+                 broad_disabled
+
+    skip 'jq is required for the periodic evidence filter' unless jq_available?
+
+    fixture do |dir|
+      outputs = run_periodic_gate(
+        dir, caller_event: 'workflow_dispatch', periodic: 'true', evidence_titles: [narrow]
+      )
+      assert_equal 'true', outputs.fetch('run'),
+                   'a successful narrow run must not close the periodic window'
+      assert_equal 'window-due', outputs.fetch('reason')
+    end
+
+    fixture do |dir|
+      outputs = run_periodic_gate(
+        dir, caller_event: 'workflow_dispatch', periodic: 'true', evidence_titles: [broad]
+      )
+      assert_equal 'false', outputs.fetch('run'),
+                   'a successful broad periodic run must still close the window'
+      assert_equal 'duplicate-window', outputs.fetch('reason')
     end
   end
 

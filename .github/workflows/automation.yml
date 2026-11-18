@@ -1,6 +1,10 @@
 name: Continuum automation
+# A narrow `auto_merge_only` dispatch runs only `auto-merge`, so it is not a
+# scheduler pass. It therefore stamps distinct markers that the scheduler's
+# periodic window gate cannot read as completed scheduler evidence. Broad
+# dispatches keep the #375 markers unchanged.
 run-name: >-
-  Continuum automation ${{ contains(format(' {0} ', github.event.inputs.periodic_wake), ' true ') && '[continuum-periodic]' || github.event_name }} ${{ github.event_name == 'workflow_dispatch' && format('[continuum-wake:{0}]', github.event.inputs.periodic_wake) || '' }}
+  Continuum automation ${{ (github.event_name == 'workflow_dispatch' && (github.event.inputs.auto_merge_only == 'true' || github.event.inputs.auto_merge_only == true)) && '[continuum-auto-merge-only]' || (contains(format(' {0} ', github.event.inputs.periodic_wake), ' true ') && '[continuum-periodic]' || github.event_name) }} ${{ github.event_name == 'workflow_dispatch' && format('[continuum-wake:{0}]', (github.event.inputs.auto_merge_only == 'true' || github.event.inputs.auto_merge_only == true) && 'auto-merge-only' || github.event.inputs.periodic_wake) || '' }}
 
 on:
   workflow_dispatch:

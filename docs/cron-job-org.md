@@ -207,11 +207,15 @@ testing, and maintaining the job is an explicit manual operator step.
 
 Use the repository's actual default branch in `ref` if it is not `main`. Both
 inputs are required for this backstop. `periodic_wake=true` is the existing
-external periodic marker from the Issue Scheduler setup, so the run name keeps
-the established `[continuum-periodic]` / `[continuum-wake:true]` markers.
+external periodic marker from the Issue Scheduler setup, and a broad dispatch
+keeps the established `[continuum-periodic]` / `[continuum-wake:true]` markers.
 `auto_merge_only=true` is a narrow job selector: it skips `scheduler`,
 `watchdog`, and `global-pr-watchdog` (including when `periodic_wake=true`), while
-`repair` already skips every dispatch. The existing `auto-merge` caller, its
+`repair` already skips every dispatch. Because the narrow run never runs the
+scheduler, it is stamped with `[continuum-auto-merge-only]` and
+`[continuum-wake:auto-merge-only]` instead; the scheduler's periodic window gate
+reads only `true` as periodic evidence, so a successful narrow run cannot make a
+later periodic dispatch skip its window. The existing `auto-merge` caller, its
 `uses` target, `with` inputs, permissions, and engine stay unchanged. Both
 inputs are mode selectors, not authorization overrides.
 
@@ -242,9 +246,10 @@ PR merged.
 
 1. Use cron-job.org's test button and confirm the dispatch is accepted (`204`).
 2. Open the `kodmial/continuum` Actions run list for **Continuum automation**.
-   The external run should show the established periodic markers and only the
-   `auto-merge` job should execute; `scheduler`, `watchdog`, `repair`, and
-   `global-pr-watchdog` should be skipped.
+   The external run should show `[continuum-auto-merge-only]` and
+   `[continuum-wake:auto-merge-only]`, and only the `auto-merge` job should
+   execute; `scheduler`, `watchdog`, `repair`, and `global-pr-watchdog` should
+   be skipped.
 3. Open the `auto-merge` job and read the canonical engine outcome. A truthful
    child-role skip is also valid. The reconciler may legitimately wake its own
    existing recovery/review workflows when ordinary reconciliation requires

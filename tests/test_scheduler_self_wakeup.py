@@ -19,11 +19,13 @@ import re
 import subprocess
 import tempfile
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
 
 import yaml
 
 from continuum import opencode_commands
+from continuum.periodic_wake import periodic_dedupe_decision
 
 ROOT = Path(__file__).resolve().parents[1]
 CONSUMER_SCHEDULER = ROOT / ".github" / "caller-stubs" / "continuum-issue-scheduler.yml"
@@ -229,6 +231,16 @@ class GitHubExpression:
         return None
 
     @staticmethod
+    def _stringify(value):
+        if value is None:
+            return ""
+        if value is True:
+            return "true"
+        if value is False:
+            return "false"
+        return str(value)
+
+    @staticmethod
     def _call(name, args):
         if name in ("startsWith", "contains") and len(args) == 2:
             haystack = "" if args[0] is None else str(args[0]).casefold()
@@ -236,6 +248,15 @@ class GitHubExpression:
             if name == "startsWith":
                 return haystack.startswith(needle)
             return needle in haystack
+        if name == "format" and args:
+            template = "" if args[0] is None else str(args[0])
+
+            def replace(match):
+                index = int(match.group(1)) + 1
+                value = args[index] if index < len(args) else None
+                return GitHubExpression._stringify(value)
+
+            return re.sub(r"\{(\d+)\}", replace, template)
         if name == "fromJSON" and len(args) == 1:
             try:
                 return json.loads(args[0])
@@ -284,6 +305,9 @@ def event_context(
             "actor": actor,
             "repository_owner": OWNER,
             "event": {
+                # `run-name:` reads the raw dispatch payload; job conditions
+                # read the typed top-level `inputs` context.
+                "inputs": inputs or {},
                 "comment": comment or {},
                 "action": action,
                 "schedule": schedule,
@@ -294,6 +318,18 @@ def event_context(
         "vars": {"CONTINUUM_ROLE": role},
         "inputs": inputs or {},
     }
+
+
+def render_run_name(template, event_name, **context):
+    """Interpolate the checked-in ``run-name:`` template for an event."""
+
+    def evaluate(match):
+        value = GitHubExpression(
+            match.group(1), event_context(event_name, **context)
+        ).evaluate()
+        return GitHubExpression._stringify(value)
+
+    return re.sub(r"\$\{\{(.*?)\}\}", evaluate, template, flags=re.S)
 
 
 def comment(body, author=OWNER, association="OWNER"):
@@ -725,11 +761,73 @@ class AutomationAutoMergeOnlyRoutingTests(unittest.TestCase):
         run_name = self.workflow["run-name"]
         self.assertIn("[continuum-periodic]", run_name)
         self.assertIn("[continuum-wake:", run_name)
-        self.assertNotIn(
-            "auto_merge_only",
+        self.assertIn(
+            "[continuum-auto-merge-only]",
             run_name,
-            "the narrow selector must reuse the #375 markers, not add a competing one",
+            "the narrow selector must emit a marker the periodic gate cannot read"
+            " as scheduler completion evidence",
         )
+        self.assertIn("'auto-merge-only'", run_name)
+
+    def test_narrow_run_does_not_close_the_scheduler_periodic_window(self):
+        # A narrow run at 12:19 and a periodic dispatch at 12:21 share the
+        # native 12:17 window. The narrow run must not be completion evidence.
+        narrow = render_run_name(
+            self.workflow["run-name"],
+            "workflow_dispatch",
+            inputs={"periodic_wake": "true", "auto_merge_only": "true"},
+        )
+        self.assertIn("[continuum-auto-merge-only]", narrow)
+        self.assertIn("[continuum-wake:auto-merge-only]", narrow)
+        self.assertNotIn("[continuum-wake:true]", narrow)
+        self.assertNotIn("[continuum-periodic]", narrow)
+
+        broad = render_run_name(
+            self.workflow["run-name"],
+            "workflow_dispatch",
+            inputs={"periodic_wake": "true"},
+        )
+        self.assertEqual(
+            "Continuum automation [continuum-periodic] [continuum-wake:true]", broad
+        )
+
+        dispatch_epoch = int(
+            datetime(2026, 10, 23, 12, 21, tzinfo=timezone.utc).timestamp()
+        )
+        created = datetime.fromtimestamp(
+            dispatch_epoch - 120, tz=timezone.utc
+        ).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+        def decision(title):
+            return periodic_dedupe_decision(
+                now_epoch=dispatch_epoch,
+                runs=[
+                    {
+                        "id": 1,
+                        "event": "workflow_dispatch",
+                        "status": "completed",
+                        "conclusion": "success",
+                        "display_title": title,
+                        "created_at": created,
+                        "head_branch": "main",
+                    }
+                ],
+                current_run_id=2,
+                caller_event_name="workflow_dispatch",
+                periodic_wake="true",
+                default_branch="main",
+            )
+
+        narrow_decision = decision(narrow)
+        self.assertTrue(
+            narrow_decision.run,
+            "a successful narrow run must not close the periodic window",
+        )
+        self.assertEqual("window-due", narrow_decision.reason)
+
+        broad_decision = decision(broad)
+        self.assertFalse(broad_decision.run)
+        self.assertEqual("duplicate-window", broad_decision.reason)
 
     def test_external_two_input_wake_admits_only_auto_merge(self):
         expected = {
