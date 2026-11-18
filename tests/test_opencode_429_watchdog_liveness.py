@@ -293,11 +293,15 @@ class MockGithub {
 }
 
 function mockFetch(url) {
-  // The watchdog now probes the installation REST budget before scanning.
-  // A normal pass must observe a healthy budget; individual scenarios may
-  // override it to exercise the exhausted/low deferral path.
+  // The production watchdog now checks GitHub's free core-budget endpoint
+  // before starting any 429 checkpoint work. This is a GitHub REST fixture,
+  // never a simulated OpenCode provider response. Individual scenarios may
+  // override the reported budget to exercise the exhausted/low deferral path.
   if (/\/rate_limit$/.test(String(url))) {
-    const budget = scenario.rateLimit || { limit: 5000, remaining: 5000, reset: 0 };
+    const budget = scenario.rateLimit || {
+      limit: 5000,
+      remaining: scenario.restRemaining === undefined ? 4500 : scenario.restRemaining,
+    };
     return Promise.resolve({
       ok: true,
       status: 200,
@@ -607,6 +611,18 @@ class WatchdogHarness(unittest.TestCase):
 
     def assert_no_dispatch(self, result):
         self.assertEqual(result["dispatches"], [], result["dispatches"])
+
+    def test_github_rest_budget_exhaustion_does_not_start_model_429_recovery(self):
+        # GitHub's core-REST quota and provider-side OpenCode 429 stay separate.
+        scenario = base_scenario()
+        scenario["restRemaining"] = 0
+        result = self.run_scenario(scenario)
+        self.assert_no_dispatch(result)
+        self.assertEqual(result["runLookups"], [])
+        self.assertTrue(
+            any("GitHub REST budget" in str(item) for item in result["notices"]),
+            result["notices"],
+        )
 
     def test_382_old_failed_observed_run_does_not_own_newer_checkpoint(self):
         result = self.run_scenario(base_scenario())

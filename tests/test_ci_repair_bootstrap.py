@@ -49,7 +49,7 @@ def make_source_repo(path: Path, *, complete: bool = True) -> Path:
             "# test admission owner\n", encoding="utf-8"
         )
         (path / ".github/scripts/ci_api_limit_recovery.py").write_text(
-            "# test GitHub REST guard\n", encoding="utf-8"
+            "# test GitHub REST API exhaustion guard\n", encoding="utf-8"
         )
     (path / "unrelated.txt").write_text("must not be fetched\n", encoding="utf-8")
     git("add", ".", cwd=path)
