@@ -7561,6 +7561,13 @@ class ContinuumTest < Minitest::Test
     assert_includes watchdog, 'listedLastPage(newestResponse)'
     assert_includes watchdog, 'Math.floor(Date.now() / ROTATION_INTERVAL_MS)'
     assert_includes watchdog, "direction: 'asc'"
+    # Native blockers are authoritative on every issue-mode recovery route,
+    # not only durable discovery: the shared recovery function checks them
+    # before releasing a hold or dispatching.
+    assert_includes watchdog, 'async function openNativeBlockersForIssue('
+    assert_includes watchdog, 'openNativeBlockers = await openNativeBlockersForIssue('
+    assert_includes watchdog, 'Number(issueText)'
+    assert_includes watchdog, 'cannot verify native blockers'
     assert_includes watchdog, 'liveOverlap: async () => {'
     assert_includes watchdog, "reason: 'release-blocked-by-live-overlap'"
     assert_includes watchdog, "reason: 'release-overlap-unverified'"

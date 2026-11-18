@@ -1798,6 +1798,77 @@ class WatchdogHarness(unittest.TestCase):
             result["notices"],
         )
 
+    def scheduled_recent_run_scenario(self):
+        # No workflow_run payload: the eventless catch-up reads the recently
+        # completed run directly and reaches recoverFrom429OnFreshVm without
+        # durable discovery.
+        scenario = base_scenario()
+        scenario["triggerRun"] = None
+        recent = (
+            datetime.now(timezone.utc) - timedelta(minutes=5)
+        ).strftime("%Y-%m-%dT%H:%M:%SZ")
+        for key in ("created_at", "updated_at"):
+            scenario["runs"][0][key] = recent
+        return scenario
+
+    def test_workflow_run_native_blocker_is_not_resumed(self):
+        scenario = base_scenario()
+        scenario["blockedBy"] = [{"number": 900, "state": "open"}]
+        result = self.run_scenario(scenario)
+        self.assert_no_dispatch(result)
+        self.assertTrue(
+            any(
+                "native blocker #900 is still open" in " ".join(line)
+                for line in result["notices"]
+            ),
+            result["notices"],
+        )
+
+    def test_workflow_run_blocker_lookup_failure_fails_closed(self):
+        scenario = base_scenario()
+        scenario["blockedByError"] = 502
+        result = self.run_scenario(scenario)
+        self.assert_no_dispatch(result)
+        self.assertTrue(
+            any(
+                "cannot verify native blockers" in " ".join(line)
+                for line in result["notices"]
+            ),
+            result["notices"],
+        )
+
+    def test_scheduled_recent_run_native_blocker_is_not_resumed(self):
+        scenario = self.scheduled_recent_run_scenario()
+        scenario["blockedBy"] = [{"number": 900, "state": "open"}]
+        result = self.run_scenario(scenario)
+        self.assert_no_dispatch(result)
+        self.assertTrue(
+            any(
+                "native blocker #900 is still open" in " ".join(line)
+                for line in result["notices"]
+            ),
+            result["notices"],
+        )
+
+    def test_scheduled_recent_run_blocker_lookup_failure_fails_closed(self):
+        scenario = self.scheduled_recent_run_scenario()
+        scenario["blockedByError"] = 502
+        result = self.run_scenario(scenario)
+        self.assert_no_dispatch(result)
+        self.assertTrue(
+            any(
+                "cannot verify native blockers" in " ".join(line)
+                for line in result["notices"]
+            ),
+            result["notices"],
+        )
+
+    def test_scheduled_recent_run_closed_native_blocker_is_resumed(self):
+        scenario = self.scheduled_recent_run_scenario()
+        scenario["blockedBy"] = [{"number": 900, "state": "closed"}]
+        result = self.run_scenario(scenario)
+        self.assert_one_current_dispatch(result, NEW_SHA)
+
     def normal_retry_scenario(self):
         # A failed OpenCode issue run without a 429 marker reaches the normal
         # watchdog retry path (not `recoverFrom429OnFreshVm`).

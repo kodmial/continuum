@@ -2142,6 +2142,21 @@ jobs:
             }
             return { blocked: true, marker, release: null };
           }
+          async function openNativeBlockersForIssue(issueNumber) {
+            const blockers = await readGithub.paginate(
+              'GET /repos/{owner}/{repo}/issues/{issue_number}/dependencies/blocked_by',
+              {
+                owner,
+                repo,
+                issue_number: issueNumber,
+                per_page: 100,
+                headers: {
+                  'X-GitHub-Api-Version': '2026-03-10',
+                },
+              }
+            );
+            return blockers.filter(blocker => blocker.state === 'open');
+          }
           async function discoverDurableRecoveryCandidates() {
             // The durable recovery owner must not depend on the scheduler
             // leaving an in-progress reservation behind. A ready-only
@@ -2425,46 +2440,11 @@ jobs:
                 );
                 continue;
               }
-              // Native GitHub dependencies are authoritative. The scheduler
-              // releases an in-progress reservation when an open blocker
-              // exists, so a checkpoint that lost its labels must not be
-              // redispatched until that blocker is closed.
-              let nativeBlockers;
-              try {
-                nativeBlockers = await readGithub.paginate(
-                  'GET /repos/{owner}/{repo}/issues/{issue_number}/dependencies/blocked_by',
-                  {
-                    owner,
-                    repo,
-                    issue_number: issue.number,
-                    per_page: 100,
-                    headers: {
-                      'X-GitHub-Api-Version': '2026-03-10',
-                    },
-                  }
-                );
-              } catch (err) {
-                core.warning(
-                  'OpenCode durable 429 recovery cannot verify native blockers ' +
-                  'for issue #' + issue.number + ' (op=' + state.operation +
-                  ' gen=' + state.generation + ' checkpoint=' +
-                  state.checkpointRef + '); failing closed for this pass.'
-                );
-                continue;
-              }
-              const openNativeBlockers = nativeBlockers.filter(
-                blocker => blocker.state === 'open'
-              );
-              if (openNativeBlockers.length > 0) {
-                core.notice(
-                  'OpenCode durable 429 recovery leaves issue #' +
-                  issue.number + ' alone: native blocker ' +
-                  openNativeBlockers.map(
-                    blocker => '#' + blocker.number
-                  ).join(', ') + ' is still open.'
-                );
-                continue;
-              }
+              // Native GitHub dependencies are authoritative. The shared
+              // recovery entry point checks them (and fails closed when they
+              // cannot be read) before any hold release or dispatch, so this
+              // route and the direct workflow_run/recent-run routes share one
+              // guard.
               await recoverFrom429OnFreshVm({
                 owner,
                 repo,
@@ -2628,6 +2608,37 @@ jobs:
                 ' metadata failed validation: ' + validationError
               );
               return;
+            }
+            // Native GitHub dependencies are authoritative on every
+            // issue-mode recovery route. The workflow_run and scheduled
+            // recent-run routes reach this function directly, so checking here
+            // (before any hold release or dispatch) fails closed when a
+            // blocker is open or its state cannot be read.
+            if (mode === 'issue') {
+              let openNativeBlockers;
+              try {
+                openNativeBlockers = await openNativeBlockersForIssue(
+                  Number(issueText)
+                );
+              } catch (err) {
+                core.warning(
+                  'OpenCode infrastructure recovery cannot verify native blockers ' +
+                  'for issue #' + issueText + ' (op=' + operation +
+                  ' gen=' + generation + ' checkpoint=' + checkpointRef +
+                  '); failing closed for this pass.'
+                );
+                return;
+              }
+              if (openNativeBlockers.length > 0) {
+                core.notice(
+                  'OpenCode infrastructure recovery leaves issue #' +
+                  issueText + ' alone: native blocker ' +
+                  openNativeBlockers.map(
+                    blocker => '#' + blocker.number
+                  ).join(', ') + ' is still open.'
+                );
+                return;
+              }
             }
             // An owner STOP is authoritative for this operation. It is
             // evaluated before any release, retry, or claim so a stopped
