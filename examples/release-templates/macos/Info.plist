@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  ILLUSTRATIVE APP BUNDLE INFO.PLIST - INACTIVE, NOT QUALIFIED.
+
+  All values are neutral placeholders. The historical Apple adapter stamps both
+  CFBundleVersion and CFBundleShortVersionString from the release version
+  before it seals the bundle. Keep both keys present: a bundle without either
+  key fails the plan rather than shipping a stale version.
+-->
+<plist version="1.0">
+<dict>
+  <key>CFBundleExecutable</key>
+  <string>ExampleApp</string>
+  <key>CFBundleIdentifier</key>
+  <string>com.example.app</string>
+  <key>CFBundleName</key>
+  <string>ExampleApp</string>
+  <key>CFBundlePackageType</key>
+  <string>APPL</string>
+  <key>CFBundleShortVersionString</key>
+  <string>0.0.0</string>
+  <key>CFBundleVersion</key>
+  <string>0.0.0</string>
+</dict>
+</plist>
