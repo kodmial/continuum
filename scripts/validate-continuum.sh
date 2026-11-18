@@ -270,3 +270,6 @@ bash "$actionlint_installer" 1.7.12 "$PWD/.opencode-tmp/bin"
   .github/caller-stubs/*.yml \
   .github/caller-stubs/tech/*.yml \
   .github/caller-stubs/parent/*.yml
+
+PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=src python3 -m unittest -v \
+  scripts.test_layer2_issue_inventory_guard
