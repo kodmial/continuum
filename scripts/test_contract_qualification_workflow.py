@@ -64,9 +64,15 @@ case "${1:-}" in
     ;;
   api)
     shift
+    # Select the API path, not the trailing option flag (`--paginate`).
     endpoint=""
     for argument in "$@"; do
-      endpoint="$argument"
+      case "$argument" in
+        repos/*|*/actions/runs/*|*/comments*)
+          endpoint="$argument"
+          break
+          ;;
+      esac
     done
     if [[ "$endpoint" == *"/actions/runs/"* ]]; then
       [[ ! -e "$fixture_dir/fail-run-api" ]] || fail "exact run evidence"
@@ -87,14 +93,29 @@ esac
 """
 
 
-def extracted_layer2_step() -> str:
-    """The production run script of the Layer 2 lifecycle probe, unmodified."""
+def layer2_step() -> dict:
+    """The production step declaration of the Layer 2 lifecycle probe."""
 
     data = yaml.safe_load(WORKFLOW.read_text(encoding="utf-8"))
     for step in data["jobs"]["qualify"]["steps"]:
         if step.get("name") == STEP_NAME:
-            return step["run"]
+            return step
     raise AssertionError(f"{STEP_NAME} step not found")
+
+
+def extracted_layer2_step() -> str:
+    """The production run script of the Layer 2 lifecycle probe, unmodified."""
+
+    return layer2_step()["run"]
+
+
+def extracted_layer2_step_env() -> dict:
+    """The ``env:`` mapping declared on the production Layer 2 step."""
+
+    return {
+        key: str(value)
+        for key, value in (layer2_step().get("env") or {}).items()
+    }
 
 
 def recent_timestamp() -> str:
@@ -120,6 +141,9 @@ class Layer2LifecycleProbeTest(unittest.TestCase):
         gh.chmod(0o755)
         self.script = self.workdir / "layer2-step.sh"
         self.script.write_text(extracted_layer2_step(), encoding="utf-8")
+        # Actions guarantees RUNNER_TEMP exists on a real runner; create it so a
+        # step that writes there without `mkdir -p` behaves the same here.
+        (self.workdir / "runner-temp").mkdir()
         # An empty, valid observation by default; every test overrides the
         # fixtures it cares about.
         self.write_json("issues.json", [])
@@ -175,7 +199,10 @@ class Layer2LifecycleProbeTest(unittest.TestCase):
         }
 
     def invoke(self) -> subprocess.CompletedProcess:
+        # Apply the step's declared env first, then the deterministic harness
+        # overrides that replace Actions expressions and credentials.
         env = dict(os.environ)
+        env.update(extracted_layer2_step_env())
         env.update(
             {
                 "PATH": str(self.bin) + os.pathsep + env.get("PATH", ""),
@@ -192,7 +219,13 @@ class Layer2LifecycleProbeTest(unittest.TestCase):
         resolved = shutil.which("gh", path=env["PATH"])
         self.assertEqual(resolved, str(self.bin / "gh"), env["PATH"])
         return subprocess.run(
-            ["bash", str(self.script)],
+            # Match the Actions `shell: bash` invocation (`-e -o pipefail`), so
+            # a failing gh or python3 command cannot be ignored here while it
+            # fails in production.
+            [
+                "bash", "--noprofile", "--norc", "-eo", "pipefail",
+                str(self.script),
+            ],
             cwd=str(ROOT),
             capture_output=True,
             text=True,
@@ -352,6 +385,11 @@ class Layer2LifecycleProbeTest(unittest.TestCase):
         completed = self.invoke()
         self.assert_failed(completed, "gh: run list unavailable")
 
+    def test_gh_pr_list_failure_is_non_success(self):
+        self.fail_command("pr")
+        completed = self.invoke()
+        self.assert_failed(completed, "gh: pr list unavailable")
+
     def test_malformed_issue_inventory_json_is_non_success(self):
         self.write_raw("issues.json", "{not json")
         completed = self.invoke()
@@ -359,6 +397,21 @@ class Layer2LifecycleProbeTest(unittest.TestCase):
 
     def test_malformed_recent_run_json_is_non_success(self):
         self.write_raw("runs.json", "[")
+        completed = self.invoke()
+        self.assert_failed(completed, "JSONDecodeError")
+
+    def test_malformed_pull_inventory_json_is_non_success(self):
+        self.write_raw("pulls.json", "{not json")
+        completed = self.invoke()
+        self.assert_failed(completed, "JSONDecodeError")
+
+    def test_malformed_exact_run_json_is_non_success(self):
+        self.write_json("issues.json", [self.labelled_issue(7)])
+        self.write_json("runs.json", [])
+        self.write_json(
+            "comments.json", [[self.owner_marker_comment(7, 12345)]]
+        )
+        self.write_raw("run.json", "{not json")
         completed = self.invoke()
         self.assert_failed(completed, "JSONDecodeError")
 
