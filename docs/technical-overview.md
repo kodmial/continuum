@@ -104,7 +104,11 @@ arm it. The marker is metadata, never an OpenCode command. It authorizes only
 its own paused+ready target, and only after the named predecessor issue is
 closed as completed through a bound implementation pull request that was
 actually merged to the default branch with exact-HEAD `CI`, Contract Gate, and
-independent clean-review evidence. The binding is the canonical
+independent clean-review evidence. The core `CI` caller does not provide the
+gate, so configure the
+[required Contract Gate workflow](consumer-variables.md#required-contract-gate-workflow)
+before the predecessor pull request runs; its evidence must belong to that
+predecessor PR's exact HEAD. The binding is the canonical
 `opencode/issue<N>-` branch, or — for an owner-authored normal fix branch — the
 exact `continuum-task-context` and `continuum-task-snapshot-ref` markers in the
 PR body verified against the durable snapshot comment on the predecessor issue;
@@ -180,7 +184,11 @@ its configuration. The detailed lifecycle routes are documented in
 4. Set `AUTOMATION_READY_LABEL=automation:ready` **before opening any issue**.
 5. Add `TAP_PAT`; add `RENDER_API_KEY` only if you use Render execution.
 6. Configure branch protection for `main`.
-7. Open an ordinary issue without the ready label and confirm it is not
+7. Add the
+   [required Contract Gate workflow](consumer-variables.md#required-contract-gate-workflow);
+   the core `CI` caller does not include it, and owner-armed resume later needs
+   exact-HEAD gate evidence on the predecessor PR.
+8. Open an ordinary issue without the ready label and confirm it is not
    dispatched. Then open a harmless issue with the label and follow it through
    the run, PR, CI, optional review, and merge.
 
