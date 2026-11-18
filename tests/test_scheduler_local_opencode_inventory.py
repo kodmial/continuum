@@ -30,15 +30,22 @@ def _extract(body: str, start: str, end: str) -> str:
     return textwrap.dedent(body[start_index:body.index(end, start_index)])
 
 
-def _harness(gh_body: str, task_number: int = 42) -> str:
+def _harness(gh_body: str, snapshot_body: str = '  : > "$4"', task_number: int = 42) -> str:
     body = WORKFLOW.read_text(encoding="utf-8")
     return "\n".join(
         [
             "set -euo pipefail",
             'child_id="opaque-child"',
             'child_repo="owner/child"',
+            'RUNNER_TEMP="$(mktemp -d)"',
+            'trap \'rm -rf "$RUNNER_TEMP"\' EXIT',
+            'active_script="/fake/delegated_active_runs.sh"',
             "gh() {",
             gh_body,
+            "}",
+            "bash() {",
+            '  [[ "$GITHUB_REPOSITORY" == "$child_repo" && "$1" == "$active_script" && "$2" == "snapshot" && "$3" == "--output" ]] || return 9',
+            snapshot_body,
             "}",
             _extract(body, INVENTORY_START, INVENTORY_END),
             # The extracted function stops before the live API section; close it
@@ -51,9 +58,9 @@ def _harness(gh_body: str, task_number: int = 42) -> str:
     )
 
 
-def _run(gh_body: str, task_number: int = 42) -> dict[str, str | list[str]]:
+def _run(gh_body: str, snapshot_body: str = '  : > "$4"', task_number: int = 42) -> dict[str, str | list[str]]:
     completed = subprocess.run(
-        ["bash", "-c", _harness(gh_body, task_number)],
+        ["bash", "-c", _harness(gh_body, snapshot_body, task_number)],
         check=True,
         capture_output=True,
         text=True,
@@ -78,24 +85,23 @@ class LocalOpenCodeInventoryTests(unittest.TestCase):
         self.assertEqual("ACTIVE", result["decision"])
 
     def test_failed_run_lookup_marks_inventory_unknown_on_any_page(self):
-        result = _run(
-            'if [[ "$1" == "api" ]]; then return 1; fi; return 0'
-        )
+        result = _run('return 0', '  return 4')
         self.assertEqual(["__unknown__"], result["RUN"])
         self.assertEqual("ACTIVE", result["decision"])
 
-    def test_full_third_page_marks_inventory_unknown(self):
-        # The workflow's jq query emits this sentinel when page 3 is full, so
-        # older active runs cannot be silently omitted from the bounded window.
-        result = _run(
-            'if [[ "$1" == "pr" ]]; then return 0; fi; '
-            '[[ "$*" == *"page=3"* ]] && echo "__unknown__"; return 0'
-        )
-        self.assertEqual(["__unknown__"], result["RUN"])
-        self.assertEqual("ACTIVE", result["decision"])
+    def test_completed_history_does_not_hide_ready_child_issue(self):
+        # The prior all-status third page was full in CodeMy (>5600 runs),
+        # even when zero OpenCode runs were active. An empty active-only
+        # snapshot must not be treated as an unknown inventory.
+        result = _run('return 0')
+        self.assertEqual([], result['RUN'])
+        self.assertEqual('IDLE', result['decision'])
+        inventory = _extract(WORKFLOW.read_text(encoding='utf-8'), INVENTORY_START, INVENTORY_END)
+        self.assertIn('GITHUB_REPOSITORY="$child_repo" bash "$active_script" snapshot', inventory)
+        self.assertNotIn('actions/runs?per_page=100&page=', inventory)
 
     def test_both_lookups_failing_never_reads_as_idle(self):
-        result = _run("return 1")
+        result = _run("return 1", "  return 4")
         self.assertEqual(["__unknown__"], result["PR"])
         self.assertEqual(["__unknown__"], result["RUN"])
         self.assertEqual("ACTIVE", result["decision"])
@@ -109,13 +115,14 @@ class LocalOpenCodeInventoryTests(unittest.TestCase):
     def test_successful_lookup_still_matches_the_owning_task(self):
         gh_body = (
             'if [[ "$1" == "pr" ]]; then echo "opencode/issue42-fix"; return 0; fi; '
-            '[[ "$2" == *"page=1"* ]] && echo 42; return 0'
+            'return 0'
         )
-        owning = _run(gh_body, task_number=42)
+        snapshot = '  printf "in_progress\\tOpenCode issue #42\\n" > "$4"'
+        owning = _run(gh_body, snapshot, task_number=42)
         self.assertEqual(["42"], owning["PR"])
         self.assertEqual(["42"], owning["RUN"])
         self.assertEqual("ACTIVE", owning["decision"])
-        other = _run(gh_body, task_number=7)
+        other = _run(gh_body, snapshot, task_number=7)
         self.assertEqual("IDLE", other["decision"])
 
 
