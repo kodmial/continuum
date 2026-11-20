@@ -141,6 +141,22 @@ is a `WAIT`: the pause label stays in place even when an old scheduler lease
 expires. A post-marker recovery attempt is a bounded fence, so a failed
 automatic recovery stays paused instead of looping.
 
+### OpenCode 429 restart cap
+
+An explicit OpenCode provider 429 marker starts bounded fresh-runner recovery
+from the durable checkpoint. `max_429_runner_restarts` is a hard lifetime cap
+on fresh-runner generations, not a per-generation retry budget. When a recorded
+`generation-exhausted` backoff reaches its `next_due`, the watchdog publishes
+one terminal `owner-action-required` recovery state with `next_due=0`: the
+checkpoint stays preserved, an explicit pause, blocked, or operator-stop state
+still wins, and no further automatic runner is dispatched. Repeated watchdog and
+scheduler passes observe that terminal state instead of renewing the deadline or
+starting a duplicate run, and the scheduler keeps the reservation fenced while
+reporting that owner action is required. The cap is never bypassed
+automatically; resuming needs an owner-authorized change. Only a real OpenCode
+model 429 marker enters this path: GitHub REST quota exhaustion is detected
+before recovery starts and defers to a scheduled wake instead.
+
 ## What this adds beyond plain GitHub Actions
 
 Plain workflow YAML gives you runners and triggers. You still have to assemble

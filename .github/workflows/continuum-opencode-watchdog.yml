@@ -45,8 +45,11 @@ on:
         default: ''
       max_429_runner_restarts:
         description: >-
-          Fresh-runner restarts after an OpenCode 429 marker. Empty falls back
-          to AUTOMATION_WATCHDOG_MAX_429_RUNNER_RESTARTS, then 3.
+          Hard lifetime cap on fresh-runner generations after an OpenCode 429
+          marker. Once exhausted, the watchdog records a terminal
+          owner-action-required state instead of dispatching another runner.
+          Empty falls back to AUTOMATION_WATCHDOG_MAX_429_RUNNER_RESTARTS,
+          then 3.
         required: false
         type: string
         default: ''
