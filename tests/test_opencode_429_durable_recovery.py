@@ -362,6 +362,60 @@ class SchedulerDurableRecoveryTests(unittest.TestCase):
         self.assertEqual(result["evaluation"]["reason"], "watchdog-lease")
         self.assertEqual(result["runLookups"], [])
 
+    def test_owner_action_required_is_terminal_and_fenced(self):
+        for next_due in (0, 4102444800):
+            with self.subTest(next_due=next_due):
+                scenario = self.base_scenario()
+                scenario["recovery"].update({
+                    "state": "owner-action-required",
+                    "attempt": 4,
+                    "nextDue": next_due,
+                    "checkpointSha": NEW_SHA,
+                })
+                result = self.run_scenario(scenario)
+                evaluation = result["evaluation"]
+                self.assertTrue(evaluation["keepReservation"])
+                self.assertTrue(evaluation["recoveryPending"])
+                self.assertTrue(evaluation["ownerActionRequired"])
+                self.assertFalse(evaluation["countWip"])
+                self.assertEqual(
+                    evaluation["reason"], "owner-action-required"
+                )
+                self.assertEqual(result["runLookups"], [])
+
+    def test_overdue_generation_exhausted_backoff_is_terminal(self):
+        scenario = self.base_scenario()
+        scenario["recovery"].update({
+            "state": "backoff",
+            "attempt": 4,
+            "nextDue": 1,
+            "checkpointSha": NEW_SHA,
+            "detail": "generation-exhausted",
+        })
+        result = self.run_scenario(scenario)
+        evaluation = result["evaluation"]
+        self.assertTrue(evaluation["keepReservation"])
+        self.assertTrue(evaluation["recoveryPending"])
+        self.assertTrue(evaluation["ownerActionRequired"])
+        self.assertEqual(evaluation["reason"], "owner-action-required")
+        self.assertEqual(result["runLookups"], [])
+
+    def test_unexpired_generation_exhausted_backoff_waits_for_cooldown(self):
+        scenario = self.base_scenario()
+        scenario["recovery"].update({
+            "state": "backoff",
+            "attempt": 4,
+            "nextDue": 4102444800,
+            "checkpointSha": NEW_SHA,
+            "detail": "generation-exhausted",
+        })
+        result = self.run_scenario(scenario)
+        evaluation = result["evaluation"]
+        self.assertTrue(evaluation["keepReservation"])
+        self.assertTrue(evaluation["recoveryPending"])
+        self.assertFalse(evaluation["ownerActionRequired"])
+        self.assertEqual(evaluation["reason"], "watchdog-lease")
+
     def test_metadata_failed_lease_expires_without_dropping_checkpoint(self):
         scenario = self.base_scenario()
         scenario["recovery"]["state"] = "metadata-failed"
@@ -459,9 +513,15 @@ class SchedulerDurableRecoveryTests(unittest.TestCase):
         self.assertIn("evaluateScheduler429Recovery", body)
         self.assertIn("getWorkflowRun", body)
         self.assertIn("recoveryPendingIssueNumbers", body)
+        self.assertIn("recoveryOwnerActionIssueNumbers", body)
         self.assertIn("recoveryEvaluation.countWip", body)
+        self.assertIn("recoveryEvaluation.ownerActionRequired", body)
         self.assertIn("verified 429 checkpoint is awaiting watchdog recovery", body)
+        self.assertIn("429 recovery is terminal and requires owner action", body)
         self.assertIn("retaining the reservation for the watchdog without", body)
+        self.assertIn(
+            "the fresh-runner restart cap is exhausted, so owner action", body
+        )
         self.assertNotIn("48 * 60 * 60 * 1000", body)
 
 

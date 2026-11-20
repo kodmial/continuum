@@ -996,6 +996,67 @@ class WatchdogHarness(unittest.TestCase):
         scenario["dispatchedRunId"] = 5001
         return scenario
 
+    def generation_exhausted_scenario(self, next_due):
+        generation = 4
+        checkpoint_ref = (
+            "opencode/429-checkpoint-" + OPERATION +
+            "-gen-" + str(generation)
+        )
+        scenario = self.durable_scenario()
+        scenario["comments"][0]["body"] = (
+            "<!-- continuum-429-recovery op={op} gen={gen} state=backoff "
+            "attempt={gen} next_due={next_due} checkpoint={ref} "
+            "sha={sha} run=- detail=generation-exhausted -->"
+        ).format(
+            op=OPERATION,
+            gen=generation,
+            next_due=next_due,
+            ref=checkpoint_ref,
+            sha=NEW_SHA,
+        )
+        scenario["checkpoint"]["refSha"] = NEW_SHA
+        scenario["checkpoint"]["metadata"] = {
+            **metadata(NEW_SHA),
+            "generation": generation,
+            "checkpoint_ref": checkpoint_ref,
+        }
+        return scenario
+
+    def test_exhausted_generation_terminalizes_once_after_due(self):
+        scenario = self.generation_exhausted_scenario(next_due=1)
+        # A second catch-up pass must observe the terminal marker and neither
+        # extend the deadline nor dispatch another runner.
+        scenario["passes"] = 2
+        result = self.run_scenario(scenario)
+        self.assert_no_dispatch(result)
+        terminal = [
+            comment["body"] for comment in result["comments"]
+            if "state=owner-action-required" in comment["body"]
+        ]
+        self.assertEqual(len(terminal), 1, result["comments"])
+        self.assertIn("detail=generation-exhausted", terminal[0])
+        self.assertIn("next_due=0", terminal[0])
+        self.assertNotIn("state=backoff", terminal[0])
+        self.assertTrue(
+            any(
+                "terminal" in " ".join(line)
+                for line in result["notices"]
+            ),
+            result["notices"],
+        )
+
+    def test_exhausted_generation_does_not_reset_an_unexpired_cooldown(self):
+        future = int(datetime.now(timezone.utc).timestamp()) + 3600
+        scenario = self.generation_exhausted_scenario(next_due=future)
+        result = self.run_scenario(scenario)
+        self.assert_no_dispatch(result)
+        bodies = "\n".join(
+            comment["body"] for comment in result["comments"]
+        )
+        self.assertIn("state=backoff", bodies)
+        self.assertNotIn("state=owner-action-required", bodies)
+        self.assertIn("next_due=" + str(future), bodies)
+
     def test_scheduled_wake_rediscovers_old_checkpoint_beyond_recent_200(self):
         result = self.run_scenario(self.durable_scenario())
         self.assert_one_current_dispatch(result, NEW_SHA)
