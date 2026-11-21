@@ -3757,19 +3757,56 @@ module.exports = async function runIssueScheduler({ github, context, core }) {
     }
     const due = Math.max(0, Number(recovery.nextDue) || 0) * 1000;
     const state = String(recovery.state || '');
-    // The fresh-runner restart cap is a hard lifetime limit. An overdue
-    // `generation-exhausted` backoff (including one recorded before the
-    // watchdog learned the terminal state) is owner-action-required, not a
-    // promise of automatic watchdog recovery. Keep the reservation fenced so
-    // the task cannot restart from main, but report the terminal state.
-    const capExhausted =
-      state === 'owner-action-required' ||
-      (
-        due <= now &&
-        state === 'backoff' &&
-        String(recovery.detail || '') === 'generation-exhausted'
+    // The fresh-runner restart cap is a hard lifetime limit shared with the
+    // watchdog. Read the same cap here so terminalization stays cap-aware:
+    // `generation-exhausted` is only terminal while its recorded generation
+    // still exceeds the configured cap. An explicit `owner-action-required`
+    // marker whose generation now fits inside a raised cap is superseded:
+    // the watchdog may legitimately resume recovery, so keep the reservation
+    // pending instead of reporting a terminal state. Any other explicit
+    // owner-action marker stays terminal regardless of the cap.
+    const max429RunnerRestarts = Number.parseInt(
+      process.env.MAX_429_RUNNER_RESTARTS || '3',
+      10
+    );
+    if (
+      !Number.isInteger(max429RunnerRestarts) ||
+      max429RunnerRestarts < 0
+    ) {
+      throw new Error(
+        'Invalid MAX_429_RUNNER_RESTARTS: ' +
+        process.env.MAX_429_RUNNER_RESTARTS
       );
-    if (capExhausted) {
+    }
+    const generationExhausted =
+      String(recovery.detail || '') === 'generation-exhausted';
+    const capStillExhausted =
+      generationExhausted &&
+      Number(recovery.generation) > max429RunnerRestarts;
+    if (state === 'owner-action-required') {
+      if (!capStillExhausted && generationExhausted) {
+        return {
+          ...base,
+          keepReservation: true,
+          recoveryPending: true,
+          reason: 'cap-raised-awaiting-watchdog',
+          checkpointSha: String(
+            recovery.checkpointSha || ''
+          ).toLowerCase(),
+        };
+      }
+      return {
+        ...base,
+        keepReservation: true,
+        recoveryPending: true,
+        ownerActionRequired: true,
+        reason: 'owner-action-required',
+        checkpointSha: String(
+          recovery.checkpointSha || ''
+        ).toLowerCase(),
+      };
+    }
+    if (due <= now && state === 'backoff' && capStillExhausted) {
       return {
         ...base,
         keepReservation: true,

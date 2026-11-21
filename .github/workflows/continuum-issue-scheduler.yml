@@ -560,6 +560,9 @@ jobs:
       REVIEW_PROVIDER: ${{ vars.CONTINUUM_REVIEW_PROVIDER || 'none' }}
       COUNT_OPEN_PRS_AS_WIP: ${{ inputs.count_open_prs_as_wip || vars.AUTOMATION_COUNT_OPEN_PRS_AS_WIP || 'true' }}
       PAUSE_ON_FAILURE: ${{ inputs.pause_on_failure || vars.AUTOMATION_PAUSE_ON_FAILURE || 'false' }}
+      # Shared with the watchdog so a terminal 429 recovery is only reported
+      # while the configured fresh-runner restart cap is still exhausted.
+      MAX_429_RUNNER_RESTARTS: ${{ vars.AUTOMATION_WATCHDOG_MAX_429_RUNNER_RESTARTS || '3' }}
       READ_GITHUB_TOKEN: ${{ github.token }}
 
     steps:

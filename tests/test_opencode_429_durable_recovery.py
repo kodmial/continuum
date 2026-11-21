@@ -93,6 +93,13 @@ const fs = require('fs');
 const scenario = JSON.parse(fs.readFileSync(process.argv[2], 'utf8'));
 const source = fs.readFileSync(process.argv[3], 'utf8');
 const resultPath = process.argv[4];
+if (scenario.max429RunnerRestarts !== undefined) {
+  process.env.MAX_429_RUNNER_RESTARTS = String(
+    scenario.max429RunnerRestarts
+  );
+} else {
+  delete process.env.MAX_429_RUNNER_RESTARTS;
+}
 
 function apiError(status, message) {
   const error = new Error(message || ('HTTP ' + status));
@@ -366,11 +373,13 @@ class SchedulerDurableRecoveryTests(unittest.TestCase):
         for next_due in (0, 4102444800):
             with self.subTest(next_due=next_due):
                 scenario = self.base_scenario()
+                scenario["max429RunnerRestarts"] = 0
                 scenario["recovery"].update({
                     "state": "owner-action-required",
                     "attempt": 4,
                     "nextDue": next_due,
                     "checkpointSha": NEW_SHA,
+                    "detail": "generation-exhausted",
                 })
                 result = self.run_scenario(scenario)
                 evaluation = result["evaluation"]
@@ -383,8 +392,45 @@ class SchedulerDurableRecoveryTests(unittest.TestCase):
                 )
                 self.assertEqual(result["runLookups"], [])
 
+    def test_owner_action_required_yields_when_cap_is_raised(self):
+        # An owner-authorized cap increase supersedes the recorded terminal
+        # generation. The watchdog may resume recovery, so the scheduler must
+        # keep the reservation pending instead of logging a terminal skip.
+        scenario = self.base_scenario()
+        scenario["max429RunnerRestarts"] = 3
+        scenario["recovery"].update({
+            "state": "owner-action-required",
+            "attempt": 1,
+            "nextDue": 0,
+            "checkpointSha": NEW_SHA,
+            "detail": "generation-exhausted",
+        })
+        evaluation = self.run_scenario(scenario)["evaluation"]
+        self.assertTrue(evaluation["keepReservation"])
+        self.assertTrue(evaluation["recoveryPending"])
+        self.assertFalse(evaluation["ownerActionRequired"])
+        self.assertEqual(
+            evaluation["reason"], "cap-raised-awaiting-watchdog"
+        )
+
+    def test_unknown_owner_action_required_stays_terminal(self):
+        scenario = self.base_scenario()
+        scenario["max429RunnerRestarts"] = 3
+        scenario["recovery"].update({
+            "state": "owner-action-required",
+            "attempt": 1,
+            "nextDue": 0,
+            "checkpointSha": NEW_SHA,
+            "detail": "operator-stop",
+        })
+        evaluation = self.run_scenario(scenario)["evaluation"]
+        self.assertTrue(evaluation["keepReservation"])
+        self.assertTrue(evaluation["ownerActionRequired"])
+        self.assertEqual(evaluation["reason"], "owner-action-required")
+
     def test_overdue_generation_exhausted_backoff_is_terminal(self):
         scenario = self.base_scenario()
+        scenario["max429RunnerRestarts"] = 0
         scenario["recovery"].update({
             "state": "backoff",
             "attempt": 4,
@@ -399,6 +445,25 @@ class SchedulerDurableRecoveryTests(unittest.TestCase):
         self.assertTrue(evaluation["ownerActionRequired"])
         self.assertEqual(evaluation["reason"], "owner-action-required")
         self.assertEqual(result["runLookups"], [])
+
+    def test_overdue_generation_exhausted_backoff_yields_to_raised_cap(self):
+        # The legacy backoff is only terminal while its generation still
+        # exceeds the configured cap. A cap increase authorizes watchdog
+        # recovery again, so the scheduler retains the reservation pending.
+        scenario = self.base_scenario()
+        scenario["max429RunnerRestarts"] = 3
+        scenario["recovery"].update({
+            "state": "backoff",
+            "attempt": 1,
+            "nextDue": 1,
+            "checkpointSha": NEW_SHA,
+            "detail": "generation-exhausted",
+        })
+        evaluation = self.run_scenario(scenario)["evaluation"]
+        self.assertTrue(evaluation["keepReservation"])
+        self.assertTrue(evaluation["recoveryPending"])
+        self.assertFalse(evaluation["ownerActionRequired"])
+        self.assertEqual(evaluation["reason"], "backoff-awaiting-watchdog")
 
     def test_unexpired_generation_exhausted_backoff_waits_for_cooldown(self):
         scenario = self.base_scenario()
