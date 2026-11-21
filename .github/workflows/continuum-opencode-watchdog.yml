@@ -45,8 +45,11 @@ on:
         default: ''
       max_429_runner_restarts:
         description: >-
-          Fresh-runner restarts after an OpenCode 429 marker. Empty falls back
-          to AUTOMATION_WATCHDOG_MAX_429_RUNNER_RESTARTS, then 3.
+          Hard lifetime cap on fresh-runner generations after an OpenCode 429
+          marker. Once exhausted, the watchdog records a terminal
+          owner-action-required state instead of dispatching another runner.
+          Empty falls back to AUTOMATION_WATCHDOG_MAX_429_RUNNER_RESTARTS,
+          then 3.
         required: false
         type: string
         default: ''
@@ -1441,38 +1444,61 @@ jobs:
               const previous = latestRecoveryState(comments, operation, generation);
 
               if (generation > max429Restarts) {
-                // Honor the durable window instead of recording a fresh
-                // `next_due` on every */15 catch-up pass, which would slide the
-                // cooldown forever and strand the reservation.
-                const backoffSchedule = [60, 300, 900, 1800, 3600];
-                const backoffDue = backoffSchedule[
-                  Math.min(
-                    Math.max(0, generation - max429Restarts - 1),
-                    backoffSchedule.length - 1
-                  )
-                ];
-                if (!previous || previous.nextDue <= now) {
-                  await recordRecoveryState({
-                    ...baseState,
-                    state: 'backoff',
-                    attempt: generation,
-                    nextDue: now + backoffDue,
-                    detail: 'generation-exhausted',
-                    summary: 'Repeated model 429s on fresh runners; entering bounded infrastructure backoff. No pause was applied and no task/review/qualification budget was consumed.',
-                  });
-                  core.warning(
-                    'OpenCode infrastructure operation ' + operation + ' entered bounded ' +
-                    'infrastructure backoff after ' + generation +
-                    ' fresh-runner generation(s); checkpoint ' + checkpointRef +
-                    ' preserved for automatic resume.'
-                  );
-                } else {
+                // `max_429_runner_restarts` is a hard cap on fresh-runner
+                // generations, not a per-generation attempt budget. Once the
+                // evacuation generation exceeds it, no further automatic
+                // dispatch is authorized. Convert the overdue cooldown to a
+                // terminal owner-action state instead of renewing `next_due`
+                // forever, which would silently strand the reservation. This
+                // branch only runs for a real OpenCode 429 evacuation (the
+                // GitHub REST budget guard returns earlier) and never
+                // dispatches, so owner STOP and duplicate-run fences stay
+                // authoritative.
+                const terminal =
+                  previous &&
+                  previous.state === 'owner-action-required' &&
+                  previous.detail === 'generation-exhausted';
+                if (terminal) {
                   core.notice(
                     'OpenCode infrastructure operation ' + operation + ' generation ' +
-                    generation + ' is already in bounded infrastructure backoff until ' +
-                    previous.nextDue + '; not resetting the window.'
+                    generation + ' is terminal: the fresh-runner restart cap (' +
+                    max429Restarts + ') is exhausted and owner action is required; ' +
+                    'checkpoint ' + checkpointRef + ' remains preserved.'
                   );
+                  return;
                 }
+                if (previous && previous.nextDue > now) {
+                  // Honor the recorded cooldown exactly once. After it expires
+                  // the next pass publishes the terminal state; it never
+                  // extends the window or dispatches another runner.
+                  core.notice(
+                    'OpenCode infrastructure operation ' + operation + ' generation ' +
+                    generation + ' is waiting for its bounded cooldown until ' +
+                    previous.nextDue + '; the restart cap is already exhausted.'
+                  );
+                  return;
+                }
+                await recordRecoveryState({
+                  ...baseState,
+                  state: 'owner-action-required',
+                  attempt: generation,
+                  nextDue: 0,
+                  detail: 'generation-exhausted',
+                  summary: 'The configured fresh-runner restart cap (' +
+                    max429Restarts + ') is exhausted at generation ' + generation +
+                    '. Checkpoint `' + checkpointRef + '` is preserved, but automatic ' +
+                    'recovery is stopped: no further fresh runner will be dispatched ' +
+                    'and no task/review/qualification budget was consumed. An owner ' +
+                    'must explicitly authorize more fresh-runner restarts or recover ' +
+                    'the checkpoint another way before this issue can move.',
+                });
+                core.warning(
+                  'OpenCode infrastructure operation ' + operation + ' generation ' +
+                  generation + ' exceeded the fresh-runner restart cap (' +
+                  max429Restarts + '); recorded a terminal owner-action-required ' +
+                  'state. Checkpoint ' + checkpointRef + ' preserved; automatic ' +
+                  'recovery will not dispatch another run.'
+                );
                 return;
               }
 

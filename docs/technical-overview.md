@@ -141,6 +141,22 @@ is a `WAIT`: the pause label stays in place even when an old scheduler lease
 expires. A post-marker recovery attempt is a bounded fence, so a failed
 automatic recovery stays paused instead of looping.
 
+### OpenCode 429 restart cap
+
+An explicit OpenCode provider 429 marker starts bounded fresh-runner recovery
+from the durable checkpoint. `max_429_runner_restarts` is a hard lifetime cap
+on fresh-runner generations, not a per-generation retry budget. When a recorded
+`generation-exhausted` backoff reaches its `next_due`, the watchdog publishes
+one terminal `owner-action-required` recovery state with `next_due=0`: the
+checkpoint stays preserved, an explicit pause, blocked, or operator-stop state
+still wins, and no further automatic runner is dispatched. Repeated watchdog and
+scheduler passes observe that terminal state instead of renewing the deadline or
+starting a duplicate run, and the scheduler keeps the reservation fenced while
+reporting that owner action is required. The cap is never bypassed
+automatically; resuming needs an owner-authorized change. Only a real OpenCode
+model 429 marker enters this path: GitHub REST quota exhaustion is detected
+before recovery starts and defers to a scheduled wake instead.
+
 ## What this adds beyond plain GitHub Actions
 
 Plain workflow YAML gives you runners and triggers. You still have to assemble
@@ -461,7 +477,7 @@ Swift-profile variable list.
 | Review never starts | `CONTINUUM_REVIEW_PROVIDER` is `none` or the selected provider is not configured. Optional review is not guaranteed to run or approve. |
 | A green PR does not merge | Branch protection, required checks, exact-HEAD evidence, conflict state, or a required gate label/name. Read the auto-merge run log. |
 | `workflow not found` after a Continuum upgrade | Reinstall every set you use, then review the prune output. |
-| Repeated model or rate-limit failures | The free anonymous route can be unavailable. An explicit OpenCode 429 marker starts a bounded fresh-runner recovery checkpoint through a repository-local `workflow_dispatch` caller; a bounded timer catches up when `workflow_run` delivery is late or lost. This is not a Continuum SLA. |
+| Repeated model or rate-limit failures | The free anonymous route can be unavailable. An explicit OpenCode 429 marker starts a bounded fresh-runner recovery checkpoint through a repository-local `workflow_dispatch` caller; a bounded timer catches up when `workflow_run` delivery is late or lost. The fresh-runner restart cap is a hard limit: once it is exhausted, the watchdog records a terminal owner-action-required state and never renews the backoff or dispatches another run. This is not a Continuum SLA. |
 
 ## What has been live-qualified
 

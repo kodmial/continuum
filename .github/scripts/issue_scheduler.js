@@ -3420,6 +3420,10 @@ module.exports = async function runIssueScheduler({ github, context, core }) {
   // their reservation label for watchdog discovery but must never
   // consume a coding WIP slot or be restarted from main.
   const recoveryPendingIssueNumbers = new Set();
+  // A cap-exhausted recovery is terminal: the reservation stays fenced so
+  // the scheduler cannot restart the task from main, but no automatic
+  // watchdog dispatch is promised any more.
+  const recoveryOwnerActionIssueNumbers = new Set();
   
   // Active/pending OpenCode Actions own WIP until their actual run completes.
   // A recent unfiltered 300-run window can exclude a long-running OpenCode
@@ -3726,6 +3730,7 @@ module.exports = async function runIssueScheduler({ github, context, core }) {
       keepReservation: false,
       countWip: false,
       recoveryPending: false,
+      ownerActionRequired: false,
       reason: 'no-recovery-state',
     };
     if (!recovery) return base;
@@ -3752,6 +3757,67 @@ module.exports = async function runIssueScheduler({ github, context, core }) {
     }
     const due = Math.max(0, Number(recovery.nextDue) || 0) * 1000;
     const state = String(recovery.state || '');
+    // The fresh-runner restart cap is a hard lifetime limit shared with the
+    // watchdog. Read the same cap here so terminalization stays cap-aware:
+    // `generation-exhausted` is only terminal while its recorded generation
+    // still exceeds the configured cap. An explicit `owner-action-required`
+    // marker whose generation now fits inside a raised cap is superseded:
+    // the watchdog may legitimately resume recovery, so keep the reservation
+    // pending instead of reporting a terminal state. Any other explicit
+    // owner-action marker stays terminal regardless of the cap.
+    const max429RunnerRestarts = Number.parseInt(
+      process.env.MAX_429_RUNNER_RESTARTS || '3',
+      10
+    );
+    if (
+      !Number.isInteger(max429RunnerRestarts) ||
+      max429RunnerRestarts < 0
+    ) {
+      throw new Error(
+        'Invalid MAX_429_RUNNER_RESTARTS: ' +
+        process.env.MAX_429_RUNNER_RESTARTS
+      );
+    }
+    const generationExhausted =
+      String(recovery.detail || '') === 'generation-exhausted';
+    const capStillExhausted =
+      generationExhausted &&
+      Number(recovery.generation) > max429RunnerRestarts;
+    if (state === 'owner-action-required') {
+      if (!capStillExhausted && generationExhausted) {
+        return {
+          ...base,
+          keepReservation: true,
+          recoveryPending: true,
+          reason: 'cap-raised-awaiting-watchdog',
+          checkpointSha: String(
+            recovery.checkpointSha || ''
+          ).toLowerCase(),
+        };
+      }
+      return {
+        ...base,
+        keepReservation: true,
+        recoveryPending: true,
+        ownerActionRequired: true,
+        reason: 'owner-action-required',
+        checkpointSha: String(
+          recovery.checkpointSha || ''
+        ).toLowerCase(),
+      };
+    }
+    if (due <= now && state === 'backoff' && capStillExhausted) {
+      return {
+        ...base,
+        keepReservation: true,
+        recoveryPending: true,
+        ownerActionRequired: true,
+        reason: 'owner-action-required',
+        checkpointSha: String(
+          recovery.checkpointSha || ''
+        ).toLowerCase(),
+      };
+    }
     if (state === 'metadata-failed') {
       if (due > now) {
         return {
@@ -4160,6 +4226,9 @@ module.exports = async function runIssueScheduler({ github, context, core }) {
         // coding WIP slot: this is infrastructure recovery, not a
         // coding run. Candidate selection below skips this issue.
         recoveryPendingIssueNumbers.add(issueNumber);
+        if (recoveryEvaluation.ownerActionRequired) {
+          recoveryOwnerActionIssueNumbers.add(issueNumber);
+        }
       }
       core.notice(
         'Issue #' + issueNumber +
@@ -4170,10 +4239,13 @@ module.exports = async function runIssueScheduler({ github, context, core }) {
         (recoveryEvaluation.checkpointRef || '-') + ' run=' +
         (newestRecovery && newestRecovery.runId || '-') +
         '); ' +
-        (recoveryEvaluation.countWip
-          ? 'counting its active run as WIP.'
-          : 'retaining the reservation for the watchdog without ' +
-            'consuming a coding dispatch attempt or WIP slot.')
+        (recoveryEvaluation.ownerActionRequired
+          ? 'the fresh-runner restart cap is exhausted, so owner action ' +
+            'is required and no automatic watchdog recovery will be dispatched.'
+          : (recoveryEvaluation.countWip
+            ? 'counting its active run as WIP.'
+            : 'retaining the reservation for the watchdog without ' +
+              'consuming a coding dispatch attempt or WIP slot.'))
       );
     };
   
@@ -4333,6 +4405,16 @@ module.exports = async function runIssueScheduler({ github, context, core }) {
       core.info(
         'Skipping #' + issue.number +
         ': open implementation PR must not be duplicated.'
+      );
+      continue;
+    }
+    // A cap-exhausted recovery is terminal. Keep it fenced, but never
+    // claim the watchdog will resume it automatically.
+    if (recoveryOwnerActionIssueNumbers.has(issue.number)) {
+      core.info(
+        'Skipping #' + issue.number +
+        ': 429 recovery is terminal and requires owner action; no ' +
+        'automatic dispatch will be made.'
       );
       continue;
     }

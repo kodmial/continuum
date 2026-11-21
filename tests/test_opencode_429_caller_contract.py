@@ -224,6 +224,7 @@ class WatchdogContractTest(unittest.TestCase):
             "accepted",
             "observed",
             "backoff",
+            "owner-action-required",
         ):
             self.assertIn("'" + state + "'", self.body, state)
         self.assertIn("next_due=", self.body)
@@ -244,13 +245,17 @@ class WatchdogContractTest(unittest.TestCase):
             "state updates must locate the exact operation+generation marker",
         )
 
-    def test_infrastructure_backoff_honors_the_durable_window(self):
+    def test_exhausted_generation_is_terminal_after_its_cooldown(self):
         recovery = self.body.split("async function recoverFrom429OnFreshVm")[-1]
-        self.assertIn(
-            "const backoffSchedule = [60, 300, 900, 1800, 3600]", recovery
-        )
-        self.assertIn("if (!previous || previous.nextDue <= now) {", recovery)
-        self.assertIn("not resetting the window", recovery)
+        # The restart cap is a hard lifetime limit: before the recorded due
+        # there is no dispatch, and after it the watchdog publishes a
+        # terminal owner-action state instead of renewing the deadline.
+        self.assertIn("previous.nextDue > now", recovery)
+        self.assertIn("state: 'owner-action-required'", recovery)
+        self.assertIn("nextDue: 0", recovery)
+        self.assertIn("detail: 'generation-exhausted'", recovery)
+        self.assertNotIn("nextDue: now + backoffDue", recovery)
+        self.assertNotIn("const backoffSchedule =", recovery)
 
     def test_pre_dispatch_claim_fences_concurrent_recovery(self):
         recovery = self.body.split("async function recoverFrom429OnFreshVm")[-1]
