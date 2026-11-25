@@ -734,6 +734,7 @@ jobs:
           GH_TOKEN: ${{ env.CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED == 'true' && secrets.TAP_PAT || (env.CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED != 'true' && github.token || '') }}
           TAP_PAT: ${{ secrets.TAP_PAT }}
           PR_NUMBER: ${{ inputs.pr_number }}
+          MODE: ${{ inputs.mode || 'repair' }}
           HEAD_SHA: ${{ inputs.head_sha }}
         run: |
           set -euo pipefail
@@ -758,6 +759,22 @@ jobs:
           if [[ "$HEAD_REPO" != "$CONTINUUM_PR_AGENT_TARGET_REPOSITORY" ]]; then
             echo "::error::PR-Agent automatic repair supports same-repository PR branches only."
             exit 1
+          fi
+          if [[ "${MODE,,}" == "conflict" ]]; then
+            # A late wakeup may have dispatched this conflict repair just
+            # before another actor resolved the PR or the owner took manual
+            # control. Fail closed before any model execution instead of
+            # spending a bounded attempt on a state that no longer needs it.
+            if jq -e '(.labels // []) | any(.name == "no-auto-merge")' <<<"$PR_JSON" >/dev/null; then
+              echo "::notice::PR #$PR_NUMBER carries an explicit no-auto-merge hold; conflict repair will not modify it."
+              exit 1
+            fi
+            CONFLICT_MERGEABLE="$(jq -r '.mergeable // "unknown"' <<<"$PR_JSON")"
+            CONFLICT_MERGE_STATE="$(jq -r '.mergeable_state // "unknown"' <<<"$PR_JSON")"
+            if [[ "$CONFLICT_MERGEABLE" == "true" && "$CONFLICT_MERGE_STATE" != "unknown" && "$CONFLICT_MERGE_STATE" != "dirty" ]]; then
+              echo "::notice::PR #$PR_NUMBER is no longer conflicted (mergeable=$CONFLICT_MERGEABLE state=$CONFLICT_MERGE_STATE); conflict repair will not run."
+              exit 1
+            fi
           fi
           [[ -n "$HEAD_REF" && "$HEAD_REF" != "null" ]] || {
             echo "::error::Could not resolve the writable PR source branch."
@@ -916,41 +933,8 @@ jobs:
           # finding and qualifying improve suggestion in one bounded pass.
           # The workflow, not OpenCode, owns commit/push so publication always
           # targets the real writable PR source branch.
-          if [[ "${MODE,,}" == "conflict" ]]; then
-            # Conflict mode is delegated from the PR-Agent auto-merge
-            # reconciler. It must not replay the original task: merge the
-            # base into this exact PR branch and resolve only the conflicts.
-            PROMPT="$(printf '%s\n' \
-              'The current branch has merge conflicts with the repository default branch.' \
-              'Merge the default branch into the current branch and resolve every conflict.' \
-              'Preserve the intent of both sides; do not discard either side wholesale.' \
-              'Do not redo the original task, do not change unrelated files, and do not manufacture review state.' \
-              'Do not commit, push, create a PR, or merge; the workflow owns publication.')"
-          else
-          PROMPT="$(python3 - <<'PY'
-          import json, os
-          items = json.loads(os.environ.get('BATCH_JSON', '[]'))
-          lines = [
-              'Repair every item below on the current PR branch in one bounded pass.',
-              'Process every item; do not stop after the first finding.',
-              '',
-          ]
-          for item in items:
-              source = item.get('source', '')
-              if source == 'review':
-                  lines.append(f"[review] {json.dumps(item.get('finding', {}))}")
-              else:
-                  lines.append(f"[improve] {json.dumps(item.get('suggestion', {}))}")
-          lines += [
-              '',
-              'Apply the required code changes only.',
-              'Do not commit, push, create a PR, or manufacture review state; the workflow owns publication.',
-          ]
-          print('\n'.join(lines))
-          PY
-          )"
-          fi
           BASE_SHA=""
+          CONFLICT_BASE_REF=""
           if [[ "${MODE,,}" == "conflict" ]]; then
             # Capture the integrated base before the agent merges it. The
             # publish gate below proves this exact commit is an ancestor of
@@ -977,6 +961,42 @@ jobs:
               echo "::error::Conflict repair could not resolve the integrated base commit; discarding repair."
               exit 1
             fi
+          fi
+          if [[ "${MODE,,}" == "conflict" ]]; then
+            # Conflict mode is delegated from the PR-Agent auto-merge
+            # reconciler. It must not replay the original task: merge the
+            # resolved base into this exact PR branch and resolve only the
+            # conflicts. The exact fetched base ref is named so the agent
+            # cannot merge a stale or guessed default branch.
+            PROMPT="$(printf '%s\n' \
+              "The current branch has merge conflicts with the repository default branch (origin/${CONFLICT_BASE_REF})." \
+              "Merge origin/${CONFLICT_BASE_REF} into the current branch and resolve every conflict." \
+              'Preserve the intent of both sides; do not discard either side wholesale.' \
+              'Do not redo the original task, do not change unrelated files, and do not manufacture review state.' \
+              'Do not commit, push, create a PR, or merge; the workflow owns publication.')"
+          else
+          PROMPT="$(python3 - <<'PY'
+          import json, os
+          items = json.loads(os.environ.get('BATCH_JSON', '[]'))
+          lines = [
+              'Repair every item below on the current PR branch in one bounded pass.',
+              'Process every item; do not stop after the first finding.',
+              '',
+          ]
+          for item in items:
+              source = item.get('source', '')
+              if source == 'review':
+                  lines.append(f"[review] {json.dumps(item.get('finding', {}))}")
+              else:
+                  lines.append(f"[improve] {json.dumps(item.get('suggestion', {}))}")
+          lines += [
+              '',
+              'Apply the required code changes only.',
+              'Do not commit, push, create a PR, or manufacture review state; the workflow owns publication.',
+          ]
+          print('\n'.join(lines))
+          PY
+          )"
           fi
           START_HEAD="$(git rev-parse HEAD)"
           # Attribute only explicit external provider failures to the
@@ -1116,6 +1136,21 @@ jobs:
             echo "classification=deterministic" >> "$GITHUB_OUTPUT"
             echo "::error::PR branch moved before publish (reviewed=$HEAD_SHA current=$CURRENT_SHA remote=$REMOTE_SHA); discarding repair."
             exit 1
+          fi
+          if [[ "${MODE,,}" == "conflict" ]]; then
+            # A conflict-only repair must not publish after the owner took
+            # manual control or another actor already resolved the PR. Both
+            # checks are deterministic: retrying the same merge cannot help.
+            if [[ ",$CURRENT_LABELS," == *",no-auto-merge,"* ]]; then
+              echo "classification=deterministic" >> "$GITHUB_OUTPUT"
+              echo "::notice::PR #$PR_NUMBER gained an explicit no-auto-merge hold during conflict repair; discarding local changes without publication."
+              exit 1
+            fi
+            if [[ "$CURRENT_MERGEABLE" == "MERGEABLE" && -n "$CURRENT_MERGE_STATE" && "$CURRENT_MERGE_STATE" != "DIRTY" && "$CURRENT_MERGE_STATE" != "UNKNOWN" && "$CURRENT_MERGE_STATE" != "DRAFT" ]]; then
+              echo "classification=deterministic" >> "$GITHUB_OUTPUT"
+              echo "::notice::PR #$PR_NUMBER is no longer conflicted (mergeable=$CURRENT_MERGEABLE state=$CURRENT_MERGE_STATE); discarding conflict repair without publication."
+              exit 1
+            fi
           fi
           # kodmial/continuum#260: workflow-owned repair commit uses the bot
           # identity inline plus the component trailer so automated repair is

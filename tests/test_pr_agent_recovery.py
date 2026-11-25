@@ -1031,11 +1031,17 @@ class RecoveryWiringTests(unittest.TestCase):
         self.assertGreaterEqual(body.count("withReadFallback("), 14)
 
         # Item 1 keeps all mutation/dispatch calls on the PAT-authenticated
-        # action client, preserving actor and event fan-out semantics.
+        # action client, preserving actor and event fan-out semantics. The
+        # delegated conflict admission also writes/removes the shared
+        # exact-HEAD conflict lock label on the target repository, so those
+        # label mutations belong to the same PAT mutation surface.
         for mutation in (
             "github.rest.issues.createComment",
             "github.rest.issues.updateComment",
             "github.rest.issues.deleteComment",
+            "github.rest.issues.createLabel",
+            "github.rest.issues.addLabels",
+            "github.rest.issues.removeLabel",
             "github.rest.actions.createWorkflowDispatch",
         ):
             with self.subTest(mutation=mutation):
@@ -1044,7 +1050,7 @@ class RecoveryWiringTests(unittest.TestCase):
         self.assertNotIn("github.paginate(", body)
         self.assertNotRegex(
             body,
-            r"github\.rest\.(?!issues\.createComment\b|issues\.updateComment\b|issues\.deleteComment\b|actions\.createWorkflowDispatch\b)",
+            r"github\.rest\.(?!issues\.createComment\b|issues\.updateComment\b|issues\.deleteComment\b|issues\.createLabel\b|issues\.addLabels\b|issues\.removeLabel\b|actions\.createWorkflowDispatch\b)",
             "PAT client must only be used for mutations/dispatch",
         )
 
