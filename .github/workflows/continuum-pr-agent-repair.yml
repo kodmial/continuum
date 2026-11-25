@@ -950,6 +950,34 @@ jobs:
           PY
           )"
           fi
+          BASE_SHA=""
+          if [[ "${MODE,,}" == "conflict" ]]; then
+            # Capture the integrated base before the agent merges it. The
+            # publish gate below proves this exact commit is an ancestor of
+            # the result, so a repair that silently skipped the default
+            # branch cannot be published as a conflict resolution.
+            CONFLICT_BASE_REF="$(gh api "repos/$CONTINUUM_PR_AGENT_TARGET_REPOSITORY" --jq .default_branch 2>/dev/null || true)"
+            CONFLICT_BASE_REF="${CONFLICT_BASE_REF#refs/heads/}"
+            CONFLICT_BASE_REF="$(printf '%s' "$CONFLICT_BASE_REF" | tr -d '[:space:]')"
+            case "$CONFLICT_BASE_REF" in
+              ""|HEAD|@|FETCH_HEAD|ORIG_HEAD|MERGE_HEAD|*".."*|*"~"*|*"^"*|*"?"*|*"*"*|*"["*|*" "*|*"@{"*|-*|/*|*/|*.lock)
+                echo "classification=deterministic" >> "$GITHUB_OUTPUT"
+                echo "::error::Conflict repair could not resolve a safe default branch for the integrated base; discarding repair."
+                exit 1
+                ;;
+            esac
+            if ! git fetch --no-tags origin "refs/heads/$CONFLICT_BASE_REF:refs/remotes/origin/$CONFLICT_BASE_REF"; then
+              echo "classification=transient" >> "$GITHUB_OUTPUT"
+              echo "::error::Conflict repair could not fetch the integrated default-branch base; recovery may retry."
+              exit 1
+            fi
+            BASE_SHA="$(git rev-parse "refs/remotes/origin/$CONFLICT_BASE_REF")"
+            if [[ ! "$BASE_SHA" =~ ^[0-9a-f]{40,64}$ ]]; then
+              echo "classification=deterministic" >> "$GITHUB_OUTPUT"
+              echo "::error::Conflict repair could not resolve the integrated base commit; discarding repair."
+              exit 1
+            fi
+          fi
           START_HEAD="$(git rev-parse HEAD)"
           # Attribute only explicit external provider failures to the
           # selected OpenCode route. Code/tool failures must not burn models.
@@ -1000,15 +1028,46 @@ jobs:
           # cancellation Gitlink or recovery metadata). An unconfigured
           # Gitlink fails closed before any publication.
           continuum_stage_publishable || exit 1
+          no_progress_classification="transient"
+          if [[ "${MODE,,}" == "conflict" ]]; then
+            # Conflict no-progress is deterministic: re-running the same merge
+            # against the same HEAD cannot produce new information, so it must
+            # stop instead of consuming the bounded conflict-retry budget.
+            no_progress_classification="deterministic"
+            # A conflict-mode result is publishable only when the index is
+            # fully resolved, no conflict markers survived staging, and both
+            # the original HEAD and the integrated default-branch base are
+            # ancestors of the result.
+            if [[ -n "$(git ls-files -u)" ]]; then
+              echo "classification=deterministic" >> "$GITHUB_OUTPUT"
+              echo "::error::Conflict repair left unresolved index entries; discarding repair."
+              exit 1
+            fi
+            if git diff --cached -U0 | grep -qE '^\+(<<<<<<< |=======$|>>>>>>> )'; then
+              echo "classification=deterministic" >> "$GITHUB_OUTPUT"
+              echo "::error::Conflict repair left conflict markers in the staged result; discarding repair."
+              exit 1
+            fi
+            if [[ -z "$BASE_SHA" ]]; then
+              echo "classification=deterministic" >> "$GITHUB_OUTPUT"
+              echo "::error::Conflict repair has no integrated base commit to validate; discarding repair."
+              exit 1
+            fi
+            if ! git merge-base --is-ancestor "$BASE_SHA" HEAD; then
+              echo "classification=deterministic" >> "$GITHUB_OUTPUT"
+              echo "::error::Conflict repair did not integrate the default-branch base $BASE_SHA; discarding repair."
+              exit 1
+            fi
+          fi
           if [[ -z "$(git status --porcelain)" ]]; then
-            echo "classification=transient" >> "$GITHUB_OUTPUT"
+            echo "classification=$no_progress_classification" >> "$GITHUB_OUTPUT"
             echo "no_progress=true" >> "$GITHUB_OUTPUT"
             echo "no_progress_reason=no-code-change" >> "$GITHUB_OUTPUT"
             echo "::warning::No repair diff; requesting bounded exact-HEAD re-review/repair instead of settling the PR."
             exit 1
           fi
           if git diff --cached --quiet; then
-            echo "classification=transient" >> "$GITHUB_OUTPUT"
+            echo "classification=$no_progress_classification" >> "$GITHUB_OUTPUT"
             echo "no_progress=true" >> "$GITHUB_OUTPUT"
             echo "no_progress_reason=no-staged-change" >> "$GITHUB_OUTPUT"
             echo "::warning::No staged repair diff; requesting bounded exact-HEAD re-review/repair instead of settling the PR."
@@ -1019,14 +1078,29 @@ jobs:
           # Target-aware revalidation runs PAT-backed (GH_TOKEN is TAP_PAT)
           # against the resolved target so delegated cross-repository reads
           # succeed; API failures are transient and recovery-eligible.
-          if ! CURRENT_STATE="$(gh pr view "$PR_NUMBER" --repo "$CONTINUUM_PR_AGENT_TARGET_REPOSITORY" --json headRefOid,state,isDraft --jq '[.headRefOid,.state,(.isDraft|tostring)]|@tsv')"; then
-            echo "classification=transient" >> "$GITHUB_OUTPUT"
-            echo "::error::Unable to revalidate PR branch before publish; GitHub API read failed and recovery may retry."
-            exit 1
+          CURRENT_LABELS=""
+          CURRENT_MERGEABLE=""
+          CURRENT_MERGE_STATE=""
+          if [[ "${MODE,,}" == "conflict" ]]; then
+            # Conflict mode additionally revalidates the owner hold and the
+            # live conflict state, because another actor may have resolved the
+            # PR while the repair was running.
+            if ! CURRENT_STATE="$(gh pr view "$PR_NUMBER" --repo "$CONTINUUM_PR_AGENT_TARGET_REPOSITORY" --json headRefOid,state,isDraft,labels,mergeable,mergeStateStatus --jq '[.headRefOid,.state,(.isDraft|tostring),([.labels[].name]|join(",")),.mergeable,(.mergeStateStatus//"")]|@tsv')"; then
+              echo "classification=transient" >> "$GITHUB_OUTPUT"
+              echo "::error::Unable to revalidate conflict PR state before publish; GitHub API read failed and recovery may retry."
+              exit 1
+            fi
+            IFS=$'\t' read -r CURRENT_SHA CURRENT_PR_STATE CURRENT_DRAFT CURRENT_LABELS CURRENT_MERGEABLE CURRENT_MERGE_STATE <<<"$CURRENT_STATE"
+          else
+            if ! CURRENT_STATE="$(gh pr view "$PR_NUMBER" --repo "$CONTINUUM_PR_AGENT_TARGET_REPOSITORY" --json headRefOid,state,isDraft --jq '[.headRefOid,.state,(.isDraft|tostring)]|@tsv')"; then
+              echo "classification=transient" >> "$GITHUB_OUTPUT"
+              echo "::error::Unable to revalidate PR branch before publish; GitHub API read failed and recovery may retry."
+              exit 1
+            fi
+            CURRENT_SHA="$(cut -f1 <<<"$CURRENT_STATE")"
+            CURRENT_PR_STATE="$(cut -f2 <<<"$CURRENT_STATE")"
+            CURRENT_DRAFT="$(cut -f3 <<<"$CURRENT_STATE")"
           fi
-          CURRENT_SHA="$(cut -f1 <<<"$CURRENT_STATE")"
-          CURRENT_PR_STATE="$(cut -f2 <<<"$CURRENT_STATE")"
-          CURRENT_DRAFT="$(cut -f3 <<<"$CURRENT_STATE")"
           REMOTE_SHA="$(git ls-remote origin "refs/heads/$HEAD_REF" | awk '{print $1}' || true)"
           if [[ "$CURRENT_PR_STATE" != "OPEN" || "$CURRENT_DRAFT" == "true" ]]; then
             echo "classification=deterministic" >> "$GITHUB_OUTPUT"
@@ -1533,6 +1607,8 @@ jobs:
           HEAD_SHA: ${{ inputs.head_sha }}
           RETRY_ATTEMPT: ${{ inputs.retry_attempt || '0' }}
           RETRY_WORKFLOW: ${{ inputs.retry_workflow || 'continuum-pr-agent.yml' }}
+          PR_AGENT_REPAIR_WORKFLOW: ${{ vars.CONTINUUM_PR_AGENT_REPAIR_WORKFLOW || 'continuum-pr-agent-repair.yml' }}
+          MODE: ${{ inputs.mode || 'repair' }}
           TARGET_CHILD_ID: ${{ inputs.target_child_id }}
           CONTINUUM_REF_INPUT: ${{ inputs.continuum_ref }}
           CI_WORKFLOW_NAME: ${{ vars.CONTINUUM_CI_WORKFLOW_NAME || 'CI' }}
@@ -1552,13 +1628,35 @@ jobs:
           fi
           attempt="${RETRY_ATTEMPT:-0}"
           [[ "$attempt" =~ ^[0-9]+$ ]] || attempt=0
-          case "$RETRY_WORKFLOW" in
-            continuum-pr-agent.yml|pr-agent.yml) ;;
-            *)
-              echo "::error::Invalid isolated PR-Agent retry workflow: $RETRY_WORKFLOW"
-              exit 1
-              ;;
-          esac
+          MODE_LOWER="$(printf '%s' "${MODE:-repair}" | tr '[:upper:]' '[:lower:]')"
+          CONFLICT_RETRY_WORKFLOW=""
+          if [[ "$MODE_LOWER" == "conflict" ]]; then
+            # Conflict retries stay in conflict mode and dispatch the existing
+            # repair caller, never the ordinary review workflow: a dirty PR has
+            # no green CI to justify a review dispatch.
+            CONFLICT_RETRY_WORKFLOW="${PR_AGENT_REPAIR_WORKFLOW:-continuum-pr-agent-repair.yml}"
+            case "$CONFLICT_RETRY_WORKFLOW" in
+              *.yml) ;;
+              *)
+                echo "::error::Invalid conflict repair retry workflow: $CONFLICT_RETRY_WORKFLOW"
+                exit 1
+                ;;
+            esac
+            case "$CONFLICT_RETRY_WORKFLOW" in
+              */*|*\\*|*..*)
+                echo "::error::Invalid conflict repair retry workflow: $CONFLICT_RETRY_WORKFLOW"
+                exit 1
+                ;;
+            esac
+          else
+            case "$RETRY_WORKFLOW" in
+              continuum-pr-agent.yml|pr-agent.yml) ;;
+              *)
+                echo "::error::Invalid isolated PR-Agent retry workflow: $RETRY_WORKFLOW"
+                exit 1
+                ;;
+            esac
+          fi
 
           # No pre-backoff PR read here (#254): the post-backoff exact-HEAD
           # revalidation below is the authoritative stale-retry gate, so a
@@ -1586,29 +1684,49 @@ jobs:
             echo "PR state changed during repair retry backoff; stale retry cancelled."
             exit 0
           fi
-          CI_JSON="$RUNNER_TEMP/pr-agent-repair-ci-runs.json"
-          if ! gh api "repos/$CONTINUUM_PR_AGENT_TARGET_REPOSITORY/actions/runs?event=pull_request&head_sha=$HEAD_SHA&per_page=100" > "$CI_JSON"; then
-            echo "Could not revalidate exact-HEAD CI after backoff; stale retry cancelled."
-            exit 0
-          fi
-          if ! python3 - "$CI_JSON" "$CI_WORKFLOW_NAME" "$HEAD_SHA" <<'PY'
-          import json, sys
-          path, workflow, head = sys.argv[1:4]
-          with open(path, "r", encoding="utf-8") as handle:
-              runs = json.load(handle).get("workflow_runs", [])
-          current = sorted(
-              (run for run in runs if run.get("name") == workflow and run.get("head_sha") == head),
-              key=lambda run: run.get("created_at") or "",
-              reverse=True,
-          )
-          raise SystemExit(
-              0 if current and current[0].get("status") == "completed"
-              and current[0].get("conclusion") == "success" else 1
-          )
-          PY
-          then
-            echo "Exact HEAD no longer has green CI; retry cancelled until a fresh CI event."
-            exit 0
+          if [[ "$MODE_LOWER" == "conflict" ]]; then
+            # Conflict mode never waits for pull_request CI: the dirty PR is
+            # admitted precisely because that CI cannot exist. Revalidate the
+            # live conflict state instead, and stop when another actor already
+            # resolved it or the owner re-added the hold.
+            if ! conflict_state="$(gh pr view "$PR_NUMBER" --repo "$CONTINUUM_PR_AGENT_TARGET_REPOSITORY" --json labels,mergeable,mergeStateStatus --jq '[([.labels[].name]|join(",")),.mergeable,(.mergeStateStatus//"")]|@tsv')"; then
+              echo "Could not revalidate conflict state after backoff; stale retry cancelled."
+              exit 0
+            fi
+            IFS=$'\t' read -r conflict_labels conflict_mergeable conflict_merge_state <<<"$conflict_state"
+            if [[ ",$conflict_labels," == *",no-auto-merge,"* ]]; then
+              echo "Owner hold re-added during conflict retry backoff; conflict retry cancelled."
+              exit 0
+            fi
+            if [[ "$conflict_mergeable" == "MERGEABLE" && -n "$conflict_merge_state" && "$conflict_merge_state" != "DIRTY" && "$conflict_merge_state" != "UNKNOWN" && "$conflict_merge_state" != "DRAFT" ]]; then
+              echo "PR is no longer conflicted; conflict retry cancelled."
+              exit 0
+            fi
+          else
+            CI_JSON="$RUNNER_TEMP/pr-agent-repair-ci-runs.json"
+            if ! gh api "repos/$CONTINUUM_PR_AGENT_TARGET_REPOSITORY/actions/runs?event=pull_request&head_sha=$HEAD_SHA&per_page=100" > "$CI_JSON"; then
+              echo "Could not revalidate exact-HEAD CI after backoff; stale retry cancelled."
+              exit 0
+            fi
+            if ! python3 - "$CI_JSON" "$CI_WORKFLOW_NAME" "$HEAD_SHA" <<'PY'
+            import json, sys
+            path, workflow, head = sys.argv[1:4]
+            with open(path, "r", encoding="utf-8") as handle:
+                runs = json.load(handle).get("workflow_runs", [])
+            current = sorted(
+                (run for run in runs if run.get("name") == workflow and run.get("head_sha") == head),
+                key=lambda run: run.get("created_at") or "",
+                reverse=True,
+            )
+            raise SystemExit(
+                0 if current and current[0].get("status") == "completed"
+                and current[0].get("conclusion") == "success" else 1
+            )
+            PY
+            then
+              echo "Exact HEAD no longer has green CI; retry cancelled until a fresh CI event."
+              exit 0
+            fi
           fi
 
           DEFAULT_BRANCH="$(gh repo view "$GITHUB_REPOSITORY" --json defaultBranchRef --jq .defaultBranchRef.name 2>/dev/null || echo main)"
@@ -1641,6 +1759,47 @@ jobs:
             fi
             return "$dispatch_status"
           }
+          if [[ "$MODE_LOWER" == "conflict" ]]; then
+            # The exact-HEAD conflict marker is the same durable claim the
+            # auto-merge and recovery reconcilers use, so the retry advances
+            # one shared bounded budget. It is removed when dispatch fails:
+            # a lost dispatch must never consume a successful attempt.
+            printf -v marker_body '%s\n%s\n%s\n%s\n%s' \
+              "<!-- opencode-conflict-repair-attempt head=$HEAD_SHA -->" \
+              "<!-- continuum-conflict-repair-attempt head=$HEAD_SHA attempt=$next -->" \
+              "⚡ **Continuum · pr-agent-repair**" \
+              "<!-- continuum-origin role=continuum component=pr-agent-repair -->" \
+              "Automatic delegated conflict repair execution $((next + 1))/3 for HEAD \`$HEAD_SHA\` (base \`$DEFAULT_BRANCH\`). Scope is merge-conflict resolution only; the repair merges the base into the PR branch and preserves intent from both sides without redoing the original task."
+            marker_id=""
+            if ! marker_id="$(gh api --method POST "repos/$CONTINUUM_PR_AGENT_TARGET_REPOSITORY/issues/$PR_NUMBER/comments" -f body="$marker_body" --jq .id)"; then
+              echo "::warning::Could not record the conflict retry marker; recovery may retry this exact index."
+              exit 1
+            fi
+            if ! [[ "$marker_id" =~ ^[0-9]+$ ]]; then
+              echo "::warning::Conflict retry marker id is invalid; recovery may retry this exact index."
+              exit 1
+            fi
+            dispatch_conflict_retry() {
+              local dispatch_output dispatch_status
+              set +e
+              if [[ -n "${TARGET_CHILD_ID:-}" ]]; then
+                dispatch_output="$(gh workflow run "$CONFLICT_RETRY_WORKFLOW" --repo "$GITHUB_REPOSITORY" --ref "$DEFAULT_BRANCH" -f pr_number="$PR_NUMBER" -f mode=conflict -f head_sha="$HEAD_SHA" -f retry_attempt="$next" -f target_child_id="$TARGET_CHILD_ID" 2>&1)"
+              else
+                dispatch_output="$(gh workflow run "$CONFLICT_RETRY_WORKFLOW" --repo "$GITHUB_REPOSITORY" --ref "$DEFAULT_BRANCH" -f pr_number="$PR_NUMBER" -f mode=conflict -f head_sha="$HEAD_SHA" -f retry_attempt="$next" 2>&1)"
+              fi
+              dispatch_status=$?
+              set -e
+              printf '%s\n' "$dispatch_output"
+              return "$dispatch_status"
+            }
+            if ! dispatch_conflict_retry; then
+              gh api --method DELETE "repos/$CONTINUUM_PR_AGENT_TARGET_REPOSITORY/issues/comments/$marker_id" >/dev/null 2>&1 || true
+              echo "::warning::Conflict repair retry dispatch failed; the attempt was not consumed and recovery may retry this exact index."
+              exit 1
+            fi
+            echo "Dispatched delegated conflict repair retry $((next + 1))/3 for exact HEAD $HEAD_SHA."
+            exit 0
+          fi
           CONTINUUM_REF_INPUT="${CONTINUUM_REF_INPUT:-}"
           if [[ -n "${TARGET_CHILD_ID:-}" ]]; then
             : "${CONTINUUM_REF_INPUT:?CONTINUUM_REF is required for delegated retry}"

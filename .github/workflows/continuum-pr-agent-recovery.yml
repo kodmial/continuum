@@ -153,6 +153,7 @@ jobs:
         uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
         env:
           REVIEW_WORKFLOW: ${{ inputs.review_workflow }}
+          PR_AGENT_REPAIR_WORKFLOW: ${{ vars.CONTINUUM_PR_AGENT_REPAIR_WORKFLOW || 'continuum-pr-agent-repair.yml' }}
           CI_WORKFLOW_NAME: ${{ inputs.ci_workflow_name || vars.CONTINUUM_CI_WORKFLOW_NAME || 'CI' }}
           STALE_MINUTES: ${{ inputs.stale_minutes || vars.PR_AGENT_RECOVERY_STALE_MINUTES || '70' }}
           DISPATCH_GRACE_SECONDS: ${{ inputs.dispatch_grace_seconds || vars.PR_AGENT_RECOVERY_DISPATCH_GRACE_SECONDS || '90' }}
@@ -942,6 +943,209 @@ jobs:
                 return false;
               }
               return null;
+            }
+
+            // Delegated conflict admission (issue #497). A delegated dirty PR
+            // has no pull_request CI to turn green, so the ordinary exact-HEAD
+            // CI gate would strand it before conflict repair can ever run.
+            // This delegated-only path admits the existing conflict-mode
+            // repair before that gate. It reuses the auto-merge reconciler's
+            // exact-HEAD marker and lock so only one authoritative conflict
+            // dispatch can win per HEAD, and it never relaxes ordinary CI or
+            // review admission.
+            const CONFLICT_LOCK_LABEL = 'opencode-conflict-repair';
+            const MAX_CONFLICT_EXECUTIONS = 3;
+            function conflictAttemptMarker(headSha) {
+              return '<!-- opencode-conflict-repair-attempt head=' +
+                String(headSha || '').toLowerCase() + ' -->';
+            }
+            function conflictAttemptMetadataMarker(headSha, attempt) {
+              return '<!-- continuum-conflict-repair-attempt head=' +
+                String(headSha || '').toLowerCase() +
+                ' attempt=' + String(attempt) + ' -->';
+            }
+            function trustedAutomationComment(comment) {
+              const rawUser = (comment.user && typeof comment.user === 'object') ? comment.user : {};
+              const login = String(rawUser.login || comment.user_login || comment.author || '').trim().toLowerCase();
+              return trustedAssociations.has(String(comment.author_association || '').toUpperCase()) ||
+                login === 'github-actions[bot]';
+            }
+            function conflictDispatchMarkers(comments, head) {
+              const exact = String(head || '').toLowerCase();
+              const marker = conflictAttemptMarker(exact);
+              const found = [];
+              for (const comment of comments) {
+                if (!trustedAutomationComment(comment)) continue;
+                if (!String(comment.body || '').includes(marker)) continue;
+                found.push({
+                  id: comment.id,
+                  created_at: comment.created_at,
+                  updated_at: comment.updated_at,
+                });
+              }
+              return found;
+            }
+            function hasConflictNoProgress(comments, head) {
+              const exact = String(head || '').toLowerCase();
+              const crypto = require('crypto');
+              const fingerprint = crypto
+                .createHash('sha256')
+                .update('conflict:' + exact)
+                .digest('hex');
+              const pattern =
+                /<!--\s*continuum-pr-agent-no-progress\s+head=([0-9a-f]{40,64})\s+fingerprint=([0-9a-f]{64})[^>]*-->/ig;
+              for (const comment of comments) {
+                if (!trustedAutomationComment(comment)) continue;
+                const body = String(comment.body || '');
+                pattern.lastIndex = 0;
+                for (const match of body.matchAll(pattern)) {
+                  if (
+                    String(match[1] || '').toLowerCase() === exact &&
+                    String(match[2] || '').toLowerCase() === fingerprint
+                  ) {
+                    return true;
+                  }
+                }
+              }
+              return false;
+            }
+            // Deterministic decision for the delegated conflict-only
+            // transition. Every durable conflict dispatch writes the same
+            // exact-HEAD marker, so the marker count is the bounded execution
+            // index: auto-merge, recovery and the repair retry all advance the
+            // same budget instead of keeping independent counters.
+            function decideDelegatedConflict({
+              delegated = false,
+              fresh = null,
+              head = '',
+              repoFullName: targetRepository = '',
+              hasHold = false,
+              repairStatus = null,
+              repairRun = null,
+              conflictMarkers = [],
+              evidence = null,
+              noProgress = false,
+              now = nowMs(),
+              dispatchGraceMs: graceMs = dispatchGraceMs,
+              staleMs: staleWindowMs = staleMs,
+              maxExecutions = MAX_CONFLICT_EXECUTIONS,
+            } = {}) {
+              if (!delegated) {
+                return { action: 'none', reason: 'conflict admission is delegated-only' };
+              }
+              const conflicted = isConflictedMergeability(
+                fresh ? fresh.mergeable : null,
+                fresh ? fresh.mergeable_state : null
+              );
+              if (conflicted === null) {
+                return { action: 'defer', reason: 'mergeability is still being computed' };
+              }
+              if (conflicted !== true) {
+                return { action: 'none', reason: 'PR is not confirmed conflicted' };
+              }
+              if (!fresh || fresh.state !== 'open' || fresh.merged) {
+                return { action: 'settled', reason: 'PR is closed or merged' };
+              }
+              if (fresh.draft) {
+                return { action: 'hold', reason: 'PR is a draft' };
+              }
+              const freshHead = String(fresh.head?.sha || '').toLowerCase();
+              if (!freshHead || freshHead !== String(head || '').toLowerCase()) {
+                return { action: 'hold', reason: 'PR HEAD moved; stale conflict admission' };
+              }
+              const freshRepo = String(fresh.head?.repo?.full_name || '');
+              if (!freshRepo || freshRepo !== targetRepository) {
+                return { action: 'hold', reason: 'PR HEAD is not the same-repository target' };
+              }
+              if (hasHold) {
+                return { action: 'hold', reason: 'explicit no-auto-merge hold is present' };
+              }
+              if (
+                repairRun &&
+                activeStatuses.has(String(repairRun.conclusion || '').toLowerCase())
+              ) {
+                return { action: 'wait', reason: 'a conflict repair is already active' };
+              }
+              if (noProgress) {
+                return {
+                  action: 'hold',
+                  reason: 'conflict repair recorded no progress for this HEAD',
+                };
+              }
+              if (evidence && evidence.exhausted) {
+                return { action: 'hold', reason: 'durable retry exhaustion marker exists' };
+              }
+              if (
+                evidence &&
+                Number.isFinite(evidence.notBeforeEpoch) &&
+                now < evidence.notBeforeEpoch * 1000
+              ) {
+                return {
+                  action: 'wait',
+                  reason: 'durable reset-aware not-before time has not arrived',
+                };
+              }
+              const markers = Array.isArray(conflictMarkers) ? conflictMarkers : [];
+              const statusState = String(repairStatus?.state || '').toLowerCase();
+              const statusDescription = String(repairStatus?.description || '').toLowerCase();
+              if (statusState === 'success') {
+                return { action: 'settled', reason: 'conflict repair already settled for this HEAD' };
+              }
+              if (statusState === 'failure' && /deterministic/.test(statusDescription)) {
+                return {
+                  action: 'hold',
+                  reason: 'deterministic conflict repair failure is not automatically retried',
+                };
+              }
+              if (markers.length >= maxExecutions) {
+                return {
+                  action: 'hold',
+                  reason: 'bounded conflict repair budget exhausted for this HEAD',
+                };
+              }
+              if (markers.length === 0) {
+                return {
+                  action: 'dispatch',
+                  attempt: 0,
+                  reason: 'dirty PR has no conflict repair dispatch',
+                };
+              }
+              const markerTimes = markers
+                .map(marker => Date.parse(String(marker.updated_at || marker.created_at || '')))
+                .filter(value => Number.isFinite(value));
+              const newestMarkerAt = markerTimes.length ? Math.max(...markerTimes) : null;
+              const markerAge = newestMarkerAt === null ? null : Math.max(0, now - newestMarkerAt);
+              if (statusState === 'pending' || statusState === 'failure') {
+                // A status proves an execution reached the repair workflow.
+                // Retry the same pending index after dispatch grace; a lost or
+                // failed dispatch never consumes a later successful slot.
+                if (markerAge !== null && markerAge < graceMs) {
+                  return {
+                    action: 'wait',
+                    reason: 'conflict repair dispatch is inside its grace window',
+                  };
+                }
+                return {
+                  action: 'retry',
+                  attempt: markers.length,
+                  reason: statusState === 'failure'
+                    ? 'transient conflict repair failure is recoverable in conflict mode'
+                    : 'stale pending conflict repair is recoverable in conflict mode',
+                };
+              }
+              // No status receipt: acceptance and liveness are unknown, so
+              // defer instead of guessing idle and duplicating a model run.
+              if (markerAge === null || markerAge < staleWindowMs) {
+                return {
+                  action: 'wait',
+                  reason: 'conflict repair dispatch acceptance is still ambiguous',
+                };
+              }
+              return {
+                action: 'retry',
+                attempt: markers.length,
+                reason: 'conflict repair dispatch receipt is stale',
+              };
             }
 
             // Admission for the clean-review -> merge-lifecycle transition.
@@ -2031,6 +2235,308 @@ jobs:
               return true;
             }
 
+            // Read the authoritative delegated conflict state. The open-PR
+            // list is only a cheap hint: mergeability is re-read through
+            // pulls.get, and the marker/status scan is bounded. A truncated
+            // comment window fails closed instead of deciding on a partial
+            // set that may hide a competing dispatch.
+            async function collectConflictState(prNumber, head) {
+              const fresh = await withReadFallback(async client => (
+                await client.rest.pulls.get({
+                  owner,
+                  repo,
+                  pull_number: prNumber,
+                })
+              ).data);
+              if (isConflictedMergeability(fresh.mergeable, fresh.mergeable_state) !== true) {
+                return { fresh, conflicted: false };
+              }
+              const statuses = await withReadFallback(client =>
+                boundedCollect(
+                  client,
+                  (params) => client.rest.repos.listCommitStatusesForRef(params),
+                  { owner, repo, ref: head, per_page: 100 },
+                  MAX_GATE_PAGES
+                )
+              );
+              const repairStatus = latestContext(statuses, REPAIR_CONTEXT);
+              const repairRun = repairStatus ? await statusRunMetadata(repairStatus) : null;
+              const comments = await withReadFallback(async (client) => {
+                const items = await boundedCollect(
+                  client,
+                  (params) => client.rest.issues.listComments(params),
+                  { owner, repo, issue_number: prNumber, per_page: 100 },
+                  MAX_COMMENT_PAGES
+                );
+                if (items.truncated) {
+                  try {
+                    await recoverNewestComments(client, prNumber, items);
+                  } catch {
+                    // Leave the truncated flag set; admission defers.
+                  }
+                }
+                return items;
+              });
+              if (comments.truncated) {
+                return { fresh, conflicted: true, truncated: true };
+              }
+              return {
+                fresh,
+                conflicted: true,
+                truncated: false,
+                repairStatus,
+                repairRun,
+                evidence: parseEvidence(comments, head, 'repair'),
+                conflictMarkers: conflictDispatchMarkers(comments, head),
+                noProgress: hasConflictNoProgress(comments, head),
+              };
+            }
+
+            async function ensureConflictLock() {
+              try {
+                await github.rest.issues.createLabel({
+                  owner,
+                  repo,
+                  name: CONFLICT_LOCK_LABEL,
+                  color: 'B60205',
+                  description: 'One automatic conflict-repair attempt per conflict episode.',
+                });
+              } catch (err) {
+                if (err.status !== 422) throw err;
+              }
+            }
+
+            async function releaseConflictLock(prNumber) {
+              try {
+                await github.rest.issues.removeLabel({
+                  owner,
+                  repo,
+                  issue_number: prNumber,
+                  name: CONFLICT_LOCK_LABEL,
+                });
+              } catch (err) {
+                if (err.status !== 404) throw err;
+              }
+            }
+
+            function conflictMarkerIds(markers) {
+              return (Array.isArray(markers) ? markers : [])
+                .map(marker => String(marker && marker.id))
+                .sort()
+                .join(',');
+            }
+
+            async function dispatchDelegatedConflict(pr, head, attempt, snapshot) {
+              const repairWorkflow = String(
+                process.env.PR_AGENT_REPAIR_WORKFLOW || 'continuum-pr-agent-repair.yml'
+              ).trim();
+              if (
+                !repairWorkflow.endsWith('.yml') ||
+                repairWorkflow.includes('/') ||
+                repairWorkflow.includes('\\') ||
+                repairWorkflow.includes('..')
+              ) {
+                throw new Error(
+                  'Invalid PR-Agent repair workflow: ' + repairWorkflow +
+                  '. Expected a bare workflow file name.'
+                );
+              }
+              // Re-read live PR/status/comments immediately before mutation:
+              // a competing auto-merge or recovery wakeup may already own this
+              // HEAD's single authoritative conflict dispatch.
+              const live = await collectConflictState(pr.number, head);
+              if (!live.conflicted || live.truncated) {
+                core.info(
+                  'PR #' + pr.number + ' HEAD ' + head +
+                  ': conflict admission state changed before dispatch; stale conflict dispatch cancelled.'
+                );
+                return false;
+              }
+              const recheck = decideDelegatedConflict({
+                delegated: true,
+                fresh: live.fresh,
+                head,
+                repoFullName,
+                hasHold: hasNoAutoMergeHold(live.fresh),
+                repairStatus: live.repairStatus,
+                repairRun: live.repairRun,
+                conflictMarkers: live.conflictMarkers,
+                evidence: live.evidence,
+                noProgress: live.noProgress,
+              });
+              if (recheck.action !== 'dispatch' && recheck.action !== 'retry') {
+                core.info(
+                  'PR #' + pr.number + ' HEAD ' + head +
+                  ': conflict admission is no longer due (' + recheck.reason + '); coalescing duplicate wakeup.'
+                );
+                return false;
+              }
+              if (
+                recheck.attempt !== attempt ||
+                conflictMarkerIds(live.conflictMarkers) !== conflictMarkerIds(snapshot.conflictMarkers)
+              ) {
+                core.info(
+                  'PR #' + pr.number + ' HEAD ' + head +
+                  ': a competing conflict dispatch changed the marker state; coalescing duplicate wakeup.'
+                );
+                return false;
+              }
+              const ref = await defaultBranch();
+              let markerComment = null;
+              try {
+                await ensureConflictLock();
+                await github.rest.issues.addLabels({
+                  owner,
+                  repo,
+                  issue_number: pr.number,
+                  labels: [CONFLICT_LOCK_LABEL],
+                });
+                // Exactly-once claim: the exact-HEAD marker is written before
+                // dispatch, so a runner crash after a successful dispatch can
+                // never let the next wakeup duplicate the same execution. A
+                // failed dispatch removes the marker so the execution index is
+                // not consumed by a dispatch that never happened.
+                const body = [
+                  conflictAttemptMarker(head),
+                  conflictAttemptMetadataMarker(head, attempt),
+                  '⚡ **Continuum · pr-agent-recovery**',
+                  '<!-- continuum-origin role=continuum component=pr-agent-recovery -->',
+                  'Automatic delegated conflict repair execution ' +
+                    String(attempt + 1) + '/' + String(MAX_CONFLICT_EXECUTIONS) +
+                    ' for HEAD `' + head + '` (base `' + ref + '`). ' +
+                    'Scope is merge-conflict resolution only: merge the base ' +
+                    'into the PR branch and preserve intent from both sides ' +
+                    'without redoing the original task.',
+                ].join('\n');
+                const { data } = await github.rest.issues.createComment({
+                  owner,
+                  repo,
+                  issue_number: pr.number,
+                  body,
+                });
+                markerComment = data;
+                const inputs = {
+                  pr_number: String(pr.number),
+                  mode: 'conflict',
+                  head_sha: head,
+                };
+                const childId = String(process.env.TARGET_CHILD_ID || '');
+                if (childId) {
+                  inputs.target_child_id = childId;
+                }
+                if (attempt > 0) {
+                  inputs.retry_attempt = String(attempt);
+                }
+                await github.rest.actions.createWorkflowDispatch({
+                  owner: executionOwner,
+                  repo: executionRepo,
+                  workflow_id: repairWorkflow,
+                  ref,
+                  inputs,
+                });
+                core.notice(
+                  'PR #' + pr.number + ' HEAD ' + head +
+                  ': dispatched delegated conflict repair execution ' +
+                  (attempt + 1) + '/' + MAX_CONFLICT_EXECUTIONS + '.'
+                );
+                return true;
+              } catch (err) {
+                if (markerComment) {
+                  try {
+                    await github.rest.issues.deleteComment({
+                      owner,
+                      repo,
+                      issue_number: pr.number,
+                      comment_id: markerComment.id,
+                    });
+                  } catch (cleanupErr) {
+                    core.warning(
+                      'PR #' + pr.number +
+                      ': failed to remove uncommitted conflict marker: ' +
+                      (cleanupErr.message || cleanupErr)
+                    );
+                  }
+                }
+                await releaseConflictLock(pr.number);
+                const status = Number(err.status || err.response?.status || 0);
+                const message = String(err.message || err);
+                if (status === 404) {
+                  core.notice(
+                    'PR #' + pr.number +
+                    ': conflict repair dispatch skipped: repair caller ' +
+                    repairWorkflow + ' is not dispatchable on ' + ref + '.'
+                  );
+                  return false;
+                }
+                if (
+                  status === 422 &&
+                  /(?:pr_number|mode|head_sha|target_child_id|workflow_dispatch)/i.test(message)
+                ) {
+                  core.notice(
+                    'PR #' + pr.number +
+                    ': conflict repair dispatch skipped: repair caller ' +
+                    repairWorkflow + ' does not accept the delegated conflict inputs.'
+                  );
+                  return false;
+                }
+                if (isTransientApiError(err)) {
+                  core.warning(
+                    'PR #' + pr.number + ' HEAD ' + head +
+                    ': transient conflict dispatch failure; a later wakeup retries: ' +
+                    message
+                  );
+                  return false;
+                }
+                throw err;
+              }
+            }
+
+            async function maybeAdmitDelegatedConflict(pr, head) {
+              if (!delegatedTarget) return false;
+              // The open-PR list is not authoritative mergeability evidence,
+              // but a confirmed-clean entry needs no extra read: ordinary
+              // CI/review admission keeps its exact behavior. A dirty or
+              // unknown entry is re-read through pulls.get below.
+              if (isConflictedMergeability(pr.mergeable, pr.mergeable_state) === false) {
+                return false;
+              }
+              const state = await collectConflictState(pr.number, head);
+              if (!state.conflicted) return false;
+              if (state.truncated) {
+                core.warning(
+                  'PR #' + pr.number + ' HEAD ' + head +
+                  ': conflict admission comment window is truncated; deferring instead of dispatching.'
+                );
+                return true;
+              }
+              const decision = decideDelegatedConflict({
+                delegated: true,
+                fresh: state.fresh,
+                head,
+                repoFullName,
+                hasHold: hasNoAutoMergeHold(state.fresh),
+                repairStatus: state.repairStatus,
+                repairRun: state.repairRun,
+                conflictMarkers: state.conflictMarkers,
+                evidence: state.evidence,
+                noProgress: state.noProgress,
+              });
+              core.info(
+                'PR #' + pr.number + ' HEAD ' + head +
+                ' conflict: admission=' + decision.action +
+                ' reason=' + decision.reason +
+                (decision.attempt === undefined ? '' : ' attempt=' + decision.attempt)
+              );
+              if (decision.action === 'none' || decision.action === 'defer') {
+                return false;
+              }
+              if (decision.action !== 'dispatch' && decision.action !== 'retry') {
+                return true;
+              }
+              await dispatchDelegatedConflict(pr, head, decision.attempt, state);
+              return true;
+            }
+
             async function exhaust(pr, head, kind, comments) {
               const marker = exhaustedMarker(head, kind);
               // Fail-closed and observable: the exhausted marker is the
@@ -2195,6 +2701,16 @@ jobs:
                 continue;
               }
               try {
+                // Delegated-only conflict admission (issue #497) runs before
+                // the ordinary exact-HEAD CI gate: a dirty delegated PR has
+                // no pull_request CI to turn green, so CI-first admission
+                // would deadlock the conflict-repair transition. The helper
+                // returns true only for a confirmed delegated conflict, where
+                // it owns this wakeup; ordinary CI/review admission below is
+                // unchanged for every other PR.
+                if (await maybeAdmitDelegatedConflict(pr, head)) {
+                  continue;
+                }
                 // Latest-state reconciliation body (flat inside the loop so
                 // per-PR skip stays a plain `continue`). The initial CI
                 // verdict comes from the bounded snapshot with exact
