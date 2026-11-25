@@ -1186,6 +1186,11 @@ jobs:
               raise SystemExit("::error::429 recovery metadata head SHA is malformed")
           if not required("head_ref"):
               raise SystemExit("::error::429 recovery metadata head ref is empty")
+          model = str(data.get("model") or "").strip()
+          if model and not re.fullmatch(
+              r"[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._/-]{0,120}", model
+          ):
+              raise SystemExit("::error::429 recovery metadata model is malformed")
           ancestor = subprocess.run(
               ["git", "merge-base", "--is-ancestor", head_sha, "FETCH_HEAD"],
               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
@@ -2983,6 +2988,9 @@ jobs:
               raise SystemExit("metadata head SHA is malformed")
           if not str(data.get("head_ref") or "").strip():
               raise SystemExit("metadata head ref is empty")
+          model = str(data.get("model") or "").strip()
+          if model and not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._/-]{0,120}", model):
+              raise SystemExit("metadata model is malformed")
           PY
           }
           continuum_infra_evacuate() {
@@ -3067,6 +3075,7 @@ jobs:
                   "mode": mode,
                   "issue_number": issue,
                   "pr_number": pr,
+                  "model": os.environ.get("OPENCODE_MODEL", ""),
                   "head_ref": os.environ.get("HEAD_REF", "") or branch,
                   "review_id": os.environ.get("REVIEW_ID", ""),
                   # Preserve the exact CodeRabbit finding batch across 429

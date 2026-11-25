@@ -230,6 +230,14 @@ _CHILD_REPO_RE = re.compile(
 )
 _SHA_RE = re.compile(r"\b[0-9a-f]{40}\b", re.IGNORECASE)
 
+#: Provider/model identifier persisted in recovery metadata so a fresh runner
+#: can pin the exact trusted route instead of performing a new selection. The
+#: pattern mirrors ``model_routing.MODEL_ID`` but stays local so this module
+#: remains dependency-free.
+_MODEL_ID_RE = re.compile(
+    r"^[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._/-]{0,120}$"
+)
+
 #: ``opencode run --format json`` emits one JSON object per line. The
 #: terminal provider failure is a top-level ``type=error`` event carrying the
 #: provider error object. Tool results are ``type=tool_use`` and prose is
@@ -956,6 +964,10 @@ def validate_recovery_metadata(
     A checkpoint pointer is only published after this returns ``True``. The
     schema is deliberately strict: recovery must be provable from durable
     evidence, never guessed from a mutable issue or a partial commit.
+
+    ``model`` is optional so checkpoints created before model persistence stay
+    recoverable. When present it must be a well-formed provider/model id; a
+    malformed value fails closed instead of being forwarded to a fresh runner.
     """
 
     if not isinstance(metadata, Mapping):
@@ -988,6 +1000,9 @@ def validate_recovery_metadata(
     failure_kind = str(metadata.get("failure_kind") or "")
     if failure_kind not in ("quota_429", "unavailable"):
         return False, "recovery metadata failure kind is unknown"
+    model = str(metadata.get("model") or "").strip()
+    if model and not _MODEL_ID_RE.fullmatch(model):
+        return False, "recovery metadata model is malformed"
     issue_text = str(metadata.get("issue_number") or "").strip()
     pr_text = str(metadata.get("pr_number") or "").strip()
     if issue_text and not issue_text.isdigit():
