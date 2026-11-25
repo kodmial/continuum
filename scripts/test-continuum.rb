@@ -11396,8 +11396,12 @@ class ContinuumTest < Minitest::Test
     # instead of two spaced reads of the same HEAD.
     retry_step = step_body(body, 'Schedule bounded retry for retryable PR-Agent repair failure')
     refute_nil retry_step, 'the repair retry step is missing'
-    assert_equal 1, retry_step.scan('gh pr view').size,
-                 'the retry step must revalidate the PR exactly once (post-backoff)'
+    # Ordinary retries revalidate HEAD/state once; conflict retries replace the
+    # CI gate with one conflict-state revalidation, never an unbounded scan.
+    assert_equal 2, retry_step.scan('gh pr view').size,
+                 'the retry step must revalidate the PR once per mode (post-backoff)'
+    assert_includes retry_step, '--json headRefOid,state,isDraft'
+    assert_includes retry_step, '--json labels,mergeable,mergeStateStatus'
     assert_includes retry_step, 'actions/runs?event=pull_request&head_sha='
   end
 

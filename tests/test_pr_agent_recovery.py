@@ -934,6 +934,628 @@ console.log('HOLD_RELEASE_OK');
                 self.assertNotIn(needle + " ' + repoFullName", body)
 
 
+class DelegatedConflictAdmissionTests(unittest.TestCase):
+    """Issue #497: delegated dirty PRs enter conflict repair before CI.
+
+    The recovery workflow is the production path. These tests extract the
+    shipped decision/admission/dispatch functions from the workflow text and
+    execute them under Node against a fake GitHub API, so a regression cannot
+    stay green behind a Python-only reimplementation.
+    """
+
+    WORKFLOW = ".github/workflows/continuum-pr-agent-recovery.yml"
+    HEAD = "a" * 40
+    OLD_HEAD = "b" * 40
+
+    @classmethod
+    def setUpClass(cls):
+        with open(os.path.join(ROOT, cls.WORKFLOW), encoding="utf-8") as handle:
+            cls.body = handle.read()
+
+    @classmethod
+    def _extract_function(cls, name: str) -> str:
+        import re
+
+        match = re.search(
+            r"(?:async\s+)?function\s+" + re.escape(name) + r"\s*\(",
+            cls.body,
+        )
+        if match is None:
+            raise AssertionError(f"workflow function {name} is missing")
+        start = match.start()
+        paren_start = cls.body.index("(", match.start())
+        depth = 0
+        paren_end = None
+        for pos in range(paren_start, len(cls.body)):
+            char = cls.body[pos]
+            if char == "(":
+                depth += 1
+            elif char == ")":
+                depth -= 1
+                if depth == 0:
+                    paren_end = pos
+                    break
+        if paren_end is None:
+            raise AssertionError(f"workflow function {name} has unbalanced parameters")
+        body_start = cls.body.index("{", paren_end)
+        depth = 0
+        body_end = None
+        for pos in range(body_start, len(cls.body)):
+            char = cls.body[pos]
+            if char == "{":
+                depth += 1
+            elif char == "}":
+                depth -= 1
+                if depth == 0:
+                    body_end = pos + 1
+                    break
+        if body_end is None:
+            raise AssertionError(f"workflow function {name} has unbalanced body")
+        return cls.body[start:body_end]
+
+    def _run_harness(self, scenario: str) -> None:
+        import shutil
+        import subprocess
+        import tempfile
+
+        node = shutil.which("node")
+        self.assertIsNotNone(
+            node,
+            "node is required to execute the shipped conflict admission JS; "
+            "failing closed instead of silently skipping",
+        )
+        functions = "\n".join(
+            self._extract_function(name)
+            for name in (
+                "conflictAttemptMarker",
+                "conflictAttemptMetadataMarker",
+                "trustedAutomationComment",
+                "conflictDispatchMarkers",
+                "hasConflictNoProgress",
+                "decideDelegatedConflict",
+                "hasNoAutoMergeHold",
+                "isConflictedMergeability",
+                "collectConflictState",
+                "ensureConflictLock",
+                "releaseConflictLock",
+                "conflictMarkerIds",
+                "dispatchDelegatedConflict",
+                "maybeAdmitDelegatedConflict",
+                "statusRunMetadata",
+                "parseEvidence",
+                "latestContext",
+                "boundedCollect",
+                "defaultBranch",
+                "isTransientApiError",
+                "requireFullHead",
+                "snapshotRunMetadata",
+            )
+        )
+        preamble = r"""
+const assert = require('assert');
+const crypto = require('crypto');
+const CONFLICT_LOCK_LABEL = 'opencode-conflict-repair';
+const MAX_CONFLICT_EXECUTIONS = 3;
+const REPAIR_CONTEXT = 'continuum/pr-agent-repair';
+const MAX_COMMENT_PAGES = 10;
+const MAX_GATE_PAGES = 2;
+const FULL_HEAD_RE = /^[0-9a-f]{40,64}$/i;
+const activeStatuses = new Set([
+  'queued', 'in_progress', 'waiting', 'requested', 'pending',
+]);
+const trustedAssociations = new Set(['OWNER', 'MEMBER', 'COLLABORATOR']);
+const maxExecutions = 10;
+const staleMs = 70 * 60 * 1000;
+const dispatchGraceMs = 90 * 1000;
+const executionOwner = 'parent-owner';
+const executionRepo = 'parent-repo';
+const owner = 'child-owner';
+const repo = 'child-repo';
+const repoFullName = 'child-owner/child-repo';
+const delegatedTarget = true;
+const HEAD = 'a'.repeat(40);
+const OLD_HEAD = 'b'.repeat(40);
+const NOW = Date.parse('2026-11-25T12:00:00Z');
+let clock = NOW;
+let runMetadataById = new Map();
+function nowMs() { return clock; }
+function iso(ms) { return new Date(ms).toISOString(); }
+function ageMs(value) {
+  const parsed = Date.parse(String(value || ''));
+  return Number.isFinite(parsed) ? Math.max(0, nowMs() - parsed) : Number.MAX_SAFE_INTEGER;
+}
+const core = {
+  info() {}, notice() {}, warning() {}, error() {},
+  setFailed(message) { throw new Error(message); },
+};
+async function withReadFallback(fn) { return fn(github); }
+async function recoverNewestComments() {
+  throw new Error('unexpected newest-comment recovery in conflict harness');
+}
+let state;
+let idSeq;
+function reset() {
+  clock = NOW;
+  idSeq = 100;
+  state = {
+    pr: {
+      number: 176,
+      state: 'open',
+      merged: false,
+      draft: false,
+      mergeable: false,
+      mergeable_state: 'dirty',
+      labels: [],
+      head: { sha: HEAD, repo: { full_name: repoFullName } },
+    },
+    statuses: [],
+    comments: [],
+    labels: [],
+    dispatches: [],
+    runs: {},
+    pullReads: 0,
+    failPull: null,
+  };
+}
+function marker(head = HEAD, ageSeconds = 0) {
+  const when = iso(clock - ageSeconds * 1000);
+  return {
+    id: ++idSeq,
+    body: '<!-- opencode-conflict-repair-attempt head=' + head + ' -->',
+    user: { login: 'github-actions[bot]' },
+    author_association: 'NONE',
+    created_at: when,
+    updated_at: when,
+  };
+}
+function repairStatus(statusName, description, ageSeconds = 0, runId = null) {
+  return {
+    state: statusName,
+    context: REPAIR_CONTEXT,
+    description,
+    updated_at: iso(clock - ageSeconds * 1000),
+    target_url: runId
+      ? 'https://github.com/parent-owner/parent-repo/actions/runs/' + runId
+      : null,
+  };
+}
+function freshPr(overrides = {}) {
+  return Object.assign({
+    number: 176,
+    state: 'open',
+    merged: false,
+    draft: false,
+    mergeable: false,
+    mergeable_state: 'dirty',
+    labels: [],
+    head: { sha: HEAD, repo: { full_name: repoFullName } },
+  }, overrides);
+}
+function decide(overrides = {}) {
+  return decideDelegatedConflict(Object.assign({
+    delegated: true,
+    fresh: freshPr(),
+    head: HEAD,
+    repoFullName,
+    hasHold: false,
+    repairStatus: null,
+    repairRun: null,
+    conflictMarkers: [],
+    evidence: { notBeforeEpoch: null },
+    noProgress: false,
+  }, overrides));
+}
+const github = {
+  rest: {
+    pulls: {
+      get: async () => {
+        state.pullReads += 1;
+        if (state.failPull) throw state.failPull;
+        return { data: state.pr };
+      },
+    },
+    repos: {
+      listCommitStatusesForRef: async () => ({ data: state.statuses, headers: {} }),
+      get: async () => ({ data: { default_branch: 'main' } }),
+    },
+    issues: {
+      listComments: async ({ page = 1, per_page = 100 }) => {
+        const start = (page - 1) * per_page;
+        return { data: state.comments.slice(start, start + per_page), headers: {} };
+      },
+      get: async () => ({ data: { comments: state.comments.length } }),
+      createLabel: async () => ({}),
+      addLabels: async ({ labels }) => { state.labels.push(...labels); return {}; },
+      removeLabel: async ({ name }) => {
+        state.labels = state.labels.filter(label => label !== name);
+        return {};
+      },
+      createComment: async ({ body }) => {
+        const when = iso(clock);
+        const created = {
+          id: ++idSeq,
+          body,
+          user: { login: 'github-actions[bot]' },
+          author_association: 'NONE',
+          created_at: when,
+          updated_at: when,
+        };
+        state.comments.push(created);
+        return { data: created };
+      },
+      deleteComment: async ({ comment_id }) => {
+        state.comments = state.comments.filter(comment => comment.id !== comment_id);
+        return {};
+      },
+    },
+    actions: {
+      getWorkflowRun: async ({ run_id }) => {
+        const run = state.runs[String(run_id)];
+        if (!run) {
+          const err = new Error('workflow run not found');
+          err.status = 404;
+          throw err;
+        }
+        return { data: run };
+      },
+      createWorkflowDispatch: async (params) => {
+        state.dispatches.push(params);
+        return {};
+      },
+    },
+  },
+};
+(async () => {
+"""
+        harness = (
+            preamble
+            + "\n"
+            + functions
+            + "\n"
+            + scenario
+            + "\n})().catch(err => { console.error(err); process.exit(1); });\n"
+        )
+        tmpdir = os.path.join(ROOT, ".opencode-tmp")
+        os.makedirs(tmpdir, exist_ok=True)
+        with tempfile.NamedTemporaryFile(
+            "w", suffix=".js", delete=False, dir=tmpdir
+        ) as handle:
+            handle.write(harness)
+            script = handle.name
+        try:
+            env = dict(
+                os.environ,
+                PR_AGENT_REPAIR_WORKFLOW="continuum-pr-agent-repair.yml",
+                TARGET_CHILD_ID="opaque-child",
+            )
+            completed = subprocess.run(
+                [node, script],
+                capture_output=True,
+                text=True,
+                env=env,
+                timeout=60,
+            )
+        finally:
+            os.unlink(script)
+        self.assertEqual(completed.returncode, 0, completed.stderr or completed.stdout)
+
+    def test_conflict_decision_table_fails_closed(self):
+        self._run_harness(r"""
+const localFresh = (overrides = {}) => Object.assign({
+  number: 176,
+  state: 'open',
+  merged: false,
+  draft: false,
+  mergeable: false,
+  mergeable_state: 'dirty',
+  labels: [],
+  head: { sha: HEAD, repo: { full_name: repoFullName } },
+}, overrides);
+const localDecide = (overrides = {}) => decideDelegatedConflict(Object.assign({
+  delegated: true,
+  fresh: localFresh(),
+  head: HEAD,
+  repoFullName,
+  hasHold: false,
+  repairStatus: null,
+  repairRun: null,
+  conflictMarkers: [],
+  evidence: { notBeforeEpoch: null },
+  noProgress: false,
+}, overrides));
+const expect = (overrides, action, attempt) => {
+  const outcome = localDecide(overrides);
+  assert.strictEqual(outcome.action, action, JSON.stringify(outcome));
+  if (attempt !== undefined) assert.strictEqual(outcome.attempt, attempt, JSON.stringify(outcome));
+  return outcome;
+};
+const markerAt = ageSeconds => ({
+  id: 1,
+  created_at: iso(clock - ageSeconds * 1000),
+  updated_at: iso(clock - ageSeconds * 1000),
+});
+
+expect({ delegated: false }, 'none');
+expect({ fresh: localFresh({ mergeable: null, mergeable_state: 'unknown' }) }, 'defer');
+expect({ fresh: localFresh({ mergeable: true, mergeable_state: 'clean' }) }, 'none');
+expect({ fresh: localFresh({ state: 'closed' }) }, 'settled');
+expect({ fresh: localFresh({ merged: true }) }, 'settled');
+expect({ fresh: localFresh({ draft: true }) }, 'hold');
+expect({ fresh: localFresh({ head: { sha: OLD_HEAD, repo: { full_name: repoFullName } } }) }, 'hold');
+expect({ fresh: localFresh({ head: { sha: HEAD, repo: { full_name: 'fork/repo' } } }) }, 'hold');
+expect({ hasHold: true }, 'hold');
+expect({ repairRun: { conclusion: 'in_progress' } }, 'wait');
+expect({ noProgress: true }, 'hold');
+
+expect({}, 'dispatch', 0);
+expect({ conflictMarkers: [markerAt(10)] }, 'wait');
+expect({ conflictMarkers: [markerAt(7200)] }, 'retry', 1);
+
+expect({
+  conflictMarkers: [markerAt(10)],
+  repairStatus: { state: 'pending' },
+  repairRun: { conclusion: 'completed' },
+}, 'wait');
+expect({
+  conflictMarkers: [markerAt(300)],
+  repairStatus: { state: 'pending' },
+  repairRun: { conclusion: 'completed' },
+}, 'retry', 1);
+expect({
+  conflictMarkers: [markerAt(10)],
+  repairStatus: { state: 'pending' },
+  repairRun: { conclusion: null },
+}, 'wait');
+expect({
+  conflictMarkers: [markerAt(7200)],
+  repairStatus: { state: 'pending' },
+  repairRun: { conclusion: null },
+}, 'retry', 1);
+
+expect({
+  conflictMarkers: [markerAt(10)],
+  repairStatus: { state: 'failure', description: 'transient; recovery eligible' },
+}, 'wait');
+expect({
+  conflictMarkers: [markerAt(300)],
+  repairStatus: { state: 'failure', description: 'transient; recovery eligible' },
+}, 'retry', 1);
+expect({
+  conflictMarkers: [markerAt(300)],
+  repairStatus: { state: 'failure', description: 'deterministic; recovery held' },
+}, 'hold');
+expect({ repairStatus: { state: 'success' } }, 'settled');
+expect({
+  conflictMarkers: [markerAt(7200), markerAt(7200), markerAt(7200)],
+}, 'hold');
+
+expect({
+  evidence: { notBeforeEpoch: Math.floor(clock / 1000) + 600 },
+}, 'wait');
+expect({
+  evidence: { notBeforeEpoch: Math.floor(clock / 1000) - 600 },
+}, 'dispatch', 0);
+// A generic review-finding exhaustion marker must not suppress a new
+// conflict episode caused by a default-branch advance.
+expect({ evidence: { exhausted: true, notBeforeEpoch: null } }, 'dispatch', 0);
+
+console.log('DECISION_TABLE_OK');
+""")
+
+    def test_production_recovery_dispatches_one_conflict_repair_at_exact_head(self):
+        self._run_harness(r"""
+const pr = { number: 176, head: { sha: HEAD } };
+reset();
+assert.strictEqual(await maybeAdmitDelegatedConflict(pr, HEAD), true);
+assert.strictEqual(state.dispatches.length, 1, 'one existing conflict-mode dispatch');
+const dispatch = state.dispatches[0];
+assert.strictEqual(dispatch.workflow_id, 'continuum-pr-agent-repair.yml');
+assert.strictEqual(dispatch.owner, executionOwner, 'dispatch stays in the parent execution repository');
+assert.strictEqual(dispatch.repo, executionRepo, 'no child-local compute');
+assert.strictEqual(dispatch.ref, 'main');
+assert.deepStrictEqual(dispatch.inputs, {
+  pr_number: '176',
+  mode: 'conflict',
+  head_sha: HEAD,
+  target_child_id: 'opaque-child',
+});
+assert.ok(state.pullReads >= 2, 'the open-PR list is not mergeability evidence; pulls.get is authoritative');
+assert.ok(state.labels.includes('opencode-conflict-repair'));
+assert.strictEqual(state.comments.length, 1);
+assert.ok(state.comments[0].body.includes('<!-- opencode-conflict-repair-attempt head=' + HEAD + ' -->'));
+assert.ok(state.comments[0].body.includes('<!-- continuum-conflict-repair-attempt head=' + HEAD + ' attempt=0 -->'));
+
+// A repeated scheduled wake with the same exact HEAD must coalesce.
+assert.strictEqual(await maybeAdmitDelegatedConflict(pr, HEAD), true);
+assert.strictEqual(state.dispatches.length, 1, 'repeated wake must not duplicate the model execution');
+
+// A competing merge-side wakeup writes the same exact-HEAD marker.
+state.comments.push(marker());
+assert.strictEqual(await maybeAdmitDelegatedConflict(pr, HEAD), true);
+assert.strictEqual(state.dispatches.length, 1, 'competing merge-side marker coalesces');
+
+// A stale snapshot cannot dispatch past the live competing marker.
+clock += staleMs + 1000;
+assert.strictEqual(
+  await dispatchDelegatedConflict(pr, HEAD, 0, { conflictMarkers: [] }),
+  false,
+);
+assert.strictEqual(state.dispatches.length, 1, 'stale dispatch snapshot is cancelled');
+
+// A new HEAD starts a fresh episode; the old HEAD marker is not evidence.
+reset();
+state.comments.push(marker(OLD_HEAD));
+assert.strictEqual(await maybeAdmitDelegatedConflict(pr, HEAD), true);
+assert.strictEqual(state.dispatches.length, 1);
+assert.strictEqual(state.dispatches[0].inputs.head_sha, HEAD);
+
+// A clean PR falls through to the unchanged ordinary CI/review admission.
+reset();
+state.pr.mergeable = true;
+state.pr.mergeable_state = 'clean';
+assert.strictEqual(await maybeAdmitDelegatedConflict(pr, HEAD), false);
+assert.strictEqual(state.dispatches.length, 0, 'clean PR receives no conflict dispatch');
+
+// Uncomputed mergeability is not conflict evidence.
+reset();
+state.pr.mergeable = null;
+state.pr.mergeable_state = 'unknown';
+assert.strictEqual(await maybeAdmitDelegatedConflict(pr, HEAD), false);
+assert.strictEqual(state.dispatches.length, 0, 'unknown mergeability must not dispatch');
+
+console.log('PRODUCTION_DISPATCH_OK');
+""")
+
+    def test_production_recovery_conflict_admission_fails_closed(self):
+        self._run_harness(r"""
+const pr = { number: 176, head: { sha: HEAD } };
+const expectNoDispatch = async (label) => {
+  assert.strictEqual(await maybeAdmitDelegatedConflict(pr, HEAD), true, label);
+  assert.strictEqual(state.dispatches.length, 0, label);
+};
+
+reset();
+state.pr.draft = true;
+await expectNoDispatch('draft PR');
+
+reset();
+state.pr.state = 'closed';
+await expectNoDispatch('closed PR');
+
+reset();
+state.pr.merged = true;
+await expectNoDispatch('merged PR');
+
+reset();
+state.pr.head.sha = OLD_HEAD;
+await expectNoDispatch('moved HEAD');
+
+reset();
+state.pr.head.repo.full_name = 'fork/repo';
+await expectNoDispatch('fork PR');
+
+reset();
+state.pr.labels = [{ name: 'no-auto-merge' }];
+await expectNoDispatch('owner hold');
+
+reset();
+state.comments.push(marker(HEAD, 10));
+state.statuses.push(repairStatus('pending', '', 10, 900));
+state.runs['900'] = {
+  status: 'in_progress',
+  conclusion: null,
+  display_title: 'PR-Agent PR #176 [repair:1]',
+};
+await expectNoDispatch('active repair');
+
+reset();
+state.failPull = Object.assign(new Error('server error'), { status: 500 });
+await assert.rejects(() => maybeAdmitDelegatedConflict(pr, HEAD));
+assert.strictEqual(state.dispatches.length, 0, 'API failure must not dispatch');
+
+reset();
+state.failPull = Object.assign(new Error('not found'), { status: 404 });
+await assert.rejects(() => maybeAdmitDelegatedConflict(pr, HEAD));
+assert.strictEqual(state.dispatches.length, 0, 'missing API evidence must not dispatch');
+
+console.log('FAIL_CLOSED_OK');
+""")
+
+    def test_production_recovery_conflict_retry_is_receipt_aware_and_bounded(self):
+        self._run_harness(r"""
+const pr = { number: 176, head: { sha: HEAD } };
+
+// Unknown acceptance/liveness defers instead of guessing idle.
+reset();
+state.comments.push(marker(HEAD, 10));
+assert.strictEqual(await maybeAdmitDelegatedConflict(pr, HEAD), true);
+assert.strictEqual(state.dispatches.length, 0, 'ambiguous receipt must not duplicate');
+
+// A stale receipt without a final status is recoverable in conflict mode.
+reset();
+state.comments.push(marker(HEAD, 7200));
+assert.strictEqual(await maybeAdmitDelegatedConflict(pr, HEAD), true);
+assert.strictEqual(state.dispatches.length, 1);
+assert.strictEqual(state.dispatches[0].inputs.mode, 'conflict');
+assert.strictEqual(state.dispatches[0].inputs.retry_attempt, '1');
+
+// A transient repair failure resumes in the same conflict mode.
+reset();
+state.comments.push(marker(HEAD, 300));
+state.statuses.push(repairStatus(
+  'failure', 'PR-Agent repair failed: transient; recovery eligible', 300,
+));
+assert.strictEqual(await maybeAdmitDelegatedConflict(pr, HEAD), true);
+assert.strictEqual(state.dispatches.length, 1);
+assert.strictEqual(state.dispatches[0].inputs.mode, 'conflict');
+assert.strictEqual(state.dispatches[0].inputs.retry_attempt, '1');
+
+// Deterministic failures stop instead of consuming the bounded budget.
+reset();
+state.comments.push(marker(HEAD, 300));
+state.statuses.push(repairStatus(
+  'failure', 'PR-Agent repair failed: deterministic; recovery held', 300,
+));
+assert.strictEqual(await maybeAdmitDelegatedConflict(pr, HEAD), true);
+assert.strictEqual(state.dispatches.length, 0, 'deterministic failure holds');
+
+// A conflict no-progress marker stops the same-HEAD loop.
+reset();
+const fingerprint = crypto.createHash('sha256').update('conflict:' + HEAD).digest('hex');
+state.comments.push({
+  id: ++idSeq,
+  body: '<!-- continuum-pr-agent-no-progress head=' + HEAD + ' fingerprint=' + fingerprint + ' -->',
+  user: { login: 'github-actions[bot]' },
+  author_association: 'NONE',
+  created_at: iso(clock),
+  updated_at: iso(clock),
+});
+assert.strictEqual(await maybeAdmitDelegatedConflict(pr, HEAD), true);
+assert.strictEqual(state.dispatches.length, 0, 'no-progress holds');
+
+// A completed run with a pending status is a lost final status: wait inside
+// grace, replay only after the stale window.
+reset();
+state.comments.push(marker(HEAD, 10));
+state.statuses.push(repairStatus('pending', '', 10, 900));
+state.runs['900'] = {
+  status: 'completed', conclusion: 'failure',
+  display_title: 'PR-Agent PR #176 [repair:1]',
+};
+assert.strictEqual(await maybeAdmitDelegatedConflict(pr, HEAD), true);
+assert.strictEqual(state.dispatches.length, 0, 'pending receipt inside grace waits');
+
+reset();
+state.comments.push(marker(HEAD, 300));
+state.statuses.push(repairStatus('pending', '', 300, 900));
+state.runs['900'] = {
+  status: 'completed', conclusion: 'failure',
+  display_title: 'PR-Agent PR #176 [repair:1]',
+};
+assert.strictEqual(await maybeAdmitDelegatedConflict(pr, HEAD), true);
+assert.strictEqual(state.dispatches.length, 1, 'lost final status replays after grace');
+
+// An active run keeps waiting even after the stale window.
+reset();
+state.comments.push(marker(HEAD, 7200));
+state.statuses.push(repairStatus('pending', '', 7200, 900));
+state.runs['900'] = {
+  status: 'in_progress', conclusion: null,
+  display_title: 'PR-Agent PR #176 [repair:1]',
+};
+assert.strictEqual(await maybeAdmitDelegatedConflict(pr, HEAD), true);
+assert.strictEqual(state.dispatches.length, 0, 'active repair never dispatches a duplicate');
+
+// The exact-HEAD marker count is the shared bounded budget.
+reset();
+for (let index = 0; index < 3; index += 1) state.comments.push(marker(HEAD, 7200));
+assert.strictEqual(await maybeAdmitDelegatedConflict(pr, HEAD), true);
+assert.strictEqual(state.dispatches.length, 0, 'bounded conflict budget is exhausted');
+
+console.log('RETRY_BOUNDS_OK');
+""")
+
+
 class RecoveryWiringTests(unittest.TestCase):
     def read(self, path: str) -> str:
         with open(os.path.join(ROOT, path), "r", encoding="utf-8") as handle:

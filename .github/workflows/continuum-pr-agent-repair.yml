@@ -969,8 +969,9 @@ jobs:
             # conflicts. The exact fetched base ref is named so the agent
             # cannot merge a stale or guessed default branch.
             PROMPT="$(printf '%s\n' \
-              "The current branch has merge conflicts with the repository default branch (origin/${CONFLICT_BASE_REF})." \
-              "Merge origin/${CONFLICT_BASE_REF} into the current branch and resolve every conflict." \
+              'The current branch has merge conflicts with the repository default branch.' \
+              'Merge the default branch into the current branch and resolve every conflict.' \
+              "Use exactly origin/${CONFLICT_BASE_REF} as the integrated default-branch base; do not guess a different base." \
               'Preserve the intent of both sides; do not discard either side wholesale.' \
               'Do not redo the original task, do not change unrelated files, and do not manufacture review state.' \
               'Do not commit, push, create a PR, or merge; the workflow owns publication.')"
@@ -1073,11 +1074,6 @@ jobs:
               echo "::error::Conflict repair has no integrated base commit to validate; discarding repair."
               exit 1
             fi
-            if ! git merge-base --is-ancestor "$BASE_SHA" HEAD; then
-              echo "classification=deterministic" >> "$GITHUB_OUTPUT"
-              echo "::error::Conflict repair did not integrate the default-branch base $BASE_SHA; discarding repair."
-              exit 1
-            fi
           fi
           if [[ -z "$(git status --porcelain)" ]]; then
             echo "classification=$no_progress_classification" >> "$GITHUB_OUTPUT"
@@ -1172,6 +1168,18 @@ jobs:
             echo "classification=deterministic" >> "$GITHUB_OUTPUT"
             echo "::error::Local repair is not based on reviewed HEAD $HEAD_SHA; discarding repair."
             exit 1
+          fi
+          if [[ "${MODE,,}" == "conflict" ]]; then
+            # The workflow-owned merge commit now exists, so both the original
+            # HEAD and the integrated default-branch base must be ancestors of
+            # the result before any push. Checking after the commit (rather
+            # than against the pre-commit HEAD) proves the published result
+            # really contains both sides instead of only the working tree.
+            if ! git merge-base --is-ancestor "$BASE_SHA" HEAD; then
+              echo "classification=deterministic" >> "$GITHUB_OUTPUT"
+              echo "::error::Conflict repair did not integrate the default-branch base $BASE_SHA; discarding repair."
+              exit 1
+            fi
           fi
           NEW_HEAD="$(git rev-parse HEAD)"
           FINDING_IDS_LOWER="${FINDING_IDS,,}"
