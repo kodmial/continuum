@@ -215,6 +215,25 @@ class PlanTests(CliTestCase):
         self.assertEqual(self.main(self.fixture.args("plan")), cli.EXIT_OK)
         self.assertEqual(self.payload()["status"], "no-op")
 
+    def test_the_configured_version_file_is_the_default_source(self):
+        self.fixture.write("VERSION", VERSION + "\n")
+        self.fixture.write_config(
+            "release:\n  hooks: hooks.json\n  version_file: VERSION\n"
+        )
+        code = self.main(self.fixture.args("plan", **{"--version": None}))
+        self.assertEqual(code, cli.EXIT_OK, self.payload())
+        self.assertEqual(self.payload()["version"], VERSION)
+
+    def test_an_explicit_version_must_agree_with_the_configured_file(self):
+        self.fixture.write("VERSION", "9.9.9\n")
+        self.fixture.write_config(
+            "release:\n  hooks: hooks.json\n  version_file: VERSION\n"
+        )
+        code = self.main(self.fixture.args("plan"))
+        self.assertNotEqual(code, cli.EXIT_OK)
+        self.assertEqual(self.payload()["status"], "failed")
+        self.assertIn("version", self.payload()["code"])
+
 
 class BuildPhaseTests(CliTestCase):
     def test_build_runs_the_toolchain_and_records_without_publishing(self):

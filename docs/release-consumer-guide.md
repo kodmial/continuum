@@ -33,6 +33,13 @@ To release, declare either a plan-only target or a hooks document:
 version: 1
 release:
   hooks: .github/release-hooks.json
+  # Where the version lives in the released commit. A push-triggered release
+  # has no dispatch input, so this is repository configuration rather than a
+  # workflow argument. Omit it only when every release is tag-triggered or
+  # manually dispatched with `version`.
+  version_file: Sources/App/Version.swift
+  # Optional. The default matches a semantic version in the file.
+  version_pattern: 'static let version = "([0-9]+\.[0-9]+\.[0-9]+)"'
 ```
 
 `release.targets` in `.continuum.yml` can describe the platforms, architectures,
@@ -132,6 +139,41 @@ environment. A named secret that is absent fails the job before a build runs.
 Build jobs do not receive `TAP_PAT` unless it is named, and hook commands never
 inherit the job's `GITHUB_TOKEN`.
 
+A `release_pr` hook is the one hook that must push a branch. Give it the release
+token explicitly instead of relying on the job token:
+
+```yaml
+with:
+  hook_secret_env: "TAP_PAT"
+```
+
+The hook then reads `$TAP_PAT` (or exports it as `GITHUB_TOKEN`/`GH_TOKEN` for
+the tool it drives). That push is what makes the release pull request run normal
+CI: an event produced by the job's `GITHUB_TOKEN` does not start other
+workflows, while the classic PAT does. Keep the hook's own `GITHUB_TOKEN` mapping
+inside the consumer script; Continuum never hands the job token to a hook.
+
+## 3a. Require exact-HEAD evidence (optional)
+
+The preparation job can require that the release commit already carries green
+checks, a review, or a merged release pull request:
+
+```yaml
+with:
+  release_pr: "123"
+  required_checks: "CI / Validate, Packaging smoke"
+  require_review: true
+  require_merged_pr: true
+```
+
+`required_checks` is comma- or space-separated. A check run that belongs to a
+different commit is stale and does not count; a missing, pending, or failed
+check is refused. `require_review` accepts only an approval whose `commit_id` is
+the release commit, and `require_merged_pr` refuses a release that is not
+downstream of a merged pull request. Evidence is enforced in the `prepare` job,
+which is the first job holding the release token; the `plan` job stays
+token-free and write-free.
+
 ## 4. Triggers and the release PR
 
 The installed caller runs on:
@@ -145,6 +187,11 @@ A consumer whose default branch is not `main` should edit its installed caller's
 demand can delete the `push` trigger; the reusable workflow does not decide
 triggers for the consumer.
 
+A `push` to `main` carries no dispatch inputs, so it needs a version source the
+commit itself carries: `release.version_file` in `.continuum.yml`, or a tag
+release. Without either, the plan fails with `version-source-unconfigured`
+instead of guessing a version.
+
 When `release_pr` is configured, a merged source change that passes eligibility
 runs the release-PR hook once. The hook owns branch creation and the PR; Continuum
 owns the version agreement, provenance, and the refusal to build from a stale
@@ -156,7 +203,7 @@ release-PR branch.
 | job | what it proves |
 | --- | --- |
 | `plan` | whether the event may release, the agreed version/tag, and the target matrix. Writes nothing and reads no token. |
-| `prepare` | eligibility, version, release PR, notes, validation, and the source pin. No build. |
+| `prepare` | eligibility, version, release PR, notes, exact-HEAD evidence, validation, and the source pin. No build. |
 | `build` | one matrix leg: exact SHA, build, sign, verify, measured manifest, and a bundle with the target receipt. |
 | `publish` | imports every build receipt, requires the whole asset set, creates the draft, uploads, verifies, publishes, then syncs publishers. |
 

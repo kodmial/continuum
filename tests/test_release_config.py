@@ -452,5 +452,46 @@ class SigningContractTests(unittest.TestCase):
             parse(self._body("        mode: notarized\n"))
 
 
+class ReleaseSettingsTests(unittest.TestCase):
+    def test_a_hooks_document_is_enough_to_enable_a_release(self):
+        config = parse(release_section("  hooks: .github/release-hooks.json\n"))
+        self.assertTrue(config.release.enabled)
+        self.assertEqual(config.release.hooks, ".github/release-hooks.json")
+        self.assertEqual(config.release.targets, ())
+
+    def test_the_version_source_is_repository_configuration(self):
+        config = parse(
+            release_section(
+                "  hooks: .github/release-hooks.json\n"
+                "  version_file: Sources/App/Version.swift\n"
+                '  version_pattern: "version = \\"([0-9.]+)\\""\n'
+            )
+        )
+        self.assertEqual(config.release.version_file, "Sources/App/Version.swift")
+        self.assertEqual(
+            config.release.version_pattern, 'version = "([0-9.]+)"'
+        )
+        described = config.release.describe()
+        self.assertEqual(described["version_file"], "Sources/App/Version.swift")
+        self.assertEqual(described["version_pattern"], 'version = "([0-9.]+)"')
+
+    def test_a_version_source_alone_does_not_enable_a_release(self):
+        config = parse(release_section("  version_file: VERSION\n"))
+        self.assertFalse(config.release.enabled)
+        self.assertEqual(config.release.version_file, "VERSION")
+
+    def test_a_version_source_cannot_escape_the_checkout(self):
+        for value in ("/etc/passwd", "../VERSION", "src/../../VERSION", "src\\\\VERSION"):
+            with self.subTest(value=value):
+                with self.assertRaises(config_module.ConfigError):
+                    parse(release_section(f"  version_file: {value}\n"))
+
+    def test_a_version_pattern_must_be_a_valid_regular_expression(self):
+        for value in ('"["', '""', '"   "'):
+            with self.subTest(value=value):
+                with self.assertRaises(config_module.ConfigError):
+                    parse(release_section(f"  version_pattern: {value}\n"))
+
+
 if __name__ == "__main__":
     unittest.main()

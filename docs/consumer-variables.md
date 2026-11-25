@@ -347,11 +347,15 @@ of `core`. It is configured by `.continuum.yml`:
 version: 1
 release:
   hooks: .github/release-hooks.json
+  version_file: Sources/App/Version.swift
 ```
 
 `release.targets` can describe the target matrix for planning, but a real build
 needs `release.hooks`, because the product build and signing commands are the
-consumer's. With neither key the release workflow is a verified green no-op.
+consumer's. `release.version_file` (and optional `release.version_pattern`) name
+the version the released commit carries; a push-triggered release has no input
+to supply it. With neither `targets` nor `hooks` the release workflow is a
+verified green no-op.
 
 The reusable workflow accepts one declared secret, `TAP_PAT`, and an optional
 `hook_secret_env` input naming additional inherited secrets for hook commands.

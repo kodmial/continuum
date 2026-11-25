@@ -27,6 +27,10 @@ on:
         description: Repository-relative file carrying the version
         required: false
         type: string
+      version_pattern:
+        description: Pattern the version file must match. Empty uses the repository config.
+        required: false
+        type: string
       tag:
         description: Tag being released, when this dispatch is about a tag
         required: false
@@ -51,6 +55,39 @@ on:
         required: false
         default: default
         type: string
+      release_pr:
+        description: Release pull request number, when this dispatch is about one
+        required: false
+        type: string
+      required_checks:
+        description: Comma- or space-separated checks that must be green on the exact commit
+        required: false
+        type: string
+      require_review:
+        description: Require an approval of the exact release commit
+        required: false
+        default: false
+        type: boolean
+      require_merged_pr:
+        description: Require the named release pull request to be merged
+        required: false
+        default: false
+        type: boolean
+      notes_file:
+        description: Repository-relative changelog used for release notes
+        required: false
+        default: CHANGELOG.md
+        type: string
+      tag_prefix:
+        description: Prefix of the immutable release tag
+        required: false
+        default: v
+        type: string
+      no_github_release:
+        description: Do not publish to GitHub Releases; a downstream hook must still exist
+        required: false
+        default: false
+        type: boolean
       hook_secret_env:
         description: Secret environment names forwarded to hook commands
         required: false
@@ -78,9 +115,17 @@ jobs:
       event: "${{ inputs.event || (github.ref_type == 'tag' && 'tag-push' || (github.event_name == 'push' && 'push' || 'workflow-dispatch')) }}"
       version: "${{ inputs.version }}"
       version_file: "${{ inputs.version_file }}"
+      version_pattern: "${{ inputs.version_pattern }}"
       tag: "${{ inputs.tag || (github.ref_type == 'tag' && github.ref_name || '') }}"
       hooks: "${{ inputs.hooks }}"
       channel: "${{ inputs.channel || 'default' }}"
+      release_pr: "${{ inputs.release_pr }}"
+      required_checks: "${{ inputs.required_checks }}"
+      require_review: ${{ inputs.require_review || false }}
+      require_merged_pr: ${{ inputs.require_merged_pr || false }}
+      notes_file: "${{ inputs.notes_file || 'CHANGELOG.md' }}"
+      tag_prefix: "${{ inputs.tag_prefix || 'v' }}"
+      no_github_release: ${{ inputs.no_github_release || false }}
       hook_secret_env: "${{ inputs.hook_secret_env }}"
       default_branch: "${{ inputs.default_branch }}"
       continuum_ref: "main"

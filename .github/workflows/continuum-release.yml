@@ -42,9 +42,12 @@ on:
         default: ''
         type: string
       version_pattern:
-        description: Pattern the version file must match
+        description: >-
+          Pattern the version file must match. Empty uses
+          release.version_pattern from .continuum.yml, then a semantic-version
+          pattern.
         required: false
-        default: '\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?'
+        default: ''
         type: string
       tag:
         description: Tag being released, for a tag-triggered release
@@ -76,6 +79,27 @@ on:
         required: false
         default: ''
         type: string
+      required_checks:
+        description: >-
+          Comma-separated check names that must be green on the exact release
+          commit. Names may contain spaces. Empty disables the check-run gate.
+        required: false
+        default: ''
+        type: string
+      require_review:
+        description: >-
+          Require an approval of the exact release commit on the named release
+          pull request. An approval of an earlier head does not count.
+        required: false
+        default: false
+        type: boolean
+      require_merged_pr:
+        description: >-
+          Require the named release pull request to be merged, so a release is
+          downstream of an accepted change.
+        required: false
+        default: false
+        type: boolean
       default_branch:
         description: Branch a release may be cut from. Empty uses the repository default.
         required: false
@@ -397,6 +421,9 @@ jobs:
           RELEASE_HOOKS: ${{ inputs.hooks }}
           RELEASE_NOTES_FILE: ${{ inputs.notes_file }}
           RELEASE_PR: ${{ inputs.release_pr }}
+          RELEASE_REQUIRED_CHECKS: ${{ inputs.required_checks }}
+          RELEASE_REQUIRE_REVIEW: ${{ inputs.require_review }}
+          RELEASE_REQUIRE_MERGED_PR: ${{ inputs.require_merged_pr }}
           RELEASE_DEFAULT_BRANCH: ${{ inputs.default_branch || github.event.repository.default_branch || 'main' }}
           HOOK_SECRET_ENV: ${{ inputs.hook_secret_env }}
         run: |
@@ -440,6 +467,11 @@ jobs:
           [[ -n "$RELEASE_TAG" ]] && args+=(--tag "$RELEASE_TAG")
           [[ -n "$RELEASE_HOOKS" ]] && args+=(--hooks "$RELEASE_HOOKS")
           [[ -n "$RELEASE_PR" ]] && args+=(--release-pr "$RELEASE_PR")
+          for check in ${RELEASE_REQUIRED_CHECKS//,/ }; do
+            args+=(--required-check "$check")
+          done
+          [[ "$RELEASE_REQUIRE_REVIEW" == "true" ]] && args+=(--require-review)
+          [[ "$RELEASE_REQUIRE_MERGED_PR" == "true" ]] && args+=(--require-merged-pr)
           for name in ${HOOK_SECRET_ENV//,/ }; do
             args+=(--secret-env "$name")
           done
@@ -717,6 +749,9 @@ jobs:
           RELEASE_HOOKS: ${{ inputs.hooks }}
           RELEASE_NOTES_FILE: ${{ inputs.notes_file }}
           RELEASE_PR: ${{ inputs.release_pr }}
+          RELEASE_REQUIRED_CHECKS: ${{ inputs.required_checks }}
+          RELEASE_REQUIRE_REVIEW: ${{ inputs.require_review }}
+          RELEASE_REQUIRE_MERGED_PR: ${{ inputs.require_merged_pr }}
           RELEASE_DEFAULT_BRANCH: ${{ inputs.default_branch || github.event.repository.default_branch || 'main' }}
           RELEASE_NO_GITHUB: ${{ inputs.no_github_release }}
           HOOK_SECRET_ENV: ${{ inputs.hook_secret_env }}
@@ -762,6 +797,11 @@ jobs:
           [[ -n "$RELEASE_VERSION_PATTERN" ]] && args+=(--version-pattern "$RELEASE_VERSION_PATTERN")
           [[ -n "$RELEASE_HOOKS" ]] && args+=(--hooks "$RELEASE_HOOKS")
           [[ -n "$RELEASE_PR" ]] && args+=(--release-pr "$RELEASE_PR")
+          for check in ${RELEASE_REQUIRED_CHECKS//,/ }; do
+            args+=(--required-check "$check")
+          done
+          [[ "$RELEASE_REQUIRE_REVIEW" == "true" ]] && args+=(--require-review)
+          [[ "$RELEASE_REQUIRE_MERGED_PR" == "true" ]] && args+=(--require-merged-pr)
           [[ "$RELEASE_NO_GITHUB" == "true" ]] && args+=(--no-github-release)
           for receipt in prepared/receipt-*.json; do
             [[ -f "$receipt" ]] && args+=(--receipt-import "$receipt")

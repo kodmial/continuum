@@ -331,6 +331,11 @@ class ReleaseTarget:
 class ReleaseSettings:
     targets: tuple = ()
     hooks: str = ""
+    # The version source is repository configuration, not a workflow input: a
+    # push-triggered release has no human to type a path, and a consumer that
+    # has to edit its installed caller to release is not opt-in, it is bespoke.
+    version_file: str = ""
+    version_pattern: str = ""
 
     @property
     def enabled(self) -> bool:
@@ -347,6 +352,8 @@ class ReleaseSettings:
             "enabled": self.enabled,
             "targets": [target.describe() for target in self.targets],
             "hooks": self.hooks,
+            "version_file": self.version_file,
+            "version_pattern": self.version_pattern,
             "required_secrets": sorted(
                 {
                     name
@@ -442,7 +449,7 @@ _ALLOWED_PR_AGENT_KEYS = (
     "bot_login",
 )
 _ALLOWED_CODERABBIT_KEYS = ("bot_login", "status_context")
-_ALLOWED_RELEASE_KEYS = ("targets", "hooks")
+_ALLOWED_RELEASE_KEYS = ("targets", "hooks", "version_file", "version_pattern")
 _ALLOWED_TARGET_KEYS = (
     "id",
     "adapter",
@@ -1034,9 +1041,31 @@ def _parse_release(value: Any) -> ReleaseSettings:
     hooks = ""
     if mapping.get("hooks") is not None:
         hooks = _require_relative_path(mapping["hooks"], "release.hooks")
+    version_file = ""
+    if mapping.get("version_file") is not None:
+        version_file = _require_relative_path(mapping["version_file"], "release.version_file")
+    version_pattern = ""
+    if mapping.get("version_pattern") is not None:
+        pattern = mapping["version_pattern"]
+        if not isinstance(pattern, str) or not pattern.strip() or len(pattern) > 400:
+            raise ConfigError(
+                "release.version_pattern must be a non-empty regular expression of at "
+                "most 400 characters"
+            )
+        try:
+            re.compile(pattern)
+        except re.error as exc:
+            raise ConfigError(
+                f"release.version_pattern is not a valid regular expression: {exc}"
+            ) from exc
+        version_pattern = pattern
     targets_value = mapping.get("targets")
     if targets_value is None:
-        return ReleaseSettings(hooks=hooks)
+        return ReleaseSettings(
+            hooks=hooks,
+            version_file=version_file,
+            version_pattern=version_pattern,
+        )
     if not isinstance(targets_value, list) or not targets_value:
         raise ConfigError("release.targets must be a non-empty list, or omitted entirely")
     targets = tuple(
@@ -1048,7 +1077,12 @@ def _parse_release(value: Any) -> ReleaseSettings:
         if target.id in seen:
             raise ConfigError(f"release.targets[{index}].id duplicates {target.id!r}")
         seen.append(target.id)
-    return ReleaseSettings(targets=targets, hooks=hooks)
+    return ReleaseSettings(
+        targets=targets,
+        hooks=hooks,
+        version_file=version_file,
+        version_pattern=version_pattern,
+    )
 
 
 

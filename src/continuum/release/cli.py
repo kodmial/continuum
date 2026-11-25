@@ -74,6 +74,7 @@ DEFAULT_CONFIG = ".continuum.yml"
 DEFAULT_RECEIPT_DIR = ".continuum-receipts"
 DEFAULT_NOTES_FILE = "CHANGELOG.md"
 DEFAULT_TOKEN_ENV = "GITHUB_TOKEN"
+DEFAULT_VERSION_PATTERN = r"\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?"
 GITHUB_DESTINATION = "github-releases"
 
 EXIT_OK = 0
@@ -158,7 +159,9 @@ def _parser() -> argparse.ArgumentParser:
     version.add_argument("--version-file", default="")
     version.add_argument(
         "--version-pattern",
-        default=r"\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?",
+        default="",
+        help="pattern the version file must match; empty uses release.version_pattern "
+        "from .continuum.yml, then a default semantic-version pattern",
     )
     version.add_argument("--tag-prefix", default="v")
     version.add_argument("--release-pr", type=int, default=0)
@@ -291,12 +294,22 @@ def _event(args: argparse.Namespace) -> ReleaseEvent:
 
 
 def _version_parts(
-    args: argparse.Namespace, event: ReleaseEvent, *, enabled: bool
+    args: argparse.Namespace,
+    event: ReleaseEvent,
+    config: config_module.ContinuumConfig,
+    *,
+    enabled: bool,
 ) -> Tuple[VersionStrategy, Tuple[VersionStrategy, ...], VersionPolicy]:
     policy = VersionPolicy(tag_prefix=args.tag_prefix)
+    version_file = args.version_file or config.release.version_file
+    version_pattern = (
+        args.version_pattern
+        or config.release.version_pattern
+        or DEFAULT_VERSION_PATTERN
+    )
     project = (
-        ProjectFileVersion(path=args.version_file, pattern=args.version_pattern)
-        if args.version_file
+        ProjectFileVersion(path=version_file, pattern=version_pattern)
+        if version_file
         else None
     )
     tag = TagVersion(tag=args.tag) if event.name == "tag-push" or args.tag else TagVersion()
@@ -319,8 +332,9 @@ def _version_parts(
     else:
         raise CliError(
             "this repository has release targets but no version source. Pass --version "
-            "for a manual release, --version-file for a file the commit carries, or "
-            "trigger the release from a tag.",
+            "for a manual release, set release.version_file in .continuum.yml (or pass "
+            "--version-file) for a file the commit carries, or trigger the release "
+            "from a tag.",
             code="version-source-unconfigured",
         )
     return primary, checks, policy
@@ -720,7 +734,7 @@ def _repository_components(
     targets = _targets(config, hooks_plan) if enabled else ()
     matrix = _matrix(hooks_plan)
     targets = _select_targets(args, targets) if enabled else ()
-    primary, checks, policy = _version_parts(args, event, enabled=enabled)
+    primary, checks, policy = _version_parts(args, event, config, enabled=enabled)
     notes = ChangelogNotes(path=args.notes_file, fallback_notes=args.notes)
 
     token = os.environ.get(args.token_env, "") if enabled else ""
@@ -1027,7 +1041,7 @@ def run(args: argparse.Namespace) -> int:
     if not dry_run and config.release.enabled:
         version = ""
         try:
-            primary, checks, policy = _version_parts(args, event, enabled=True)
+            primary, checks, policy = _version_parts(args, event, config, enabled=True)
             version = _agreed_version(
                 primary,
                 checks,

@@ -11967,6 +11967,43 @@ class ContinuumTest < Minitest::Test
     end
   end
 
+  def test_application_release_requires_evidence_only_where_it_can_read_it
+    inputs = events(yaml(release_workflow_path)).fetch('workflow_call').fetch('inputs')
+    %w[required_checks require_review require_merged_pr].each do |name|
+      assert inputs.key?(name), "the reusable release workflow must expose #{name}"
+    end
+
+    prepare = release_job_body('prepare')
+    assert_includes prepare, '--required-check "$check"'
+    assert_includes prepare, '--require-review'
+    assert_includes prepare, '--require-merged-pr'
+    publish = release_job_body('publish')
+    assert_includes publish, '--required-check "$check"'
+    assert_includes publish, '--require-review'
+    assert_includes publish, '--require-merged-pr'
+
+    plan = release_job_body('plan')
+    refute_includes plan, '--required-check',
+                    'the token-free plan job must not try to read evidence'
+    refute_includes plan, '--require-review'
+    refute_includes plan, '--require-merged-pr'
+
+    caller = File.read(release_caller_path)
+    assert_includes caller, 'release_pr: "${{ inputs.release_pr }}"'
+    assert_includes caller, 'required_checks: "${{ inputs.required_checks }}"'
+    assert_includes caller, 'require_review: ${{ inputs.require_review || false }}'
+    assert_includes caller, 'require_merged_pr: ${{ inputs.require_merged_pr || false }}'
+  end
+
+  def test_application_release_reads_the_version_source_from_configuration
+    document = File.read(release_workflow_path)
+    refute_includes document, '--version-file "$CONTINUUM_CONSUMER',
+                    'the engine reads release.version_file from .continuum.yml; the workflow must not invent a path'
+    guide = File.read(File.join(ROOT, 'docs/release-consumer-guide.md'))
+    assert_includes guide, 'release.version_file'
+    assert_includes guide, 'version-source-unconfigured'
+  end
+
   def test_terminal_generation_stop_gates_every_scheduler_path
     engine = File.read(File.join(ROOT, 'src/continuum/task_snapshot.py'))
     %w[
