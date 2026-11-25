@@ -3757,14 +3757,14 @@ module.exports = async function runIssueScheduler({ github, context, core }) {
     }
     const due = Math.max(0, Number(recovery.nextDue) || 0) * 1000;
     const state = String(recovery.state || '');
-    // The fresh-runner restart cap is a hard lifetime limit shared with the
-    // watchdog. Read the same cap here so terminalization stays cap-aware:
-    // `generation-exhausted` is only terminal while its recorded generation
-    // still exceeds the configured cap. An explicit `owner-action-required`
-    // marker whose generation now fits inside a raised cap is superseded:
-    // the watchdog may legitimately resume recovery, so keep the reservation
-    // pending instead of reporting a terminal state. Any other explicit
-    // owner-action marker stays terminal regardless of the cap.
+    // kodmial/continuum#496: `max_429_runner_restarts` is the fast
+    // replacement budget, not a lifetime stop. A beyond-budget generation
+    // waits on the watchdog's bounded durable backoff and then resumes
+    // automatically, so the scheduler must keep its reservation pending.
+    // A legacy `generation-exhausted` owner-action marker is the same
+    // durable recovery wait after the watchdog validates the checkpoint; it
+    // is never a terminal skip. Any other explicit owner-action marker
+    // (operator STOP, blocked, invalid identity) remains authoritative.
     const max429RunnerRestarts = Number.parseInt(
       process.env.MAX_429_RUNNER_RESTARTS || '3',
       10
@@ -3780,33 +3780,18 @@ module.exports = async function runIssueScheduler({ github, context, core }) {
     }
     const generationExhausted =
       String(recovery.detail || '') === 'generation-exhausted';
-    const capStillExhausted =
-      generationExhausted &&
-      Number(recovery.generation) > max429RunnerRestarts;
     if (state === 'owner-action-required') {
-      if (!capStillExhausted && generationExhausted) {
+      if (generationExhausted) {
         return {
           ...base,
           keepReservation: true,
           recoveryPending: true,
-          reason: 'cap-raised-awaiting-watchdog',
+          reason: 'durable-backoff-awaiting-watchdog',
           checkpointSha: String(
             recovery.checkpointSha || ''
           ).toLowerCase(),
         };
       }
-      return {
-        ...base,
-        keepReservation: true,
-        recoveryPending: true,
-        ownerActionRequired: true,
-        reason: 'owner-action-required',
-        checkpointSha: String(
-          recovery.checkpointSha || ''
-        ).toLowerCase(),
-      };
-    }
-    if (due <= now && state === 'backoff' && capStillExhausted) {
       return {
         ...base,
         keepReservation: true,

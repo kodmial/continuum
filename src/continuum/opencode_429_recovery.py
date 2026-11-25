@@ -1043,6 +1043,10 @@ def validate_recovery_metadata(
     model = str(metadata.get("model") or "").strip()
     if model and not _MODEL_ID_RE.fullmatch(model):
         return False, "recovery metadata model is malformed"
+    for field in ("not_before", "retry_after_seconds"):
+        value = str(metadata.get(field) or "").strip()
+        if value and not value.isdigit():
+            return False, "recovery metadata {} is malformed".format(field)
     issue_text = str(metadata.get("issue_number") or "").strip()
     pr_text = str(metadata.get("pr_number") or "").strip()
     if issue_text and not issue_text.isdigit():

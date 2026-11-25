@@ -309,6 +309,40 @@ jobs:
                 process.env.MAX_429_RUNNER_RESTARTS
               );
             }
+            // kodmial/continuum#496: the fast replacement budget above is not
+            // a lifetime stop. Beyond it, recovery uses one bounded increasing
+            // durable-backoff schedule shared with
+            // ``opencode_429_recovery.INFRA_BACKOFF_SCHEDULE``. The first
+            // generation beyond the budget waits the first step; later
+            // generations advance one step and the last step is the ceiling.
+            const durableBackoffSchedule = [60, 300, 900, 1800, 3600];
+            function durableBackoffSeconds(generation, maxRestarts) {
+              const limit = Math.max(0, Number(maxRestarts) || 0);
+              const gen = Math.max(0, Number(generation) || 0);
+              if (gen <= limit) return 0;
+              const index = Math.min(
+                gen - limit - 1, durableBackoffSchedule.length - 1
+              );
+              return durableBackoffSchedule[Math.max(0, index)];
+            }
+            // A provider Retry-After/not-before, when the checkpoint carries
+            // one, is a floor the bounded backoff may extend but never
+            // shorten. A provider-required wait may therefore exceed the
+            // 3600-second schedule ceiling.
+            function providerNotBeforeEpoch(identity, now) {
+              let floor = 0;
+              const notBefore = Number(identity && identity.not_before || 0);
+              const retryAfter = Number(
+                identity && identity.retry_after_seconds || 0
+              );
+              if (Number.isFinite(notBefore) && notBefore > 0) {
+                floor = Math.max(floor, Math.floor(notBefore));
+              }
+              if (Number.isFinite(retryAfter) && retryAfter > 0) {
+                floor = Math.max(floor, now + Math.floor(retryAfter));
+              }
+              return floor;
+            }
 
             // kodmial/continuum#290: fresh-VM 429 resumption. Dispatches a NEW
             // workflow_dispatch carrying the explicit recovery identity onto
@@ -527,6 +561,19 @@ jobs:
               }
               if (!String(identity.head_ref || '').trim()) {
                 return 'recovery metadata head ref is empty';
+              }
+              const model = String(identity.model || '').trim();
+              if (
+                model &&
+                !/^[A-Za-z0-9][A-Za-z0-9._-]*\/[A-Za-z0-9][A-Za-z0-9._/-]{0,120}$/.test(model)
+              ) {
+                return 'recovery metadata model is malformed';
+              }
+              for (const field of ['not_before', 'retry_after_seconds']) {
+                const value = String(identity[field] ?? '').trim();
+                if (value && !/^[0-9]+$/.test(value)) {
+                  return 'recovery metadata ' + field + ' is malformed';
+                }
               }
               if (!['issue', 'qualification', 'coderabbit-fix', 'resolve-conflict', 'ci-fix'].includes(expected.mode)) {
                 return 'recovery metadata mode is not dispatchable';
@@ -1443,61 +1490,25 @@ jobs:
               const comments = await listThreadComments(threadNumber);
               const previous = latestRecoveryState(comments, operation, generation);
 
-              if (generation > max429Restarts) {
-                // `max_429_runner_restarts` is a hard cap on fresh-runner
-                // generations, not a per-generation attempt budget. Once the
-                // evacuation generation exceeds it, no further automatic
-                // dispatch is authorized. Convert the overdue cooldown to a
-                // terminal owner-action state instead of renewing `next_due`
-                // forever, which would silently strand the reservation. This
-                // branch only runs for a real OpenCode 429 evacuation (the
-                // GitHub REST budget guard returns earlier) and never
-                // dispatches, so owner STOP and duplicate-run fences stay
-                // authoritative.
-                const terminal =
-                  previous &&
-                  previous.state === 'owner-action-required' &&
-                  previous.detail === 'generation-exhausted';
-                if (terminal) {
-                  core.notice(
-                    'OpenCode infrastructure operation ' + operation + ' generation ' +
-                    generation + ' is terminal: the fresh-runner restart cap (' +
-                    max429Restarts + ') is exhausted and owner action is required; ' +
-                    'checkpoint ' + checkpointRef + ' remains preserved.'
-                  );
-                  return;
-                }
-                if (previous && previous.nextDue > now) {
-                  // Honor the recorded cooldown exactly once. After it expires
-                  // the next pass publishes the terminal state; it never
-                  // extends the window or dispatches another runner.
-                  core.notice(
-                    'OpenCode infrastructure operation ' + operation + ' generation ' +
-                    generation + ' is waiting for its bounded cooldown until ' +
-                    previous.nextDue + '; the restart cap is already exhausted.'
-                  );
-                  return;
-                }
-                await recordRecoveryState({
-                  ...baseState,
-                  state: 'owner-action-required',
-                  attempt: generation,
-                  nextDue: 0,
-                  detail: 'generation-exhausted',
-                  summary: 'The configured fresh-runner restart cap (' +
-                    max429Restarts + ') is exhausted at generation ' + generation +
-                    '. Checkpoint `' + checkpointRef + '` is preserved, but automatic ' +
-                    'recovery is stopped: no further fresh runner will be dispatched ' +
-                    'and no task/review/qualification budget was consumed. An owner ' +
-                    'must explicitly authorize more fresh-runner restarts or recover ' +
-                    'the checkpoint another way before this issue can move.',
-                });
-                core.warning(
+              // kodmial/continuum#496: `max_429_runner_restarts` is a fast
+              // replacement budget, not a lifetime stop. A generation beyond
+              // it still resumes automatically after one bounded increasing
+              // durable-backoff window. An unexpired window returns here; an
+              // expired window, a first event for a beyond-budget generation,
+              // or a legacy `generation-exhausted` owner-action marker falls
+              // through to metadata validation and the shared dispatch path.
+              // This branch only runs for a real OpenCode infrastructure
+              // evacuation (the GitHub REST budget guard returns earlier), so
+              // owner STOP and duplicate-run fences stay authoritative.
+              if (
+                generation > max429Restarts &&
+                previous &&
+                previous.nextDue > now
+              ) {
+                core.notice(
                   'OpenCode infrastructure operation ' + operation + ' generation ' +
-                  generation + ' exceeded the fresh-runner restart cap (' +
-                  max429Restarts + '); recorded a terminal owner-action-required ' +
-                  'state. Checkpoint ' + checkpointRef + ' preserved; automatic ' +
-                  'recovery will not dispatch another run.'
+                  generation + ' is waiting for its durable bounded backoff until ' +
+                  previous.nextDue + '; no duplicate dispatch.'
                 );
                 return;
               }
@@ -1675,6 +1686,40 @@ jobs:
                   'watchdog will not dispatch a resumption.'
                 );
                 return;
+              }
+
+              // kodmial/continuum#496: an explicit pause or blocked label is
+              // also authoritative. The scheduled discovery already filters
+              // these, but the workflow_run path reaches this function
+              // directly, so re-read the live issue before any durable-backoff
+              // write or dispatch. An unreadable label set fails closed
+              // without dispatching.
+              if (mode === 'issue') {
+                let liveLabels;
+                try {
+                  const liveIssue = await readGithub.rest.issues.get({
+                    owner, repo, issue_number: threadNumber,
+                  });
+                  liveLabels = issueLabelNames(liveIssue.data);
+                } catch (err) {
+                  core.warning(
+                    'OpenCode infrastructure operation ' + operation +
+                    ' generation ' + generation + ' could not re-read issue ' +
+                    'labels (' + (err.message || err) + '); no dispatch was made.'
+                  );
+                  return;
+                }
+                const holdLabels = [pausedLabel, blockedLabel]
+                  .filter(label => liveLabels.has(label));
+                if (holdLabels.length > 0) {
+                  core.notice(
+                    'OpenCode infrastructure operation ' + operation +
+                    ' generation ' + generation + ' is held by ' +
+                    holdLabels.join(', ') + '; watchdog will not dispatch a ' +
+                    'resumption or record a new recovery window.'
+                  );
+                  return;
+                }
               }
 
               const displayTitle = mode === 'issue'
@@ -1859,19 +1904,100 @@ jobs:
                 // re-recording the same exhausted backoff forever.
                 const backoffExpired =
                   previous.state === 'backoff' && previous.nextDue <= now;
+                const durableGeneration = generation > max429Restarts;
                 if (
                   previous.attempt >= Math.max(1, max429Restarts + 1) &&
                   !backoffExpired
                 ) {
+                  // kodmial/continuum#496: a beyond-budget generation is not
+                  // terminal. Record one durable bounded-backoff window (or
+                  // transition a legacy `generation-exhausted` owner-action
+                  // marker into that same state) and resume automatically
+                  // when it expires. Non-generation retry exhaustion keeps
+                  // its historical bounded 3600-second catch-up.
+                  const wait = durableGeneration
+                    ? durableBackoffSeconds(generation, max429Restarts)
+                    : 3600;
+                  const nextDue = Math.max(
+                    now + wait,
+                    providerNotBeforeEpoch(identity, now)
+                  );
                   await recordRecoveryState({
                     ...baseState,
                     checkpointSha,
                     state: 'backoff',
                     attempt: previous.attempt,
-                    nextDue: now + 3600,
-                    detail: 'attempts-exhausted',
-                    summary: 'Bounded recovery attempts are exhausted for this generation. Checkpoint `' + checkpointRef + '` is preserved; no pause was applied.',
+                    nextDue,
+                    runId: previous.runId || '',
+                    detail: durableGeneration
+                      ? 'durable-backoff'
+                      : 'attempts-exhausted',
+                    summary: durableGeneration
+                      ? 'The fast fresh-runner replacement budget (' +
+                        max429Restarts + ') is exhausted at generation ' +
+                        generation + '. Checkpoint `' + checkpointRef +
+                        '` is preserved and the operation will resume ' +
+                        'automatically with the same trusted model after a ' +
+                        'bounded durable backoff (' + wait + 's). No ' +
+                        'task/review/qualification budget was consumed.'
+                      : 'Bounded recovery attempts are exhausted for this ' +
+                        'generation. Checkpoint `' + checkpointRef +
+                        '` is preserved; no pause was applied.',
                   });
+                  if (durableGeneration) {
+                    core.notice(
+                      'OpenCode infrastructure operation ' + operation +
+                      ' generation ' + generation + ' is beyond the fast ' +
+                      'fresh-runner budget (' + max429Restarts + '); recorded ' +
+                      'a durable bounded backoff of ' + wait + 's. The same ' +
+                      'checkpoint and trusted model will resume automatically.'
+                    );
+                  }
+                  return;
+                }
+              }
+              // kodmial/continuum#496: beyond the fast replacement budget the
+              // first observed event and every later non-expired state wait
+              // for one durable window. Only a backoff state whose recorded
+              // `next_due` has actually expired authorizes exactly one fresh
+              // resumption from the latest validated checkpoint. Repeated
+              // events therefore cannot slide the deadline or dispatch twice.
+              if (generation > max429Restarts) {
+                const durableWindowExpired = Boolean(
+                  previous &&
+                  previous.state === 'backoff' &&
+                  previous.nextDue <= now
+                );
+                if (!durableWindowExpired) {
+                  const wait = durableBackoffSeconds(
+                    generation, max429Restarts
+                  );
+                  const nextDue = Math.max(
+                    now + wait,
+                    providerNotBeforeEpoch(identity, now)
+                  );
+                  await recordRecoveryState({
+                    ...baseState,
+                    checkpointSha,
+                    state: 'backoff',
+                    attempt: Math.max(1, Number(previous && previous.attempt) || 1),
+                    nextDue,
+                    runId: previous && previous.runId || '',
+                    detail: 'durable-backoff',
+                    summary: 'The fast fresh-runner replacement budget (' +
+                      max429Restarts + ') is exhausted at generation ' +
+                      generation + '. Checkpoint `' + checkpointRef +
+                      '` is preserved; one fresh resumption with the same ' +
+                      'trusted model is authorized after a bounded durable ' +
+                      'backoff (' + wait + 's). No task/review/qualification ' +
+                      'budget was consumed.',
+                  });
+                  core.notice(
+                    'OpenCode infrastructure operation ' + operation +
+                    ' generation ' + generation + ' entered a durable bounded ' +
+                    'backoff of ' + wait + 's; no runner was dispatched before ' +
+                    'its due time.'
+                  );
                   return;
                 }
               }
