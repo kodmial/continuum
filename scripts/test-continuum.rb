@@ -246,6 +246,20 @@ class ContinuumTest < Minitest::Test
     end.join
   end
 
+  def pr_agent_recovery_controller_body
+    lines = workflow_body('continuum-pr-agent-recovery.yml').lines
+    marker = "cat > \"$RUNNER_TEMP/continuum/pr-agent-recovery.js\" <<'CONTINUUM_JS'"
+    start = lines.index { |line| line.strip == marker }
+    refute_nil start, 'continuum-pr-agent-recovery.yml: controller staging marker is missing'
+    indent = lines[start][/\A */].size
+    rest = lines[(start + 1)..]
+    stop = rest.index { |line| line.strip == 'CONTINUUM_JS' }
+    refute_nil stop, 'continuum-pr-agent-recovery.yml: unterminated controller heredoc'
+    rest[0...stop].map do |line|
+      line[/\A */].size >= indent ? line[indent..] : line
+    end.join
+  end
+
   # The parsed core workflow behind a caller stub of the same base name.
   def workflow_stub_callee
     yaml(File.join(ROOT, '.github/workflows', 'continuum-opencode-repair.yml'))
@@ -11951,6 +11965,13 @@ class ContinuumTest < Minitest::Test
 
     reconcile = step_body(body, 'Reconcile PR-Agent latest state')
     refute_nil reconcile, "#{base}: reconciliation step is missing"
+    # The controller is staged in a run step to keep the github-script argv
+    # below the platform limit; the step keeps only a small loader.
+    assert_includes reconcile, "process.env.RUNNER_TEMP + '/continuum/pr-agent-recovery.js'",
+                    "#{base}: reconciliation must load the staged controller"
+    assert_includes reconcile, "eval('(async () => {' + controllerSource",
+                    "#{base}: reconciliation must execute the staged controller"
+    reconcile = reconcile + "\n" + pr_agent_recovery_controller_body
     assert_includes reconcile, 'const executionOwner = context.repo.owner;',
                       "#{base}: execution identity must stay the parent repository"
     assert_includes reconcile, 'const owner = process.env.CONTINUUM_PR_AGENT_TARGET_OWNER;',

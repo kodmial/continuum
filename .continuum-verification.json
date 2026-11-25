@@ -4,11 +4,11 @@
     "commands": [
       {
         "command": "bash scripts/validate-continuum.sh",
-        "duration_ms": 291545,
+        "duration_ms": 259132,
         "exit_code": 0,
         "name": "validation",
-        "output_sha256": "b02c876d434cdf7d1f183da3dbf182e646acde7238ed920cd7fb061290153080",
-        "output_tail": "ux/amd64\ntest_empty_inventory_remains_valid_zero_reservations (scripts.test_layer2_issue_inventory_guard.Layer2IssueInventoryGuardTest.test_empty_inventory_remains_valid_zero_reservations) ... ok\ntest_empty_labels_fail_closed (scripts.test_layer2_issue_inventory_guard.Layer2IssueInventoryGuardTest.test_empty_labels_fail_closed) ... ok\ntest_label_filtered_issue_remains_observable (scripts.test_layer2_issue_inventory_guard.Layer2IssueInventoryGuardTest.test_label_filtered_issue_remains_observable) ... ok\ntest_missing_labels_fail_closed (scripts.test_layer2_issue_inventory_guard.Layer2IssueInventoryGuardTest.test_missing_labels_fail_closed) ... ok\ntest_missing_number_is_reported_as_placeholder (scripts.test_layer2_issue_inventory_guard.Layer2IssueInventoryGuardTest.test_missing_number_is_reported_as_placeholder) ... ok\ntest_non_object_entry_fails_closed (scripts.test_layer2_issue_inventory_guard.Layer2IssueInventoryGuardTest.test_non_object_entry_fails_closed) ... ok\ntest_unexpected_object_fails_closed (scripts.test_layer2_issue_inventory_guard.Layer2IssueInventoryGuardTest.test_unexpected_object_fails_closed) ... ok\n\n----------------------------------------------------------------------\nRan 7 tests in 0.738s\n\nOK\ntest_gh_issue_list_failure_is_non_success (scripts.test_contract_qualification_workflow.Layer2LifecycleProbeTest.test_gh_issue_list_failure_is_non_success) ... ok\ntest_gh_pr_list_failure_is_non_success (scripts.test_contract_qualification_workflow.Layer2LifecycleProbeTest.test_gh_pr_list_failure_is_non_success) ... ok\ntest_gh_run_list_failure_is_non_success (scripts.test_contract_qualification_workflow.Layer2LifecycleProbeTest.test_gh_run_list_failure_is_non_success) ... ok\ntest_healthy_attributable_reservation_passes (scripts.test_contract_qualification_workflow.Layer2LifecycleProbeTest.test_healthy_attributable_reservation_passes) ... ok\ntest_malformed_exact_run_json_is_non_success (scripts.test_contract_qualification_workflow.Layer2LifecycleProbeTest.test_malformed_exact_run_json_is_non_success) ... ok\ntest_malformed_issue_inventory_json_is_non_success (scripts.test_contract_qualification_workflow.Layer2LifecycleProbeTest.test_malformed_issue_inventory_json_is_non_success) ... ok\ntest_malformed_pull_inventory_json_is_non_success (scripts.test_contract_qualification_workflow.Layer2LifecycleProbeTest.test_malformed_pull_inventory_json_is_non_success) ... ok\ntest_malformed_recent_run_json_is_non_success (scripts.test_contract_qualification_workflow.Layer2LifecycleProbeTest.test_malformed_recent_run_json_is_non_success) ... ok\ntest_malformed_worker_evidence_json_is_non_success (scripts.test_contract_qualification_workflow.Layer2LifecycleProbeTest.test_malformed_worker_evidence_json_is_non_success) ... ok\ntest_owner_marker_fallback_recovers_run_outside_recent_window (scripts.test_contract_qualification_workflow.Layer2LifecycleProbeTest.test_owner_marker_fallback_recovers_run_outside_recent_window) ... ok\ntest_stranded_reservation_without_worker_pr_or_lease_fails (scripts.test_contract_qualification_workflow.Layer2LifecycleProbeTest.test_stranded_reservation_without_worker_pr_or_lease_fails) ... ok\ntest_unavailable_exact_run_evidence_is_non_success (scripts.test_contract_qualification_workflow.Layer2LifecycleProbeTest.test_unavailable_exact_run_evidence_is_non_success) ... ok\ntest_unavailable_worker_comment_evidence_is_non_success (scripts.test_contract_qualification_workflow.Layer2LifecycleProbeTest.test_unavailable_worker_comment_evidence_is_non_success) ... ok\ntest_untrusted_exact_run_identity_remains_stranded (scripts.test_contract_qualification_workflow.Layer2LifecycleProbeTest.test_untrusted_exact_run_identity_remains_stranded) ... ok\ntest_valid_empty_inventory_passes_as_zero_reservations (scripts.test_contract_qualification_workflow.Layer2LifecycleProbeTest.test_valid_empty_inventory_passes_as_zero_reservations) ... ok\n\n----------------------------------------------------------------------\nRan 15 tests in 1.919s\n\nOK\n",
+        "output_sha256": "12857bb9e3ddfa5b3520dbb159be0e26c081df399592f8d6fde36d3e3abe32e9",
+        "output_tail": "ux/amd64\ntest_empty_inventory_remains_valid_zero_reservations (scripts.test_layer2_issue_inventory_guard.Layer2IssueInventoryGuardTest.test_empty_inventory_remains_valid_zero_reservations) ... ok\ntest_empty_labels_fail_closed (scripts.test_layer2_issue_inventory_guard.Layer2IssueInventoryGuardTest.test_empty_labels_fail_closed) ... ok\ntest_label_filtered_issue_remains_observable (scripts.test_layer2_issue_inventory_guard.Layer2IssueInventoryGuardTest.test_label_filtered_issue_remains_observable) ... ok\ntest_missing_labels_fail_closed (scripts.test_layer2_issue_inventory_guard.Layer2IssueInventoryGuardTest.test_missing_labels_fail_closed) ... ok\ntest_missing_number_is_reported_as_placeholder (scripts.test_layer2_issue_inventory_guard.Layer2IssueInventoryGuardTest.test_missing_number_is_reported_as_placeholder) ... ok\ntest_non_object_entry_fails_closed (scripts.test_layer2_issue_inventory_guard.Layer2IssueInventoryGuardTest.test_non_object_entry_fails_closed) ... ok\ntest_unexpected_object_fails_closed (scripts.test_layer2_issue_inventory_guard.Layer2IssueInventoryGuardTest.test_unexpected_object_fails_closed) ... ok\n\n----------------------------------------------------------------------\nRan 7 tests in 0.639s\n\nOK\ntest_gh_issue_list_failure_is_non_success (scripts.test_contract_qualification_workflow.Layer2LifecycleProbeTest.test_gh_issue_list_failure_is_non_success) ... ok\ntest_gh_pr_list_failure_is_non_success (scripts.test_contract_qualification_workflow.Layer2LifecycleProbeTest.test_gh_pr_list_failure_is_non_success) ... ok\ntest_gh_run_list_failure_is_non_success (scripts.test_contract_qualification_workflow.Layer2LifecycleProbeTest.test_gh_run_list_failure_is_non_success) ... ok\ntest_healthy_attributable_reservation_passes (scripts.test_contract_qualification_workflow.Layer2LifecycleProbeTest.test_healthy_attributable_reservation_passes) ... ok\ntest_malformed_exact_run_json_is_non_success (scripts.test_contract_qualification_workflow.Layer2LifecycleProbeTest.test_malformed_exact_run_json_is_non_success) ... ok\ntest_malformed_issue_inventory_json_is_non_success (scripts.test_contract_qualification_workflow.Layer2LifecycleProbeTest.test_malformed_issue_inventory_json_is_non_success) ... ok\ntest_malformed_pull_inventory_json_is_non_success (scripts.test_contract_qualification_workflow.Layer2LifecycleProbeTest.test_malformed_pull_inventory_json_is_non_success) ... ok\ntest_malformed_recent_run_json_is_non_success (scripts.test_contract_qualification_workflow.Layer2LifecycleProbeTest.test_malformed_recent_run_json_is_non_success) ... ok\ntest_malformed_worker_evidence_json_is_non_success (scripts.test_contract_qualification_workflow.Layer2LifecycleProbeTest.test_malformed_worker_evidence_json_is_non_success) ... ok\ntest_owner_marker_fallback_recovers_run_outside_recent_window (scripts.test_contract_qualification_workflow.Layer2LifecycleProbeTest.test_owner_marker_fallback_recovers_run_outside_recent_window) ... ok\ntest_stranded_reservation_without_worker_pr_or_lease_fails (scripts.test_contract_qualification_workflow.Layer2LifecycleProbeTest.test_stranded_reservation_without_worker_pr_or_lease_fails) ... ok\ntest_unavailable_exact_run_evidence_is_non_success (scripts.test_contract_qualification_workflow.Layer2LifecycleProbeTest.test_unavailable_exact_run_evidence_is_non_success) ... ok\ntest_unavailable_worker_comment_evidence_is_non_success (scripts.test_contract_qualification_workflow.Layer2LifecycleProbeTest.test_unavailable_worker_comment_evidence_is_non_success) ... ok\ntest_untrusted_exact_run_identity_remains_stranded (scripts.test_contract_qualification_workflow.Layer2LifecycleProbeTest.test_untrusted_exact_run_identity_remains_stranded) ... ok\ntest_valid_empty_inventory_passes_as_zero_reservations (scripts.test_contract_qualification_workflow.Layer2LifecycleProbeTest.test_valid_empty_inventory_passes_as_zero_reservations) ... ok\n\n----------------------------------------------------------------------\nRan 15 tests in 1.681s\n\nOK\n",
         "source": ".github/workflows/ci.yml:validation_command"
       }
     ],
@@ -31,7 +31,7 @@
     "head_sha": "7e460620a7db5b8447f9ca708e55867b478a4055",
     "phase": "baseline",
     "previous_environment_fingerprint": "22dc4d096385c8ec880a5a53bf77d6be5f3f7c2421c7a84e9768b302fa5619fc",
-    "recorded_at": "2026-11-25T22:17:10Z",
+    "recorded_at": "2026-11-25T22:35:03Z",
     "state": "passed"
   },
   "contract": {
@@ -50,21 +50,21 @@
   "resume_provenance": {
     "base_ref": "main",
     "base_sha": "7e460620a7db5b8447f9ca708e55867b478a4055",
-    "checkpoint_ref": "opencode/429-checkpoint-opencode-429-issue-issue497-gen-2",
-    "checkpoint_sha": "6436beeba286d01e51165675b72985e58801fbf3",
+    "checkpoint_ref": "opencode/429-checkpoint-opencode-429-issue-issue497-gen-3",
+    "checkpoint_sha": "5ec192100720f590c75438e1e300446ccd0e0e8a",
     "evidence_file": ".continuum-verification.json",
-    "evidence_sha256": "8729ef5c3ee0a121c04fcfad3339ee81f54a7a02678b53729225b53ccc68794a",
+    "evidence_sha256": "ac4dee9b7ea029c8d480403ee47a462ac99863b859cdd48f698041cc10f7a18b",
     "legacy_evidence_untrusted": true,
     "metadata_file": ".continuum-429-recovery.json",
-    "metadata_sha256": "2d12ecbae093c500749e4f1b26661c0794615cc05d54700f2953110e1afe7bb0",
+    "metadata_sha256": "a347f73f30896e002fb59818387736b1872b8a2d4bc65163ce9eda5a08fd79e4",
     "operation": "opencode-429-issue-issue497",
     "request": {
       "base_sha": "7e460620a7db5b8447f9ca708e55867b478a4055",
-      "checkpoint_ref": "opencode/429-checkpoint-opencode-429-issue-issue497-gen-2",
-      "checkpoint_sha": "6436beeba286d01e51165675b72985e58801fbf3",
-      "generation": 2,
+      "checkpoint_ref": "opencode/429-checkpoint-opencode-429-issue-issue497-gen-3",
+      "checkpoint_sha": "5ec192100720f590c75438e1e300446ccd0e0e8a",
+      "generation": 3,
       "issue": 497,
-      "latest_generation": 2,
+      "latest_generation": 3,
       "mode": "issue",
       "operation": "opencode-429-issue-issue497",
       "repository": "kodmial/continuum",

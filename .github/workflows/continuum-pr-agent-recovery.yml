@@ -149,26 +149,11 @@ jobs:
           CONTINUUM_ENGINE_ROOT="$RUNTIME_ROOT" PARENT_CONFIG="$PARENT_CONFIG_FILE" \
             bash "$RUNTIME_ROOT/.github/scripts/pr_agent_target.sh" "$TARGET_CHILD_ID"
 
-      - name: Reconcile PR-Agent latest state
-        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
-        env:
-          REVIEW_WORKFLOW: ${{ inputs.review_workflow }}
-          PR_AGENT_REPAIR_WORKFLOW: ${{ vars.CONTINUUM_PR_AGENT_REPAIR_WORKFLOW || 'continuum-pr-agent-repair.yml' }}
-          CI_WORKFLOW_NAME: ${{ inputs.ci_workflow_name || vars.CONTINUUM_CI_WORKFLOW_NAME || 'CI' }}
-          STALE_MINUTES: ${{ inputs.stale_minutes || vars.PR_AGENT_RECOVERY_STALE_MINUTES || '70' }}
-          DISPATCH_GRACE_SECONDS: ${{ inputs.dispatch_grace_seconds || vars.PR_AGENT_RECOVERY_DISPATCH_GRACE_SECONDS || '90' }}
-          TARGET_CHILD_ID: ${{ inputs.target_child_id || vars.CONTINUUM_PR_AGENT_TARGET_CHILD_ID }}
-          MAX_EXECUTIONS_RAW: ${{ inputs.max_executions }}
-          MAX_EXECUTIONS_FALLBACK: ${{ vars.PR_AGENT_RECOVERY_MAX_EXECUTIONS || '10' }}
-          # Item 1 of Work Lock #58: same-repo reads use the repository-scoped
-          # installation token. PAT remains the mutation/dispatch identity.
-          # For delegated recovery, cross-repository target reads fall back
-          # to the PAT client via withReadFallback when github.token cannot
-          # see the child.
-          READ_GITHUB_TOKEN: ${{ github.token }}
-        with:
-          github-token: ${{ secrets.TAP_PAT }}
-          script: |
+      - name: Stage the PR-Agent recovery controller script
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/continuum"
+          cat > "$RUNNER_TEMP/continuum/pr-agent-recovery.js" <<'CONTINUUM_JS'
             const executionOwner = context.repo.owner;
             const executionRepo = context.repo.repo;
             const owner = process.env.CONTINUUM_PR_AGENT_TARGET_OWNER;
@@ -3015,3 +3000,28 @@ jobs:
                 (deterministicFailure.message || deterministicFailure)
               );
             }
+          CONTINUUM_JS
+      - name: Reconcile PR-Agent latest state
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
+        env:
+          REVIEW_WORKFLOW: ${{ inputs.review_workflow }}
+          PR_AGENT_REPAIR_WORKFLOW: ${{ vars.CONTINUUM_PR_AGENT_REPAIR_WORKFLOW || 'continuum-pr-agent-repair.yml' }}
+          CI_WORKFLOW_NAME: ${{ inputs.ci_workflow_name || vars.CONTINUUM_CI_WORKFLOW_NAME || 'CI' }}
+          STALE_MINUTES: ${{ inputs.stale_minutes || vars.PR_AGENT_RECOVERY_STALE_MINUTES || '70' }}
+          DISPATCH_GRACE_SECONDS: ${{ inputs.dispatch_grace_seconds || vars.PR_AGENT_RECOVERY_DISPATCH_GRACE_SECONDS || '90' }}
+          TARGET_CHILD_ID: ${{ inputs.target_child_id || vars.CONTINUUM_PR_AGENT_TARGET_CHILD_ID }}
+          MAX_EXECUTIONS_RAW: ${{ inputs.max_executions }}
+          MAX_EXECUTIONS_FALLBACK: ${{ vars.PR_AGENT_RECOVERY_MAX_EXECUTIONS || '10' }}
+          # Item 1 of Work Lock #58: same-repo reads use the repository-scoped
+          # installation token. PAT remains the mutation/dispatch identity.
+          # For delegated recovery, cross-repository target reads fall back
+          # to the PAT client via withReadFallback when github.token cannot
+          # see the child.
+          READ_GITHUB_TOKEN: ${{ github.token }}
+        with:
+          github-token: ${{ secrets.TAP_PAT }}
+          script: |
+            const fs = require('fs');
+            const controllerPath = process.env.RUNNER_TEMP + '/continuum/pr-agent-recovery.js';
+            const controllerSource = fs.readFileSync(controllerPath, 'utf8');
+            await eval('(async () => {' + controllerSource + '\n})()');
