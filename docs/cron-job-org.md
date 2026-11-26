@@ -275,3 +275,40 @@ PR merged.
 | `422` | Invalid `ref` or an input the caller does not declare | Use the default branch and both `periodic_wake` and `auto_merge_only`. |
 | No run appears | The request never reached GitHub or was rejected | Check the cron-job.org response status and request headers. |
 | Token expiry | The fine-grained PAT reached its expiry date | Issue a new PAT, update the header, verify one dispatch, then revoke the old one. |
+
+## Optional self-dogfood OpenCode recovery backstop
+
+The native `*/15 * * * *` watchdog schedule remains active. To cover a
+missing/delayed schedule without triggering the scheduler, auto-merge, or the
+cross-repository watchdog, target the **same** `automation.yml` dispatch URL
+and fine-grained **Actions: write** token described above, but send:
+
+```json
+{"ref":"main","inputs":{"periodic_wake":"true","watchdog_only":"true"}}
+```
+
+Do not set both narrow selectors: for backward compatibility
+`auto_merge_only=true` takes precedence if both are true. The watchdog-only
+run is marked `[continuum-watchdog-only] [continuum-wake:watchdog-only]`, so
+it is never scheduler-window evidence. A useful external backup is UTC minute
+`:03, :18, :33, :48`. Native and external eventless watchdog passes share one
+concurrency lane; an actual completed catch-up at the same default-branch
+SHA in the current 15-minute window is required to skip a redundant periodic
+pass. A skipped job, failed run, or unverifiable inventory is not such
+evidence. Ordinary event-driven recovery and manual watchdog-only dispatch
+without `periodic_wake` are not deduplicated by the periodic gate. The
+watchdog still independently checks holds, checkpoint identity, and existing
+claims/runs before dispatching; a wake is not permission to restart a task.
+
+An owner removing the configured pause label from an open issue also wakes
+the same watchdog. This does not bypass holds or start work from the beginning;
+a valid reserved checkpoint must still pass the existing recovery guards.
+
+Verify HTTP 204, the watchdog-only run markers, and the actual
+`watchdog / recover` job. All other jobs must be skipped. If the periodic
+gate reports a prior completed catch-up, verify the cited run's attestation
+step. To confirm recovery, require an observed fresh-VM run for the exact
+operation/generation/checkpoint, not merely an accepted HTTP request or a
+green controller. The external job is optional and must be configured by the
+operator; Continuum neither stores its token nor claims a backup exists
+until an actual external dispatch is observed.
