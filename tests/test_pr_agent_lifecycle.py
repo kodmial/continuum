@@ -404,9 +404,14 @@ APPROVED_467_PRE_MERGE_OPENCODE_SHA256 = (
 # 2026-11-17 (#459 + #469): protected OpenCode workflow combines the
 # reviewed issue-publication recovery and main-sync fence from #459 with
 # the run-scoped no-change repair provenance from #469. Keep earlier immutable
-# workflow digests for audit; this exact union is the active safety pin.
+# workflow digests for audit; this exact union was the prior safety pin.
 APPROVED_459_469_MERGED_OPENCODE_SHA256 = (
     "46b0e0bdf21022aaaf4a62ed3d8dc8fbd64de7bd0a60e68a7fcbc6e608ee65c3"
+)
+# #496 recovery candidate: advance only the exact full-file artifact.
+# Independent PR review and exact-HEAD validation remain required before merge.
+RECOVERY_496_OPENCODE_SHA256 = (
+    "285c191e08219b535fa44e7056ac8376e4a6f292c56cc92c4f0e95ab02e4428b"
 )
 # The prior #460 resume pin stays for audit; any further byte drift still
 # fails closed.
@@ -2838,10 +2843,12 @@ class ProtectedBaselineTests(unittest.TestCase):
                     # main's #454 telemetry upload, and main's reviewed
                     # CI-repair/main-sync fence all share this artifact, with
                     # full-file digests and executable regression tests.
+                    # #496 advances this artifact for the recovered route and
+                    # exact checkpoint model without changing other protected files.
                     self.assertEqual(
                         protected_file_digest(path),
-                        APPROVED_459_469_MERGED_OPENCODE_SHA256,
-                        f"{path}: unexpected drift outside combined reviewed PR #459 and #469 provenance workflow",
+                        RECOVERY_496_OPENCODE_SHA256,
+                        f"{path}: unexpected drift outside the exact #496 recovery artifact",
                     )
                 else:
                     # The self-dogfood caller is the dispatchable surface
@@ -2926,7 +2933,7 @@ class ProtectedBaselineTests(unittest.TestCase):
         # therefore be dirty in this pre-commit worktree; any unapproved byte
         # change still fails the exact digest assertions above.
         approved = {
-            ".github/workflows/continuum-opencode.yml": APPROVED_459_469_MERGED_OPENCODE_SHA256,
+            ".github/workflows/continuum-opencode.yml": RECOVERY_496_OPENCODE_SHA256,
             ".github/workflows/opencode.yml": APPROVED_350_SELF_CALLER_SHA256,
         }
         for path in PROTECTED_FILES:

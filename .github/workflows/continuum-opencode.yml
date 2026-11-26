@@ -3348,8 +3348,8 @@ jobs:
           steps.duplicate_guard.outputs.skip != 'true' &&
           inputs.mode == 'issue'
         env:
-          GH_TOKEN: ${{ secrets.TAP_PAT }}
-          GITHUB_TOKEN: ${{ secrets.TAP_PAT }}
+          # Read-only default-branch lookup; git retains checkout PAT for the push.
+          GH_TOKEN: ${{ github.token }}
           OPENCODE_MODEL: ${{ steps.recovery_model.outputs.model }}
           ISSUE_NUMBER: ${{ inputs.issue_number }}
           RECOVERY_OPERATION_ID: ${{ steps.recovery_restore.outputs.operation_id }}

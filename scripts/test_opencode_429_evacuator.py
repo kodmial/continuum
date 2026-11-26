@@ -438,6 +438,13 @@ class ProductionEvacuatorTest(unittest.TestCase):
         step = next(s for s in steps if s.get("name") == "Preserve restored issue checkpoint after pinned route quota 429")
         self.assertIn("steps.model_route.outcome == 'failure'", step["if"])
         self.assertIn("steps.recovery_restore.outputs.resumed == 'true'", step["if"])
+        # The guard reads with the scoped token; code pushes retain the
+        # already-configured checkout credential, without new PAT bindings.
+        self.assertEqual(step["env"]["GH_TOKEN"], "${{ github.token }}")
+        self.assertNotIn("GITHUB_TOKEN", step["env"])
+        checkout = next(s for s in steps if s.get("name") == "Checkout repository")
+        self.assertTrue(checkout["with"]["persist-credentials"])
+        self.assertEqual(checkout["with"]["token"], "${{ secrets.TAP_PAT }}")
         env = dict(os.environ, PATH=str(self.bin) + os.pathsep + os.environ["PATH"],
                    RUNNER_TEMP=str(self.runner), GITHUB_ENV=str(self.github_env),
                    GITHUB_REPOSITORY="owner/repo", GITHUB_RUN_ID="400",
