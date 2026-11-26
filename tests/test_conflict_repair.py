@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import os
+import shutil
+import subprocess
 import sys
+import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
 
@@ -230,6 +233,193 @@ class BoundedIdempotentRetryTests(unittest.TestCase):
         )
         self.assertEqual(decision.action, "dispatch")
         self.assertEqual(decision.attempt, 0)
+
+
+class PrAgentConflictPublishGuardTests(unittest.TestCase):
+    """Issue #497: execute the shipped conflict publication guard.
+
+    The guard must reject unresolved index entries, surviving conflict
+    markers, and a result that does not contain the integrated default-branch
+    base. A real merge of both sides must pass.
+    """
+
+    WORKFLOW = ".github/workflows/continuum-pr-agent-repair.yml"
+
+    @classmethod
+    def setUpClass(cls):
+        with open(
+            os.path.join(ROOT, cls.WORKFLOW), "r", encoding="utf-8"
+        ) as handle:
+            body = handle.read()
+        start = body.index('no_progress_classification="transient"')
+        end = body.index(
+            'if [[ -z "$(git status --porcelain)" ]]; then', start
+        )
+        cls.precommit_guard = body[start:end]
+        head_anchor = body.index(
+            'if ! git merge-base --is-ancestor "$HEAD_SHA" HEAD; then'
+        )
+        post_start = body.index(
+            'if [[ "${MODE,,}" == "conflict" ]]; then', head_anchor
+        )
+        post_end = body.index(
+            'NEW_HEAD="$(git rev-parse HEAD)"', post_start
+        )
+        cls.postcommit_guard = body[post_start:post_end]
+
+    def setUp(self):
+        tmp_root = os.path.join(ROOT, ".opencode-tmp")
+        os.makedirs(tmp_root, exist_ok=True)
+        self.tmp = tempfile.mkdtemp(prefix="conflict-publish-", dir=tmp_root)
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.repo = os.path.join(self.tmp, "repo")
+        os.makedirs(self.repo)
+        self.env = dict(
+            os.environ,
+            GIT_AUTHOR_NAME="Continuum Test",
+            GIT_AUTHOR_EMAIL="continuum-test@example.invalid",
+            GIT_COMMITTER_NAME="Continuum Test",
+            GIT_COMMITTER_EMAIL="continuum-test@example.invalid",
+            RUNNER_TEMP=self.tmp,
+        )
+        self._git("init", "-q", "-b", "main")
+        self._git("config", "user.name", "Continuum Test")
+        self._git("config", "user.email", "continuum-test@example.invalid")
+        self._write("shared.txt", "base\n")
+        self._git("add", "shared.txt")
+        self._git("commit", "-q", "-m", "base")
+        self._git("checkout", "-q", "-b", "feature")
+        self._write("shared.txt", "feature\n")
+        self._git("add", "shared.txt")
+        self._git("commit", "-q", "-m", "feature")
+        self.head_sha = self._git("rev-parse", "HEAD").stdout.strip()
+        self._git("checkout", "-q", "main")
+        self._write("shared.txt", "base\nmain\n")
+        self._git("add", "shared.txt")
+        self._git("commit", "-q", "-m", "advance main")
+        self.base_sha = self._git("rev-parse", "HEAD").stdout.strip()
+        self._git("checkout", "-q", "feature")
+
+    def _git(self, *args, check=True):
+        return subprocess.run(
+            ["git", *args],
+            cwd=self.repo,
+            env=self.env,
+            capture_output=True,
+            text=True,
+            check=check,
+        )
+
+    def _write(self, name, content):
+        with open(os.path.join(self.repo, name), "w", encoding="utf-8") as handle:
+            handle.write(content)
+
+    def _merge_base(self):
+        return self._git("merge", "main", check=False)
+
+    def _run_script(self, block):
+        output_path = os.path.join(self.tmp, "github-output")
+        with open(output_path, "w", encoding="utf-8") as handle:
+            handle.write("")
+        script = (
+            "set -euo pipefail\n"
+            "MODE=conflict\n"
+            f"GITHUB_OUTPUT={output_path!r}\n"
+            f"BASE_SHA={self.base_sha}\n"
+            + block
+        )
+        completed = subprocess.run(
+            ["bash", "-c", script],
+            cwd=self.repo,
+            env=self.env,
+            capture_output=True,
+            text=True,
+        )
+        with open(output_path, "r", encoding="utf-8") as handle:
+            outputs = handle.read()
+        return completed, outputs
+
+    def test_merged_result_contains_both_sides_and_publishes(self):
+        merge = self._merge_base()
+        self.assertNotEqual(merge.returncode, 0, "fixture must conflict")
+        self._write("shared.txt", "feature\nmain\n")
+        self._git("add", "shared.txt")
+        completed, outputs = self._run_script(self.precommit_guard)
+        self.assertEqual(completed.returncode, 0, completed.stderr or completed.stdout)
+        self._git("commit", "-q", "-m", "merge main into feature")
+        published, published_outputs = self._run_script(self.postcommit_guard)
+        self.assertEqual(
+            published.returncode, 0, published.stderr or published.stdout
+        )
+        for ancestor in (self.head_sha, self.base_sha):
+            with self.subTest(ancestor=ancestor):
+                self.assertEqual(
+                    self._git("merge-base", "--is-ancestor", ancestor, "HEAD").returncode,
+                    0,
+                    "repaired HEAD must contain both the original HEAD and the integrated base",
+                )
+        with open(os.path.join(self.repo, "shared.txt"), encoding="utf-8") as handle:
+            content = handle.read()
+        self.assertIn("feature", content)
+        self.assertIn("main", content)
+        self.assertEqual(outputs.strip(), "")
+        self.assertEqual(published_outputs.strip(), "")
+
+    def test_unresolved_index_entries_are_rejected(self):
+        merge = self._merge_base()
+        self.assertNotEqual(merge.returncode, 0, "fixture must conflict")
+        completed, outputs = self._run_script(self.precommit_guard)
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertIn("unresolved index entries", completed.stderr + completed.stdout)
+        self.assertIn("classification=deterministic", outputs)
+
+    def test_surviving_conflict_markers_are_rejected(self):
+        merge = self._merge_base()
+        self.assertNotEqual(merge.returncode, 0, "fixture must conflict")
+        self._write(
+            "shared.txt",
+            "<<<<<<< HEAD\nfeature\n=======\nmain\n>>>>>>> main\n",
+        )
+        self._git("add", "shared.txt")
+        completed, outputs = self._run_script(self.precommit_guard)
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertIn("conflict markers", completed.stderr + completed.stdout)
+        self.assertIn("classification=deterministic", outputs)
+
+    def test_large_staged_diff_with_early_marker_still_fails_closed(self):
+        # A `git diff | grep -q` pipeline can fail open when grep exits early
+        # and git receives SIGPIPE. The guard must capture the diff first so
+        # a large staged result cannot publish surviving conflict markers.
+        merge = self._merge_base()
+        self.assertNotEqual(merge.returncode, 0, "fixture must conflict")
+        self._write(
+            "shared.txt",
+            "<<<<<<< HEAD\nfeature\n=======\nmain\n>>>>>>> main\n",
+        )
+        self._git("add", "shared.txt")
+        large = os.path.join(self.repo, "large.txt")
+        with open(large, "w", encoding="utf-8") as handle:
+            handle.write("<<<<<<< HEAD\nfeature\n=======\nmain\n>>>>>>> main\n")
+            for index in range(200000):
+                handle.write("padding line %d\n" % index)
+        self._git("add", "large.txt")
+        completed, outputs = self._run_script(self.precommit_guard)
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertIn("conflict markers", completed.stderr + completed.stdout)
+        self.assertIn("classification=deterministic", outputs)
+        self.assertTrue(
+            os.path.exists(os.path.join(self.tmp, "conflict-staged.diff")),
+            "the guard must inspect a captured diff instead of a pipe",
+        )
+
+    def test_result_without_integrated_base_is_rejected(self):
+        completed, outputs = self._run_script(self.postcommit_guard)
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertIn(
+            "did not integrate the default-branch base",
+            completed.stderr + completed.stdout,
+        )
+        self.assertIn("classification=deterministic", outputs)
 
 
 if __name__ == "__main__":
