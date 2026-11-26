@@ -166,6 +166,9 @@ function makeRest() {
       listWorkflowRuns: async (params = {}) => {
         const callNumber = state.observationListCalls.length + 1;
         state.observationListCalls.push({ ...params });
+        if (scenario.observationAppearAfter?.call === callNumber) {
+          state.workflowRuns.push(scenario.observationAppearAfter.run);
+        }
         if ((scenario.observationListErrors || []).includes(callNumber)) {
           throw apiError(500, 'observation inventory failed');
         }
@@ -183,7 +186,8 @@ function makeRest() {
             if (end) upperBound = new Date(end).getTime();
           }
           runs = runs.filter(run => {
-            const at = new Date(run.created_at).getTime();
+            // GitHub creation filters compare inclusive whole seconds.
+            const at = Math.floor(new Date(run.created_at).getTime() / 1000) * 1000;
             return at >= lowerBound && at <= upperBound;
           });
         }
@@ -195,8 +199,9 @@ function makeRest() {
         const total = runs.length;
         if (params.event || params.created) runs = runs.slice(0, 1000);
         const pageSize = Number(params.per_page || 30);
-        const offset = (Number(params.page || 1) - 1) * pageSize;
-        return { data: { total_count: total,
+        const page = Number(params.page || 1);
+        const offset = (scenario.observationRepeatPage && page > 1 ? 0 : page - 1) * pageSize;
+        return { data: { total_count: total + (page > 1 ? (scenario.observationCountDrift || 0) : 0),
           workflow_runs: runs.slice(offset, offset + pageSize) } };
       },
       listWorkflowRunsForRepo: async (params = {}) => {
@@ -804,8 +809,8 @@ class WatchdogHarness(unittest.TestCase):
                             for item in result["comments"]))
 
     def test_exactly_one_thousand_complete_results_do_not_hold_the_claim(self):
-        # Exactly 1,000 matching runs is a complete inventory, not proof of
-        # truncation. The claim must be discharged by a fresh dispatch.
+        # A saturated query (even when exactly 1,000) can be partitioned
+        # into complete, distinct, non-overlapping time windows.
         scenario = base_scenario()
         now = datetime.now(timezone.utc)
         scenario["comments"][0]["body"] = recovery_marker(
@@ -815,7 +820,7 @@ class WatchdogHarness(unittest.TestCase):
             {
                 "id": index + 90000,
                 "event": "workflow_dispatch",
-                "created_at": now.isoformat(),
+                "created_at": (now - timedelta(seconds=index // 20)).isoformat(),
                 "status": "completed",
                 "conclusion": "failure",
                 "display_title": "Unrelated dispatch",
@@ -831,30 +836,65 @@ class WatchdogHarness(unittest.TestCase):
             result["notices"],
         )
 
-    def test_completed_observation_survives_later_retry_failures(self):
-        # The first attempt proves absence; the remaining retries fail. One
-        # complete observation is enough to stop holding the claim.
+    def test_unstable_paginated_inventory_cannot_prove_absence(self):
+        for bad_page in ("observationRepeatPage", "observationCountDrift"):
+            with self.subTest(bad_page=bad_page):
+                scenario = base_scenario()
+                now = datetime.now(timezone.utc)
+                scenario["comments"][0]["body"] = recovery_marker(
+                    "claimed", NEW_SHA, "-", next_due=int(now.timestamp()) - 60
+                )
+                scenario["workflowRuns"] = [{
+                    "id": index + 90000,
+                    "event": "workflow_dispatch",
+                    "created_at": now.isoformat(),
+                    "status": "completed",
+                    "display_title": "Unrelated dispatch",
+                    "path": ".github/workflows/opencode.yml",
+                } for index in range(101)]
+                scenario[bad_page] = 1
+                result = self.run_scenario(scenario)
+                self.assert_no_dispatch(result)
+                self.assertEqual(2, len(result["observationListCalls"]))
+
+    def test_later_failed_observations_invalidate_previous_absence(self):
+        # A real accepted dispatch becomes visible after the first negative
+        # read, but the remaining API reads fail. An old snapshot must not
+        # grant ownership of a second dispatch.
         scenario = base_scenario()
         now = datetime.now(timezone.utc)
         scenario["comments"][0]["body"] = recovery_marker(
             "claimed", NEW_SHA, "-", next_due=int(now.timestamp()) - 60
         )
         scenario["workflowRuns"] = []
+        scenario["observationAppearAfter"] = {
+            "call": 2,
+            "run": {
+                "id": 424242,
+                "event": "workflow_dispatch",
+                "created_at": now.isoformat(),
+                "status": "in_progress",
+                "display_title": "OpenCode 429 recovery " + OPERATION + " gen 1",
+                "path": ".github/workflows/opencode.yml",
+            },
+        }
         scenario["observationListErrors"] = list(range(2, 11))
         result = self.run_scenario(scenario)
-        self.assert_one_current_dispatch(result, NEW_SHA)
+        self.assert_no_dispatch(result)
         self.assertTrue(any(
-            "state=observed" in item["body"] and "run=5001" in item["body"]
-            for item in result["comments"]
-        ), result["comments"])
+            "Incomplete dispatch inventory" in " ".join(item)
+            for item in result["notices"]
+        ), result["notices"])
 
-    def test_unset_marker_timestamp_does_not_scan_epoch_history(self):
-        # next_due=0 must not degrade the lower bound to 1970 and rescan the
-        # repository's complete run history.
+    def test_unset_marker_timestamp_uses_real_claim_creation(self):
+        # Legacy next_due=0 must use the durable comment's creation time,
+        # not a fabricated five-minute window that can hide accepted work.
         scenario = base_scenario()
+        claim_at = datetime.now(timezone.utc) - timedelta(hours=2)
         scenario["comments"][0]["body"] = recovery_marker(
             "claimed", NEW_SHA, "-", next_due=0
         )
+        scenario["comments"][0]["created_at"] = claim_at.isoformat()
         scenario["workflowRuns"] = []
         result = self.run_scenario(scenario)
         self.assert_one_current_dispatch(result, NEW_SHA)
@@ -862,11 +902,41 @@ class WatchdogHarness(unittest.TestCase):
         lower_bound = datetime.fromisoformat(
             created.split("..")[0].replace("Z", "+00:00")
         )
-        self.assertGreater(
-            lower_bound,
-            datetime.now(timezone.utc) - timedelta(minutes=10),
-            "an unset next_due must not degrade the bound to 1970",
+        self.assertAlmostEqual(
+            (claim_at - lower_bound).total_seconds(), 5, delta=1.1
         )
+
+    def test_unknown_claim_creation_cannot_authorize_redispatch(self):
+        scenario = base_scenario()
+        scenario["comments"][0]["body"] = recovery_marker(
+            "claimed", NEW_SHA, "-", next_due=0
+        )
+        scenario["comments"][0].pop("created_at")
+        result = self.run_scenario(scenario)
+        self.assert_no_dispatch(result)
+        self.assertEqual([], result["observationListCalls"])
+
+    def test_delayed_dispatch_beyond_one_hour_is_adopted(self):
+        scenario = base_scenario()
+        now = datetime.now(timezone.utc)
+        claim_at = now - timedelta(hours=3)
+        scenario["comments"][0]["body"] = recovery_marker(
+            "claimed", NEW_SHA, "-", next_due=int(claim_at.timestamp()) + 300
+        )
+        scenario["workflowRuns"] = [{
+            "id": 424242,
+            "event": "workflow_dispatch",
+            "created_at": (now - timedelta(hours=1)).isoformat(),
+            "status": "in_progress",
+            "display_title": "OpenCode 429 recovery " + OPERATION + " gen 1",
+            "path": ".github/workflows/opencode.yml",
+        }]
+        result = self.run_scenario(scenario)
+        self.assert_no_dispatch(result)
+        self.assertTrue(any(
+            "state=observed" in item["body"] and "run=424242" in item["body"]
+            for item in result["comments"]
+        ), result["comments"])
 
     def test_observation_window_excludes_dispatches_after_the_target(self):
         # The API returns newest first. A long-expired claim whose target run

@@ -144,7 +144,7 @@ jobs:
           # Pinned: these files are executed by require()/python3; never leave
           # them on a mutable ref. Advance the pin only in the same PR that
           # changes them.
-          ref: b06bd207d8ff5ad079d14626eb10669c13d56435
+          ref: 2e4c77116194f13ca1f9928cd6e559224f698d91
           path: .continuum-watchdog-engine
           fetch-depth: 1
           persist-credentials: false
@@ -375,7 +375,8 @@ jobs:
                 for (const state of parseRecoveryStates(
                   comment.body || '', operation, generation
                 )) {
-                  all.push({ ...state, commentId: Number(comment.id || 0) });
+                  all.push({ ...state, commentId: Number(comment.id || 0),
+                    createdAt: Date.parse(comment.created_at || "") });
                 }
               }
               return all.length ? all[all.length - 1] : null;
@@ -697,93 +698,13 @@ jobs:
                 ' gen ' + String(generation);
             }
 
-            async function observeDispatchedRun({
-              target, notBefore, displayTitle, recoveryRunName, oldRunId,
-            }) {
-              // List-runs has no ascending sort and returns newest first.
-              // Bound both ends so newer dispatches cannot evict the target
-              // from the 1,000-result cap; unset timestamps use a recent floor.
-              const start = notBefore > 0
-                ? Math.max(0, notBefore - 5000)
-                : Date.now() - 300000;
-              const end = Math.max(start,
-                (notBefore > 0 ? notBefore : Date.now()) + 3600000);
-              const created = new Date(start).toISOString() + '..' +
-                new Date(end).toISOString();
-              let complete = false;
-              for (let attempt = 0; attempt < 10; attempt += 1) {
-                try {
-                  let runs = [];
-                  let totalCount = null;
-                  for (let page = 1; page <= 10; page += 1) {
-                    const { data } = await readGithub.rest.actions.listWorkflowRuns({
-                      owner, repo, workflow_id: target.workflowId,
-                      event: 'workflow_dispatch', created, per_page: 100, page,
-                    });
-                    if (page === 1) {
-                      const total = Number(data.total_count);
-                      totalCount = Number.isFinite(total) ? total : null;
-                    }
-                    const pageRuns = Array.isArray(data.workflow_runs)
-                      ? data.workflow_runs
-                      : [];
-                    runs = runs.concat(pageRuns);
-                    if (pageRuns.length < 100 || runs.length >= 1000) break;
-                  }
-                  const candidates = runs.filter(candidate => {
-                    if (Number(candidate.id) === Number(oldRunId || 0)) return false;
-                    if (candidate.event !== 'workflow_dispatch') return false;
-                    if (candidate.path && candidate.path !== target.path) return false;
-                    if (new Date(candidate.created_at || 0).getTime() + 5000 < notBefore) {
-                      return false;
-                    }
-                    return true;
-                  });
-                  const byTitle = title => title
-                    ? candidates.find(candidate =>
-                        candidate.display_title === title)
-                    : null;
-                  // Prefer the recovery identity embedded in run-name. Fall
-                  // back to the caller's mode/issue title and finally, only
-                  // when it is unambiguous, to the single new dispatch run. A
-                  // missing/unrelated display_title must never turn an
-                  // observable dispatch into an accepted-but-unowned one.
-                  const exact = byTitle(recoveryRunName);
-                  if (exact) return exact;
-                  // Exactly 1,000 results is complete; only a larger reported
-                  // total is truncated. Complete observations stay sticky
-                  // across retries.
-                  const truncated = totalCount === null
-                    ? runs.length >= 1000
-                    : totalCount > runs.length;
-                  if (truncated) {
-                    if (complete) return null;
-                    return { incomplete: true };
-                  }
-                  complete = true;
-                  let match = byTitle(displayTitle);
-                  if (!match) {
-                    const ordered = candidates.slice().sort((a, b) =>
-                      new Date(a.created_at || 0).getTime() -
-                        new Date(b.created_at || 0).getTime() ||
-                      Number(a.id || 0) - Number(b.id || 0)
-                    );
-                    if (ordered.length === 1) {
-                      match = ordered[0];
-                    }
-                  }
-                  if (match) return match;
-                } catch (err) {
-                  core.warning(
-                    'OpenCode 429 dispatch observation attempt failed for ' +
-                    target.path + ': ' + (err.message || err)
-                  );
-                }
-                if (attempt < 9) {
-                  await new Promise(resolve => setTimeout(resolve, 5000));
-                }
-              }
-              return complete ? null : { incomplete: true };
+            async function observeDispatchedRun(options) {
+              return dispatchRouting.observeDispatchedRun({
+                ...options, owner, repo,
+                listWorkflowRuns: params => readGithub.rest.actions.listWorkflowRuns(params),
+                warn: message => core.warning(message),
+                sleep: ms => new Promise(resolve => setTimeout(resolve, ms)),
+              });
             }
 
             // A recorded `observed` marker is an ownership fence only while
@@ -1759,11 +1680,19 @@ jobs:
                     'checking for an already accepted run (' +
                     (err.message || err) + ').'
                   );
+                  return;
                 }
-                if (observedTarget) {
+                if (!observedTarget) {
+                  core.warning('Cannot resolve previous dispatch target; keeping recovery claim.');
+                  return;
+                }
+                {
                   const recovered = await observeDispatchedRun({
                     target: observedTarget,
-                    notBefore: Math.max(0, previous.nextDue - 300) * 1000,
+                    notBefore: previous.nextDue > 0
+                      ? Math.max(0, previous.nextDue - 300) * 1000
+                      : previous.createdAt,
+                    adopting: true,
                     displayTitle,
                     recoveryRunName: recoveryTitle,
                     oldRunId: run && run.id,
