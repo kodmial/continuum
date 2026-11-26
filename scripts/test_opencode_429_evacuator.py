@@ -437,7 +437,11 @@ class ProductionEvacuatorTest(unittest.TestCase):
         steps = yaml.safe_load(WORKFLOW.read_text(encoding="utf-8"))["jobs"]["opencode"]["steps"]
         step = next(s for s in steps if s.get("name") == "Preserve restored issue checkpoint after pinned route quota 429")
         self.assertIn("steps.model_route.outcome == 'failure'", step["if"])
-        self.assertIn("steps.recovery_restore.outputs.resumed == 'true'", step["if"])
+        self.assertIn(
+            "(inputs.mode == 'issue' || needs.admit.outputs.route == 'issue')",
+            step["if"],
+        )
+        self.assertNotIn("steps.recovery_restore.outputs.resumed == 'true'", step["if"])
         # The guard reads with the scoped token; code pushes retain the
         # already-configured checkout credential, without new PAT bindings.
         self.assertEqual(step["env"]["GH_TOKEN"], "${{ github.token }}")
@@ -448,9 +452,11 @@ class ProductionEvacuatorTest(unittest.TestCase):
         env = dict(os.environ, PATH=str(self.bin) + os.pathsep + os.environ["PATH"],
                    RUNNER_TEMP=str(self.runner), GITHUB_ENV=str(self.github_env),
                    GITHUB_REPOSITORY="owner/repo", GITHUB_RUN_ID="400",
-                   ISSUE_NUMBER="350", RECOVERY_OPERATION_ID=operation,
+                   ISSUE_NUMBER="350", RECOVERY_RESUMED="true",
+                   RECOVERY_OPERATION_ID=operation,
                    RECOVERY_GENERATION_IN="1", RECOVERY_STAGE_IN="implementation-incomplete",
-                   CHECKPOINT_SHA=old_sha, OPENCODE_MODEL=model)
+                   CHECKPOINT_SHA=old_sha, CHECKPOINT_REF=first_ref,
+                   OPENCODE_MODEL=model)
         env.update(GIT_ENV)
         result = subprocess.run(["bash", "-c", step["run"]], cwd=fresh,
                                 env=env, capture_output=True, text=True, timeout=120)
@@ -463,6 +469,113 @@ class ProductionEvacuatorTest(unittest.TestCase):
         self.assertEqual(new_metadata["model"], model)
         self.assertEqual(new_metadata["generation"], 2)
         self.assertEqual(new_metadata["stage"], "implementation-incomplete")
+
+    def route_preservation_step(self):
+        import yaml
+        steps = yaml.safe_load(WORKFLOW.read_text(encoding="utf-8"))["jobs"]["opencode"]["steps"]
+        return next(s for s in steps if s.get("name") == "Preserve restored issue checkpoint after pinned route quota 429")
+
+    def route_preservation_env(self, **overrides):
+        env = dict(
+            os.environ,
+            PATH=str(self.bin) + os.pathsep + os.environ["PATH"],
+            RUNNER_TEMP=str(self.runner),
+            GITHUB_ENV=str(self.github_env),
+            GITHUB_REPOSITORY="owner/repo",
+            GITHUB_RUN_ID="400",
+            ISSUE_NUMBER="350",
+        )
+        env.update(overrides)
+        env.update(GIT_ENV)
+        return env
+
+    def prepare_route_probe_checkpoint(self, model=""):
+        completed = self.invoke(model=model)
+        self.assertEqual(completed.returncode, 75, completed.stdout + completed.stderr)
+        operation = "opencode-429-issue-issue350"
+        first_ref = "opencode/429-checkpoint-" + operation + "-gen-1"
+        old_sha = self.remote_ref_tips()["refs/heads/" + first_ref]
+        (self.runner / "continuum-opencode-429").touch()
+        shutil.copy(self.script, self.runner / "continuum-429-evacuate.sh")
+        return operation, first_ref, old_sha
+
+    def test_legacy_restored_checkpoint_without_model_still_evacuates(self):
+        operation, first_ref, old_sha = self.prepare_route_probe_checkpoint()
+        fresh = self.workdir / "legacy-restored"
+        subprocess.run(
+            ["git", "clone", str(self.origin), str(fresh)],
+            check=True, capture_output=True,
+        )
+        run_git(fresh, "fetch", "origin", first_ref)
+        run_git(fresh, "switch", "--detach", "FETCH_HEAD")
+        step = self.route_preservation_step()
+        env = self.route_preservation_env(
+            GITHUB_RUN_ID="401",
+            RECOVERY_RESUMED="true",
+            RECOVERY_OPERATION_ID=operation,
+            RECOVERY_GENERATION_IN="1",
+            RECOVERY_STAGE_IN="implementation-incomplete",
+            CHECKPOINT_SHA=old_sha,
+            CHECKPOINT_REF=first_ref,
+            OPENCODE_MODEL="",
+        )
+        result = subprocess.run(
+            ["bash", "-c", step["run"]], cwd=fresh, env=env,
+            capture_output=True, text=True, timeout=120,
+        )
+        self.assertEqual(result.returncode, 75, result.stdout + result.stderr)
+        new_ref = "opencode/429-checkpoint-" + operation + "-gen-2"
+        tips = self.remote_ref_tips()
+        self.assertEqual(tips["refs/heads/" + first_ref], old_sha)
+        self.assertIn("refs/heads/" + new_ref, tips)
+        new_metadata = json.loads(
+            run_git(fresh, "show", "HEAD:.continuum-429-recovery.json")
+        )
+        self.assertEqual(new_metadata["model"], "")
+        self.assertEqual(new_metadata["generation"], 2)
+        self.assertEqual(new_metadata["stage"], "implementation-incomplete")
+
+    def test_manual_issue_checkpoint_discovery_evacuates_without_resume(self):
+        model = "opencode/example-free"
+        operation, first_ref, old_sha = self.prepare_route_probe_checkpoint(
+            model=model
+        )
+        run_git(
+            self.repo, "push", "origin",
+            "{}:refs/heads/opencode/checkpoint-issue350".format(old_sha),
+        )
+        fresh = self.workdir / "manual-discovery"
+        subprocess.run(
+            ["git", "clone", str(self.origin), str(fresh)],
+            check=True, capture_output=True,
+        )
+        step = self.route_preservation_step()
+        env = self.route_preservation_env(
+            GITHUB_RUN_ID="402",
+            RECOVERY_RESUMED="",
+            RECOVERY_OPERATION_ID="",
+            RECOVERY_GENERATION_IN="",
+            RECOVERY_STAGE_IN="",
+            CHECKPOINT_SHA="",
+            CHECKPOINT_REF="",
+            OPENCODE_MODEL=model,
+        )
+        result = subprocess.run(
+            ["bash", "-c", step["run"]], cwd=fresh, env=env,
+            capture_output=True, text=True, timeout=120,
+        )
+        self.assertEqual(result.returncode, 75, result.stdout + result.stderr)
+        new_ref = "opencode/429-checkpoint-" + operation + "-gen-2"
+        tips = self.remote_ref_tips()
+        self.assertEqual(tips["refs/heads/" + first_ref], old_sha)
+        self.assertIn("refs/heads/" + new_ref, tips)
+        new_metadata = json.loads(
+            run_git(fresh, "show", "HEAD:.continuum-429-recovery.json")
+        )
+        self.assertEqual(new_metadata["model"], model)
+        self.assertEqual(new_metadata["generation"], 2)
+        self.assertEqual(new_metadata["stage"], "implementation-incomplete")
+        self.assertEqual(new_metadata["checkpoint_ref"], new_ref)
 
     def test_provider_429_fresh_runner_handoff_preserves_provenance(self):
         from continuum.opencode_429_recovery import is_opencode_429

@@ -258,6 +258,23 @@ class WatchdogContractTest(unittest.TestCase):
         self.assertIn("identity.failure_kind === 'quota_429'", recovery)
         self.assertNotIn("nextDue: now + backoffDue", recovery)
         self.assertNotIn("const backoffSchedule =", recovery)
+        # The terminal cap belongs only to the upstream-unavailable namespace.
+        # Quota generations beyond the fast budget must reach the durable
+        # backoff branch and never record owner-action-required there.
+        self.assertLess(
+            recovery.index(
+                "checkpointRef.startsWith('opencode/infra-checkpoint-')"
+            ),
+            recovery.index("state: 'owner-action-required'"),
+            "owner-action-required must be guarded by the infra namespace",
+        )
+        quota = recovery[
+            recovery.index("const durableGeneration = quota"):
+            recovery.index("const attempt = (previous ? previous.attempt : 0) + 1;")
+        ]
+        self.assertIn("detail: 'durable-backoff'", quota)
+        self.assertNotIn("owner-action-required", quota)
+        self.assertNotIn("generation-exhausted", quota)
 
     def test_pre_dispatch_claim_fences_concurrent_recovery(self):
         recovery = self.body.split("async function recoverFrom429OnFreshVm")[-1]

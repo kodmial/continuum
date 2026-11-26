@@ -1682,7 +1682,11 @@ jobs:
                   if (!issue || issue.state !== 'open' || issue.pull_request ||
                       !Array.isArray(issue.labels)) return;
                   const liveLabels = issueLabelNames(issue);
-                  const holdLabels = [pausedLabel, blockedLabel, qualifyingLabel, noAutoMergeLabel]
+                  // Only explicit operator holds are terminal here. A
+                  // qualifying or no-auto-merge label is transient workflow
+                  // state; treating it as a hold would stall a quota
+                  // generation whose reservation remains pending.
+                  const holdLabels = [pausedLabel, blockedLabel]
                     .filter(label => liveLabels.has(label));
                   if (holdLabels.length) {
                     core.notice('Quota recovery held by ' + holdLabels.join(', '));

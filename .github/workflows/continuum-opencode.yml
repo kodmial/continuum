@@ -3336,38 +3336,112 @@ jobs:
           timeout: ${{ vars.OPENCODE_PROBE_TIMEOUT || '90' }}
 
       # A fresh runner can receive its next quota 429 during the route probe,
-      # before the issue-coder step. Preserve the exact already-restored code
-      # and pinned model instead of letting the ordinary no-PR retry own it.
+      # before the issue-coder step. Preserve the exact checkpoint instead of
+      # letting the ordinary no-PR retry own it. This includes a legacy
+      # checkpoint with no bound model and a manually discovered legacy mirror,
+      # neither of which has a resumed restore or a pinned model.
       - name: Preserve restored issue checkpoint after pinned route quota 429
         if: >-
           failure() &&
           steps.model_route.outcome == 'failure' &&
-          steps.recovery_restore.outputs.resumed == 'true' &&
+          (inputs.mode == 'issue' || needs.admit.outputs.route == 'issue') &&
           steps.recovery_restore.outputs.skip_opencode != 'true' &&
-          steps.recovery_model.outputs.model != '' &&
-          steps.duplicate_guard.outputs.skip != 'true' &&
-          inputs.mode == 'issue'
+          steps.duplicate_guard.outputs.skip != 'true'
         env:
           # Read-only default-branch lookup; git retains checkout PAT for the push.
           GH_TOKEN: ${{ github.token }}
           OPENCODE_MODEL: ${{ steps.recovery_model.outputs.model }}
-          ISSUE_NUMBER: ${{ inputs.issue_number }}
+          ISSUE_NUMBER: ${{ inputs.issue_number || github.event.issue.number }}
+          RECOVERY_RESUMED: ${{ steps.recovery_restore.outputs.resumed }}
           RECOVERY_OPERATION_ID: ${{ steps.recovery_restore.outputs.operation_id }}
           RECOVERY_GENERATION_IN: ${{ steps.recovery_restore.outputs.generation }}
           RECOVERY_STAGE_IN: ${{ steps.recovery_restore.outputs.stage }}
           CHECKPOINT_SHA: ${{ steps.recovery_restore.outputs.checkpoint_sha }}
+          CHECKPOINT_REF: ${{ steps.recovery_restore.outputs.checkpoint_ref }}
         run: |
           set -euo pipefail
           # The route engine writes this only for an actual provider quota 429;
           # configuration, unavailable routes, and GitHub limits do not qualify.
           [[ -f "${RUNNER_TEMP:-/tmp}/continuum-opencode-429" ]] || exit 0
-          [[ "$ISSUE_NUMBER" =~ ^[1-9][0-9]*$ && "$(git rev-parse HEAD)" == "$CHECKPOINT_SHA" ]]
-          base_sha="$(git show "$CHECKPOINT_SHA:.continuum-429-recovery.json" | python3 -c 'import json,sys; print(json.load(sys.stdin)["base_sha"])')"
+          [[ "$ISSUE_NUMBER" =~ ^[1-9][0-9]*$ ]]
+          operation="${RECOVERY_OPERATION_ID:-}"
+          generation="${RECOVERY_GENERATION_IN:-}"
+          stage="${RECOVERY_STAGE_IN:-}"
+          checkpoint_ref="${CHECKPOINT_REF:-}"
+          checkpoint_sha="${CHECKPOINT_SHA:-}"
+          base_sha=""
+          if [[ "${RECOVERY_RESUMED:-}" == "true" ]]; then
+            [[ -n "$operation" && -n "$generation" && -n "$stage" && -n "$checkpoint_ref" && -n "$checkpoint_sha" ]]
+            base_sha="$(git show "$checkpoint_sha:.continuum-429-recovery.json" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("base_sha") or "")')"
+          else
+            # A manual issue dispatch discovers the legacy mirror after
+            # admission, so no restore step ran. A legacy checkpoint may have
+            # no bound model; its workflow-owned quota identity is still enough
+            # to preserve the saved work for the next durable generation.
+            mirror_ref="opencode/checkpoint-issue${ISSUE_NUMBER}"
+            if ! git fetch --no-tags origin "+refs/heads/${mirror_ref}:refs/remotes/origin/${mirror_ref}" --quiet 2>/dev/null; then
+              echo "::notice::No legacy issue checkpoint is discoverable; no route-probe evacuation."
+              exit 0
+            fi
+            mirror_sha="$(git rev-parse "refs/remotes/origin/${mirror_ref}")"
+            if ! metadata="$(git show "$mirror_sha:.continuum-429-recovery.json" 2>/dev/null)"; then
+              echo "::notice::Legacy issue checkpoint has no recovery metadata; no route-probe evacuation."
+              exit 0
+            fi
+            identity="$(MIRROR_METADATA="$metadata" python3 - <<'PY'
+          import json, os, re
+          d = json.loads(os.environ["MIRROR_METADATA"])
+          issue = os.environ["ISSUE_NUMBER"]
+          op = "opencode-429-issue-issue" + issue
+          gen = str(d.get("generation") or "")
+          ref = str(d.get("checkpoint_ref") or "")
+          stage = str(d.get("stage") or "")
+          base = str(d.get("base_sha") or "")
+          allowed_stages = {
+              "implementation-incomplete", "implementation-complete",
+              "tests-running", "tests-passed", "publish-pr",
+          }
+          if (d.get("schema_version") != 1 or d.get("repository") != os.environ["GITHUB_REPOSITORY"]
+              or d.get("failure_kind") != "quota_429"
+              or d.get("mode") != "issue" or str(d.get("issue_number")) != issue
+              or d.get("operation_id") != op or not re.fullmatch(r"[1-9][0-9]*", gen)
+              or ref != "opencode/429-checkpoint-" + op + "-gen-" + gen
+              or stage not in allowed_stages
+              or not re.fullmatch(r"[0-9a-f]{40}", base)):
+              raise SystemExit(1)
+          print(op)
+          print(gen)
+          print(stage)
+          print(ref)
+          print(base)
+          PY
+            )" || {
+              echo "::notice::Legacy issue checkpoint is not a trusted quota checkpoint; no route-probe evacuation."
+              exit 0
+            }
+            { read -r operation; read -r generation; read -r stage; read -r checkpoint_ref; read -r base_sha; } <<< "$identity"
+            if ! git fetch --no-tags origin "$checkpoint_ref" --quiet 2>/dev/null; then
+              echo "::warning::Durable quota checkpoint $checkpoint_ref is unavailable; no route-probe evacuation."
+              exit 0
+            fi
+            [[ "$(git rev-parse FETCH_HEAD)" == "$mirror_sha" ]] || {
+              echo "::error::Legacy checkpoint mirror does not match durable quota checkpoint $checkpoint_ref."
+              exit 1
+            }
+            checkpoint_sha="$mirror_sha"
+          fi
           [[ "$base_sha" =~ ^[0-9a-f]{40}$ ]]
+          # The route probe runs before the issue step; a manual dispatch is
+          # still on its base branch. Restore the exact checkpoint content
+          # before evacuating so no saved work is lost.
+          if [[ "$(git rev-parse HEAD)" != "$checkpoint_sha" ]]; then
+            git switch --detach "$checkpoint_sha"
+          fi
           git switch -c "opencode/issue${ISSUE_NUMBER}-${GITHUB_RUN_ID}"
+          export RECOVERY_GENERATION_IN="$generation"
           export CONTINUUM_429_LEGACY_REF="opencode/checkpoint-issue${ISSUE_NUMBER}"
           source "${RUNNER_TEMP:-/tmp}/continuum-429-evacuate.sh"
-          continuum_infra_evacuate "$RECOVERY_OPERATION_ID" "$RECOVERY_STAGE_IN" issue "$ISSUE_NUMBER" "" "$base_sha" quota_429
+          continuum_infra_evacuate "$operation" "$stage" issue "$ISSUE_NUMBER" "" "$base_sha" quota_429
 
       - name: Run OpenCode
         if: >-

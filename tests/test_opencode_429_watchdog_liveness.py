@@ -1096,6 +1096,18 @@ class WatchdogHarness(unittest.TestCase):
             scenario["issues"] = [{"number": 382, "state": "open", "labels": [{"name": hold}]}]
             self.assert_no_dispatch(self.run_scenario(scenario))
 
+    def test_quota_recovery_ignores_transient_qualifying_and_no_auto_merge_labels(self):
+        # Qualifying and no-auto-merge are workflow state, not operator STOPs.
+        # A quota generation whose reservation stays pending must still resume.
+        for label in ("automation:qualifying", "no-auto-merge"):
+            with self.subTest(label=label):
+                scenario = base_scenario()
+                scenario["issues"] = [
+                    {"number": 382, "state": "open", "labels": [{"name": label}]}
+                ]
+                result = self.run_scenario(scenario)
+                self.assert_one_current_dispatch(result, NEW_SHA)
+
     def test_non_quota_checkpoint_cannot_use_quota_dispatch(self):
         scenario = self.generation_exhausted_scenario(next_due=1)
         scenario["checkpoint"]["metadata"]["failure_kind"] = "unavailable"

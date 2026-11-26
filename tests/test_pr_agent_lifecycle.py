@@ -409,9 +409,11 @@ APPROVED_459_469_MERGED_OPENCODE_SHA256 = (
     "46b0e0bdf21022aaaf4a62ed3d8dc8fbd64de7bd0a60e68a7fcbc6e608ee65c3"
 )
 # #496 recovery candidate: advance only the exact full-file artifact.
-# Independent PR review and exact-HEAD validation remain required before merge.
+# The pin includes the reviewed legacy/manual route-probe preservation and the
+# narrowed quota holds. Independent PR review and exact-HEAD validation remain
+# required before merge.
 RECOVERY_496_OPENCODE_SHA256 = (
-    "285c191e08219b535fa44e7056ac8376e4a6f292c56cc92c4f0e95ab02e4428b"
+    "1a1c00bac3370ea79ec492d6f73dbfeca51740fad3d8f20edc7a6066315ad9fb"
 )
 # The prior #460 resume pin stays for audit; any further byte drift still
 # fails closed.
