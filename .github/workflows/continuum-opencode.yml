@@ -1146,10 +1146,11 @@ jobs:
           # the operation/stage/generation/ref or references a code commit
           # outside this checkpoint history.
           RECOVERY_METADATA_FILE="${RUNNER_TEMP:-/tmp}/continuum-429-recovery-checkpoint.json"
+          RECOVERY_MODEL_FILE="${RUNNER_TEMP:-/tmp}/continuum-429-recovery-model"
           git show "FETCH_HEAD:.continuum-429-recovery.json" > "$RECOVERY_METADATA_FILE" 2>/dev/null || {
             echo "::error::429 recovery checkpoint has no recovery metadata"; exit 1;
           }
-          RECOVERY_METADATA_FILE="$RECOVERY_METADATA_FILE" python3 - <<'PY'
+          RECOVERY_METADATA_FILE="$RECOVERY_METADATA_FILE" RECOVERY_MODEL_FILE="$RECOVERY_MODEL_FILE" python3 - <<'PY'
           import json, os, re, subprocess, sys
           path = os.environ["RECOVERY_METADATA_FILE"]
           try:
@@ -1186,6 +1187,19 @@ jobs:
               raise SystemExit("::error::429 recovery metadata head SHA is malformed")
           if not required("head_ref"):
               raise SystemExit("::error::429 recovery metadata head ref is empty")
+          model = str(data.get("model") or "").strip()
+          if model and not re.fullmatch(
+              r"[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._/-]{0,120}", model
+          ):
+              raise SystemExit("::error::429 recovery metadata model is malformed")
+          for field in ("not_before", "retry_after_seconds"):
+              value = str(data.get(field) or "").strip()
+              if value and not value.isdigit():
+                  raise SystemExit(
+                      "::error::429 recovery metadata {} is malformed".format(field)
+                  )
+          with open(os.environ["RECOVERY_MODEL_FILE"], "w", encoding="utf-8") as handle:
+              handle.write(model if data.get("failure_kind") == "quota_429" else "")
           ancestor = subprocess.run(
               ["git", "merge-base", "--is-ancestor", head_sha, "FETCH_HEAD"],
               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
@@ -1194,6 +1208,7 @@ jobs:
               raise SystemExit("::error::429 recovery metadata head SHA is outside the checkpoint history")
           print("Validated 429 recovery metadata for {} generation {} stage {}".format(operation, generation, stage))
           PY
+          CHECKPOINT_MODEL="$(cat "$RECOVERY_MODEL_FILE" 2>/dev/null || true)"
           git switch --detach FETCH_HEAD
           # kodmial/continuum#290: drop any stage-progress file carried by
           # the checkpoint. The dispatch recovery_stage above is
@@ -1208,6 +1223,7 @@ jobs:
             echo "operation_id=$RECOVERY_OPERATION_ID"
             echo "generation=${RECOVERY_GENERATION:-0}"
             echo "stage=${RECOVERY_STAGE:-implementation-incomplete}"
+            echo "model=$CHECKPOINT_MODEL"
             case "${RECOVERY_STAGE:-implementation-incomplete}" in
               tests-passed|publish-pr) echo "skip_opencode=true" ;;
               *) echo "skip_opencode=false" ;;
@@ -2983,6 +2999,13 @@ jobs:
               raise SystemExit("metadata head SHA is malformed")
           if not str(data.get("head_ref") or "").strip():
               raise SystemExit("metadata head ref is empty")
+          model = str(data.get("model") or "").strip()
+          if model and not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._/-]{0,120}", model):
+              raise SystemExit("metadata model is malformed")
+          for field in ("not_before", "retry_after_seconds"):
+              value = str(data.get(field) or "").strip()
+              if value and not value.isdigit():
+                  raise SystemExit("metadata {} is malformed".format(field))
           PY
           }
           continuum_infra_evacuate() {
@@ -3053,8 +3076,13 @@ jobs:
             # `|| true`, so the checkpoint ref was pushed without the
             # identity file. Never mask this failure again.
             if ! metadata_error="$(CONTINUUM_INFRA_FAILURE_KIND="$failure_kind" CONTINUUM_429_CHECKPOINT_REF="$checkpoint_ref" python3 - "$metadata" "$operation" "$next_gen" "$stage" "$mode" "$issue_number" "$pr_number" "$base_sha" "$code_head_sha" "$current_branch" <<'PY' 2>&1
-          import json, os, sys
+          import json, os, sys, time
           path, operation, gen, stage, mode, issue, pr, base, head, branch = sys.argv[1:11]
+          quota = os.environ.get("CONTINUUM_INFRA_FAILURE_KIND") == "quota_429"
+          retry_after = os.environ.get("CONTINUUM_429_RETRY_AFTER_SECONDS", "") if quota else ""
+          not_before = (os.environ.get("CONTINUUM_429_NOT_BEFORE_EPOCH", "") or os.environ.get("CONTINUUM_MODEL_NOT_BEFORE_EPOCH", "")) if quota else ""
+          if retry_after:
+              not_before = str(max(int(not_before or 0), int(time.time()) + int(retry_after)))
           with open(path, "w", encoding="utf-8") as handle:
               json.dump({
                   "schema_version": 1,
@@ -3067,6 +3095,12 @@ jobs:
                   "mode": mode,
                   "issue_number": issue,
                   "pr_number": pr,
+                  "model": os.environ.get("OPENCODE_MODEL", "") if os.environ.get("CONTINUUM_INFRA_FAILURE_KIND") == "quota_429" else "",
+                  # Optional provider-required wait evidence. Never invented:
+                  # these are only forwarded when the workflow environment
+                  # carries an explicit value.
+                  "not_before": not_before,
+                  "retry_after_seconds": retry_after,
                   "head_ref": os.environ.get("HEAD_REF", "") or branch,
                   "review_id": os.environ.get("REVIEW_ID", ""),
                   # Preserve the exact CodeRabbit finding batch across 429
@@ -3197,6 +3231,79 @@ jobs:
           chmod +x "$helper"
           echo "Installed 429 checkpoint evacuator at $helper."
 
+      # Pin a confirmed quota-429 checkpoint model before routing. Older
+      # checkpoint metadata may lack this field; one normal approved selection
+      # is then unavoidable and the next evacuation saves the effective model.
+      - name: Resolve trusted 429 checkpoint model
+        id: recovery_model
+        if: >-
+          steps.issue_readiness.outputs.ready != 'false' &&
+          steps.recovery_restore.outputs.skip_opencode != 'true' &&
+          steps.duplicate_guard.outputs.skip != 'true'
+        env:
+          RECOVERY_MODEL: ${{ steps.recovery_restore.outputs.model }}
+          RECOVERY_RESUMED: ${{ steps.recovery_restore.outputs.resumed }}
+          ISSUE_NUMBER: ${{ inputs.issue_number || github.event.issue.number }}
+          DISPATCH_MODE: ${{ inputs.mode }}
+          ADMITTED_ROUTE: ${{ needs.admit.outputs.route }}
+          TRUSTED_MODEL_POOL: ${{ vars.OPENCODE_MODELS }}
+          TRUSTED_LEGACY_MODEL: ${{ vars.OPENCODE_MODEL }}
+        run: |
+          set -euo pipefail
+          model="${RECOVERY_MODEL:-}"
+          if [[ "${RECOVERY_RESUMED:-}" != "true" ]] &&
+             [[ "${DISPATCH_MODE:-}" == "issue" || "${ADMITTED_ROUTE:-}" == "issue" ]] &&
+             [[ "${ISSUE_NUMBER:-}" =~ ^[1-9][0-9]*$ ]]; then
+            branch="opencode/checkpoint-issue${ISSUE_NUMBER}"
+            if git fetch --no-tags origin "+refs/heads/${branch}:refs/remotes/origin/${branch}" --quiet 2>/dev/null; then
+              mirror_sha="$(git rev-parse "refs/remotes/origin/${branch}")"
+              if metadata="$(git show "$mirror_sha:.continuum-429-recovery.json" 2>/dev/null)"; then
+                # Only a workflow-owned, matching quota checkpoint may pin a
+                # model. A legacy checkpoint without a model is compatible.
+                model="$(printf '%s' "$metadata" | python3 -c '
+          import json, os, re, sys
+          d = json.load(sys.stdin)
+          issue = os.environ["ISSUE_NUMBER"]
+          if d.get("failure_kind") != "quota_429":
+              sys.exit(0)
+          model = str(d.get("model") or "")
+          if not model:
+              sys.exit(0)
+          op = "opencode-429-issue-issue" + issue
+          gen = str(d.get("generation") or "")
+          ref = str(d.get("checkpoint_ref") or "")
+          if (d.get("schema_version") != 1 or d.get("repository") != os.environ["GITHUB_REPOSITORY"]
+              or d.get("mode") != "issue" or str(d.get("issue_number")) != issue
+              or d.get("operation_id") != op or not re.fullmatch(r"[1-9][0-9]*", gen)
+              or ref != "opencode/429-checkpoint-" + op + "-gen-" + gen):
+              sys.exit("Untrusted checkpoint model identity")
+          print(model)
+          ')"
+                if [[ -n "$model" ]]; then
+                  durable_ref="$(printf '%s' "$metadata" | python3 -c 'import json,sys; print(json.load(sys.stdin)["checkpoint_ref"])')"
+                  git fetch --no-tags origin "$durable_ref" --quiet
+                  [[ "$(git rev-parse FETCH_HEAD)" == "$mirror_sha" ]] || {
+                    echo "::error::Checkpoint model mirror does not match the durable SHA."
+                    exit 1
+                  }
+                fi
+              fi
+            fi
+          fi
+          if [[ -n "$model" ]]; then
+            CHECKPOINT_MODEL="$model" python3 - <<'PYMODEL'
+          import os, re
+          model = os.environ["CHECKPOINT_MODEL"]
+          raw = os.environ["TRUSTED_MODEL_POOL"]
+          allowed = [v.strip() for v in raw.split(",")] if raw else [os.environ["TRUSTED_LEGACY_MODEL"].strip()]
+          if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._/-]{0,120}", model) or model not in allowed:
+              raise SystemExit("::error::Checkpoint model is malformed or no longer in the approved model pool.")
+          PYMODEL
+          elif [[ "${RECOVERY_RESUMED:-}" == "true" || -n "${mirror_sha:-}" ]]; then
+            echo "::notice::Legacy checkpoint has no bound quota model; selecting once from the approved pool."
+          fi
+          echo "model=$model" >> "$GITHUB_OUTPUT"
+
       # Interactive OpenCode remains available for PR/review comments. A /oc
       # comment on a plain issue is an implementation command and is routed
       # through the deterministic issue-mode contract below instead of letting
@@ -3218,6 +3325,7 @@ jobs:
         with:
           models: ${{ vars.OPENCODE_MODELS }}
           legacy-model: ${{ vars.OPENCODE_MODEL }}
+          explicit-pin: ${{ steps.recovery_model.outputs.model }}
           task-class: coder
           profile: ${{ inputs.mode || 'interactive' }}
           state-token: ${{ secrets.TAP_PAT }}
@@ -3226,6 +3334,114 @@ jobs:
           probe-ttl: ${{ vars.OPENCODE_PROBE_TTL || '3600' }}
           cooldown: ${{ vars.OPENCODE_MODEL_COOLDOWN || '900' }}
           timeout: ${{ vars.OPENCODE_PROBE_TIMEOUT || '90' }}
+
+      # A fresh runner can receive its next quota 429 during the route probe,
+      # before the issue-coder step. Preserve the exact checkpoint instead of
+      # letting the ordinary no-PR retry own it. This includes a legacy
+      # checkpoint with no bound model and a manually discovered legacy mirror,
+      # neither of which has a resumed restore or a pinned model.
+      - name: Preserve restored issue checkpoint after pinned route quota 429
+        if: >-
+          failure() &&
+          steps.model_route.outcome == 'failure' &&
+          (inputs.mode == 'issue' || needs.admit.outputs.route == 'issue') &&
+          steps.recovery_restore.outputs.skip_opencode != 'true' &&
+          steps.duplicate_guard.outputs.skip != 'true'
+        env:
+          # Read-only default-branch lookup; git retains checkout PAT for the push.
+          GH_TOKEN: ${{ github.token }}
+          OPENCODE_MODEL: ${{ steps.recovery_model.outputs.model }}
+          ISSUE_NUMBER: ${{ inputs.issue_number || github.event.issue.number }}
+          RECOVERY_RESUMED: ${{ steps.recovery_restore.outputs.resumed }}
+          RECOVERY_OPERATION_ID: ${{ steps.recovery_restore.outputs.operation_id }}
+          RECOVERY_GENERATION_IN: ${{ steps.recovery_restore.outputs.generation }}
+          RECOVERY_STAGE_IN: ${{ steps.recovery_restore.outputs.stage }}
+          CHECKPOINT_SHA: ${{ steps.recovery_restore.outputs.checkpoint_sha }}
+          CHECKPOINT_REF: ${{ steps.recovery_restore.outputs.checkpoint_ref }}
+        run: |
+          set -euo pipefail
+          # The route engine writes this only for an actual provider quota 429;
+          # configuration, unavailable routes, and GitHub limits do not qualify.
+          [[ -f "${RUNNER_TEMP:-/tmp}/continuum-opencode-429" ]] || exit 0
+          [[ "$ISSUE_NUMBER" =~ ^[1-9][0-9]*$ ]]
+          operation="${RECOVERY_OPERATION_ID:-}"
+          generation="${RECOVERY_GENERATION_IN:-}"
+          stage="${RECOVERY_STAGE_IN:-}"
+          checkpoint_ref="${CHECKPOINT_REF:-}"
+          checkpoint_sha="${CHECKPOINT_SHA:-}"
+          base_sha=""
+          if [[ "${RECOVERY_RESUMED:-}" == "true" ]]; then
+            [[ -n "$operation" && -n "$generation" && -n "$stage" && -n "$checkpoint_ref" && -n "$checkpoint_sha" ]]
+            base_sha="$(git show "$checkpoint_sha:.continuum-429-recovery.json" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("base_sha") or "")')"
+          else
+            # A manual issue dispatch discovers the legacy mirror after
+            # admission, so no restore step ran. A legacy checkpoint may have
+            # no bound model; its workflow-owned quota identity is still enough
+            # to preserve the saved work for the next durable generation.
+            mirror_ref="opencode/checkpoint-issue${ISSUE_NUMBER}"
+            if ! git fetch --no-tags origin "+refs/heads/${mirror_ref}:refs/remotes/origin/${mirror_ref}" --quiet 2>/dev/null; then
+              echo "::notice::No legacy issue checkpoint is discoverable; no route-probe evacuation."
+              exit 0
+            fi
+            mirror_sha="$(git rev-parse "refs/remotes/origin/${mirror_ref}")"
+            if ! metadata="$(git show "$mirror_sha:.continuum-429-recovery.json" 2>/dev/null)"; then
+              echo "::notice::Legacy issue checkpoint has no recovery metadata; no route-probe evacuation."
+              exit 0
+            fi
+            identity="$(MIRROR_METADATA="$metadata" python3 - <<'PY'
+          import json, os, re
+          d = json.loads(os.environ["MIRROR_METADATA"])
+          issue = os.environ["ISSUE_NUMBER"]
+          op = "opencode-429-issue-issue" + issue
+          gen = str(d.get("generation") or "")
+          ref = str(d.get("checkpoint_ref") or "")
+          stage = str(d.get("stage") or "")
+          base = str(d.get("base_sha") or "")
+          allowed_stages = {
+              "implementation-incomplete", "implementation-complete",
+              "tests-running", "tests-passed", "publish-pr",
+          }
+          if (d.get("schema_version") != 1 or d.get("repository") != os.environ["GITHUB_REPOSITORY"]
+              or d.get("failure_kind") != "quota_429"
+              or d.get("mode") != "issue" or str(d.get("issue_number")) != issue
+              or d.get("operation_id") != op or not re.fullmatch(r"[1-9][0-9]*", gen)
+              or ref != "opencode/429-checkpoint-" + op + "-gen-" + gen
+              or stage not in allowed_stages
+              or not re.fullmatch(r"[0-9a-f]{40}", base)):
+              raise SystemExit(1)
+          print(op)
+          print(gen)
+          print(stage)
+          print(ref)
+          print(base)
+          PY
+            )" || {
+              echo "::notice::Legacy issue checkpoint is not a trusted quota checkpoint; no route-probe evacuation."
+              exit 0
+            }
+            { read -r operation; read -r generation; read -r stage; read -r checkpoint_ref; read -r base_sha; } <<< "$identity"
+            if ! git fetch --no-tags origin "$checkpoint_ref" --quiet 2>/dev/null; then
+              echo "::warning::Durable quota checkpoint $checkpoint_ref is unavailable; no route-probe evacuation."
+              exit 0
+            fi
+            [[ "$(git rev-parse FETCH_HEAD)" == "$mirror_sha" ]] || {
+              echo "::error::Legacy checkpoint mirror does not match durable quota checkpoint $checkpoint_ref."
+              exit 1
+            }
+            checkpoint_sha="$mirror_sha"
+          fi
+          [[ "$base_sha" =~ ^[0-9a-f]{40}$ ]]
+          # The route probe runs before the issue step; a manual dispatch is
+          # still on its base branch. Restore the exact checkpoint content
+          # before evacuating so no saved work is lost.
+          if [[ "$(git rev-parse HEAD)" != "$checkpoint_sha" ]]; then
+            git switch --detach "$checkpoint_sha"
+          fi
+          git switch -c "opencode/issue${ISSUE_NUMBER}-${GITHUB_RUN_ID}"
+          export RECOVERY_GENERATION_IN="$generation"
+          export CONTINUUM_429_LEGACY_REF="opencode/checkpoint-issue${ISSUE_NUMBER}"
+          source "${RUNNER_TEMP:-/tmp}/continuum-429-evacuate.sh"
+          continuum_infra_evacuate "$operation" "$stage" issue "$ISSUE_NUMBER" "" "$base_sha" quota_429
 
       - name: Run OpenCode
         if: >-
@@ -3695,6 +3911,16 @@ jobs:
           else
             git switch --detach "origin/$BASE_REF"
             git switch -c "$BRANCH"
+          fi
+
+          if [[ "$RESUME_ACTIVE" == "true" ]]; then
+            # The manual mirror may have advanced between route selection and
+            # checkout. Never call the agent with a mismatched pinned model.
+            ACTUAL_MODEL="$(git show "$RESUME_CHECKPOINT_SHA:.continuum-429-recovery.json" 2>/dev/null | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d.get("model") or "" if d.get("failure_kind")=="quota_429" else "")' 2>/dev/null || true)"
+            if [[ -n "$ACTUAL_MODEL" && "$ACTUAL_MODEL" != "$OPENCODE_MODEL" ]]; then
+              echo "::error::Selected model does not match the exact resumed checkpoint."
+              exit 1
+            fi
           fi
 
           # kodmial/continuum#460: a resumed checkpoint is only current while
