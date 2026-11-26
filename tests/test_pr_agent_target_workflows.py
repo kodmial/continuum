@@ -655,6 +655,177 @@ class PrAgentTargetWorkflowContractTests(unittest.TestCase):
         repair = read(".github/workflows/continuum-pr-agent-repair.yml")
         self.assertIn("target_child_id:", repair)
 
+    def test_recovery_delegated_conflict_admission_precedes_exact_head_ci_gate(self):
+        body = read(".github/workflows/continuum-pr-agent-recovery.yml")
+        admission = body.index("if (await maybeAdmitDelegatedConflict(pr, head))")
+        ci_gate = body.index("const ciGreen = await scanCiGreen(head);")
+        self.assertLess(
+            admission,
+            ci_gate,
+            "delegated conflict admission must run before the ordinary CI gate",
+        )
+        self.assertIn("if (!delegatedTarget) return false;", body)
+        # The open-PR list is only a discovery hint; mergeability is re-read
+        # through pulls.get on the resolved opaque target.
+        collect = body[
+            body.index("async function collectConflictState"):
+            body.index("async function ensureConflictLock")
+        ]
+        self.assertIn("client.rest.pulls.get(", collect)
+        self.assertIn("pull_number: prNumber", collect)
+        self.assertIn(
+            "isConflictedMergeability(fresh.mergeable, fresh.mergeable_state) !== true",
+            collect,
+        )
+        decision = body[
+            body.index("function decideDelegatedConflict("):
+            body.index("// Admission for the clean-review")
+        ]
+        for needle in (
+            "if (!delegated)",
+            "mergeability is still being computed",
+            "fresh.state !== 'open'",
+            "fresh.merged",
+            "fresh.draft",
+            "freshHead !== String(head || '').toLowerCase()",
+            "freshRepo !== targetRepository",
+            "explicit no-auto-merge hold is present",
+            "a conflict repair is already active",
+            "conflict repair recorded no progress for this HEAD",
+            "bounded conflict repair budget exhausted for this HEAD",
+        ):
+            with self.subTest(needle=needle):
+                self.assertIn(needle, decision)
+        dispatch = body[
+            body.index("async function dispatchDelegatedConflict"):
+            body.index("async function maybeAdmitDelegatedConflict")
+        ]
+        for needle in (
+            "mode: 'conflict'",
+            "head_sha: head",
+            "target_child_id",
+            "workflow_id: repairWorkflow",
+            "owner: executionOwner",
+            "repo: executionRepo",
+            "createWorkflowDispatch",
+        ):
+            with self.subTest(needle=needle):
+                self.assertIn(needle, dispatch)
+        self.assertNotIn("mode: 'repair'", dispatch)
+        self.assertNotIn("target_repository:", dispatch)
+
+    def test_repair_conflict_retry_stays_in_conflict_mode_without_ci(self):
+        body = read(".github/workflows/continuum-pr-agent-repair.yml")
+        start = body.index(
+            "Schedule bounded retry for retryable PR-Agent repair failure"
+        )
+        next_step = body.find("\n      - name: ", start + 1)
+        retry = body[start:] if next_step < 0 else body[start:next_step]
+        self.assertIn('MODE_LOWER="$(printf', retry)
+        conflict_branch = retry.index('if [[ "$MODE_LOWER" == "conflict" ]]')
+        ci_revalidation = retry.index("actions/runs?event=pull_request")
+        self.assertLess(
+            conflict_branch,
+            ci_revalidation,
+            "conflict mode must branch before the ordinary CI revalidation",
+        )
+        self.assertIn("CONFLICT_RETRY_WORKFLOW=", retry)
+        self.assertIn("-f mode=conflict", retry)
+        self.assertIn('-f head_sha="$HEAD_SHA"', retry)
+        self.assertIn('-f retry_attempt="$next"', retry)
+        self.assertIn(
+            'gh api --method DELETE "repos/$CONTINUUM_PR_AGENT_TARGET_REPOSITORY/issues/comments/$marker_id"',
+            retry,
+        )
+        self.assertIn("the attempt was not consumed", retry)
+        # The ordinary review retry keeps its completed-success CI gate.
+        self.assertIn('CI_JSON="$RUNNER_TEMP/pr-agent-repair-ci-runs.json"', retry)
+        self.assertIn("Exact HEAD no longer has green CI; retry cancelled", retry)
+        self.assertIn('-f recovery_kind="repair"', retry)
+
+    def test_repair_conflict_publish_requires_both_ancestors_and_clean_index(self):
+        body = read(".github/workflows/continuum-pr-agent-repair.yml")
+        self.assertIn(
+            'git fetch --no-tags origin "refs/heads/$CONFLICT_BASE_REF:refs/remotes/origin/$CONFLICT_BASE_REF"',
+            body,
+        )
+        start = body.index('no_progress_classification="transient"')
+        end = body.index('if [[ -z "$(git status --porcelain)" ]]; then', start)
+        publish = body[start:end]
+        for needle in (
+            'if [[ -n "$(git ls-files -u)" ]]',
+            "Conflict repair left unresolved index entries",
+            'git diff --cached -U0',
+            "conflict-staged.diff",
+            "Unable to inspect the staged conflict result",
+            "Conflict repair left conflict markers",
+        ):
+            with self.subTest(needle=needle):
+                self.assertIn(needle, publish)
+        # Both ancestry proofs run after the workflow-owned commit, when HEAD
+        # is the actual result that would be pushed.
+        postcommit = body[
+            body.index('if ! git merge-base --is-ancestor "$HEAD_SHA" HEAD; then'):
+            body.index('NEW_HEAD="$(git rev-parse HEAD)"')
+        ]
+        self.assertIn('git merge-base --is-ancestor "$HEAD_SHA" HEAD', postcommit)
+        self.assertIn('git merge-base --is-ancestor "$BASE_SHA" HEAD', postcommit)
+        self.assertIn(
+            "Conflict repair did not integrate the default-branch base",
+            postcommit,
+        )
+        revalidation = body[
+            body.index('CURRENT_LABELS=""'):
+            body.index("# kodmial/continuum#260", body.index('CURRENT_LABELS=""'))
+        ]
+        for needle in (
+            "no-auto-merge",
+            "CURRENT_MERGEABLE",
+            "is no longer conflicted",
+            "discarding conflict repair without publication",
+        ):
+            with self.subTest(needle=needle):
+                self.assertIn(needle, revalidation)
+        self.assertIn('git merge-base --is-ancestor "$HEAD_SHA" HEAD', body)
+        self.assertIn(
+            'git push --force-with-lease="refs/heads/$HEAD_REF:$HEAD_SHA"',
+            body,
+        )
+
+    def test_pr_agent_conflict_marker_is_shared_by_merge_recovery_and_repair(self):
+        marker = "<!-- opencode-conflict-repair-attempt head="
+        lock = "opencode-conflict-repair"
+        for path in (
+            ".github/workflows/continuum-pr-agent-auto-merge.yml",
+            ".github/workflows/continuum-pr-agent-recovery.yml",
+            ".github/workflows/continuum-pr-agent-repair.yml",
+        ):
+            with self.subTest(path=path):
+                body = read(path)
+                self.assertIn(marker, body)
+                self.assertNotIn("<!-- continuum-pr-agent-conflict-attempt", body)
+        for path in (
+            ".github/workflows/continuum-pr-agent-auto-merge.yml",
+            ".github/workflows/continuum-pr-agent-recovery.yml",
+        ):
+            with self.subTest(path=path):
+                self.assertIn(lock, read(path))
+
+    def test_conflict_success_status_records_the_integrated_base(self):
+        # Recovery must not treat a success from an earlier base as terminal
+        # after a default-branch advance, so the repair success status carries
+        # the exact base it integrated.
+        repair = read(".github/workflows/continuum-pr-agent-repair.yml")
+        self.assertIn('echo "base_sha=$BASE_SHA" >> "$GITHUB_OUTPUT"', repair)
+        self.assertIn(
+            "REPAIR_BASE_SHA: ${{ steps.repair_pass.outputs.base_sha }}",
+            repair,
+        )
+        self.assertIn("'PR-Agent repair settled; base ' + baseSha", repair)
+        recovery = read(".github/workflows/continuum-pr-agent-recovery.yml")
+        self.assertIn(r"\bbase[=: ]+([0-9a-f]{40,64})\b", recovery)
+        self.assertIn("conflict repair already settled for this base", recovery)
+
     def test_delegated_repair_uses_private_comment_handoff_not_raw_outputs(self):
         review = read(".github/workflows/continuum-pr-agent.yml")
         repair = read(".github/workflows/continuum-pr-agent-repair.yml")
