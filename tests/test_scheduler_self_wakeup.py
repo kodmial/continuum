@@ -737,7 +737,7 @@ class WatchdogPeriodicGateTests(unittest.TestCase):
         self.condition = gate["if"]
         self.concurrent = workflow["concurrency"]
 
-    def run_gate(self, candidates, jobs, *, error=False, context=None):
+    def run_gate(self, candidates, jobs, *, error=False, context=None, workflow_id=369085546):
         harness = r"""
 const scenario = JSON.parse(process.argv[1]);
 const source = process.argv[2];
@@ -749,6 +749,10 @@ const context = Object.assign({
 }, scenario.context || {});
 const outputs = {}, calls = [], warnings = [];
 const github = {rest: {actions: {
+  getWorkflowRun: async params => {
+    calls.push(['caller', params]);
+    return {data: {workflow_id: scenario.workflow_id}};
+  },
   listWorkflowRuns: async params => {
     calls.push(['runs', params]);
     if (scenario.error) throw new Error('API unavailable');
@@ -771,7 +775,7 @@ const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor;
 })().catch(err => { console.error(err); process.exitCode = 1; });
 """
         result = subprocess.run(
-            ["node", "-e", harness, json.dumps(dict(candidates=candidates, jobs=jobs, error=error, context=context)), self.script],
+            ["node", "-e", harness, json.dumps(dict(candidates=candidates, jobs=jobs, error=error, context=context, workflow_id=workflow_id)), self.script],
             capture_output=True, text=True, check=True,
         )
         return json.loads(result.stdout)
@@ -809,8 +813,10 @@ const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor;
             run["event"] = event
             result = self.run_gate([run], {101: [self.job()]})
             self.assertEqual({"skip": "true"}, result["outputs"])
-            params = result["calls"][0][1]
-            self.assertEqual("automation.yml", params["workflow_id"])
+            self.assertEqual("caller", result["calls"][0][0])
+            self.assertEqual(999, result["calls"][0][1]["run_id"])
+            params = result["calls"][1][1]
+            self.assertEqual(369085546, params["workflow_id"])
             self.assertEqual("abc", params["head_sha"])
             self.assertEqual("main", params["branch"])
             self.assertEqual(">=2026-11-26T18:00:00.000Z", params["created"])
@@ -835,6 +841,10 @@ const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor;
             self.assertEqual({}, self.run_gate([run], {101: [self.job()]})["outputs"])
 
     def test_unavailable_evidence_runs_guarded_pass_and_bounds_inventory(self):
+        unknown = self.run_gate([self.candidate()], {101: [self.job()]}, workflow_id=None)
+        self.assertEqual({}, unknown["outputs"])
+        self.assertEqual(["caller"], [call[0] for call in unknown["calls"]])
+        self.assertTrue(unknown["warnings"])
         result = self.run_gate([], {}, error=True)
         self.assertEqual({}, result["outputs"])
         self.assertTrue(result["warnings"])

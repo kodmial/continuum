@@ -161,8 +161,17 @@ jobs:
             if (!branch || context.ref !== 'refs/heads/' + branch) return;
             const windowStart = Math.floor(Date.now() / 900000) * 900000;
             try {
+              // Resolve the actual caller identity, never a sibling filename:
+              // reusable workflows can be installed under different paths.
+              const current = (await github.rest.actions.getWorkflowRun({
+                owner, repo, run_id: context.runId,
+              })).data;
+              if (!Number.isSafeInteger(current?.workflow_id) || current.workflow_id <= 0) {
+                core.warning('Periodic watchdog caller identity unavailable; running normal guarded catch-up.');
+                return;
+              }
               const { data } = await github.rest.actions.listWorkflowRuns({
-                owner, repo, workflow_id: 'automation.yml',
+                owner, repo, workflow_id: current.workflow_id,
                 branch, head_sha: context.sha, status: 'completed',
                 created: '>=' + new Date(windowStart).toISOString(),
                 per_page: 100,
