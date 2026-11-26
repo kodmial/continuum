@@ -700,22 +700,36 @@ jobs:
             async function observeDispatchedRun({
               target, notBefore, displayTitle, recoveryRunName, oldRunId,
             }) {
+              // List-runs has no ascending sort and returns newest first.
+              // Bound both ends so newer dispatches cannot evict the target
+              // from the 1,000-result cap; unset timestamps use a recent floor.
+              const start = notBefore > 0
+                ? Math.max(0, notBefore - 5000)
+                : Date.now() - 300000;
+              const end = Math.max(start,
+                (notBefore > 0 ? notBefore : Date.now()) + 3600000);
+              const created = new Date(start).toISOString() + '..' +
+                new Date(end).toISOString();
               let complete = false;
               for (let attempt = 0; attempt < 10; attempt += 1) {
-                complete = false;
                 try {
-                  const runs = await readGithub.paginate(
-                    readGithub.rest.actions.listWorkflowRuns,
-                    {
+                  let runs = [];
+                  let totalCount = null;
+                  for (let page = 1; page <= 10; page += 1) {
+                    const { data } = await readGithub.rest.actions.listWorkflowRuns({
                       owner, repo, workflow_id: target.workflowId,
-                      event: 'workflow_dispatch',
-                      // Filter on the server before paginating. Without a
-                      // lower date bound a single observation scanned all past
-                      // runs and blocked other due recovery candidates.
-                      created: '>=' + new Date(Math.max(0, notBefore - 5000)).toISOString(),
-                      per_page: 100,
+                      event: 'workflow_dispatch', created, per_page: 100, page,
+                    });
+                    if (page === 1) {
+                      const total = Number(data.total_count);
+                      totalCount = Number.isFinite(total) ? total : null;
                     }
-                  );
+                    const pageRuns = Array.isArray(data.workflow_runs)
+                      ? data.workflow_runs
+                      : [];
+                    runs = runs.concat(pageRuns);
+                    if (pageRuns.length < 100 || runs.length >= 1000) break;
+                  }
                   const candidates = runs.filter(candidate => {
                     if (Number(candidate.id) === Number(oldRunId || 0)) return false;
                     if (candidate.event !== 'workflow_dispatch') return false;
@@ -736,9 +750,16 @@ jobs:
                   // observable dispatch into an accepted-but-unowned one.
                   const exact = byTitle(recoveryRunName);
                   if (exact) return exact;
-                  // GitHub caps filtered run searches at 1,000 results.
-                  // A truncated or failed inventory cannot prove absence.
-                  if (runs.length >= 1000) return { incomplete: true };
+                  // Exactly 1,000 results is complete; only a larger reported
+                  // total is truncated. Complete observations stay sticky
+                  // across retries.
+                  const truncated = totalCount === null
+                    ? runs.length >= 1000
+                    : totalCount > runs.length;
+                  if (truncated) {
+                    if (complete) return null;
+                    return { incomplete: true };
+                  }
                   complete = true;
                   let match = byTitle(displayTitle);
                   if (!match) {

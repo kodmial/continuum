@@ -164,13 +164,34 @@ function makeRest() {
     },
     actions: {
       listWorkflowRuns: async (params = {}) => {
+        const callNumber = state.observationListCalls.length + 1;
         state.observationListCalls.push({ ...params });
+        if ((scenario.observationListErrors || []).includes(callNumber)) {
+          throw apiError(500, 'observation inventory failed');
+        }
         let runs = state.workflowRuns.slice();
         if (params.event) runs = runs.filter(run => run.event === params.event);
-        if (params.created && params.created.startsWith('>=')) {
-          const lowerBound = new Date(params.created.slice(2)).getTime();
-          runs = runs.filter(run => new Date(run.created_at).getTime() >= lowerBound);
+        const created = String(params.created || '');
+        if (created) {
+          let lowerBound = -Infinity;
+          let upperBound = Infinity;
+          if (created.startsWith('>=')) {
+            lowerBound = new Date(created.slice(2)).getTime();
+          } else {
+            const [start, end] = created.split('..');
+            if (start) lowerBound = new Date(start).getTime();
+            if (end) upperBound = new Date(end).getTime();
+          }
+          runs = runs.filter(run => {
+            const at = new Date(run.created_at).getTime();
+            return at >= lowerBound && at <= upperBound;
+          });
         }
+        // GitHub returns newest first and caps a filtered search at 1,000
+        // results, which is exactly what the observation must survive.
+        runs.sort((a, b) =>
+          new Date(b.created_at).getTime() - new Date(a.created_at).getTime()
+        );
         const total = runs.length;
         if (params.event || params.created) runs = runs.slice(0, 1000);
         const pageSize = Number(params.per_page || 30);
@@ -748,7 +769,15 @@ class WatchdogHarness(unittest.TestCase):
         calls = result["observationListCalls"]
         self.assertEqual(len(calls), 1, "observation must not read historical pages")
         self.assertEqual(calls[0]["event"], "workflow_dispatch")
-        self.assertTrue(calls[0]["created"].startswith(">="))
+        self.assertIn("..", calls[0]["created"])
+        lower_bound = datetime.fromisoformat(
+            calls[0]["created"].split("..")[0].replace("Z", "+00:00")
+        )
+        self.assertGreater(
+            lower_bound,
+            datetime.now(timezone.utc) - timedelta(minutes=5),
+            "observation must not read historical pages",
+        )
         self.assertTrue(any("state=observed" in item["body"] and "run=5001" in item["body"]
                             for item in result["comments"]))
 
@@ -773,6 +802,110 @@ class WatchdogHarness(unittest.TestCase):
         self.assert_no_dispatch(result)
         self.assertTrue(any("state=claimed" in item["body"]
                             for item in result["comments"]))
+
+    def test_exactly_one_thousand_complete_results_do_not_hold_the_claim(self):
+        # Exactly 1,000 matching runs is a complete inventory, not proof of
+        # truncation. The claim must be discharged by a fresh dispatch.
+        scenario = base_scenario()
+        now = datetime.now(timezone.utc)
+        scenario["comments"][0]["body"] = recovery_marker(
+            "claimed", NEW_SHA, "-", next_due=int(now.timestamp()) - 60
+        )
+        scenario["workflowRuns"] = [
+            {
+                "id": index + 90000,
+                "event": "workflow_dispatch",
+                "created_at": now.isoformat(),
+                "status": "completed",
+                "conclusion": "failure",
+                "display_title": "Unrelated dispatch",
+                "path": ".github/workflows/opencode.yml",
+            }
+            for index in range(1000)
+        ]
+        result = self.run_scenario(scenario)
+        self.assert_one_current_dispatch(result, NEW_SHA)
+        self.assertFalse(
+            any("Incomplete dispatch inventory" in " ".join(item)
+                for item in result["notices"]),
+            result["notices"],
+        )
+
+    def test_completed_observation_survives_later_retry_failures(self):
+        # The first attempt proves absence; the remaining retries fail. One
+        # complete observation is enough to stop holding the claim.
+        scenario = base_scenario()
+        now = datetime.now(timezone.utc)
+        scenario["comments"][0]["body"] = recovery_marker(
+            "claimed", NEW_SHA, "-", next_due=int(now.timestamp()) - 60
+        )
+        scenario["workflowRuns"] = []
+        scenario["observationListErrors"] = list(range(2, 11))
+        result = self.run_scenario(scenario)
+        self.assert_one_current_dispatch(result, NEW_SHA)
+        self.assertTrue(any(
+            "state=observed" in item["body"] and "run=5001" in item["body"]
+            for item in result["comments"]
+        ), result["comments"])
+
+    def test_unset_marker_timestamp_does_not_scan_epoch_history(self):
+        # next_due=0 must not degrade the lower bound to 1970 and rescan the
+        # repository's complete run history.
+        scenario = base_scenario()
+        scenario["comments"][0]["body"] = recovery_marker(
+            "claimed", NEW_SHA, "-", next_due=0
+        )
+        scenario["workflowRuns"] = []
+        result = self.run_scenario(scenario)
+        self.assert_one_current_dispatch(result, NEW_SHA)
+        created = result["observationListCalls"][0]["created"]
+        lower_bound = datetime.fromisoformat(
+            created.split("..")[0].replace("Z", "+00:00")
+        )
+        self.assertGreater(
+            lower_bound,
+            datetime.now(timezone.utc) - timedelta(minutes=10),
+            "an unset next_due must not degrade the bound to 1970",
+        )
+
+    def test_observation_window_excludes_dispatches_after_the_target(self):
+        # The API returns newest first. A long-expired claim whose target run
+        # sits at the start of the window must not be evicted by thousands of
+        # later dispatches.
+        scenario = base_scenario()
+        now = datetime.now(timezone.utc)
+        claim_at = now - timedelta(hours=2)
+        scenario["comments"][0]["body"] = recovery_marker(
+            "claimed", NEW_SHA, "-",
+            next_due=int(claim_at.timestamp()) + 300,
+        )
+        target_run = {
+            "id": 424242,
+            "event": "workflow_dispatch",
+            "created_at": (claim_at + timedelta(seconds=5)).isoformat(),
+            "status": "in_progress",
+            "conclusion": None,
+            "display_title": "OpenCode 429 recovery " + OPERATION + " gen 1",
+            "path": ".github/workflows/opencode.yml",
+        }
+        scenario["workflowRuns"] = [target_run] + [
+            {
+                "id": index + 80000,
+                "event": "workflow_dispatch",
+                "created_at": (now - timedelta(minutes=1)).isoformat(),
+                "status": "completed",
+                "conclusion": "failure",
+                "display_title": "Unrelated dispatch",
+                "path": ".github/workflows/opencode.yml",
+            }
+            for index in range(1500)
+        ]
+        result = self.run_scenario(scenario)
+        self.assert_no_dispatch(result)
+        self.assertTrue(any(
+            "state=observed" in item["body"] and "run=424242" in item["body"]
+            for item in result["comments"]
+        ), result["comments"])
 
     def test_truncated_candidate_does_not_starve_later_due_candidates(self):
         # A truncated observation for one due candidate must end only that
@@ -805,14 +938,14 @@ class WatchdogHarness(unittest.TestCase):
             "2026-10-23T09:31:00Z",
         )
         second_comment["issue_number"] = 383
-        # The old window for issue #382 includes this whole inventory, so its
-        # observation is truncated at GitHub's 1,000-result cap. Issue #383's
-        # newer window excludes it, so its observation is complete.
+        # Issue #382's observation window includes this whole inventory, so it
+        # is truncated at GitHub's 1,000-result cap. Issue #383's newer window
+        # excludes it, so its observation is complete.
         unrelated = [
             {
                 "id": index + 70000,
                 "event": "workflow_dispatch",
-                "created_at": (now - timedelta(hours=1)).isoformat(),
+                "created_at": (now - timedelta(hours=2)).isoformat(),
                 "status": "completed",
                 "conclusion": "failure",
                 "display_title": "Unrelated dispatch",
