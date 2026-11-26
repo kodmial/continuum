@@ -214,7 +214,11 @@ printf '%s\n' \
   'setup: an ordinary issue dispatch resumes a generation-2 legacy checkpoint with an empty RECOVERY_GENERATION_IN; generation-1 and generation-2 checkpoint refs already exist; the run hits another 429.' \
   'assertions: the evacuator publishes generation 3 through the same-step carry and force-pushes neither the generation-1 nor the generation-2 ref.'
 PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=src python3 -m unittest -v \
-  scripts.test_opencode_429_evacuator.ProductionEvacuatorTest.test_resumed_generation_evacuates_next_generation_without_overwriting
+  scripts.test_opencode_429_evacuator.ProductionEvacuatorTest.test_resumed_generation_evacuates_next_generation_without_overwriting \
+  scripts.test_opencode_429_evacuator.ProductionEvacuatorTest.test_provider_429_fresh_runner_handoff_preserves_provenance \
+  scripts.test_opencode_429_evacuator.ProductionEvacuatorTest.test_pinned_route_quota_preflight_preserves_checkpoint_and_model \
+  scripts.test_opencode_429_evacuator.ProductionRestoreTest.test_bound_checkpoint_model_is_pinned_or_rejected_before_routing \
+  scripts.test_opencode_429_evacuator.ProductionRestoreTest.test_manual_issue_mode_resolves_model_from_exact_durable_mirror
 
 # Print the durable checkpoint supersession and repository-provenance
 # regressions by name in the exact-HEAD gate log. CodeRabbit excludes tests/**

@@ -96,11 +96,15 @@ FAIL_CLOSED_STATUSES = frozenset({400, 401, 403, 404, 422})
 
 #: Bounded infrastructure backoff between fresh-VM 429 generations
 #: (seconds). Backoff can grow, but the task remains automatically
-#: recoverable: exhaustion enters cooldown, never ``automation:paused``.
+#: recoverable: exhaustion enters a durable backoff, never
+#: ``automation:paused``. The same schedule is used beyond the fast
+#: replacement budget (see :func:`durable_backoff_seconds`).
 INFRA_BACKOFF_SCHEDULE = (60, 300, 900, 1800, 3600)
 
-#: Fast runner replacements tolerated before entering infrastructure
-#: cooldown. Separate from every task-failure budget.
+#: Fast runner replacements tolerated before switching to durable bounded
+#: backoff. This is a *fast* replacement budget, not a lifetime stop:
+#: generations beyond it still recover automatically with the same model
+#: and checkpoint. Separate from every task-failure budget.
 DEFAULT_MAX_429_RUNNER_RESTARTS = 3
 
 #: Prefix for workflow-owned durable checkpoint refs.
@@ -229,6 +233,14 @@ _CHILD_REPO_RE = re.compile(
     r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+",
 )
 _SHA_RE = re.compile(r"\b[0-9a-f]{40}\b", re.IGNORECASE)
+
+#: Provider/model identifier persisted in recovery metadata so a fresh runner
+#: can pin the exact trusted route instead of performing a new selection. The
+#: pattern mirrors ``model_routing.MODEL_ID`` but stays local so this module
+#: remains dependency-free.
+_MODEL_ID_RE = re.compile(
+    r"^[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._/-]{0,120}$"
+)
 
 #: ``opencode run --format json`` emits one JSON object per line. The
 #: terminal provider failure is a top-level ``type=error`` event carrying the
@@ -800,7 +812,12 @@ def infra_backoff_seconds(generation: Any) -> int:
 
 
 def should_enter_infra_cooldown(generation: Any, max_restarts: Any = None) -> bool:
-    """Whether repeated fresh-VM 429s move the operation into cooldown."""
+    """Whether repeated fresh-VM 429s move the operation into durable backoff.
+
+    The name is historical: beyond the fast replacement budget recovery is
+    not stopped. It switches to the bounded increasing backoff produced by
+    :func:`durable_backoff_seconds` and resumes automatically.
+    """
 
     try:
         gen = int(generation)
@@ -815,6 +832,37 @@ def should_enter_infra_cooldown(generation: Any, max_restarts: Any = None) -> bo
     except (TypeError, ValueError):
         limit = DEFAULT_MAX_429_RUNNER_RESTARTS
     return gen > max(0, limit)
+
+
+def durable_backoff_seconds(generation: Any, max_restarts: Any = None) -> int:
+    """Bounded durable backoff for generations beyond the fast budget.
+
+    ``max_429_runner_restarts`` is a fast-replacement budget, not a lifetime
+    stop. The first generation beyond it waits ``INFRA_BACKOFF_SCHEDULE[0]``;
+    each later generation advances one step and the final step is the
+    ceiling. The operation keeps the same checkpoint and model and resumes
+    automatically when the window expires, so repeated failures can never
+    become a terminal state or a retry storm.
+    """
+
+    try:
+        gen = int(generation)
+    except (TypeError, ValueError):
+        gen = 0
+    try:
+        limit = int(
+            DEFAULT_MAX_429_RUNNER_RESTARTS
+            if max_restarts in (None, "")
+            else max_restarts
+        )
+    except (TypeError, ValueError):
+        limit = DEFAULT_MAX_429_RUNNER_RESTARTS
+    limit = max(0, limit)
+    if gen <= limit:
+        return 0
+    index = min(gen - limit - 1, len(INFRA_BACKOFF_SCHEDULE) - 1)
+    return INFRA_BACKOFF_SCHEDULE[max(0, index)]
+
 
 
 def cooldown_comment(operation: Any, generation: Any, checkpoint: Any) -> str:
@@ -956,6 +1004,10 @@ def validate_recovery_metadata(
     A checkpoint pointer is only published after this returns ``True``. The
     schema is deliberately strict: recovery must be provable from durable
     evidence, never guessed from a mutable issue or a partial commit.
+
+    ``model`` is optional so checkpoints created before model persistence stay
+    recoverable. When present it must be a well-formed provider/model id; a
+    malformed value fails closed instead of being forwarded to a fresh runner.
     """
 
     if not isinstance(metadata, Mapping):
@@ -988,6 +1040,13 @@ def validate_recovery_metadata(
     failure_kind = str(metadata.get("failure_kind") or "")
     if failure_kind not in ("quota_429", "unavailable"):
         return False, "recovery metadata failure kind is unknown"
+    model = str(metadata.get("model") or "").strip()
+    if model and not _MODEL_ID_RE.fullmatch(model):
+        return False, "recovery metadata model is malformed"
+    for field in ("not_before", "retry_after_seconds"):
+        value = str(metadata.get(field) or "").strip()
+        if value and not value.isdigit():
+            return False, "recovery metadata {} is malformed".format(field)
     issue_text = str(metadata.get("issue_number") or "").strip()
     pr_text = str(metadata.get("pr_number") or "").strip()
     if issue_text and not issue_text.isdigit():

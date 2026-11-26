@@ -369,11 +369,12 @@ class SchedulerDurableRecoveryTests(unittest.TestCase):
         self.assertEqual(result["evaluation"]["reason"], "watchdog-lease")
         self.assertEqual(result["runLookups"], [])
 
-    def test_owner_action_required_is_terminal_and_fenced(self):
+    def test_unavailable_owner_action_required_is_terminal_and_fenced(self):
         for next_due in (0, 4102444800):
             with self.subTest(next_due=next_due):
                 scenario = self.base_scenario()
                 scenario["max429RunnerRestarts"] = 0
+                scenario["recovery"]["checkpointRef"] = CHECKPOINT_REF.replace("/429-", "/infra-")
                 scenario["recovery"].update({
                     "state": "owner-action-required",
                     "attempt": 4,
@@ -392,12 +393,13 @@ class SchedulerDurableRecoveryTests(unittest.TestCase):
                 )
                 self.assertEqual(result["runLookups"], [])
 
-    def test_owner_action_required_yields_when_cap_is_raised(self):
+    def test_unavailable_owner_action_required_yields_when_cap_is_raised(self):
         # An owner-authorized cap increase supersedes the recorded terminal
         # generation. The watchdog may resume recovery, so the scheduler must
         # keep the reservation pending instead of logging a terminal skip.
         scenario = self.base_scenario()
         scenario["max429RunnerRestarts"] = 3
+        scenario["recovery"]["checkpointRef"] = CHECKPOINT_REF.replace("/429-", "/infra-")
         scenario["recovery"].update({
             "state": "owner-action-required",
             "attempt": 1,
@@ -412,6 +414,34 @@ class SchedulerDurableRecoveryTests(unittest.TestCase):
         self.assertEqual(
             evaluation["reason"], "cap-raised-awaiting-watchdog"
         )
+
+    def test_quota_legacy_terminal_marker_awaits_watchdog_without_owner(self):
+        scenario = self.base_scenario()
+        scenario["max429RunnerRestarts"] = 0
+        scenario["recovery"].update({
+            "state": "owner-action-required",
+            "attempt": 4, "nextDue": 0, "checkpointSha": NEW_SHA,
+            "detail": "generation-exhausted",
+        })
+        evaluation = self.run_scenario(scenario)["evaluation"]
+        self.assertTrue(evaluation["keepReservation"])
+        self.assertTrue(evaluation["recoveryPending"])
+        self.assertFalse(evaluation["ownerActionRequired"])
+        self.assertFalse(evaluation["countWip"])
+        self.assertEqual(evaluation["reason"], "durable-backoff-awaiting-watchdog")
+
+    def test_quota_overdue_backoff_retains_watchdog_ownership(self):
+        scenario = self.base_scenario()
+        scenario["max429RunnerRestarts"] = 0
+        scenario["recovery"].update({
+            "state": "backoff", "attempt": 4, "nextDue": 1,
+            "checkpointSha": NEW_SHA, "detail": "generation-exhausted",
+        })
+        evaluation = self.run_scenario(scenario)["evaluation"]
+        self.assertTrue(evaluation["keepReservation"])
+        self.assertTrue(evaluation["recoveryPending"])
+        self.assertFalse(evaluation["ownerActionRequired"])
+        self.assertEqual(evaluation["reason"], "backoff-awaiting-watchdog")
 
     def test_unknown_owner_action_required_stays_terminal(self):
         scenario = self.base_scenario()
@@ -428,9 +458,10 @@ class SchedulerDurableRecoveryTests(unittest.TestCase):
         self.assertTrue(evaluation["ownerActionRequired"])
         self.assertEqual(evaluation["reason"], "owner-action-required")
 
-    def test_overdue_generation_exhausted_backoff_is_terminal(self):
+    def test_overdue_unavailable_generation_exhausted_backoff_is_terminal(self):
         scenario = self.base_scenario()
         scenario["max429RunnerRestarts"] = 0
+        scenario["recovery"]["checkpointRef"] = CHECKPOINT_REF.replace("/429-", "/infra-")
         scenario["recovery"].update({
             "state": "backoff",
             "attempt": 4,

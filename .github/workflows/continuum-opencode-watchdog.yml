@@ -45,9 +45,9 @@ on:
         default: ''
       max_429_runner_restarts:
         description: >-
-          Hard lifetime cap on fresh-runner generations after an OpenCode 429
-          marker. Once exhausted, the watchdog records a terminal
-          owner-action-required state instead of dispatching another runner.
+          Fast fresh-runner replacement budget for a confirmed OpenCode quota 429.
+          After exhaustion, one resumption becomes due after bounded durable
+          backoff. The lifetime cap for upstream-unavailable remains unchanged.
           Empty falls back to AUTOMATION_WATCHDOG_MAX_429_RUNNER_RESTARTS,
           then 3.
         required: false
@@ -309,6 +309,8 @@ jobs:
                 process.env.MAX_429_RUNNER_RESTARTS
               );
             }
+            // #496: fast replacement budget, then durable quota backoff.
+            const durableBackoffSchedule = [60, 300, 900, 1800, 3600];
 
             // kodmial/continuum#290: fresh-VM 429 resumption. Dispatches a NEW
             // workflow_dispatch carrying the explicit recovery identity onto
@@ -527,6 +529,24 @@ jobs:
               }
               if (!String(identity.head_ref || '').trim()) {
                 return 'recovery metadata head ref is empty';
+              }
+              const expectedKind = expected.checkpointRef.startsWith('opencode/429-checkpoint-')
+                ? 'quota_429' : 'unavailable';
+              if (identity.failure_kind !== expectedKind) {
+                return 'recovery metadata failure kind does not match checkpoint namespace';
+              }
+              const model = String(identity.model || '').trim();
+              if (
+                model &&
+                !/^[A-Za-z0-9][A-Za-z0-9._-]*\/[A-Za-z0-9][A-Za-z0-9._/-]{0,120}$/.test(model)
+              ) {
+                return 'recovery metadata model is malformed';
+              }
+              for (const field of ['not_before', 'retry_after_seconds']) {
+                const value = String(identity[field] ?? '').trim();
+                if (value && (!/^[0-9]+$/.test(value) || !Number.isSafeInteger(Number(value)))) {
+                  return 'recovery metadata ' + field + ' is malformed';
+                }
               }
               if (!['issue', 'qualification', 'coderabbit-fix', 'resolve-conflict', 'ci-fix'].includes(expected.mode)) {
                 return 'recovery metadata mode is not dispatchable';
@@ -1443,64 +1463,39 @@ jobs:
               const comments = await listThreadComments(threadNumber);
               const previous = latestRecoveryState(comments, operation, generation);
 
-              if (generation > max429Restarts) {
-                // `max_429_runner_restarts` is a hard cap on fresh-runner
-                // generations, not a per-generation attempt budget. Once the
-                // evacuation generation exceeds it, no further automatic
-                // dispatch is authorized. Convert the overdue cooldown to a
-                // terminal owner-action state instead of renewing `next_due`
-                // forever, which would silently strand the reservation. This
-                // branch only runs for a real OpenCode 429 evacuation (the
-                // GitHub REST budget guard returns earlier) and never
-                // dispatches, so owner STOP and duplicate-run fences stay
-                // authoritative.
-                const terminal =
-                  previous &&
-                  previous.state === 'owner-action-required' &&
-                  previous.detail === 'generation-exhausted';
-                if (terminal) {
-                  core.notice(
-                    'OpenCode infrastructure operation ' + operation + ' generation ' +
-                    generation + ' is terminal: the fresh-runner restart cap (' +
-                    max429Restarts + ') is exhausted and owner action is required; ' +
-                    'checkpoint ' + checkpointRef + ' remains preserved.'
-                  );
+              const latest = latestTrustedRecoveryState(comments);
+              if (latest && latest.operation === operation &&
+                  Number(latest.generation) > generation) {
+                core.notice('Ignoring a superseded infrastructure recovery generation ' + generation + '.');
+                return;
+              }
+              if (previous && previous.state === 'owner-action-required' &&
+                  previous.detail !== 'generation-exhausted') {
+                core.notice('Explicit owner-action-required recovery hold remains authoritative.');
+                return;
+              }
+              if (checkpointRef.startsWith('opencode/infra-checkpoint-') &&
+                  generation > max429Restarts) {
+                if (previous && previous.state === 'owner-action-required' &&
+                    previous.detail === 'generation-exhausted') {
+                  core.notice('Infrastructure recovery is terminal: restart cap exhausted.');
                   return;
                 }
-                if (previous && previous.nextDue > now) {
-                  // Honor the recorded cooldown exactly once. After it expires
-                  // the next pass publishes the terminal state; it never
-                  // extends the window or dispatches another runner.
-                  core.notice(
-                    'OpenCode infrastructure operation ' + operation + ' generation ' +
-                    generation + ' is waiting for its bounded cooldown until ' +
-                    previous.nextDue + '; the restart cap is already exhausted.'
-                  );
-                  return;
-                }
+                if (previous && previous.nextDue > now) return;
                 await recordRecoveryState({
                   ...baseState,
                   state: 'owner-action-required',
                   attempt: generation,
                   nextDue: 0,
                   detail: 'generation-exhausted',
-                  summary: 'The configured fresh-runner restart cap (' +
-                    max429Restarts + ') is exhausted at generation ' + generation +
-                    '. Checkpoint `' + checkpointRef + '` is preserved, but automatic ' +
-                    'recovery is stopped: no further fresh runner will be dispatched ' +
-                    'and no task/review/qualification budget was consumed. An owner ' +
-                    'must explicitly authorize more fresh-runner restarts or recover ' +
-                    'the checkpoint another way before this issue can move.',
+                  summary: 'The fresh-runner restart cap is exhausted for upstream-unavailable; checkpoint preserved, owner action required.',
                 });
-                core.warning(
-                  'OpenCode infrastructure operation ' + operation + ' generation ' +
-                  generation + ' exceeded the fresh-runner restart cap (' +
-                  max429Restarts + '); recorded a terminal owner-action-required ' +
-                  'state. Checkpoint ' + checkpointRef + ' preserved; automatic ' +
-                  'recovery will not dispatch another run.'
-                );
+                core.warning('Infrastructure recovery is terminal: restart cap exhausted.');
                 return;
               }
+              // Persisted quota waits must not slide on repeat wake-ups.
+              if (previous && previous.nextDue > now &&
+                  checkpointRef.startsWith('opencode/429-checkpoint-')) return;
 
               const metadata = await readCheckpointMetadata({
                 operation, generation, checkpointRef,
@@ -1676,6 +1671,29 @@ jobs:
                 );
                 return;
               }
+
+              // Re-check explicit holds in the workflow_run path too.
+              const quota = identity.failure_kind === 'quota_429';
+              if (mode === 'issue' && quota) {
+                try {
+                  const { data: issue } = await readGithub.rest.issues.get({
+                    owner, repo, issue_number: threadNumber,
+                  });
+                  if (!issue || issue.state !== 'open' || issue.pull_request ||
+                      !Array.isArray(issue.labels)) return;
+                  const liveLabels = issueLabelNames(issue);
+                  const holdLabels = [pausedLabel, blockedLabel, qualifyingLabel, noAutoMergeLabel]
+                    .filter(label => liveLabels.has(label));
+                  if (holdLabels.length) {
+                    core.notice('Quota recovery held by ' + holdLabels.join(', '));
+                    return;
+                  }
+                } catch (err) {
+                  core.warning('Cannot verify issue holds; no resumption.');
+                  return;
+                }
+              }
+              const durableGeneration = quota && generation > max429Restarts;
 
               const displayTitle = mode === 'issue'
                 ? 'OpenCode issue #' + issueText
@@ -1859,21 +1877,35 @@ jobs:
                 // re-recording the same exhausted backoff forever.
                 const backoffExpired =
                   previous.state === 'backoff' && previous.nextDue <= now;
-                if (
+                if (!durableGeneration &&
                   previous.attempt >= Math.max(1, max429Restarts + 1) &&
                   !backoffExpired
                 ) {
                   await recordRecoveryState({
-                    ...baseState,
-                    checkpointSha,
-                    state: 'backoff',
-                    attempt: previous.attempt,
-                    nextDue: now + 3600,
+                    ...baseState, checkpointSha, state: 'backoff',
+                    attempt: previous.attempt, nextDue: now + 3600,
                     detail: 'attempts-exhausted',
                     summary: 'Bounded recovery attempts are exhausted for this generation. Checkpoint `' + checkpointRef + '` is preserved; no pause was applied.',
                   });
                   return;
                 }
+              }
+              // One durable window per validated generation. A legacy terminal
+              // quota marker enters this same path; no automatic wait renewal.
+              const durableWindowExpired = previous &&
+                previous.state === 'backoff' && previous.nextDue <= now;
+              const providerDue = quota ? Number(identity.not_before || 0) : 0;
+              if ((durableGeneration && !durableWindowExpired) || providerDue > now) {
+                const wait = durableGeneration
+                  ? durableBackoffSchedule[Math.min(generation - max429Restarts - 1, 4)] : 0;
+                const nextDue = Math.max(now + wait, providerDue);
+                await recordRecoveryState({
+                  ...baseState, checkpointSha, state: 'backoff',
+                  attempt: Number(previous && previous.attempt) || 1,
+                  nextDue, detail: 'durable-backoff',
+                  summary: 'Quota recovery waits until ' + nextDue + '; checkpoint preserved, no task/review/qualification budget consumed.',
+                });
+                return;
               }
               const attempt = (previous ? previous.attempt : 0) + 1;
 
@@ -2218,6 +2250,16 @@ jobs:
                 per_page: 100,
               }
             );
+            // An issue-comment admission-only run is not an implementation.
+            // The completed wrapper has a real skipped opencode job. Treating
+            // its green conclusion as 'success but no PR' races 429 recovery.
+            if (run.conclusion === 'success' && jobs.some(job =>
+              /(?:^| \/ )opencode$/.test(String(job.name || '')) &&
+              job.conclusion === 'skipped'
+            )) {
+              core.notice('Ignoring successful admission-only OpenCode run ' + run.id + '; no coding job ran.');
+              return;
+            }
             let runnerRestartRequired = false;
             let publishRaceRestartRequired = false;
             let evacuated429 = null;

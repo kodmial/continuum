@@ -245,15 +245,17 @@ class WatchdogContractTest(unittest.TestCase):
             "state updates must locate the exact operation+generation marker",
         )
 
-    def test_exhausted_generation_is_terminal_after_its_cooldown(self):
+    def test_quota_generation_uses_durable_cooldown_and_retains_unavailable_cap(self):
         recovery = self.body.split("async function recoverFrom429OnFreshVm")[-1]
-        # The restart cap is a hard lifetime limit: before the recorded due
-        # there is no dispatch, and after it the watchdog publishes a
-        # terminal owner-action state instead of renewing the deadline.
+        # The quota fast budget uses an expiring durable cooldown; unavailable
+        # retains the existing terminal cap.
         self.assertIn("previous.nextDue > now", recovery)
         self.assertIn("state: 'owner-action-required'", recovery)
         self.assertIn("nextDue: 0", recovery)
         self.assertIn("detail: 'generation-exhausted'", recovery)
+        self.assertIn("detail: 'durable-backoff'", recovery)
+        self.assertIn("durableWindowExpired", recovery)
+        self.assertIn("identity.failure_kind === 'quota_429'", recovery)
         self.assertNotIn("nextDue: now + backoffDue", recovery)
         self.assertNotIn("const backoffSchedule =", recovery)
 
