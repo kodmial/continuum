@@ -3916,7 +3916,19 @@ module.exports = async function runIssueScheduler({ github, context, core }) {
           checkpointSha: checkpoint.refSha,
         };
       }
-      if (watchdogPendingStates.includes(state)) {
+      // A settled `observed-unverified` run is the one pending state the
+      // watchdog cannot advance: its stand-down path returns without
+      // rewriting the marker, so retaining the reservation here would hold it
+      // forever. Release the reservation once the observed run is terminal
+      // and the checkpoint is unchanged; every other pending state keeps
+      // watchdog ownership.
+      if (
+        watchdogPendingStates.includes(state) &&
+        !(state === 'observed-unverified' &&
+          run.kind === 'found' &&
+          run.run &&
+          run.run.status === 'completed')
+      ) {
         // next_due makes a pending recovery eligible for watchdog catch-up.
         // It does not release an authenticated, unchanged checkpoint to the
         // ordinary scheduler, even after a crash between claim and dispatch.
