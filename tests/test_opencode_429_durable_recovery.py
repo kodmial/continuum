@@ -492,6 +492,24 @@ class SchedulerDurableRecoveryTests(unittest.TestCase):
         self.assertEqual(evaluation["reason"], "checkpoint-unchanged")
         self.assertEqual(result["runLookups"], [OLD_RUN_ID])
 
+    def test_missing_observed_unverified_run_releases_when_checkpoint_unchanged(self):
+        # A recorded run can be deleted. The watchdog can never advance that
+        # marker, so a definitive 404 must release the unchanged checkpoint
+        # instead of retaining the reservation forever.
+        scenario = self.base_scenario()
+        scenario["recovery"].update({
+            "state": "observed-unverified", "attempt": 2, "nextDue": 1,
+            "checkpointSha": NEW_SHA, "runId": OLD_RUN_ID,
+        })
+        scenario["exactRuns"] = []
+        result = self.run_scenario(scenario)
+        evaluation = result["evaluation"]
+        self.assertFalse(evaluation["keepReservation"])
+        self.assertFalse(evaluation["recoveryPending"])
+        self.assertFalse(evaluation["countWip"])
+        self.assertEqual(evaluation["reason"], "checkpoint-unchanged")
+        self.assertEqual(result["runLookups"], [OLD_RUN_ID])
+
     def test_unknown_owner_action_required_stays_terminal(self):
         scenario = self.base_scenario()
         scenario["max429RunnerRestarts"] = 3

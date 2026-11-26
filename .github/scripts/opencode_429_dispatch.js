@@ -110,7 +110,10 @@ async function observeDispatchedRun({
   // hour. GitHub's filtered search can cap at 1,000; bisect saturated
   // inclusive second-resolution windows, oldest first, under a
   // per-observation REST budget. Never scan unrelated history.
-  let remaining = 40;
+  // Two complete scans are required for `adopting`; a shared 40-call
+  // budget can starve the confirmation scan on dense inventories and
+  // permanently retain the claim. Give adoption room for both scans.
+  let remaining = adopting ? 80 : 40;
   const candidates = runs => runs.filter(candidate => {
     if (Number(candidate.id) === Number(oldRunId || 0)) return false;
     if (candidate.event !== 'workflow_dispatch') return false;
@@ -131,7 +134,9 @@ async function observeDispatchedRun({
       const local = new Map();
       let total = null;
       for (let page = 1; page <= 10; page += 1) {
-        if (remaining <= 0) return { incomplete: true };
+        if (remaining <= 0) {
+          return { incomplete: true, reason: 'budget-exhausted' };
+        }
         remaining -= 1;
         const { data } = await listWorkflowRuns({
           owner, repo, workflow_id: target.workflowId,
@@ -139,7 +144,7 @@ async function observeDispatchedRun({
         });
         if (!Array.isArray(data?.workflow_runs) ||
             !Number.isSafeInteger(data.total_count) || data.total_count < 0) {
-          return { incomplete: true };
+          return { incomplete: true, reason: 'malformed-page' };
         }
         const pageRuns = data.workflow_runs;
         // Positive exact identity is valid even on a capped page;
@@ -156,13 +161,17 @@ async function observeDispatchedRun({
           // Split even at equality; a complete inventory of
           // exactly 1,000 distinct runs can then be reconciled.
           if (total >= 1000) {
-            if (start === end) return { incomplete: true };
+            // A single second cannot be subdivided any further, so its
+            // saturation is not a transient read failure.
+            if (start === end) {
+              return { incomplete: true, reason: 'saturated-second' };
+            }
             const midpoint = Math.floor((start + end) / 2);
             pending.push([midpoint + 1, end], [start, midpoint]);
             break;
           }
         } else if (data.total_count !== total) {
-          return { incomplete: true };
+          return { incomplete: true, reason: 'count-drift' };
         }
         for (const candidate of pageRuns) {
           const id = String(candidate.id || '');
@@ -170,7 +179,7 @@ async function observeDispatchedRun({
           if (!/^\d+$/.test(id) || local.has(id) || inventory.has(id) ||
               !Number.isFinite(at) || at < start || at > end ||
               candidate.event !== 'workflow_dispatch') {
-            return { incomplete: true };
+            return { incomplete: true, reason: 'invalid-run' };
           }
           local.set(id, candidate);
         }
@@ -179,7 +188,7 @@ async function observeDispatchedRun({
           break;
         }
         if (local.size > total || pageRuns.length < 100 || page === 10) {
-          return { incomplete: true };
+          return { incomplete: true, reason: 'inconsistent-page' };
         }
       }
     }
@@ -195,7 +204,19 @@ async function observeDispatchedRun({
     try {
       const result = await scanInventory();
       if (result.match) return result.match;
-      if (result.incomplete) return { incomplete: true };
+      if (result.incomplete) {
+        // A transient inconsistency invalidates only the current read;
+        // retry within the remaining budget instead of giving up after
+        // one. A saturated single second cannot be subdivided, so a
+        // retry reproduces the same result and would only burn budget.
+        consecutiveComplete = 0;
+        complete = false;
+        if (result.reason === 'saturated-second' || remaining <= 0) {
+          return { incomplete: true };
+        }
+        if (attempt < 9) await sleep(5000);
+        continue;
+      }
       const runs = result.runs;
       const match = byTitle(runs, displayTitle) ||
         (runs.length === 1 ? runs[0] : null);

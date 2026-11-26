@@ -174,6 +174,20 @@ function makeRest() {
         }
         let runs = state.workflowRuns.slice();
         if (params.event) runs = runs.filter(run => run.event === params.event);
+        if (params.workflow_id !== undefined && params.workflow_id !== null) {
+          // Production always scopes the inventory to the resolved target
+          // workflow. Ignoring this parameter would hide a regression in
+          // `target.workflowId`.
+          const workflowId = String(params.workflow_id);
+          runs = runs.filter(run => {
+            if (/^\d+$/.test(workflowId)) {
+              return String(run.workflow_id || '') === workflowId;
+            }
+            const runPath = String(run.path || '');
+            return runPath === '.github/workflows/' + workflowId ||
+              runPath.endsWith('/' + workflowId);
+          });
+        }
         const created = String(params.created || '');
         if (created) {
           let lowerBound = -Infinity;
@@ -774,6 +788,7 @@ class WatchdogHarness(unittest.TestCase):
         calls = result["observationListCalls"]
         self.assertEqual(len(calls), 1, "observation must not read historical pages")
         self.assertEqual(calls[0]["event"], "workflow_dispatch")
+        self.assertEqual(calls[0]["workflow_id"], "opencode.yml")
         self.assertIn("..", calls[0]["created"])
         lower_bound = datetime.fromisoformat(
             calls[0]["created"].split("..")[0].replace("Z", "+00:00")
@@ -855,7 +870,19 @@ class WatchdogHarness(unittest.TestCase):
                 scenario[bad_page] = 1
                 result = self.run_scenario(scenario)
                 self.assert_no_dispatch(result)
-                self.assertEqual(2, len(result["observationListCalls"]))
+                calls = result["observationListCalls"]
+                # A transient inconsistency is retried within the bounded
+                # budget instead of aborting after the first read, but it
+                # still can never prove absence.
+                self.assertGreater(len(calls), 2, calls)
+                self.assertLessEqual(len(calls), 20, calls)
+                self.assertTrue(
+                    any(
+                        "state=claimed" in item["body"]
+                        for item in result["comments"]
+                    ),
+                    result["comments"],
+                )
 
     def test_github_rest_refusal_does_not_poll_or_dispatch(self):
         for status in (403, 429):
@@ -918,6 +945,39 @@ class WatchdogHarness(unittest.TestCase):
         )
         self.assertAlmostEqual(
             (claim_at - lower_bound).total_seconds(), 5, delta=1.1
+        )
+
+    def test_dense_legacy_inventory_fits_two_adoption_scans(self):
+        # A legacy next_due=0 claim whose window spans a dense-but-valid
+        # inventory must still prove absence for adoption. Adoption needs two
+        # complete scans, so a single shared 40-call budget starved the
+        # confirmation scan and pinned the claim forever.
+        scenario = base_scenario()
+        claim_at = datetime.now(timezone.utc) - timedelta(hours=2)
+        scenario["comments"][0]["body"] = recovery_marker(
+            "claimed", NEW_SHA, "-", next_due=0
+        )
+        scenario["comments"][0]["created_at"] = claim_at.isoformat()
+        scenario["workflowRuns"] = [
+            {
+                "id": index + 90000,
+                "event": "workflow_dispatch",
+                "created_at": (
+                    claim_at + timedelta(seconds=index // 50)
+                ).isoformat(),
+                "status": "completed",
+                "conclusion": "failure",
+                "display_title": "Unrelated dispatch",
+                "path": ".github/workflows/opencode.yml",
+            }
+            for index in range(1500)
+        ]
+        result = self.run_scenario(scenario)
+        self.assert_one_current_dispatch(result, NEW_SHA)
+        self.assertFalse(
+            any("Incomplete dispatch inventory" in " ".join(item)
+                for item in result["notices"]),
+            result["notices"],
         )
 
     def test_unknown_claim_creation_cannot_authorize_redispatch(self):
@@ -1022,9 +1082,9 @@ class WatchdogHarness(unittest.TestCase):
             "2026-10-23T09:31:00Z",
         )
         second_comment["issue_number"] = 383
-        # Issue #382's observation window includes this whole inventory, so it
-        # is truncated at GitHub's 1,000-result cap. Issue #383's newer window
-        # excludes it, so its observation is complete.
+        # Issue #382's observation window includes this whole target-workflow
+        # inventory, so it is truncated at GitHub's 1,000-result cap. Issue
+        # #383's newer window excludes it, so its observation is complete.
         unrelated = [
             {
                 "id": index + 70000,
@@ -1033,7 +1093,7 @@ class WatchdogHarness(unittest.TestCase):
                 "status": "completed",
                 "conclusion": "failure",
                 "display_title": "Unrelated dispatch",
-                "path": ".github/workflows/unrelated.yml",
+                "path": ".github/workflows/opencode.yml",
             }
             for index in range(1100)
         ]

@@ -3920,14 +3920,15 @@ module.exports = async function runIssueScheduler({ github, context, core }) {
       // watchdog cannot advance: its stand-down path returns without
       // rewriting the marker, so retaining the reservation here would hold it
       // forever. Release the reservation once the observed run is terminal
-      // and the checkpoint is unchanged; every other pending state keeps
-      // watchdog ownership.
+      // (or no longer exists) and the checkpoint is unchanged; every other
+      // pending state keeps watchdog ownership.
       if (
         watchdogPendingStates.includes(state) &&
         !(state === 'observed-unverified' &&
-          run.kind === 'found' &&
-          run.run &&
-          run.run.status === 'completed')
+          ((run.kind === 'found' &&
+            run.run &&
+            run.run.status === 'completed') ||
+            run.kind === 'missing'))
       ) {
         // next_due makes a pending recovery eligible for watchdog catch-up.
         // It does not release an authenticated, unchanged checkpoint to the
