@@ -209,6 +209,12 @@ async function observeDispatchedRun({
       if (adopting && consecutiveComplete >= 2) return null;
     } catch (err) {
       consecutiveComplete = 0;
+      // This is GitHub REST, not the OpenCode provider. An access or rate
+      // refusal cannot prove absence; defer to the next guarded wake.
+      if ([403, 429].includes(Number(err?.status))) {
+        warn('GitHub REST refused dispatch observation; keeping recovery claim.');
+        return { incomplete: true };
+      }
       warn(
         'OpenCode 429 dispatch observation attempt failed for ' +
         target.path + ': ' + (err.message || err)
