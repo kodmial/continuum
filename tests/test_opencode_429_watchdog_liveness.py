@@ -108,7 +108,20 @@ function makeRest() {
         }
         return items.map(issue => ({ ...issue }));
       },
-      listComments: async () => state.comments.map(comment => ({ ...comment })),
+      listComments: async ({ issue_number } = {}) => {
+        // Durable discovery lists one thread at a time. Scenarios that tag
+        // comments with an issue_number are thread-scoped; legacy scenarios
+        // without tags keep the single-thread view.
+        const scoped = state.comments.some(
+          comment => comment.issue_number !== undefined
+        );
+        const items = scoped && issue_number !== undefined
+          ? state.comments.filter(
+              comment => Number(comment.issue_number) === Number(issue_number)
+            )
+          : state.comments;
+        return items.map(comment => ({ ...comment }));
+      },
       createComment: async ({ issue_number, body }) => {
         const comment = {
           id: state.nextCommentId++,
@@ -230,7 +243,16 @@ function makeRest() {
       },
     },
     git: {
-      getRef: async () => {
+      getRef: async ({ ref } = {}) => {
+        const key = String(ref || '').replace(/^heads\//, '');
+        if (
+          scenario.checkpointRefs &&
+          Object.prototype.hasOwnProperty.call(scenario.checkpointRefs, key)
+        ) {
+          const sha = scenario.checkpointRefs[key];
+          if (sha === null) throw apiError(404, 'ref not found');
+          return { data: { object: { sha } } };
+        }
         if (scenario.checkpoint && scenario.checkpoint.missingRef) {
           throw apiError(404, 'ref not found');
         }
@@ -245,8 +267,22 @@ function makeRest() {
     },
     repos: {
       get: async () => ({ data: { default_branch: 'main' } }),
-      getContent: async ({ path }) => {
+      getContent: async ({ path, ref }) => {
         if (path === '.continuum-429-recovery.json') {
+          const bySha = scenario.checkpointMetadataBySha;
+          if (bySha && Object.prototype.hasOwnProperty.call(bySha, String(ref))) {
+            const metadata = bySha[String(ref)];
+            if (metadata === null) throw apiError(404, 'metadata not found');
+            const text = typeof metadata === 'string'
+              ? metadata
+              : JSON.stringify(metadata);
+            return {
+              data: {
+                type: 'file',
+                content: Buffer.from(text, 'utf8').toString('base64'),
+              },
+            };
+          }
           if (!scenario.checkpoint || scenario.checkpoint.missingMetadata) {
             throw apiError(404, 'metadata not found');
           }
@@ -406,16 +442,25 @@ def watchdog_script() -> str:
 
 
 def recovery_marker(state, sha, run_id, attempt=1, next_due=0):
+    return recovery_marker_for(
+        OPERATION, CHECKPOINT_REF, state, sha, run_id,
+        attempt=attempt, next_due=next_due,
+    )
+
+
+def recovery_marker_for(
+    operation, ref, state, sha, run_id, attempt=1, next_due=0,
+):
     return (
         "<!-- continuum-429-recovery op={op} gen=1 state={state} "
         "attempt={attempt} next_due={next_due} checkpoint={ref} "
         "sha={sha} run={run_id} detail=test -->"
     ).format(
-        op=OPERATION,
+        op=operation,
         state=state,
         attempt=attempt,
         next_due=next_due,
-        ref=CHECKPOINT_REF,
+        ref=ref,
         sha=sha,
         run_id=run_id,
     )
@@ -502,6 +547,17 @@ def metadata(sha=NEW_SHA):
         "branch": BRANCH,
         "checkpoint_ref": CHECKPOINT_REF,
     }
+
+
+def metadata_for(operation, issue_number, ref, sha):
+    data = metadata(sha)
+    data.update({
+        "operation_id": operation,
+        "issue_number": str(issue_number),
+        "checkpoint_ref": ref,
+        "head_sha": sha,
+    })
+    return data
 
 
 def base_scenario():
@@ -717,6 +773,121 @@ class WatchdogHarness(unittest.TestCase):
         self.assert_no_dispatch(result)
         self.assertTrue(any("state=claimed" in item["body"]
                             for item in result["comments"]))
+
+    def test_truncated_candidate_does_not_starve_later_due_candidates(self):
+        # A truncated observation for one due candidate must end only that
+        # candidate. The durable-discovery loop still has to process the next
+        # due candidate in the same pass, otherwise one >=1,000-result
+        # inventory starves every later candidate.
+        now = datetime.now(timezone.utc)
+        stale_due = int(now.timestamp()) - 7200
+        recent_due = int(now.timestamp()) - 60
+        second_op = "opencode-429-issue-issue383"
+        second_ref = (
+            "opencode/429-checkpoint-opencode-429-issue-issue383-gen-1"
+        )
+        second_sha = "a" * 40
+        first_comment = thread_comment(
+            10,
+            recovery_marker_for(
+                OPERATION, CHECKPOINT_REF, "claimed", NEW_SHA, "-",
+                next_due=stale_due,
+            ),
+            "2026-10-23T09:30:00Z",
+        )
+        first_comment["issue_number"] = 382
+        second_comment = thread_comment(
+            20,
+            recovery_marker_for(
+                second_op, second_ref, "backoff", second_sha, "-",
+                next_due=recent_due,
+            ),
+            "2026-10-23T09:31:00Z",
+        )
+        second_comment["issue_number"] = 383
+        # The old window for issue #382 includes this whole inventory, so its
+        # observation is truncated at GitHub's 1,000-result cap. Issue #383's
+        # newer window excludes it, so its observation is complete.
+        unrelated = [
+            {
+                "id": index + 70000,
+                "event": "workflow_dispatch",
+                "created_at": (now - timedelta(hours=1)).isoformat(),
+                "status": "completed",
+                "conclusion": "failure",
+                "display_title": "Unrelated dispatch",
+                "path": ".github/workflows/unrelated.yml",
+            }
+            for index in range(1100)
+        ]
+        scenario = {
+            "owner": OWNER,
+            "repo": REPO,
+            "comments": [first_comment, second_comment],
+            "runs": [],
+            "workflowRuns": unrelated,
+            "jobs": [],
+            "jobLog": "",
+            "issues": [
+                {
+                    "number": 382,
+                    "state": "open",
+                    "title": "Issue 382",
+                    "labels": [{"name": "automation:in-progress"}],
+                },
+                {
+                    "number": 383,
+                    "state": "open",
+                    "title": "Issue 383",
+                    "labels": [{"name": "automation:in-progress"}],
+                },
+            ],
+            "pulls": [],
+            "checkpointRefs": {
+                CHECKPOINT_REF: NEW_SHA,
+                second_ref: second_sha,
+            },
+            "checkpointMetadataBySha": {
+                NEW_SHA: metadata_for(
+                    OPERATION, 382, CHECKPOINT_REF, NEW_SHA
+                ),
+                second_sha: metadata_for(
+                    second_op, 383, second_ref, second_sha
+                ),
+            },
+            "workflowFiles": {
+                ".github/workflows/opencode.yml": (
+                    "on:\n"
+                    "  workflow_dispatch:\n"
+                    "    inputs:\n"
+                    "      recovery_identity:\n"
+                    "        required: false\n"
+                ),
+            },
+        }
+        result = self.run_scenario(scenario)
+        self.assertTrue(
+            any("Incomplete dispatch inventory" in " ".join(item)
+                for item in result["notices"]),
+            result["notices"],
+        )
+        self.assertEqual(len(result["dispatches"]), 1, result["dispatches"])
+        dispatch = result["dispatches"][0]
+        identity = json.loads(dispatch["inputs"]["recovery_identity"])
+        self.assertEqual(identity["recovery_operation_id"], second_op)
+        self.assertEqual(identity["recovery_checkpoint_ref"], second_ref)
+        self.assertEqual(identity["recovery_checkpoint_sha"], second_sha)
+        self.assertEqual(dispatch["inputs"]["issue_number"], "383")
+        first_bodies = [
+            comment["body"] for comment in result["comments"]
+            if comment.get("issue_number") == 382
+        ]
+        self.assertTrue(first_bodies)
+        self.assertFalse(
+            any("state=observed" in body or "state=accepted" in body
+                for body in first_bodies),
+            "the truncated candidate must keep its claim and stay undischarged",
+        )
 
     def test_sequential_catch_up_sees_live_recovery_and_does_not_duplicate(self):
         scenario = base_scenario()

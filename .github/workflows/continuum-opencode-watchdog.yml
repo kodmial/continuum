@@ -1749,6 +1749,10 @@ jobs:
                   });
                   if (recovered && recovered.incomplete) {
                     core.warning('Incomplete dispatch inventory; keeping recovery claim.');
+                    // This returns from the per-target helper only. Both
+                    // callers invoke it inside their due-candidate loops
+                    // (scheduled catch-up and durable discovery), so the
+                    // remaining candidates in this pass still run.
                     return;
                   }
                   if (recovered) {
