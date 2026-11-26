@@ -49,6 +49,7 @@ const resultPath = process.argv[4];
 const state = {
   comments: (scenario.comments || []).map(comment => ({ ...comment })),
   nextCommentId: scenario.nextCommentId || 100,
+  outputs: [],
   dispatches: [],
   runs: new Map(),
   runErrors: new Map(Object.entries(scenario.runErrors || {})),
@@ -331,6 +332,7 @@ async function runOnce() {
     info: (...args) => state.notices.push(['info', ...args.map(String)]),
     error: (...args) => state.notices.push(['error', ...args.map(String)]),
     setFailed: (...args) => state.notices.push(['failed', ...args.map(String)]),
+    setOutput: (key, value) => state.outputs.push([key, value]),
   };
   const context = {
     repo: { owner: scenario.owner || 'kodmial', repo: scenario.repo || 'continuum' },
@@ -361,6 +363,7 @@ async function runOnce() {
     }
   }
   const result = {
+    outputs: state.outputs,
     dispatches: state.dispatches,
     comments: state.comments,
     notices: state.notices,
@@ -1230,11 +1233,17 @@ class WatchdogHarness(unittest.TestCase):
         result = self.run_scenario(scenario)
         self.assert_no_dispatch(result)
 
+    def test_complete_scheduled_inventory_is_attested(self):
+        scenario = self.durable_scenario()
+        result = self.run_scenario(scenario)
+        self.assertIn(["catch_up_complete", "true"], result["outputs"])
+
     def test_scheduled_active_run_lookup_failure_fails_closed(self):
         scenario = self.durable_scenario()
         scenario["activeRunsError"] = 429
         result = self.run_scenario(scenario)
         self.assert_no_dispatch(result)
+        self.assertNotIn(["catch_up_complete", "true"], result["outputs"])
         self.assertTrue(
             any(
                 "cannot verify competing runs" in " ".join(line)
