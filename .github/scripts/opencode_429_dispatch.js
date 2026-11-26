@@ -97,7 +97,133 @@ function resolveDispatchWorkflow({ configured, watchedRunPath, workflows } = {})
   return null;
 }
 
+async function observeDispatchedRun({
+  target, notBefore, displayTitle, recoveryRunName, oldRunId,
+  adopting = false, owner, repo, listWorkflowRuns, warn, sleep,
+}) {
+  // No invented recent floor: without a real claim timestamp, an
+  // inventory cannot prove that an earlier dispatch is absent.
+  if (!Number.isFinite(notBefore) || notBefore <= 0 ||
+      notBefore > Date.now() + 5000) return { incomplete: true };
+  const lower = Math.floor(Math.max(0, notBefore - 5000) / 1000);
+  // Keep the entire claim-to-now history in scope, not an arbitrary
+  // hour. GitHub's filtered search can cap at 1,000; bisect saturated
+  // inclusive second-resolution windows, oldest first, under a
+  // per-observation REST budget. Never scan unrelated history.
+  let remaining = 40;
+  const candidates = runs => runs.filter(candidate => {
+    if (Number(candidate.id) === Number(oldRunId || 0)) return false;
+    if (candidate.event !== 'workflow_dispatch') return false;
+    if (candidate.path && candidate.path !== target.path) return false;
+    return new Date(candidate.created_at || 0).getTime() + 5000 >= notBefore;
+  });
+  const byTitle = (runs, title) => title
+    ? runs.find(candidate => candidate.display_title === title)
+    : null;
+  async function scanInventory() {
+    const upper = Math.ceil(Date.now() / 1000);
+    const pending = [[lower, upper]];
+    const inventory = new Map();
+    while (pending.length) {
+      const [start, end] = pending.pop();
+      const created = new Date(start * 1000).toISOString() + '..' +
+        new Date(end * 1000).toISOString();
+      const local = new Map();
+      let total = null;
+      for (let page = 1; page <= 10; page += 1) {
+        if (remaining <= 0) return { incomplete: true };
+        remaining -= 1;
+        const { data } = await listWorkflowRuns({
+          owner, repo, workflow_id: target.workflowId,
+          event: 'workflow_dispatch', created, per_page: 100, page,
+        });
+        if (!Array.isArray(data?.workflow_runs) ||
+            !Number.isSafeInteger(data.total_count) || data.total_count < 0) {
+          return { incomplete: true };
+        }
+        const pageRuns = data.workflow_runs;
+        // Positive exact identity is valid even on a capped page;
+        // fallback matching and negative evidence require completeness.
+        const exact = byTitle(candidates(pageRuns).filter(candidate => {
+          const at = Math.floor(new Date(candidate.created_at || 0).getTime() / 1000);
+          return /^\d+$/.test(String(candidate.id || '')) &&
+            Number.isFinite(at) && at >= start && at <= end;
+        }), recoveryRunName);
+        if (exact) return { match: exact };
+        if (page === 1) {
+          total = data.total_count;
+          // A reported 1,000 may itself be the search ceiling.
+          // Split even at equality; a complete inventory of
+          // exactly 1,000 distinct runs can then be reconciled.
+          if (total >= 1000) {
+            if (start === end) return { incomplete: true };
+            const midpoint = Math.floor((start + end) / 2);
+            pending.push([midpoint + 1, end], [start, midpoint]);
+            break;
+          }
+        } else if (data.total_count !== total) {
+          return { incomplete: true };
+        }
+        for (const candidate of pageRuns) {
+          const id = String(candidate.id || '');
+          const at = Math.floor(new Date(candidate.created_at || 0).getTime() / 1000);
+          if (!/^\d+$/.test(id) || local.has(id) || inventory.has(id) ||
+              !Number.isFinite(at) || at < start || at > end ||
+              candidate.event !== 'workflow_dispatch') {
+            return { incomplete: true };
+          }
+          local.set(id, candidate);
+        }
+        if (local.size === total) {
+          for (const [id, candidate] of local) inventory.set(id, candidate);
+          break;
+        }
+        if (local.size > total || pageRuns.length < 100 || page === 10) {
+          return { incomplete: true };
+        }
+      }
+    }
+    return { runs: candidates([...inventory.values()]) };
+  }
+  let complete = false;
+  let consecutiveComplete = 0;
+  for (let attempt = 0; attempt < 10 && remaining > 0; attempt += 1) {
+    // Negative evidence is a point-in-time observation. A later
+    // failed/truncated read invalidates it; only the exact positive
+    // match may settle ownership regardless of scan completeness.
+    complete = false;
+    try {
+      const result = await scanInventory();
+      if (result.match) return result.match;
+      if (result.incomplete) return { incomplete: true };
+      const runs = result.runs;
+      const match = byTitle(runs, displayTitle) ||
+        (runs.length === 1 ? runs[0] : null);
+      if (match) return match;
+      complete = true;
+      consecutiveComplete += 1;
+      // An expired claim has already waited its lease. Two fresh,
+      // consecutive complete observations, without a later failed
+      // read, establish absence without rewalking dense inventories
+      // ten times. Post-dispatch observation keeps its usual poll.
+      if (adopting && consecutiveComplete >= 2) return null;
+    } catch (err) {
+      consecutiveComplete = 0;
+      warn(
+        'OpenCode 429 dispatch observation attempt failed for ' +
+        target.path + ': ' + (err.message || err)
+      );
+    }
+    if (attempt < 9 && remaining > 0) {
+      await sleep(5000);
+    }
+  }
+  return complete && (!adopting || consecutiveComplete >= 2)
+    ? null : { incomplete: true };
+}
+
 module.exports = {
+  observeDispatchedRun,
   DEFAULT_CANDIDATES,
   normalizeWorkflowPath,
   workflowIdFor,
