@@ -949,7 +949,9 @@ class WatchdogHarness(unittest.TestCase):
         recovery = self.source.split(
             "async function recoverFrom429OnFreshVm"
         )[-1].split("if (publishRaceRestartRequired)")[0]
-        self.assertNotIn("pausedLabel", recovery)
+        self.assertIn("holdLabels = [pausedLabel, blockedLabel", recovery)
+        self.assertNotIn("addLabel(pausedLabel)", recovery)
+        self.assertNotIn("removeLabel(pausedLabel)", recovery)
         self.assertIn("issueLabels.has(pausedLabel)", self.source)
         self.assertIn("' is ' + pausedLabel + '; watchdog will not retry it.'",
                       self.source)
@@ -1022,8 +1024,11 @@ class WatchdogHarness(unittest.TestCase):
         }
         return scenario
 
-    def test_exhausted_generation_terminalizes_once_after_due(self):
+    def test_unavailable_exhausted_generation_terminalizes_once_after_due(self):
         scenario = self.generation_exhausted_scenario(next_due=1)
+        scenario["comments"][0]["body"] = scenario["comments"][0]["body"].replace("/429-checkpoint-", "/infra-checkpoint-")
+        scenario["checkpoint"]["metadata"]["checkpoint_ref"] = scenario["checkpoint"]["metadata"]["checkpoint_ref"].replace("/429-checkpoint-", "/infra-checkpoint-")
+        scenario["checkpoint"]["metadata"]["failure_kind"] = "unavailable"
         # A second catch-up pass must observe the terminal marker and neither
         # extend the deadline nor dispatch another runner.
         scenario["passes"] = 2
@@ -1044,6 +1049,71 @@ class WatchdogHarness(unittest.TestCase):
             ),
             result["notices"],
         )
+
+    def test_legacy_quota_terminal_marker_records_one_stable_backoff(self):
+        scenario = self.generation_exhausted_scenario(next_due=0)
+        scenario["comments"][0]["body"] = scenario["comments"][0]["body"].replace(
+            "state=backoff", "state=owner-action-required"
+        )
+        scenario["passes"] = 2
+        result = self.run_scenario(scenario)
+        self.assert_no_dispatch(result)
+        bodies = [c["body"] for c in result["comments"] if "detail=durable-backoff" in c["body"]]
+        self.assertEqual(len(bodies), 1, result["comments"])
+        due = int(re.search(r"next_due=(\d+)", bodies[0]).group(1))
+        self.assertGreater(due, int(datetime.now(timezone.utc).timestamp()))
+        self.assertNotIn("state=owner-action-required", bodies[0])
+
+    def test_quota_expired_backoff_dispatches_once_even_on_concurrent_wakes(self):
+        scenario = self.generation_exhausted_scenario(next_due=1)
+        scenario["comments"][0]["body"] = scenario["comments"][0]["body"].replace(
+            "detail=generation-exhausted", "detail=durable-backoff"
+        )
+        scenario["checkpoint"]["metadata"]["model"] = "opencode/example-free"
+        scenario["passes"] = 2
+        scenario["concurrent"] = True
+        result = self.run_scenario(scenario)
+        self.assertEqual(len(result["dispatches"]), 1, result["dispatches"])
+        identity = json.loads(result["dispatches"][0]["inputs"]["recovery_identity"])
+        self.assertEqual(identity["recovery_generation"], "4")
+        self.assertEqual(identity["recovery_checkpoint_sha"], NEW_SHA)
+
+    def test_confirmed_quota_waits_for_provider_not_before(self):
+        scenario = self.generation_exhausted_scenario(next_due=0)
+        scenario["comments"][0]["body"] = scenario["comments"][0]["body"].replace(
+            "state=backoff", "state=owner-action-required"
+        )
+        due = int(datetime.now(timezone.utc).timestamp()) + 7200
+        scenario["checkpoint"]["metadata"]["not_before"] = str(due)
+        scenario["passes"] = 2
+        result = self.run_scenario(scenario)
+        self.assert_no_dispatch(result)
+        self.assertIn("next_due=" + str(due), "\n".join(c["body"] for c in result["comments"]))
+
+    def test_quota_blocked_or_paused_does_not_resume(self):
+        for hold in ("automation:blocked", "automation:paused"):
+            scenario = base_scenario()
+            scenario["issues"] = [{"number": 382, "state": "open", "labels": [{"name": hold}]}]
+            self.assert_no_dispatch(self.run_scenario(scenario))
+
+    def test_quota_recovery_ignores_transient_qualifying_and_no_auto_merge_labels(self):
+        # Qualifying and no-auto-merge are workflow state, not operator STOPs.
+        # A quota generation whose reservation stays pending must still resume.
+        for label in ("automation:qualifying", "no-auto-merge"):
+            with self.subTest(label=label):
+                scenario = base_scenario()
+                scenario["issues"] = [
+                    {"number": 382, "state": "open", "labels": [{"name": label}]}
+                ]
+                result = self.run_scenario(scenario)
+                self.assert_one_current_dispatch(result, NEW_SHA)
+
+    def test_non_quota_checkpoint_cannot_use_quota_dispatch(self):
+        scenario = self.generation_exhausted_scenario(next_due=1)
+        scenario["checkpoint"]["metadata"]["failure_kind"] = "unavailable"
+        result = self.run_scenario(scenario)
+        self.assert_no_dispatch(result)
+        self.assertIn("state=metadata-failed", "\n".join(c["body"] for c in result["comments"]))
 
     def test_exhausted_generation_does_not_reset_an_unexpired_cooldown(self):
         future = int(datetime.now(timezone.utc).timestamp()) + 3600
@@ -1590,6 +1660,18 @@ class WatchdogHarness(unittest.TestCase):
         self.assert_no_dispatch(
             self.run_scenario(later_marker_not_authoritative)
         )
+
+    def test_admission_only_success_does_not_trigger_normal_retry(self):
+        scenario = self.normal_retry_scenario()
+        scenario["triggerRun"]["conclusion"] = "success"
+        scenario["jobs"] = [
+            {"id": 100, "name": "call / Admit OpenCode event", "conclusion": "success"},
+            {"id": 101, "name": "call / opencode", "conclusion": "skipped"},
+        ]
+        result = self.run_scenario(scenario)
+        self.assertEqual(self.retried_bodies(result), [])
+        self.assert_no_dispatch(result)
+        self.assertTrue(any("admission-only" in str(n) for n in result["notices"]))
 
     def test_normal_retry_path_honors_the_hold(self):
         scenario = self.normal_retry_scenario()

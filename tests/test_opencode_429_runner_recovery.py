@@ -174,7 +174,8 @@ class OpenCode429RunnerRecoveryContractTest(unittest.TestCase):
         recovery_fn = self.watchdog.split(
             "async function recoverFrom429OnFreshVm"
         )[-1].split("if (publishRaceRestartRequired)")[0]
-        self.assertNotIn("pausedLabel", recovery_fn)
+        self.assertIn("holdLabels = [pausedLabel, blockedLabel", recovery_fn)
+        self.assertNotIn("removeLabel(pausedLabel)", recovery_fn)
         self.assertNotIn("addLabel(pausedLabel)", recovery_fn)
         self.assertNotIn("retryMarker", recovery_fn)
         self.assertNotIn("previousRetries", recovery_fn)

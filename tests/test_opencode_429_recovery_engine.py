@@ -43,6 +43,7 @@ from continuum.opencode_429_recovery import (
     validate_recovery_inputs,
     validate_recovery_metadata,
     DEFAULT_MAX_429_RUNNER_RESTARTS,
+    durable_backoff_seconds,
     RUNNER_DEATH_EXIT_CODE,
 )
 
@@ -558,6 +559,17 @@ class BudgetAndBackoffTest(unittest.TestCase):
         self.assertGreater(second, first)
         self.assertEqual(infra_backoff_seconds(99), infra_backoff_seconds(100))
 
+    def test_durable_backoff_waits_grow_and_saturate_after_fast_budget(self):
+        self.assertEqual([durable_backoff_seconds(g, 3) for g in range(1, 10)],
+                         [0, 0, 0, 60, 300, 900, 1800, 3600, 3600])
+
+    def test_durable_backoff_uses_safe_defaults_for_invalid_budgets(self):
+        self.assertEqual(durable_backoff_seconds("invalid", 3), 0)
+        self.assertEqual(durable_backoff_seconds(4), 60)
+        self.assertEqual(durable_backoff_seconds(4, ""), 60)
+        self.assertEqual(durable_backoff_seconds(4, "invalid"), 60)
+        self.assertEqual(durable_backoff_seconds(1, -3), 60)
+
     def test_cooldown_only_after_fast_replacements_exhausted(self):
         self.assertFalse(
             should_enter_infra_cooldown(1, DEFAULT_MAX_429_RUNNER_RESTARTS)
@@ -740,6 +752,13 @@ class RecoveryMetadataValidationTests(unittest.TestCase):
             self.metadata(), generation="1"
         )
         self.assertTrue(ok, reason)
+
+    def test_legacy_and_bound_model_metadata(self):
+        self.assertTrue(validate_recovery_metadata(self.metadata())[0])
+        self.assertTrue(validate_recovery_metadata(
+            self.metadata(model="opencode/example-free", not_before="123"))[0])
+        self.assertFalse(validate_recovery_metadata(self.metadata(model="untrusted"))[0])
+        self.assertFalse(validate_recovery_metadata(self.metadata(retry_after_seconds="-1"))[0])
 
     def test_non_integer_pointer_generation_fails_closed(self):
         # A malformed pointer generation must be an explicit validation
