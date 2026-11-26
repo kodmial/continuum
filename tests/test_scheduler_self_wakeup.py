@@ -298,6 +298,10 @@ def event_context(
     schedule=None,
     workflow_run=None,
     inputs=None,
+    label=None,
+    issue_state=None,
+    issue_pull_request=None,
+    pause_label=None,
 ):
     return {
         "github": {
@@ -312,10 +316,15 @@ def event_context(
                 "action": action,
                 "schedule": schedule,
                 "workflow_run": workflow_run or {},
-                "issue": {"number": 439},
+                "issue": {
+                    "number": 439,
+                    "state": issue_state,
+                    "pull_request": issue_pull_request,
+                },
+                "label": {"name": label},
             },
         },
-        "vars": {"CONTINUUM_ROLE": role},
+        "vars": {"CONTINUUM_ROLE": role, "AUTOMATION_PAUSE_LABEL": pause_label},
         "inputs": inputs or {},
     }
 
@@ -722,6 +731,146 @@ class ActualSchedulerConditionTests(unittest.TestCase):
         )
 
 
+class WatchdogPeriodicGateTests(unittest.TestCase):
+    """A skipped or stale caller run is never evidence of watchdog work."""
+
+    def setUp(self):
+        workflow = yaml.safe_load((ROOT / ".github/workflows/continuum-opencode-watchdog.yml").read_text(encoding="utf-8"))
+        self.steps = workflow["jobs"]["recover"]["steps"]
+        gate = next(step for step in self.steps if step.get("id") == "periodic_gate")
+        self.script = gate["with"]["script"]
+        self.condition = gate["if"]
+        self.concurrent = workflow["concurrency"]
+
+    def run_gate(self, candidates, jobs, *, error=False, context=None, workflow_id=369085546):
+        harness = r"""
+const scenario = JSON.parse(process.argv[1]);
+const source = process.argv[2];
+Date.now = () => Date.parse('2026-11-26T18:08:00Z');
+const context = Object.assign({
+  repo: { owner: 'kodmial', repo: 'continuum' },
+  payload: { repository: { default_branch: 'main' } },
+  ref: 'refs/heads/main', sha: 'abc', runId: 999,
+}, scenario.context || {});
+const outputs = {}, calls = [], warnings = [];
+const github = {rest: {actions: {
+  getWorkflowRun: async params => {
+    calls.push(['caller', params]);
+    return {data: {workflow_id: scenario.workflow_id}};
+  },
+  listWorkflowRuns: async params => {
+    calls.push(['runs', params]);
+    if (scenario.error) throw new Error('API unavailable');
+    return {data: {workflow_runs: scenario.candidates}};
+  },
+  listJobsForWorkflowRun: async params => {
+    calls.push(['jobs', params]);
+    return {data: {jobs: scenario.jobs[params.run_id] || []}};
+  },
+}}};
+const core = {
+  setOutput: (key, value) => outputs[key] = value,
+  notice: () => {},
+  warning: text => warnings.push(text),
+};
+const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor;
+(async () => {
+  await new AsyncFunction('github', 'context', 'core', source)(github, context, core);
+  console.log(JSON.stringify({outputs, calls, warnings}));
+})().catch(err => { console.error(err); process.exitCode = 1; });
+"""
+        result = subprocess.run(
+            ["node", "-e", harness, json.dumps(dict(candidates=candidates, jobs=jobs, error=error, context=context, workflow_id=workflow_id)), self.script],
+            capture_output=True, text=True, check=True,
+        )
+        return json.loads(result.stdout)
+
+    @staticmethod
+    def candidate(**extra):
+        return dict(id=101, event="schedule", head_sha="abc", head_branch="main", status="completed", created_at="2026-11-26T18:01:00Z", **extra)
+
+    @staticmethod
+    def job(attest="success", conclusion="success"):
+        return {"name": "watchdog / recover", "status": "completed", "conclusion": conclusion,
+                "steps": [{"name": "Attest completed watchdog catch-up", "conclusion": attest}]}
+
+    def test_gate_only_applies_to_self_dogfood_periodic_sources(self):
+        for event, schedule, inputs, repo, workflow, expected in (
+            ("schedule", "*/15 * * * *", {}, "kodmial/continuum", "Continuum automation", True),
+            ("schedule", "17,47 * * * *", {}, "kodmial/continuum", "Continuum automation", False),
+            ("workflow_dispatch", None, {"watchdog_only": True, "periodic_wake": "true"}, "kodmial/continuum", "Continuum automation", True),
+            ("workflow_dispatch", None, {"watchdog_only": "true", "periodic_wake": "true"}, "kodmial/continuum", "Continuum automation", True),
+            ("workflow_dispatch", None, {"watchdog_only": True}, "kodmial/continuum", "Continuum automation", False),
+            ("workflow_dispatch", None, {"periodic_wake": "true"}, "kodmial/continuum", "Continuum automation", False),
+            ("workflow_run", None, {}, "kodmial/continuum", "Continuum automation", False),
+            ("issues", None, {}, "kodmial/continuum", "Continuum automation", False),
+            ("schedule", "*/15 * * * *", {}, "consumer/repo", "OpenCode watchdog", False),
+            ("schedule", "*/15 * * * *", {}, "kodmial/continuum", "Other caller", False),
+        ):
+            with self.subTest(event=event, inputs=inputs, repo=repo, workflow=workflow):
+                context = event_context(event, schedule=schedule, inputs=inputs)
+                context["github"].update(repository=repo, workflow=workflow)
+                self.assertEqual(expected, admitted(self.condition, context))
+
+    def test_actual_successful_watchdog_evidence_skips_duplicate(self):
+        for event in ("schedule", "workflow_dispatch"):
+            run = self.candidate()
+            run["event"] = event
+            result = self.run_gate([run], {101: [self.job()]})
+            self.assertEqual({"skip": "true"}, result["outputs"])
+            self.assertEqual("caller", result["calls"][0][0])
+            self.assertEqual(999, result["calls"][0][1]["run_id"])
+            params = result["calls"][1][1]
+            self.assertEqual(369085546, params["workflow_id"])
+            self.assertEqual("abc", params["head_sha"])
+            self.assertEqual("main", params["branch"])
+            self.assertEqual(">=2026-11-26T18:00:00Z", params["created"])
+            self.assertEqual(100, params["per_page"])
+
+    def test_noop_missing_failed_stale_and_auto_merge_only_runs_do_not_skip(self):
+        bad_jobs = [
+            [], [{"name": "auto-merge / controller", "status": "completed", "conclusion": "success"}],
+            [self.job(attest="skipped")], [self.job(conclusion="failure")],
+            [self.job(conclusion="cancelled")],
+        ]
+        for jobs in bad_jobs:
+            self.assertEqual({}, self.run_gate([self.candidate()], {101: jobs})["outputs"])
+        for change in (
+            {"head_sha": "old"}, {"head_branch": "non-main"}, {"id": 999},
+            {"status": "in_progress"}, {"created_at": "2026-11-26T17:59:00Z"},
+            {"event": "workflow_run"},
+            {"event": "workflow_dispatch", "display_title": "Continuum automation [continuum-auto-merge-only]"},
+        ):
+            run = self.candidate()
+            run.update(change)
+            self.assertEqual({}, self.run_gate([run], {101: [self.job()]})["outputs"])
+
+    def test_unavailable_evidence_runs_guarded_pass_and_bounds_inventory(self):
+        unknown = self.run_gate([self.candidate()], {101: [self.job()]}, workflow_id=None)
+        self.assertEqual({}, unknown["outputs"])
+        self.assertEqual(["caller"], [call[0] for call in unknown["calls"]])
+        self.assertTrue(unknown["warnings"])
+        result = self.run_gate([], {}, error=True)
+        self.assertEqual({}, result["outputs"])
+        self.assertTrue(result["warnings"])
+        candidates = []
+        for n in range(40):
+            run = self.candidate()
+            run["id"] = 101 + n
+            candidates.append(run)
+        result = self.run_gate(candidates, {})
+        self.assertEqual(8, len([c for c in result["calls"] if c[0] == "jobs"]))
+        self.assertEqual({}, result["outputs"])
+
+    def test_duplicate_skips_expensive_steps_and_eventless_lanes_are_shared(self):
+        self.assertFalse(self.concurrent["cancel-in-progress"])
+        self.assertIn("github.event_name == 'workflow_run' && github.event.workflow_run.id || 'catch-up'", self.concurrent["group"])
+        for step in self.steps:
+            if step["name"] in ("Checkout Continuum watchdog helpers", "Recover failed OpenCode issue run"):
+                self.assertEqual("steps.periodic_gate.outputs.skip != 'true'", step["if"])
+        attest = next(step for step in self.steps if step["name"] == "Attest completed watchdog catch-up")
+        self.assertEqual("steps.recover.outputs.catch_up_complete == 'true'", attest["if"])
+
 class AutomationAutoMergeOnlyRoutingTests(unittest.TestCase):
     """#470: the external wake must admit only the existing auto-merge job.
 
@@ -849,6 +998,70 @@ class AutomationAutoMergeOnlyRoutingTests(unittest.TestCase):
                     },
                 )
                 self.assertEqual(expected, result)
+
+    def test_watchdog_only_dispatch_is_narrow_and_has_distinct_marker(self):
+        expected = dict.fromkeys(self.AUTO_MERGE_JOBS, False)
+        expected["watchdog"] = True
+        selector = self.events()["workflow_dispatch"]["inputs"]["watchdog_only"]
+        self.assertEqual("boolean", selector["type"])
+        self.assertIs(False, selector["default"])
+        self.assertIs(False, selector["required"])
+        for value in (True, "true"):
+            for periodic in (None, "false", "true"):
+                inputs = {"watchdog_only": value}
+                if periodic is not None:
+                    inputs["periodic_wake"] = periodic
+                with self.subTest(inputs=inputs):
+                    self.assertEqual(expected, self.routing("workflow_dispatch", inputs=inputs))
+                    title = render_run_name(self.workflow["run-name"], "workflow_dispatch", inputs=inputs)
+                    self.assertEqual("Continuum automation [continuum-watchdog-only] [continuum-wake:watchdog-only]", title)
+                    self.assertNotIn("[continuum-wake:true]", title)
+                    self.assertNotIn("[continuum-periodic]", title)
+
+    def test_watchdog_only_false_preserves_broad_dispatch(self):
+        for value in (False, "false"):
+            for periodic in ("true", "false"):
+                with self.subTest(value=value, periodic=periodic):
+                    self.assertEqual(
+                        self.routing("workflow_dispatch", inputs={"periodic_wake": periodic}),
+                        self.routing("workflow_dispatch", inputs={"periodic_wake": periodic, "watchdog_only": value}),
+                    )
+
+    def test_overlapping_selectors_keep_original_auto_merge_only_precedence(self):
+        for auto_merge in (True, "true"):
+            for watchdog in (True, "true"):
+                inputs = {"watchdog_only": watchdog, "auto_merge_only": auto_merge, "periodic_wake": "true"}
+                with self.subTest(inputs=inputs):
+                    self.assertEqual(self.routing("workflow_dispatch", inputs={"auto_merge_only": auto_merge}), self.routing("workflow_dispatch", inputs=inputs))
+                    title = render_run_name(self.workflow["run-name"], "workflow_dispatch", inputs=inputs)
+                    self.assertIn("[continuum-wake:auto-merge-only]", title)
+                    self.assertNotIn("[continuum-watchdog-only]", title)
+
+    def test_owner_unpause_is_an_explicit_watchdog_wake_not_a_generic_issue_event(self):
+        for actor, action, label, issue_state, pull_request, custom_pause, expected in (
+            (OWNER, "unlabeled", "automation:paused", "open", None, None, True),
+            (OWNER, "unlabeled", "custom-pause", "open", None, "custom-pause", True),
+            (OTHER, "unlabeled", "automation:paused", "open", None, None, False),
+            (OWNER, "labeled", "automation:paused", "open", None, None, False),
+            (OWNER, "unlabeled", "automation:ready", "open", None, None, False),
+            (OWNER, "unlabeled", "automation:paused", "closed", None, None, False),
+            (OWNER, "unlabeled", "automation:paused", "open", {"url": "pr"}, None, False),
+        ):
+            with self.subTest(actor=actor, action=action, label=label, state=issue_state):
+                route = self.routing(
+                    "issues",
+                    actor=actor,
+                    action=action,
+                    label=label,
+                    issue_state=issue_state,
+                    issue_pull_request=pull_request,
+                    pause_label=custom_pause,
+                )
+                self.assertEqual(expected, route["watchdog"])
+                self.assertTrue(route["scheduler"])
+                self.assertFalse(route["auto-merge"])
+                self.assertFalse(route["repair"])
+                self.assertFalse(route["global-pr-watchdog"])
 
     def test_auto_merge_only_alone_remains_narrow_for_manual_testing(self):
         expected = {

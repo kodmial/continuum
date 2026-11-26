@@ -1,10 +1,9 @@
 name: Continuum automation
-# A narrow `auto_merge_only` dispatch runs only `auto-merge`, so it is not a
-# scheduler pass. It therefore stamps distinct markers that the scheduler's
-# periodic window gate cannot read as completed scheduler evidence. Broad
-# dispatches keep the #375 markers unchanged.
+# Narrow dispatches are not scheduler passes: their markers must never close
+# the scheduler's periodic window. Existing broad markers stay unchanged.
+# If both selectors are set, the original auto_merge_only mode takes precedence.
 run-name: >-
-  Continuum automation ${{ (github.event_name == 'workflow_dispatch' && (github.event.inputs.auto_merge_only == 'true' || github.event.inputs.auto_merge_only == true)) && '[continuum-auto-merge-only]' || (contains(format(' {0} ', github.event.inputs.periodic_wake), ' true ') && '[continuum-periodic]' || github.event_name) }} ${{ github.event_name == 'workflow_dispatch' && format('[continuum-wake:{0}]', (github.event.inputs.auto_merge_only == 'true' || github.event.inputs.auto_merge_only == true) && 'auto-merge-only' || github.event.inputs.periodic_wake) || '' }}
+  Continuum automation ${{ (github.event_name == 'workflow_dispatch' && (github.event.inputs.auto_merge_only == 'true' || github.event.inputs.auto_merge_only == true)) && '[continuum-auto-merge-only]' || (github.event_name == 'workflow_dispatch' && (github.event.inputs.watchdog_only == 'true' || github.event.inputs.watchdog_only == true)) && '[continuum-watchdog-only]' || (contains(format(' {0} ', github.event.inputs.periodic_wake), ' true ') && '[continuum-periodic]' || github.event_name) }} ${{ github.event_name == 'workflow_dispatch' && format('[continuum-wake:{0}]', (github.event.inputs.auto_merge_only == 'true' || github.event.inputs.auto_merge_only == true) && 'auto-merge-only' || (github.event.inputs.watchdog_only == 'true' || github.event.inputs.watchdog_only == true) && 'watchdog-only' || github.event.inputs.periodic_wake) || '' }}
 
 on:
   workflow_dispatch:
@@ -20,6 +19,14 @@ on:
           Other jobs keep their ordinary dispatch behavior when this is
           false or omitted; it is a mode selector, never an authorization
           override.
+        required: false
+        type: boolean
+        default: false
+      watchdog_only:
+        description: >-
+          Run only the existing OpenCode watchdog catch-up. Use periodic_wake
+          for a deduplicated external timer; omit it for an explicit operator
+          wake. If auto_merge_only is also true, auto_merge_only wins.
         required: false
         type: boolean
         default: false
@@ -64,6 +71,8 @@ jobs:
     if: >-
       inputs.auto_merge_only != true &&
       inputs.auto_merge_only != 'true' &&
+      inputs.watchdog_only != true &&
+      inputs.watchdog_only != 'true' &&
       ((github.event_name == 'schedule' && github.event.schedule == '*/15 * * * *') ||
       github.event_name == 'workflow_dispatch' ||
       github.event_name == 'issues' ||
@@ -116,6 +125,10 @@ jobs:
        github.event.workflow_run.path == '.github/workflows/opencode.yml') ||
       (github.event_name == 'schedule' &&
        github.event.schedule == '*/15 * * * *') ||
+      (github.event_name == 'issues' && github.event.action == 'unlabeled' &&
+       github.actor == github.repository_owner && github.event.issue.state == 'open' &&
+       github.event.issue.pull_request == null &&
+       github.event.label.name == (vars.AUTOMATION_PAUSE_LABEL || 'automation:paused')) ||
       github.event_name == 'workflow_dispatch')
     uses: ./.github/workflows/continuum-opencode-watchdog.yml
     secrets: inherit
@@ -138,7 +151,9 @@ jobs:
 
   auto-merge:
     if: >-
-      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'workflow_dispatch' &&
+       ((inputs.watchdog_only != true && inputs.watchdog_only != 'true') ||
+        inputs.auto_merge_only == true || inputs.auto_merge_only == 'true')) ||
       github.event_name == 'pull_request_review' ||
       github.event_name == 'pull_request_review_comment' ||
       github.event_name == 'status' ||
@@ -167,6 +182,8 @@ jobs:
     if: >-
       inputs.auto_merge_only != true &&
       inputs.auto_merge_only != 'true' &&
+      inputs.watchdog_only != true &&
+      inputs.watchdog_only != 'true' &&
       ((github.event_name == 'schedule' && github.event.schedule == '17,47 * * * *') ||
       (github.event_name == 'workflow_dispatch' && inputs.periodic_wake == 'true'))
     runs-on: ubuntu-latest

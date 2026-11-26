@@ -98,7 +98,9 @@ on:
 permissions: {}
 
 concurrency:
-  group: ${{ github.workflow }}-opencode-watchdog-${{ github.event_name == 'schedule' && 'catch-up' || github.event.workflow_run.id }}
+  # Every eventless catch-up uses one lane; a completion event still keeps its
+  # per-run lane and the durable operation/generation claim fences its effects.
+  group: ${{ github.workflow }}-opencode-watchdog-${{ github.event_name == 'workflow_run' && github.event.workflow_run.id || 'catch-up' }}
   cancel-in-progress: false
 
 jobs:
@@ -137,7 +139,74 @@ jobs:
       READ_GITHUB_TOKEN: ${{ github.token }}
 
     steps:
+      # Only the self-dogfood periodic sources share this cheap window gate.
+      # A completed caller run is not evidence: auto-merge-only/safety-net
+      # runs can succeed with the watchdog skipped. Require the actual
+      # watchdog's completion step at the same default-branch SHA.
+      - name: Admit periodic watchdog catch-up
+        id: periodic_gate
+        if: >-
+          github.repository == 'kodmial/continuum' &&
+          github.workflow == 'Continuum automation' &&
+          ((github.event_name == 'schedule' && github.event.schedule == '*/15 * * * *') ||
+           (github.event_name == 'workflow_dispatch' &&
+            (github.event.inputs.watchdog_only == 'true' || github.event.inputs.watchdog_only == true) &&
+            github.event.inputs.periodic_wake == 'true'))
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
+        with:
+          github-token: ${{ github.token }}
+          script: |
+            const { owner, repo } = context.repo;
+            const branch = context.payload.repository?.default_branch;
+            if (!branch || context.ref !== 'refs/heads/' + branch) return;
+            const windowStart = Math.floor(Date.now() / 900000) * 900000;
+            try {
+              // Resolve the actual caller identity, never a sibling filename:
+              // reusable workflows can be installed under different paths.
+              const current = (await github.rest.actions.getWorkflowRun({
+                owner, repo, run_id: context.runId,
+              })).data;
+              if (!Number.isSafeInteger(current?.workflow_id) || current.workflow_id <= 0) {
+                core.warning('Periodic watchdog caller identity unavailable; running normal guarded catch-up.');
+                return;
+              }
+              const { data } = await github.rest.actions.listWorkflowRuns({
+                owner, repo, workflow_id: current.workflow_id,
+                branch, head_sha: context.sha, status: 'completed',
+                created: '>=' + new Date(windowStart).toISOString().replace(/\.\d{3}Z$/, 'Z'),
+                per_page: 100,
+              });
+              const candidates = (data.workflow_runs || []).filter(run =>
+                Number(run.id) !== Number(context.runId) &&
+                run.head_sha === context.sha && run.head_branch === branch &&
+                run.status === 'completed' &&
+                new Date(run.created_at || 0).getTime() >= windowStart &&
+                (run.event === 'schedule' || run.event === 'workflow_dispatch') &&
+                !String(run.display_title || '').includes('[continuum-auto-merge-only]')
+              ).slice(0, 8);
+              for (const candidate of candidates) {
+                const { data } = await github.rest.actions.listJobsForWorkflowRun({
+                  owner, repo, run_id: candidate.id, filter: 'latest', per_page: 100,
+                });
+                if ((data.jobs || []).some(job =>
+                  job.name === 'watchdog / recover' &&
+                  job.status === 'completed' && job.conclusion === 'success' &&
+                  (job.steps || []).some(step =>
+                    step.name === 'Attest completed watchdog catch-up' &&
+                    step.conclusion === 'success'
+                  )
+                )) {
+                  core.setOutput('skip', 'true');
+                  core.notice('Periodic watchdog catch-up already completed in this window on run ' + candidate.id + '.');
+                  return;
+                }
+              }
+            } catch (err) {
+              core.warning('Periodic watchdog evidence unavailable; running normal guarded catch-up.');
+            }
+
       - name: Checkout Continuum watchdog helpers
+        if: steps.periodic_gate.outputs.skip != 'true'
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           repository: kodmial/continuum
@@ -152,6 +221,8 @@ jobs:
             .github/scripts/opencode_429_dispatch.js
 
       - name: Recover failed OpenCode issue run
+        id: recover
+        if: steps.periodic_gate.outputs.skip != 'true'
         uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
         env:
           CONTINUUM_DISPATCH_HELPER: ${{ github.workspace }}/.continuum-watchdog-engine/.github/scripts/opencode_429_dispatch.js
@@ -1287,9 +1358,12 @@ jobs:
                   per_page: 100,
                 }
               );
-              const issues = reserved
-                .filter(issue => !issue.pull_request)
-                .slice(0, 100);
+              const eligibleIssues = reserved.filter(issue => !issue.pull_request);
+              const issues = eligibleIssues.slice(0, 100);
+              // `reserved` is paginated across every page, so its length is the
+              // true total. Attest completeness only when the inspected slice
+              // covers all of it; any issue left behind fails closed.
+              let inventoryComplete = eligibleIssues.length === issues.length;
               let activeRuns = null;
               let activeRunsError = null;
               let inspected = 0;
@@ -1300,6 +1374,7 @@ jobs:
                     owner, repo, issue_number: listedIssue.number,
                   })).data;
                 } catch (err) {
+                  inventoryComplete = false;
                   core.warning(
                     'OpenCode durable 429 recovery could not re-read issue #' +
                     listedIssue.number + ': ' + (err.message || err)
@@ -1325,6 +1400,7 @@ jobs:
                 try {
                   comments = await listThreadComments(issue.number);
                 } catch (err) {
+                  inventoryComplete = false;
                   core.warning(
                     'OpenCode durable 429 recovery could not read comments for ' +
                     'issue #' + issue.number + ': ' + (err.message || err)
@@ -1360,6 +1436,7 @@ jobs:
                   }
                 }
                 if (activeRunsError) {
+                  inventoryComplete = false;
                   core.warning(
                     'OpenCode durable 429 recovery cannot verify competing ' +
                     'runs for issue #' + issue.number + ' (op=' +
@@ -1415,6 +1492,7 @@ jobs:
                 ' trusted recovery marker(s) on ' + issues.length +
                 ' reserved open issue(s).'
               );
+              return inventoryComplete;
             }
             async function recoverFrom429OnFreshVm({
               owner, repo, run, evacuated429,
@@ -2130,6 +2208,11 @@ jobs:
                 const updated = new Date(candidate.updated_at || candidate.created_at || 0).getTime();
                 return Number.isFinite(updated) && (catchUpNow - updated) < 48 * 60 * 60 * 1000;
               }).slice(0, 8);
+              // `catchUpCandidates` is capped at 8, so a full list may hide
+              // more matching runs. Fail closed unless the slice is clearly
+              // below the cap; otherwise the periodic gate could suppress the
+              // next wake with part of the recent inventory uninspected.
+              let recentInventoryComplete = catchUpCandidates.length < 8;
               for (const candidate of catchUpCandidates) {
                 let candidateJobs = [];
                 try {
@@ -2147,6 +2230,7 @@ jobs:
                     core.warning('GitHub REST rate limit exhausted; stop catch-up until scheduled wake.');
                     return;
                   }
+                  recentInventoryComplete = false;
                   core.warning(
                     'OpenCode 429 catch-up could not list jobs for run ' +
                     candidate.id + ': ' + (err.message || err)
@@ -2157,6 +2241,7 @@ jobs:
                 let candidateMetadataFailed = null;
                 let candidateRestart = false;
                 for (const job of candidateJobs) {
+                  if (job.conclusion === 'skipped') continue;
                   let response;
                   try {
                     response = await fetch(
@@ -2172,9 +2257,11 @@ jobs:
                       }
                     );
                   } catch (err) {
+                    recentInventoryComplete = false;
                     continue;
                   }
                   if (!response.ok) {
+                    recentInventoryComplete = false;
                     if (isExhaustedGithubREST(response)) {
                       core.warning('GitHub REST 403 budget exhausted; stop catch-up until scheduled wake.');
                       return;
@@ -2241,7 +2328,12 @@ jobs:
                 'OpenCode 429 scheduled catch-up inspected ' +
                 catchUpCandidates.length + ' recent completed run(s).'
               );
-              await discoverDurableRecoveryCandidates();
+              const durableInventoryComplete = await discoverDurableRecoveryCandidates();
+              if (recentInventoryComplete && durableInventoryComplete) {
+                core.setOutput('catch_up_complete', 'true');
+              } else {
+                core.warning('Watchdog inventory incomplete; do not suppress the next periodic wake.');
+              }
               return;
             }
             const jobs = await readGithub.paginate(
@@ -2894,3 +2986,8 @@ jobs:
               'Immediately retried issue #' + issueNumber +
               ' after failed OpenCode run ' + run.id + '.'
             );
+
+      - name: Attest completed watchdog catch-up
+        if: steps.recover.outputs.catch_up_complete == 'true'
+        shell: bash
+        run: echo "Bounded watchdog catch-up completed."
