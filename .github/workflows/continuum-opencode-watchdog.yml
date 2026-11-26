@@ -769,9 +769,15 @@ jobs:
                 ' gen ' + String(generation);
             }
 
+            // One wall-clock retry budget shared by every observation in
+            // this pass: a single unstable candidate must not spend the whole
+            // retry allowance before later due candidates are examined.
+            const dispatchObservationSleepBudget = { remainingMs: 30000 };
+
             async function observeDispatchedRun(options) {
               return dispatchRouting.observeDispatchedRun({
                 ...options, owner, repo,
+                sleepBudget: dispatchObservationSleepBudget,
                 listWorkflowRuns: params => readGithub.rest.actions.listWorkflowRuns(params),
                 warn: message => core.warning(message),
                 sleep: ms => new Promise(resolve => setTimeout(resolve, ms)),

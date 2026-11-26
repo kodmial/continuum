@@ -201,7 +201,9 @@ function makeRest() {
             if (end) upperBound = new Date(end).getTime();
           }
           runs = runs.filter(run => {
-            // GitHub creation filters compare inclusive whole seconds.
+            // This fixture models whole-second truncation. Full-precision
+            // `created` comparison is covered by
+            // tests/test_opencode_429_observation.py.
             const at = Math.floor(new Date(run.created_at).getTime() / 1000) * 1000;
             return at >= lowerBound && at <= upperBound;
           });
