@@ -170,7 +170,7 @@ function makeRest() {
           state.workflowRuns.push(scenario.observationAppearAfter.run);
         }
         if ((scenario.observationListErrors || []).includes(callNumber)) {
-          throw apiError(500, 'observation inventory failed');
+          throw apiError(scenario.observationErrorStatus || 500, 'observation inventory failed');
         }
         let runs = state.workflowRuns.slice();
         if (params.event) runs = runs.filter(run => run.event === params.event);
@@ -856,6 +856,20 @@ class WatchdogHarness(unittest.TestCase):
                 result = self.run_scenario(scenario)
                 self.assert_no_dispatch(result)
                 self.assertEqual(2, len(result["observationListCalls"]))
+
+    def test_github_rest_refusal_does_not_poll_or_dispatch(self):
+        for status in (403, 429):
+            with self.subTest(status=status):
+                scenario = base_scenario()
+                now = datetime.now(timezone.utc)
+                scenario["comments"][0]["body"] = recovery_marker(
+                    "claimed", NEW_SHA, "-", next_due=int(now.timestamp()) - 60
+                )
+                scenario["observationListErrors"] = [1]
+                scenario["observationErrorStatus"] = status
+                result = self.run_scenario(scenario)
+                self.assert_no_dispatch(result)
+                self.assertEqual(1, len(result["observationListCalls"]))
 
     def test_later_failed_observations_invalidate_previous_absence(self):
         # A real accepted dispatch becomes visible after the first negative

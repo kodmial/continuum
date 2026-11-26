@@ -144,7 +144,7 @@ jobs:
           # Pinned: these files are executed by require()/python3; never leave
           # them on a mutable ref. Advance the pin only in the same PR that
           # changes them.
-          ref: 2e4c77116194f13ca1f9928cd6e559224f698d91
+          ref: 5e80481449e1bef83d9c3694b4a3941ce5fd33a4
           path: .continuum-watchdog-engine
           fetch-depth: 1
           persist-credentials: false
