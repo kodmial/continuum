@@ -55,6 +55,7 @@ const state = {
   runLookups: [],
   workflowRuns: (scenario.workflowRuns || []).map(run => ({ ...run })),
   workflowRunListCalls: [],
+  observationListCalls: [],
   issues: (scenario.issues || []).map(issue => ({ ...issue })),
   scriptErrors: [],
   notices: [],
@@ -149,7 +150,21 @@ function makeRest() {
       },
     },
     actions: {
-      listWorkflowRuns: async () => state.workflowRuns.map(run => ({ ...run })),
+      listWorkflowRuns: async (params = {}) => {
+        state.observationListCalls.push({ ...params });
+        let runs = state.workflowRuns.slice();
+        if (params.event) runs = runs.filter(run => run.event === params.event);
+        if (params.created && params.created.startsWith('>=')) {
+          const lowerBound = new Date(params.created.slice(2)).getTime();
+          runs = runs.filter(run => new Date(run.created_at).getTime() >= lowerBound);
+        }
+        const total = runs.length;
+        if (params.event || params.created) runs = runs.slice(0, 1000);
+        const pageSize = Number(params.per_page || 30);
+        const offset = (Number(params.page || 1) - 1) * pageSize;
+        return { data: { total_count: total,
+          workflow_runs: runs.slice(offset, offset + pageSize) } };
+      },
       listWorkflowRunsForRepo: async (params = {}) => {
         state.workflowRunListCalls.push({
           status: params.status || null,
@@ -366,6 +381,7 @@ async function runOnce() {
     notices: state.notices,
     runLookups: state.runLookups,
     workflowRunListCalls: state.workflowRunListCalls,
+    observationListCalls: state.observationListCalls,
     scriptErrors: state.scriptErrors,
   };
   fs.writeFileSync(resultPath, JSON.stringify(result, null, 2), 'utf8');
@@ -656,6 +672,51 @@ class WatchdogHarness(unittest.TestCase):
             any("run=5001" in body for body in observed),
             "the new observed marker must record the real dispatched run id",
         )
+
+    def test_dispatch_observation_does_not_scan_historical_runs(self):
+        scenario = base_scenario()
+        historic = (datetime.now(timezone.utc) - timedelta(days=1)).isoformat()
+        scenario["workflowRuns"] = [
+            {
+                "id": index + 90000,
+                "event": "workflow_dispatch",
+                "created_at": historic,
+                "status": "completed",
+                "display_title": "Old OpenCode dispatch",
+                "path": ".github/workflows/opencode.yml",
+            }
+            for index in range(3000)
+        ]
+        result = self.run_scenario(scenario)
+        self.assert_one_current_dispatch(result, NEW_SHA)
+        calls = result["observationListCalls"]
+        self.assertEqual(len(calls), 1, "observation must not read historical pages")
+        self.assertEqual(calls[0]["event"], "workflow_dispatch")
+        self.assertTrue(calls[0]["created"].startswith(">="))
+        self.assertTrue(any("state=observed" in item["body"] and "run=5001" in item["body"]
+                            for item in result["comments"]))
+
+    def test_truncated_observation_does_not_redispatch_expired_claim(self):
+        scenario = base_scenario()
+        now = datetime.now(timezone.utc)
+        scenario["comments"][0]["body"] = recovery_marker(
+            "claimed", NEW_SHA, "-", next_due=int(now.timestamp()) - 60
+        )
+        scenario["workflowRuns"] = [
+            {
+                "id": index + 90000,
+                "event": "workflow_dispatch",
+                "created_at": now.isoformat(),
+                "status": "completed",
+                "display_title": "Unrelated dispatch",
+                "path": ".github/workflows/opencode.yml",
+            }
+            for index in range(1100)
+        ]
+        result = self.run_scenario(scenario)
+        self.assert_no_dispatch(result)
+        self.assertTrue(any("state=claimed" in item["body"]
+                            for item in result["comments"]))
 
     def test_sequential_catch_up_sees_live_recovery_and_does_not_duplicate(self):
         scenario = base_scenario()

@@ -700,13 +700,20 @@ jobs:
             async function observeDispatchedRun({
               target, notBefore, displayTitle, recoveryRunName, oldRunId,
             }) {
+              let complete = false;
               for (let attempt = 0; attempt < 10; attempt += 1) {
+                complete = false;
                 try {
                   const runs = await readGithub.paginate(
                     readGithub.rest.actions.listWorkflowRuns,
                     {
                       owner, repo, workflow_id: target.workflowId,
-                      per_page: 50,
+                      event: 'workflow_dispatch',
+                      // Filter on the server before paginating. Without a
+                      // lower date bound a single observation scanned all past
+                      // runs and blocked other due recovery candidates.
+                      created: '>=' + new Date(Math.max(0, notBefore - 5000)).toISOString(),
+                      per_page: 100,
                     }
                   );
                   const candidates = runs.filter(candidate => {
@@ -727,7 +734,13 @@ jobs:
                   // when it is unambiguous, to the single new dispatch run. A
                   // missing/unrelated display_title must never turn an
                   // observable dispatch into an accepted-but-unowned one.
-                  let match = byTitle(recoveryRunName) || byTitle(displayTitle);
+                  const exact = byTitle(recoveryRunName);
+                  if (exact) return exact;
+                  // GitHub caps filtered run searches at 1,000 results.
+                  // A truncated or failed inventory cannot prove absence.
+                  if (runs.length >= 1000) return { incomplete: true };
+                  complete = true;
+                  let match = byTitle(displayTitle);
                   if (!match) {
                     const ordered = candidates.slice().sort((a, b) =>
                       new Date(a.created_at || 0).getTime() -
@@ -749,7 +762,7 @@ jobs:
                   await new Promise(resolve => setTimeout(resolve, 5000));
                 }
               }
-              return null;
+              return complete ? null : { incomplete: true };
             }
 
             // A recorded `observed` marker is an ownership fence only while
@@ -1734,6 +1747,10 @@ jobs:
                     recoveryRunName: recoveryTitle,
                     oldRunId: run && run.id,
                   });
+                  if (recovered && recovered.incomplete) {
+                    core.warning('Incomplete dispatch inventory; keeping recovery claim.');
+                    return;
+                  }
                   if (recovered) {
                     await recordRecoveryState({
                       ...baseState,
@@ -2058,7 +2075,7 @@ jobs:
                 recoveryRunName: recoveryTitle,
                 oldRunId: run && run.id,
               });
-              if (!observed) {
+              if (!observed || observed.incomplete) {
                 await recordRecoveryState({
                   ...baseState,
                   checkpointSha,
