@@ -2254,11 +2254,11 @@ jobs:
                     continue;
                   }
                   if (!response.ok) {
+                    recentInventoryComplete = false;
                     if (isExhaustedGithubREST(response)) {
                       core.warning('GitHub REST 403 budget exhausted; stop catch-up until scheduled wake.');
                       return;
                     }
-                    recentInventoryComplete = false;
                     continue;
                   }
                   const logText = await response.text();
