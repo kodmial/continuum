@@ -334,9 +334,14 @@ async function runOnce() {
     setFailed: (...args) => state.notices.push(['failed', ...args.map(String)]),
     setOutput: (key, value) => state.outputs.push([key, value]),
   };
+  const payload = {};
+  if (scenario.triggerRun) payload.workflow_run = scenario.triggerRun;
+  if (scenario.issue) payload.issue = scenario.issue;
   const context = {
     repo: { owner: scenario.owner || 'kodmial', repo: scenario.repo || 'continuum' },
-    payload: { workflow_run: scenario.triggerRun || null },
+    event_name: scenario.eventName ||
+      (scenario.triggerRun ? 'workflow_run' : 'schedule'),
+    payload,
   };
   const fn = new AsyncFunction(
     'github', 'context', 'core', 'fetch', 'require', 'process', 'Buffer',
@@ -1237,6 +1242,68 @@ class WatchdogHarness(unittest.TestCase):
         scenario = self.durable_scenario()
         result = self.run_scenario(scenario)
         self.assertIn(["catch_up_complete", "true"], result["outputs"])
+
+    def test_owner_unpause_issues_event_runs_durable_catch_up(self):
+        # The new `issues` wake carries no `workflow_run` payload at all, so it
+        # must fall into the eventless catch-up lane instead of failing.
+        scenario = self.durable_scenario()
+        scenario["eventName"] = "issues"
+        scenario["issue"] = {
+            "number": 382,
+            "state": "open",
+            "labels": [
+                {"name": "automation:in-progress"},
+                {"name": "automation:ready"},
+            ],
+        }
+        result = self.run_scenario(scenario)
+        self.assert_one_current_dispatch(result, NEW_SHA)
+        self.assertIn(["catch_up_complete", "true"], result["outputs"])
+
+    def test_truncated_recent_inventory_is_not_attested(self):
+        scenario = self.durable_scenario()
+        now = datetime.now(timezone.utc)
+        recent = []
+        for index in range(9):
+            recent.append({
+                "id": 700000 + index,
+                "status": "completed",
+                "conclusion": "success",
+                "event": "workflow_dispatch",
+                "path": ".github/workflows/opencode.yml",
+                "name": "OpenCode agent",
+                "display_title": "OpenCode recent run " + str(index),
+                "created_at": (
+                    now - timedelta(minutes=index + 1)
+                ).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "updated_at": (
+                    now - timedelta(minutes=index + 1)
+                ).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            })
+        scenario["workflowRuns"] = recent + scenario["workflowRuns"]
+        result = self.run_scenario(scenario)
+        self.assertNotIn(["catch_up_complete", "true"], result["outputs"])
+
+    def test_durable_inventory_fetch_is_paginated(self):
+        start = self.source.index("async function discoverDurableRecoveryCandidates")
+        end = self.source.index("async function recoverFrom429OnFreshVm")
+        block = self.source[start:end]
+        self.assertRegex(
+            block,
+            r"readGithub\.paginate\(\s*readGithub\.rest\.issues\.listForRepo",
+        )
+
+    def test_more_than_one_hundred_reserved_issues_fail_closed(self):
+        scenario = self.durable_scenario()
+        for number in range(1000, 1102):
+            scenario["issues"].append({
+                "number": number,
+                "state": "open",
+                "title": "Reserved issue " + str(number),
+                "labels": [{"name": "automation:in-progress"}],
+            })
+        result = self.run_scenario(scenario)
+        self.assertNotIn(["catch_up_complete", "true"], result["outputs"])
 
     def test_scheduled_active_run_lookup_failure_fails_closed(self):
         scenario = self.durable_scenario()

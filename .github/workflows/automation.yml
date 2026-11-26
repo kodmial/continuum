@@ -127,6 +127,7 @@ jobs:
        github.event.schedule == '*/15 * * * *') ||
       (github.event_name == 'issues' && github.event.action == 'unlabeled' &&
        github.actor == github.repository_owner && github.event.issue.state == 'open' &&
+       github.event.issue.pull_request == null &&
        github.event.label.name == (vars.AUTOMATION_PAUSE_LABEL || 'automation:paused')) ||
       github.event_name == 'workflow_dispatch')
     uses: ./.github/workflows/continuum-opencode-watchdog.yml

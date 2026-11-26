@@ -173,7 +173,7 @@ jobs:
               const { data } = await github.rest.actions.listWorkflowRuns({
                 owner, repo, workflow_id: current.workflow_id,
                 branch, head_sha: context.sha, status: 'completed',
-                created: '>=' + new Date(windowStart).toISOString(),
+                created: '>=' + new Date(windowStart).toISOString().replace(/\.\d{3}Z$/, 'Z'),
                 per_page: 100,
               });
               const candidates = (data.workflow_runs || []).filter(run =>
@@ -1360,7 +1360,10 @@ jobs:
               );
               const eligibleIssues = reserved.filter(issue => !issue.pull_request);
               const issues = eligibleIssues.slice(0, 100);
-              let inventoryComplete = eligibleIssues.length <= 100;
+              // `reserved` is paginated across every page, so its length is the
+              // true total. Attest completeness only when the inspected slice
+              // covers all of it; any issue left behind fails closed.
+              let inventoryComplete = eligibleIssues.length === issues.length;
               let activeRuns = null;
               let activeRunsError = null;
               let inspected = 0;
@@ -2205,7 +2208,11 @@ jobs:
                 const updated = new Date(candidate.updated_at || candidate.created_at || 0).getTime();
                 return Number.isFinite(updated) && (catchUpNow - updated) < 48 * 60 * 60 * 1000;
               }).slice(0, 8);
-              let recentInventoryComplete = true;
+              // `catchUpCandidates` is capped at 8, so a full list may hide
+              // more matching runs. Fail closed unless the slice is clearly
+              // below the cap; otherwise the periodic gate could suppress the
+              // next wake with part of the recent inventory uninspected.
+              let recentInventoryComplete = catchUpCandidates.length < 8;
               for (const candidate of catchUpCandidates) {
                 let candidateJobs = [];
                 try {

@@ -300,6 +300,7 @@ def event_context(
     inputs=None,
     label=None,
     issue_state=None,
+    issue_pull_request=None,
     pause_label=None,
 ):
     return {
@@ -315,7 +316,11 @@ def event_context(
                 "action": action,
                 "schedule": schedule,
                 "workflow_run": workflow_run or {},
-                "issue": {"number": 439, "state": issue_state},
+                "issue": {
+                    "number": 439,
+                    "state": issue_state,
+                    "pull_request": issue_pull_request,
+                },
                 "label": {"name": label},
             },
         },
@@ -819,7 +824,7 @@ const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor;
             self.assertEqual(369085546, params["workflow_id"])
             self.assertEqual("abc", params["head_sha"])
             self.assertEqual("main", params["branch"])
-            self.assertEqual(">=2026-11-26T18:00:00.000Z", params["created"])
+            self.assertEqual(">=2026-11-26T18:00:00Z", params["created"])
             self.assertEqual(100, params["per_page"])
 
     def test_noop_missing_failed_stale_and_auto_merge_only_runs_do_not_skip(self):
@@ -1033,16 +1038,25 @@ class AutomationAutoMergeOnlyRoutingTests(unittest.TestCase):
                     self.assertNotIn("[continuum-watchdog-only]", title)
 
     def test_owner_unpause_is_an_explicit_watchdog_wake_not_a_generic_issue_event(self):
-        for actor, action, label, issue_state, custom_pause, expected in (
-            (OWNER, "unlabeled", "automation:paused", "open", None, True),
-            (OWNER, "unlabeled", "custom-pause", "open", "custom-pause", True),
-            (OTHER, "unlabeled", "automation:paused", "open", None, False),
-            (OWNER, "labeled", "automation:paused", "open", None, False),
-            (OWNER, "unlabeled", "automation:ready", "open", None, False),
-            (OWNER, "unlabeled", "automation:paused", "closed", None, False),
+        for actor, action, label, issue_state, pull_request, custom_pause, expected in (
+            (OWNER, "unlabeled", "automation:paused", "open", None, None, True),
+            (OWNER, "unlabeled", "custom-pause", "open", None, "custom-pause", True),
+            (OTHER, "unlabeled", "automation:paused", "open", None, None, False),
+            (OWNER, "labeled", "automation:paused", "open", None, None, False),
+            (OWNER, "unlabeled", "automation:ready", "open", None, None, False),
+            (OWNER, "unlabeled", "automation:paused", "closed", None, None, False),
+            (OWNER, "unlabeled", "automation:paused", "open", {"url": "pr"}, None, False),
         ):
             with self.subTest(actor=actor, action=action, label=label, state=issue_state):
-                route = self.routing("issues", actor=actor, action=action, label=label, issue_state=issue_state, pause_label=custom_pause)
+                route = self.routing(
+                    "issues",
+                    actor=actor,
+                    action=action,
+                    label=label,
+                    issue_state=issue_state,
+                    issue_pull_request=pull_request,
+                    pause_label=custom_pause,
+                )
                 self.assertEqual(expected, route["watchdog"])
                 self.assertTrue(route["scheduler"])
                 self.assertFalse(route["auto-merge"])
