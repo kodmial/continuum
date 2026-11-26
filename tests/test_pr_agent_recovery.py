@@ -1055,6 +1055,8 @@ const repoFullName = 'child-owner/child-repo';
 const delegatedTarget = true;
 const HEAD = 'a'.repeat(40);
 const OLD_HEAD = 'b'.repeat(40);
+const BASE = 'c'.repeat(40);
+const OLD_BASE = 'd'.repeat(40);
 const NOW = Date.parse('2026-11-25T12:00:00Z');
 let clock = NOW;
 let runMetadataById = new Map();
@@ -1087,6 +1089,7 @@ function reset() {
       mergeable_state: 'dirty',
       labels: [],
       head: { sha: HEAD, repo: { full_name: repoFullName } },
+      base: { ref: 'main', sha: BASE, repo: { full_name: repoFullName } },
     },
     statuses: [],
     comments: [],
@@ -1129,6 +1132,7 @@ function freshPr(overrides = {}) {
     mergeable_state: 'dirty',
     labels: [],
     head: { sha: HEAD, repo: { full_name: repoFullName } },
+    base: { ref: 'main', sha: BASE, repo: { full_name: repoFullName } },
   }, overrides);
 }
 function decide(overrides = {}) {
@@ -1250,6 +1254,7 @@ const localFresh = (overrides = {}) => Object.assign({
   mergeable_state: 'dirty',
   labels: [],
   head: { sha: HEAD, repo: { full_name: repoFullName } },
+  base: { ref: 'main', sha: BASE, repo: { full_name: repoFullName } },
 }, overrides);
 const localDecide = (overrides = {}) => decideDelegatedConflict(Object.assign({
   delegated: true,
@@ -1324,7 +1329,28 @@ expect({
   conflictMarkers: [markerAt(300)],
   repairStatus: { state: 'failure', description: 'deterministic; recovery held' },
 }, 'hold');
-expect({ repairStatus: { state: 'success' } }, 'settled');
+// A success status is terminal only for the base it integrated. A stale
+// success (old base or no base evidence) must not suppress a new conflict
+// episode caused by a default-branch advance.
+expect({
+  repairStatus: { state: 'success', description: 'PR-Agent repair settled; base ' + BASE },
+}, 'settled');
+expect({
+  repairStatus: { state: 'success', description: 'PR-Agent repair settled; base ' + OLD_BASE },
+}, 'dispatch', 0);
+expect({ repairStatus: { state: 'success' } }, 'dispatch', 0);
+expect({
+  conflictMarkers: [markerAt(10)],
+  repairStatus: { state: 'success', description: 'PR-Agent repair settled; base ' + OLD_BASE },
+}, 'wait');
+expect({
+  conflictMarkers: [markerAt(300)],
+  repairStatus: { state: 'success', description: 'PR-Agent repair settled; base ' + OLD_BASE },
+}, 'retry', 1);
+expect({
+  conflictMarkers: [markerAt(7200)],
+  repairStatus: { state: 'success', description: 'PR-Agent repair settled; base ' + OLD_BASE },
+}, 'retry', 1);
 expect({
   conflictMarkers: [markerAt(7200), markerAt(7200), markerAt(7200)],
 }, 'hold');
@@ -1489,6 +1515,26 @@ assert.strictEqual(await maybeAdmitDelegatedConflict(pr, HEAD), true);
 assert.strictEqual(state.dispatches.length, 1);
 assert.strictEqual(state.dispatches[0].inputs.mode, 'conflict');
 assert.strictEqual(state.dispatches[0].inputs.retry_attempt, '1');
+
+// A success status from the current base is terminal.
+reset();
+state.comments.push(marker(HEAD, 300));
+state.statuses.push(repairStatus(
+  'success', 'PR-Agent repair settled; base ' + BASE, 300,
+));
+assert.strictEqual(await maybeAdmitDelegatedConflict(pr, HEAD), true);
+assert.strictEqual(state.dispatches.length, 0, 'current-base success is terminal');
+
+// A success status from an earlier base must not suppress a new conflict
+// episode caused by a default-branch advance.
+reset();
+state.comments.push(marker(HEAD, 300));
+state.statuses.push(repairStatus(
+  'success', 'PR-Agent repair settled; base ' + OLD_BASE, 300,
+));
+assert.strictEqual(await maybeAdmitDelegatedConflict(pr, HEAD), true);
+assert.strictEqual(state.dispatches.length, 1, 'stale-base success starts the new episode');
+assert.strictEqual(state.dispatches[0].inputs.mode, 'conflict');
 
 // Deterministic failures stop instead of consuming the bounded budget.
 reset();

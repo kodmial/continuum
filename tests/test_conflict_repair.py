@@ -280,6 +280,7 @@ class PrAgentConflictPublishGuardTests(unittest.TestCase):
             GIT_AUTHOR_EMAIL="continuum-test@example.invalid",
             GIT_COMMITTER_NAME="Continuum Test",
             GIT_COMMITTER_EMAIL="continuum-test@example.invalid",
+            RUNNER_TEMP=self.tmp,
         )
         self._git("init", "-q", "-b", "main")
         self._git("config", "user.name", "Continuum Test")
@@ -384,6 +385,32 @@ class PrAgentConflictPublishGuardTests(unittest.TestCase):
         self.assertNotEqual(completed.returncode, 0)
         self.assertIn("conflict markers", completed.stderr + completed.stdout)
         self.assertIn("classification=deterministic", outputs)
+
+    def test_large_staged_diff_with_early_marker_still_fails_closed(self):
+        # A `git diff | grep -q` pipeline can fail open when grep exits early
+        # and git receives SIGPIPE. The guard must capture the diff first so
+        # a large staged result cannot publish surviving conflict markers.
+        merge = self._merge_base()
+        self.assertNotEqual(merge.returncode, 0, "fixture must conflict")
+        self._write(
+            "shared.txt",
+            "<<<<<<< HEAD\nfeature\n=======\nmain\n>>>>>>> main\n",
+        )
+        self._git("add", "shared.txt")
+        large = os.path.join(self.repo, "large.txt")
+        with open(large, "w", encoding="utf-8") as handle:
+            handle.write("<<<<<<< HEAD\nfeature\n=======\nmain\n>>>>>>> main\n")
+            for index in range(200000):
+                handle.write("padding line %d\n" % index)
+        self._git("add", "large.txt")
+        completed, outputs = self._run_script(self.precommit_guard)
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertIn("conflict markers", completed.stderr + completed.stdout)
+        self.assertIn("classification=deterministic", outputs)
+        self.assertTrue(
+            os.path.exists(os.path.join(self.tmp, "conflict-staged.diff")),
+            "the guard must inspect a captured diff instead of a pipe",
+        )
 
     def test_result_without_integrated_base_is_rejected(self):
         completed, outputs = self._run_script(self.postcommit_guard)

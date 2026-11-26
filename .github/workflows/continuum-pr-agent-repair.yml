@@ -961,6 +961,10 @@ jobs:
               echo "::error::Conflict repair could not resolve the integrated base commit; discarding repair."
               exit 1
             fi
+            # Record the integrated base on the durable success status so
+            # recovery can tell a settled episode from a stale success after
+            # a later default-branch advance.
+            echo "base_sha=$BASE_SHA" >> "$GITHUB_OUTPUT"
           fi
           if [[ "${MODE,,}" == "conflict" ]]; then
             # Conflict mode is delegated from the PR-Agent auto-merge
@@ -1064,7 +1068,17 @@ jobs:
               echo "::error::Conflict repair left unresolved index entries; discarding repair."
               exit 1
             fi
-            if git diff --cached -U0 | grep -qE '^\+(<<<<<<< |=======$|>>>>>>> )'; then
+            # Capture the staged diff before matching so `grep -q` cannot
+            # close the pipe early and make `git diff` fail with SIGPIPE
+            # under `set -o pipefail` (which would fail open). A failed diff
+            # is itself a fail-closed condition.
+            conflict_diff_file="${RUNNER_TEMP:-/tmp}/conflict-staged.diff"
+            if ! git diff --cached -U0 > "$conflict_diff_file"; then
+              echo "classification=deterministic" >> "$GITHUB_OUTPUT"
+              echo "::error::Unable to inspect the staged conflict result; discarding repair."
+              exit 1
+            fi
+            if grep -qE '^\+(<<<<<<< |=======$|>>>>>>> )' "$conflict_diff_file"; then
               echo "classification=deterministic" >> "$GITHUB_OUTPUT"
               echo "::error::Conflict repair left conflict markers in the staged result; discarding repair."
               exit 1
@@ -1499,16 +1513,21 @@ jobs:
         uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
         env:
           HEAD_SHA: ${{ inputs.head_sha }}
+          REPAIR_BASE_SHA: ${{ steps.repair_pass.outputs.base_sha }}
         with:
           github-token: ${{ secrets.TAP_PAT }}
           script: |
+            const baseSha = String(process.env.REPAIR_BASE_SHA || '').trim().toLowerCase();
+            const description = /^[0-9a-f]{40,64}$/.test(baseSha)
+              ? 'PR-Agent repair settled; base ' + baseSha
+              : 'PR-Agent repair settled';
             await github.rest.repos.createCommitStatus({
               owner: process.env.CONTINUUM_PR_AGENT_TARGET_OWNER,
               repo: process.env.CONTINUUM_PR_AGENT_TARGET_REPO,
               sha: process.env.HEAD_SHA,
               state: 'success',
               context: 'continuum/pr-agent-repair',
-              description: 'PR-Agent repair settled',
+              description,
               target_url:
                 context.serverUrl + '/' + context.repo.owner + '/' +
                 context.repo.repo + '/actions/runs/' + context.runId,

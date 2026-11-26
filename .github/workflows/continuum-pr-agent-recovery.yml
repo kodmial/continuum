@@ -1074,10 +1074,65 @@ jobs:
                 };
               }
               const markers = Array.isArray(conflictMarkers) ? conflictMarkers : [];
+              const markerTimes = markers
+                .map(marker => Date.parse(String(marker.updated_at || marker.created_at || '')))
+                .filter(value => Number.isFinite(value));
+              const newestMarkerAt = markerTimes.length ? Math.max(...markerTimes) : null;
+              const markerAge = newestMarkerAt === null ? null : Math.max(0, now - newestMarkerAt);
               const statusState = String(repairStatus?.state || '').toLowerCase();
               const statusDescription = String(repairStatus?.description || '').toLowerCase();
               if (statusState === 'success') {
-                return { action: 'settled', reason: 'conflict repair already settled for this HEAD' };
+                // A success status is terminal only for the base it actually
+                // integrated. The PR is confirmed dirty here, so a success
+                // from an earlier base (or one without base evidence) is
+                // stale: a later default-branch advance can make the same
+                // HEAD dirty again while the old status remains, and that
+                // new conflict episode must not be suppressed. Treat the
+                // stale success as a completed attempt for the old base and
+                // let the exact-HEAD marker budget bound the new episode.
+                const settledBase = (
+                  String(repairStatus?.description || '').match(
+                    /\bbase[=: ]+([0-9a-f]{40,64})\b/i
+                  ) || []
+                )[1];
+                const currentBase = String(fresh?.base?.sha || '').toLowerCase();
+                if (
+                  settledBase &&
+                  currentBase &&
+                  settledBase.toLowerCase() === currentBase
+                ) {
+                  return {
+                    action: 'settled',
+                    reason: 'conflict repair already settled for this base',
+                  };
+                }
+                // The previous execution completed for an older base, so it
+                // is safe to start the new episode once the dispatch grace
+                // has passed. The exact-HEAD marker count still bounds it.
+                if (markers.length === 0) {
+                  return {
+                    action: 'dispatch',
+                    attempt: 0,
+                    reason: 'dirty PR has no conflict repair dispatch for the current base',
+                  };
+                }
+                if (markers.length >= maxExecutions) {
+                  return {
+                    action: 'hold',
+                    reason: 'bounded conflict repair budget exhausted for this HEAD',
+                  };
+                }
+                if (markerAge !== null && markerAge < graceMs) {
+                  return {
+                    action: 'wait',
+                    reason: 'conflict repair dispatch is inside its grace window',
+                  };
+                }
+                return {
+                  action: 'retry',
+                  attempt: markers.length,
+                  reason: 'stale conflict repair success is recoverable for a new base episode',
+                };
               }
               if (statusState === 'failure' && /deterministic/.test(statusDescription)) {
                 return {
@@ -1098,11 +1153,6 @@ jobs:
                   reason: 'dirty PR has no conflict repair dispatch',
                 };
               }
-              const markerTimes = markers
-                .map(marker => Date.parse(String(marker.updated_at || marker.created_at || '')))
-                .filter(value => Number.isFinite(value));
-              const newestMarkerAt = markerTimes.length ? Math.max(...markerTimes) : null;
-              const markerAge = newestMarkerAt === null ? null : Math.max(0, now - newestMarkerAt);
               if (statusState === 'failure') {
                 // A transient failure is recoverable in conflict mode after
                 // the existing dispatch grace. A deterministic/no-progress

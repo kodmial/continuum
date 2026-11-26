@@ -756,6 +756,8 @@ class PrAgentTargetWorkflowContractTests(unittest.TestCase):
             'if [[ -n "$(git ls-files -u)" ]]',
             "Conflict repair left unresolved index entries",
             'git diff --cached -U0',
+            "conflict-staged.diff",
+            "Unable to inspect the staged conflict result",
             "Conflict repair left conflict markers",
         ):
             with self.subTest(needle=needle):
@@ -808,6 +810,21 @@ class PrAgentTargetWorkflowContractTests(unittest.TestCase):
         ):
             with self.subTest(path=path):
                 self.assertIn(lock, read(path))
+
+    def test_conflict_success_status_records_the_integrated_base(self):
+        # Recovery must not treat a success from an earlier base as terminal
+        # after a default-branch advance, so the repair success status carries
+        # the exact base it integrated.
+        repair = read(".github/workflows/continuum-pr-agent-repair.yml")
+        self.assertIn('echo "base_sha=$BASE_SHA" >> "$GITHUB_OUTPUT"', repair)
+        self.assertIn(
+            "REPAIR_BASE_SHA: ${{ steps.repair_pass.outputs.base_sha }}",
+            repair,
+        )
+        self.assertIn("'PR-Agent repair settled; base ' + baseSha", repair)
+        recovery = read(".github/workflows/continuum-pr-agent-recovery.yml")
+        self.assertIn(r"\bbase[=: ]+([0-9a-f]{40,64})\b", recovery)
+        self.assertIn("conflict repair already settled for this base", recovery)
 
     def test_delegated_repair_uses_private_comment_handoff_not_raw_outputs(self):
         review = read(".github/workflows/continuum-pr-agent.yml")
