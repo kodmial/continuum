@@ -86,8 +86,8 @@ MUTATION_COUNTS = {
     "continuum-opencode.yml": 15,  # #450 moved two inline CodeRabbit replies into serialized auto-merge; #451 adds the repair-completion handoff; #459 records the publication identity marker on both publish paths
     "continuum-pr-agent-auto-merge.yml": 1,
     "continuum-pr-agent-canary.yml": 4,
-    "continuum-pr-agent-recovery.yml": 4,
-    "continuum-pr-agent-repair.yml": 6,
+    "continuum-pr-agent-recovery.yml": 5,  # #497 adds the delegated conflict dispatch marker
+    "continuum-pr-agent-repair.yml": 7,  # #497 adds the delegated conflict retry marker
     "continuum-pr-agent.yml": 3,
     "continuum-render-executor.yml": 18,  # fail-closed incomplete bounded scan
 }
@@ -224,10 +224,12 @@ FUNCTIONAL_ANCHORS = {
     "continuum-pr-agent-recovery.yml": (
         "controllerStateBody(",
         "Controller dispatch run: ",
+        "Automatic delegated conflict repair execution ",
     ),
     "continuum-pr-agent-repair.yml": (
         "policy.controllerStateBody",
         "printf -v BODY",
+        "Automatic delegated conflict repair execution ",
     ),
     "continuum-pr-agent.yml": (
         "policy.controllerStateBody",
