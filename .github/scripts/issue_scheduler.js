@@ -3827,14 +3827,11 @@ module.exports = async function runIssueScheduler({ github, context, core }) {
       }
       return { ...base, reason: 'metadata-failed-expired' };
     }
-    if (
-      due > now &&
-      [
-        'claimed', 'accepted', 'backoff', 'metadata-pending',
-        'dispatch-failed', 'observed-unverified',
-        'reconcile-pending',
-      ].includes(state)
-    ) {
+    const watchdogPendingStates = [
+      'claimed', 'accepted', 'backoff', 'metadata-pending',
+      'dispatch-failed', 'observed-unverified', 'reconcile-pending',
+    ];
+    if (due > now && watchdogPendingStates.includes(state)) {
       return {
         ...base,
         keepReservation: true,
@@ -3919,16 +3916,28 @@ module.exports = async function runIssueScheduler({ github, context, core }) {
           checkpointSha: checkpoint.refSha,
         };
       }
-      if (state === 'backoff') {
-        // next_due is the watchdog's earliest retry time, NOT expiration.
-        // An authenticated, unchanged 429 checkpoint still belongs to the
-        // recovery controller after that instant. Releasing it would let the
-        // ordinary scheduler burn the issue dispatch budget and pause work.
+      // A settled `observed-unverified` run is the one pending state the
+      // watchdog cannot advance: its stand-down path returns without
+      // rewriting the marker, so retaining the reservation here would hold it
+      // forever. Release the reservation once the observed run is terminal
+      // (or no longer exists) and the checkpoint is unchanged; every other
+      // pending state keeps watchdog ownership.
+      if (
+        watchdogPendingStates.includes(state) &&
+        !(state === 'observed-unverified' &&
+          ((run.kind === 'found' &&
+            run.run &&
+            run.run.status === 'completed') ||
+            run.kind === 'missing'))
+      ) {
+        // next_due makes a pending recovery eligible for watchdog catch-up.
+        // It does not release an authenticated, unchanged checkpoint to the
+        // ordinary scheduler, even after a crash between claim and dispatch.
         return {
           ...base,
           keepReservation: true,
           recoveryPending: true,
-          reason: 'backoff-awaiting-watchdog',
+          reason: state + '-awaiting-watchdog',
           checkpointSha: checkpoint.refSha,
         };
       }

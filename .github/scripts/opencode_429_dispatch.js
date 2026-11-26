@@ -17,6 +17,12 @@ const DEFAULT_CANDIDATES = [
   '.github/workflows/continuum-opencode.yml',
 ];
 
+// Wall-clock bound for retrying a transient inventory read. A caller may pass
+// one budget object shared by every observation in a pass, so several unstable
+// candidates cannot starve the candidates examined later.
+const OBSERVATION_SLEEP_BUDGET_MS = 30000;
+const OBSERVATION_RETRY_SLEEP_MS = 5000;
+
 function normalizeWorkflowPath(value) {
   let text = String(value || '').trim();
   if (!text) return '';
@@ -97,7 +103,188 @@ function resolveDispatchWorkflow({ configured, watchedRunPath, workflows } = {})
   return null;
 }
 
+async function observeDispatchedRun({
+  target, notBefore, displayTitle, recoveryRunName, oldRunId,
+  adopting = false, owner, repo, listWorkflowRuns, warn, sleep, sleepBudget,
+}) {
+  // No invented recent floor: without a real claim timestamp, an
+  // inventory cannot prove that an earlier dispatch is absent.
+  if (!Number.isFinite(notBefore) || notBefore <= 0 ||
+      notBefore > Date.now() + 5000) return { incomplete: true };
+  const lower = Math.floor(Math.max(0, notBefore - 5000) / 1000);
+  // Keep the entire claim-to-now history in scope, not an arbitrary
+  // hour. GitHub's filtered search can cap at 1,000; bisect saturated
+  // inclusive second-resolution windows, oldest first, under a
+  // per-observation REST budget. Never scan unrelated history.
+  // Two complete scans are required for `adopting`; a shared 40-call
+  // budget can starve the confirmation scan on dense inventories and
+  // permanently retain the claim. Give adoption room for both scans.
+  let remaining = adopting ? 80 : 40;
+  const candidates = runs => runs.filter(candidate => {
+    if (Number(candidate.id) === Number(oldRunId || 0)) return false;
+    if (candidate.event !== 'workflow_dispatch') return false;
+    if (candidate.path && candidate.path !== target.path) return false;
+    return new Date(candidate.created_at || 0).getTime() + 5000 >= notBefore;
+  });
+  const byTitle = (runs, title) => title
+    ? runs.find(candidate => candidate.display_title === title)
+    : null;
+  // The watchdog shares one budget across all candidates in a pass. A
+  // standalone call still gets the same bounded wall clock instead of the
+  // previous ten-retry, ~45-second worst case.
+  const budget = sleepBudget && typeof sleepBudget === 'object' &&
+    Number.isFinite(sleepBudget.remainingMs)
+    ? sleepBudget
+    : { remainingMs: OBSERVATION_SLEEP_BUDGET_MS };
+  async function pause() {
+    if (!(budget.remainingMs > 0)) return false;
+    const wait = Math.min(OBSERVATION_RETRY_SLEEP_MS, budget.remainingMs);
+    budget.remainingMs -= wait;
+    await sleep(wait);
+    return true;
+  }
+  async function scanInventory() {
+    const upper = Math.ceil(Date.now() / 1000);
+    const pending = [[lower, upper]];
+    const inventory = new Map();
+    while (pending.length) {
+      const [start, end] = pending.pop();
+      const created = new Date(start * 1000).toISOString() + '..' +
+        new Date(end * 1000).toISOString();
+      const local = new Map();
+      let total = null;
+      for (let page = 1; page <= 10; page += 1) {
+        if (remaining <= 0) {
+          return { incomplete: true, reason: 'budget-exhausted' };
+        }
+        remaining -= 1;
+        const { data } = await listWorkflowRuns({
+          owner, repo, workflow_id: target.workflowId,
+          event: 'workflow_dispatch', created, per_page: 100, page,
+        });
+        if (!Array.isArray(data?.workflow_runs) ||
+            !Number.isSafeInteger(data.total_count) || data.total_count < 0) {
+          return { incomplete: true, reason: 'malformed-page' };
+        }
+        const pageRuns = data.workflow_runs;
+        // Positive exact identity is valid even on a capped page;
+        // fallback matching and negative evidence require completeness.
+        const exact = byTitle(candidates(pageRuns).filter(candidate => {
+          const at = Math.floor(new Date(candidate.created_at || 0).getTime() / 1000);
+          return /^\d+$/.test(String(candidate.id || '')) &&
+            Number.isFinite(at) && at >= start && at <= end;
+        }), recoveryRunName);
+        if (exact) return { match: exact };
+        if (page === 1) {
+          total = data.total_count;
+          // A reported 1,000 may itself be the search ceiling.
+          // Split even at equality; a complete inventory of
+          // exactly 1,000 distinct runs can then be reconciled.
+          if (total >= 1000) {
+            // A single second cannot be subdivided any further, so its
+            // saturation is not a transient read failure.
+            if (start === end) {
+              return { incomplete: true, reason: 'saturated-second' };
+            }
+            const midpoint = Math.floor((start + end) / 2);
+            // Overlap the split second instead of partitioning it. The
+            // `created` filter may be compared against full-precision
+            // `created_at` values, so a run at `midpoint.500` belongs to
+            // neither `[start, midpoint]` nor `[midpoint + 1, end]`. Both
+            // windows include the boundary second; the inventory dedupes the
+            // shared run by id.
+            pending.push([midpoint, end], [start, midpoint]);
+            break;
+          }
+        } else if (data.total_count !== total) {
+          return { incomplete: true, reason: 'count-drift' };
+        }
+        for (const candidate of pageRuns) {
+          const id = String(candidate.id || '');
+          const at = Math.floor(new Date(candidate.created_at || 0).getTime() / 1000);
+          if (!/^\d+$/.test(id) || local.has(id) ||
+              !Number.isFinite(at) || at < start || at > end ||
+              candidate.event !== 'workflow_dispatch') {
+            return { incomplete: true, reason: 'invalid-run' };
+          }
+          local.set(id, candidate);
+        }
+        if (local.size === total) {
+          // Adjacent windows overlap on their split second, so a run already
+          // collected by a sibling window is expected here.
+          for (const [id, candidate] of local) {
+            if (!inventory.has(id)) inventory.set(id, candidate);
+          }
+          break;
+        }
+        if (local.size > total || pageRuns.length < 100 || page === 10) {
+          return { incomplete: true, reason: 'inconsistent-page' };
+        }
+      }
+    }
+    return { runs: candidates([...inventory.values()]) };
+  }
+  let complete = false;
+  let consecutiveComplete = 0;
+  for (let attempt = 0; attempt < 10 && remaining > 0; attempt += 1) {
+    // Negative evidence is a point-in-time observation. A later
+    // failed/truncated read invalidates it; only the exact positive
+    // match may settle ownership regardless of scan completeness.
+    complete = false;
+    try {
+      const result = await scanInventory();
+      if (result.match) return result.match;
+      if (result.incomplete) {
+        // A transient inconsistency invalidates only the current read;
+        // retry within the remaining budget instead of giving up after
+        // one. A saturated single second cannot be subdivided, so a
+        // retry reproduces the same result and would only burn budget.
+        consecutiveComplete = 0;
+        complete = false;
+        if (result.reason === 'saturated-second' || remaining <= 0) {
+          return { incomplete: true };
+        }
+        // Without wall clock left, an immediate retry would repeat the same
+        // transient read without giving GitHub's index time to settle.
+        if (attempt < 9 && !(await pause())) return { incomplete: true };
+        continue;
+      }
+      const runs = result.runs;
+      const match = byTitle(runs, displayTitle) ||
+        (runs.length === 1 ? runs[0] : null);
+      if (match) return match;
+      complete = true;
+      consecutiveComplete += 1;
+      // An expired claim has already waited its lease. Two fresh,
+      // consecutive complete observations, without a later failed
+      // read, establish absence without rewalking dense inventories
+      // ten times. Post-dispatch observation keeps its usual poll.
+      if (adopting && consecutiveComplete >= 2) return null;
+    } catch (err) {
+      consecutiveComplete = 0;
+      // This is GitHub REST, not the OpenCode provider. An access or rate
+      // refusal cannot prove absence; defer to the next guarded wake.
+      if ([403, 429].includes(Number(err?.status))) {
+        warn('GitHub REST refused dispatch observation; keeping recovery claim.');
+        return { incomplete: true };
+      }
+      warn(
+        'OpenCode 429 dispatch observation attempt failed for ' +
+        target.path + ': ' + (err.message || err)
+      );
+    }
+    if (attempt < 9 && remaining > 0 && !(await pause())) {
+      // Exhausted the shared wall clock: keep the claim instead of
+      // repeating an unsettled read and burning API calls.
+      return { incomplete: true };
+    }
+  }
+  return complete && (!adopting || consecutiveComplete >= 2)
+    ? null : { incomplete: true };
+}
+
 module.exports = {
+  observeDispatchedRun,
   DEFAULT_CANDIDATES,
   normalizeWorkflowPath,
   workflowIdFor,

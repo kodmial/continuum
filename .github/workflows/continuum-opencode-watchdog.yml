@@ -213,7 +213,7 @@ jobs:
           # Pinned: these files are executed by require()/python3; never leave
           # them on a mutable ref. Advance the pin only in the same PR that
           # changes them.
-          ref: b06bd207d8ff5ad079d14626eb10669c13d56435
+          ref: 5e80481449e1bef83d9c3694b4a3941ce5fd33a4
           path: .continuum-watchdog-engine
           fetch-depth: 1
           persist-credentials: false
@@ -446,7 +446,8 @@ jobs:
                 for (const state of parseRecoveryStates(
                   comment.body || '', operation, generation
                 )) {
-                  all.push({ ...state, commentId: Number(comment.id || 0) });
+                  all.push({ ...state, commentId: Number(comment.id || 0),
+                    createdAt: Date.parse(comment.created_at || "") });
                 }
               }
               return all.length ? all[all.length - 1] : null;
@@ -768,59 +769,19 @@ jobs:
                 ' gen ' + String(generation);
             }
 
-            async function observeDispatchedRun({
-              target, notBefore, displayTitle, recoveryRunName, oldRunId,
-            }) {
-              for (let attempt = 0; attempt < 10; attempt += 1) {
-                try {
-                  const runs = await readGithub.paginate(
-                    readGithub.rest.actions.listWorkflowRuns,
-                    {
-                      owner, repo, workflow_id: target.workflowId,
-                      per_page: 50,
-                    }
-                  );
-                  const candidates = runs.filter(candidate => {
-                    if (Number(candidate.id) === Number(oldRunId || 0)) return false;
-                    if (candidate.event !== 'workflow_dispatch') return false;
-                    if (candidate.path && candidate.path !== target.path) return false;
-                    if (new Date(candidate.created_at || 0).getTime() + 5000 < notBefore) {
-                      return false;
-                    }
-                    return true;
-                  });
-                  const byTitle = title => title
-                    ? candidates.find(candidate =>
-                        candidate.display_title === title)
-                    : null;
-                  // Prefer the recovery identity embedded in run-name. Fall
-                  // back to the caller's mode/issue title and finally, only
-                  // when it is unambiguous, to the single new dispatch run. A
-                  // missing/unrelated display_title must never turn an
-                  // observable dispatch into an accepted-but-unowned one.
-                  let match = byTitle(recoveryRunName) || byTitle(displayTitle);
-                  if (!match) {
-                    const ordered = candidates.slice().sort((a, b) =>
-                      new Date(a.created_at || 0).getTime() -
-                        new Date(b.created_at || 0).getTime() ||
-                      Number(a.id || 0) - Number(b.id || 0)
-                    );
-                    if (ordered.length === 1) {
-                      match = ordered[0];
-                    }
-                  }
-                  if (match) return match;
-                } catch (err) {
-                  core.warning(
-                    'OpenCode 429 dispatch observation attempt failed for ' +
-                    target.path + ': ' + (err.message || err)
-                  );
-                }
-                if (attempt < 9) {
-                  await new Promise(resolve => setTimeout(resolve, 5000));
-                }
-              }
-              return null;
+            // One wall-clock retry budget shared by every observation in
+            // this pass: a single unstable candidate must not spend the whole
+            // retry allowance before later due candidates are examined.
+            const dispatchObservationSleepBudget = { remainingMs: 30000 };
+
+            async function observeDispatchedRun(options) {
+              return dispatchRouting.observeDispatchedRun({
+                ...options, owner, repo,
+                sleepBudget: dispatchObservationSleepBudget,
+                listWorkflowRuns: params => readGithub.rest.actions.listWorkflowRuns(params),
+                warn: message => core.warning(message),
+                sleep: ms => new Promise(resolve => setTimeout(resolve, ms)),
+              });
             }
 
             // A recorded `observed` marker is an ownership fence only while
@@ -1803,15 +1764,31 @@ jobs:
                     'checking for an already accepted run (' +
                     (err.message || err) + ').'
                   );
+                  return;
                 }
-                if (observedTarget) {
+                if (!observedTarget) {
+                  core.warning('Cannot resolve previous dispatch target; keeping recovery claim.');
+                  return;
+                }
+                {
                   const recovered = await observeDispatchedRun({
                     target: observedTarget,
-                    notBefore: Math.max(0, previous.nextDue - 300) * 1000,
+                    notBefore: previous.nextDue > 0
+                      ? Math.max(0, previous.nextDue - 300) * 1000
+                      : previous.createdAt,
+                    adopting: true,
                     displayTitle,
                     recoveryRunName: recoveryTitle,
                     oldRunId: run && run.id,
                   });
+                  if (recovered && recovered.incomplete) {
+                    core.warning('Incomplete dispatch inventory; keeping recovery claim.');
+                    // This returns from the per-target helper only. Both
+                    // callers invoke it inside their due-candidate loops
+                    // (scheduled catch-up and durable discovery), so the
+                    // remaining candidates in this pass still run.
+                    return;
+                  }
                   if (recovered) {
                     await recordRecoveryState({
                       ...baseState,
@@ -2136,7 +2113,7 @@ jobs:
                 recoveryRunName: recoveryTitle,
                 oldRunId: run && run.id,
               });
-              if (!observed) {
+              if (!observed || observed.incomplete) {
                 await recordRecoveryState({
                   ...baseState,
                   checkpointSha,

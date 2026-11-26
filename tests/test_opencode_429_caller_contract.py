@@ -300,11 +300,12 @@ class WatchdogContractTest(unittest.TestCase):
         )
 
     def test_observation_prefers_the_durable_recovery_run_identity(self):
-        observation = self.body.split("async function observeDispatchedRun")[-1]
+        observation = HELPER.read_text(encoding="utf-8").split("async function observeDispatchedRun")[-1]
+        self.assertIn("dispatchRouting.observeDispatchedRun", self.body)
         self.assertIn("function recoveryRunName(operation, generation)", self.body)
-        self.assertIn("byTitle(recoveryRunName)", observation)
-        self.assertIn("byTitle(displayTitle)", observation)
-        self.assertIn("ordered.length === 1", observation)
+        self.assertIn("}), recoveryRunName);", observation)
+        self.assertIn("byTitle(runs, displayTitle)", observation)
+        self.assertIn("runs.length === 1", observation)
 
     def test_expired_attempt_backoff_opens_a_fresh_cycle(self):
         recovery = self.body.split("async function recoverFrom429OnFreshVm")[-1]

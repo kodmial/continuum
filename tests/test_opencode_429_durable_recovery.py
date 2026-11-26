@@ -443,6 +443,73 @@ class SchedulerDurableRecoveryTests(unittest.TestCase):
         self.assertFalse(evaluation["ownerActionRequired"])
         self.assertEqual(evaluation["reason"], "backoff-awaiting-watchdog")
 
+    def test_overdue_pending_recovery_retains_watchdog_ownership(self):
+        # Reproduce the crash after pre-dispatch claim on #472: next_due
+        # elapsed, no run id exists, and the saved checkpoint is unchanged.
+        # All watchdog-owned pending states must retain this verified checkpoint.
+        for state in ("claimed", "accepted", "metadata-pending",
+                      "dispatch-failed", "observed-unverified", "reconcile-pending"):
+            with self.subTest(state=state):
+                scenario = self.base_scenario()
+                scenario["recovery"].update({
+                    "state": state, "attempt": 6, "nextDue": 1,
+                    "checkpointSha": NEW_SHA, "runId": "-",
+                })
+                result = self.run_scenario(scenario)
+                evaluation = result["evaluation"]
+                self.assertTrue(evaluation["keepReservation"])
+                self.assertTrue(evaluation["recoveryPending"])
+                self.assertFalse(evaluation["countWip"])
+                self.assertFalse(evaluation["ownerActionRequired"])
+                self.assertEqual(evaluation["reason"], state + "-awaiting-watchdog")
+                self.assertEqual(result["runLookups"], [])
+
+    def test_overdue_pending_state_requires_verified_checkpoint(self):
+        scenario = self.base_scenario()
+        scenario["recovery"].update({
+            "state": "claimed", "attempt": 6, "nextDue": 1,
+            "checkpointSha": NEW_SHA, "runId": "-",
+        })
+        scenario["missingRef"] = True
+        evaluation = self.run_scenario(scenario)["evaluation"]
+        self.assertFalse(evaluation["keepReservation"])
+        self.assertEqual(evaluation["reason"], "checkpoint-missing")
+
+    def test_terminal_observed_unverified_releases_when_checkpoint_unchanged(self):
+        # observed-unverified always carries a run id; a completed run with an
+        # unchanged checkpoint makes the watchdog stand down without rewriting
+        # the marker, so the scheduler must not retain the reservation forever.
+        scenario = self.base_scenario()
+        scenario["recovery"].update({
+            "state": "observed-unverified", "attempt": 2, "nextDue": 1,
+            "checkpointSha": NEW_SHA, "runId": OLD_RUN_ID,
+        })
+        result = self.run_scenario(scenario)
+        evaluation = result["evaluation"]
+        self.assertFalse(evaluation["keepReservation"])
+        self.assertFalse(evaluation["recoveryPending"])
+        self.assertFalse(evaluation["countWip"])
+        self.assertEqual(evaluation["reason"], "checkpoint-unchanged")
+        self.assertEqual(result["runLookups"], [OLD_RUN_ID])
+
+    def test_missing_observed_unverified_run_releases_when_checkpoint_unchanged(self):
+        # A recorded run can be deleted. The watchdog can never advance that
+        # marker, so a definitive 404 must release the unchanged checkpoint
+        # instead of retaining the reservation forever.
+        scenario = self.base_scenario()
+        scenario["recovery"].update({
+            "state": "observed-unverified", "attempt": 2, "nextDue": 1,
+            "checkpointSha": NEW_SHA, "runId": OLD_RUN_ID,
+        })
+        scenario["exactRuns"] = []
+        result = self.run_scenario(scenario)
+        evaluation = result["evaluation"]
+        self.assertFalse(evaluation["keepReservation"])
+        self.assertFalse(evaluation["recoveryPending"])
+        self.assertFalse(evaluation["countWip"])
+        self.assertEqual(evaluation["reason"], "checkpoint-unchanged")
+        self.assertEqual(result["runLookups"], [OLD_RUN_ID])
+
     def test_unknown_owner_action_required_stays_terminal(self):
         scenario = self.base_scenario()
         scenario["max429RunnerRestarts"] = 3
