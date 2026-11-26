@@ -563,6 +563,13 @@ class BudgetAndBackoffTest(unittest.TestCase):
         self.assertEqual([durable_backoff_seconds(g, 3) for g in range(1, 10)],
                          [0, 0, 0, 60, 300, 900, 1800, 3600, 3600])
 
+    def test_durable_backoff_uses_safe_defaults_for_invalid_budgets(self):
+        self.assertEqual(durable_backoff_seconds("invalid", 3), 0)
+        self.assertEqual(durable_backoff_seconds(4), 60)
+        self.assertEqual(durable_backoff_seconds(4, ""), 60)
+        self.assertEqual(durable_backoff_seconds(4, "invalid"), 60)
+        self.assertEqual(durable_backoff_seconds(1, -3), 60)
+
     def test_cooldown_only_after_fast_replacements_exhausted(self):
         self.assertFalse(
             should_enter_infra_cooldown(1, DEFAULT_MAX_429_RUNNER_RESTARTS)
